@@ -1,0 +1,161 @@
+{
+  "schema": "jsvm-real-corpus/v1",
+  "source_project": "/srv/scratch/searxrs2",
+  "created": "2026-09-30",
+  "notes": "Raw captures are preserved byte-for-byte. *.pretty.js files are Oxc-codegen analyst views generated locally and are not capture truth.",
+  "samples": [
+    {
+      "id": "datadome-qwant-5.10.0",
+      "family": "DataDome",
+      "role": "raw",
+      "capture_date": "2026-09-26",
+      "path": "datadome/qwant-tags-v5.10.0.raw.js",
+      "source": "/srv/scratch/searxrs2/data/qwant-dd/tags.js",
+      "purpose": "Production DataDome browser tag; large anti-fraud/fingerprinting sample and current safe-deob hard case.",
+      "bytes": 132516,
+      "sha256": "9c002086227c79e328e8ddf2b5870de416af0d175615d9a90589d92e6d5c2714",
+      "pretty_path": "datadome/qwant-tags-v5.10.0.pretty.js"
+    },
+    {
+      "id": "cloudflare-ecosia-orchestrate-1",
+      "family": "Cloudflare Managed Challenge",
+      "role": "raw",
+      "capture_date": "2026-09-26",
+      "path": "cloudflare/ecosia-orchestrate-sample1.raw.js",
+      "source": "/srv/scratch/searxrs2/research/cloudflare-ecosia-2026-09-26/orchestrate.js",
+      "purpose": "Fresh managed-challenge orchestrator; sample 1 of a polymorphic wrapper pair.",
+      "bytes": 240897,
+      "sha256": "784d5f9958eb8e742f38de01eed29431accc9bbb836722688525c173b4130560",
+      "pretty_path": "cloudflare/ecosia-orchestrate-sample1.pretty.js"
+    },
+    {
+      "id": "cloudflare-ecosia-orchestrate-2",
+      "family": "Cloudflare Managed Challenge",
+      "role": "raw",
+      "capture_date": "2026-09-26",
+      "path": "cloudflare/ecosia-orchestrate-sample2.raw.js",
+      "source": "/srv/scratch/searxrs2/research/cloudflare-ecosia-2026-09-26/orchestrate2.js",
+      "purpose": "Fresh managed-challenge orchestrator; sample 2 with reshuffled decoder/offset but stable protocol skeleton.",
+      "bytes": 232932,
+      "sha256": "feb2f98cb40bf6c82b37a571c3a5252bec99027bb3f652a8dfa8693f9067b618",
+      "pretty_path": "cloudflare/ecosia-orchestrate-sample2.pretty.js"
+    },
+    {
+      "id": "cloudflare-main-chrome-raw",
+      "family": "Cloudflare",
+      "role": "raw",
+      "capture_date": "2026-09-26",
+      "path": "cloudflare/main-chrome.raw.js",
+      "source": "/srv/scratch/searxrs2/research/cloudflare-ecosia-2026-09-26/gproxy-ref2/fixtures/cloudflare/main-chrome.js",
+      "purpose": "Compact raw Cloudflare fixture with a known external deobfuscated counterpart.",
+      "bytes": 20639,
+      "sha256": "68e18d639933ad44351c22a5dd89d9247bf103ac724a0e645bcf42e70c3d98c1",
+      "pretty_path": "cloudflare/main-chrome.pretty.js"
+    },
+    {
+      "id": "cloudflare-main-chrome-reference",
+      "family": "Cloudflare",
+      "role": "deobfuscated_reference",
+      "capture_date": "2026-09-26",
+      "path": "cloudflare/main-chrome.deobfuscated.reference.js",
+      "source": "/srv/scratch/searxrs2/research/cloudflare-ecosia-2026-09-26/gproxy-ref2/fixtures/cloudflare/deobfuscation/main-chrome.deobfuscated.js",
+      "purpose": "Reference deobfuscation paired with cloudflare-main-chrome-raw for future quality scoring.",
+      "bytes": 46382,
+      "sha256": "19a50c29ec51c0c91af59e1a27d8b3f3e043e95a14c4cf3811e076a70a3a3f9b"
+    },
+    {
+      "id": "castle-raw",
+      "family": "Castle",
+      "role": "raw",
+      "capture_date": "2026-09-26",
+      "path": "castle/castle-Cs-TYKFF.raw.js",
+      "source": "/srv/scratch/searxrs2/research/cloudflare-ecosia-2026-09-26/gproxy-ref2/fixtures/castle/castle.umd-Cs-TYKFF.js",
+      "purpose": "Large browser anti-fraud/fingerprinting bundle; structurally different from challenge-page VMs.",
+      "bytes": 647451,
+      "sha256": "8a6caeb6bb26da3060bdd5cc213c63f327e764af9b0ac098d0916247133f5eb3",
+      "pretty_path": "castle/castle-Cs-TYKFF.pretty.js"
+    },
+    {
+      "id": "castle-reference",
+      "family": "Castle",
+      "role": "deobfuscated_reference",
+      "capture_date": "2026-09-26",
+      "path": "castle/castle-Cs-TYKFF.deobfuscated.reference.js",
+      "source": "/srv/scratch/searxrs2/research/cloudflare-ecosia-2026-09-26/gproxy-ref2/fixtures/castle/deobfuscation/castle.umd-Cs-TYKFF.deobfuscated.js",
+      "purpose": "Reference deobfuscation paired with castle-raw for future quality scoring.",
+      "bytes": 1391851,
+      "sha256": "49f502027449df48241ea9cc544afa2a3a5bab9ef0cae641b0d3f8978fa3efd9"
+    },
+    {
+      "id": "google-knitsail-current",
+      "family": "Google Knitsail",
+      "role": "raw",
+      "capture_date": "2026-09-27",
+      "path": "google-knitsail/current-live-vm-20260927.raw.js",
+      "source": "/srv/scratch/searxrs2/research/google-historical-2026-09-27/current-live-knitsail-vm.js",
+      "purpose": "Current live Knitsail custom-VM body; heavily polymorphed relative to historical bodies while outer ABI stays stable.",
+      "bytes": 63650,
+      "sha256": "e414463345509a89678cd7dc9afa9b9391e4dce58a56f6a1e641990f2884fa5e",
+      "pretty_path": "google-knitsail/current-live-vm-20260927.pretty.js"
+    },
+    {
+      "id": "google-knitsail-public-reference",
+      "family": "Google Knitsail",
+      "role": "reference",
+      "capture_date": "2026-09-09",
+      "path": "google-knitsail/public-20260909.reference.js",
+      "source": "/srv/scratch/searxrs2/research/google-historical-2026-09-27/public-knitsail-2026-09-09.js",
+      "purpose": "Public September 2026 Knitsail reference sample retained for cross-version structural comparison.",
+      "bytes": 118529,
+      "sha256": "ca0344a06dc83d2e21627fc0c9c28370a4a4d86222fe11f1c8ce66164278173d"
+    },
+    {
+      "id": "acw-sc-v2-phison-1",
+      "family": "acw_sc__v2 challenge",
+      "role": "raw",
+      "capture_date": "2026-09-27",
+      "path": "acw-sc-v2/mpall518-challenge.raw.js",
+      "source": "/srv/scratch/searxrs2/research/phison-ps2319-2026-09-27/downloads/mpall518-challenge.js",
+      "purpose": "Compact anti-bot challenge with string-table rotation/decoder indirection, self-defending scaffolding, permutation/XOR cookie derivation and reload; non-VM reversible-obfuscation hard negative.",
+      "bytes": 4291,
+      "sha256": "c2b3f62a7b164f3ca64ee4c3a15b9c412758d19c961164e7024da989c47b1808",
+      "pretty_path": "acw-sc-v2/mpall518-challenge.pretty.js"
+    },
+    {
+      "id": "acw-sc-v2-phison-2",
+      "family": "acw_sc__v2 challenge",
+      "role": "raw",
+      "capture_date": "2026-09-27",
+      "path": "acw-sc-v2/mpall518-challenge2.raw.js",
+      "source": "/srv/scratch/searxrs2/research/phison-ps2319-2026-09-27/downloads/mpall518-challenge2.js",
+      "purpose": "Second capture of the same anti-bot challenge family with a different per-request arg1 value; useful for structural invariance and deobfuscation comparison.",
+      "bytes": 4291,
+      "sha256": "f0c20e18ff72f8dd6e70f29f4383ef58a5012802c910d2a1ef83eeb77af6df54",
+      "pretty_path": "acw-sc-v2/mpall518-challenge2.pretty.js"
+    },
+    {
+      "id": "datadome-allegro-captcha-c",
+      "family": "DataDome challenge runtime",
+      "role": "raw",
+      "capture_date": "2026-09-30",
+      "path": "datadome/allegro-captcha-c.raw.js",
+      "source": "https://ct.captcha-delivery.com/c.js",
+      "purpose": "Current DataDome CAPTCHA/slider challenge runtime observed from Allegro. Distinct from the main 5.10.0 browser tag; compact challenge-page control code and a useful non-VM anti-bot hard negative.",
+      "pretty_path": "datadome/allegro-captcha-c.pretty.js",
+      "bytes": 14188,
+      "sha256": "b9b43e1b096916080a61719bb63bcacc88df3e926d8620a72fa03820457a6f83"
+    },
+    {
+      "id": "datadome-allegro-interstitial-i",
+      "family": "DataDome challenge runtime",
+      "role": "raw",
+      "capture_date": "2026-09-30",
+      "path": "datadome/allegro-interstitial-i.raw.js",
+      "source": "https://ct.captcha-delivery.com/i.js",
+      "purpose": "Current DataDome interstitial/device-check runtime observed from Allegro. Distinct from both c.js and the main 5.10.0 tag; useful anti-bot/cleaner hard negative.",
+      "pretty_path": "datadome/allegro-interstitial-i.pretty.js",
+      "bytes": 15014,
+      "sha256": "158a65061f6423a9d6d1f434004fd90f12c76a87ee3a8871784e060db18284c4"
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+project="$root/src/jsvm-lift"
+publish_root="$root/.cargo-target-nodebug"
+toolchain="/opt/toolchains/rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu"
+cargo_bin="$toolchain/bin/cargo"
+rustc_bin="$toolchain/bin/rustc"
+
+export RUSTC="$rustc_bin"
+export RUSTUP_TOOLCHAIN="1.98.1-x86_64-unknown-linux-gnu"
+export CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_PROFILE_DEV_INCREMENTAL=false
+
+if [[ "${JSVM_LOCAL_BUILD:-0}" == "1" ]]; then
+  echo "JSVM_LOCAL_BUILD=1 is disabled for this project; use the sccache-dist build path." >&2
+  exit 2
+fi
+
+jobs="$("$root/scripts/cargo-dist-jobs.sh")"
+mode="sccache-dist"
+
+profile=debug
+for arg in "$@"; do
+  [[ "$arg" == "--release" ]] && profile=release
+done
+
+echo "building JS VM tools with $jobs Cargo jobs ($mode)"
+echo "publish root: $publish_root"
+echo "cargo: $("$cargo_bin" --version)"
+echo "rustc: $("$rustc_bin" --version)"
+echo "RUSTC_WRAPPER=${RUSTC_WRAPPER:-<unset>}"
+
+cd "$project"
+"$cargo_bin" build -j "$jobs" "$@"
+
+# Site-wrapper target is a disposable compile cache; durable executables are published below.
+shim_target_root="/var/cache/sentinelx/cargo-target"
+if [[ -r /etc/sentinelx/build-scratch.conf ]]; then
+  # shellcheck disable=SC1091
+  . /etc/sentinelx/build-scratch.conf
+  shim_target_root="${SENTINELX_CARGO_TARGET_ROOT:-$shim_target_root}"
+fi
+workspace="$(pwd -P)"
+hash="$(printf '%s' "$workspace" | sha256sum | cut -c1-16)"
+name="$(basename "$workspace" | tr -c 'A-Za-z0-9._-' '_')"
+actual="$shim_target_root/${name}-$hash/$profile"
+canonical="$publish_root/$profile"
+mkdir -p "$canonical"
+
+published=0
+for bin in jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack; do
+  if [[ -f "$actual/$bin" ]]; then
+    install -m 0755 "$actual/$bin" "$canonical/$bin"
+    published=$((published + 1))
+  fi
+done
+
+echo "actual target: $actual"
+echo "published $published executable(s) to $canonical"
+if [[ -e "$canonical/jsvm-lift" ]]; then
+  stat -c 'canonical scanner: %y %s %n' "$canonical/jsvm-lift"
+fi
