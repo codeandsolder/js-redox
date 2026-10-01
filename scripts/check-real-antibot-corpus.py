@@ -16,11 +16,23 @@ SCANNER = ROOT / ".cargo-target-nodebug/debug/jsvm-lift"
 MIN_DEOB_TRANSFORMS = {
     # Filled only for transforms whose presence is part of the readability
     # contract, not for incidental optimizer counts.
+    "datadome-qwant-5.10.0": {
+        "string_array_decode": 4000,
+        "pure_function_eval": 120,
+        "reference_identity_compare": 13,
+        "reference_state_unflatten": 36,
+    },
 }
 
 EXPECTED_DEOB_STRINGS = {
-    # Likewise, only stable semantic strings recovered from deterministic
-    # static encodings belong here.
+    # Stable semantic strings recovered from DataDome's two literal tables:
+    # the ordinary atob table and the fixed-permutation Base64 table.
+    "datadome-qwant-5.10.0": (
+        "__selenium_evaluate",
+        "AudioContext",
+        "enumerateDevices",
+        "parseInt",
+    ),
 }
 
 FORBIDDEN_DEOB_STRINGS = {
