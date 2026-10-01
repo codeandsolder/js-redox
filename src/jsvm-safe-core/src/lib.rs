@@ -8,7 +8,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_semantic::{ReferenceId, Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
-use oxc_syntax::symbol::SymbolId;
+use oxc_syntax::{scope::ScopeId, symbol::SymbolId};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -91,6 +91,18 @@ fn same_value(a: &Value, b: &Value) -> bool {
         (Value::Null, Value::Null) | (Value::Undefined, Value::Undefined) => true,
         _ => false,
     }
+}
+
+fn same_values(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(left, right)| same_value(left, right))
+}
+
+fn render_value_array(values: &[Value]) -> Option<String> {
+    let rendered = values
+        .iter()
+        .map(Value::render)
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("[{}]", rendered.join(", ")))
 }
 
 fn eval(expr: &Expression<'_>) -> Option<Value> {
@@ -293,6 +305,7 @@ struct Decoder {
     values: Vec<Value>,
     offset: i64,
     provider: String,
+    provider_array_span: Span,
     transform: DecoderTransform,
 }
 
@@ -612,72 +625,110 @@ fn top_level_arrays(program: &oxc_ast::ast::Program<'_>) -> HashMap<SymbolId, Ve
     out
 }
 
+#[derive(Debug, Clone)]
+struct StaticArrayInfo {
+    values: Vec<Value>,
+    span: Span,
+}
+
 #[derive(Debug)]
 struct FnInfo {
     name: String,
     symbol: SymbolId,
+    scope: ScopeId,
     params: Vec<String>,
     span: Span,
-    static_arrays: HashMap<String, Vec<Value>>,
+    static_arrays: HashMap<String, StaticArrayInfo>,
 }
 
-fn top_level_functions(program: &oxc_ast::ast::Program<'_>) -> Vec<FnInfo> {
-    let mut out = Vec::new();
-    for stmt in &program.body {
-        let Statement::FunctionDeclaration(f) = stmt else {
-            continue;
-        };
-        let Some(id) = &f.id else { continue };
-        let Some(symbol) = id.symbol_id.get() else {
-            continue;
-        };
-        let params = f
-            .params
-            .items
-            .iter()
-            .filter_map(|p| match &p.pattern {
-                BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-                _ => None,
-            })
-            .collect();
+fn function_info(f: &oxc_ast::ast::Function<'_>, scoping: &Scoping) -> Option<FnInfo> {
+    if f.r#type != oxc_ast::ast::FunctionType::FunctionDeclaration {
+        return None;
+    }
+    let id = f.id.as_ref()?;
+    let symbol = id.symbol_id.get()?;
+    let params = f
+        .params
+        .items
+        .iter()
+        .filter_map(|p| match &p.pattern {
+            BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+            _ => None,
+        })
+        .collect();
 
-        let mut static_arrays = HashMap::new();
-        if let Some(body) = &f.body {
-            for stmt in &body.statements {
-                let Statement::VariableDeclaration(decl) = stmt else {
+    let mut static_arrays = HashMap::new();
+    if let Some(body) = &f.body {
+        for stmt in &body.statements {
+            let Statement::VariableDeclaration(decl) = stmt else {
+                continue;
+            };
+            for d in &decl.declarations {
+                let BindingPattern::BindingIdentifier(array_id) = &d.id else {
                     continue;
                 };
-                for d in &decl.declarations {
-                    let BindingPattern::BindingIdentifier(array_id) = &d.id else {
-                        continue;
-                    };
-                    let Some(Expression::ArrayExpression(array)) = &d.init else {
-                        continue;
-                    };
-                    let Some(values) = array
-                        .elements
-                        .iter()
-                        .map(array_element)
-                        .collect::<Option<Vec<_>>>()
-                    else {
-                        continue;
-                    };
-                    if !values.is_empty() {
-                        static_arrays.insert(array_id.name.to_string(), values);
-                    }
+                let Some(Expression::ArrayExpression(array)) = &d.init else {
+                    continue;
+                };
+                let Some(values) = array
+                    .elements
+                    .iter()
+                    .map(array_element)
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                if !values.is_empty() {
+                    static_arrays.insert(
+                        array_id.name.to_string(),
+                        StaticArrayInfo {
+                            values,
+                            span: array.span,
+                        },
+                    );
                 }
             }
         }
-
-        out.push(FnInfo {
-            name: id.name.to_string(),
-            symbol,
-            params,
-            span: f.span,
-            static_arrays,
-        });
     }
-    out
+
+    Some(FnInfo {
+        name: id.name.to_string(),
+        symbol,
+        scope: scoping.symbol_scope_id(symbol),
+        params,
+        span: f.span,
+        static_arrays,
+    })
+}
+
+struct FunctionDeclarationCollector<'s> {
+    scoping: &'s Scoping,
+    out: Vec<FnInfo>,
+}
+
+impl<'a> Visit<'a> for FunctionDeclarationCollector<'_> {
+    fn visit_function(
+        &mut self,
+        it: &oxc_ast::ast::Function<'a>,
+        flags: oxc_syntax::scope::ScopeFlags,
+    ) {
+        if let Some(info) = function_info(it, self.scoping) {
+            self.out.push(info);
+        }
+        walk::walk_function(self, it, flags);
+    }
+}
+
+fn all_function_declarations(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> Vec<FnInfo> {
+    let mut collector = FunctionDeclarationCollector {
+        scoping,
+        out: Vec::new(),
+    };
+    collector.visit_program(program);
+    collector.out
 }
 
 fn parse_i64_literal(text: &str) -> Option<i64> {
@@ -963,29 +1014,92 @@ fn eval_rotation_checksum(
     (parser.pos == expression.len()).then_some(value)
 }
 
+#[derive(Debug, Clone)]
+struct RotationIife {
+    provider: String,
+    target: i64,
+    body_span: Span,
+    statement_span: Span,
+}
+
+fn rotation_iife_function<'a>(expr: &'a Expression<'a>) -> Option<&'a oxc_ast::ast::Function<'a>> {
+    match expr {
+        Expression::FunctionExpression(function) => Some(function),
+        Expression::ParenthesizedExpression(parenthesized) => {
+            rotation_iife_function(&parenthesized.expression)
+        }
+        _ => None,
+    }
+}
+
+fn rotation_iife_call<'a>(expr: &'a Expression<'a>) -> Option<&'a CallExpression<'a>> {
+    match expr {
+        Expression::CallExpression(call) => Some(call),
+        Expression::ParenthesizedExpression(parenthesized) => {
+            rotation_iife_call(&parenthesized.expression)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct RotationIifeCollector {
+    out: Vec<RotationIife>,
+}
+
+impl<'a> Visit<'a> for RotationIifeCollector {
+    fn visit_expression_statement(&mut self, it: &ExpressionStatement<'a>) {
+        let Some(call) = rotation_iife_call(&it.expression) else {
+            walk::walk_expression_statement(self, it);
+            return;
+        };
+        if !call.optional && call.arguments.len() == 2 {
+            let provider = match &call.arguments[0] {
+                Argument::Identifier(identifier) => Some(identifier.name.to_string()),
+                _ => None,
+            };
+            let target = argument_integer(&call.arguments[1]);
+            let function = rotation_iife_function(&call.callee);
+            if let (Some(provider), Some(target), Some(function)) = (provider, target, function) {
+                if !function.r#async && !function.generator && function.params.items.len() == 2 {
+                    if let Some(body) = &function.body {
+                        self.out.push(RotationIife {
+                            provider,
+                            target,
+                            body_span: body.span,
+                            statement_span: it.span,
+                        });
+                    }
+                }
+            }
+        }
+        walk::walk_expression_statement(self, it);
+    }
+}
+
+fn collect_rotation_iifes(program: &oxc_ast::ast::Program<'_>) -> Vec<RotationIife> {
+    let mut collector = RotationIifeCollector::default();
+    collector.visit_program(program);
+    collector.out
+}
+
 fn apply_proven_decoder_rotations(
     source: &str,
     decoders: &mut HashMap<String, Decoder>,
-) -> Vec<(usize, usize)> {
-    let iife_re = regex::Regex::new(
-        r#"(?s)\(\s*function\s*\([^)]*\)\s*\{(?P<body>.*?)\}\s*\)?\s*\(\s*(?P<provider>[A-Za-z_$][A-Za-z0-9_$]*)\s*,\s*(?P<target>-?(?:0[xX][0-9A-Fa-f]+|[0-9]+))\s*\)"#,
-    )
-    .unwrap();
+    rotation_iifes: &[RotationIife],
+) -> (Vec<(usize, usize)>, Vec<Replacement>) {
     let checksum_re = regex::Regex::new(
         r#"(?s)\btry\s*\{\s*(?:var|let|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(?P<expr>[^;]+);"#,
     )
     .unwrap();
     let mut protected_spans = Vec::new();
+    let mut proven_iifes: Vec<(String, usize, usize)> = Vec::new();
 
-    for caps in iife_re.captures_iter(source) {
-        let body = &caps["body"];
+    for iife in rotation_iifes {
+        let body = fragment(source, iife.body_span);
         if !body.contains("push") || !body.contains("shift") {
             continue;
         }
-        let provider = &caps["provider"];
-        let Some(target) = parse_i64_literal(&caps["target"]) else {
-            continue;
-        };
         let Some(checksum) = checksum_re.captures(body) else {
             continue;
         };
@@ -993,7 +1107,7 @@ fn apply_proven_decoder_rotations(
         let mut proven_here = false;
 
         for (decoder_name, decoder) in decoders.iter_mut() {
-            if decoder.provider != provider || decoder.values.is_empty() {
+            if decoder.provider != iife.provider || decoder.values.is_empty() {
                 continue;
             }
             let alias_re = regex::Regex::new(&format!(
@@ -1015,7 +1129,7 @@ fn apply_proven_decoder_rotations(
                 else {
                     continue;
                 };
-                if value.is_finite() && (value - target as f64).abs() < 1e-9 {
+                if value.is_finite() && (value - iife.target as f64).abs() < 1e-9 {
                     matches.push(rotation);
                     if matches.len() > 1 {
                         break;
@@ -1031,13 +1145,72 @@ fn apply_proven_decoder_rotations(
         }
 
         if proven_here {
-            if let Some(full_match) = caps.get(0) {
-                protected_spans.push((full_match.start(), full_match.end()));
-            }
+            let start = iife.statement_span.start as usize;
+            let end = iife.statement_span.end as usize;
+            protected_spans.push((start, end));
+            proven_iifes.push((iife.provider.clone(), start, end));
         }
     }
 
-    protected_spans
+    // Materialization is stricter than decoding. Every detected decoder sharing
+    // a provider must agree on the same final rotated table and the same literal
+    // array span. If that cannot be proved, keep the runtime IIFE intact.
+    let proven_providers = proven_iifes
+        .iter()
+        .map(|(provider, _, _)| provider.clone())
+        .collect::<HashSet<_>>();
+    let mut materialized: HashMap<String, (Span, Vec<Value>)> = HashMap::new();
+    let mut inconsistent = HashSet::new();
+    for decoder in decoders.values() {
+        if !proven_providers.contains(&decoder.provider) {
+            continue;
+        }
+        match materialized.get(&decoder.provider) {
+            None => {
+                materialized.insert(
+                    decoder.provider.clone(),
+                    (decoder.provider_array_span, decoder.values.clone()),
+                );
+            }
+            Some((span, values))
+                if *span == decoder.provider_array_span && same_values(values, &decoder.values) => {
+            }
+            Some(_) => {
+                inconsistent.insert(decoder.provider.clone());
+            }
+        }
+    }
+    for provider in &inconsistent {
+        materialized.remove(provider);
+    }
+
+    let mut replacements = Vec::new();
+    for (provider, (array_span, values)) in materialized {
+        let Some(array_text) = render_value_array(&values) else {
+            continue;
+        };
+        replacements.push(Replacement {
+            start: array_span.start as usize,
+            end: array_span.end as usize,
+            text: array_text,
+            kind: "materialize_decoder_rotation",
+            arithmetic_state_proof: None,
+        });
+        for (_, start, end) in proven_iifes
+            .iter()
+            .filter(|(iife_provider, _, _)| iife_provider.as_str() == provider.as_str())
+        {
+            replacements.push(Replacement {
+                start: *start,
+                end: *end,
+                text: String::new(),
+                kind: "remove_decoder_rotation_iife",
+                arithmetic_state_proof: None,
+            });
+        }
+    }
+
+    (protected_spans, replacements)
 }
 
 fn detect_decoders(
@@ -1045,7 +1218,11 @@ fn detect_decoders(
     functions: &[FnInfo],
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
-) -> (HashMap<SymbolId, Decoder>, Vec<(usize, usize)>) {
+) -> (
+    HashMap<SymbolId, Decoder>,
+    Vec<(usize, usize)>,
+    Vec<Replacement>,
+) {
     let local_re = regex::Regex::new(
         r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\(\)\s*;",
     )
@@ -1058,6 +1235,11 @@ fn detect_decoders(
         r"\b(?:let|const|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\[([A-Za-z_$][A-Za-z0-9_$]*)\]\s*;",
     )
     .unwrap();
+
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for f in functions {
+        *name_counts.entry(f.name.clone()).or_default() += 1;
+    }
 
     let mut providers = HashMap::new();
     for f in functions {
@@ -1073,7 +1255,7 @@ fn detect_decoders(
         }
         for (array_name, values) in &f.static_arrays {
             if body.contains(&format!("return {array_name};")) {
-                providers.insert(f.name.clone(), values.clone());
+                providers.insert((f.scope, f.name.clone()), values.clone());
                 break;
             }
         }
@@ -1090,7 +1272,15 @@ fn detect_decoders(
         };
         let local_array = local[1].to_string();
         let provider = local[2].to_string();
-        let Some(values) = providers.get(&provider) else {
+        // Rotation proof below is textual. Fail closed if either function name
+        // occurs in more than one lexical scope, so a sibling IIFE cannot
+        // accidentally supply another decoder's rotation.
+        if name_counts.get(&f.name).copied() != Some(1)
+            || name_counts.get(&provider).copied() != Some(1)
+        {
+            continue;
+        }
+        let Some(provider_info) = providers.get(&(f.scope, provider.clone())) else {
             continue;
         };
         let Some(off) = offset_re.captures(body) else {
@@ -1103,14 +1293,6 @@ fn detect_decoders(
         let Some(public_param) = f.params.first() else {
             continue;
         };
-        if (!body.contains(&format!("{} = function({param}", f.name))
-            && !body.contains(&format!("{}=function({param}", f.name)))
-            || (!body.contains(&format!("return {}({public_param}", f.name))
-                && !body.contains(&format!(",{}({public_param}", f.name))
-                && !body.contains(&format!(", {}({public_param}", f.name)))
-        {
-            continue;
-        }
         let Some(offset) = parse_i64_literal(&off[3]) else {
             continue;
         };
@@ -1121,7 +1303,54 @@ fn detect_decoders(
             continue;
         }
         let value_var = index[1].to_string();
-        if !body.contains(&format!("return {value_var};")) {
+        let bare_value_return = body.contains(&format!("return {value_var};"));
+        let sequence_value_return =
+            body.contains(&format!(", {value_var};")) || body.contains(&format!(",{value_var};"));
+
+        let installs_replacement_re = regex::Regex::new(&format!(
+            r#"\b{}\s*=\s*function\s*\(\s*{}\b"#,
+            regex::escape(&f.name),
+            regex::escape(&param),
+        ))
+        .unwrap();
+        let tail_calls_public_re = regex::Regex::new(&format!(
+            r#"(?:\breturn\b|,)\s*{}\s*\(\s*{}\b"#,
+            regex::escape(&f.name),
+            regex::escape(public_param),
+        ))
+        .unwrap();
+        let self_rewriting =
+            installs_replacement_re.is_match(body) && tail_calls_public_re.is_match(body);
+
+        // Some javascript-obfuscator-style outputs use the simpler, equally
+        // static shape directly instead of installing a memoizing replacement:
+        //
+        //   function d(i, unused) {
+        //     i = i - 123;
+        //     const table = provider();
+        //     let value = table[i];
+        //     return value;
+        //   }
+        //
+        // Match the complete function body rather than merely looking for the
+        // three ingredients, so arbitrary application array accessors are not
+        // promoted to decoders.
+        let direct_re = regex::Regex::new(&format!(
+            r#"(?s)^\s*function\s+{}\s*\([^)]*\)\s*\{{\s*{}\s*=\s*{}\s*-\s*(?:0[xX][0-9A-Fa-f]+|[0-9]+)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\(\s*\)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+{}\s*;\s*\}}\s*$"#,
+            regex::escape(&f.name),
+            regex::escape(&param),
+            regex::escape(&param),
+            regex::escape(&local_array),
+            regex::escape(&provider),
+            regex::escape(&value_var),
+            regex::escape(&local_array),
+            regex::escape(&param),
+            regex::escape(&value_var),
+        ))
+        .unwrap();
+        let direct_index = direct_re.is_match(body);
+
+        if !direct_index && !(self_rewriting && (bare_value_return || sequence_value_return)) {
             continue;
         }
 
@@ -1129,13 +1358,30 @@ fn detect_decoders(
             .contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=")
             && body.contains("decodeURIComponent")
         {
-            // javascript-obfuscator's common base64 decoder includes a
-            // self-defending guard based on Function#toString. A literal LF
-            // at one of the probed positions substitutes the loop counter for
-            // the decoded byte. For a one-line decoder the guard is provably
-            // inert; after pretty-printing it may not be. Refuse to decode
-            // unless the current representation proves no line terminators.
-            if body.contains('\n') || body.contains('\r') {
+            // Recognize the pure javascript-obfuscator Base64 -> percent-URI
+            // decoder by its actual dataflow ingredients, not by whether the
+            // source happens to be minified. Some variants add a source-text
+            // self-defence gate whose result depends on Function#toString /
+            // line layout. Those introduce an additional charCodeAt probe.
+            //
+            // Requiring exactly the one charCodeAt used by the final
+            // percent-encoding loop accepts clean formatted decoders such as
+            // current aclib/suv5 while failing closed on the guarded variant.
+            let char_code_at_count = body.matches(".charCodeAt(").count();
+            let base64_uri_shape = body.contains(".charAt(")
+                && body.contains(".indexOf(")
+                && body.contains("String.fromCharCode")
+                && body.contains(".toString(16)");
+            if !base64_uri_shape || char_code_at_count == 0 {
+                continue;
+            }
+
+            // A single charCodeAt is the ordinary percent-encoding loop and is
+            // source-layout independent. Extra charCodeAt probes are treated as
+            // source-sensitive self-defence: retain the historical proof that
+            // they are safe only when the exact decoder representation is one
+            // physical line.
+            if char_code_at_count > 1 && (body.contains('\n') || body.contains('\r')) {
                 continue;
             }
             DecoderTransform::LowerAlphabetBase64Uri
@@ -1146,15 +1392,18 @@ fn detect_decoders(
         by_name.insert(
             f.name.clone(),
             Decoder {
-                values: values.clone(),
+                values: provider_info.values.clone(),
                 offset,
                 provider,
+                provider_array_span: provider_info.span,
                 transform,
             },
         );
     }
 
-    let protected_spans = apply_proven_decoder_rotations(source, &mut by_name);
+    let rotation_iifes = collect_rotation_iifes(program);
+    let (protected_spans, rotation_replacements) =
+        apply_proven_decoder_rotations(source, &mut by_name, &rotation_iifes);
 
     let mut out = HashMap::new();
     for f in functions {
@@ -1180,7 +1429,7 @@ fn detect_decoders(
         }
     }
 
-    (out, protected_spans)
+    (out, protected_spans, rotation_replacements)
 }
 
 struct SymbolAliasCollector<'s> {
@@ -1190,6 +1439,13 @@ struct SymbolAliasCollector<'s> {
 
 impl<'a> Visit<'a> for SymbolAliasCollector<'_> {
     fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        // Decoder aliases are only propagated when JavaScript itself proves
+        // the binding cannot later be rebound. This keeps the transform
+        // fail-closed without needing a second write-analysis pass.
+        if it.kind != VariableDeclarationKind::Const {
+            walk::walk_variable_declaration(self, it);
+            return;
+        }
         for d in &it.declarations {
             let BindingPattern::BindingIdentifier(alias) = &d.id else {
                 continue;
@@ -1310,9 +1566,20 @@ fn collect_dispatch_bindings(
 
 #[derive(Debug, Clone)]
 enum ProxyProperty {
-    String(String),
+    Literal(Value),
+    Unary { operator: String },
     Binary { operator: String },
+    StaticMember { property: String },
+    ComputedMember,
     Call { arity: usize },
+}
+
+fn proxy_literal_kind(value: &Value) -> &'static str {
+    if matches!(value, Value::String(_)) {
+        "proxy_string"
+    } else {
+        "proxy_literal"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1371,7 +1638,39 @@ fn analyze_proxy_return(
         })
         .collect::<Option<Vec<_>>>()?;
 
+    if params.len() == 1 {
+        if let Expression::UnaryExpression(unary) = returned {
+            let operator = unary.operator.as_str();
+            if matches!(operator, "!" | "+" | "-" | "~" | "void")
+                && direct_identifier_name(&unary.argument)? == params[0]
+            {
+                return Some(ProxyProperty::Unary {
+                    operator: operator.to_string(),
+                });
+            }
+        }
+    }
+
+    if params.len() == 1 {
+        if let Expression::StaticMemberExpression(member) = returned {
+            if !member.optional && direct_identifier_name(&member.object)? == params[0] {
+                return Some(ProxyProperty::StaticMember {
+                    property: member.property.name.to_string(),
+                });
+            }
+        }
+    }
+
     if params.len() == 2 {
+        if let Expression::ComputedMemberExpression(member) = returned {
+            if !member.optional
+                && direct_identifier_name(&member.object)? == params[0]
+                && direct_identifier_name(&member.expression)? == params[1]
+            {
+                return Some(ProxyProperty::ComputedMember);
+            }
+        }
+
         if let Expression::BinaryExpression(binary) = returned {
             if direct_identifier_name(&binary.left)? == params[0]
                 && direct_identifier_name(&binary.right)? == params[1]
@@ -1455,8 +1754,8 @@ fn analyze_proxy_object(
         let Some(key) = prop.key.static_name().map(|name| name.into_owned()) else {
             continue;
         };
-        if let Some(Value::String(value)) = eval(&prop.value) {
-            properties.insert(key, ProxyProperty::String(value));
+        if let Some(value) = eval(&prop.value) {
+            properties.insert(key, ProxyProperty::Literal(value));
             continue;
         }
         let proxy = match &prop.value {
@@ -2448,13 +2747,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
         if !it.optional {
             if let Some(symbol) = symbol_of(self.scoping, &it.object) {
-                if let Some(ProxyProperty::String(value)) = self
+                if let Some(ProxyProperty::Literal(value)) = self
                     .proxies
                     .get(&symbol)
                     .and_then(|object| object.properties.get(it.property.name.as_str()))
                 {
-                    if let Ok(text) = serde_json::to_string(value) {
-                        self.push(it.span, text, "proxy_string");
+                    if let Some(text) = value.render() {
+                        self.push(it.span, text, proxy_literal_kind(value));
                         return;
                     }
                 }
@@ -2467,13 +2766,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         if !it.optional {
             if let Some(Value::String(property)) = eval(&it.expression) {
                 if let Some(symbol) = symbol_of(self.scoping, &it.object) {
-                    if let Some(ProxyProperty::String(value)) = self
+                    if let Some(ProxyProperty::Literal(value)) = self
                         .proxies
                         .get(&symbol)
                         .and_then(|object| object.properties.get(&property))
                     {
-                        if let Ok(text) = serde_json::to_string(value) {
-                            self.push(it.span, text, "proxy_string");
+                        if let Some(text) = value.render() {
+                            self.push(it.span, text, proxy_literal_kind(value));
                             return;
                         }
                     }
@@ -2525,6 +2824,65 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                         self.push(it.span, format!("((0, ({callee})))({args})"), "proxy_call");
                         return;
                     }
+                }
+            }
+        }
+
+        if !it.optional && it.arguments.len() == 1 && !it.arguments.iter().any(Argument::is_spread)
+        {
+            if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
+                if let Some(ProxyProperty::StaticMember { property }) = self
+                    .proxies
+                    .get(&symbol)
+                    .and_then(|object| object.properties.get(&key))
+                {
+                    let object = fragment(self.source, it.arguments[0].span());
+                    self.push(
+                        it.span,
+                        format!("(({object}).{property})"),
+                        "proxy_static_member",
+                    );
+                    return;
+                }
+            }
+        }
+
+        if !it.optional && it.arguments.len() == 2 && !it.arguments.iter().any(Argument::is_spread)
+        {
+            if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
+                if let Some(ProxyProperty::ComputedMember) = self
+                    .proxies
+                    .get(&symbol)
+                    .and_then(|object| object.properties.get(&key))
+                {
+                    let object = fragment(self.source, it.arguments[0].span());
+                    let property = fragment(self.source, it.arguments[1].span());
+                    self.push(
+                        it.span,
+                        format!("(({object})[{property}])"),
+                        "proxy_computed_member",
+                    );
+                    return;
+                }
+            }
+        }
+
+        if !it.optional && it.arguments.len() == 1 && !it.arguments.iter().any(Argument::is_spread)
+        {
+            if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
+                if let Some(ProxyProperty::Unary { operator }) = self
+                    .proxies
+                    .get(&symbol)
+                    .and_then(|object| object.properties.get(&key))
+                {
+                    let argument = fragment(self.source, it.arguments[0].span());
+                    let text = if operator == "void" {
+                        format!("(void ({argument}))")
+                    } else {
+                        format!("({operator}({argument}))")
+                    };
+                    self.push(it.span, text, "proxy_unary");
+                    return;
                 }
             }
         }
@@ -2586,6 +2944,33 @@ fn argument_integer(arg: &Argument<'_>) -> Option<i64> {
     }
 }
 
+fn js_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || byte >= 0x80
+}
+
+fn needs_lexical_separator(left: u8, right: u8) -> bool {
+    (js_word_byte(left) && js_word_byte(right))
+        || (left == b'+' && right == b'+')
+        || (left == b'-' && right == b'-')
+        || (left == b'/' && matches!(right, b'/' | b'*'))
+        || (left.is_ascii_digit() && right == b'.')
+}
+
+fn append_with_safe_boundary(out: &mut String, piece: &str) {
+    if piece.is_empty() {
+        return;
+    }
+    if let (Some(left), Some(right)) = (
+        out.as_bytes().last().copied(),
+        piece.as_bytes().first().copied(),
+    ) {
+        if needs_lexical_separator(left, right) {
+            out.push(' ');
+        }
+    }
+    out.push_str(piece);
+}
+
 fn apply(
     source: &str,
     mut replacements: Vec<Replacement>,
@@ -2608,17 +2993,21 @@ fn apply(
         }
         selected.push(candidate);
     }
-    selected.sort_by(|a, b| b.start.cmp(&a.start));
+    selected.sort_by(|a, b| a.start.cmp(&b.start));
 
-    let mut out = source.to_string();
+    let mut out = String::with_capacity(source.len());
+    let mut cursor = 0usize;
     for mut replacement in selected {
-        out.replace_range(replacement.start..replacement.end, &replacement.text);
+        append_with_safe_boundary(&mut out, &source[cursor..replacement.start]);
+        append_with_safe_boundary(&mut out, &replacement.text);
+        cursor = replacement.end;
         counts.bump(replacement.kind);
         if let Some(mut proof) = replacement.arithmetic_state_proof.take() {
             proof.iteration = iteration;
             arithmetic_state_proofs.push(proof);
         }
     }
+    append_with_safe_boundary(&mut out, &source[cursor..]);
     out
 }
 
@@ -2650,8 +3039,9 @@ fn transform_once(
     let scoping = semantic.scoping();
 
     let arrays = top_level_arrays(&program);
-    let functions = top_level_functions(&program);
-    let (decoders, protected_spans) = detect_decoders(source, &functions, &program, scoping);
+    let functions = all_function_declarations(&program, scoping);
+    let (decoders, protected_spans, rotation_replacements) =
+        detect_decoders(source, &functions, &program, scoping);
     let constants = collect_const_values(&program, scoping);
     let shorthand_spans = collect_shorthand_spans(&program);
     let proxies = collect_proxy_objects(&program, scoping);
@@ -2670,7 +3060,7 @@ fn transform_once(
         zero_counters: &zero_counters,
         reference_spans: &reference_spans,
         protected_spans: &protected_spans,
-        replacements: Vec::new(),
+        replacements: rotation_replacements,
     };
     collector.visit_program(&program);
     if collector.replacements.is_empty() {
