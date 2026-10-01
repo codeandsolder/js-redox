@@ -8,7 +8,10 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_semantic::{ReferenceId, Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
-use oxc_syntax::symbol::SymbolId;
+use oxc_syntax::{
+    scope::{ScopeFlags, ScopeId},
+    symbol::SymbolId,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -84,13 +87,25 @@ fn render_number(n: f64) -> String {
 fn same_value(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::String(a), Value::String(b)) => a == b,
-        (Value::Number(a), Value::Number(b)) => {
-            (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
-        }
+        // JavaScript Strict Equality: NaN is never equal to itself, while
+        // +0 and -0 compare equal.
+        (Value::Number(a), Value::Number(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Null, Value::Null) | (Value::Undefined, Value::Undefined) => true,
         _ => false,
     }
+}
+
+fn same_values(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(left, right)| same_value(left, right))
+}
+
+fn render_value_array(values: &[Value]) -> Option<String> {
+    let rendered = values
+        .iter()
+        .map(Value::render)
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("[{}]", rendered.join(", ")))
 }
 
 fn eval(expr: &Expression<'_>) -> Option<Value> {
@@ -142,7 +157,9 @@ fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
     match op {
         "+" => value.number().map(Value::Number),
         "-" => value.number().map(|x| Value::Number(-x)),
-        "~" => value.number().map(|x| Value::Number((!(x as i32)) as f64)),
+        "~" => value
+            .number()
+            .map(|x| Value::Number((!js_to_int32(x)) as f64)),
         "typeof" => Some(Value::String(
             match value {
                 Value::String(_) => "string",
@@ -155,6 +172,17 @@ fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
         )),
         _ => None,
     }
+}
+
+fn js_to_uint32(n: f64) -> u32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    n.trunc().rem_euclid(4_294_967_296.0) as u32
+}
+
+fn js_to_int32(n: f64) -> i32 {
+    js_to_uint32(n) as i32
 }
 
 fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
@@ -175,23 +203,30 @@ fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
         "/" => Some(Value::Number(left.number()? / right.number()?)),
         "%" => Some(Value::Number(left.number()? % right.number()?)),
         "**" => Some(Value::Number(left.number()?.powf(right.number()?))),
-        "<<" => Some(Value::Number(
-            ((left.number()? as i32) << ((right.number()? as u32) & 31)) as f64,
-        )),
-        ">>" => Some(Value::Number(
-            ((left.number()? as i32) >> ((right.number()? as u32) & 31)) as f64,
-        )),
-        ">>>" => Some(Value::Number(
-            ((left.number()? as u32) >> ((right.number()? as u32) & 31)) as f64,
-        )),
+        "<<" => {
+            let shift = js_to_uint32(right.number()?) & 31;
+            Some(Value::Number(
+                js_to_int32(left.number()?).wrapping_shl(shift) as f64,
+            ))
+        }
+        ">>" => {
+            let shift = js_to_uint32(right.number()?) & 31;
+            Some(Value::Number((js_to_int32(left.number()?) >> shift) as f64))
+        }
+        ">>>" => {
+            let shift = js_to_uint32(right.number()?) & 31;
+            Some(Value::Number(
+                (js_to_uint32(left.number()?) >> shift) as f64,
+            ))
+        }
         "|" => Some(Value::Number(
-            ((left.number()? as i32) | (right.number()? as i32)) as f64,
+            (js_to_int32(left.number()?) | js_to_int32(right.number()?)) as f64,
         )),
         "^" => Some(Value::Number(
-            ((left.number()? as i32) ^ (right.number()? as i32)) as f64,
+            (js_to_int32(left.number()?) ^ js_to_int32(right.number()?)) as f64,
         )),
         "&" => Some(Value::Number(
-            ((left.number()? as i32) & (right.number()? as i32)) as f64,
+            (js_to_int32(left.number()?) & js_to_int32(right.number()?)) as f64,
         )),
         "===" => Some(Value::Bool(same_value(&left, &right))),
         "!==" => Some(Value::Bool(!same_value(&left, &right))),
@@ -282,10 +317,12 @@ struct Replacement {
     arithmetic_state_proof: Option<ArithmeticStateProof>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum DecoderTransform {
     Plain,
     LowerAlphabetBase64Uri,
+    StandardBase64,
+    FixedBase64Alphabet(String),
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +330,7 @@ struct Decoder {
     values: Vec<Value>,
     offset: i64,
     provider: String,
+    provider_array_span: Span,
     transform: DecoderTransform,
 }
 
@@ -302,20 +340,155 @@ impl Decoder {
         if index < 0 || self.values.is_empty() {
             return None;
         }
-        let index = (index as usize).checked_add(rotation)? % self.values.len();
+        let index = index as usize;
+        // Array indexing never wraps. Rotation only maps an already-valid
+        // logical table index onto the physically rotated backing array.
+        // Applying modulo before this bounds check would incorrectly turn an
+        // out-of-range runtime lookup (undefined) into an unrelated entry.
+        if index >= self.values.len() {
+            return None;
+        }
+        let index = index.checked_add(rotation)? % self.values.len();
         let value = self.values.get(index)?.clone();
-        match (self.transform, value) {
+        match (&self.transform, value) {
             (DecoderTransform::Plain, value) => Some(value),
             (DecoderTransform::LowerAlphabetBase64Uri, Value::String(encoded)) => {
                 decode_lower_alphabet_base64_uri(&encoded).map(Value::String)
             }
             (DecoderTransform::LowerAlphabetBase64Uri, _) => None,
+            (DecoderTransform::StandardBase64, Value::String(encoded)) => {
+                decode_standard_base64_latin1(&encoded).map(Value::String)
+            }
+            (DecoderTransform::StandardBase64, _) => None,
+            (DecoderTransform::FixedBase64Alphabet(alphabet), Value::String(encoded)) => {
+                decode_fixed_base64_latin1(&encoded, alphabet).map(Value::String)
+            }
+            // DataDome-style tables intentionally mix encoded strings with
+            // literal numbers, booleans, and null. The runtime decoder only
+            // transforms strings and returns every other table value as-is.
+            (DecoderTransform::FixedBase64Alphabet(_), value) => Some(value),
         }
     }
 
     fn value_for_raw(&self, raw: i64) -> Option<Value> {
         self.value_for_raw_rotated(raw, 0)
     }
+}
+
+fn decode_standard_base64_latin1(input: &str) -> Option<String> {
+    let compact = input
+        .chars()
+        .filter(|ch| !matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0c'))
+        .collect::<String>();
+    if compact.len() % 4 == 1 {
+        return None;
+    }
+
+    let padding = compact.chars().rev().take_while(|ch| *ch == '=').count();
+    if padding > 2 {
+        return None;
+    }
+    if padding > 0 {
+        if compact.len() % 4 != 0 {
+            return None;
+        }
+        if compact[..compact.len() - padding].contains('=') {
+            return None;
+        }
+    } else if compact.contains('=') {
+        return None;
+    }
+
+    decode_base64_latin1(
+        &compact,
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=",
+    )
+}
+
+fn decode_fixed_base64_latin1(input: &str, alphabet: &str) -> Option<String> {
+    let alphabet = alphabet.chars().collect::<Vec<_>>();
+    if alphabet.len() != 65 {
+        return None;
+    }
+    let unique = alphabet.iter().copied().collect::<HashSet<_>>();
+    if unique.len() != 65 {
+        return None;
+    }
+
+    // Match the observed decoder rather than treating the alphabet as a
+    // generic RFC 4648 alphabet: it first strips everything outside this
+    // character class, then decodes in groups of four. Missing charAt()
+    // positions become "", and alphabet.indexOf("") is 0 in JavaScript.
+    let filtered = input
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '='))
+        .collect::<Vec<_>>();
+
+    let mut out = String::with_capacity(((filtered.len() + 3) / 4) * 3);
+    let mut index = 0usize;
+    while index < filtered.len() {
+        let symbol = |offset: usize| -> Option<usize> {
+            match filtered.get(index + offset) {
+                Some(ch) => alphabet.iter().position(|candidate| candidate == ch),
+                None => Some(0),
+            }
+        };
+        let a = symbol(0)?;
+        let b = symbol(1)?;
+        let c = symbol(2)?;
+        let d = symbol(3)?;
+
+        let mut push_code_unit = |value: usize| -> Option<()> {
+            // String.fromCharCode applies ToUint16. These decoder expressions
+            // are small, but mask explicitly so the modeled primitive is exact.
+            out.push(char::from_u32((value & 0xffff) as u32)?);
+            Some(())
+        };
+        push_code_unit((a << 2) | (b >> 4))?;
+        if c != 64 {
+            push_code_unit(((b & 15) << 4) | (c >> 2))?;
+        }
+        if d != 64 {
+            push_code_unit(((c & 3) << 6) | d)?;
+        }
+        index += 4;
+    }
+
+    Some(out)
+}
+
+fn decode_base64_latin1(input: &str, alphabet: &str) -> Option<String> {
+    let alphabet = alphabet.chars().collect::<Vec<_>>();
+    if alphabet.len() != 65 {
+        return None;
+    }
+    let unique = alphabet.iter().copied().collect::<HashSet<_>>();
+    if unique.len() != 65 {
+        return None;
+    }
+
+    let mut bits = 0u32;
+    let mut bit_count = 0u32;
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    for ch in input.chars() {
+        let index = alphabet.iter().position(|candidate| *candidate == ch)?;
+        if index == 64 {
+            break;
+        }
+        bits = (bits << 6) | index as u32;
+        bit_count += 6;
+        while bit_count >= 8 {
+            bit_count -= 8;
+            out.push(((bits >> bit_count) & 0xff) as u8);
+            bits &= if bit_count == 0 {
+                0
+            } else {
+                (1u32 << bit_count) - 1
+            };
+        }
+    }
+
+    Some(out.into_iter().map(char::from).collect())
 }
 
 fn decode_lower_alphabet_base64_uri(input: &str) -> Option<String> {
@@ -577,6 +750,50 @@ fn array_element(el: &ArrayExpressionElement<'_>) -> Option<Value> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct StaticArrayInfo {
+    symbol: SymbolId,
+    name: String,
+    values: Vec<Value>,
+}
+
+#[derive(Default)]
+struct StaticArrayCollector {
+    candidates: Vec<StaticArrayInfo>,
+}
+
+impl<'a> Visit<'a> for StaticArrayCollector {
+    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        for d in &it.declarations {
+            let BindingPattern::BindingIdentifier(id) = &d.id else {
+                continue;
+            };
+            let Some(symbol) = id.symbol_id.get() else {
+                continue;
+            };
+            let Some(Expression::ArrayExpression(arr)) = &d.init else {
+                continue;
+            };
+            let Some(values) = arr
+                .elements
+                .iter()
+                .map(array_element)
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            if !values.is_empty() {
+                self.candidates.push(StaticArrayInfo {
+                    symbol,
+                    name: id.name.to_string(),
+                    values,
+                });
+            }
+        }
+        walk::walk_variable_declaration(self, it);
+    }
+}
+
 fn top_level_arrays(program: &oxc_ast::ast::Program<'_>) -> HashMap<SymbolId, Vec<Value>> {
     let mut out = HashMap::new();
     for stmt in &program.body {
@@ -612,72 +829,1197 @@ fn top_level_arrays(program: &oxc_ast::ast::Program<'_>) -> HashMap<SymbolId, Ve
     out
 }
 
+fn decoder_static_arrays(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> Vec<StaticArrayInfo> {
+    let mut collector = StaticArrayCollector::default();
+    collector.visit_program(program);
+    collector.candidates.retain(|candidate| {
+        scoping
+            .get_resolved_reference_ids(candidate.symbol)
+            .iter()
+            .all(|reference_id| {
+                let reference = scoping.get_reference(*reference_id);
+                !reference.is_write() && !reference.flags().is_member_write_target()
+            })
+    });
+    collector.candidates
+}
+
+#[derive(Default)]
+struct DirectCallCounter {
+    count: usize,
+}
+
+impl<'a> Visit<'a> for DirectCallCounter {
+    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+        self.count += 1;
+        walk::walk_call_expression(self, it);
+    }
+
+    fn visit_function(&mut self, _f: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
+        // Nested functions do not execute as part of the candidate decoder
+        // invocation itself, so do not count calls inside them.
+    }
+}
+
+fn direct_body_call_count(body: &oxc_ast::ast::FunctionBody<'_>) -> usize {
+    let mut counter = DirectCallCounter::default();
+    for statement in &body.statements {
+        counter.visit_statement(statement);
+    }
+    counter.count
+}
+
+fn fixed_decoder_control_shape(body: &oxc_ast::ast::FunctionBody<'_>) -> bool {
+    if body.statements.len() != 3 {
+        return false;
+    }
+    let first = matches!(
+        &body.statements[0],
+        Statement::IfStatement(statement)
+            if statement.alternate.is_none()
+                && matches!(&statement.consequent, Statement::ReturnStatement(_))
+    );
+    let second = match &body.statements[1] {
+        Statement::ForStatement(statement) => match &statement.body {
+            Statement::ExpressionStatement(_) => true,
+            // The generic sequence splitter may already have turned the
+            // decoder's six comma-separated loop operations into six
+            // expression statements by the time the literal table becomes
+            // fully static on a later fixed-point iteration.
+            Statement::BlockStatement(block) => {
+                block.body.len() == 6
+                    && block
+                        .body
+                        .iter()
+                        .all(|statement| matches!(statement, Statement::ExpressionStatement(_)))
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    let third = matches!(&body.statements[2], Statement::ReturnStatement(_));
+    first && second && third
+}
+
+#[derive(Debug, Clone)]
+struct LocalStaticArrayInfo {
+    values: Vec<Value>,
+    span: Span,
+}
+
 #[derive(Debug)]
 struct FnInfo {
     name: String,
     symbol: SymbolId,
+    scope: ScopeId,
     params: Vec<String>,
     span: Span,
+    static_arrays: HashMap<String, LocalStaticArrayInfo>,
+}
+
+fn function_info(f: &oxc_ast::ast::Function<'_>, scoping: &Scoping) -> Option<FnInfo> {
+    if f.r#type != oxc_ast::ast::FunctionType::FunctionDeclaration {
+        return None;
+    }
+    let id = f.id.as_ref()?;
+    let symbol = id.symbol_id.get()?;
+    let params = f
+        .params
+        .items
+        .iter()
+        .filter_map(|p| match &p.pattern {
+            BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+            _ => None,
+        })
+        .collect();
+
+    let mut static_arrays = HashMap::new();
+    if let Some(body) = &f.body {
+        for stmt in &body.statements {
+            let Statement::VariableDeclaration(decl) = stmt else {
+                continue;
+            };
+            for d in &decl.declarations {
+                let BindingPattern::BindingIdentifier(array_id) = &d.id else {
+                    continue;
+                };
+                let Some(Expression::ArrayExpression(array)) = &d.init else {
+                    continue;
+                };
+                let Some(values) = array
+                    .elements
+                    .iter()
+                    .map(array_element)
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                if !values.is_empty() {
+                    static_arrays.insert(
+                        array_id.name.to_string(),
+                        LocalStaticArrayInfo {
+                            values,
+                            span: array.span,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    Some(FnInfo {
+        name: id.name.to_string(),
+        symbol,
+        scope: scoping.symbol_scope_id(symbol),
+        params,
+        span: f.span,
+        static_arrays,
+    })
+}
+
+struct FunctionDeclarationCollector<'s> {
+    scoping: &'s Scoping,
+    out: Vec<FnInfo>,
+}
+
+impl<'a> Visit<'a> for FunctionDeclarationCollector<'_> {
+    fn visit_function(
+        &mut self,
+        it: &oxc_ast::ast::Function<'a>,
+        flags: oxc_syntax::scope::ScopeFlags,
+    ) {
+        if let Some(info) = function_info(it, self.scoping) {
+            self.out.push(info);
+        }
+        walk::walk_function(self, it, flags);
+    }
+}
+
+fn all_function_declarations(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> Vec<FnInfo> {
+    let mut collector = FunctionDeclarationCollector {
+        scoping,
+        out: Vec::new(),
+    };
+    collector.visit_program(program);
+    collector.out
+}
+
+#[derive(Debug)]
+struct DirectFnInfo {
+    name: String,
+    symbol: SymbolId,
+    params: Vec<String>,
+    span: Span,
+    body_statement_count: usize,
+    direct_call_count: usize,
+    fixed_decoder_control_shape: bool,
     static_arrays: HashMap<String, Vec<Value>>,
 }
 
-fn top_level_functions(program: &oxc_ast::ast::Program<'_>) -> Vec<FnInfo> {
-    let mut out = Vec::new();
-    for stmt in &program.body {
-        let Statement::FunctionDeclaration(f) = stmt else {
-            continue;
-        };
-        let Some(id) = &f.id else { continue };
-        let Some(symbol) = id.symbol_id.get() else {
-            continue;
-        };
-        let params = f
-            .params
-            .items
-            .iter()
-            .filter_map(|p| match &p.pattern {
-                BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-                _ => None,
-            })
-            .collect();
+#[derive(Default)]
+struct DirectFnInfoCollector {
+    out: Vec<DirectFnInfo>,
+}
 
-        let mut static_arrays = HashMap::new();
-        if let Some(body) = &f.body {
-            for stmt in &body.statements {
-                let Statement::VariableDeclaration(decl) = stmt else {
-                    continue;
-                };
-                for d in &decl.declarations {
-                    let BindingPattern::BindingIdentifier(array_id) = &d.id else {
-                        continue;
-                    };
-                    let Some(Expression::ArrayExpression(array)) = &d.init else {
-                        continue;
-                    };
-                    let Some(values) = array
-                        .elements
-                        .iter()
-                        .map(array_element)
-                        .collect::<Option<Vec<_>>>()
-                    else {
-                        continue;
-                    };
-                    if !values.is_empty() {
-                        static_arrays.insert(array_id.name.to_string(), values);
+impl<'a> Visit<'a> for DirectFnInfoCollector {
+    fn visit_function(&mut self, f: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        if let Some(id) = &f.id {
+            if let Some(symbol) = id.symbol_id.get() {
+                let params = f
+                    .params
+                    .items
+                    .iter()
+                    .filter_map(|p| match &p.pattern {
+                        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+
+                let mut static_arrays = HashMap::new();
+                if let Some(body) = &f.body {
+                    for stmt in &body.statements {
+                        let Statement::VariableDeclaration(decl) = stmt else {
+                            continue;
+                        };
+                        for d in &decl.declarations {
+                            let BindingPattern::BindingIdentifier(array_id) = &d.id else {
+                                continue;
+                            };
+                            let Some(Expression::ArrayExpression(array)) = &d.init else {
+                                continue;
+                            };
+                            let Some(values) = array
+                                .elements
+                                .iter()
+                                .map(array_element)
+                                .collect::<Option<Vec<_>>>()
+                            else {
+                                continue;
+                            };
+                            if !values.is_empty() {
+                                static_arrays.insert(array_id.name.to_string(), values);
+                            }
+                        }
+                    }
+                }
+
+                self.out.push(DirectFnInfo {
+                    name: id.name.to_string(),
+                    symbol,
+                    params,
+                    span: f.span,
+                    body_statement_count: f.body.as_ref().map_or(0, |body| body.statements.len()),
+                    direct_call_count: f
+                        .body
+                        .as_ref()
+                        .map_or(0, |body| direct_body_call_count(body)),
+                    fixed_decoder_control_shape: f
+                        .body
+                        .as_ref()
+                        .is_some_and(|body| fixed_decoder_control_shape(body)),
+                    static_arrays,
+                });
+            }
+        }
+        walk::walk_function(self, f, flags);
+    }
+}
+
+fn all_functions(program: &oxc_ast::ast::Program<'_>) -> Vec<DirectFnInfo> {
+    let mut collector = DirectFnInfoCollector::default();
+    collector.visit_program(program);
+    collector.out
+}
+
+#[derive(Debug, Clone)]
+enum PureExpr {
+    Value(Value),
+    Param(usize),
+    Unary {
+        operator: String,
+        argument: Box<PureExpr>,
+    },
+    Binary {
+        operator: String,
+        left: Box<PureExpr>,
+        right: Box<PureExpr>,
+    },
+    Logical {
+        operator: String,
+        left: Box<PureExpr>,
+        right: Box<PureExpr>,
+    },
+    Conditional {
+        test: Box<PureExpr>,
+        consequent: Box<PureExpr>,
+        alternate: Box<PureExpr>,
+    },
+}
+
+impl PureExpr {
+    fn eval(&self, args: &[Value]) -> Option<Value> {
+        match self {
+            Self::Value(value) => Some(value.clone()),
+            Self::Param(index) => args.get(*index).cloned(),
+            Self::Unary { operator, argument } => {
+                let value = argument.eval(args)?;
+                match operator.as_str() {
+                    "!" => Some(Value::Bool(!value.truthy())),
+                    "+" => value.number().map(Value::Number),
+                    "-" => value.number().map(|n| Value::Number(-n)),
+                    "~" => value
+                        .number()
+                        .map(|n| Value::Number((!js_to_int32(n)) as f64)),
+                    "void" => Some(Value::Undefined),
+                    "typeof" => Some(Value::String(
+                        match value {
+                            Value::String(_) => "string",
+                            Value::Number(_) => "number",
+                            Value::Bool(_) => "boolean",
+                            Value::Null => "object",
+                            Value::Undefined => "undefined",
+                        }
+                        .to_string(),
+                    )),
+                    _ => None,
+                }
+            }
+            Self::Binary {
+                operator,
+                left,
+                right,
+            } => eval_binary(operator, left.eval(args)?, right.eval(args)?),
+            Self::Logical {
+                operator,
+                left,
+                right,
+            } => {
+                let left = left.eval(args)?;
+                match operator.as_str() {
+                    "&&" => {
+                        if left.truthy() {
+                            right.eval(args)
+                        } else {
+                            Some(left)
+                        }
+                    }
+                    "||" => {
+                        if left.truthy() {
+                            Some(left)
+                        } else {
+                            right.eval(args)
+                        }
+                    }
+                    "??" => {
+                        if matches!(left, Value::Null | Value::Undefined) {
+                            right.eval(args)
+                        } else {
+                            Some(left)
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            Self::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                if test.eval(args)?.truthy() {
+                    consequent.eval(args)
+                } else {
+                    alternate.eval(args)
+                }
+            }
+        }
+    }
+}
+
+fn compile_pure_expr(expr: &Expression<'_>, params: &HashMap<String, usize>) -> Option<PureExpr> {
+    match expr {
+        Expression::Identifier(id) => params.get(id.name.as_str()).copied().map(PureExpr::Param),
+        Expression::StringLiteral(v) => Some(PureExpr::Value(Value::String(v.value.to_string()))),
+        Expression::NumericLiteral(v) => Some(PureExpr::Value(Value::Number(v.value))),
+        Expression::BooleanLiteral(v) => Some(PureExpr::Value(Value::Bool(v.value))),
+        Expression::NullLiteral(_) => Some(PureExpr::Value(Value::Null)),
+        Expression::TemplateLiteral(v) if v.expressions.is_empty() => v.quasis.first().map(|q| {
+            PureExpr::Value(Value::String(
+                q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string(),
+            ))
+        }),
+        Expression::ParenthesizedExpression(v) => compile_pure_expr(&v.expression, params),
+        Expression::UnaryExpression(v)
+            if matches!(
+                v.operator.as_str(),
+                "!" | "+" | "-" | "~" | "void" | "typeof"
+            ) =>
+        {
+            Some(PureExpr::Unary {
+                operator: v.operator.as_str().to_string(),
+                argument: Box::new(compile_pure_expr(&v.argument, params)?),
+            })
+        }
+        Expression::BinaryExpression(v)
+            if matches!(
+                v.operator.as_str(),
+                "+" | "-"
+                    | "*"
+                    | "/"
+                    | "%"
+                    | "**"
+                    | "<<"
+                    | ">>"
+                    | ">>>"
+                    | "|"
+                    | "^"
+                    | "&"
+                    | "==="
+                    | "!=="
+                    | "=="
+                    | "!="
+                    | "<"
+                    | "<="
+                    | ">"
+                    | ">="
+            ) =>
+        {
+            Some(PureExpr::Binary {
+                operator: v.operator.as_str().to_string(),
+                left: Box::new(compile_pure_expr(&v.left, params)?),
+                right: Box::new(compile_pure_expr(&v.right, params)?),
+            })
+        }
+        Expression::LogicalExpression(v) => Some(PureExpr::Logical {
+            operator: v.operator.as_str().to_string(),
+            left: Box::new(compile_pure_expr(&v.left, params)?),
+            right: Box::new(compile_pure_expr(&v.right, params)?),
+        }),
+        Expression::ConditionalExpression(v) => Some(PureExpr::Conditional {
+            test: Box::new(compile_pure_expr(&v.test, params)?),
+            consequent: Box::new(compile_pure_expr(&v.consequent, params)?),
+            alternate: Box::new(compile_pure_expr(&v.alternate, params)?),
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PureFunction {
+    arity: usize,
+    expression: PureExpr,
+}
+
+struct PureFunctionCollector<'c> {
+    scoping: &'c Scoping,
+    functions: HashMap<SymbolId, PureFunction>,
+}
+
+impl<'a> Visit<'a> for PureFunctionCollector<'_> {
+    fn visit_function(&mut self, f: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        if !f.r#async && !f.generator && f.params.rest.is_none() {
+            if let (Some(id), Some(body)) = (&f.id, &f.body) {
+                if let Some(symbol) = id.symbol_id.get() {
+                    let immutable =
+                        self.scoping.get_resolved_reference_ids(symbol).iter().all(
+                            |reference_id| !self.scoping.get_reference(*reference_id).is_write(),
+                        );
+                    if immutable && body.statements.len() == 1 {
+                        let mut params = HashMap::new();
+                        let mut valid_params = true;
+                        for (index, parameter) in f.params.items.iter().enumerate() {
+                            let BindingPattern::BindingIdentifier(parameter_id) =
+                                &parameter.pattern
+                            else {
+                                valid_params = false;
+                                break;
+                            };
+                            if parameter.initializer.is_some()
+                                || params
+                                    .insert(parameter_id.name.to_string(), index)
+                                    .is_some()
+                            {
+                                valid_params = false;
+                                break;
+                            }
+                        }
+                        if valid_params {
+                            if let Statement::ReturnStatement(ret) = &body.statements[0] {
+                                if let Some(argument) = &ret.argument {
+                                    if let Some(expression) = compile_pure_expr(argument, &params) {
+                                        self.functions.insert(
+                                            symbol,
+                                            PureFunction {
+                                                arity: f.params.items.len(),
+                                                expression,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+        walk::walk_function(self, f, flags);
+    }
+}
 
-        out.push(FnInfo {
-            name: id.name.to_string(),
-            symbol,
-            params,
-            span: f.span,
-            static_arrays,
-        });
+fn collect_pure_functions(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> HashMap<SymbolId, PureFunction> {
+    let mut collector = PureFunctionCollector {
+        scoping,
+        functions: HashMap::new(),
+    };
+    collector.visit_program(program);
+    collector.functions
+}
+
+fn fixed_base64_alphabet(body: &str) -> Option<String> {
+    if !body.contains("String.fromCharCode")
+        || !body.contains(".indexOf")
+        || !body.contains(".charAt")
+    {
+        return None;
+    }
+    let re = regex::Regex::new(r#"["']([A-Za-z0-9+/=]{65})["']"#).unwrap();
+    let standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+        .chars()
+        .collect::<HashSet<_>>();
+    let mut candidates = re
+        .captures_iter(body)
+        .filter_map(|caps| caps.get(1).map(|capture| capture.as_str().to_string()))
+        .filter(|candidate| candidate.chars().collect::<HashSet<_>>() == standard)
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn function_inner_source(body: &str) -> Option<&str> {
+    let start = body.find('{')?.checked_add(1)?;
+    let end = body.rfind('}')?;
+    (start <= end).then(|| &body[start..end])
+}
+
+fn standard_base64_decoder_matches(body: &str, array: &str, param: &str) -> bool {
+    let Some(inner) = function_inner_source(body) else {
+        return false;
+    };
+
+    // Match the complete function body, not merely a decoder-looking
+    // expression somewhere inside it. Replacing a call removes the entire
+    // function execution, so accepting extra statements could silently drop
+    // observable side effects.
+    let direct = regex::Regex::new(&format!(
+        r#"(?s)^\s*return\s+atob\s*\(\s*{}\s*\[\s*{}\s*\]\s*\)\s*;?\s*$"#,
+        regex::escape(array),
+        regex::escape(param)
+    ))
+    .unwrap();
+    if direct.is_match(inner) {
+        return true;
+    }
+
+    let sequence = regex::Regex::new(&format!(
+        r#"(?s)^\s*return\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*,\s*atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$"#,
+        regex::escape(array),
+        regex::escape(param)
+    ))
+    .unwrap();
+    if sequence
+        .captures(inner)
+        .is_some_and(|caps| caps.get(1).map(|m| m.as_str()) == caps.get(2).map(|m| m.as_str()))
+    {
+        return true;
+    }
+
+    let assignment = regex::Regex::new(&format!(
+        r#"(?s)^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$"#,
+        regex::escape(array),
+        regex::escape(param)
+    ))
+    .unwrap();
+    assignment
+        .captures(inner)
+        .is_some_and(|caps| caps.get(1).map(|m| m.as_str()) == caps.get(2).map(|m| m.as_str()))
+}
+
+fn fixed_base64_decoder_matches(body: &str, array: &str, param: &str) -> Option<String> {
+    let alphabet = fixed_base64_alphabet(body)?;
+    let guarded_load = regex::Regex::new(&format!(
+        r#"typeof\s*\(?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*\)?"#,
+        regex::escape(array),
+        regex::escape(param)
+    ))
+    .unwrap();
+
+    let alias = guarded_load
+        .captures_iter(body)
+        .find_map(|caps| caps.get(1).map(|m| m.as_str()))?;
+    let return_alias =
+        regex::Regex::new(&format!(r#"\breturn\s+{}\s*;"#, regex::escape(alias))).unwrap();
+    if !return_alias.is_match(body) {
+        return None;
+    }
+
+    // Fail closed on a recognizable Base64 decoder shape rather than merely
+    // seeing an alphabet and String.fromCharCode somewhere in the function.
+    if !body.contains(".replace(/[^A-Za-z0-9\\+\\/\\=]/g")
+        || body.matches(".indexOf(").count() != 4
+        || body.matches(".charAt(").count() != 4
+        || body.matches("String.fromCharCode").count() != 3
+        || body.matches("<<").count() != 3
+        || body.matches(">>").count() != 2
+    {
+        return None;
+    }
+    let sentinel_checks = regex::Regex::new(r#"(?:64\s*!=|!=\s*64)"#).unwrap();
+    if sentinel_checks.find_iter(body).count() != 2 {
+        return None;
+    }
+
+    Some(alphabet)
+}
+
+fn function_has_external_write(
+    span: Span,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> bool {
+    for symbol in scoping.symbol_ids() {
+        let declaration = scoping.symbol_span(symbol);
+        if span.start <= declaration.start && declaration.end <= span.end {
+            continue;
+        }
+        for reference_id in scoping.get_resolved_reference_ids(symbol) {
+            let Some(reference_span) = reference_spans.get(reference_id) else {
+                continue;
+            };
+            if span.start <= reference_span.start && reference_span.end <= span.end {
+                let reference = scoping.get_reference(*reference_id);
+                if reference.is_write() || reference.flags().is_member_write_target() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    for reference_ids in scoping.root_unresolved_references_ids() {
+        for reference_id in reference_ids {
+            let Some(reference_span) = reference_spans.get(&reference_id) else {
+                continue;
+            };
+            if span.start <= reference_span.start && reference_span.end <= span.end {
+                let reference = scoping.get_reference(reference_id);
+                if reference.is_write() || reference.flags().is_member_write_target() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn detect_direct_table_decoders(
+    source: &str,
+    functions: &[DirectFnInfo],
+    arrays: &[StaticArrayInfo],
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> HashMap<SymbolId, Decoder> {
+    let mut arrays_by_name: HashMap<&str, Vec<&StaticArrayInfo>> = HashMap::new();
+    for array in arrays {
+        arrays_by_name
+            .entry(array.name.as_str())
+            .or_default()
+            .push(array);
+    }
+
+    let mut out = HashMap::new();
+    for function in functions {
+        if scoping
+            .get_resolved_reference_ids(function.symbol)
+            .iter()
+            .any(|reference_id| scoping.get_reference(*reference_id).is_write())
+        {
+            continue;
+        }
+        let Some(param) = function.params.first() else {
+            continue;
+        };
+        let body = fragment(source, function.span);
+        let access = regex::Regex::new(&format!(
+            r#"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*{}\s*\]"#,
+            regex::escape(param)
+        ))
+        .unwrap();
+        let mut matched = access
+            .captures_iter(body)
+            .filter_map(|caps| caps.get(1).map(|capture| capture.as_str()))
+            .filter_map(|name| arrays_by_name.get(name))
+            .filter(|candidates| candidates.len() == 1)
+            .map(|candidates| candidates[0])
+            .collect::<Vec<_>>();
+        matched.sort_by_key(|array| array.symbol);
+        matched.dedup_by_key(|array| array.symbol);
+        if matched.len() != 1 {
+            continue;
+        }
+        let array = matched[0];
+
+        // A direct literal-table decoder should have exactly one resolved
+        // use of the table binding: the indexed load proved above. Requiring a
+        // single confined read fails closed on aliases/escapes both outside
+        // and *inside* the decoder (an internal alias can otherwise mutate the
+        // array before the returned lookup without writing the original
+        // binding itself).
+        let table_references = scoping.get_resolved_reference_ids(array.symbol);
+        if table_references.len() != 1 {
+            continue;
+        }
+        let reference_id = table_references[0];
+        let reference = scoping.get_reference(reference_id);
+        if reference.is_write() || reference.flags().is_member_write_target() {
+            continue;
+        }
+        let Some(span) = reference_spans.get(&reference_id) else {
+            continue;
+        };
+        if function.span.start > span.start || span.end > function.span.end {
+            continue;
+        }
+
+        let mutator = regex::Regex::new(&format!(
+            r#"\b{}\s*\.\s*(?:copyWithin|fill|pop|push|reverse|shift|sort|splice|unshift)\s*\("#,
+            regex::escape(&array.name)
+        ))
+        .unwrap();
+        if mutator.is_match(source) {
+            continue;
+        }
+
+        let transform = if standard_base64_decoder_matches(body, &array.name, param) {
+            DecoderTransform::StandardBase64
+        } else if function.body_statement_count == 3
+            && function.fixed_decoder_control_shape
+            && function.direct_call_count == 12
+            && !function_has_external_write(function.span, scoping, reference_spans)
+        {
+            let Some(alphabet) = fixed_base64_decoder_matches(body, &array.name, param) else {
+                continue;
+            };
+            DecoderTransform::FixedBase64Alphabet(alphabet)
+        } else {
+            continue;
+        };
+
+        out.insert(
+            function.symbol,
+            Decoder {
+                values: array.values.clone(),
+                offset: 0,
+                provider: array.name.clone(),
+                transform,
+            },
+        );
     }
     out
+}
+
+#[derive(Default)]
+struct StableVarNumberCollector {
+    candidates: HashMap<SymbolId, i64>,
+}
+
+impl<'a> Visit<'a> for StableVarNumberCollector {
+    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        if it.kind == VariableDeclarationKind::Var {
+            for declaration in &it.declarations {
+                let BindingPattern::BindingIdentifier(id) = &declaration.id else {
+                    continue;
+                };
+                let Some(symbol) = id.symbol_id.get() else {
+                    continue;
+                };
+                let Some(init) = &declaration.init else {
+                    continue;
+                };
+                let Some(Value::Number(number)) = eval(init) else {
+                    continue;
+                };
+                if !number.is_finite()
+                    || number.fract() != 0.0
+                    || number < i64::MIN as f64
+                    || number > i64::MAX as f64
+                {
+                    continue;
+                }
+                self.candidates.insert(symbol, number as i64);
+            }
+        }
+        walk::walk_variable_declaration(self, it);
+    }
+}
+
+fn collect_stable_var_numbers(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> HashMap<SymbolId, i64> {
+    let mut collector = StableVarNumberCollector::default();
+    collector.visit_program(program);
+    collector.candidates.retain(|symbol, _| {
+        scoping
+            .get_resolved_reference_ids(*symbol)
+            .iter()
+            .all(|reference_id| {
+                let reference = scoping.get_reference(*reference_id);
+                !reference.is_write() && !reference.flags().is_member_write_target()
+            })
+    });
+    collector.candidates
+}
+
+fn expression_integer(expr: &Expression<'_>) -> Option<i64> {
+    let Value::Number(number) = eval(expr)? else {
+        return None;
+    };
+    if !number.is_finite()
+        || number.fract() != 0.0
+        || number < i64::MIN as f64
+        || number > i64::MAX as f64
+    {
+        return None;
+    }
+    Some(number as i64)
+}
+
+fn selector_identifier_symbol(expr: &Expression<'_>, scoping: &Scoping) -> Option<SymbolId> {
+    match expr {
+        Expression::Identifier(_) => symbol_of(scoping, expr),
+        Expression::ParenthesizedExpression(parenthesized) => {
+            selector_identifier_symbol(&parenthesized.expression, scoping)
+        }
+        _ => None,
+    }
+}
+
+fn selector_test_value(
+    expr: &Expression<'_>,
+    selector_symbol: SymbolId,
+    selector_value: i64,
+    scoping: &Scoping,
+    stable_var_numbers: &HashMap<SymbolId, i64>,
+) -> Option<bool> {
+    match expr {
+        Expression::ParenthesizedExpression(parenthesized) => selector_test_value(
+            &parenthesized.expression,
+            selector_symbol,
+            selector_value,
+            scoping,
+            stable_var_numbers,
+        ),
+        Expression::UnaryExpression(unary) if unary.operator.as_str() == "!" => {
+            selector_test_value(
+                &unary.argument,
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            )
+            .map(|value| !value)
+        }
+        Expression::LogicalExpression(logical) => {
+            let left = selector_test_value(
+                &logical.left,
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            );
+            let right = selector_test_value(
+                &logical.right,
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            );
+            match logical.operator.as_str() {
+                "&&" => match (left, right) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                },
+                "||" => match (left, right) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        Expression::BinaryExpression(binary)
+            if matches!(binary.operator.as_str(), "==" | "===" | "!=" | "!==") =>
+        {
+            let left_symbol = selector_identifier_symbol(&binary.left, scoping);
+            let right_symbol = selector_identifier_symbol(&binary.right, scoping);
+
+            let other = if left_symbol == Some(selector_symbol) {
+                Some(&binary.right)
+            } else if right_symbol == Some(selector_symbol) {
+                Some(&binary.left)
+            } else {
+                None
+            }?;
+
+            let equal = if let Some(number) = expression_integer(other) {
+                selector_value == number
+            } else if let Some(symbol) = selector_identifier_symbol(other, scoping) {
+                let initialized_value = *stable_var_numbers.get(&symbol)?;
+                if selector_value == initialized_value {
+                    // A var binding is undefined before its initializer executes
+                    // and has the proven number afterward. Equality to that exact
+                    // number therefore depends on runtime ordering.
+                    return None;
+                }
+                false
+            } else {
+                return None;
+            };
+
+            Some(if matches!(binary.operator.as_str(), "==" | "===") {
+                equal
+            } else {
+                !equal
+            })
+        }
+        _ => known_bool(expr),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SelectorFlow {
+    Continue,
+    Return(Span),
+}
+
+fn selector_return_expression(
+    expr: &Expression<'_>,
+    selector_symbol: SymbolId,
+    selector_value: i64,
+    scoping: &Scoping,
+    stable_var_numbers: &HashMap<SymbolId, i64>,
+) -> Option<Span> {
+    match expr {
+        Expression::ConditionalExpression(conditional) => {
+            let test = selector_test_value(
+                &conditional.test,
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            )?;
+            selector_return_expression(
+                if test {
+                    &conditional.consequent
+                } else {
+                    &conditional.alternate
+                },
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            )
+        }
+        _ => Some(expr.span()),
+    }
+}
+
+fn selector_statement_flow(
+    statement: &Statement<'_>,
+    selector_symbol: SymbolId,
+    selector_value: i64,
+    scoping: &Scoping,
+    stable_var_numbers: &HashMap<SymbolId, i64>,
+) -> Option<SelectorFlow> {
+    match statement {
+        Statement::BlockStatement(block) => selector_statements_flow(
+            &block.body,
+            selector_symbol,
+            selector_value,
+            scoping,
+            stable_var_numbers,
+        ),
+        Statement::IfStatement(branch) => {
+            let test = selector_test_value(
+                &branch.test,
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            )?;
+            if test {
+                selector_statement_flow(
+                    &branch.consequent,
+                    selector_symbol,
+                    selector_value,
+                    scoping,
+                    stable_var_numbers,
+                )
+            } else if let Some(alternate) = &branch.alternate {
+                selector_statement_flow(
+                    alternate,
+                    selector_symbol,
+                    selector_value,
+                    scoping,
+                    stable_var_numbers,
+                )
+            } else {
+                Some(SelectorFlow::Continue)
+            }
+        }
+        Statement::ReturnStatement(ret) => {
+            let expression = ret.argument.as_ref()?;
+            let span = selector_return_expression(
+                expression,
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            )?;
+            Some(SelectorFlow::Return(span))
+        }
+        Statement::EmptyStatement(_) => Some(SelectorFlow::Continue),
+        _ => None,
+    }
+}
+
+fn selector_statements_flow(
+    statements: &[Statement<'_>],
+    selector_symbol: SymbolId,
+    selector_value: i64,
+    scoping: &Scoping,
+    stable_var_numbers: &HashMap<SymbolId, i64>,
+) -> Option<SelectorFlow> {
+    for statement in statements {
+        match selector_statement_flow(
+            statement,
+            selector_symbol,
+            selector_value,
+            scoping,
+            stable_var_numbers,
+        )? {
+            SelectorFlow::Continue => {}
+            returned @ SelectorFlow::Return(_) => return Some(returned),
+        }
+    }
+    Some(SelectorFlow::Continue)
+}
+
+#[derive(Default)]
+struct SelectorLiteralCollector<'c> {
+    scoping: Option<&'c Scoping>,
+    selector_symbol: Option<SymbolId>,
+    values: HashSet<i64>,
+}
+
+impl<'a> Visit<'a> for SelectorLiteralCollector<'_> {
+    fn visit_function(&mut self, _function: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
+        // Do not collect selector tests from nested functions.
+    }
+
+    fn visit_binary_expression(&mut self, binary: &oxc_ast::ast::BinaryExpression<'a>) {
+        if matches!(binary.operator.as_str(), "==" | "===" | "!=" | "!==") {
+            let Some(scoping) = self.scoping else {
+                return;
+            };
+            let Some(selector_symbol) = self.selector_symbol else {
+                return;
+            };
+            let left_symbol = selector_identifier_symbol(&binary.left, scoping);
+            let right_symbol = selector_identifier_symbol(&binary.right, scoping);
+            let literal = if left_symbol == Some(selector_symbol) {
+                expression_integer(&binary.right)
+            } else if right_symbol == Some(selector_symbol) {
+                expression_integer(&binary.left)
+            } else {
+                None
+            };
+            if let Some(literal) = literal {
+                self.values.insert(literal);
+            }
+        }
+        walk::walk_binary_expression(self, binary);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SelectorDispatcher {
+    params: Vec<String>,
+    returns: HashMap<i64, Span>,
+}
+
+struct SelectorDispatcherCollector<'c> {
+    scoping: &'c Scoping,
+    stable_var_numbers: &'c HashMap<SymbolId, i64>,
+    dispatchers: HashMap<SymbolId, SelectorDispatcher>,
+}
+
+impl<'a> Visit<'a> for SelectorDispatcherCollector<'_> {
+    fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        if !function.r#async && !function.generator {
+            if let (Some(id), Some(body)) = (&function.id, &function.body) {
+                if let Some(function_symbol) = id.symbol_id.get() {
+                    let binding_is_stable = self
+                        .scoping
+                        .get_resolved_reference_ids(function_symbol)
+                        .iter()
+                        .all(|reference_id| {
+                            let reference = self.scoping.get_reference(*reference_id);
+                            !reference.is_write() && !reference.flags().is_member_write_target()
+                        });
+
+                    let params = function
+                        .params
+                        .items
+                        .iter()
+                        .map(|param| match &param.pattern {
+                            BindingPattern::BindingIdentifier(id) => {
+                                Some((id.name.to_string(), id.symbol_id.get()?))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>();
+
+                    if binding_is_stable && body.directives.is_empty() {
+                        if let Some(params) = params {
+                            if let Some((_, selector_symbol)) = params.first() {
+                                let mut literals = SelectorLiteralCollector {
+                                    scoping: Some(self.scoping),
+                                    selector_symbol: Some(*selector_symbol),
+                                    values: HashSet::new(),
+                                };
+                                for statement in &body.statements {
+                                    literals.visit_statement(statement);
+                                }
+
+                                let mut returns = HashMap::new();
+                                for value in literals.values {
+                                    if let Some(SelectorFlow::Return(span)) =
+                                        selector_statements_flow(
+                                            &body.statements,
+                                            *selector_symbol,
+                                            value,
+                                            self.scoping,
+                                            self.stable_var_numbers,
+                                        )
+                                    {
+                                        returns.insert(value, span);
+                                    }
+                                }
+
+                                if !returns.is_empty() {
+                                    self.dispatchers.insert(
+                                        function_symbol,
+                                        SelectorDispatcher {
+                                            params: params
+                                                .into_iter()
+                                                .map(|(name, _)| name)
+                                                .collect(),
+                                            returns,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_function(self, function, flags);
+    }
+}
+
+fn collect_selector_dispatchers(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+    stable_var_numbers: &HashMap<SymbolId, i64>,
+) -> HashMap<SymbolId, SelectorDispatcher> {
+    let mut collector = SelectorDispatcherCollector {
+        scoping,
+        stable_var_numbers,
+        dispatchers: HashMap::new(),
+    };
+    collector.visit_program(program);
+    collector.dispatchers
 }
 
 fn parse_i64_literal(text: &str) -> Option<i64> {
@@ -963,29 +2305,92 @@ fn eval_rotation_checksum(
     (parser.pos == expression.len()).then_some(value)
 }
 
+#[derive(Debug, Clone)]
+struct RotationIife {
+    provider: String,
+    target: i64,
+    body_span: Span,
+    statement_span: Span,
+}
+
+fn rotation_iife_function<'a>(expr: &'a Expression<'a>) -> Option<&'a oxc_ast::ast::Function<'a>> {
+    match expr {
+        Expression::FunctionExpression(function) => Some(function),
+        Expression::ParenthesizedExpression(parenthesized) => {
+            rotation_iife_function(&parenthesized.expression)
+        }
+        _ => None,
+    }
+}
+
+fn rotation_iife_call<'a>(expr: &'a Expression<'a>) -> Option<&'a CallExpression<'a>> {
+    match expr {
+        Expression::CallExpression(call) => Some(call),
+        Expression::ParenthesizedExpression(parenthesized) => {
+            rotation_iife_call(&parenthesized.expression)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct RotationIifeCollector {
+    out: Vec<RotationIife>,
+}
+
+impl<'a> Visit<'a> for RotationIifeCollector {
+    fn visit_expression_statement(&mut self, it: &ExpressionStatement<'a>) {
+        let Some(call) = rotation_iife_call(&it.expression) else {
+            walk::walk_expression_statement(self, it);
+            return;
+        };
+        if !call.optional && call.arguments.len() == 2 {
+            let provider = match &call.arguments[0] {
+                Argument::Identifier(identifier) => Some(identifier.name.to_string()),
+                _ => None,
+            };
+            let target = argument_integer(&call.arguments[1]);
+            let function = rotation_iife_function(&call.callee);
+            if let (Some(provider), Some(target), Some(function)) = (provider, target, function) {
+                if !function.r#async && !function.generator && function.params.items.len() == 2 {
+                    if let Some(body) = &function.body {
+                        self.out.push(RotationIife {
+                            provider,
+                            target,
+                            body_span: body.span,
+                            statement_span: it.span,
+                        });
+                    }
+                }
+            }
+        }
+        walk::walk_expression_statement(self, it);
+    }
+}
+
+fn collect_rotation_iifes(program: &oxc_ast::ast::Program<'_>) -> Vec<RotationIife> {
+    let mut collector = RotationIifeCollector::default();
+    collector.visit_program(program);
+    collector.out
+}
+
 fn apply_proven_decoder_rotations(
     source: &str,
     decoders: &mut HashMap<String, Decoder>,
-) -> Vec<(usize, usize)> {
-    let iife_re = regex::Regex::new(
-        r#"(?s)\(\s*function\s*\([^)]*\)\s*\{(?P<body>.*?)\}\s*\)?\s*\(\s*(?P<provider>[A-Za-z_$][A-Za-z0-9_$]*)\s*,\s*(?P<target>-?(?:0[xX][0-9A-Fa-f]+|[0-9]+))\s*\)"#,
-    )
-    .unwrap();
+    rotation_iifes: &[RotationIife],
+) -> (Vec<(usize, usize)>, Vec<Replacement>) {
     let checksum_re = regex::Regex::new(
         r#"(?s)\btry\s*\{\s*(?:var|let|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(?P<expr>[^;]+);"#,
     )
     .unwrap();
     let mut protected_spans = Vec::new();
+    let mut proven_iifes: Vec<(String, usize, usize)> = Vec::new();
 
-    for caps in iife_re.captures_iter(source) {
-        let body = &caps["body"];
+    for iife in rotation_iifes {
+        let body = fragment(source, iife.body_span);
         if !body.contains("push") || !body.contains("shift") {
             continue;
         }
-        let provider = &caps["provider"];
-        let Some(target) = parse_i64_literal(&caps["target"]) else {
-            continue;
-        };
         let Some(checksum) = checksum_re.captures(body) else {
             continue;
         };
@@ -993,7 +2398,7 @@ fn apply_proven_decoder_rotations(
         let mut proven_here = false;
 
         for (decoder_name, decoder) in decoders.iter_mut() {
-            if decoder.provider != provider || decoder.values.is_empty() {
+            if decoder.provider != iife.provider || decoder.values.is_empty() {
                 continue;
             }
             let alias_re = regex::Regex::new(&format!(
@@ -1015,7 +2420,7 @@ fn apply_proven_decoder_rotations(
                 else {
                     continue;
                 };
-                if value.is_finite() && (value - target as f64).abs() < 1e-9 {
+                if value.is_finite() && (value - iife.target as f64).abs() < 1e-9 {
                     matches.push(rotation);
                     if matches.len() > 1 {
                         break;
@@ -1031,13 +2436,72 @@ fn apply_proven_decoder_rotations(
         }
 
         if proven_here {
-            if let Some(full_match) = caps.get(0) {
-                protected_spans.push((full_match.start(), full_match.end()));
-            }
+            let start = iife.statement_span.start as usize;
+            let end = iife.statement_span.end as usize;
+            protected_spans.push((start, end));
+            proven_iifes.push((iife.provider.clone(), start, end));
         }
     }
 
-    protected_spans
+    // Materialization is stricter than decoding. Every detected decoder sharing
+    // a provider must agree on the same final rotated table and the same literal
+    // array span. If that cannot be proved, keep the runtime IIFE intact.
+    let proven_providers = proven_iifes
+        .iter()
+        .map(|(provider, _, _)| provider.clone())
+        .collect::<HashSet<_>>();
+    let mut materialized: HashMap<String, (Span, Vec<Value>)> = HashMap::new();
+    let mut inconsistent = HashSet::new();
+    for decoder in decoders.values() {
+        if !proven_providers.contains(&decoder.provider) {
+            continue;
+        }
+        match materialized.get(&decoder.provider) {
+            None => {
+                materialized.insert(
+                    decoder.provider.clone(),
+                    (decoder.provider_array_span, decoder.values.clone()),
+                );
+            }
+            Some((span, values))
+                if *span == decoder.provider_array_span && same_values(values, &decoder.values) => {
+            }
+            Some(_) => {
+                inconsistent.insert(decoder.provider.clone());
+            }
+        }
+    }
+    for provider in &inconsistent {
+        materialized.remove(provider);
+    }
+
+    let mut replacements = Vec::new();
+    for (provider, (array_span, values)) in materialized {
+        let Some(array_text) = render_value_array(&values) else {
+            continue;
+        };
+        replacements.push(Replacement {
+            start: array_span.start as usize,
+            end: array_span.end as usize,
+            text: array_text,
+            kind: "materialize_decoder_rotation",
+            arithmetic_state_proof: None,
+        });
+        for (_, start, end) in proven_iifes
+            .iter()
+            .filter(|(iife_provider, _, _)| iife_provider.as_str() == provider.as_str())
+        {
+            replacements.push(Replacement {
+                start: *start,
+                end: *end,
+                text: String::new(),
+                kind: "remove_decoder_rotation_iife",
+                arithmetic_state_proof: None,
+            });
+        }
+    }
+
+    (protected_spans, replacements)
 }
 
 fn detect_decoders(
@@ -1045,7 +2509,11 @@ fn detect_decoders(
     functions: &[FnInfo],
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
-) -> (HashMap<SymbolId, Decoder>, Vec<(usize, usize)>) {
+) -> (
+    HashMap<SymbolId, Decoder>,
+    Vec<(usize, usize)>,
+    Vec<Replacement>,
+) {
     let local_re = regex::Regex::new(
         r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\(\)\s*;",
     )
@@ -1058,6 +2526,11 @@ fn detect_decoders(
         r"\b(?:let|const|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\[([A-Za-z_$][A-Za-z0-9_$]*)\]\s*;",
     )
     .unwrap();
+
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for f in functions {
+        *name_counts.entry(f.name.clone()).or_default() += 1;
+    }
 
     let mut providers = HashMap::new();
     for f in functions {
@@ -1073,7 +2546,7 @@ fn detect_decoders(
         }
         for (array_name, values) in &f.static_arrays {
             if body.contains(&format!("return {array_name};")) {
-                providers.insert(f.name.clone(), values.clone());
+                providers.insert((f.scope, f.name.clone()), values.clone());
                 break;
             }
         }
@@ -1090,7 +2563,15 @@ fn detect_decoders(
         };
         let local_array = local[1].to_string();
         let provider = local[2].to_string();
-        let Some(values) = providers.get(&provider) else {
+        // Rotation proof below is textual. Fail closed if either function name
+        // occurs in more than one lexical scope, so a sibling IIFE cannot
+        // accidentally supply another decoder's rotation.
+        if name_counts.get(&f.name).copied() != Some(1)
+            || name_counts.get(&provider).copied() != Some(1)
+        {
+            continue;
+        }
+        let Some(provider_info) = providers.get(&(f.scope, provider.clone())) else {
             continue;
         };
         let Some(off) = offset_re.captures(body) else {
@@ -1103,14 +2584,6 @@ fn detect_decoders(
         let Some(public_param) = f.params.first() else {
             continue;
         };
-        if (!body.contains(&format!("{} = function({param}", f.name))
-            && !body.contains(&format!("{}=function({param}", f.name)))
-            || (!body.contains(&format!("return {}({public_param}", f.name))
-                && !body.contains(&format!(",{}({public_param}", f.name))
-                && !body.contains(&format!(", {}({public_param}", f.name)))
-        {
-            continue;
-        }
         let Some(offset) = parse_i64_literal(&off[3]) else {
             continue;
         };
@@ -1121,7 +2594,54 @@ fn detect_decoders(
             continue;
         }
         let value_var = index[1].to_string();
-        if !body.contains(&format!("return {value_var};")) {
+        let bare_value_return = body.contains(&format!("return {value_var};"));
+        let sequence_value_return =
+            body.contains(&format!(", {value_var};")) || body.contains(&format!(",{value_var};"));
+
+        let installs_replacement_re = regex::Regex::new(&format!(
+            r#"\b{}\s*=\s*function\s*\(\s*{}\b"#,
+            regex::escape(&f.name),
+            regex::escape(&param),
+        ))
+        .unwrap();
+        let tail_calls_public_re = regex::Regex::new(&format!(
+            r#"(?:\breturn\b|,)\s*{}\s*\(\s*{}\b"#,
+            regex::escape(&f.name),
+            regex::escape(public_param),
+        ))
+        .unwrap();
+        let self_rewriting =
+            installs_replacement_re.is_match(body) && tail_calls_public_re.is_match(body);
+
+        // Some javascript-obfuscator-style outputs use the simpler, equally
+        // static shape directly instead of installing a memoizing replacement:
+        //
+        //   function d(i, unused) {
+        //     i = i - 123;
+        //     const table = provider();
+        //     let value = table[i];
+        //     return value;
+        //   }
+        //
+        // Match the complete function body rather than merely looking for the
+        // three ingredients, so arbitrary application array accessors are not
+        // promoted to decoders.
+        let direct_re = regex::Regex::new(&format!(
+            r#"(?s)^\s*function\s+{}\s*\([^)]*\)\s*\{{\s*{}\s*=\s*{}\s*-\s*(?:0[xX][0-9A-Fa-f]+|[0-9]+)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\(\s*\)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+{}\s*;\s*\}}\s*$"#,
+            regex::escape(&f.name),
+            regex::escape(&param),
+            regex::escape(&param),
+            regex::escape(&local_array),
+            regex::escape(&provider),
+            regex::escape(&value_var),
+            regex::escape(&local_array),
+            regex::escape(&param),
+            regex::escape(&value_var),
+        ))
+        .unwrap();
+        let direct_index = direct_re.is_match(body);
+
+        if !direct_index && !(self_rewriting && (bare_value_return || sequence_value_return)) {
             continue;
         }
 
@@ -1129,13 +2649,30 @@ fn detect_decoders(
             .contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=")
             && body.contains("decodeURIComponent")
         {
-            // javascript-obfuscator's common base64 decoder includes a
-            // self-defending guard based on Function#toString. A literal LF
-            // at one of the probed positions substitutes the loop counter for
-            // the decoded byte. For a one-line decoder the guard is provably
-            // inert; after pretty-printing it may not be. Refuse to decode
-            // unless the current representation proves no line terminators.
-            if body.contains('\n') || body.contains('\r') {
+            // Recognize the pure javascript-obfuscator Base64 -> percent-URI
+            // decoder by its actual dataflow ingredients, not by whether the
+            // source happens to be minified. Some variants add a source-text
+            // self-defence gate whose result depends on Function#toString /
+            // line layout. Those introduce an additional charCodeAt probe.
+            //
+            // Requiring exactly the one charCodeAt used by the final
+            // percent-encoding loop accepts clean formatted decoders such as
+            // current aclib/suv5 while failing closed on the guarded variant.
+            let char_code_at_count = body.matches(".charCodeAt(").count();
+            let base64_uri_shape = body.contains(".charAt(")
+                && body.contains(".indexOf(")
+                && body.contains("String.fromCharCode")
+                && body.contains(".toString(16)");
+            if !base64_uri_shape || char_code_at_count == 0 {
+                continue;
+            }
+
+            // A single charCodeAt is the ordinary percent-encoding loop and is
+            // source-layout independent. Extra charCodeAt probes are treated as
+            // source-sensitive self-defence: retain the historical proof that
+            // they are safe only when the exact decoder representation is one
+            // physical line.
+            if char_code_at_count > 1 && (body.contains('\n') || body.contains('\r')) {
                 continue;
             }
             DecoderTransform::LowerAlphabetBase64Uri
@@ -1146,15 +2683,18 @@ fn detect_decoders(
         by_name.insert(
             f.name.clone(),
             Decoder {
-                values: values.clone(),
+                values: provider_info.values.clone(),
                 offset,
                 provider,
+                provider_array_span: provider_info.span,
                 transform,
             },
         );
     }
 
-    let protected_spans = apply_proven_decoder_rotations(source, &mut by_name);
+    let rotation_iifes = collect_rotation_iifes(program);
+    let (protected_spans, rotation_replacements) =
+        apply_proven_decoder_rotations(source, &mut by_name, &rotation_iifes);
 
     let mut out = HashMap::new();
     for f in functions {
@@ -1180,7 +2720,7 @@ fn detect_decoders(
         }
     }
 
-    (out, protected_spans)
+    (out, protected_spans, rotation_replacements)
 }
 
 struct SymbolAliasCollector<'s> {
@@ -1190,6 +2730,13 @@ struct SymbolAliasCollector<'s> {
 
 impl<'a> Visit<'a> for SymbolAliasCollector<'_> {
     fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        // Decoder aliases are only propagated when JavaScript itself proves
+        // the binding cannot later be rebound. This keeps the transform
+        // fail-closed without needing a second write-analysis pass.
+        if it.kind != VariableDeclarationKind::Const {
+            walk::walk_variable_declaration(self, it);
+            return;
+        }
         for d in &it.declarations {
             let BindingPattern::BindingIdentifier(alias) = &d.id else {
                 continue;
@@ -1310,9 +2857,20 @@ fn collect_dispatch_bindings(
 
 #[derive(Debug, Clone)]
 enum ProxyProperty {
-    String(String),
+    Literal(Value),
+    Unary { operator: String },
     Binary { operator: String },
+    StaticMember { property: String },
+    ComputedMember,
     Call { arity: usize },
+}
+
+fn proxy_literal_kind(value: &Value) -> &'static str {
+    if matches!(value, Value::String(_)) {
+        "proxy_string"
+    } else {
+        "proxy_literal"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1371,7 +2929,39 @@ fn analyze_proxy_return(
         })
         .collect::<Option<Vec<_>>>()?;
 
+    if params.len() == 1 {
+        if let Expression::UnaryExpression(unary) = returned {
+            let operator = unary.operator.as_str();
+            if matches!(operator, "!" | "+" | "-" | "~" | "void")
+                && direct_identifier_name(&unary.argument)? == params[0]
+            {
+                return Some(ProxyProperty::Unary {
+                    operator: operator.to_string(),
+                });
+            }
+        }
+    }
+
+    if params.len() == 1 {
+        if let Expression::StaticMemberExpression(member) = returned {
+            if !member.optional && direct_identifier_name(&member.object)? == params[0] {
+                return Some(ProxyProperty::StaticMember {
+                    property: member.property.name.to_string(),
+                });
+            }
+        }
+    }
+
     if params.len() == 2 {
+        if let Expression::ComputedMemberExpression(member) = returned {
+            if !member.optional
+                && direct_identifier_name(&member.object)? == params[0]
+                && direct_identifier_name(&member.expression)? == params[1]
+            {
+                return Some(ProxyProperty::ComputedMember);
+            }
+        }
+
         if let Expression::BinaryExpression(binary) = returned {
             if direct_identifier_name(&binary.left)? == params[0]
                 && direct_identifier_name(&binary.right)? == params[1]
@@ -1455,8 +3045,8 @@ fn analyze_proxy_object(
         let Some(key) = prop.key.static_name().map(|name| name.into_owned()) else {
             continue;
         };
-        if let Some(Value::String(value)) = eval(&prop.value) {
-            properties.insert(key, ProxyProperty::String(value));
+        if let Some(value) = eval(&prop.value) {
+            properties.insert(key, ProxyProperty::Literal(value));
             continue;
         }
         let proxy = match &prop.value {
@@ -1591,6 +3181,310 @@ fn collect_shorthand_spans(program: &oxc_ast::ast::Program<'_>) -> HashSet<(u32,
     collector.spans
 }
 
+#[derive(Debug, Clone)]
+struct ReferenceIdentityTable {
+    rows: u32,
+    columns: u32,
+    root_row: u32,
+    column_multiplier: u32,
+    row_multiplier: u32,
+    salt_left: u32,
+    salt_right: u32,
+    construction_start: usize,
+    construction_end: usize,
+}
+
+impl ReferenceIdentityTable {
+    fn row_for(&self, row: u32, column: u32) -> Option<u32> {
+        if row >= self.rows || column >= self.columns || !self.rows.is_power_of_two() {
+            return None;
+        }
+        let column_term = js_to_uint32(self.column_multiplier as f64 * column as f64);
+        let row_term = js_to_uint32(self.row_multiplier as f64 * row as f64);
+        let salt_term = js_to_uint32(self.salt_left as f64 * self.salt_right as f64);
+        Some((column_term ^ row_term ^ salt_term) & (self.rows - 1))
+    }
+
+    fn identity_for(&self, first: u32, second: u32) -> Option<u32> {
+        let row = self.row_for(self.root_row, first)?;
+        self.row_for(row, second)
+    }
+}
+
+fn unique_symbol_named_near(
+    scoping: &Scoping,
+    name: &str,
+    start: u32,
+    end: u32,
+) -> Option<SymbolId> {
+    let mut matches = scoping.symbol_ids().filter(|symbol| {
+        scoping.symbol_name(*symbol) == name && {
+            let span = scoping.symbol_span(*symbol);
+            start <= span.start && span.end <= end
+        }
+    });
+    let symbol = matches.next()?;
+    matches.next().is_none().then_some(symbol)
+}
+
+fn detect_reference_identity_tables(
+    source: &str,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> HashMap<SymbolId, ReferenceIdentityTable> {
+    let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
+    let row_re = regex::Regex::new(&format!(
+        r"(?P<table>{identifier})=\[\],(?P<idx>{identifier})=0;(?P<test>{identifier})<(?P<rows>\d+);(?P<update>{identifier})\+\+\)(?P<table2>{identifier})\[(?P<idx2>{identifier})\]=new Array\((?P<columns>\d+)\)"
+    ))
+    .unwrap();
+    let timer_re = regex::Regex::new(&format!(
+        r"(?P<timer>{identifier})=function\((?P<arg>{identifier})\)\{{setTimeout\((?P<arg2>{identifier}),0\)\}}"
+    ))
+    .unwrap();
+    let outer_re = regex::Regex::new(&format!(
+        r"for\(var (?P<loop>{identifier})=0;(?P<test>{identifier})<(?P<chunks>\d+);(?P<update>{identifier})\+\+\)\((?P<callback>{identifier})=>\{{(?P<timer>{identifier})\(function\(\)\{{"
+    ))
+    .unwrap();
+    let fill_re = regex::Regex::new(&format!(
+        r"for\(var (?P<t>{identifier})=(?P<chunk>\d+)\*(?P<callback>{identifier}),(?P<n>{identifier})=Math\.min\((?P<t2>{identifier})\+(?P<chunk2>\d+),(?P<columns>\d+)\),(?P<column>{identifier})=(?P<t3>{identifier});(?P<column2>{identifier})<(?P<n2>{identifier});(?P<column3>{identifier})\+\+\)for\((?P<row>{identifier})=0;(?P<row2>{identifier})<(?P<rows>\d+);(?P<row3>{identifier})\+\+\)(?P<table>{identifier})\[(?P<row4>{identifier})\]\[(?P<column4>{identifier})\]=(?P<table2>{identifier})\[\((?P<a>\d+)\*(?P<column5>{identifier})\^(?P<b>\d+)\*(?P<row5>{identifier})\^(?P<c>\d+)\*(?P<k>\d+)\)>>>0&(?P<mask>\d+)-1\]"
+    ))
+    .unwrap();
+    let root_re = regex::Regex::new(&format!(
+        r"(?P<timer>{identifier})\(function\(\)\{{(?P<target>{identifier})=(?P<table>{identifier})\[(?P<root>\d+)\]\}}\)"
+    ))
+    .unwrap();
+
+    let mut out = HashMap::new();
+    for row_caps in row_re.captures_iter(source) {
+        let row_match = row_caps.get(0).unwrap();
+        let table_name = row_caps.name("table").unwrap().as_str();
+        let row_index = row_caps.name("idx").unwrap().as_str();
+        if row_caps.name("test").unwrap().as_str() != row_index
+            || row_caps.name("update").unwrap().as_str() != row_index
+            || row_caps.name("idx2").unwrap().as_str() != row_index
+            || row_caps.name("table2").unwrap().as_str() != table_name
+        {
+            continue;
+        }
+        let Ok(rows) = row_caps.name("rows").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        let Ok(columns) = row_caps.name("columns").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        if rows < 2 || columns < 2 || !rows.is_power_of_two() {
+            continue;
+        }
+
+        let window_start = row_match.start().saturating_sub(256);
+        let window_end = (row_match.end() + 1800).min(source.len());
+        let window = &source[window_start..window_end];
+
+        let Some(timer_caps) = timer_re.captures(window) else {
+            continue;
+        };
+        if timer_caps.name("arg").unwrap().as_str() != timer_caps.name("arg2").unwrap().as_str() {
+            continue;
+        }
+        let timer_name = timer_caps.name("timer").unwrap().as_str();
+
+        let Some(outer_caps) = outer_re.captures(window) else {
+            continue;
+        };
+        let outer_loop = outer_caps.name("loop").unwrap().as_str();
+        if outer_caps.name("test").unwrap().as_str() != outer_loop
+            || outer_caps.name("update").unwrap().as_str() != outer_loop
+            || outer_caps.name("timer").unwrap().as_str() != timer_name
+        {
+            continue;
+        }
+        let callback_name = outer_caps.name("callback").unwrap().as_str();
+        let Ok(chunks) = outer_caps.name("chunks").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+
+        let Some(fill_caps) = fill_re.captures(window) else {
+            continue;
+        };
+        if fill_caps.name("callback").unwrap().as_str() != callback_name
+            || fill_caps.name("table").unwrap().as_str() != table_name
+            || fill_caps.name("table2").unwrap().as_str() != table_name
+        {
+            continue;
+        }
+        let t_name = fill_caps.name("t").unwrap().as_str();
+        let n_name = fill_caps.name("n").unwrap().as_str();
+        let column_name = fill_caps.name("column").unwrap().as_str();
+        let row_name = fill_caps.name("row").unwrap().as_str();
+        if fill_caps.name("t2").unwrap().as_str() != t_name
+            || fill_caps.name("t3").unwrap().as_str() != t_name
+            || fill_caps.name("n2").unwrap().as_str() != n_name
+            || fill_caps.name("column2").unwrap().as_str() != column_name
+            || fill_caps.name("column3").unwrap().as_str() != column_name
+            || fill_caps.name("column4").unwrap().as_str() != column_name
+            || fill_caps.name("column5").unwrap().as_str() != column_name
+            || fill_caps.name("row2").unwrap().as_str() != row_name
+            || fill_caps.name("row3").unwrap().as_str() != row_name
+            || fill_caps.name("row4").unwrap().as_str() != row_name
+            || fill_caps.name("row5").unwrap().as_str() != row_name
+        {
+            continue;
+        }
+
+        let Ok(chunk) = fill_caps.name("chunk").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        let Ok(chunk2) = fill_caps.name("chunk2").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        let Ok(fill_columns) = fill_caps.name("columns").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        let Ok(fill_rows) = fill_caps.name("rows").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        let Ok(mask) = fill_caps.name("mask").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        if chunk == 0
+            || chunk != chunk2
+            || fill_columns != columns
+            || fill_rows != rows
+            || mask != rows
+            || chunks.checked_mul(chunk) != Some(columns)
+        {
+            continue;
+        }
+
+        let Some(root_caps) = root_re.captures(window) else {
+            continue;
+        };
+        if root_caps.name("timer").unwrap().as_str() != timer_name
+            || root_caps.name("table").unwrap().as_str() != table_name
+        {
+            continue;
+        }
+        let target_name = root_caps.name("target").unwrap().as_str();
+        let Ok(root_row) = root_caps.name("root").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        if root_row >= rows {
+            continue;
+        }
+
+        let absolute_start = window_start as u32;
+        let absolute_end = window_end as u32;
+        let Some(target_symbol) =
+            unique_symbol_named_near(scoping, target_name, absolute_start, absolute_end)
+        else {
+            continue;
+        };
+        let Some(table_symbol) =
+            unique_symbol_named_near(scoping, table_name, absolute_start, absolute_end)
+        else {
+            continue;
+        };
+
+        let construction_end = (window_start + root_caps.get(0).unwrap().end()) as u32;
+        if scoping
+            .get_resolved_reference_ids(table_symbol)
+            .iter()
+            .any(|reference_id| {
+                reference_spans
+                    .get(reference_id)
+                    .is_none_or(|span| span.start < absolute_start || span.end > construction_end)
+            })
+        {
+            continue;
+        }
+        let target_writes = scoping
+            .get_resolved_reference_ids(target_symbol)
+            .iter()
+            .filter(|reference_id| scoping.get_reference(**reference_id).is_write())
+            .count();
+        if target_writes != 1 {
+            continue;
+        }
+
+        let parse_capture = |name: &str| {
+            fill_caps
+                .name(name)
+                .and_then(|capture| capture.as_str().parse::<u32>().ok())
+        };
+        let (Some(column_multiplier), Some(row_multiplier), Some(salt_left), Some(salt_right)) = (
+            parse_capture("a"),
+            parse_capture("b"),
+            parse_capture("c"),
+            parse_capture("k"),
+        ) else {
+            continue;
+        };
+
+        let construction_start = window_start
+            + timer_caps
+                .get(0)
+                .unwrap()
+                .start()
+                .min(row_match.start() - window_start);
+        let descriptor = ReferenceIdentityTable {
+            rows,
+            columns,
+            root_row,
+            column_multiplier,
+            row_multiplier,
+            salt_left,
+            salt_right,
+            construction_start,
+            construction_end: construction_end as usize,
+        };
+        let valid = (0..rows)
+            .all(|row| (0..columns).all(|column| descriptor.row_for(row, column).is_some()));
+        if valid {
+            out.insert(target_symbol, descriptor);
+        }
+    }
+    out
+}
+
+fn reference_identity(
+    expr: &Expression<'_>,
+    scoping: &Scoping,
+    tables: &HashMap<SymbolId, ReferenceIdentityTable>,
+) -> Option<(SymbolId, u32)> {
+    let Expression::ComputedMemberExpression(outer) = expr else {
+        return None;
+    };
+    if outer.optional {
+        return None;
+    }
+    let Expression::ComputedMemberExpression(inner) = &outer.object else {
+        return None;
+    };
+    if inner.optional {
+        return None;
+    }
+    let symbol = symbol_of(scoping, &inner.object)?;
+    let table = tables.get(&symbol)?;
+    let Value::Number(first) = eval(&inner.expression)? else {
+        return None;
+    };
+    let Value::Number(second) = eval(&outer.expression)? else {
+        return None;
+    };
+    if !first.is_finite()
+        || !second.is_finite()
+        || first.fract() != 0.0
+        || second.fract() != 0.0
+        || first < 0.0
+        || second < 0.0
+        || first > u32::MAX as f64
+        || second > u32::MAX as f64
+    {
+        return None;
+    }
+    Some((symbol, table.identity_for(first as u32, second as u32)?))
+}
+
 struct Collector<'s, 'c> {
     source: &'s str,
     scoping: &'c Scoping,
@@ -1599,6 +3493,9 @@ struct Collector<'s, 'c> {
     constants: &'c HashMap<SymbolId, ConstBinding>,
     shorthand_spans: &'c HashSet<(u32, u32)>,
     proxies: &'c HashMap<SymbolId, ProxyObject>,
+    pure_functions: &'c HashMap<SymbolId, PureFunction>,
+    reference_identity_tables: &'c HashMap<SymbolId, ReferenceIdentityTable>,
+    selector_dispatchers: &'c HashMap<SymbolId, SelectorDispatcher>,
     dispatch_orders: &'c HashMap<SymbolId, Vec<String>>,
     zero_counters: &'c HashSet<SymbolId>,
     reference_spans: &'c HashMap<ReferenceId, Span>,
@@ -1781,7 +3678,9 @@ fn eval_with_env(expr: &Expression<'_>, env: &HashMap<String, Value>) -> Option<
                 "!" => Some(Value::Bool(!value.truthy())),
                 "+" => value.number().map(Value::Number),
                 "-" => value.number().map(|n| Value::Number(-n)),
-                "~" => value.number().map(|n| Value::Number((!(n as i32)) as f64)),
+                "~" => value
+                    .number()
+                    .map(|n| Value::Number((!js_to_int32(n)) as f64)),
                 "typeof" => Some(Value::String(
                     match value {
                         Value::String(_) => "string",
@@ -1859,6 +3758,38 @@ fn expression_mentions(expr: &Expression<'_>, name: &str) -> bool {
     let mut collector = NameUseCollector::default();
     collector.visit_expression(expr);
     collector.names.contains(name)
+}
+
+fn statement_mentions(stmt: &Statement<'_>, name: &str) -> bool {
+    let mut collector = NameUseCollector::default();
+    collector.visit_statement(stmt);
+    collector.names.contains(name)
+}
+
+#[derive(Default)]
+struct LoopControlDetector {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for LoopControlDetector {
+    fn visit_break_statement(&mut self, _it: &oxc_ast::ast::BreakStatement<'a>) {
+        self.found = true;
+    }
+
+    fn visit_continue_statement(&mut self, _it: &oxc_ast::ast::ContinueStatement<'a>) {
+        self.found = true;
+    }
+
+    fn visit_function(&mut self, _it: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
+        // A nested function's control flow cannot target the surrounding
+        // dispatcher loop, so do not descend into it.
+    }
+}
+
+fn statement_has_loop_control(stmt: &Statement<'_>) -> bool {
+    let mut detector = LoopControlDetector::default();
+    detector.visit_statement(stmt);
+    detector.found
 }
 
 fn direct_assignment_name<'a>(target: &'a oxc_ast::ast::AssignmentTarget<'a>) -> Option<&'a str> {
@@ -2184,7 +4115,302 @@ fn resolved_refs_within(
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceCaseFlow {
+    Normal,
+    Continue,
+    Break,
+    Return,
+    Throw,
+}
+
 impl Collector<'_, '_> {
+    fn reference_state_assignment(
+        &self,
+        expr: &Expression<'_>,
+        state_var: &str,
+        table_symbol: SymbolId,
+    ) -> Option<u32> {
+        let expr = match expr {
+            Expression::ParenthesizedExpression(parenthesized) => &parenthesized.expression,
+            _ => expr,
+        };
+        let Expression::AssignmentExpression(assign) = expr else {
+            return None;
+        };
+        if assign.operator.as_str() != "="
+            || direct_assignment_name(&assign.left) != Some(state_var)
+        {
+            return None;
+        }
+        let (symbol, identity) =
+            reference_identity(&assign.right, self.scoping, self.reference_identity_tables)?;
+        (symbol == table_symbol).then_some(identity)
+    }
+
+    fn clean_reference_state_statement(
+        &self,
+        stmt: &Statement<'_>,
+        state_var: &str,
+        table_symbol: SymbolId,
+    ) -> Option<(String, Option<u32>, ReferenceCaseFlow)> {
+        match stmt {
+            Statement::BlockStatement(block) => {
+                let mut chunks = Vec::new();
+                let mut next_state = None;
+                for child in &block.body {
+                    let (text, next, flow) =
+                        self.clean_reference_state_statement(child, state_var, table_symbol)?;
+                    if !text.trim().is_empty() {
+                        chunks.push(text);
+                    }
+                    if let Some(next) = next {
+                        next_state = Some(next);
+                    }
+                    if flow != ReferenceCaseFlow::Normal {
+                        return Some((
+                            format!(
+                                "{{
+{}
+}}",
+                                chunks.join(
+                                    "
+"
+                                )
+                            ),
+                            next_state,
+                            flow,
+                        ));
+                    }
+                }
+                Some((
+                    format!(
+                        "{{
+{}
+}}",
+                        chunks.join(
+                            "
+"
+                        )
+                    ),
+                    next_state,
+                    ReferenceCaseFlow::Normal,
+                ))
+            }
+            Statement::ExpressionStatement(expression) => {
+                if let Some(next) =
+                    self.reference_state_assignment(&expression.expression, state_var, table_symbol)
+                {
+                    return Some((String::new(), Some(next), ReferenceCaseFlow::Normal));
+                }
+                if expression_mentions(&expression.expression, state_var) {
+                    return None;
+                }
+                Some((
+                    fragment(self.source, stmt.span()).to_string(),
+                    None,
+                    ReferenceCaseFlow::Normal,
+                ))
+            }
+            Statement::ContinueStatement(continue_stmt) if continue_stmt.label.is_none() => {
+                Some((String::new(), None, ReferenceCaseFlow::Continue))
+            }
+            Statement::BreakStatement(break_stmt) if break_stmt.label.is_none() => {
+                Some((String::new(), None, ReferenceCaseFlow::Break))
+            }
+            Statement::ReturnStatement(_) => {
+                if statement_mentions(stmt, state_var) {
+                    return None;
+                }
+                Some((
+                    fragment(self.source, stmt.span()).to_string(),
+                    None,
+                    ReferenceCaseFlow::Return,
+                ))
+            }
+            Statement::ThrowStatement(_) => {
+                if statement_mentions(stmt, state_var) {
+                    return None;
+                }
+                Some((
+                    fragment(self.source, stmt.span()).to_string(),
+                    None,
+                    ReferenceCaseFlow::Throw,
+                ))
+            }
+            _ => {
+                if statement_mentions(stmt, state_var) || statement_has_loop_control(stmt) {
+                    return None;
+                }
+                Some((
+                    fragment(self.source, stmt.span()).to_string(),
+                    None,
+                    ReferenceCaseFlow::Normal,
+                ))
+            }
+        }
+    }
+
+    fn reference_state_replacement(&self, it: &oxc_ast::ast::ForStatement<'_>) -> Option<String> {
+        if it.update.is_some() || !matches!(eval(it.test.as_ref()?), Some(Value::Bool(true))) {
+            return None;
+        }
+
+        let init = it.init.as_ref()?;
+        let oxc_ast::ast::ForStatementInit::VariableDeclaration(init_decl) = init else {
+            return None;
+        };
+        if init_decl.kind != VariableDeclarationKind::Var || init_decl.declarations.is_empty() {
+            return None;
+        }
+
+        let mut state_index = None;
+        let mut state_symbol = None;
+        let mut state_var = None;
+        let mut table_symbol = None;
+        let mut initial_identity = None;
+        for (index, declaration) in init_decl.declarations.iter().enumerate() {
+            let Some(init) = &declaration.init else {
+                continue;
+            };
+            let Some((symbol, identity)) =
+                reference_identity(init, self.scoping, self.reference_identity_tables)
+            else {
+                continue;
+            };
+            if state_index.is_some() {
+                return None;
+            }
+            let BindingPattern::BindingIdentifier(id) = &declaration.id else {
+                return None;
+            };
+            state_index = Some(index);
+            state_symbol = id.symbol_id.get();
+            state_var = Some(id.name.as_str());
+            table_symbol = Some(symbol);
+            initial_identity = Some(identity);
+        }
+
+        let state_index = state_index?;
+        let state_symbol = state_symbol?;
+        let state_var = state_var?;
+        let table_symbol = table_symbol?;
+        let mut current = initial_identity?;
+
+        if !resolved_refs_within(self.scoping, self.reference_spans, state_symbol, it.span) {
+            return None;
+        }
+        for declaration in &init_decl.declarations {
+            if let Some(init) = &declaration.init {
+                if expression_mentions(init, state_var)
+                    && direct_identifier_name(init) != Some(state_var)
+                {
+                    return None;
+                }
+            }
+        }
+
+        let Statement::BlockStatement(body) = &it.body else {
+            return None;
+        };
+        if body.body.len() != 2 {
+            return None;
+        }
+        let Statement::SwitchStatement(switch) = &body.body[0] else {
+            return None;
+        };
+        let Statement::BreakStatement(outer_break) = &body.body[1] else {
+            return None;
+        };
+        if outer_break.label.is_some()
+            || direct_identifier_name(&switch.discriminant) != Some(state_var)
+        {
+            return None;
+        }
+
+        let mut cases = HashMap::new();
+        for (index, case) in switch.cases.iter().enumerate() {
+            let test = case.test.as_ref()?;
+            let (symbol, identity) =
+                reference_identity(test, self.scoping, self.reference_identity_tables)?;
+            if symbol != table_symbol || cases.insert(identity, index).is_some() {
+                return None;
+            }
+        }
+
+        let mut chunks = Vec::new();
+        let other_declarations = init_decl
+            .declarations
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != state_index)
+            .map(|(_, declaration)| fragment(self.source, declaration.span))
+            .collect::<Vec<_>>();
+        if !other_declarations.is_empty() {
+            chunks.push(format!("var {};", other_declarations.join(",")));
+        }
+
+        let mut seen = HashSet::new();
+        for _ in 0..256 {
+            if !seen.insert(current) {
+                return None;
+            }
+            let Some(start) = cases.get(&current).copied() else {
+                // No case matches, so the switch falls through and the
+                // unconditional break after it terminates the dispatcher.
+                return Some(format!(
+                    "{{
+{}
+}}",
+                    chunks.join(
+                        "
+"
+                    )
+                ));
+            };
+
+            let mut next_state = None;
+            let mut flow = ReferenceCaseFlow::Normal;
+            'cases: for case in switch.cases.iter().skip(start) {
+                for stmt in &case.consequent {
+                    let (text, next, stmt_flow) =
+                        self.clean_reference_state_statement(stmt, state_var, table_symbol)?;
+                    if !text.trim().is_empty() {
+                        chunks.push(text);
+                    }
+                    if let Some(next) = next {
+                        next_state = Some(next);
+                    }
+                    if stmt_flow != ReferenceCaseFlow::Normal {
+                        flow = stmt_flow;
+                        break 'cases;
+                    }
+                }
+            }
+
+            match flow {
+                ReferenceCaseFlow::Continue => {
+                    current = next_state?;
+                }
+                ReferenceCaseFlow::Break
+                | ReferenceCaseFlow::Return
+                | ReferenceCaseFlow::Throw
+                | ReferenceCaseFlow::Normal => {
+                    return Some(format!(
+                        "{{
+{}
+}}",
+                        chunks.join(
+                            "
+"
+                        )
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     fn arithmetic_state_replacement(
         &self,
         it: &oxc_ast::ast::ForStatement<'_>,
@@ -2361,6 +4587,30 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_binary_expression(&mut self, it: &oxc_ast::ast::BinaryExpression<'a>) {
+        if matches!(it.operator.as_str(), "==" | "===" | "!=" | "!==") {
+            let left_reference =
+                reference_identity(&it.left, self.scoping, self.reference_identity_tables);
+            let right_reference =
+                reference_identity(&it.right, self.scoping, self.reference_identity_tables);
+            if let (Some((left_symbol, left_identity)), Some((right_symbol, right_identity))) =
+                (left_reference, right_reference)
+            {
+                if left_symbol == right_symbol {
+                    let equal = left_identity == right_identity;
+                    let value = if matches!(it.operator.as_str(), "==" | "===") {
+                        equal
+                    } else {
+                        !equal
+                    };
+                    self.push(
+                        it.span,
+                        if value { "true" } else { "false" }.to_string(),
+                        "reference_identity_compare",
+                    );
+                    return;
+                }
+            }
+        }
         if let (Some(left), Some(right)) = (eval(&it.left), eval(&it.right)) {
             if let Some(value) = eval_binary(it.operator.as_str(), left, right) {
                 if let Some(text) = value.render() {
@@ -2417,6 +4667,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
+        if let Some(text) = self.reference_state_replacement(it) {
+            self.push(it.span, text, "reference_state_unflatten");
+            return;
+        }
         if let Some((text, proof)) = self.arithmetic_state_replacement(it) {
             self.push_arithmetic(it.span, text, proof);
             return;
@@ -2448,13 +4702,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_static_member_expression(&mut self, it: &StaticMemberExpression<'a>) {
         if !it.optional {
             if let Some(symbol) = symbol_of(self.scoping, &it.object) {
-                if let Some(ProxyProperty::String(value)) = self
+                if let Some(ProxyProperty::Literal(value)) = self
                     .proxies
                     .get(&symbol)
                     .and_then(|object| object.properties.get(it.property.name.as_str()))
                 {
-                    if let Ok(text) = serde_json::to_string(value) {
-                        self.push(it.span, text, "proxy_string");
+                    if let Some(text) = value.render() {
+                        self.push(it.span, text, proxy_literal_kind(value));
                         return;
                     }
                 }
@@ -2467,13 +4721,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         if !it.optional {
             if let Some(Value::String(property)) = eval(&it.expression) {
                 if let Some(symbol) = symbol_of(self.scoping, &it.object) {
-                    if let Some(ProxyProperty::String(value)) = self
+                    if let Some(ProxyProperty::Literal(value)) = self
                         .proxies
                         .get(&symbol)
                         .and_then(|object| object.properties.get(&property))
                     {
-                        if let Ok(text) = serde_json::to_string(value) {
-                            self.push(it.span, text, "proxy_string");
+                        if let Some(text) = value.render() {
+                            self.push(it.span, text, proxy_literal_kind(value));
                             return;
                         }
                     }
@@ -2509,6 +4763,31 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
 
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
         if !it.optional && !it.arguments.iter().any(Argument::is_spread) {
+            if let Some(symbol) = symbol_of(self.scoping, &it.callee) {
+                if let Some(dispatcher) = self.selector_dispatchers.get(&symbol) {
+                    if let Some(selector) = it.arguments.first().and_then(argument_integer) {
+                        if let Some(return_span) = dispatcher.returns.get(&selector) {
+                            let params = dispatcher.params.join(", ");
+                            let args = it
+                                .arguments
+                                .iter()
+                                .map(|argument| fragment(self.source, argument.span()))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let returned = fragment(self.source, *return_span);
+                            self.push(
+                                it.span,
+                                format!("(function({params}){{return ({returned});}})({args})"),
+                                "selector_dispatch_specialize",
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !it.optional && !it.arguments.iter().any(Argument::is_spread) {
             if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
                 if let Some(ProxyProperty::Call { arity }) = self
                     .proxies
@@ -2525,6 +4804,65 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                         self.push(it.span, format!("((0, ({callee})))({args})"), "proxy_call");
                         return;
                     }
+                }
+            }
+        }
+
+        if !it.optional && it.arguments.len() == 1 && !it.arguments.iter().any(Argument::is_spread)
+        {
+            if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
+                if let Some(ProxyProperty::StaticMember { property }) = self
+                    .proxies
+                    .get(&symbol)
+                    .and_then(|object| object.properties.get(&key))
+                {
+                    let object = fragment(self.source, it.arguments[0].span());
+                    self.push(
+                        it.span,
+                        format!("(({object}).{property})"),
+                        "proxy_static_member",
+                    );
+                    return;
+                }
+            }
+        }
+
+        if !it.optional && it.arguments.len() == 2 && !it.arguments.iter().any(Argument::is_spread)
+        {
+            if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
+                if let Some(ProxyProperty::ComputedMember) = self
+                    .proxies
+                    .get(&symbol)
+                    .and_then(|object| object.properties.get(&key))
+                {
+                    let object = fragment(self.source, it.arguments[0].span());
+                    let property = fragment(self.source, it.arguments[1].span());
+                    self.push(
+                        it.span,
+                        format!("(({object})[{property}])"),
+                        "proxy_computed_member",
+                    );
+                    return;
+                }
+            }
+        }
+
+        if !it.optional && it.arguments.len() == 1 && !it.arguments.iter().any(Argument::is_spread)
+        {
+            if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
+                if let Some(ProxyProperty::Unary { operator }) = self
+                    .proxies
+                    .get(&symbol)
+                    .and_then(|object| object.properties.get(&key))
+                {
+                    let argument = fragment(self.source, it.arguments[0].span());
+                    let text = if operator == "void" {
+                        format!("(void ({argument}))")
+                    } else {
+                        format!("({operator}({argument}))")
+                    };
+                    self.push(it.span, text, "proxy_unary");
+                    return;
                 }
             }
         }
@@ -2548,19 +4886,105 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 }
             }
         }
+        if !it.optional && !it.arguments.iter().any(Argument::is_spread) {
+            if let Some(symbol) = symbol_of(self.scoping, &it.callee) {
+                if let Some(function) = self.pure_functions.get(&symbol) {
+                    if it.arguments.len() == function.arity {
+                        let values = it
+                            .arguments
+                            .iter()
+                            .map(eval_static_argument)
+                            .collect::<Option<Vec<_>>>();
+                        if let Some(values) = values {
+                            if let Some(text) = function
+                                .expression
+                                .eval(&values)
+                                .and_then(|value| value.render())
+                            {
+                                self.push(it.span, text, "pure_function_eval");
+                                walk::walk_call_expression(self, it);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(symbol) = symbol_of(self.scoping, &it.callee) {
             if let Some(decoder) = self.decoders.get(&symbol) {
-                if let Some(raw) = it.arguments.first().and_then(argument_integer) {
-                    if let Some(text) = decoder.value_for_raw(raw).and_then(|value| value.render())
-                    {
-                        self.push(it.span, text, "string_array_decode");
-                        walk::walk_call_expression(self, it);
-                        return;
+                if let Some(argument) = it.arguments.first() {
+                    if let Some(raw) = argument_integer(argument) {
+                        if let Some(text) =
+                            decoder.value_for_raw(raw).and_then(|value| value.render())
+                        {
+                            self.push(it.span, text, "string_array_decode");
+                            walk::walk_call_expression(self, it);
+                            return;
+                        }
+                    } else if let Argument::ConditionalExpression(conditional) = argument {
+                        let consequent = expression_integer(&conditional.consequent)
+                            .and_then(|raw| decoder.value_for_raw(raw))
+                            .and_then(|value| value.render());
+                        let alternate = expression_integer(&conditional.alternate)
+                            .and_then(|raw| decoder.value_for_raw(raw))
+                            .and_then(|value| value.render());
+                        if let (Some(consequent), Some(alternate)) = (consequent, alternate) {
+                            let test = fragment(self.source, conditional.test.span());
+                            self.push(
+                                it.span,
+                                format!("(({}) ? ({}) : ({}))", test, consequent, alternate),
+                                "string_array_decode",
+                            );
+                            // The replacement spans the whole call. Revisit its
+                            // copied test expression on the next fixed-point
+                            // iteration instead of creating overlapping edits.
+                            return;
+                        }
                     }
                 }
             }
         }
         walk::walk_call_expression(self, it);
+    }
+}
+
+fn eval_static_argument(arg: &Argument<'_>) -> Option<Value> {
+    match arg {
+        Argument::StringLiteral(v) => Some(Value::String(v.value.to_string())),
+        Argument::NumericLiteral(v) => Some(Value::Number(v.value)),
+        Argument::BooleanLiteral(v) => Some(Value::Bool(v.value)),
+        Argument::NullLiteral(_) => Some(Value::Null),
+        Argument::TemplateLiteral(v) if v.expressions.is_empty() => v
+            .quasis
+            .first()
+            .map(|q| Value::String(q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string())),
+        Argument::ParenthesizedExpression(v) => eval(&v.expression),
+        Argument::UnaryExpression(v) => eval_unary(v),
+        Argument::BinaryExpression(v) => {
+            eval_binary(v.operator.as_str(), eval(&v.left)?, eval(&v.right)?)
+        }
+        Argument::LogicalExpression(v) => eval_logical(v),
+        Argument::ConditionalExpression(v) => {
+            let test = known_bool(&v.test)?;
+            eval(if test { &v.consequent } else { &v.alternate })
+        }
+        _ => None,
+    }
+}
+
+fn expression_integer(expr: &Expression<'_>) -> Option<i64> {
+    let Value::Number(value) = eval(expr)? else {
+        return None;
+    };
+    if value.is_finite()
+        && value.fract() == 0.0
+        && value >= i64::MIN as f64
+        && value <= i64::MAX as f64
+    {
+        Some(value as i64)
+    } else {
+        None
     }
 }
 
@@ -2586,6 +5010,33 @@ fn argument_integer(arg: &Argument<'_>) -> Option<i64> {
     }
 }
 
+fn js_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || byte >= 0x80
+}
+
+fn needs_lexical_separator(left: u8, right: u8) -> bool {
+    (js_word_byte(left) && js_word_byte(right))
+        || (left == b'+' && right == b'+')
+        || (left == b'-' && right == b'-')
+        || (left == b'/' && matches!(right, b'/' | b'*'))
+        || (left.is_ascii_digit() && right == b'.')
+}
+
+fn append_with_safe_boundary(out: &mut String, piece: &str) {
+    if piece.is_empty() {
+        return;
+    }
+    if let (Some(left), Some(right)) = (
+        out.as_bytes().last().copied(),
+        piece.as_bytes().first().copied(),
+    ) {
+        if needs_lexical_separator(left, right) {
+            out.push(' ');
+        }
+    }
+    out.push_str(piece);
+}
+
 fn apply(
     source: &str,
     mut replacements: Vec<Replacement>,
@@ -2608,17 +5059,21 @@ fn apply(
         }
         selected.push(candidate);
     }
-    selected.sort_by(|a, b| b.start.cmp(&a.start));
+    selected.sort_by(|a, b| a.start.cmp(&b.start));
 
-    let mut out = source.to_string();
+    let mut out = String::with_capacity(source.len());
+    let mut cursor = 0usize;
     for mut replacement in selected {
-        out.replace_range(replacement.start..replacement.end, &replacement.text);
+        append_with_safe_boundary(&mut out, &source[cursor..replacement.start]);
+        append_with_safe_boundary(&mut out, &replacement.text);
+        cursor = replacement.end;
         counts.bump(replacement.kind);
         if let Some(mut proof) = replacement.arithmetic_state_proof.take() {
             proof.iteration = iteration;
             arithmetic_state_proofs.push(proof);
         }
     }
+    append_with_safe_boundary(&mut out, &source[cursor..]);
     out
 }
 
@@ -2650,13 +5105,35 @@ fn transform_once(
     let scoping = semantic.scoping();
 
     let arrays = top_level_arrays(&program);
-    let functions = top_level_functions(&program);
-    let (decoders, protected_spans) = detect_decoders(source, &functions, &program, scoping);
+    let array_infos = decoder_static_arrays(&program, scoping);
+    let direct_functions = all_functions(&program);
+    let functions = all_function_declarations(&program, scoping);
+    let reference_spans = collect_reference_spans(&program);
+    let (mut decoders, mut protected_spans, rotation_replacements) =
+        detect_decoders(source, &functions, &program, scoping);
+    for (symbol, decoder) in detect_direct_table_decoders(
+        source,
+        &direct_functions,
+        &array_infos,
+        scoping,
+        &reference_spans,
+    ) {
+        decoders.entry(symbol).or_insert(decoder);
+    }
     let constants = collect_const_values(&program, scoping);
     let shorthand_spans = collect_shorthand_spans(&program);
     let proxies = collect_proxy_objects(&program, scoping);
+    let pure_functions = collect_pure_functions(&program, scoping);
+    let reference_identity_tables =
+        detect_reference_identity_tables(source, scoping, &reference_spans);
+    protected_spans.extend(
+        reference_identity_tables
+            .values()
+            .map(|table| (table.construction_start, table.construction_end)),
+    );
+    let stable_var_numbers = collect_stable_var_numbers(&program, scoping);
+    let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
     let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
-    let reference_spans = collect_reference_spans(&program);
 
     let mut collector = Collector {
         source,
@@ -2666,11 +5143,14 @@ fn transform_once(
         constants: &constants,
         shorthand_spans: &shorthand_spans,
         proxies: &proxies,
+        pure_functions: &pure_functions,
+        reference_identity_tables: &reference_identity_tables,
+        selector_dispatchers: &selector_dispatchers,
         dispatch_orders: &dispatch_orders,
         zero_counters: &zero_counters,
         reference_spans: &reference_spans,
         protected_spans: &protected_spans,
-        replacements: Vec::new(),
+        replacements: rotation_replacements,
     };
     collector.visit_program(&program);
     if collector.replacements.is_empty() {

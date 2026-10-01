@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -35,6 +36,31 @@ CASES = [
         ['console.log("cookie", "reload")'],
     ),
     (
+        "direct-rotated-string-array",
+        ROOT / "corpus/generated/reversible-obfuscation/direct-rotated-string-array.js",
+        ['"44close"', '"11cookie"', "return alias1(index)"],
+    ),
+    (
+        "formatted-base64-string-array",
+        ROOT / "corpus/generated/reversible-obfuscation/formatted-base64-string-array.js",
+        ['console.log("cookie", "reload")'],
+    ),
+    (
+        "token-boundaries",
+        ROOT / "corpus/generated/reversible-obfuscation/token-boundaries.js",
+        ["return false", "return true", "throw true"],
+    ),
+    (
+        "proxy-literals-unary",
+        ROOT / "corpus/generated/reversible-obfuscation/proxy-literals-unary.js",
+        ['"visible"', "42", "true", "null", "void 0", "void (bump())"],
+    ),
+    (
+        "proxy-members",
+        ROOT / "corpus/generated/reversible-obfuscation/proxy-members.js",
+        ["((makeTarget()).value)", "((makeTarget())[makeKey()])"],
+    ),
+    (
         "safe-mix",
         ROOT / "corpus/generated/reversible-obfuscation/safe-mix.js",
         ['"hello, world"', '"beta"', "console.log", "seq"],
@@ -58,7 +84,7 @@ CASES = [
     (
         "proxy-calls",
         ROOT / "corpus/generated/reversible-obfuscation/proxy-calls.js",
-        ["detached", "(0, add)(20, 22)", "(0, holder.method)()"],
+        ["detached", "((0, (add)))(20, 22)", "((0, (holder.method)))()"],
     ),
     (
         "ordered-switch",
@@ -128,11 +154,45 @@ def main():
             assert before == after, (name, before, after)
 
             text = out.read_text()
+            compact_text = re.sub(r"\s+", "", text)
             for needle in needles:
-                assert needle in text, (name, needle, text[:2000])
+                compact_needle = re.sub(r"\s+", "", needle)
+                assert compact_needle in compact_text, (name, needle, text[:2000])
 
             meta = json.loads(report.read_text())
             assert meta["schema"] == "js-safe-deobfuscate/v0"
+            assert meta["safe_static_only"] is True
+            assert meta["presentation_formatted"] is False
+            assert meta["runtime_semantics_preserved_by_design"] is True
+            if name in {
+                "rotated-base64-string-array",
+                "direct-rotated-string-array",
+                "formatted-base64-string-array",
+            }:
+                assert meta["transforms"].get("string_array_decode", 0) >= 2, meta
+                assert meta["transforms"].get("materialize_decoder_rotation", 0) >= 1, meta
+                assert meta["transforms"].get("remove_decoder_rotation_iife", 0) >= 1, meta
+            if name == "direct-rotated-string-array":
+                # The unresolved identifier-argument call remains executable after
+                # the runtime rotation IIFE has been eliminated.
+                assert "return alias1(index)" in text, text
+                assert "while (true)" not in text, text
+            if name == "token-boundaries":
+                # These merged forms are valid JavaScript identifiers, so a
+                # syntax check alone cannot detect the semantic corruption.
+                assert "returnfalse" not in text, text
+                assert "returntrue" not in text, text
+                assert "throwtrue" not in text, text
+                assert "return false" in text, text
+                assert "return true" in text, text
+                assert "throw true" in text, text
+            if name == "proxy-literals-unary":
+                assert meta["transforms"].get("proxy_literal", 0) >= 4, meta
+                assert meta["transforms"].get("proxy_string", 0) >= 1, meta
+                assert meta["transforms"].get("proxy_unary", 0) >= 4, meta
+            if name == "proxy-members":
+                assert meta["transforms"].get("proxy_static_member", 0) >= 2, meta
+                assert meta["transforms"].get("proxy_computed_member", 0) >= 2, meta
             if name == "proxy-calls":
                 assert meta["transforms"].get("proxy_call", 0) >= 3, meta
                 assert meta["transforms"].get("proxy_binary", 0) >= 1, meta
@@ -163,9 +223,76 @@ def main():
         assert totals.get("const_propagate", 0) >= 4, totals
         assert totals.get("proxy_binary", 0) >= 5, totals
         assert totals.get("proxy_string", 0) >= 5, totals
+        assert totals.get("proxy_literal", 0) >= 4, totals
+        assert totals.get("proxy_unary", 0) >= 4, totals
+        assert totals.get("proxy_static_member", 0) >= 2, totals
+        assert totals.get("proxy_computed_member", 0) >= 2, totals
         assert totals.get("proxy_call", 0) >= 3, totals
         assert totals.get("ordered_switch_unflatten", 0) >= 1, totals
         assert totals.get("arithmetic_state_unflatten", 0) >= 1, totals
+
+        duplicate_source = ROOT / "corpus/generated/reversible-obfuscation/duplicate-scope-decoder-negative.js"
+        duplicate_out = td / "duplicate-scope-decoder-negative.js"
+        duplicate_report = td / "duplicate-scope-decoder-negative.json"
+        before = node_stdout(duplicate_source)
+        cp = subprocess.run(
+            [str(BIN), str(duplicate_source), str(duplicate_out), "--report", str(duplicate_report)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(
+                f"duplicate-scope decoder safety deobfuscation failed:\n{cp.stdout}\n{cp.stderr}"
+            )
+        assert node_stdout(duplicate_out) == before
+        duplicate_meta = json.loads(duplicate_report.read_text())
+        assert duplicate_meta["transforms"].get("string_array_decode", 0) == 0, duplicate_meta
+        print("duplicate-scope-decoder-safety", duplicate_meta["transforms"])
+
+        mutable_alias_source = ROOT / "corpus/generated/reversible-obfuscation/mutable-decoder-alias-safety.js"
+        mutable_alias_out = td / "mutable-decoder-alias-safety.js"
+        mutable_alias_report = td / "mutable-decoder-alias-safety.json"
+        before = node_stdout(mutable_alias_source)
+        cp = subprocess.run(
+            [str(BIN), str(mutable_alias_source), str(mutable_alias_out), "--report", str(mutable_alias_report)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(
+                f"mutable decoder alias safety deobfuscation failed:\n{cp.stdout}\n{cp.stderr}"
+            )
+        assert node_stdout(mutable_alias_out) == before
+        mutable_alias_meta = json.loads(mutable_alias_report.read_text())
+        assert mutable_alias_meta["transforms"].get("string_array_decode", 0) == 0, mutable_alias_meta
+        print("mutable-decoder-alias-safety", mutable_alias_meta["transforms"])
+
+        guarded_source = ROOT / "corpus/generated/reversible-obfuscation/source-sensitive-base64-negative.js"
+        guarded_out = td / "source-sensitive-base64-negative.js"
+        guarded_report = td / "source-sensitive-base64-negative.json"
+        before = node_stdout(guarded_source)
+        cp = subprocess.run(
+            [str(BIN), str(guarded_source), str(guarded_out), "--report", str(guarded_report)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(
+                f"source-sensitive base64 safety deobfuscation failed:\n{cp.stdout}\n{cp.stderr}"
+            )
+        assert node_stdout(guarded_out) == before
+        guarded_meta = json.loads(guarded_report.read_text())
+        assert guarded_meta["transforms"].get("string_array_decode", 0) == 0, guarded_meta
+        print("source-sensitive-base64-safety", guarded_meta["transforms"])
 
         safety_source = ROOT / "corpus/generated/reversible-obfuscation/proxy-safety.js"
         safety_out = td / "proxy-safety.js"
