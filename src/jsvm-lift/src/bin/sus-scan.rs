@@ -362,7 +362,43 @@ impl Collector<'_> {
         );
     }
 
+    fn record_array_rotation(&mut self, it: &CallExpression<'_>) {
+        let Expression::StaticMemberExpression(outer) = &it.callee else {
+            return;
+        };
+        if outer.optional || outer.property.name.as_str() != "push" || it.arguments.len() != 1 {
+            return;
+        }
+        let Some(subject) = Self::identifier(&outer.object) else {
+            return;
+        };
+        let Argument::CallExpression(inner_call) = &it.arguments[0] else {
+            return;
+        };
+        if inner_call.optional || !inner_call.arguments.is_empty() {
+            return;
+        }
+        let Expression::StaticMemberExpression(inner) = &inner_call.callee else {
+            return;
+        };
+        if inner.optional || inner.property.name.as_str() != "shift" {
+            return;
+        }
+        if Self::identifier(&inner.object).as_deref() != Some(subject.as_str()) {
+            return;
+        }
+
+        self.push(
+            "array_rotation",
+            8,
+            it.span,
+            Some(subject),
+            "same-array push(shift()) rotation",
+        );
+    }
+
     fn record_call(&mut self, it: &CallExpression<'_>) {
+        self.record_array_rotation(it);
         let callee = self.fragment(it.callee.span()).trim().to_string();
         let lower = callee.to_ascii_lowercase();
 

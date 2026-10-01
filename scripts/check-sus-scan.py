@@ -37,13 +37,15 @@ def main():
     )
     report = json.loads(cp.stdout)
     assert report["schema"] == "js-sus-scan/v1"
-    assert report["files_scanned"] == 4, report["files_scanned"]
+    assert report["files_scanned"] == 6, report["files_scanned"]
 
     by_name = {Path(item["input"]).name: item for item in report["files"]}
     dense = by_name["dense-obfuscation.js"]
     clean = by_name["clean-control.js"]
     asset = by_name["asset-control.js"]
     long_string = by_name["long-string-control.js"]
+    rotation = by_name["array-rotation.js"]
+    rotation_control = by_name["array-rotation-control.js"]
 
     assert dense["clusters"], dense
     assert dense["top_score"] >= 30, dense["top_score"]
@@ -74,11 +76,28 @@ def main():
     assert long_string["top_score"] == 0, long_string["top_score"]
     assert long_string["signal_kinds"].get("string_plus_chain", 0) == 1, long_string["signal_kinds"]
 
+    assert rotation["clusters"], rotation
+    assert rotation["signal_kinds"].get("array_rotation", 0) == 2, rotation["signal_kinds"]
+    rotation_signals = [
+        signal
+        for signal in rotation["signals"]
+        if signal["kind"] == "array_rotation"
+    ]
+    assert all(signal.get("subject") == "table" for signal in rotation_signals), rotation_signals
+
+    # A single ordinary queue rotation is still structurally the same operation,
+    # but weight 8 intentionally leaves it below the default cluster threshold.
+    assert rotation_control["clusters"] == [], rotation_control
+    assert rotation_control["signal_kinds"].get("array_rotation", 0) == 1, rotation_control["signal_kinds"]
+
     text = run(BIN, FIXTURES / "dense-obfuscation.js").stdout
     assert "SUS summary:" in text
     assert "api_string_table" in text
     assert "base64" in text
     assert "repeated=[" in text
+
+    rotation_text = run(BIN, FIXTURES / "array-rotation.js").stdout
+    assert "array_rotation" in rotation_text
 
     print(
         "PASS: sus-scan dense fixture ranked",
