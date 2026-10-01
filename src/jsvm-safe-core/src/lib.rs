@@ -8,7 +8,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_semantic::{ReferenceId, Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
-use oxc_syntax::symbol::SymbolId;
+use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -678,6 +678,433 @@ fn top_level_functions(program: &oxc_ast::ast::Program<'_>) -> Vec<FnInfo> {
         });
     }
     out
+}
+
+#[derive(Default)]
+struct StableVarNumberCollector {
+    candidates: HashMap<SymbolId, i64>,
+}
+
+impl<'a> Visit<'a> for StableVarNumberCollector {
+    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        if it.kind == VariableDeclarationKind::Var {
+            for declaration in &it.declarations {
+                let BindingPattern::BindingIdentifier(id) = &declaration.id else {
+                    continue;
+                };
+                let Some(symbol) = id.symbol_id.get() else {
+                    continue;
+                };
+                let Some(init) = &declaration.init else {
+                    continue;
+                };
+                let Some(Value::Number(number)) = eval(init) else {
+                    continue;
+                };
+                if !number.is_finite()
+                    || number.fract() != 0.0
+                    || number < i64::MIN as f64
+                    || number > i64::MAX as f64
+                {
+                    continue;
+                }
+                self.candidates.insert(symbol, number as i64);
+            }
+        }
+        walk::walk_variable_declaration(self, it);
+    }
+}
+
+fn collect_stable_var_numbers(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> HashMap<SymbolId, i64> {
+    let mut collector = StableVarNumberCollector::default();
+    collector.visit_program(program);
+    collector.candidates.retain(|symbol, _| {
+        scoping
+            .get_resolved_reference_ids(*symbol)
+            .iter()
+            .all(|reference_id| {
+                let reference = scoping.get_reference(*reference_id);
+                !reference.is_write() && !reference.flags().is_member_write_target()
+            })
+    });
+    collector.candidates
+}
+
+fn expression_integer(expr: &Expression<'_>) -> Option<i64> {
+    let Value::Number(number) = eval(expr)? else {
+        return None;
+    };
+    if !number.is_finite()
+        || number.fract() != 0.0
+        || number < i64::MIN as f64
+        || number > i64::MAX as f64
+    {
+        return None;
+    }
+    Some(number as i64)
+}
+
+fn selector_identifier_symbol(expr: &Expression<'_>, scoping: &Scoping) -> Option<SymbolId> {
+    match expr {
+        Expression::Identifier(_) => symbol_of(scoping, expr),
+        Expression::ParenthesizedExpression(parenthesized) => {
+            selector_identifier_symbol(&parenthesized.expression, scoping)
+        }
+        _ => None,
+    }
+}
+
+fn selector_test_value(
+    expr: &Expression<'_>,
+    selector_symbol: SymbolId,
+    selector_value: i64,
+    scoping: &Scoping,
+    stable_var_numbers: &HashMap<SymbolId, i64>,
+) -> Option<bool> {
+    match expr {
+        Expression::ParenthesizedExpression(parenthesized) => selector_test_value(
+            &parenthesized.expression,
+            selector_symbol,
+            selector_value,
+            scoping,
+            stable_var_numbers,
+        ),
+        Expression::UnaryExpression(unary) if unary.operator.as_str() == "!" => {
+            selector_test_value(
+                &unary.argument,
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            )
+            .map(|value| !value)
+        }
+        Expression::LogicalExpression(logical) => {
+            let left = selector_test_value(
+                &logical.left,
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            );
+            let right = selector_test_value(
+                &logical.right,
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            );
+            match logical.operator.as_str() {
+                "&&" => match (left, right) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                },
+                "||" => match (left, right) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        Expression::BinaryExpression(binary)
+            if matches!(binary.operator.as_str(), "==" | "===" | "!=" | "!==") =>
+        {
+            let left_symbol = selector_identifier_symbol(&binary.left, scoping);
+            let right_symbol = selector_identifier_symbol(&binary.right, scoping);
+
+            let other = if left_symbol == Some(selector_symbol) {
+                Some(&binary.right)
+            } else if right_symbol == Some(selector_symbol) {
+                Some(&binary.left)
+            } else {
+                None
+            }?;
+
+            let equal = if let Some(number) = expression_integer(other) {
+                selector_value == number
+            } else if let Some(symbol) = selector_identifier_symbol(other, scoping) {
+                let initialized_value = *stable_var_numbers.get(&symbol)?;
+                if selector_value == initialized_value {
+                    // A var binding is undefined before its initializer executes
+                    // and has the proven number afterward. Equality to that exact
+                    // number therefore depends on runtime ordering.
+                    return None;
+                }
+                false
+            } else {
+                return None;
+            };
+
+            Some(if matches!(binary.operator.as_str(), "==" | "===") {
+                equal
+            } else {
+                !equal
+            })
+        }
+        _ => known_bool(expr),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SelectorFlow {
+    Continue,
+    Return(Span),
+}
+
+fn selector_return_expression(
+    expr: &Expression<'_>,
+    selector_symbol: SymbolId,
+    selector_value: i64,
+    scoping: &Scoping,
+    stable_var_numbers: &HashMap<SymbolId, i64>,
+) -> Option<Span> {
+    match expr {
+        Expression::ConditionalExpression(conditional) => {
+            let test = selector_test_value(
+                &conditional.test,
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            )?;
+            selector_return_expression(
+                if test {
+                    &conditional.consequent
+                } else {
+                    &conditional.alternate
+                },
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            )
+        }
+        _ => Some(expr.span()),
+    }
+}
+
+fn selector_statement_flow(
+    statement: &Statement<'_>,
+    selector_symbol: SymbolId,
+    selector_value: i64,
+    scoping: &Scoping,
+    stable_var_numbers: &HashMap<SymbolId, i64>,
+) -> Option<SelectorFlow> {
+    match statement {
+        Statement::BlockStatement(block) => selector_statements_flow(
+            &block.body,
+            selector_symbol,
+            selector_value,
+            scoping,
+            stable_var_numbers,
+        ),
+        Statement::IfStatement(branch) => {
+            let test = selector_test_value(
+                &branch.test,
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            )?;
+            if test {
+                selector_statement_flow(
+                    &branch.consequent,
+                    selector_symbol,
+                    selector_value,
+                    scoping,
+                    stable_var_numbers,
+                )
+            } else if let Some(alternate) = &branch.alternate {
+                selector_statement_flow(
+                    alternate,
+                    selector_symbol,
+                    selector_value,
+                    scoping,
+                    stable_var_numbers,
+                )
+            } else {
+                Some(SelectorFlow::Continue)
+            }
+        }
+        Statement::ReturnStatement(ret) => {
+            let expression = ret.argument.as_ref()?;
+            let span = selector_return_expression(
+                expression,
+                selector_symbol,
+                selector_value,
+                scoping,
+                stable_var_numbers,
+            )?;
+            Some(SelectorFlow::Return(span))
+        }
+        Statement::EmptyStatement(_) => Some(SelectorFlow::Continue),
+        _ => None,
+    }
+}
+
+fn selector_statements_flow(
+    statements: &[Statement<'_>],
+    selector_symbol: SymbolId,
+    selector_value: i64,
+    scoping: &Scoping,
+    stable_var_numbers: &HashMap<SymbolId, i64>,
+) -> Option<SelectorFlow> {
+    for statement in statements {
+        match selector_statement_flow(
+            statement,
+            selector_symbol,
+            selector_value,
+            scoping,
+            stable_var_numbers,
+        )? {
+            SelectorFlow::Continue => {}
+            returned @ SelectorFlow::Return(_) => return Some(returned),
+        }
+    }
+    Some(SelectorFlow::Continue)
+}
+
+#[derive(Default)]
+struct SelectorLiteralCollector<'c> {
+    scoping: Option<&'c Scoping>,
+    selector_symbol: Option<SymbolId>,
+    values: HashSet<i64>,
+}
+
+impl<'a> Visit<'a> for SelectorLiteralCollector<'_> {
+    fn visit_function(&mut self, _function: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
+        // Do not collect selector tests from nested functions.
+    }
+
+    fn visit_binary_expression(&mut self, binary: &oxc_ast::ast::BinaryExpression<'a>) {
+        if matches!(binary.operator.as_str(), "==" | "===" | "!=" | "!==") {
+            let Some(scoping) = self.scoping else {
+                return;
+            };
+            let Some(selector_symbol) = self.selector_symbol else {
+                return;
+            };
+            let left_symbol = selector_identifier_symbol(&binary.left, scoping);
+            let right_symbol = selector_identifier_symbol(&binary.right, scoping);
+            let literal = if left_symbol == Some(selector_symbol) {
+                expression_integer(&binary.right)
+            } else if right_symbol == Some(selector_symbol) {
+                expression_integer(&binary.left)
+            } else {
+                None
+            };
+            if let Some(literal) = literal {
+                self.values.insert(literal);
+            }
+        }
+        walk::walk_binary_expression(self, binary);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SelectorDispatcher {
+    params: Vec<String>,
+    returns: HashMap<i64, Span>,
+}
+
+struct SelectorDispatcherCollector<'c> {
+    scoping: &'c Scoping,
+    stable_var_numbers: &'c HashMap<SymbolId, i64>,
+    dispatchers: HashMap<SymbolId, SelectorDispatcher>,
+}
+
+impl<'a> Visit<'a> for SelectorDispatcherCollector<'_> {
+    fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        if !function.r#async && !function.generator {
+            if let (Some(id), Some(body)) = (&function.id, &function.body) {
+                if let Some(function_symbol) = id.symbol_id.get() {
+                    let binding_is_stable = self
+                        .scoping
+                        .get_resolved_reference_ids(function_symbol)
+                        .iter()
+                        .all(|reference_id| {
+                            let reference = self.scoping.get_reference(*reference_id);
+                            !reference.is_write() && !reference.flags().is_member_write_target()
+                        });
+
+                    let params = function
+                        .params
+                        .items
+                        .iter()
+                        .map(|param| match &param.pattern {
+                            BindingPattern::BindingIdentifier(id) => {
+                                Some((id.name.to_string(), id.symbol_id.get()?))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>();
+
+                    if binding_is_stable && body.directives.is_empty() {
+                        if let Some(params) = params {
+                            if let Some((_, selector_symbol)) = params.first() {
+                                let mut literals = SelectorLiteralCollector {
+                                    scoping: Some(self.scoping),
+                                    selector_symbol: Some(*selector_symbol),
+                                    values: HashSet::new(),
+                                };
+                                for statement in &body.statements {
+                                    literals.visit_statement(statement);
+                                }
+
+                                let mut returns = HashMap::new();
+                                for value in literals.values {
+                                    if let Some(SelectorFlow::Return(span)) =
+                                        selector_statements_flow(
+                                            &body.statements,
+                                            *selector_symbol,
+                                            value,
+                                            self.scoping,
+                                            self.stable_var_numbers,
+                                        )
+                                    {
+                                        returns.insert(value, span);
+                                    }
+                                }
+
+                                if !returns.is_empty() {
+                                    self.dispatchers.insert(
+                                        function_symbol,
+                                        SelectorDispatcher {
+                                            params: params
+                                                .into_iter()
+                                                .map(|(name, _)| name)
+                                                .collect(),
+                                            returns,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_function(self, function, flags);
+    }
+}
+
+fn collect_selector_dispatchers(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+    stable_var_numbers: &HashMap<SymbolId, i64>,
+) -> HashMap<SymbolId, SelectorDispatcher> {
+    let mut collector = SelectorDispatcherCollector {
+        scoping,
+        stable_var_numbers,
+        dispatchers: HashMap::new(),
+    };
+    collector.visit_program(program);
+    collector.dispatchers
 }
 
 fn parse_i64_literal(text: &str) -> Option<i64> {
@@ -1599,6 +2026,7 @@ struct Collector<'s, 'c> {
     constants: &'c HashMap<SymbolId, ConstBinding>,
     shorthand_spans: &'c HashSet<(u32, u32)>,
     proxies: &'c HashMap<SymbolId, ProxyObject>,
+    selector_dispatchers: &'c HashMap<SymbolId, SelectorDispatcher>,
     dispatch_orders: &'c HashMap<SymbolId, Vec<String>>,
     zero_counters: &'c HashSet<SymbolId>,
     reference_spans: &'c HashMap<ReferenceId, Span>,
@@ -2509,6 +2937,31 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
 
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
         if !it.optional && !it.arguments.iter().any(Argument::is_spread) {
+            if let Some(symbol) = symbol_of(self.scoping, &it.callee) {
+                if let Some(dispatcher) = self.selector_dispatchers.get(&symbol) {
+                    if let Some(selector) = it.arguments.first().and_then(argument_integer) {
+                        if let Some(return_span) = dispatcher.returns.get(&selector) {
+                            let params = dispatcher.params.join(", ");
+                            let args = it
+                                .arguments
+                                .iter()
+                                .map(|argument| fragment(self.source, argument.span()))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let returned = fragment(self.source, *return_span);
+                            self.push(
+                                it.span,
+                                format!("(function({params}){{return ({returned});}})({args})"),
+                                "selector_dispatch_specialize",
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !it.optional && !it.arguments.iter().any(Argument::is_spread) {
             if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
                 if let Some(ProxyProperty::Call { arity }) = self
                     .proxies
@@ -2655,6 +3108,8 @@ fn transform_once(
     let constants = collect_const_values(&program, scoping);
     let shorthand_spans = collect_shorthand_spans(&program);
     let proxies = collect_proxy_objects(&program, scoping);
+    let stable_var_numbers = collect_stable_var_numbers(&program, scoping);
+    let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
     let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
     let reference_spans = collect_reference_spans(&program);
 
@@ -2666,6 +3121,7 @@ fn transform_once(
         constants: &constants,
         shorthand_spans: &shorthand_spans,
         proxies: &proxies,
+        selector_dispatchers: &selector_dispatchers,
         dispatch_orders: &dispatch_orders,
         zero_counters: &zero_counters,
         reference_spans: &reference_spans,
