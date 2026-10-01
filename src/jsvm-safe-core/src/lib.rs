@@ -8,7 +8,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_semantic::{ReferenceId, Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
-use oxc_syntax::symbol::SymbolId;
+use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -84,9 +84,9 @@ fn render_number(n: f64) -> String {
 fn same_value(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::String(a), Value::String(b)) => a == b,
-        (Value::Number(a), Value::Number(b)) => {
-            (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
-        }
+        // JavaScript Strict Equality: NaN is never equal to itself, while
+        // +0 and -0 compare equal.
+        (Value::Number(a), Value::Number(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Null, Value::Null) | (Value::Undefined, Value::Undefined) => true,
         _ => false,
@@ -142,7 +142,9 @@ fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
     match op {
         "+" => value.number().map(Value::Number),
         "-" => value.number().map(|x| Value::Number(-x)),
-        "~" => value.number().map(|x| Value::Number((!(x as i32)) as f64)),
+        "~" => value
+            .number()
+            .map(|x| Value::Number((!js_to_int32(x)) as f64)),
         "typeof" => Some(Value::String(
             match value {
                 Value::String(_) => "string",
@@ -155,6 +157,17 @@ fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
         )),
         _ => None,
     }
+}
+
+fn js_to_uint32(n: f64) -> u32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    n.trunc().rem_euclid(4_294_967_296.0) as u32
+}
+
+fn js_to_int32(n: f64) -> i32 {
+    js_to_uint32(n) as i32
 }
 
 fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
@@ -175,23 +188,30 @@ fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
         "/" => Some(Value::Number(left.number()? / right.number()?)),
         "%" => Some(Value::Number(left.number()? % right.number()?)),
         "**" => Some(Value::Number(left.number()?.powf(right.number()?))),
-        "<<" => Some(Value::Number(
-            ((left.number()? as i32) << ((right.number()? as u32) & 31)) as f64,
-        )),
-        ">>" => Some(Value::Number(
-            ((left.number()? as i32) >> ((right.number()? as u32) & 31)) as f64,
-        )),
-        ">>>" => Some(Value::Number(
-            ((left.number()? as u32) >> ((right.number()? as u32) & 31)) as f64,
-        )),
+        "<<" => {
+            let shift = js_to_uint32(right.number()?) & 31;
+            Some(Value::Number(
+                js_to_int32(left.number()?).wrapping_shl(shift) as f64,
+            ))
+        }
+        ">>" => {
+            let shift = js_to_uint32(right.number()?) & 31;
+            Some(Value::Number((js_to_int32(left.number()?) >> shift) as f64))
+        }
+        ">>>" => {
+            let shift = js_to_uint32(right.number()?) & 31;
+            Some(Value::Number(
+                (js_to_uint32(left.number()?) >> shift) as f64,
+            ))
+        }
         "|" => Some(Value::Number(
-            ((left.number()? as i32) | (right.number()? as i32)) as f64,
+            (js_to_int32(left.number()?) | js_to_int32(right.number()?)) as f64,
         )),
         "^" => Some(Value::Number(
-            ((left.number()? as i32) ^ (right.number()? as i32)) as f64,
+            (js_to_int32(left.number()?) ^ js_to_int32(right.number()?)) as f64,
         )),
         "&" => Some(Value::Number(
-            ((left.number()? as i32) & (right.number()? as i32)) as f64,
+            (js_to_int32(left.number()?) & js_to_int32(right.number()?)) as f64,
         )),
         "===" => Some(Value::Bool(same_value(&left, &right))),
         "!==" => Some(Value::Bool(!same_value(&left, &right))),
@@ -282,10 +302,12 @@ struct Replacement {
     arithmetic_state_proof: Option<ArithmeticStateProof>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum DecoderTransform {
     Plain,
     LowerAlphabetBase64Uri,
+    StandardBase64,
+    FixedBase64Alphabet(String),
 }
 
 #[derive(Debug, Clone)]
@@ -302,20 +324,155 @@ impl Decoder {
         if index < 0 || self.values.is_empty() {
             return None;
         }
-        let index = (index as usize).checked_add(rotation)? % self.values.len();
+        let index = index as usize;
+        // Array indexing never wraps. Rotation only maps an already-valid
+        // logical table index onto the physically rotated backing array.
+        // Applying modulo before this bounds check would incorrectly turn an
+        // out-of-range runtime lookup (undefined) into an unrelated entry.
+        if index >= self.values.len() {
+            return None;
+        }
+        let index = index.checked_add(rotation)? % self.values.len();
         let value = self.values.get(index)?.clone();
-        match (self.transform, value) {
+        match (&self.transform, value) {
             (DecoderTransform::Plain, value) => Some(value),
             (DecoderTransform::LowerAlphabetBase64Uri, Value::String(encoded)) => {
                 decode_lower_alphabet_base64_uri(&encoded).map(Value::String)
             }
             (DecoderTransform::LowerAlphabetBase64Uri, _) => None,
+            (DecoderTransform::StandardBase64, Value::String(encoded)) => {
+                decode_standard_base64_latin1(&encoded).map(Value::String)
+            }
+            (DecoderTransform::StandardBase64, _) => None,
+            (DecoderTransform::FixedBase64Alphabet(alphabet), Value::String(encoded)) => {
+                decode_fixed_base64_latin1(&encoded, alphabet).map(Value::String)
+            }
+            // DataDome-style tables intentionally mix encoded strings with
+            // literal numbers, booleans, and null. The runtime decoder only
+            // transforms strings and returns every other table value as-is.
+            (DecoderTransform::FixedBase64Alphabet(_), value) => Some(value),
         }
     }
 
     fn value_for_raw(&self, raw: i64) -> Option<Value> {
         self.value_for_raw_rotated(raw, 0)
     }
+}
+
+fn decode_standard_base64_latin1(input: &str) -> Option<String> {
+    let compact = input
+        .chars()
+        .filter(|ch| !matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0c'))
+        .collect::<String>();
+    if compact.len() % 4 == 1 {
+        return None;
+    }
+
+    let padding = compact.chars().rev().take_while(|ch| *ch == '=').count();
+    if padding > 2 {
+        return None;
+    }
+    if padding > 0 {
+        if compact.len() % 4 != 0 {
+            return None;
+        }
+        if compact[..compact.len() - padding].contains('=') {
+            return None;
+        }
+    } else if compact.contains('=') {
+        return None;
+    }
+
+    decode_base64_latin1(
+        &compact,
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=",
+    )
+}
+
+fn decode_fixed_base64_latin1(input: &str, alphabet: &str) -> Option<String> {
+    let alphabet = alphabet.chars().collect::<Vec<_>>();
+    if alphabet.len() != 65 {
+        return None;
+    }
+    let unique = alphabet.iter().copied().collect::<HashSet<_>>();
+    if unique.len() != 65 {
+        return None;
+    }
+
+    // Match the observed decoder rather than treating the alphabet as a
+    // generic RFC 4648 alphabet: it first strips everything outside this
+    // character class, then decodes in groups of four. Missing charAt()
+    // positions become "", and alphabet.indexOf("") is 0 in JavaScript.
+    let filtered = input
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '='))
+        .collect::<Vec<_>>();
+
+    let mut out = String::with_capacity(((filtered.len() + 3) / 4) * 3);
+    let mut index = 0usize;
+    while index < filtered.len() {
+        let symbol = |offset: usize| -> Option<usize> {
+            match filtered.get(index + offset) {
+                Some(ch) => alphabet.iter().position(|candidate| candidate == ch),
+                None => Some(0),
+            }
+        };
+        let a = symbol(0)?;
+        let b = symbol(1)?;
+        let c = symbol(2)?;
+        let d = symbol(3)?;
+
+        let mut push_code_unit = |value: usize| -> Option<()> {
+            // String.fromCharCode applies ToUint16. These decoder expressions
+            // are small, but mask explicitly so the modeled primitive is exact.
+            out.push(char::from_u32((value & 0xffff) as u32)?);
+            Some(())
+        };
+        push_code_unit((a << 2) | (b >> 4))?;
+        if c != 64 {
+            push_code_unit(((b & 15) << 4) | (c >> 2))?;
+        }
+        if d != 64 {
+            push_code_unit(((c & 3) << 6) | d)?;
+        }
+        index += 4;
+    }
+
+    Some(out)
+}
+
+fn decode_base64_latin1(input: &str, alphabet: &str) -> Option<String> {
+    let alphabet = alphabet.chars().collect::<Vec<_>>();
+    if alphabet.len() != 65 {
+        return None;
+    }
+    let unique = alphabet.iter().copied().collect::<HashSet<_>>();
+    if unique.len() != 65 {
+        return None;
+    }
+
+    let mut bits = 0u32;
+    let mut bit_count = 0u32;
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    for ch in input.chars() {
+        let index = alphabet.iter().position(|candidate| *candidate == ch)?;
+        if index == 64 {
+            break;
+        }
+        bits = (bits << 6) | index as u32;
+        bit_count += 6;
+        while bit_count >= 8 {
+            bit_count -= 8;
+            out.push(((bits >> bit_count) & 0xff) as u8);
+            bits &= if bit_count == 0 {
+                0
+            } else {
+                (1u32 << bit_count) - 1
+            };
+        }
+    }
+
+    Some(out.into_iter().map(char::from).collect())
 }
 
 fn decode_lower_alphabet_base64_uri(input: &str) -> Option<String> {
@@ -577,6 +734,50 @@ fn array_element(el: &ArrayExpressionElement<'_>) -> Option<Value> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct StaticArrayInfo {
+    symbol: SymbolId,
+    name: String,
+    values: Vec<Value>,
+}
+
+#[derive(Default)]
+struct StaticArrayCollector {
+    candidates: Vec<StaticArrayInfo>,
+}
+
+impl<'a> Visit<'a> for StaticArrayCollector {
+    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        for d in &it.declarations {
+            let BindingPattern::BindingIdentifier(id) = &d.id else {
+                continue;
+            };
+            let Some(symbol) = id.symbol_id.get() else {
+                continue;
+            };
+            let Some(Expression::ArrayExpression(arr)) = &d.init else {
+                continue;
+            };
+            let Some(values) = arr
+                .elements
+                .iter()
+                .map(array_element)
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            if !values.is_empty() {
+                self.candidates.push(StaticArrayInfo {
+                    symbol,
+                    name: id.name.to_string(),
+                    values,
+                });
+            }
+        }
+        walk::walk_variable_declaration(self, it);
+    }
+}
+
 fn top_level_arrays(program: &oxc_ast::ast::Program<'_>) -> HashMap<SymbolId, Vec<Value>> {
     let mut out = HashMap::new();
     for stmt in &program.body {
@@ -612,12 +813,90 @@ fn top_level_arrays(program: &oxc_ast::ast::Program<'_>) -> HashMap<SymbolId, Ve
     out
 }
 
+fn decoder_static_arrays(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> Vec<StaticArrayInfo> {
+    let mut collector = StaticArrayCollector::default();
+    collector.visit_program(program);
+    collector.candidates.retain(|candidate| {
+        scoping
+            .get_resolved_reference_ids(candidate.symbol)
+            .iter()
+            .all(|reference_id| {
+                let reference = scoping.get_reference(*reference_id);
+                !reference.is_write() && !reference.flags().is_member_write_target()
+            })
+    });
+    collector.candidates
+}
+
+#[derive(Default)]
+struct DirectCallCounter {
+    count: usize,
+}
+
+impl<'a> Visit<'a> for DirectCallCounter {
+    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+        self.count += 1;
+        walk::walk_call_expression(self, it);
+    }
+
+    fn visit_function(&mut self, _f: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
+        // Nested functions do not execute as part of the candidate decoder
+        // invocation itself, so do not count calls inside them.
+    }
+}
+
+fn direct_body_call_count(body: &oxc_ast::ast::FunctionBody<'_>) -> usize {
+    let mut counter = DirectCallCounter::default();
+    for statement in &body.statements {
+        counter.visit_statement(statement);
+    }
+    counter.count
+}
+
+fn fixed_decoder_control_shape(body: &oxc_ast::ast::FunctionBody<'_>) -> bool {
+    if body.statements.len() != 3 {
+        return false;
+    }
+    let first = matches!(
+        &body.statements[0],
+        Statement::IfStatement(statement)
+            if statement.alternate.is_none()
+                && matches!(&statement.consequent, Statement::ReturnStatement(_))
+    );
+    let second = match &body.statements[1] {
+        Statement::ForStatement(statement) => match &statement.body {
+            Statement::ExpressionStatement(_) => true,
+            // The generic sequence splitter may already have turned the
+            // decoder's six comma-separated loop operations into six
+            // expression statements by the time the literal table becomes
+            // fully static on a later fixed-point iteration.
+            Statement::BlockStatement(block) => {
+                block.body.len() == 6
+                    && block
+                        .body
+                        .iter()
+                        .all(|statement| matches!(statement, Statement::ExpressionStatement(_)))
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    let third = matches!(&body.statements[2], Statement::ReturnStatement(_));
+    first && second && third
+}
+
 #[derive(Debug)]
 struct FnInfo {
     name: String,
     symbol: SymbolId,
     params: Vec<String>,
     span: Span,
+    body_statement_count: usize,
+    direct_call_count: usize,
+    fixed_decoder_control_shape: bool,
     static_arrays: HashMap<String, Vec<Value>>,
 }
 
@@ -674,8 +953,590 @@ fn top_level_functions(program: &oxc_ast::ast::Program<'_>) -> Vec<FnInfo> {
             symbol,
             params,
             span: f.span,
+            body_statement_count: f.body.as_ref().map_or(0, |body| body.statements.len()),
+            direct_call_count: f
+                .body
+                .as_ref()
+                .map_or(0, |body| direct_body_call_count(body)),
+            fixed_decoder_control_shape: f
+                .body
+                .as_ref()
+                .is_some_and(|body| fixed_decoder_control_shape(body)),
             static_arrays,
         });
+    }
+    out
+}
+
+#[derive(Default)]
+struct FnInfoCollector {
+    out: Vec<FnInfo>,
+}
+
+impl<'a> Visit<'a> for FnInfoCollector {
+    fn visit_function(&mut self, f: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        if let Some(id) = &f.id {
+            if let Some(symbol) = id.symbol_id.get() {
+                let params = f
+                    .params
+                    .items
+                    .iter()
+                    .filter_map(|p| match &p.pattern {
+                        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+
+                let mut static_arrays = HashMap::new();
+                if let Some(body) = &f.body {
+                    for stmt in &body.statements {
+                        let Statement::VariableDeclaration(decl) = stmt else {
+                            continue;
+                        };
+                        for d in &decl.declarations {
+                            let BindingPattern::BindingIdentifier(array_id) = &d.id else {
+                                continue;
+                            };
+                            let Some(Expression::ArrayExpression(array)) = &d.init else {
+                                continue;
+                            };
+                            let Some(values) = array
+                                .elements
+                                .iter()
+                                .map(array_element)
+                                .collect::<Option<Vec<_>>>()
+                            else {
+                                continue;
+                            };
+                            if !values.is_empty() {
+                                static_arrays.insert(array_id.name.to_string(), values);
+                            }
+                        }
+                    }
+                }
+
+                self.out.push(FnInfo {
+                    name: id.name.to_string(),
+                    symbol,
+                    params,
+                    span: f.span,
+                    body_statement_count: f.body.as_ref().map_or(0, |body| body.statements.len()),
+                    direct_call_count: f
+                        .body
+                        .as_ref()
+                        .map_or(0, |body| direct_body_call_count(body)),
+                    fixed_decoder_control_shape: f
+                        .body
+                        .as_ref()
+                        .is_some_and(|body| fixed_decoder_control_shape(body)),
+                    static_arrays,
+                });
+            }
+        }
+        walk::walk_function(self, f, flags);
+    }
+}
+
+fn all_functions(program: &oxc_ast::ast::Program<'_>) -> Vec<FnInfo> {
+    let mut collector = FnInfoCollector::default();
+    collector.visit_program(program);
+    collector.out
+}
+
+#[derive(Debug, Clone)]
+enum PureExpr {
+    Value(Value),
+    Param(usize),
+    Unary {
+        operator: String,
+        argument: Box<PureExpr>,
+    },
+    Binary {
+        operator: String,
+        left: Box<PureExpr>,
+        right: Box<PureExpr>,
+    },
+    Logical {
+        operator: String,
+        left: Box<PureExpr>,
+        right: Box<PureExpr>,
+    },
+    Conditional {
+        test: Box<PureExpr>,
+        consequent: Box<PureExpr>,
+        alternate: Box<PureExpr>,
+    },
+}
+
+impl PureExpr {
+    fn eval(&self, args: &[Value]) -> Option<Value> {
+        match self {
+            Self::Value(value) => Some(value.clone()),
+            Self::Param(index) => args.get(*index).cloned(),
+            Self::Unary { operator, argument } => {
+                let value = argument.eval(args)?;
+                match operator.as_str() {
+                    "!" => Some(Value::Bool(!value.truthy())),
+                    "+" => value.number().map(Value::Number),
+                    "-" => value.number().map(|n| Value::Number(-n)),
+                    "~" => value
+                        .number()
+                        .map(|n| Value::Number((!js_to_int32(n)) as f64)),
+                    "void" => Some(Value::Undefined),
+                    "typeof" => Some(Value::String(
+                        match value {
+                            Value::String(_) => "string",
+                            Value::Number(_) => "number",
+                            Value::Bool(_) => "boolean",
+                            Value::Null => "object",
+                            Value::Undefined => "undefined",
+                        }
+                        .to_string(),
+                    )),
+                    _ => None,
+                }
+            }
+            Self::Binary {
+                operator,
+                left,
+                right,
+            } => eval_binary(operator, left.eval(args)?, right.eval(args)?),
+            Self::Logical {
+                operator,
+                left,
+                right,
+            } => {
+                let left = left.eval(args)?;
+                match operator.as_str() {
+                    "&&" => {
+                        if left.truthy() {
+                            right.eval(args)
+                        } else {
+                            Some(left)
+                        }
+                    }
+                    "||" => {
+                        if left.truthy() {
+                            Some(left)
+                        } else {
+                            right.eval(args)
+                        }
+                    }
+                    "??" => {
+                        if matches!(left, Value::Null | Value::Undefined) {
+                            right.eval(args)
+                        } else {
+                            Some(left)
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            Self::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                if test.eval(args)?.truthy() {
+                    consequent.eval(args)
+                } else {
+                    alternate.eval(args)
+                }
+            }
+        }
+    }
+}
+
+fn compile_pure_expr(expr: &Expression<'_>, params: &HashMap<String, usize>) -> Option<PureExpr> {
+    match expr {
+        Expression::Identifier(id) => params.get(id.name.as_str()).copied().map(PureExpr::Param),
+        Expression::StringLiteral(v) => Some(PureExpr::Value(Value::String(v.value.to_string()))),
+        Expression::NumericLiteral(v) => Some(PureExpr::Value(Value::Number(v.value))),
+        Expression::BooleanLiteral(v) => Some(PureExpr::Value(Value::Bool(v.value))),
+        Expression::NullLiteral(_) => Some(PureExpr::Value(Value::Null)),
+        Expression::TemplateLiteral(v) if v.expressions.is_empty() => v.quasis.first().map(|q| {
+            PureExpr::Value(Value::String(
+                q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string(),
+            ))
+        }),
+        Expression::ParenthesizedExpression(v) => compile_pure_expr(&v.expression, params),
+        Expression::UnaryExpression(v)
+            if matches!(
+                v.operator.as_str(),
+                "!" | "+" | "-" | "~" | "void" | "typeof"
+            ) =>
+        {
+            Some(PureExpr::Unary {
+                operator: v.operator.as_str().to_string(),
+                argument: Box::new(compile_pure_expr(&v.argument, params)?),
+            })
+        }
+        Expression::BinaryExpression(v)
+            if matches!(
+                v.operator.as_str(),
+                "+" | "-"
+                    | "*"
+                    | "/"
+                    | "%"
+                    | "**"
+                    | "<<"
+                    | ">>"
+                    | ">>>"
+                    | "|"
+                    | "^"
+                    | "&"
+                    | "==="
+                    | "!=="
+                    | "=="
+                    | "!="
+                    | "<"
+                    | "<="
+                    | ">"
+                    | ">="
+            ) =>
+        {
+            Some(PureExpr::Binary {
+                operator: v.operator.as_str().to_string(),
+                left: Box::new(compile_pure_expr(&v.left, params)?),
+                right: Box::new(compile_pure_expr(&v.right, params)?),
+            })
+        }
+        Expression::LogicalExpression(v) => Some(PureExpr::Logical {
+            operator: v.operator.as_str().to_string(),
+            left: Box::new(compile_pure_expr(&v.left, params)?),
+            right: Box::new(compile_pure_expr(&v.right, params)?),
+        }),
+        Expression::ConditionalExpression(v) => Some(PureExpr::Conditional {
+            test: Box::new(compile_pure_expr(&v.test, params)?),
+            consequent: Box::new(compile_pure_expr(&v.consequent, params)?),
+            alternate: Box::new(compile_pure_expr(&v.alternate, params)?),
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PureFunction {
+    arity: usize,
+    expression: PureExpr,
+}
+
+struct PureFunctionCollector<'c> {
+    scoping: &'c Scoping,
+    functions: HashMap<SymbolId, PureFunction>,
+}
+
+impl<'a> Visit<'a> for PureFunctionCollector<'_> {
+    fn visit_function(&mut self, f: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        if !f.r#async && !f.generator && f.params.rest.is_none() {
+            if let (Some(id), Some(body)) = (&f.id, &f.body) {
+                if let Some(symbol) = id.symbol_id.get() {
+                    let immutable =
+                        self.scoping.get_resolved_reference_ids(symbol).iter().all(
+                            |reference_id| !self.scoping.get_reference(*reference_id).is_write(),
+                        );
+                    if immutable && body.statements.len() == 1 {
+                        let mut params = HashMap::new();
+                        let mut valid_params = true;
+                        for (index, parameter) in f.params.items.iter().enumerate() {
+                            let BindingPattern::BindingIdentifier(parameter_id) =
+                                &parameter.pattern
+                            else {
+                                valid_params = false;
+                                break;
+                            };
+                            if parameter.initializer.is_some()
+                                || params
+                                    .insert(parameter_id.name.to_string(), index)
+                                    .is_some()
+                            {
+                                valid_params = false;
+                                break;
+                            }
+                        }
+                        if valid_params {
+                            if let Statement::ReturnStatement(ret) = &body.statements[0] {
+                                if let Some(argument) = &ret.argument {
+                                    if let Some(expression) = compile_pure_expr(argument, &params) {
+                                        self.functions.insert(
+                                            symbol,
+                                            PureFunction {
+                                                arity: f.params.items.len(),
+                                                expression,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_function(self, f, flags);
+    }
+}
+
+fn collect_pure_functions(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> HashMap<SymbolId, PureFunction> {
+    let mut collector = PureFunctionCollector {
+        scoping,
+        functions: HashMap::new(),
+    };
+    collector.visit_program(program);
+    collector.functions
+}
+
+fn fixed_base64_alphabet(body: &str) -> Option<String> {
+    if !body.contains("String.fromCharCode")
+        || !body.contains(".indexOf")
+        || !body.contains(".charAt")
+    {
+        return None;
+    }
+    let re = regex::Regex::new(r#"["']([A-Za-z0-9+/=]{65})["']"#).unwrap();
+    let standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+        .chars()
+        .collect::<HashSet<_>>();
+    let mut candidates = re
+        .captures_iter(body)
+        .filter_map(|caps| caps.get(1).map(|capture| capture.as_str().to_string()))
+        .filter(|candidate| candidate.chars().collect::<HashSet<_>>() == standard)
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn function_inner_source(body: &str) -> Option<&str> {
+    let start = body.find('{')?.checked_add(1)?;
+    let end = body.rfind('}')?;
+    (start <= end).then(|| &body[start..end])
+}
+
+fn standard_base64_decoder_matches(body: &str, array: &str, param: &str) -> bool {
+    let Some(inner) = function_inner_source(body) else {
+        return false;
+    };
+
+    // Match the complete function body, not merely a decoder-looking
+    // expression somewhere inside it. Replacing a call removes the entire
+    // function execution, so accepting extra statements could silently drop
+    // observable side effects.
+    let direct = regex::Regex::new(&format!(
+        r#"(?s)^\s*return\s+atob\s*\(\s*{}\s*\[\s*{}\s*\]\s*\)\s*;?\s*$"#,
+        regex::escape(array),
+        regex::escape(param)
+    ))
+    .unwrap();
+    if direct.is_match(inner) {
+        return true;
+    }
+
+    let sequence = regex::Regex::new(&format!(
+        r#"(?s)^\s*return\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*,\s*atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$"#,
+        regex::escape(array),
+        regex::escape(param)
+    ))
+    .unwrap();
+    if sequence
+        .captures(inner)
+        .is_some_and(|caps| caps.get(1).map(|m| m.as_str()) == caps.get(2).map(|m| m.as_str()))
+    {
+        return true;
+    }
+
+    let assignment = regex::Regex::new(&format!(
+        r#"(?s)^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$"#,
+        regex::escape(array),
+        regex::escape(param)
+    ))
+    .unwrap();
+    assignment
+        .captures(inner)
+        .is_some_and(|caps| caps.get(1).map(|m| m.as_str()) == caps.get(2).map(|m| m.as_str()))
+}
+
+fn fixed_base64_decoder_matches(body: &str, array: &str, param: &str) -> Option<String> {
+    let alphabet = fixed_base64_alphabet(body)?;
+    let guarded_load = regex::Regex::new(&format!(
+        r#"typeof\s*\(?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*\)?"#,
+        regex::escape(array),
+        regex::escape(param)
+    ))
+    .unwrap();
+
+    let alias = guarded_load
+        .captures_iter(body)
+        .find_map(|caps| caps.get(1).map(|m| m.as_str()))?;
+    let return_alias =
+        regex::Regex::new(&format!(r#"\breturn\s+{}\s*;"#, regex::escape(alias))).unwrap();
+    if !return_alias.is_match(body) {
+        return None;
+    }
+
+    // Fail closed on a recognizable Base64 decoder shape rather than merely
+    // seeing an alphabet and String.fromCharCode somewhere in the function.
+    if !body.contains(".replace(/[^A-Za-z0-9\\+\\/\\=]/g")
+        || body.matches(".indexOf(").count() != 4
+        || body.matches(".charAt(").count() != 4
+        || body.matches("String.fromCharCode").count() != 3
+        || body.matches("<<").count() != 3
+        || body.matches(">>").count() != 2
+    {
+        return None;
+    }
+    let sentinel_checks = regex::Regex::new(r#"(?:64\s*!=|!=\s*64)"#).unwrap();
+    if sentinel_checks.find_iter(body).count() != 2 {
+        return None;
+    }
+
+    Some(alphabet)
+}
+
+fn function_has_external_write(
+    span: Span,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> bool {
+    for symbol in scoping.symbol_ids() {
+        let declaration = scoping.symbol_span(symbol);
+        if span.start <= declaration.start && declaration.end <= span.end {
+            continue;
+        }
+        for reference_id in scoping.get_resolved_reference_ids(symbol) {
+            let Some(reference_span) = reference_spans.get(reference_id) else {
+                continue;
+            };
+            if span.start <= reference_span.start && reference_span.end <= span.end {
+                let reference = scoping.get_reference(*reference_id);
+                if reference.is_write() || reference.flags().is_member_write_target() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    for reference_ids in scoping.root_unresolved_references_ids() {
+        for reference_id in reference_ids {
+            let Some(reference_span) = reference_spans.get(&reference_id) else {
+                continue;
+            };
+            if span.start <= reference_span.start && reference_span.end <= span.end {
+                let reference = scoping.get_reference(reference_id);
+                if reference.is_write() || reference.flags().is_member_write_target() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn detect_direct_table_decoders(
+    source: &str,
+    functions: &[FnInfo],
+    arrays: &[StaticArrayInfo],
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> HashMap<SymbolId, Decoder> {
+    let mut arrays_by_name: HashMap<&str, Vec<&StaticArrayInfo>> = HashMap::new();
+    for array in arrays {
+        arrays_by_name
+            .entry(array.name.as_str())
+            .or_default()
+            .push(array);
+    }
+
+    let mut out = HashMap::new();
+    for function in functions {
+        if scoping
+            .get_resolved_reference_ids(function.symbol)
+            .iter()
+            .any(|reference_id| scoping.get_reference(*reference_id).is_write())
+        {
+            continue;
+        }
+        let Some(param) = function.params.first() else {
+            continue;
+        };
+        let body = fragment(source, function.span);
+        let access = regex::Regex::new(&format!(
+            r#"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*{}\s*\]"#,
+            regex::escape(param)
+        ))
+        .unwrap();
+        let mut matched = access
+            .captures_iter(body)
+            .filter_map(|caps| caps.get(1).map(|capture| capture.as_str()))
+            .filter_map(|name| arrays_by_name.get(name))
+            .filter(|candidates| candidates.len() == 1)
+            .map(|candidates| candidates[0])
+            .collect::<Vec<_>>();
+        matched.sort_by_key(|array| array.symbol);
+        matched.dedup_by_key(|array| array.symbol);
+        if matched.len() != 1 {
+            continue;
+        }
+        let array = matched[0];
+
+        // A direct literal-table decoder should have exactly one resolved
+        // use of the table binding: the indexed load proved above. Requiring a
+        // single confined read fails closed on aliases/escapes both outside
+        // and *inside* the decoder (an internal alias can otherwise mutate the
+        // array before the returned lookup without writing the original
+        // binding itself).
+        let table_references = scoping.get_resolved_reference_ids(array.symbol);
+        if table_references.len() != 1 {
+            continue;
+        }
+        let reference_id = table_references[0];
+        let reference = scoping.get_reference(reference_id);
+        if reference.is_write() || reference.flags().is_member_write_target() {
+            continue;
+        }
+        let Some(span) = reference_spans.get(&reference_id) else {
+            continue;
+        };
+        if function.span.start > span.start || span.end > function.span.end {
+            continue;
+        }
+
+        let mutator = regex::Regex::new(&format!(
+            r#"\b{}\s*\.\s*(?:copyWithin|fill|pop|push|reverse|shift|sort|splice|unshift)\s*\("#,
+            regex::escape(&array.name)
+        ))
+        .unwrap();
+        if mutator.is_match(source) {
+            continue;
+        }
+
+        let transform = if standard_base64_decoder_matches(body, &array.name, param) {
+            DecoderTransform::StandardBase64
+        } else if function.body_statement_count == 3
+            && function.fixed_decoder_control_shape
+            && function.direct_call_count == 12
+            && !function_has_external_write(function.span, scoping, reference_spans)
+        {
+            let Some(alphabet) = fixed_base64_decoder_matches(body, &array.name, param) else {
+                continue;
+            };
+            DecoderTransform::FixedBase64Alphabet(alphabet)
+        } else {
+            continue;
+        };
+
+        out.insert(
+            function.symbol,
+            Decoder {
+                values: array.values.clone(),
+                offset: 0,
+                provider: array.name.clone(),
+                transform,
+            },
+        );
     }
     out
 }
@@ -1599,6 +2460,7 @@ struct Collector<'s, 'c> {
     constants: &'c HashMap<SymbolId, ConstBinding>,
     shorthand_spans: &'c HashSet<(u32, u32)>,
     proxies: &'c HashMap<SymbolId, ProxyObject>,
+    pure_functions: &'c HashMap<SymbolId, PureFunction>,
     dispatch_orders: &'c HashMap<SymbolId, Vec<String>>,
     zero_counters: &'c HashSet<SymbolId>,
     reference_spans: &'c HashMap<ReferenceId, Span>,
@@ -1781,7 +2643,9 @@ fn eval_with_env(expr: &Expression<'_>, env: &HashMap<String, Value>) -> Option<
                 "!" => Some(Value::Bool(!value.truthy())),
                 "+" => value.number().map(Value::Number),
                 "-" => value.number().map(|n| Value::Number(-n)),
-                "~" => value.number().map(|n| Value::Number((!(n as i32)) as f64)),
+                "~" => value
+                    .number()
+                    .map(|n| Value::Number((!js_to_int32(n)) as f64)),
                 "typeof" => Some(Value::String(
                     match value {
                         Value::String(_) => "string",
@@ -2548,19 +3412,105 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 }
             }
         }
+        if !it.optional && !it.arguments.iter().any(Argument::is_spread) {
+            if let Some(symbol) = symbol_of(self.scoping, &it.callee) {
+                if let Some(function) = self.pure_functions.get(&symbol) {
+                    if it.arguments.len() == function.arity {
+                        let values = it
+                            .arguments
+                            .iter()
+                            .map(eval_static_argument)
+                            .collect::<Option<Vec<_>>>();
+                        if let Some(values) = values {
+                            if let Some(text) = function
+                                .expression
+                                .eval(&values)
+                                .and_then(|value| value.render())
+                            {
+                                self.push(it.span, text, "pure_function_eval");
+                                walk::walk_call_expression(self, it);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(symbol) = symbol_of(self.scoping, &it.callee) {
             if let Some(decoder) = self.decoders.get(&symbol) {
-                if let Some(raw) = it.arguments.first().and_then(argument_integer) {
-                    if let Some(text) = decoder.value_for_raw(raw).and_then(|value| value.render())
-                    {
-                        self.push(it.span, text, "string_array_decode");
-                        walk::walk_call_expression(self, it);
-                        return;
+                if let Some(argument) = it.arguments.first() {
+                    if let Some(raw) = argument_integer(argument) {
+                        if let Some(text) =
+                            decoder.value_for_raw(raw).and_then(|value| value.render())
+                        {
+                            self.push(it.span, text, "string_array_decode");
+                            walk::walk_call_expression(self, it);
+                            return;
+                        }
+                    } else if let Argument::ConditionalExpression(conditional) = argument {
+                        let consequent = expression_integer(&conditional.consequent)
+                            .and_then(|raw| decoder.value_for_raw(raw))
+                            .and_then(|value| value.render());
+                        let alternate = expression_integer(&conditional.alternate)
+                            .and_then(|raw| decoder.value_for_raw(raw))
+                            .and_then(|value| value.render());
+                        if let (Some(consequent), Some(alternate)) = (consequent, alternate) {
+                            let test = fragment(self.source, conditional.test.span());
+                            self.push(
+                                it.span,
+                                format!("(({}) ? ({}) : ({}))", test, consequent, alternate),
+                                "string_array_decode",
+                            );
+                            // The replacement spans the whole call. Revisit its
+                            // copied test expression on the next fixed-point
+                            // iteration instead of creating overlapping edits.
+                            return;
+                        }
                     }
                 }
             }
         }
         walk::walk_call_expression(self, it);
+    }
+}
+
+fn eval_static_argument(arg: &Argument<'_>) -> Option<Value> {
+    match arg {
+        Argument::StringLiteral(v) => Some(Value::String(v.value.to_string())),
+        Argument::NumericLiteral(v) => Some(Value::Number(v.value)),
+        Argument::BooleanLiteral(v) => Some(Value::Bool(v.value)),
+        Argument::NullLiteral(_) => Some(Value::Null),
+        Argument::TemplateLiteral(v) if v.expressions.is_empty() => v
+            .quasis
+            .first()
+            .map(|q| Value::String(q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string())),
+        Argument::ParenthesizedExpression(v) => eval(&v.expression),
+        Argument::UnaryExpression(v) => eval_unary(v),
+        Argument::BinaryExpression(v) => {
+            eval_binary(v.operator.as_str(), eval(&v.left)?, eval(&v.right)?)
+        }
+        Argument::LogicalExpression(v) => eval_logical(v),
+        Argument::ConditionalExpression(v) => {
+            let test = known_bool(&v.test)?;
+            eval(if test { &v.consequent } else { &v.alternate })
+        }
+        _ => None,
+    }
+}
+
+fn expression_integer(expr: &Expression<'_>) -> Option<i64> {
+    let Value::Number(value) = eval(expr)? else {
+        return None;
+    };
+    if value.is_finite()
+        && value.fract() == 0.0
+        && value >= i64::MIN as f64
+        && value <= i64::MAX as f64
+    {
+        Some(value as i64)
+    } else {
+        None
     }
 }
 
@@ -2650,13 +3600,22 @@ fn transform_once(
     let scoping = semantic.scoping();
 
     let arrays = top_level_arrays(&program);
-    let functions = top_level_functions(&program);
-    let (decoders, protected_spans) = detect_decoders(source, &functions, &program, scoping);
+    let array_infos = decoder_static_arrays(&program, scoping);
+    let functions = all_functions(&program);
+    let legacy_functions = top_level_functions(&program);
+    let reference_spans = collect_reference_spans(&program);
+    let (mut decoders, protected_spans) =
+        detect_decoders(source, &legacy_functions, &program, scoping);
+    for (symbol, decoder) in
+        detect_direct_table_decoders(source, &functions, &array_infos, scoping, &reference_spans)
+    {
+        decoders.entry(symbol).or_insert(decoder);
+    }
     let constants = collect_const_values(&program, scoping);
     let shorthand_spans = collect_shorthand_spans(&program);
     let proxies = collect_proxy_objects(&program, scoping);
+    let pure_functions = collect_pure_functions(&program, scoping);
     let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
-    let reference_spans = collect_reference_spans(&program);
 
     let mut collector = Collector {
         source,
@@ -2666,6 +3625,7 @@ fn transform_once(
         constants: &constants,
         shorthand_spans: &shorthand_spans,
         proxies: &proxies,
+        pure_functions: &pure_functions,
         dispatch_orders: &dispatch_orders,
         zero_counters: &zero_counters,
         reference_spans: &reference_spans,

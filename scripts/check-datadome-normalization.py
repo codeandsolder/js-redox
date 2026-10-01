@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BIN = ROOT / ".cargo-target-nodebug/debug/deobfuscate-safe"
+FIXTURE = ROOT / "corpus/generated/reversible-obfuscation/datadome-direct-table.js"
+TMP = ROOT / "work/test-tmp/datadome-normalization"
+
+
+def run(argv, timeout=60):
+    cp = subprocess.run(
+        [str(x) for x in argv],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    if cp.returncode:
+        raise RuntimeError(
+            f"command failed ({cp.returncode}): {' '.join(map(str, argv))}\n"
+            f"{cp.stdout}{cp.stderr}"
+        )
+    return cp
+
+
+def main():
+    if not BIN.is_file():
+        raise SystemExit(f"missing binary: {BIN}")
+    TMP.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="direct-table-", dir=TMP) as td:
+        td = Path(td)
+        out = td / "out.js"
+        report = td / "report.json"
+        before = run(["node", FIXTURE]).stdout
+        run([BIN, FIXTURE, out, "--report", report])
+        run(["node", "--check", out])
+        after = run(["node", out]).stdout
+        assert (
+            before
+            == after
+            == "cookie reload parseInt 17 true null invalid bm90LWRlY29kZWQ= dGhpcy1tdXN0LXN0YXktcmF3 17 true false 1 3 3 112 0 0 par 3 256 undefined b c x a 1 17 undefined parseInt 3\n"
+        ), (before, after)
+        text = out.read_text()
+        assert "QInvalid(0)" in text, "invalid atob input must remain dynamic"
+        assert "QDecoy(0)" in text, "unrelated atob use must not turn a raw table into a decoder"
+        assert "CDecoy(0)" in text, "alphabet-like code must not turn a raw table into a decoder"
+        assert "reassigned(5, 2)" in text, "reassigned helper functions must not be statically folded"
+        assert "QEscaped(0)" in text, "escaped/mutable literal tables must not be statically decoded"
+        assert "QInternalEscaped(0)" in text, "internally aliased/mutable literal tables must not be statically decoded"
+        assert "QReassigned(0)" in text, "reassigned decoder functions must not be statically decoded"
+        assert "QSideEffect(0)" in text, "decoder-looking functions with extra side effects must remain dynamic"
+        assert "C(7)" in text, "out-of-range direct table lookups must not wrap modulo table length"
+        assert "C(dynamicChoice ? 0 : 1)" not in text, "conditional decoder indices should become a literal-valued conditional"
+        assert "C(dynamicChoice ? 0 : 7)" in text, "conditional decoder rewrites must fail closed when either branch is out of range"
+        assert "CFixedSide(0)" in text, "fixed-alphabet decoder candidates with outer writes must remain dynamic"
+
+        text = out.read_text()
+        for expected in ('"cookie"', '"reload"', '"parseInt"', "17", "true", "null"):
+            assert expected in text, (expected, text[:3000])
+        meta = json.loads(report.read_text())
+        transforms = meta["transforms"]
+        assert transforms.get("string_array_decode", 0) >= 15, transforms
+        assert transforms.get("pure_function_eval", 0) >= 5, transforms
+        assert meta["safe_static_only"] is True
+        print("PASS", transforms)
+
+
+if __name__ == "__main__":
+    main()

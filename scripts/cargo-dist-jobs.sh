@@ -8,8 +8,8 @@ fi
 
 if command -v sccache >/dev/null 2>&1 && command -v uv >/dev/null 2>&1; then
   status=$(sccache --dist-status 2>/dev/null || true)
-  read -r cpus busy < <(
-    printf '%s' "$status" | uv run python -c '
+  parsed=$(
+    printf '%s' "$status" | uv run --no-project python -c '
 import json, sys
 try:
     d=json.load(sys.stdin)["SchedulerStatus"][1]
@@ -18,6 +18,11 @@ except Exception:
     pass
 ' 2>/dev/null || true
   )
+  cpus=""
+  busy=""
+  if [[ -n "$parsed" ]]; then
+    read -r cpus busy <<<"$parsed"
+  fi
 
   if [[ "${cpus:-}" =~ ^[0-9]+$ ]] && (( cpus > 0 )); then
     # Normal cap: use at most two thirds of the remote farm.
