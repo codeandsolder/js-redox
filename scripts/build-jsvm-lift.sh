@@ -46,18 +46,29 @@ workspace="$(pwd -P)"
 hash="$(printf '%s' "$workspace" | sha256sum | cut -c1-16)"
 name="$(basename "$workspace" | tr -c 'A-Za-z0-9._-' '_')"
 actual="$shim_target_root/${name}-$hash/$profile"
+mirror="$project/target/$profile"
 canonical="$publish_root/$profile"
 mkdir -p "$canonical"
 
+# SentinelX Cargo mirrors final link artifacts to the workspace target/ before
+# deleting its disposable scratch target. Prefer that durable mirror after Cargo
+# returns, while retaining the scratch path as a fallback for older wrappers.
 published=0
-for bin in jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack; do
-  if [[ -f "$actual/$bin" ]]; then
-    install -m 0755 "$actual/$bin" "$canonical/$bin"
+for bin in jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack sus-scan; do
+  source_bin=""
+  if [[ -f "$mirror/$bin" ]]; then
+    source_bin="$mirror/$bin"
+  elif [[ -f "$actual/$bin" ]]; then
+    source_bin="$actual/$bin"
+  fi
+  if [[ -n "$source_bin" ]]; then
+    install -m 0755 "$source_bin" "$canonical/$bin"
     published=$((published + 1))
   fi
 done
 
-echo "actual target: $actual"
+echo "artifact mirror: $mirror"
+echo "scratch target: $actual"
 echo "published $published executable(s) to $canonical"
 if [[ -e "$canonical/jsvm-lift" ]]; then
   stat -c 'canonical scanner: %y %s %n' "$canonical/jsvm-lift"
