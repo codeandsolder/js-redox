@@ -38,6 +38,14 @@ uv run python scripts/benchmark-jsvm-lift.py
 
 The harness asserts structural VM detection for generated/real VM positives, zero confirmed dispatchers for negatives/CFF-only samples, and exact stdout equivalence for generated source/virtualized pairs.
 
+## Suspicious-structure triage
+
+`sus-scan` is the cheap first-pass structural scanner used to rank code before deeper recovery. General AST-level obfuscation structures live in `src/jsvm-lift/src/bin/sus-scan/structures.rs` rather than being mixed into the scoring collector.
+
+The structure module uses small detector registries by AST node type. Detectors emit explainable `StructuralSignal` records; the main scanner owns clustering, weighting and output. New families should therefore be added as a detector plus positive/control fixtures in `corpus/generated/sus-scanner/`, without vendor-name checks.
+
+Current structural families include same-array rotation (`x.push(x.shift())`, including literal bracket members), checksum-driven rotation bootstraps, dense operator/call proxy tables, and self-disabling one-shot wrapper factories. Low-level evidence may deliberately remain below the standalone cluster threshold; repeated evidence or a stronger composite structure promotes the region.
+
 ## Current pipeline
 
 The long-term target is a provenance-preserving **HAR -> readable source project** pipeline, with VM devirtualization as one transformation stage rather than the whole product.

@@ -4,7 +4,7 @@ use clap::Parser as ClapParser;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, BinaryExpression, CallExpression,
-    ComputedMemberExpression, Expression, NewExpression,
+    ComputedMemberExpression, Expression, NewExpression, ObjectExpression,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -15,6 +15,9 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+
+#[path = "sus-scan/structures.rs"]
+mod structures;
 
 #[derive(ClapParser, Debug)]
 #[command(
@@ -362,43 +365,32 @@ impl Collector<'_> {
         );
     }
 
-    fn record_array_rotation(&mut self, it: &CallExpression<'_>) {
-        let Expression::StaticMemberExpression(outer) = &it.callee else {
-            return;
-        };
-        if outer.optional || outer.property.name.as_str() != "push" || it.arguments.len() != 1 {
-            return;
+    fn record_structural_call(&mut self, it: &CallExpression<'_>) {
+        for signal in structures::call_signals(it) {
+            self.push(
+                signal.kind,
+                signal.weight,
+                signal.span,
+                signal.subject,
+                signal.detail,
+            );
         }
-        let Some(subject) = Self::identifier(&outer.object) else {
-            return;
-        };
-        let Argument::CallExpression(inner_call) = &it.arguments[0] else {
-            return;
-        };
-        if inner_call.optional || !inner_call.arguments.is_empty() {
-            return;
-        }
-        let Expression::StaticMemberExpression(inner) = &inner_call.callee else {
-            return;
-        };
-        if inner.optional || inner.property.name.as_str() != "shift" {
-            return;
-        }
-        if Self::identifier(&inner.object).as_deref() != Some(subject.as_str()) {
-            return;
-        }
+    }
 
-        self.push(
-            "array_rotation",
-            8,
-            it.span,
-            Some(subject),
-            "same-array push(shift()) rotation",
-        );
+    fn record_structural_object(&mut self, it: &ObjectExpression<'_>) {
+        for signal in structures::object_signals(it) {
+            self.push(
+                signal.kind,
+                signal.weight,
+                signal.span,
+                signal.subject,
+                signal.detail,
+            );
+        }
     }
 
     fn record_call(&mut self, it: &CallExpression<'_>) {
-        self.record_array_rotation(it);
+        self.record_structural_call(it);
         let callee = self.fragment(it.callee.span()).trim().to_string();
         let lower = callee.to_ascii_lowercase();
 
@@ -654,6 +646,11 @@ impl<'a> Visit<'a> for Collector<'_> {
     fn visit_array_expression(&mut self, it: &ArrayExpression<'a>) {
         self.record_array(it);
         walk::walk_array_expression(self, it);
+    }
+
+    fn visit_object_expression(&mut self, it: &ObjectExpression<'a>) {
+        self.record_structural_object(it);
+        walk::walk_object_expression(self, it);
     }
 
     fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {

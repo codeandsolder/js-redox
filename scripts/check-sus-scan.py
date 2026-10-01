@@ -37,15 +37,36 @@ def main():
     )
     report = json.loads(cp.stdout)
     assert report["schema"] == "js-sus-scan/v1"
-    assert report["files_scanned"] == 6, report["files_scanned"]
 
     by_name = {Path(item["input"]).name: item for item in report["files"]}
+    expected = {
+        "dense-obfuscation.js",
+        "clean-control.js",
+        "asset-control.js",
+        "long-string-control.js",
+        "array-rotation.js",
+        "array-rotation-control.js",
+        "rotation-bootstrap.js",
+        "rotation-bootstrap-control.js",
+        "operator-proxy-table.js",
+        "operator-proxy-table-control.js",
+        "one-shot-wrapper.js",
+        "one-shot-wrapper-control.js",
+    }
+    assert expected <= by_name.keys(), sorted(by_name)
+
     dense = by_name["dense-obfuscation.js"]
     clean = by_name["clean-control.js"]
     asset = by_name["asset-control.js"]
     long_string = by_name["long-string-control.js"]
     rotation = by_name["array-rotation.js"]
     rotation_control = by_name["array-rotation-control.js"]
+    bootstrap = by_name["rotation-bootstrap.js"]
+    bootstrap_control = by_name["rotation-bootstrap-control.js"]
+    proxy_table = by_name["operator-proxy-table.js"]
+    proxy_control = by_name["operator-proxy-table-control.js"]
+    one_shot = by_name["one-shot-wrapper.js"]
+    one_shot_control = by_name["one-shot-wrapper-control.js"]
 
     assert dense["clusters"], dense
     assert dense["top_score"] >= 30, dense["top_score"]
@@ -89,6 +110,18 @@ def main():
     # but weight 8 intentionally leaves it below the default cluster threshold.
     assert rotation_control["clusters"] == [], rotation_control
     assert rotation_control["signal_kinds"].get("array_rotation", 0) == 1, rotation_control["signal_kinds"]
+
+    # Bracket-literal push/shift must normalize to the same low-level rotation signal,
+    # while the checksum IIFE contributes one stronger composite structure.
+    assert bootstrap["signal_kinds"].get("array_rotation", 0) == 2, bootstrap["signal_kinds"]
+    assert bootstrap["signal_kinds"].get("rotation_checksum_iife", 0) == 1, bootstrap["signal_kinds"]
+    assert bootstrap_control["signal_kinds"].get("rotation_checksum_iife", 0) == 0, bootstrap_control["signal_kinds"]
+
+    assert proxy_table["signal_kinds"].get("operator_proxy_table", 0) == 1, proxy_table["signal_kinds"]
+    assert proxy_control["signal_kinds"].get("operator_proxy_table", 0) == 0, proxy_control["signal_kinds"]
+
+    assert one_shot["signal_kinds"].get("one_shot_wrapper", 0) == 1, one_shot["signal_kinds"]
+    assert one_shot_control["signal_kinds"].get("one_shot_wrapper", 0) == 0, one_shot_control["signal_kinds"]
 
     text = run(BIN, FIXTURES / "dense-obfuscation.js").stdout
     assert "SUS summary:" in text
