@@ -19,6 +19,8 @@ MIN_DEOB_TRANSFORMS = {
     "datadome-qwant-5.10.0": {
         "string_array_decode": 4000,
         "pure_function_eval": 120,
+        "reference_identity_compare": 13,
+        "reference_state_unflatten": 36,
     },
 }
 

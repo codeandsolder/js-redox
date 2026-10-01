@@ -2452,6 +2452,310 @@ fn collect_shorthand_spans(program: &oxc_ast::ast::Program<'_>) -> HashSet<(u32,
     collector.spans
 }
 
+#[derive(Debug, Clone)]
+struct ReferenceIdentityTable {
+    rows: u32,
+    columns: u32,
+    root_row: u32,
+    column_multiplier: u32,
+    row_multiplier: u32,
+    salt_left: u32,
+    salt_right: u32,
+    construction_start: usize,
+    construction_end: usize,
+}
+
+impl ReferenceIdentityTable {
+    fn row_for(&self, row: u32, column: u32) -> Option<u32> {
+        if row >= self.rows || column >= self.columns || !self.rows.is_power_of_two() {
+            return None;
+        }
+        let column_term = js_to_uint32(self.column_multiplier as f64 * column as f64);
+        let row_term = js_to_uint32(self.row_multiplier as f64 * row as f64);
+        let salt_term = js_to_uint32(self.salt_left as f64 * self.salt_right as f64);
+        Some((column_term ^ row_term ^ salt_term) & (self.rows - 1))
+    }
+
+    fn identity_for(&self, first: u32, second: u32) -> Option<u32> {
+        let row = self.row_for(self.root_row, first)?;
+        self.row_for(row, second)
+    }
+}
+
+fn unique_symbol_named_near(
+    scoping: &Scoping,
+    name: &str,
+    start: u32,
+    end: u32,
+) -> Option<SymbolId> {
+    let mut matches = scoping.symbol_ids().filter(|symbol| {
+        scoping.symbol_name(*symbol) == name && {
+            let span = scoping.symbol_span(*symbol);
+            start <= span.start && span.end <= end
+        }
+    });
+    let symbol = matches.next()?;
+    matches.next().is_none().then_some(symbol)
+}
+
+fn detect_reference_identity_tables(
+    source: &str,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> HashMap<SymbolId, ReferenceIdentityTable> {
+    let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
+    let row_re = regex::Regex::new(&format!(
+        r"(?P<table>{identifier})=\[\],(?P<idx>{identifier})=0;(?P<test>{identifier})<(?P<rows>\d+);(?P<update>{identifier})\+\+\)(?P<table2>{identifier})\[(?P<idx2>{identifier})\]=new Array\((?P<columns>\d+)\)"
+    ))
+    .unwrap();
+    let timer_re = regex::Regex::new(&format!(
+        r"(?P<timer>{identifier})=function\((?P<arg>{identifier})\)\{{setTimeout\((?P<arg2>{identifier}),0\)\}}"
+    ))
+    .unwrap();
+    let outer_re = regex::Regex::new(&format!(
+        r"for\(var (?P<loop>{identifier})=0;(?P<test>{identifier})<(?P<chunks>\d+);(?P<update>{identifier})\+\+\)\((?P<callback>{identifier})=>\{{(?P<timer>{identifier})\(function\(\)\{{"
+    ))
+    .unwrap();
+    let fill_re = regex::Regex::new(&format!(
+        r"for\(var (?P<t>{identifier})=(?P<chunk>\d+)\*(?P<callback>{identifier}),(?P<n>{identifier})=Math\.min\((?P<t2>{identifier})\+(?P<chunk2>\d+),(?P<columns>\d+)\),(?P<column>{identifier})=(?P<t3>{identifier});(?P<column2>{identifier})<(?P<n2>{identifier});(?P<column3>{identifier})\+\+\)for\((?P<row>{identifier})=0;(?P<row2>{identifier})<(?P<rows>\d+);(?P<row3>{identifier})\+\+\)(?P<table>{identifier})\[(?P<row4>{identifier})\]\[(?P<column4>{identifier})\]=(?P<table2>{identifier})\[\((?P<a>\d+)\*(?P<column5>{identifier})\^(?P<b>\d+)\*(?P<row5>{identifier})\^(?P<c>\d+)\*(?P<k>\d+)\)>>>0&(?P<mask>\d+)-1\]"
+    ))
+    .unwrap();
+    let root_re = regex::Regex::new(&format!(
+        r"(?P<timer>{identifier})\(function\(\)\{{(?P<target>{identifier})=(?P<table>{identifier})\[(?P<root>\d+)\]\}}\)"
+    ))
+    .unwrap();
+
+    let mut out = HashMap::new();
+    for row_caps in row_re.captures_iter(source) {
+        let row_match = row_caps.get(0).unwrap();
+        let table_name = row_caps.name("table").unwrap().as_str();
+        let row_index = row_caps.name("idx").unwrap().as_str();
+        if row_caps.name("test").unwrap().as_str() != row_index
+            || row_caps.name("update").unwrap().as_str() != row_index
+            || row_caps.name("idx2").unwrap().as_str() != row_index
+            || row_caps.name("table2").unwrap().as_str() != table_name
+        {
+            continue;
+        }
+        let Ok(rows) = row_caps.name("rows").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        let Ok(columns) = row_caps.name("columns").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        if rows < 2 || columns < 2 || !rows.is_power_of_two() {
+            continue;
+        }
+
+        let window_start = row_match.start().saturating_sub(256);
+        let window_end = (row_match.end() + 1800).min(source.len());
+        let window = &source[window_start..window_end];
+
+        let Some(timer_caps) = timer_re.captures(window) else {
+            continue;
+        };
+        if timer_caps.name("arg").unwrap().as_str() != timer_caps.name("arg2").unwrap().as_str() {
+            continue;
+        }
+        let timer_name = timer_caps.name("timer").unwrap().as_str();
+
+        let Some(outer_caps) = outer_re.captures(window) else {
+            continue;
+        };
+        let outer_loop = outer_caps.name("loop").unwrap().as_str();
+        if outer_caps.name("test").unwrap().as_str() != outer_loop
+            || outer_caps.name("update").unwrap().as_str() != outer_loop
+            || outer_caps.name("timer").unwrap().as_str() != timer_name
+        {
+            continue;
+        }
+        let callback_name = outer_caps.name("callback").unwrap().as_str();
+        let Ok(chunks) = outer_caps.name("chunks").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+
+        let Some(fill_caps) = fill_re.captures(window) else {
+            continue;
+        };
+        if fill_caps.name("callback").unwrap().as_str() != callback_name
+            || fill_caps.name("table").unwrap().as_str() != table_name
+            || fill_caps.name("table2").unwrap().as_str() != table_name
+        {
+            continue;
+        }
+        let t_name = fill_caps.name("t").unwrap().as_str();
+        let n_name = fill_caps.name("n").unwrap().as_str();
+        let column_name = fill_caps.name("column").unwrap().as_str();
+        let row_name = fill_caps.name("row").unwrap().as_str();
+        if fill_caps.name("t2").unwrap().as_str() != t_name
+            || fill_caps.name("t3").unwrap().as_str() != t_name
+            || fill_caps.name("n2").unwrap().as_str() != n_name
+            || fill_caps.name("column2").unwrap().as_str() != column_name
+            || fill_caps.name("column3").unwrap().as_str() != column_name
+            || fill_caps.name("column4").unwrap().as_str() != column_name
+            || fill_caps.name("column5").unwrap().as_str() != column_name
+            || fill_caps.name("row2").unwrap().as_str() != row_name
+            || fill_caps.name("row3").unwrap().as_str() != row_name
+            || fill_caps.name("row4").unwrap().as_str() != row_name
+            || fill_caps.name("row5").unwrap().as_str() != row_name
+        {
+            continue;
+        }
+
+        let Ok(chunk) = fill_caps.name("chunk").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        let Ok(chunk2) = fill_caps.name("chunk2").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        let Ok(fill_columns) = fill_caps.name("columns").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        let Ok(fill_rows) = fill_caps.name("rows").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        let Ok(mask) = fill_caps.name("mask").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        if chunk == 0
+            || chunk != chunk2
+            || fill_columns != columns
+            || fill_rows != rows
+            || mask != rows
+            || chunks.checked_mul(chunk) != Some(columns)
+        {
+            continue;
+        }
+
+        let Some(root_caps) = root_re.captures(window) else {
+            continue;
+        };
+        if root_caps.name("timer").unwrap().as_str() != timer_name
+            || root_caps.name("table").unwrap().as_str() != table_name
+        {
+            continue;
+        }
+        let target_name = root_caps.name("target").unwrap().as_str();
+        let Ok(root_row) = root_caps.name("root").unwrap().as_str().parse::<u32>() else {
+            continue;
+        };
+        if root_row >= rows {
+            continue;
+        }
+
+        let absolute_start = window_start as u32;
+        let absolute_end = window_end as u32;
+        let Some(target_symbol) =
+            unique_symbol_named_near(scoping, target_name, absolute_start, absolute_end)
+        else {
+            continue;
+        };
+        let Some(table_symbol) =
+            unique_symbol_named_near(scoping, table_name, absolute_start, absolute_end)
+        else {
+            continue;
+        };
+
+        let construction_end = (window_start + root_caps.get(0).unwrap().end()) as u32;
+        if scoping
+            .get_resolved_reference_ids(table_symbol)
+            .iter()
+            .any(|reference_id| {
+                reference_spans
+                    .get(reference_id)
+                    .is_none_or(|span| span.start < absolute_start || span.end > construction_end)
+            })
+        {
+            continue;
+        }
+        let target_writes = scoping
+            .get_resolved_reference_ids(target_symbol)
+            .iter()
+            .filter(|reference_id| scoping.get_reference(**reference_id).is_write())
+            .count();
+        if target_writes != 1 {
+            continue;
+        }
+
+        let parse_capture = |name: &str| {
+            fill_caps
+                .name(name)
+                .and_then(|capture| capture.as_str().parse::<u32>().ok())
+        };
+        let (Some(column_multiplier), Some(row_multiplier), Some(salt_left), Some(salt_right)) = (
+            parse_capture("a"),
+            parse_capture("b"),
+            parse_capture("c"),
+            parse_capture("k"),
+        ) else {
+            continue;
+        };
+
+        let construction_start = window_start
+            + timer_caps
+                .get(0)
+                .unwrap()
+                .start()
+                .min(row_match.start() - window_start);
+        let descriptor = ReferenceIdentityTable {
+            rows,
+            columns,
+            root_row,
+            column_multiplier,
+            row_multiplier,
+            salt_left,
+            salt_right,
+            construction_start,
+            construction_end: construction_end as usize,
+        };
+        let valid = (0..rows)
+            .all(|row| (0..columns).all(|column| descriptor.row_for(row, column).is_some()));
+        if valid {
+            out.insert(target_symbol, descriptor);
+        }
+    }
+    out
+}
+
+fn reference_identity(
+    expr: &Expression<'_>,
+    scoping: &Scoping,
+    tables: &HashMap<SymbolId, ReferenceIdentityTable>,
+) -> Option<(SymbolId, u32)> {
+    let Expression::ComputedMemberExpression(outer) = expr else {
+        return None;
+    };
+    if outer.optional {
+        return None;
+    }
+    let Expression::ComputedMemberExpression(inner) = &outer.object else {
+        return None;
+    };
+    if inner.optional {
+        return None;
+    }
+    let symbol = symbol_of(scoping, &inner.object)?;
+    let table = tables.get(&symbol)?;
+    let Value::Number(first) = eval(&inner.expression)? else {
+        return None;
+    };
+    let Value::Number(second) = eval(&outer.expression)? else {
+        return None;
+    };
+    if !first.is_finite()
+        || !second.is_finite()
+        || first.fract() != 0.0
+        || second.fract() != 0.0
+        || first < 0.0
+        || second < 0.0
+        || first > u32::MAX as f64
+        || second > u32::MAX as f64
+    {
+        return None;
+    }
+    Some((symbol, table.identity_for(first as u32, second as u32)?))
+}
+
 struct Collector<'s, 'c> {
     source: &'s str,
     scoping: &'c Scoping,
@@ -2461,6 +2765,7 @@ struct Collector<'s, 'c> {
     shorthand_spans: &'c HashSet<(u32, u32)>,
     proxies: &'c HashMap<SymbolId, ProxyObject>,
     pure_functions: &'c HashMap<SymbolId, PureFunction>,
+    reference_identity_tables: &'c HashMap<SymbolId, ReferenceIdentityTable>,
     dispatch_orders: &'c HashMap<SymbolId, Vec<String>>,
     zero_counters: &'c HashSet<SymbolId>,
     reference_spans: &'c HashMap<ReferenceId, Span>,
@@ -2723,6 +3028,38 @@ fn expression_mentions(expr: &Expression<'_>, name: &str) -> bool {
     let mut collector = NameUseCollector::default();
     collector.visit_expression(expr);
     collector.names.contains(name)
+}
+
+fn statement_mentions(stmt: &Statement<'_>, name: &str) -> bool {
+    let mut collector = NameUseCollector::default();
+    collector.visit_statement(stmt);
+    collector.names.contains(name)
+}
+
+#[derive(Default)]
+struct LoopControlDetector {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for LoopControlDetector {
+    fn visit_break_statement(&mut self, _it: &oxc_ast::ast::BreakStatement<'a>) {
+        self.found = true;
+    }
+
+    fn visit_continue_statement(&mut self, _it: &oxc_ast::ast::ContinueStatement<'a>) {
+        self.found = true;
+    }
+
+    fn visit_function(&mut self, _it: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
+        // A nested function's control flow cannot target the surrounding
+        // dispatcher loop, so do not descend into it.
+    }
+}
+
+fn statement_has_loop_control(stmt: &Statement<'_>) -> bool {
+    let mut detector = LoopControlDetector::default();
+    detector.visit_statement(stmt);
+    detector.found
 }
 
 fn direct_assignment_name<'a>(target: &'a oxc_ast::ast::AssignmentTarget<'a>) -> Option<&'a str> {
@@ -3048,7 +3385,302 @@ fn resolved_refs_within(
         })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReferenceCaseFlow {
+    Normal,
+    Continue,
+    Break,
+    Return,
+    Throw,
+}
+
 impl Collector<'_, '_> {
+    fn reference_state_assignment(
+        &self,
+        expr: &Expression<'_>,
+        state_var: &str,
+        table_symbol: SymbolId,
+    ) -> Option<u32> {
+        let expr = match expr {
+            Expression::ParenthesizedExpression(parenthesized) => &parenthesized.expression,
+            _ => expr,
+        };
+        let Expression::AssignmentExpression(assign) = expr else {
+            return None;
+        };
+        if assign.operator.as_str() != "="
+            || direct_assignment_name(&assign.left) != Some(state_var)
+        {
+            return None;
+        }
+        let (symbol, identity) =
+            reference_identity(&assign.right, self.scoping, self.reference_identity_tables)?;
+        (symbol == table_symbol).then_some(identity)
+    }
+
+    fn clean_reference_state_statement(
+        &self,
+        stmt: &Statement<'_>,
+        state_var: &str,
+        table_symbol: SymbolId,
+    ) -> Option<(String, Option<u32>, ReferenceCaseFlow)> {
+        match stmt {
+            Statement::BlockStatement(block) => {
+                let mut chunks = Vec::new();
+                let mut next_state = None;
+                for child in &block.body {
+                    let (text, next, flow) =
+                        self.clean_reference_state_statement(child, state_var, table_symbol)?;
+                    if !text.trim().is_empty() {
+                        chunks.push(text);
+                    }
+                    if let Some(next) = next {
+                        next_state = Some(next);
+                    }
+                    if flow != ReferenceCaseFlow::Normal {
+                        return Some((
+                            format!(
+                                "{{
+{}
+}}",
+                                chunks.join(
+                                    "
+"
+                                )
+                            ),
+                            next_state,
+                            flow,
+                        ));
+                    }
+                }
+                Some((
+                    format!(
+                        "{{
+{}
+}}",
+                        chunks.join(
+                            "
+"
+                        )
+                    ),
+                    next_state,
+                    ReferenceCaseFlow::Normal,
+                ))
+            }
+            Statement::ExpressionStatement(expression) => {
+                if let Some(next) =
+                    self.reference_state_assignment(&expression.expression, state_var, table_symbol)
+                {
+                    return Some((String::new(), Some(next), ReferenceCaseFlow::Normal));
+                }
+                if expression_mentions(&expression.expression, state_var) {
+                    return None;
+                }
+                Some((
+                    fragment(self.source, stmt.span()).to_string(),
+                    None,
+                    ReferenceCaseFlow::Normal,
+                ))
+            }
+            Statement::ContinueStatement(continue_stmt) if continue_stmt.label.is_none() => {
+                Some((String::new(), None, ReferenceCaseFlow::Continue))
+            }
+            Statement::BreakStatement(break_stmt) if break_stmt.label.is_none() => {
+                Some((String::new(), None, ReferenceCaseFlow::Break))
+            }
+            Statement::ReturnStatement(_) => {
+                if statement_mentions(stmt, state_var) {
+                    return None;
+                }
+                Some((
+                    fragment(self.source, stmt.span()).to_string(),
+                    None,
+                    ReferenceCaseFlow::Return,
+                ))
+            }
+            Statement::ThrowStatement(_) => {
+                if statement_mentions(stmt, state_var) {
+                    return None;
+                }
+                Some((
+                    fragment(self.source, stmt.span()).to_string(),
+                    None,
+                    ReferenceCaseFlow::Throw,
+                ))
+            }
+            _ => {
+                if statement_mentions(stmt, state_var) || statement_has_loop_control(stmt) {
+                    return None;
+                }
+                Some((
+                    fragment(self.source, stmt.span()).to_string(),
+                    None,
+                    ReferenceCaseFlow::Normal,
+                ))
+            }
+        }
+    }
+
+    fn reference_state_replacement(&self, it: &oxc_ast::ast::ForStatement<'_>) -> Option<String> {
+        if it.update.is_some() || !matches!(eval(it.test.as_ref()?), Some(Value::Bool(true))) {
+            return None;
+        }
+
+        let init = it.init.as_ref()?;
+        let oxc_ast::ast::ForStatementInit::VariableDeclaration(init_decl) = init else {
+            return None;
+        };
+        if init_decl.kind != VariableDeclarationKind::Var || init_decl.declarations.is_empty() {
+            return None;
+        }
+
+        let mut state_index = None;
+        let mut state_symbol = None;
+        let mut state_var = None;
+        let mut table_symbol = None;
+        let mut initial_identity = None;
+        for (index, declaration) in init_decl.declarations.iter().enumerate() {
+            let Some(init) = &declaration.init else {
+                continue;
+            };
+            let Some((symbol, identity)) =
+                reference_identity(init, self.scoping, self.reference_identity_tables)
+            else {
+                continue;
+            };
+            if state_index.is_some() {
+                return None;
+            }
+            let BindingPattern::BindingIdentifier(id) = &declaration.id else {
+                return None;
+            };
+            state_index = Some(index);
+            state_symbol = id.symbol_id.get();
+            state_var = Some(id.name.as_str());
+            table_symbol = Some(symbol);
+            initial_identity = Some(identity);
+        }
+
+        let state_index = state_index?;
+        let state_symbol = state_symbol?;
+        let state_var = state_var?;
+        let table_symbol = table_symbol?;
+        let mut current = initial_identity?;
+
+        if !resolved_refs_within(self.scoping, self.reference_spans, state_symbol, it.span) {
+            return None;
+        }
+        for declaration in &init_decl.declarations {
+            if let Some(init) = &declaration.init {
+                if expression_mentions(init, state_var)
+                    && direct_identifier_name(init) != Some(state_var)
+                {
+                    return None;
+                }
+            }
+        }
+
+        let Statement::BlockStatement(body) = &it.body else {
+            return None;
+        };
+        if body.body.len() != 2 {
+            return None;
+        }
+        let Statement::SwitchStatement(switch) = &body.body[0] else {
+            return None;
+        };
+        let Statement::BreakStatement(outer_break) = &body.body[1] else {
+            return None;
+        };
+        if outer_break.label.is_some()
+            || direct_identifier_name(&switch.discriminant) != Some(state_var)
+        {
+            return None;
+        }
+
+        let mut cases = HashMap::new();
+        for (index, case) in switch.cases.iter().enumerate() {
+            let test = case.test.as_ref()?;
+            let (symbol, identity) =
+                reference_identity(test, self.scoping, self.reference_identity_tables)?;
+            if symbol != table_symbol || cases.insert(identity, index).is_some() {
+                return None;
+            }
+        }
+
+        let mut chunks = Vec::new();
+        let other_declarations = init_decl
+            .declarations
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != state_index)
+            .map(|(_, declaration)| fragment(self.source, declaration.span))
+            .collect::<Vec<_>>();
+        if !other_declarations.is_empty() {
+            chunks.push(format!("var {};", other_declarations.join(",")));
+        }
+
+        let mut seen = HashSet::new();
+        for _ in 0..256 {
+            if !seen.insert(current) {
+                return None;
+            }
+            let Some(start) = cases.get(&current).copied() else {
+                // No case matches, so the switch falls through and the
+                // unconditional break after it terminates the dispatcher.
+                return Some(format!(
+                    "{{
+{}
+}}",
+                    chunks.join(
+                        "
+"
+                    )
+                ));
+            };
+
+            let mut next_state = None;
+            let mut flow = ReferenceCaseFlow::Normal;
+            'cases: for case in switch.cases.iter().skip(start) {
+                for stmt in &case.consequent {
+                    let (text, next, stmt_flow) =
+                        self.clean_reference_state_statement(stmt, state_var, table_symbol)?;
+                    if !text.trim().is_empty() {
+                        chunks.push(text);
+                    }
+                    if let Some(next) = next {
+                        next_state = Some(next);
+                    }
+                    if stmt_flow != ReferenceCaseFlow::Normal {
+                        flow = stmt_flow;
+                        break 'cases;
+                    }
+                }
+            }
+
+            match flow {
+                ReferenceCaseFlow::Continue => {
+                    current = next_state?;
+                }
+                ReferenceCaseFlow::Break
+                | ReferenceCaseFlow::Return
+                | ReferenceCaseFlow::Throw
+                | ReferenceCaseFlow::Normal => {
+                    return Some(format!(
+                        "{{
+{}
+}}",
+                        chunks.join(
+                            "
+"
+                        )
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     fn arithmetic_state_replacement(
         &self,
         it: &oxc_ast::ast::ForStatement<'_>,
@@ -3225,6 +3857,30 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_binary_expression(&mut self, it: &oxc_ast::ast::BinaryExpression<'a>) {
+        if matches!(it.operator.as_str(), "==" | "===" | "!=" | "!==") {
+            let left_reference =
+                reference_identity(&it.left, self.scoping, self.reference_identity_tables);
+            let right_reference =
+                reference_identity(&it.right, self.scoping, self.reference_identity_tables);
+            if let (Some((left_symbol, left_identity)), Some((right_symbol, right_identity))) =
+                (left_reference, right_reference)
+            {
+                if left_symbol == right_symbol {
+                    let equal = left_identity == right_identity;
+                    let value = if matches!(it.operator.as_str(), "==" | "===") {
+                        equal
+                    } else {
+                        !equal
+                    };
+                    self.push(
+                        it.span,
+                        if value { "true" } else { "false" }.to_string(),
+                        "reference_identity_compare",
+                    );
+                    return;
+                }
+            }
+        }
         if let (Some(left), Some(right)) = (eval(&it.left), eval(&it.right)) {
             if let Some(value) = eval_binary(it.operator.as_str(), left, right) {
                 if let Some(text) = value.render() {
@@ -3281,6 +3937,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
+        if let Some(text) = self.reference_state_replacement(it) {
+            self.push(it.span, text, "reference_state_unflatten");
+            return;
+        }
         if let Some((text, proof)) = self.arithmetic_state_replacement(it) {
             self.push_arithmetic(it.span, text, proof);
             return;
@@ -3604,7 +4264,7 @@ fn transform_once(
     let functions = all_functions(&program);
     let legacy_functions = top_level_functions(&program);
     let reference_spans = collect_reference_spans(&program);
-    let (mut decoders, protected_spans) =
+    let (mut decoders, mut protected_spans) =
         detect_decoders(source, &legacy_functions, &program, scoping);
     for (symbol, decoder) in
         detect_direct_table_decoders(source, &functions, &array_infos, scoping, &reference_spans)
@@ -3615,6 +4275,13 @@ fn transform_once(
     let shorthand_spans = collect_shorthand_spans(&program);
     let proxies = collect_proxy_objects(&program, scoping);
     let pure_functions = collect_pure_functions(&program, scoping);
+    let reference_identity_tables =
+        detect_reference_identity_tables(source, scoping, &reference_spans);
+    protected_spans.extend(
+        reference_identity_tables
+            .values()
+            .map(|table| (table.construction_start, table.construction_end)),
+    );
     let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
 
     let mut collector = Collector {
@@ -3626,6 +4293,7 @@ fn transform_once(
         shorthand_spans: &shorthand_spans,
         proxies: &proxies,
         pure_functions: &pure_functions,
+        reference_identity_tables: &reference_identity_tables,
         dispatch_orders: &dispatch_orders,
         zero_counters: &zero_counters,
         reference_spans: &reference_spans,

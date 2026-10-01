@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / ".cargo-target-nodebug/debug/deobfuscate-safe"
 FIXTURE = ROOT / "corpus/generated/reversible-obfuscation/datadome-direct-table.js"
+IDENTITY_FIXTURE = ROOT / "corpus/generated/reversible-obfuscation/reference-identity-table.js"
 TMP = ROOT / "work/test-tmp/datadome-normalization"
 
 
@@ -66,7 +67,27 @@ def main():
         assert transforms.get("string_array_decode", 0) >= 15, transforms
         assert transforms.get("pure_function_eval", 0) >= 5, transforms
         assert meta["safe_static_only"] is True
-        print("PASS", transforms)
+        print("PASS direct-table", transforms)
+
+    with tempfile.TemporaryDirectory(prefix="identity-table-", dir=TMP) as td:
+        td = Path(td)
+        out = td / "out.js"
+        report = td / "report.json"
+        before = run(["node", IDENTITY_FIXTURE]).stdout
+        run([BIN, IDENTITY_FIXTURE, out, "--report", report])
+        run(["node", "--check", out])
+        after = run(["node", out]).stdout
+        assert before == after == "true true true true ab\n", (before, after)
+        text = out.read_text()
+        assert "S[0][0] === S[4][0]" not in text, text
+        assert "S[0][0] !== S[0][1]" not in text, text
+        assert "switch (state)" not in text and "switch(state)" not in text, text
+        meta = json.loads(report.read_text())
+        transforms = meta["transforms"]
+        assert transforms.get("reference_identity_compare", 0) >= 4, transforms
+        assert transforms.get("reference_state_unflatten", 0) >= 1, transforms
+        assert meta["safe_static_only"] is True
+        print("PASS reference-identity", transforms)
 
 
 if __name__ == "__main__":
