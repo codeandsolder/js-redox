@@ -751,7 +751,7 @@ fn base64_probe(value: &str, min_len: usize) -> Option<Base64Probe> {
         .ok()?;
 
     let magic = decoded_magic(&decoded);
-    let asset_like = magic.as_deref().is_some_and(|kind| {
+    let asset_like = magic.is_some_and(|kind| {
         matches!(
             kind,
             "png" | "jpeg" | "gif" | "webp" | "svg" | "woff" | "woff2" | "ttf" | "otf" | "pdf"
@@ -811,7 +811,9 @@ fn decoded_magic(decoded: &[u8]) -> Option<&'static str> {
 
 fn looks_hex_blob(value: &str) -> bool {
     let trimmed = value.trim();
-    trimmed.len() >= 128 && trimmed.len() % 2 == 0 && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+    trimmed.len() >= 128
+        && trimmed.len().is_multiple_of(2)
+        && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn looks_opaque_blob(value: &str) -> bool {
