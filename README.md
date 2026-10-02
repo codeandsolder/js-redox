@@ -44,7 +44,9 @@ The harness asserts structural VM detection for generated/real VM positives, zer
 
 The structure module uses small detector registries by AST node type. Detectors emit explainable `StructuralSignal` records; the main scanner owns clustering, weighting and output. New families should therefore be added as a detector plus positive/control fixtures in `corpus/generated/sus-scanner/`, without vendor-name checks.
 
-Current structural families include same-array rotation (`x.push(x.shift())`, including literal bracket members), checksum-driven rotation bootstraps, dense operator/call proxy tables, and self-disabling one-shot wrapper factories. Low-level evidence may deliberately remain below the standalone cluster threshold; repeated evidence or a stronger composite structure promotes the region.
+Current structural families include same-array rotation (`x.push(x.shift())`, including literal bracket members), checksum-driven rotation bootstraps, dense operator/call proxy tables, self-disabling one-shot wrapper factories, direct literal-table decoders, tiny mixed-boolean-arithmetic helpers, and numeric selector dispatchers. Low-level evidence may deliberately remain below the standalone cluster threshold; repeated evidence or a stronger composite structure promotes the region.
+
+Coverage is intentionally measured separately from generic suspicion scoring. On the 47-file real corpus plus 3 VM hard negatives, the simple scanner and structural scanner both cluster 49/50 files, but the structural layer names concrete obfuscation families in 17 files (16 real + the Yandex VM-negative that genuinely contains a rotation bootstrap). That named coverage is the useful metric because the families map directly onto safe deobfuscation passes such as table decoding, pure-helper evaluation, and selector specialization.
 
 ## Current pipeline
 

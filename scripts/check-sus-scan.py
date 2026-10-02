@@ -52,6 +52,12 @@ def main():
         "operator-proxy-table-control.js",
         "one-shot-wrapper.js",
         "one-shot-wrapper-control.js",
+        "direct-table-decoder.js",
+        "direct-table-decoder-control.js",
+        "mba-helper-cluster.js",
+        "mba-helper-control.js",
+        "selector-dispatcher.js",
+        "selector-dispatcher-control.js",
     }
     assert expected <= by_name.keys(), sorted(by_name)
 
@@ -67,6 +73,12 @@ def main():
     proxy_control = by_name["operator-proxy-table-control.js"]
     one_shot = by_name["one-shot-wrapper.js"]
     one_shot_control = by_name["one-shot-wrapper-control.js"]
+    direct_decoder = by_name["direct-table-decoder.js"]
+    direct_decoder_control = by_name["direct-table-decoder-control.js"]
+    mba_helpers = by_name["mba-helper-cluster.js"]
+    mba_control = by_name["mba-helper-control.js"]
+    selector = by_name["selector-dispatcher.js"]
+    selector_control = by_name["selector-dispatcher-control.js"]
 
     assert dense["clusters"], dense
     assert dense["top_score"] >= 30, dense["top_score"]
@@ -122,6 +134,15 @@ def main():
 
     assert one_shot["signal_kinds"].get("one_shot_wrapper", 0) == 1, one_shot["signal_kinds"]
     assert one_shot_control["signal_kinds"].get("one_shot_wrapper", 0) == 0, one_shot_control["signal_kinds"]
+
+    assert direct_decoder["signal_kinds"].get("direct_table_decoder", 0) == 1, direct_decoder["signal_kinds"]
+    assert direct_decoder_control["signal_kinds"].get("direct_table_decoder", 0) == 0, direct_decoder_control["signal_kinds"]
+
+    assert mba_helpers["signal_kinds"].get("mba_helper", 0) == 4, mba_helpers["signal_kinds"]
+    assert mba_control["signal_kinds"].get("mba_helper", 0) == 0, mba_control["signal_kinds"]
+
+    assert selector["signal_kinds"].get("selector_dispatcher", 0) == 1, selector["signal_kinds"]
+    assert selector_control["signal_kinds"].get("selector_dispatcher", 0) == 0, selector_control["signal_kinds"]
 
     text = run(BIN, FIXTURES / "dense-obfuscation.js").stdout
     assert "SUS summary:" in text

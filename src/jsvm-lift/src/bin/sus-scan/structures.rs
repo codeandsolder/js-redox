@@ -5,6 +5,8 @@ use oxc_ast::ast::{
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_span::Span;
+use oxc_syntax::scope::ScopeFlags;
+use std::collections::HashSet;
 
 #[derive(Debug)]
 pub(crate) struct StructuralSignal {
@@ -17,6 +19,7 @@ pub(crate) struct StructuralSignal {
 
 type CallDetector = fn(&CallExpression<'_>) -> Option<StructuralSignal>;
 type ObjectDetector = fn(&ObjectExpression<'_>) -> Option<StructuralSignal>;
+type FunctionDetector = fn(&Function<'_>) -> Option<StructuralSignal>;
 
 const CALL_DETECTORS: &[CallDetector] = &[
     detect_array_rotation,
@@ -25,6 +28,12 @@ const CALL_DETECTORS: &[CallDetector] = &[
 ];
 
 const OBJECT_DETECTORS: &[ObjectDetector] = &[detect_operator_proxy_table];
+
+const FUNCTION_DETECTORS: &[FunctionDetector] = &[
+    detect_direct_table_decoder,
+    detect_mba_helper,
+    detect_selector_dispatcher,
+];
 
 pub(crate) fn call_signals(call: &CallExpression<'_>) -> Vec<StructuralSignal> {
     CALL_DETECTORS
@@ -37,6 +46,13 @@ pub(crate) fn object_signals(object: &ObjectExpression<'_>) -> Vec<StructuralSig
     OBJECT_DETECTORS
         .iter()
         .filter_map(|detector| detector(object))
+        .collect()
+}
+
+pub(crate) fn function_signals(function: &Function<'_>) -> Vec<StructuralSignal> {
+    FUNCTION_DETECTORS
+        .iter()
+        .filter_map(|detector| detector(function))
         .collect()
 }
 
@@ -404,6 +420,262 @@ fn detect_operator_proxy_table(object: &ObjectExpression<'_>) -> Option<Structur
         subject: None,
         detail: format!(
             "{proxy_functions}/{static_properties} tiny proxy functions; {generated_keys} generated-looking short keys"
+        ),
+    })
+}
+
+fn simple_function_params(function: &Function<'_>) -> Option<Vec<String>> {
+    if function.generator || function.r#async {
+        return None;
+    }
+    function
+        .params
+        .items
+        .iter()
+        .map(|param| match &param.pattern {
+            BindingPattern::BindingIdentifier(identifier) => Some(identifier.name.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn function_subject(function: &Function<'_>) -> Option<String> {
+    function.id.as_ref().map(|id| id.name.to_string())
+}
+
+fn decode_primitive(call: &CallExpression<'_>) -> bool {
+    matches!(
+        direct_identifier(&call.callee),
+        Some("atob" | "decodeURIComponent" | "unescape")
+    )
+}
+
+struct DirectTableDecoderProbe<'p> {
+    index_param: &'p str,
+    table: Option<String>,
+    table_conflict: bool,
+    indexed_uses: usize,
+    decode_calls: usize,
+}
+
+impl<'a> Visit<'a> for DirectTableDecoderProbe<'_> {
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {
+        // Nested functions do not execute as part of the candidate decoder.
+    }
+
+    fn visit_computed_member_expression(
+        &mut self,
+        it: &oxc_ast::ast::ComputedMemberExpression<'a>,
+    ) {
+        if direct_identifier(&it.expression) == Some(self.index_param) {
+            if let Some(table) = direct_identifier(&it.object) {
+                self.indexed_uses += 1;
+                match &self.table {
+                    None => self.table = Some(table.to_string()),
+                    Some(existing) if existing == table => {}
+                    Some(_) => self.table_conflict = true,
+                }
+            }
+        }
+        walk::walk_computed_member_expression(self, it);
+    }
+
+    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+        if decode_primitive(it) {
+            self.decode_calls += 1;
+        }
+        walk::walk_call_expression(self, it);
+    }
+}
+
+fn detect_direct_table_decoder(function: &Function<'_>) -> Option<StructuralSignal> {
+    let params = simple_function_params(function)?;
+    if params.is_empty() || params.len() > 2 || function.span.size() > 4096 {
+        return None;
+    }
+    let body = function.body.as_ref()?;
+    let mut probe = DirectTableDecoderProbe {
+        index_param: &params[0],
+        table: None,
+        table_conflict: false,
+        indexed_uses: 0,
+        decode_calls: 0,
+    };
+    probe.visit_function_body(body);
+    if probe.table_conflict || probe.indexed_uses == 0 || probe.decode_calls == 0 {
+        return None;
+    }
+    let table = probe.table?;
+    Some(StructuralSignal {
+        kind: "direct_table_decoder",
+        weight: 12 + (probe.decode_calls as u32).min(4),
+        span: function.span,
+        subject: Some(table.clone()),
+        detail: format!(
+            "{} indexed table use(s) through parameter {}; {} decode primitive call(s) [{}]",
+            probe.indexed_uses, params[0], probe.decode_calls, table
+        ),
+    })
+}
+
+#[derive(Default)]
+struct NumericHelperStats {
+    operations: usize,
+    bitwise: usize,
+}
+
+fn numeric_helper_expression(
+    expression: &Expression<'_>,
+    params: &[String],
+    stats: &mut NumericHelperStats,
+) -> bool {
+    match expression {
+        Expression::Identifier(identifier) => {
+            params.iter().any(|param| param == identifier.name.as_str())
+        }
+        Expression::NumericLiteral(number) => number.value.is_finite(),
+        Expression::ParenthesizedExpression(parenthesized) => {
+            numeric_helper_expression(&parenthesized.expression, params, stats)
+        }
+        Expression::UnaryExpression(unary)
+            if matches!(unary.operator.as_str(), "~" | "+" | "-") =>
+        {
+            stats.operations += 1;
+            if unary.operator.as_str() == "~" {
+                stats.bitwise += 1;
+            }
+            numeric_helper_expression(&unary.argument, params, stats)
+        }
+        Expression::BinaryExpression(binary)
+            if matches!(
+                binary.operator.as_str(),
+                "+" | "-" | "*" | "/" | "%" | "**" | "<<" | ">>" | ">>>" | "|" | "^" | "&"
+            ) =>
+        {
+            stats.operations += 1;
+            if matches!(
+                binary.operator.as_str(),
+                "<<" | ">>" | ">>>" | "|" | "^" | "&"
+            ) {
+                stats.bitwise += 1;
+            }
+            numeric_helper_expression(&binary.left, params, stats)
+                && numeric_helper_expression(&binary.right, params, stats)
+        }
+        _ => false,
+    }
+}
+
+fn detect_mba_helper(function: &Function<'_>) -> Option<StructuralSignal> {
+    let params = simple_function_params(function)?;
+    if params.is_empty() || params.len() > 3 {
+        return None;
+    }
+    let body = function.body.as_ref()?;
+    if !body.directives.is_empty() {
+        return None;
+    }
+    let [Statement::ReturnStatement(ret)] = body.statements.as_slice() else {
+        return None;
+    };
+    let expression = ret.argument.as_ref()?;
+    let mut stats = NumericHelperStats::default();
+    if !numeric_helper_expression(expression, &params, &mut stats)
+        || stats.operations < 12
+        || stats.bitwise < 4
+    {
+        return None;
+    }
+    Some(StructuralSignal {
+        kind: "mba_helper",
+        weight: 2 + (stats.bitwise as u32).min(5),
+        span: function.span,
+        subject: function_subject(function),
+        detail: format!(
+            "tiny pure numeric helper with {} operation(s), {} bitwise",
+            stats.operations, stats.bitwise
+        ),
+    })
+}
+
+fn integer_literal(expression: &Expression<'_>) -> Option<i64> {
+    match expression {
+        Expression::NumericLiteral(number)
+            if number.value.is_finite() && number.value.fract() == 0.0 =>
+        {
+            Some(number.value as i64)
+        }
+        Expression::UnaryExpression(unary) if matches!(unary.operator.as_str(), "+" | "-") => {
+            let value = integer_literal(&unary.argument)?;
+            Some(if unary.operator.as_str() == "-" {
+                -value
+            } else {
+                value
+            })
+        }
+        _ => None,
+    }
+}
+
+struct SelectorDispatcherProbe<'s> {
+    selector: &'s str,
+    literals: HashSet<i64>,
+    returns: usize,
+}
+
+impl<'a> Visit<'a> for SelectorDispatcherProbe<'_> {
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {
+        // Do not let nested callbacks make an outer function look like a dispatcher.
+    }
+
+    fn visit_binary_expression(&mut self, it: &oxc_ast::ast::BinaryExpression<'a>) {
+        if matches!(it.operator.as_str(), "==" | "===" | "!=" | "!==") {
+            let literal = if direct_identifier(&it.left) == Some(self.selector) {
+                integer_literal(&it.right)
+            } else if direct_identifier(&it.right) == Some(self.selector) {
+                integer_literal(&it.left)
+            } else {
+                None
+            };
+            if let Some(literal) = literal {
+                self.literals.insert(literal);
+            }
+        }
+        walk::walk_binary_expression(self, it);
+    }
+
+    fn visit_return_statement(&mut self, it: &oxc_ast::ast::ReturnStatement<'a>) {
+        self.returns += 1;
+        walk::walk_return_statement(self, it);
+    }
+}
+
+fn detect_selector_dispatcher(function: &Function<'_>) -> Option<StructuralSignal> {
+    let params = simple_function_params(function)?;
+    let selector = params.first()?;
+    let body = function.body.as_ref()?;
+    if function.span.size() > 8192 {
+        return None;
+    }
+    let mut probe = SelectorDispatcherProbe {
+        selector,
+        literals: HashSet::new(),
+        returns: 0,
+    };
+    probe.visit_function_body(body);
+    if probe.literals.len() < 4 || probe.returns < 8 || probe.returns < probe.literals.len() {
+        return None;
+    }
+    Some(StructuralSignal {
+        kind: "selector_dispatcher",
+        weight: 8 + (probe.literals.len() as u32).min(8),
+        span: function.span,
+        subject: function_subject(function),
+        detail: format!(
+            "{} numeric selector value(s), {} return path(s) through parameter {}",
+            probe.literals.len(),
+            probe.returns,
+            selector
         ),
     })
 }

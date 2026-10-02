@@ -4,11 +4,12 @@ use clap::Parser as ClapParser;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, BinaryExpression, CallExpression,
-    ComputedMemberExpression, Expression, NewExpression, ObjectExpression,
+    ComputedMemberExpression, Expression, Function, NewExpression, ObjectExpression,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
+use oxc_syntax::scope::ScopeFlags;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -389,6 +390,18 @@ impl Collector<'_> {
         }
     }
 
+    fn record_structural_function(&mut self, it: &Function<'_>) {
+        for signal in structures::function_signals(it) {
+            self.push(
+                signal.kind,
+                signal.weight,
+                signal.span,
+                signal.subject,
+                signal.detail,
+            );
+        }
+    }
+
     fn record_call(&mut self, it: &CallExpression<'_>) {
         self.record_structural_call(it);
         let callee = self.fragment(it.callee.span()).trim().to_string();
@@ -614,6 +627,11 @@ impl Collector<'_> {
 }
 
 impl<'a> Visit<'a> for Collector<'_> {
+    fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+        self.record_structural_function(it);
+        walk::walk_function(self, it, flags);
+    }
+
     fn visit_expression(&mut self, it: &Expression<'a>) {
         match it {
             Expression::StringLiteral(value) => self.record_blob(value.span, value.value.as_str()),
