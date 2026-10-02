@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import re
 import subprocess
@@ -12,22 +13,22 @@ TEMP_ROOT = ROOT / "work" / "test-tmp"
 CASES = [
     (
         "split-strings",
-        ROOT / "third_party/obscura/fixtures/golden/split-strings/trivial/hello.js",
+        ROOT / "corpus/generated/reversible-obfuscation/obscura-split-strings.js",
         ['"hello, world"', ".log("],
     ),
     (
         "number-expressions",
-        ROOT / "third_party/obscura/fixtures/golden/numbers-to-expressions/numbers/literals.js",
+        ROOT / "corpus/generated/reversible-obfuscation/obscura-number-expressions.js",
         ["const integer = 42", ".log("],
     ),
     (
         "unicode-escape",
-        ROOT / "third_party/obscura/fixtures/golden/unicode-escape/trivial/hello.js",
+        ROOT / "corpus/generated/reversible-obfuscation/obscura-unicode-escape.js",
         ['"hello, world"', ".log("],
     ),
     (
         "static-string-array",
-        ROOT / "third_party/obscura/fixtures/golden/string-array-only/trivial/hello.js",
+        ROOT / "corpus/generated/reversible-obfuscation/obscura-string-array.js",
         ['const greeting = "hello, world"', 'console.log("hello, world")'],
     ),
     (
@@ -66,13 +67,18 @@ CASES = [
         ['"hello, world"', '"beta"', "console.log", "seq"],
     ),
     (
+        "proven-helper-prune",
+        ROOT / "corpus/generated/reversible-obfuscation/proven-helper-prune.js",
+        ["function keepMe", "console.log"],
+    ),
+    (
         "const-aliases",
         ROOT / "corpus/generated/reversible-obfuscation/const-aliases.js",
         ['"hello"', "42", "return later", "{ answer }"],
     ),
     (
         "control-flow-storage",
-        ROOT / "third_party/obscura/fixtures/golden/control-flow-flattening/control-flow/branches.js",
+        ROOT / "corpus/generated/reversible-obfuscation/obscura-control-flow-storage.js",
         [
             'return "negative"',
             'return "zero"',
@@ -85,6 +91,16 @@ CASES = [
         "proxy-calls",
         ROOT / "corpus/generated/reversible-obfuscation/proxy-calls.js",
         ["detached", "((0, (add)))(20, 22)", "((0, (holder.method)))()"],
+    ),
+    (
+        "selector-trailing-params",
+        ROOT / "corpus/generated/reversible-obfuscation/selector-trailing-params.js",
+        ["function(selector, left)", "bump(9)", "bump(12)"],
+    ),
+    (
+        "reference-identity-table",
+        ROOT / "corpus/generated/reversible-obfuscation/reference-identity-table.js",
+        [],
     ),
     (
         "ordered-switch",
@@ -127,6 +143,10 @@ def node_check(path: Path) -> None:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--require-real-corpus", action="store_true")
+    args = parser.parse_args()
+
     if not BIN.is_file():
         raise SystemExit(f"missing binary: {BIN}")
 
@@ -196,6 +216,17 @@ def main():
             if name == "proxy-calls":
                 assert meta["transforms"].get("proxy_call", 0) >= 3, meta
                 assert meta["transforms"].get("proxy_binary", 0) >= 1, meta
+            if name == "proven-helper-prune":
+                assert "function pruneMe" not in text, text
+                assert "function keepMe" in text, text
+                assert meta["transforms"].get("pure_function_eval", 0) >= 1, meta
+                assert meta["transforms"].get("remove_unused_proven_helper", 0) >= 1, meta
+            if name == "selector-trailing-params":
+                assert meta["transforms"].get("selector_dispatch_specialize", 0) >= 2, meta
+                assert "function(selector, left, p2, p3, p4, p5, p6, p7, p8, p9){return (left | 0);}" not in text, text
+            if name == "reference-identity-table":
+                assert meta["transforms"].get("reference_identity_compare", 0) >= 4, meta
+                assert meta["transforms"].get("reference_state_unflatten", 0) >= 1, meta
             if name == "ordered-switch":
                 assert meta["transforms"].get("ordered_switch_unflatten", 0) >= 1, meta
             if name == "arithmetic-state":
@@ -228,6 +259,11 @@ def main():
         assert totals.get("proxy_static_member", 0) >= 2, totals
         assert totals.get("proxy_computed_member", 0) >= 2, totals
         assert totals.get("proxy_call", 0) >= 3, totals
+        assert totals.get("pure_function_eval", 0) >= 1, totals
+        assert totals.get("remove_unused_proven_helper", 0) >= 1, totals
+        assert totals.get("selector_dispatch_specialize", 0) >= 2, totals
+        assert totals.get("reference_identity_compare", 0) >= 4, totals
+        assert totals.get("reference_state_unflatten", 0) >= 1, totals
         assert totals.get("ordered_switch_unflatten", 0) >= 1, totals
         assert totals.get("arithmetic_state_unflatten", 0) >= 1, totals
 
@@ -251,6 +287,29 @@ def main():
         duplicate_meta = json.loads(duplicate_report.read_text())
         assert duplicate_meta["transforms"].get("string_array_decode", 0) == 0, duplicate_meta
         print("duplicate-scope-decoder-safety", duplicate_meta["transforms"])
+
+        eval_prune_source = ROOT / "corpus/generated/reversible-obfuscation/proven-helper-prune-eval-safety.js"
+        eval_prune_out = td / "proven-helper-prune-eval-safety.js"
+        eval_prune_report = td / "proven-helper-prune-eval-safety.json"
+        before = node_stdout(eval_prune_source)
+        cp = subprocess.run(
+            [str(BIN), str(eval_prune_source), str(eval_prune_out), "--report", str(eval_prune_report)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(
+                f"direct-eval helper prune safety deobfuscation failed:\n{cp.stdout}\n{cp.stderr}"
+            )
+        assert node_stdout(eval_prune_out) == before
+        eval_prune_text = eval_prune_out.read_text()
+        eval_prune_meta = json.loads(eval_prune_report.read_text())
+        assert "function hiddenHelper" in eval_prune_text, eval_prune_text
+        assert eval_prune_meta["transforms"].get("remove_unused_proven_helper", 0) == 0, eval_prune_meta
+        print("direct-eval-helper-prune-safety", eval_prune_meta["transforms"])
 
         mutable_alias_source = ROOT / "corpus/generated/reversible-obfuscation/mutable-decoder-alias-safety.js"
         mutable_alias_out = td / "mutable-decoder-alias-safety.js"
@@ -368,35 +427,42 @@ def main():
         # normal sibling has one fully deterministic helper; the captcha sibling
         # used to false-positive because a nested IIFE invalidated outer values.
         real_positive = ROOT / "corpus/taobao/normal_et_f(1).js"
-        real_positive_out = td / "normal-et-real.js"
-        real_positive_report = td / "normal-et-real.json"
-        cp = subprocess.run(
-            [str(BIN), str(real_positive), str(real_positive_out), "--report", str(real_positive_report)],
-            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-        )
-        if cp.returncode:
-            raise RuntimeError(f"real ET positive deobfuscation failed:\n{cp.stdout}\n{cp.stderr}")
-        node_check(real_positive_out)
-        real_positive_meta = json.loads(real_positive_report.read_text())
-        assert real_positive_meta["transforms"].get("arithmetic_state_unflatten", 0) == 1, real_positive_meta
-        assert len(real_positive_meta["arithmetic_state_proofs"]) == 1, real_positive_meta
-        assert real_positive_meta["arithmetic_state_proofs"][0]["termination"] in {"undefined", "return", "throw"}
-        print("real-et-positive", real_positive_meta["transforms"], real_positive_meta["arithmetic_state_proofs"])
-
         real_negative = ROOT / "corpus/taobao/captcha_et_f(1).js"
-        real_negative_out = td / "captcha-et-real.js"
-        real_negative_report = td / "captcha-et-real.json"
-        cp = subprocess.run(
-            [str(BIN), str(real_negative), str(real_negative_out), "--report", str(real_negative_report)],
-            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
-        )
-        if cp.returncode:
-            raise RuntimeError(f"real ET negative deobfuscation failed:\n{cp.stdout}\n{cp.stderr}")
-        node_check(real_negative_out)
-        real_negative_meta = json.loads(real_negative_report.read_text())
-        assert real_negative_meta["transforms"].get("arithmetic_state_unflatten", 0) == 0, real_negative_meta
-        assert real_negative_meta["arithmetic_state_proofs"] == [], real_negative_meta
-        print("real-et-negative", real_negative_meta["transforms"])
+        if real_positive.is_file() and real_negative.is_file():
+            real_positive_out = td / "normal-et-real.js"
+            real_positive_report = td / "normal-et-real.json"
+            cp = subprocess.run(
+                [str(BIN), str(real_positive), str(real_positive_out), "--report", str(real_positive_report)],
+                cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+            )
+            if cp.returncode:
+                raise RuntimeError(f"real ET positive deobfuscation failed:\n{cp.stdout}\n{cp.stderr}")
+            node_check(real_positive_out)
+            real_positive_meta = json.loads(real_positive_report.read_text())
+            assert real_positive_meta["transforms"].get("arithmetic_state_unflatten", 0) == 1, real_positive_meta
+            assert len(real_positive_meta["arithmetic_state_proofs"]) == 1, real_positive_meta
+            assert real_positive_meta["arithmetic_state_proofs"][0]["termination"] in {"undefined", "return", "throw"}
+            print("real-et-positive", real_positive_meta["transforms"], real_positive_meta["arithmetic_state_proofs"])
+
+            real_negative_out = td / "captcha-et-real.js"
+            real_negative_report = td / "captcha-et-real.json"
+            cp = subprocess.run(
+                [str(BIN), str(real_negative), str(real_negative_out), "--report", str(real_negative_report)],
+                cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+            )
+            if cp.returncode:
+                raise RuntimeError(f"real ET negative deobfuscation failed:\n{cp.stdout}\n{cp.stderr}")
+            node_check(real_negative_out)
+            real_negative_meta = json.loads(real_negative_report.read_text())
+            assert real_negative_meta["transforms"].get("arithmetic_state_unflatten", 0) == 0, real_negative_meta
+            assert real_negative_meta["arithmetic_state_proofs"] == [], real_negative_meta
+            print("real-et-negative", real_negative_meta["transforms"])
+        elif args.require_real_corpus:
+            raise SystemExit(
+                "real ET corpus is required but missing; run this gate from a full-corpus workspace"
+            )
+        else:
+            print("SKIP real-et: external Taobao corpus is not present in this worktree")
 
         print("PASS: safe reversible deobfuscation runtime-equivalent across", len(CASES), "families")
         print("totals", totals)

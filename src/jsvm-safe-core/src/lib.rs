@@ -755,6 +755,7 @@ struct StaticArrayInfo {
     symbol: SymbolId,
     name: String,
     values: Vec<Value>,
+    span: Span,
 }
 
 #[derive(Default)]
@@ -787,6 +788,7 @@ impl<'a> Visit<'a> for StaticArrayCollector {
                     symbol,
                     name: id.name.to_string(),
                     values,
+                    span: arr.span,
                 });
             }
         }
@@ -1012,14 +1014,12 @@ fn all_function_declarations(
 
 #[derive(Debug)]
 struct DirectFnInfo {
-    name: String,
     symbol: SymbolId,
     params: Vec<String>,
     span: Span,
     body_statement_count: usize,
     direct_call_count: usize,
     fixed_decoder_control_shape: bool,
-    static_arrays: HashMap<String, Vec<Value>>,
 }
 
 #[derive(Default)]
@@ -1041,36 +1041,7 @@ impl<'a> Visit<'a> for DirectFnInfoCollector {
                     })
                     .collect();
 
-                let mut static_arrays = HashMap::new();
-                if let Some(body) = &f.body {
-                    for stmt in &body.statements {
-                        let Statement::VariableDeclaration(decl) = stmt else {
-                            continue;
-                        };
-                        for d in &decl.declarations {
-                            let BindingPattern::BindingIdentifier(array_id) = &d.id else {
-                                continue;
-                            };
-                            let Some(Expression::ArrayExpression(array)) = &d.init else {
-                                continue;
-                            };
-                            let Some(values) = array
-                                .elements
-                                .iter()
-                                .map(array_element)
-                                .collect::<Option<Vec<_>>>()
-                            else {
-                                continue;
-                            };
-                            if !values.is_empty() {
-                                static_arrays.insert(array_id.name.to_string(), values);
-                            }
-                        }
-                    }
-                }
-
                 self.out.push(DirectFnInfo {
-                    name: id.name.to_string(),
                     symbol,
                     params,
                     span: f.span,
@@ -1083,7 +1054,6 @@ impl<'a> Visit<'a> for DirectFnInfoCollector {
                         .body
                         .as_ref()
                         .is_some_and(|body| fixed_decoder_control_shape(body)),
-                    static_arrays,
                 });
             }
         }
@@ -1588,6 +1558,7 @@ fn detect_direct_table_decoders(
                 values: array.values.clone(),
                 offset: 0,
                 provider: array.name.clone(),
+                provider_array_span: array.span,
                 transform,
             },
         );
@@ -1924,6 +1895,7 @@ impl<'a> Visit<'a> for SelectorLiteralCollector<'_> {
 #[derive(Debug, Clone)]
 struct SelectorDispatcher {
     params: Vec<String>,
+    param_symbols: Vec<SymbolId>,
     returns: HashMap<i64, Span>,
 }
 
@@ -1935,7 +1907,7 @@ struct SelectorDispatcherCollector<'c> {
 
 impl<'a> Visit<'a> for SelectorDispatcherCollector<'_> {
     fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
-        if !function.r#async && !function.generator {
+        if !function.r#async && !function.generator && function.params.rest.is_none() {
             if let (Some(id), Some(body)) = (&function.id, &function.body) {
                 if let Some(function_symbol) = id.symbol_id.get() {
                     let binding_is_stable = self
@@ -1951,11 +1923,16 @@ impl<'a> Visit<'a> for SelectorDispatcherCollector<'_> {
                         .params
                         .items
                         .iter()
-                        .map(|param| match &param.pattern {
-                            BindingPattern::BindingIdentifier(id) => {
-                                Some((id.name.to_string(), id.symbol_id.get()?))
+                        .map(|param| {
+                            if param.initializer.is_some() {
+                                return None;
                             }
-                            _ => None,
+                            match &param.pattern {
+                                BindingPattern::BindingIdentifier(id) => {
+                                    Some((id.name.to_string(), id.symbol_id.get()?))
+                                }
+                                _ => None,
+                            }
                         })
                         .collect::<Option<Vec<_>>>();
 
@@ -1991,8 +1968,12 @@ impl<'a> Visit<'a> for SelectorDispatcherCollector<'_> {
                                         function_symbol,
                                         SelectorDispatcher {
                                             params: params
+                                                .iter()
+                                                .map(|(name, _)| name.clone())
+                                                .collect(),
+                                            param_symbols: params
                                                 .into_iter()
-                                                .map(|(name, _)| name)
+                                                .map(|(_, symbol)| symbol)
                                                 .collect(),
                                             returns,
                                         },
@@ -3233,24 +3214,25 @@ fn detect_reference_identity_tables(
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> HashMap<SymbolId, ReferenceIdentityTable> {
     let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
+    let ws = r"\s*";
     let row_re = regex::Regex::new(&format!(
-        r"(?P<table>{identifier})=\[\],(?P<idx>{identifier})=0;(?P<test>{identifier})<(?P<rows>\d+);(?P<update>{identifier})\+\+\)(?P<table2>{identifier})\[(?P<idx2>{identifier})\]=new Array\((?P<columns>\d+)\)"
+        r"(?P<table>{identifier}){ws}={ws}\[\]{ws},{ws}(?P<idx>{identifier}){ws}={ws}0{ws};{ws}(?P<test>{identifier}){ws}<{ws}(?P<rows>\d+){ws};{ws}(?P<update>{identifier}){ws}\+\+{ws}\){ws}(?P<table2>{identifier}){ws}\[{ws}(?P<idx2>{identifier}){ws}\]{ws}={ws}new{ws}Array{ws}\({ws}(?P<columns>\d+){ws}\)"
     ))
     .unwrap();
     let timer_re = regex::Regex::new(&format!(
-        r"(?P<timer>{identifier})=function\((?P<arg>{identifier})\)\{{setTimeout\((?P<arg2>{identifier}),0\)\}}"
+        r"(?P<timer>{identifier}){ws}={ws}function{ws}\({ws}(?P<arg>{identifier}){ws}\){ws}\{{{ws}setTimeout{ws}\({ws}(?P<arg2>{identifier}){ws},{ws}0{ws}\){ws};?{ws}\}}"
     ))
     .unwrap();
     let outer_re = regex::Regex::new(&format!(
-        r"for\(var (?P<loop>{identifier})=0;(?P<test>{identifier})<(?P<chunks>\d+);(?P<update>{identifier})\+\+\)\((?P<callback>{identifier})=>\{{(?P<timer>{identifier})\(function\(\)\{{"
+        r"for{ws}\({ws}var\s+(?P<loop>{identifier}){ws}={ws}0{ws};{ws}(?P<test>{identifier}){ws}<{ws}(?P<chunks>\d+){ws};{ws}(?P<update>{identifier}){ws}\+\+{ws}\){ws}\({ws}\(?{ws}(?P<callback>{identifier}){ws}\)?{ws}=>{ws}\{{{ws}(?P<timer>{identifier}){ws}\({ws}function{ws}\({ws}\){ws}\{{"
     ))
     .unwrap();
     let fill_re = regex::Regex::new(&format!(
-        r"for\(var (?P<t>{identifier})=(?P<chunk>\d+)\*(?P<callback>{identifier}),(?P<n>{identifier})=Math\.min\((?P<t2>{identifier})\+(?P<chunk2>\d+),(?P<columns>\d+)\),(?P<column>{identifier})=(?P<t3>{identifier});(?P<column2>{identifier})<(?P<n2>{identifier});(?P<column3>{identifier})\+\+\)for\((?P<row>{identifier})=0;(?P<row2>{identifier})<(?P<rows>\d+);(?P<row3>{identifier})\+\+\)(?P<table>{identifier})\[(?P<row4>{identifier})\]\[(?P<column4>{identifier})\]=(?P<table2>{identifier})\[\((?P<a>\d+)\*(?P<column5>{identifier})\^(?P<b>\d+)\*(?P<row5>{identifier})\^(?P<c>\d+)\*(?P<k>\d+)\)>>>0&(?P<mask>\d+)-1\]"
+        r"for{ws}\({ws}var\s+(?P<t>{identifier}){ws}={ws}(?P<chunk>\d+){ws}\*{ws}(?P<callback>{identifier}){ws},{ws}(?P<n>{identifier}){ws}={ws}Math{ws}\.{ws}min{ws}\({ws}(?P<t2>{identifier}){ws}\+{ws}(?P<chunk2>\d+){ws},{ws}(?P<columns>\d+){ws}\){ws},{ws}(?P<column>{identifier}){ws}={ws}(?P<t3>{identifier}){ws};{ws}(?P<column2>{identifier}){ws}<{ws}(?P<n2>{identifier}){ws};{ws}(?P<column3>{identifier}){ws}\+\+{ws}\){ws}for{ws}\({ws}(?P<row>{identifier}){ws}={ws}0{ws};{ws}(?P<row2>{identifier}){ws}<{ws}(?P<rows>\d+){ws};{ws}(?P<row3>{identifier}){ws}\+\+{ws}\){ws}(?P<table>{identifier}){ws}\[{ws}(?P<row4>{identifier}){ws}\]{ws}\[{ws}(?P<column4>{identifier}){ws}\]{ws}={ws}(?P<table2>{identifier}){ws}\[{ws}\({ws}(?P<a>\d+){ws}\*{ws}(?P<column5>{identifier}){ws}\^{ws}(?P<b>\d+){ws}\*{ws}(?P<row5>{identifier}){ws}\^{ws}(?P<c>\d+){ws}\*{ws}(?P<k>\d+){ws}\){ws}>>>{ws}0{ws}&{ws}(?P<mask>\d+){ws}-{ws}1{ws}\]"
     ))
     .unwrap();
     let root_re = regex::Regex::new(&format!(
-        r"(?P<timer>{identifier})\(function\(\)\{{(?P<target>{identifier})=(?P<table>{identifier})\[(?P<root>\d+)\]\}}\)"
+        r"(?P<timer>{identifier}){ws}\({ws}function{ws}\({ws}\){ws}\{{{ws}(?P<target>{identifier}){ws}={ws}(?P<table>{identifier}){ws}\[{ws}(?P<root>\d+){ws}\]{ws};?{ws}\}}{ws}\)"
     ))
     .unwrap();
 
@@ -4767,7 +4749,26 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 if let Some(dispatcher) = self.selector_dispatchers.get(&symbol) {
                     if let Some(selector) = it.arguments.first().and_then(argument_integer) {
                         if let Some(return_span) = dispatcher.returns.get(&selector) {
-                            let params = dispatcher.params.join(", ");
+                            let used_param_count = dispatcher
+                                .param_symbols
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, symbol)| {
+                                    self.scoping
+                                        .get_resolved_reference_ids(*symbol)
+                                        .iter()
+                                        .filter_map(|reference_id| {
+                                            self.reference_spans.get(reference_id)
+                                        })
+                                        .any(|span| {
+                                            return_span.start <= span.start
+                                                && span.end <= return_span.end
+                                        })
+                                        .then_some(index + 1)
+                                })
+                                .max()
+                                .unwrap_or(0);
+                            let params = dispatcher.params[..used_param_count].join(", ");
                             let args = it
                                 .arguments
                                 .iter()
@@ -4973,21 +4974,6 @@ fn eval_static_argument(arg: &Argument<'_>) -> Option<Value> {
     }
 }
 
-fn expression_integer(expr: &Expression<'_>) -> Option<i64> {
-    let Value::Number(value) = eval(expr)? else {
-        return None;
-    };
-    if value.is_finite()
-        && value.fract() == 0.0
-        && value >= i64::MIN as f64
-        && value <= i64::MAX as f64
-    {
-        Some(value as i64)
-    } else {
-        None
-    }
-}
-
 fn argument_integer(arg: &Argument<'_>) -> Option<i64> {
     match arg {
         Argument::NumericLiteral(v)
@@ -5008,6 +4994,66 @@ fn argument_integer(arg: &Argument<'_>) -> Option<i64> {
         },
         _ => None,
     }
+}
+
+#[derive(Default)]
+struct DirectEvalProbe {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for DirectEvalProbe {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if matches!(
+            &call.callee,
+            Expression::Identifier(identifier) if identifier.name.as_str() == "eval"
+        ) {
+            self.found = true;
+            return;
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+fn has_direct_eval(program: &oxc_ast::ast::Program<'_>) -> bool {
+    let mut probe = DirectEvalProbe::default();
+    probe.visit_program(program);
+    probe.found
+}
+
+fn remove_unused_proven_helpers(
+    functions: &[FnInfo],
+    scoping: &Scoping,
+    decoders: &HashMap<SymbolId, Decoder>,
+    pure_functions: &HashMap<SymbolId, PureFunction>,
+    direct_eval_present: bool,
+) -> Vec<Replacement> {
+    if direct_eval_present {
+        return Vec::new();
+    }
+    let root_scope = scoping.root_scope_id();
+    let recognized = decoders
+        .keys()
+        .chain(pure_functions.keys())
+        .copied()
+        .collect::<HashSet<_>>();
+
+    functions
+        .iter()
+        .filter(|function| {
+            function.scope != root_scope
+                && recognized.contains(&function.symbol)
+                && scoping
+                    .get_resolved_reference_ids(function.symbol)
+                    .is_empty()
+        })
+        .map(|function| Replacement {
+            start: function.span.start as usize,
+            end: function.span.end as usize,
+            text: String::new(),
+            kind: "remove_unused_proven_helper",
+            arithmetic_state_proof: None,
+        })
+        .collect()
 }
 
 fn js_word_byte(byte: u8) -> bool {
@@ -5109,7 +5155,7 @@ fn transform_once(
     let direct_functions = all_functions(&program);
     let functions = all_function_declarations(&program, scoping);
     let reference_spans = collect_reference_spans(&program);
-    let (mut decoders, mut protected_spans, rotation_replacements) =
+    let (mut decoders, mut protected_spans, mut rotation_replacements) =
         detect_decoders(source, &functions, &program, scoping);
     for (symbol, decoder) in detect_direct_table_decoders(
         source,
@@ -5134,6 +5180,13 @@ fn transform_once(
     let stable_var_numbers = collect_stable_var_numbers(&program, scoping);
     let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
     let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
+    rotation_replacements.extend(remove_unused_proven_helpers(
+        &functions,
+        scoping,
+        &decoders,
+        &pure_functions,
+        has_direct_eval(&program),
+    ));
 
     let mut collector = Collector {
         source,
