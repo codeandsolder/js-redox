@@ -241,8 +241,7 @@ fn named_function_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
     let mut quote = None::<u8>;
     let mut escaped = false;
 
-    for i in open..bytes.len() {
-        let b = bytes[i];
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
         if let Some(q) = quote {
             if escaped {
                 escaped = false;
@@ -528,7 +527,7 @@ fn infer_semantic_label(
         if parts.len() == 1 && regex_is(r"^ip=[^;]+$", parts[0]) {
             return "jump".into();
         }
-        if parts.iter().any(|part| *part == "stack[--sp]") {
+        if parts.contains(&"stack[--sp]") {
             return "pop".into();
         }
         if text.contains("stack[sp-1]") && text.contains("stack[sp++]=e") {

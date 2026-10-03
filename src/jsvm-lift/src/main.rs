@@ -1469,7 +1469,7 @@ impl<'s> Scanner<'s> {
 
         let mut width_hints = Vec::new();
         for width in 2usize..=8 {
-            if call.arguments.len() < width * 8 || call.arguments.len() % width != 0 {
+            if call.arguments.len() < width * 8 || !call.arguments.len().is_multiple_of(width) {
                 continue;
             }
             let instructions = call.arguments.len() / width;
@@ -1944,7 +1944,7 @@ impl<'s> Scanner<'s> {
                 }
                 let insts = n / width;
                 let mut score = 0i32;
-                if n % width == 0 {
+                if n.is_multiple_of(width) {
                     score += 2;
                 }
                 if op_max <= 63 {

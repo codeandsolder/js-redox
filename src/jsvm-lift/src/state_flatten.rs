@@ -265,7 +265,7 @@ fn exec_function_body(
 
 fn expression_function_body<'a>(expr: &'a Expression<'a>) -> Option<&'a FunctionBody<'a>> {
     match expr {
-        Expression::FunctionExpression(fun) => fun.body.as_ref().map(|v| &**v),
+        Expression::FunctionExpression(fun) => fun.body.as_deref(),
         Expression::ArrowFunctionExpression(fun) => Some(&fun.body),
         Expression::ParenthesizedExpression(paren) => expression_function_body(&paren.expression),
         _ => None,
@@ -274,7 +274,7 @@ fn expression_function_body<'a>(expr: &'a Expression<'a>) -> Option<&'a Function
 
 fn argument_function_body<'a>(arg: &'a Argument<'a>) -> Option<&'a FunctionBody<'a>> {
     match arg {
-        Argument::FunctionExpression(fun) => fun.body.as_ref().map(|v| &**v),
+        Argument::FunctionExpression(fun) => fun.body.as_deref(),
         Argument::ArrowFunctionExpression(fun) => Some(&fun.body),
         Argument::ParenthesizedExpression(paren) => expression_function_body(&paren.expression),
         _ => None,

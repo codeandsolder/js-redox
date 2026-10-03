@@ -231,17 +231,15 @@ fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
         "===" => Some(Value::Bool(same_value(&left, &right))),
         "!==" => Some(Value::Bool(!same_value(&left, &right))),
         "==" | "!=" => {
-            let equal = if same_value(&left, &right) {
-                true
-            } else if matches!(
-                (&left, &right),
-                (Value::Null, Value::Undefined) | (Value::Undefined, Value::Null)
-            ) {
-                true
-            } else {
+            let equal = same_value(&left, &right)
+                || matches!(
+                    (&left, &right),
+                    (Value::Null, Value::Undefined) | (Value::Undefined, Value::Null)
+                );
+            if !equal {
                 return None;
-            };
-            Some(Value::Bool(if op == "==" { equal } else { !equal }))
+            }
+            Some(Value::Bool(op == "=="))
         }
         "<" | "<=" | ">" | ">=" => {
             let result = match (&left, &right) {
@@ -424,7 +422,7 @@ fn decode_fixed_base64_latin1(input: &str, alphabet: &str) -> Option<String> {
         .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '='))
         .collect::<Vec<_>>();
 
-    let mut out = String::with_capacity(((filtered.len() + 3) / 4) * 3);
+    let mut out = String::with_capacity(filtered.len().div_ceil(4) * 3);
     let mut index = 0usize;
     while index < filtered.len() {
         let symbol = |offset: usize| -> Option<usize> {
@@ -1713,7 +1711,8 @@ fn selector_test_value(
 
             let equal = if let Some(number) = expression_integer(other) {
                 selector_value == number
-            } else if let Some(symbol) = selector_identifier_symbol(other, scoping) {
+            } else {
+                let symbol = selector_identifier_symbol(other, scoping)?;
                 let initialized_value = *stable_var_numbers.get(&symbol)?;
                 if selector_value == initialized_value {
                     // A var binding is undefined before its initializer executes
@@ -1722,8 +1721,6 @@ fn selector_test_value(
                     return None;
                 }
                 false
-            } else {
-                return None;
             };
 
             Some(if matches!(binary.operator.as_str(), "==" | "===") {
@@ -2485,16 +2482,18 @@ fn apply_proven_decoder_rotations(
     (protected_spans, replacements)
 }
 
+type DecoderDetection = (
+    HashMap<SymbolId, Decoder>,
+    Vec<(usize, usize)>,
+    Vec<Replacement>,
+);
+
 fn detect_decoders(
     source: &str,
     functions: &[FnInfo],
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
-) -> (
-    HashMap<SymbolId, Decoder>,
-    Vec<(usize, usize)>,
-    Vec<Replacement>,
-) {
+) -> DecoderDetection {
     let local_re = regex::Regex::new(
         r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\(\)\s*;",
     )
@@ -5105,7 +5104,7 @@ fn apply(
         }
         selected.push(candidate);
     }
-    selected.sort_by(|a, b| a.start.cmp(&b.start));
+    selected.sort_by_key(|replacement| replacement.start);
 
     let mut out = String::with_capacity(source.len());
     let mut cursor = 0usize;
