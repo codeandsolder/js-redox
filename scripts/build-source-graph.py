@@ -28,6 +28,7 @@ def main():
     jsrefs_path = project / 'analysis/js-references.json'
     deobfuscation_path = project / 'analysis/deobfuscation.json'
     bundles_path = project / 'analysis/bundles.json'
+    import_maps_path = project / 'analysis/import-maps.json'
 
     source_index = json.loads(source_index_path.read_text()) if source_index_path.exists() else {'units': []}
     sourcemaps = json.loads(sourcemaps_path.read_text()) if sourcemaps_path.exists() else {'source_maps': []}
@@ -42,6 +43,11 @@ def main():
         json.loads(bundles_path.read_text())
         if bundles_path.exists()
         else {'bundles': [], 'modules': []}
+    )
+    import_maps = (
+        json.loads(import_maps_path.read_text())
+        if import_maps_path.exists()
+        else {'maps': [], 'documents': {}, 'summary': {}}
     )
 
     source_by_resource = defaultdict(list)
@@ -455,6 +461,40 @@ def main():
                 handler_table=unit.get('handler_table'),
             )
 
+    # Import-map definitions are captured provenance too, not just resolver state.
+    for record in import_maps.get('maps', []):
+        src = inline_node_by_raw.get(record.get('raw_path'))
+        if not src:
+            continue
+        document_resource_id = record.get('document_resource_id')
+        for specifier, resolved in record.get('imports', {}).items():
+            if resolved is None:
+                continue
+            for dst in targets_for(resolved):
+                add_edge(
+                    src,
+                    dst,
+                    'import_map_entry',
+                    specifier=specifier,
+                    resolved_url=resolved,
+                    document_resource_id=document_resource_id,
+                    scope=None,
+                )
+        for scope, entries in record.get('scopes', {}).items():
+            for specifier, resolved in entries.items():
+                if resolved is None:
+                    continue
+                for dst in targets_for(resolved):
+                    add_edge(
+                        src,
+                        dst,
+                        'import_map_entry',
+                        specifier=specifier,
+                        resolved_url=resolved,
+                        document_resource_id=document_resource_id,
+                        scope=scope,
+                    )
+
     # AST-backed JavaScript module / worker references.
     specifier_nodes = {}
     for unit in jsrefs.get('code_units', []):
@@ -464,32 +504,67 @@ def main():
         src = inline_node_by_raw.get(unit.get('raw_path')) or f"resource:{int(rid)}"
         for ref in unit.get('references', []):
             resolved = ref.get('resolved_url')
+            candidates = []
             if resolved:
-                targets = targets_for(resolved)
-            else:
-                specifier = ref.get('specifier') or ''
-                node_id = specifier_nodes.get(specifier)
-                if node_id is None:
-                    node_id = specifier_id(specifier)
-                    specifier_nodes[specifier] = node_id
-                    add_node(
-                        node_id,
-                        type='module_specifier',
-                        specifier=specifier,
-                        bare=bool(ref.get('bare_specifier')),
-                        captured=False,
+                contexts = ref.get('resolution_candidates') or [{}]
+                for context in contexts:
+                    candidates.append(
+                        {
+                            'resolved_url': resolved,
+                            'document_resource_id': context.get('document_resource_id'),
+                            'resolution': ref.get('resolution'),
+                            'import_map_key': ref.get('import_map_key'),
+                            'scope': ref.get('scope'),
+                        }
                     )
-                targets = [node_id]
-            for dst in targets:
-                add_edge(
-                    src,
-                    dst,
-                    f"js_{ref.get('kind') or 'reference'}",
-                    specifier=ref.get('specifier'),
-                    resolved_url=resolved,
-                    start=ref.get('start'),
-                    end=ref.get('end'),
+            else:
+                for context in ref.get('resolution_candidates', []):
+                    if context.get('resolved_url'):
+                        candidates.append(context)
+
+            if candidates:
+                for candidate in candidates:
+                    candidate_url = candidate.get('resolved_url')
+                    for dst in targets_for(candidate_url):
+                        add_edge(
+                            src,
+                            dst,
+                            f"js_{ref.get('kind') or 'reference'}",
+                            specifier=ref.get('specifier'),
+                            resolved_url=candidate_url,
+                            resolution=candidate.get('resolution'),
+                            import_map_key=candidate.get('import_map_key'),
+                            scope=candidate.get('scope'),
+                            document_resource_id=candidate.get('document_resource_id'),
+                            start=ref.get('start'),
+                            end=ref.get('end'),
+                        )
+                continue
+
+            specifier = ref.get('specifier') or ''
+            node_id = specifier_nodes.get(specifier)
+            if node_id is None:
+                node_id = specifier_id(specifier)
+                specifier_nodes[specifier] = node_id
+                add_node(
+                    node_id,
+                    type='module_specifier',
+                    specifier=specifier,
+                    bare=bool(ref.get('bare_specifier')),
+                    captured=False,
                 )
+            add_edge(
+                src,
+                node_id,
+                f"js_{ref.get('kind') or 'reference'}",
+                specifier=specifier,
+                resolved_url=None,
+                resolution=ref.get('resolution'),
+                import_map_key=ref.get('import_map_key'),
+                scope=ref.get('scope'),
+                start=ref.get('start'),
+                end=ref.get('end'),
+            )
 
     edge_counts = Counter(edge['kind'] for edge in edges)
     node_counts = Counter(node['type'] for node in nodes.values())

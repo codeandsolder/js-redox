@@ -231,6 +231,8 @@ def main():
         f"  captured resources: {len(manifest['resources'])}\n"
         f"  JavaScript units:   {js_units}\n"
         f"  literal JS/module/worker references: {jsrefs['summary']['references']}\n"
+        f"  import-map resolutions: {jsrefs['summary'].get('resolved_by_import_map', 0)} "
+        f"(unresolved bare: {jsrefs['summary'].get('unresolved_bare_specifiers', 0)})\n"
         f"  safe-deobfuscated JS units: {deob['summary']['changed_units'] if deob else 0}\n"
         f"  structured bundle modules: {bundles.get('summary', {}).get('modules', 0)}\n"
         f"  source-map originals: {originals}\n"

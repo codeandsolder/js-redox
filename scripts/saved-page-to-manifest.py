@@ -407,7 +407,8 @@ def main():
         if not body.strip():
             continue
         body_bytes = body.encode("utf-8")
-        ext = "json" if "json" in ty else "js"
+        structured_json = "json" in ty or ty == "importmap"
+        ext = "json" if structured_json else "js"
         digest = sha256_hex(body_bytes)
         desired = Path("resources") / page_rel.parent / (page_rel.name + ".inline") / f"script-{ordinal:03}.{ext}"
         out_rel = desired

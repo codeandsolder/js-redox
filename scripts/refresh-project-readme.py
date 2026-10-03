@@ -21,6 +21,7 @@ def main():
     source_index = load(project / "analysis/source-index.json", {"units": []})
     sourcemaps = load(project / "analysis/sourcemaps.json", {"source_maps": []})
     jsrefs = load(project / "analysis/js-references.json", {"code_units": [], "summary": {}})
+    import_maps = load(project / "analysis/import-maps.json", {"maps": [], "summary": {}})
     deob = load(project / "analysis/deobfuscation.json", {"units": [], "summary": {}})
     jsvm = load(
         project / "analysis/jsvm/index.json",
@@ -109,6 +110,7 @@ def main():
         "- [resources/](resources/) — capture-faithful response bodies or saved-page files.",
         "- [capture-manifest.json](capture-manifest.json) — normalized capture provenance and resource inventory.",
         "- [har-manifest.json](har-manifest.json) — compatibility manifest consumed by the current analysis stages.",
+        "- [analysis/import-maps.json](analysis/import-maps.json) — captured import-map definitions, normalized mappings and merge diagnostics.",
         "- [analysis/source-graph.json](analysis/source-graph.json) — machine-readable relationship/provenance graph.",
         "",
         "## Capture summary",
@@ -118,6 +120,9 @@ def main():
         f"- Readable source units: **{len(source_units)}** ({len(js_units)} JavaScript)",
         f"- Source kinds: {dict(sorted(source_kinds.items()))}",
         f"- Literal JS/module/worker references: **{jsrefs.get('summary', {}).get('references', 0)}**",
+        f"- Import-map blocks captured: **{import_maps.get('summary', {}).get('import_map_scripts', 0)}**",
+        f"- Imports resolved through import maps: **{jsrefs.get('summary', {}).get('resolved_by_import_map', 0)}**",
+        f"- Unresolved bare module specifiers: **{jsrefs.get('summary', {}).get('unresolved_bare_specifiers', 0)}**",
         f"- Source-map originals recovered: **{len(recovered_originals)}**",
         f"- Literal generated-code units recovered: **{len(dynamic)}**",
         f"- Generated-code units recursively scanned: **{len(recursive_generated)}**",

@@ -59,6 +59,8 @@ capture normalization + exact raw resources/
   ↓
 HTML inline-script extraction + source/source-map/module references
   ↓
+document import-map normalization + scoped/bare-specifier resolution
+  ↓
 Oxc parse/codegen validation into readable src/
   ↓
 safe static deobfuscation from exact captured bytes + formatted src/_readable/
@@ -86,7 +88,7 @@ The directory contract is intentionally simple:
 - `src/_dynamic_deobfuscated/` contains proven safe recovery of generated-code children; exact recovered bytes remain the fallback when validation refuses a child.
 - `src/_dynamic/` contains formatted analyst views of generated-code children after the selected safe stage.
 - `src/_devirtualized/` contains semantic modules and pseudocode for supported direct-switch and function-table VMs.
-- `analysis/` contains machine-readable provenance, VM evidence and transform metadata.
+- `analysis/` contains machine-readable provenance, import-map/module-resolution state, VM evidence and transform metadata.
 
 This separation is important: presentation/deobfuscation passes never overwrite the original capture or make provenance ambiguous.
 
@@ -101,7 +103,7 @@ uv run python scripts/capture-to-project.py "Saved Page.html" work/saved-project
 
 For a normal browser **Save Page / Webpage, Complete** export, the companion `Saved Page_files/` directory is discovered automatically. `--assets-dir` can override it. Saved-page files get stable synthetic URLs for graph resolution; an original page URL from Chromium's `saved from url=(...)` marker is retained separately when available.
 
-The driver runs capture normalization, readable-source materialization, source-map recovery, literal module/worker reference analysis, safe deobfuscation, explicit bundle-module extraction, generated-code recovery, VM triage/devirtualization, provenance-graph construction, and an analyst-facing project README.
+The driver runs capture normalization, readable-source materialization, source-map recovery, literal module/worker reference analysis, document import-map resolution, safe deobfuscation, explicit bundle-module extraction, generated-code recovery, VM triage/devirtualization, provenance-graph construction, and an analyst-facing project README. Import maps are resolved with exact, prefix and scoped mappings; multiple maps keep earlier exact definitions, and document context is propagated only through captured module imports so worker graphs do not accidentally inherit page import maps.
 
 `har-project` remains the HAR-specific importer. `saved-page-to-manifest.py` performs the equivalent normalization for saved HTML plus its resource directory. Both converge on the same internal resource/inline-script model.
 

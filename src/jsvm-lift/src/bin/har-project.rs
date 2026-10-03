@@ -718,7 +718,8 @@ fn main() -> Result<()> {
                             continue;
                         }
 
-                        let body = if ty.contains("json") {
+                        let structured_json = ty.contains("json") || ty == "importmap";
+                        let body = if structured_json {
                             format_json_if_possible(script.body.as_bytes())
                         } else {
                             script.body.into_bytes()
@@ -726,7 +727,7 @@ fn main() -> Result<()> {
                         if body.iter().all(|b| b.is_ascii_whitespace()) {
                             continue;
                         }
-                        let ext = if ty.contains("json") { "json" } else { "js" };
+                        let ext = if structured_json { "json" } else { "js" };
                         let desired = format!("{written}.inline/script-{ordinal:03}.{ext}");
                         let (script_path, _) =
                             write_resource(&args.output, desired, &body, &mut seen)?;
