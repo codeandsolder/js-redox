@@ -9,7 +9,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 use serde::Serialize;
-use std::{fs, path::PathBuf};
+use std::{collections::HashSet, fs, path::PathBuf};
 
 #[derive(ClapParser, Debug)]
 #[command(about = "Inventory statically explicit Webpack/Next JSONP chunk module tables")]
@@ -88,6 +88,85 @@ impl Collector<'_> {
         Some(ids)
     }
 
+    fn module_records(
+        module_table: &oxc_ast::ast::ObjectExpression<'_>,
+    ) -> Option<Vec<ModuleRecord>> {
+        let mut modules = Vec::with_capacity(module_table.properties.len());
+        for item in &module_table.properties {
+            let ObjectPropertyKind::ObjectProperty(prop) = item else {
+                return None;
+            };
+            if prop.computed || prop.kind != oxc_ast::ast::PropertyKind::Init {
+                return None;
+            }
+            let id = Self::property_key(&prop.key)?;
+            let (value_kind, span) = match &prop.value {
+                Expression::FunctionExpression(f) => ("function", f.span),
+                Expression::ArrowFunctionExpression(f) => ("arrow", f.span),
+                _ => return None,
+            };
+            modules.push(ModuleRecord {
+                id,
+                property_start: prop.span.start,
+                property_end: prop.span.end,
+                value_start: span.start,
+                value_end: span.end,
+                value_kind: value_kind.to_string(),
+                method: prop.method,
+            });
+        }
+        (!modules.is_empty()).then_some(modules)
+    }
+
+    fn direct_table_is_webpack_like(
+        module_table: &oxc_ast::ast::ObjectExpression<'_>,
+        modules: &[ModuleRecord],
+    ) -> bool {
+        if modules.len() < 16
+            || modules
+                .iter()
+                .any(|m| !m.id.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return false;
+        }
+
+        let mut conventional_arity = 0usize;
+        for item in &module_table.properties {
+            let ObjectPropertyKind::ObjectProperty(prop) = item else {
+                return false;
+            };
+            let arity = match &prop.value {
+                Expression::FunctionExpression(f) => f.params.items.len(),
+                Expression::ArrowFunctionExpression(f) => f.params.items.len(),
+                _ => return false,
+            };
+            if (2..=3).contains(&arity) {
+                conventional_arity += 1;
+            }
+        }
+
+        conventional_arity * 4 >= modules.len() * 3
+    }
+
+    fn record_object(&mut self, module_table: &oxc_ast::ast::ObjectExpression<'_>) {
+        let Some(modules) = Self::module_records(module_table) else {
+            return;
+        };
+        if !Self::direct_table_is_webpack_like(module_table, &modules) {
+            return;
+        }
+        self.bundles.push(BundleRecord {
+            kind: "webpack_module_table".into(),
+            start: module_table.span.start,
+            end: module_table.span.end,
+            callee: "<direct-object-module-table>".into(),
+            chunk_ids: Vec::new(),
+            module_table_start: module_table.span.start,
+            module_table_end: module_table.span.end,
+            modules,
+        });
+    }
+
     fn record_call(&mut self, call: &oxc_ast::ast::CallExpression<'_>) {
         let callee = self.fragment(call.callee.span()).trim().to_string();
         if !(callee.ends_with(".push")
@@ -115,45 +194,11 @@ impl Collector<'_> {
             return;
         };
 
-        let mut modules = Vec::new();
-        let mut unsupported = 0usize;
-        for item in &module_table.properties {
-            let ObjectPropertyKind::ObjectProperty(prop) = item else {
-                unsupported += 1;
-                continue;
-            };
-            if prop.computed || prop.kind != oxc_ast::ast::PropertyKind::Init {
-                unsupported += 1;
-                continue;
-            }
-            let Some(id) = Self::property_key(&prop.key) else {
-                unsupported += 1;
-                continue;
-            };
-            let (value_kind, span) = match &prop.value {
-                Expression::FunctionExpression(f) => ("function", f.span),
-                Expression::ArrowFunctionExpression(f) => ("arrow", f.span),
-                _ => {
-                    unsupported += 1;
-                    continue;
-                }
-            };
-            modules.push(ModuleRecord {
-                id,
-                property_start: prop.span.start,
-                property_end: prop.span.end,
-                value_start: span.start,
-                value_end: span.end,
-                value_kind: value_kind.to_string(),
-                method: prop.method,
-            });
-        }
-
-        // A Webpack/Next JSONP payload module table is overwhelmingly function-valued.
-        // Reject generic object pushes and partially dynamic tables rather than guessing.
-        if modules.is_empty() || unsupported > 0 || modules.len() != module_table.properties.len() {
+        // A Webpack/Next JSONP payload module table is overwhelmingly
+        // function-valued. Reject generic or partially dynamic object pushes.
+        let Some(modules) = Self::module_records(module_table) else {
             return;
-        }
+        };
 
         self.bundles.push(BundleRecord {
             kind: "webpack_chunk_push".into(),
@@ -170,8 +215,10 @@ impl Collector<'_> {
 
 impl<'a> Visit<'a> for Collector<'_> {
     fn enter_node(&mut self, kind: AstKind<'a>) {
-        if let AstKind::CallExpression(call) = kind {
-            self.record_call(call);
+        match kind {
+            AstKind::CallExpression(call) => self.record_call(call),
+            AstKind::ObjectExpression(object) => self.record_object(object),
+            _ => {}
         }
     }
 
@@ -207,6 +254,20 @@ fn main() -> Result<()> {
     if !panicked {
         collector.visit_program(&parsed.program);
     }
+
+    // The object inside a JSONP chunk push also satisfies the direct-table
+    // shape. Prefer the richer chunk-push record when both describe the same
+    // table.
+    let pushed_tables = collector
+        .bundles
+        .iter()
+        .filter(|bundle| bundle.kind == "webpack_chunk_push")
+        .map(|bundle| (bundle.module_table_start, bundle.module_table_end))
+        .collect::<HashSet<_>>();
+    collector.bundles.retain(|bundle| {
+        bundle.kind != "webpack_module_table"
+            || !pushed_tables.contains(&(bundle.module_table_start, bundle.module_table_end))
+    });
     collector.bundles.sort_by_key(|b| b.start);
 
     let report = Report {

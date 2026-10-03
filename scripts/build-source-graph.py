@@ -16,7 +16,7 @@ def specifier_id(specifier: str) -> str:
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Build a provenance/source reference graph for a HAR project')
+    ap = argparse.ArgumentParser(description='Build a provenance/source reference graph for a recovered browser capture')
     ap.add_argument('project', type=Path)
     args = ap.parse_args()
     project = args.project.resolve()
@@ -27,6 +27,7 @@ def main():
     jsvm_path = project / 'analysis/jsvm/index.json'
     jsrefs_path = project / 'analysis/js-references.json'
     deobfuscation_path = project / 'analysis/deobfuscation.json'
+    bundles_path = project / 'analysis/bundles.json'
 
     source_index = json.loads(source_index_path.read_text()) if source_index_path.exists() else {'units': []}
     sourcemaps = json.loads(sourcemaps_path.read_text()) if sourcemaps_path.exists() else {'source_maps': []}
@@ -36,6 +37,11 @@ def main():
         json.loads(deobfuscation_path.read_text())
         if deobfuscation_path.exists()
         else {'units': []}
+    )
+    bundles = (
+        json.loads(bundles_path.read_text())
+        if bundles_path.exists()
+        else {'bundles': [], 'modules': []}
     )
 
     source_by_resource = defaultdict(list)
@@ -122,6 +128,8 @@ def main():
     # Inline scripts are generated source nodes owned by their HTML resource.
     inline_node_by_raw = {}
     for item in manifest.get('inline_scripts', []):
+        if not item.get('output_path'):
+            continue
         parent = int(item['parent_resource_id'])
         ordinal = int(item['ordinal'])
         node_id = f'inline:{parent}:{ordinal}'
@@ -140,18 +148,22 @@ def main():
             inline_node_by_raw[item['output_path']] = node_id
 
     # Safe static deobfuscation is a provenance-preserving source transform.
+    deob_nodes = {}
     for unit in deobfuscation.get('units', []):
         if unit.get('exit'):
             continue
         ordinal = int(unit.get('ordinal', 0))
         rid = unit.get('resource_id')
         node_id = f'deobfuscated:{ordinal}'
+        deob_nodes[ordinal] = node_id
         add_node(
             node_id,
             type='deobfuscated_source',
             resource_id=rid,
             input_path=unit.get('input_path'),
             source_path=unit.get('output_path'),
+            readable_source_path=unit.get('readable_output_path'),
+            readable_formatted=bool(unit.get('readable_formatted')),
             input_sha256=unit.get('input_sha256'),
             output_sha256=unit.get('output_sha256'),
             changed=bool(unit.get('changed')),
@@ -179,6 +191,60 @@ def main():
                 changed=bool(unit.get('changed')),
                 transforms=unit.get('transforms', {}),
                 string_recovery_replacements=unit.get('string_recovery_replacements', 0),
+            )
+
+    # Statically explicit Webpack/Next module tables become navigable project modules.
+    bundle_nodes = {}
+    for bundle in bundles.get('bundles', []):
+        bundle_id = int(bundle['bundle_id'])
+        node_id = f'bundle:{bundle_id}'
+        bundle_nodes[bundle_id] = node_id
+        add_node(
+            node_id,
+            type='bundle_payload',
+            bundle_id=bundle_id,
+            resource_id=bundle.get('resource_id'),
+            kind=bundle.get('kind'),
+            chunk_ids=bundle.get('chunk_ids', []),
+            parent_path=bundle.get('parent_path'),
+            start=bundle.get('start'),
+            end=bundle.get('end'),
+            module_count=bundle.get('module_count'),
+        )
+        parent_ordinal = bundle.get('parent_ordinal')
+        if parent_ordinal is not None and int(parent_ordinal) in deob_nodes:
+            add_edge(
+                deob_nodes[int(parent_ordinal)],
+                node_id,
+                'bundle_payload',
+                chunk_ids=bundle.get('chunk_ids', []),
+            )
+
+    for module in bundles.get('modules', []):
+        bundle_id = int(module['bundle_id'])
+        ordinal = int(module.get('module_ordinal', 0))
+        node_id = f'bundle-module:{bundle_id}:{ordinal}'
+        add_node(
+            node_id,
+            type='bundle_module',
+            bundle_id=bundle_id,
+            module_ordinal=ordinal,
+            module_id=module.get('module_id'),
+            resource_id=module.get('resource_id'),
+            parent_path=module.get('parent_path'),
+            chunk_ids=module.get('chunk_ids', []),
+            source_path=module.get('source_path'),
+            formatted=bool(module.get('formatted')),
+            sha256=module.get('sha256'),
+            value_kind=module.get('value_kind'),
+        )
+        parent = bundle_nodes.get(bundle_id)
+        if parent:
+            add_edge(
+                parent,
+                node_id,
+                'bundle_module',
+                module_id=module.get('module_id'),
             )
 
     # Source maps link generated JS -> map resource -> recovered original source.
@@ -215,11 +281,25 @@ def main():
             add_edge(map_node or src, node_id, 'source_map_source', ordinal=ordinal)
 
     # Static Function(...) recovery is a generated-code provenance edge.
-    scan_to_parent = {
-        int(unit['scan_id']): f"resource:{int(unit['resource_id'])}"
-        for unit in jsvm.get('code_units', [])
-        if unit.get('scan_id') is not None and unit.get('resource_id') is not None
-    }
+    scan_to_parent = {}
+    for unit in jsvm.get('code_units', []):
+        if unit.get('scan_id') is None:
+            continue
+        if unit.get('origin') == 'generated_dynamic_code':
+            parent_scan = unit.get('parent_scan_id')
+            ordinal = unit.get('parent_dynamic_ordinal')
+            if parent_scan is None or ordinal is None:
+                continue
+            parent = f"dynamic:{int(parent_scan)}:{int(ordinal)}"
+        else:
+            deob_ordinal = unit.get('deobfuscation_ordinal')
+            if deob_ordinal is not None and int(deob_ordinal) in deob_nodes:
+                parent = deob_nodes[int(deob_ordinal)]
+            elif unit.get('resource_id') is not None:
+                parent = f"resource:{int(unit['resource_id'])}"
+            else:
+                continue
+        scan_to_parent[int(unit['scan_id'])] = parent
     for dyn in jsvm.get('dynamic_code_units', []):
         scan = int(dyn['parent_scan_id'])
         ordinal = int(dyn['ordinal'])
@@ -237,6 +317,7 @@ def main():
             raw_dump=dyn.get('raw_dump'),
             source_path=dyn.get('source_path'),
             formatted=dyn.get('formatted'),
+            child_scan_id=dyn.get('child_scan_id'),
         )
         parent = scan_to_parent.get(scan)
         if parent:
@@ -252,12 +333,14 @@ def main():
     for unit in jsvm.get('devirtualized_units', []):
         scan = int(unit['parent_scan_id'])
         ordinal = int(unit['vm_ordinal'])
-        node_id = f'devirtualized:{scan}:{ordinal}'
+        vm_kind = unit.get('vm_kind') or 'unknown'
+        node_id = f'devirtualized:{scan}:{vm_kind}:{ordinal}'
         add_node(
             node_id,
             type='devirtualized_vm',
             parent_scan_id=scan,
             vm_ordinal=ordinal,
+            vm_kind=vm_kind,
             parent_function_id=unit.get('parent_function_id'),
             function_name=unit.get('function_name'),
             function_start=unit.get('function_start'),
@@ -265,6 +348,8 @@ def main():
             switch_start=unit.get('switch_start'),
             switch_end=unit.get('switch_end'),
             selector_style=unit.get('selector_style'),
+            handler_table=unit.get('handler_table'),
+            architecture=unit.get('architecture'),
             handler_count=unit.get('handler_count'),
             source_path=unit.get('source_path'),
             pseudocode_path=unit.get('pseudocode_path'),
@@ -276,10 +361,12 @@ def main():
                 parent,
                 node_id,
                 'devirtualized_vm',
+                vm_kind=vm_kind,
                 function_start=unit.get('function_start'),
                 function_end=unit.get('function_end'),
                 switch_start=unit.get('switch_start'),
                 switch_end=unit.get('switch_end'),
+                handler_table=unit.get('handler_table'),
             )
 
     # AST-backed JavaScript module / worker references.

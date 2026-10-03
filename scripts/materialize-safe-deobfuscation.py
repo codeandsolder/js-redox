@@ -7,14 +7,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STRING_RECOVERER = ROOT / "scripts/recover-js-obfuscator-strings.py"
+DEFAULT_FORMATTER = ROOT / ".cargo-target-nodebug/debug/js-format"
 
 
-def output_path(source_path: str) -> Path:
-    p = Path(source_path)
+def derived_path(raw_path: str, root: str) -> Path:
+    p = Path(raw_path)
     parts = list(p.parts)
-    if parts and parts[0] == "src":
+    if parts and parts[0] == "resources":
         parts = parts[1:]
-    return Path("src/_deobfuscated", *parts)
+    elif parts and parts[0] == "src":
+        parts = parts[1:]
+    return Path("src", root, *parts)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -36,7 +39,7 @@ def main():
     ap = argparse.ArgumentParser(
         description=(
             "Run conservative non-executing static source recovery and reversible "
-            "JS deobfuscation over readable HAR source units"
+            "JS deobfuscation over normalized browser-capture source units"
         )
     )
     ap.add_argument("project", type=Path)
@@ -49,6 +52,11 @@ def main():
         "--string-recoverer",
         type=Path,
         default=DEFAULT_STRING_RECOVERER,
+    )
+    ap.add_argument(
+        "--formatter",
+        type=Path,
+        default=DEFAULT_FORMATTER,
     )
     args = ap.parse_args()
 
@@ -68,25 +76,32 @@ def main():
     for ordinal, unit in enumerate(source_index.get("units", [])):
         if unit.get("kind") != "javascript" or not unit.get("source_path"):
             continue
-        source = project / unit["source_path"]
+        raw_path = unit.get("raw_path")
+        if not raw_path:
+            continue
+        source = project / raw_path
         if not source.is_file():
             continue
 
-        rel = output_path(unit["source_path"])
+        rel = derived_path(raw_path, "_deobfuscated")
+        readable_rel = derived_path(raw_path, "_readable")
         dest = project / rel
+        readable_dest = project / readable_rel
         report_rel = Path("analysis/deobfuscation") / f"{ordinal:04}.json"
         report = project / report_rel
         string_report_rel = Path("analysis/string-recovery") / f"{ordinal:04}.json"
         string_report = project / string_report_rel
         recovered_tmp = tmp_dir / f"{ordinal:04}.js"
         dest.parent.mkdir(parents=True, exist_ok=True)
+        readable_dest.parent.mkdir(parents=True, exist_ok=True)
 
         original_sha = sha256_bytes(source.read_bytes())
         string_row = {
             "ordinal": ordinal,
             "resource_id": unit.get("resource_id"),
             "url": unit.get("url"),
-            "input_path": unit["source_path"],
+            "input_path": raw_path,
+            "readable_baseline_path": unit.get("source_path"),
             "report_path": str(string_report_rel),
             "input_sha256": original_sha,
         }
@@ -150,9 +165,11 @@ def main():
             "ordinal": ordinal,
             "resource_id": unit.get("resource_id"),
             "url": unit.get("url"),
-            "raw_path": unit.get("raw_path"),
-            "input_path": unit["source_path"],
+            "raw_path": raw_path,
+            "input_path": raw_path,
+            "readable_baseline_path": unit.get("source_path"),
             "output_path": str(rel),
+            "readable_output_path": str(readable_rel),
             "report_path": str(report_rel),
             "string_recovery_report_path": str(string_report_rel),
             "string_recovery_changed": bool(string_row.get("changed")),
@@ -171,7 +188,7 @@ def main():
             raise RuntimeError(f"unsafe deobfuscation report for {source}")
         if not meta.get("runtime_semantics_preserved_by_design", True):
             raise RuntimeError(
-                f"presentation-formatted deobfuscation is not allowed in the safe HAR stage: {source}"
+                f"presentation-formatted deobfuscation is not allowed in the exact-safe capture stage: {source}"
             )
         transforms = dict(meta.get("transforms", {}))
         if string_row.get("replacements"):
@@ -186,6 +203,16 @@ def main():
             meta.get("runtime_semantics_preserved_by_design", True)
         )
         row["output_sha256"] = meta.get("output_sha256")
+
+        format_cp = run([args.formatter, dest, readable_dest], timeout=120)
+        if format_cp.returncode == 0:
+            row["readable_formatted"] = True
+            row["readable_output_sha256"] = sha256_bytes(readable_dest.read_bytes())
+        else:
+            readable_dest.write_bytes(dest.read_bytes())
+            row["readable_formatted"] = False
+            row["readable_output_sha256"] = row["output_sha256"]
+            row["readable_format_error"] = (format_cp.stdout + format_cp.stderr)[-3000:]
         units.append(row)
 
     string_changed = [u for u in string_units if u.get("changed")]
@@ -219,6 +246,7 @@ def main():
         "runtime_semantics_preserved_by_design": True,
         "presentation_formatted": False,
         "deobfuscator": str(args.deobfuscator),
+        "formatter": str(args.formatter),
         "string_recovery": "analysis/string-recovery.json",
         "units": units,
         "summary": {

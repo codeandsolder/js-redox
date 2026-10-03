@@ -11,7 +11,7 @@ def load(path: Path, default):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Refresh the analyst-facing README for a generated HAR source project"
+        description="Refresh the analyst-facing README for a recovered browser-capture source project"
     )
     ap.add_argument("project", type=Path)
     args = ap.parse_args()
@@ -27,6 +27,7 @@ def main():
         {"code_units": [], "dynamic_code_units": [], "devirtualized_units": []},
     )
     graph = load(project / "analysis/source-graph.json", {"summary": {}})
+    bundles = load(project / "analysis/bundles.json", {"bundles": [], "modules": [], "summary": {}})
 
     resources = manifest.get("resources", [])
     source_units = source_index.get("units", [])
@@ -47,6 +48,18 @@ def main():
     ]
     devirtualized = jsvm.get("devirtualized_units", [])
     dynamic = jsvm.get("dynamic_code_units", [])
+    recursive_generated = [
+        u for u in vm_units if u.get("origin") == "generated_dynamic_code"
+    ]
+    large_handler_candidates = [
+        u for u in candidates if u.get("large_handler_table_candidate")
+    ]
+    switch_devirtualized = [
+        u for u in devirtualized if u.get("vm_kind") == "direct_switch"
+    ]
+    table_devirtualized = [
+        u for u in devirtualized if u.get("vm_kind") == "function_table"
+    ]
 
     deob_summary = deob.get("summary", {})
     changed_deob = deob_summary.get(
@@ -65,24 +78,31 @@ def main():
     encoded_string_units = deob_summary.get("string_recovery_changed_units", 0)
 
     capture_state = "SALVAGED / truncated" if manifest.get("salvaged") else "complete"
-    source_har = manifest.get("source_har") or manifest.get("source") or "HAR capture"
+    source_capture = manifest.get("source_har") or manifest.get("source") or "browser capture"
+    source_kind = manifest.get("source_kind") or "har"
+    original_url = manifest.get("original_page_url")
+    bundle_summary = bundles.get("summary", {})
 
     lines = [
-        "# HAR source project",
+        "# Recovered source project",
         "",
-        f"Generated from {source_har}. Capture state: **{capture_state}**.",
+        f"Generated from {source_capture}. Input kind: **{source_kind}**. Capture state: **{capture_state}**.",
+        *([f"Original page URL recorded by the saved page: {original_url}."] if original_url else []),
         "",
-        "This tree keeps capture truth separate from analyst transformations. Start in src/ for readable code, and use analysis/source-graph.json when you need exact provenance back to the HAR.",
+        "This tree keeps capture truth separate from analyst transformations. Start in src/ for readable code, and use analysis/source-graph.json when you need exact provenance back to the browser capture.",
         "",
         "## Start here",
         "",
-        "- [src/](src/) — Oxc-parsed readable source materialized from captured text/code resources.",
-        "- [src/_deobfuscated/](src/_deobfuscated/) — conservative static rewrites; captured source is never overwritten.",
+        "- [src/](src/) — Oxc-formatted baseline view of captured text/code resources.",
+        "- [src/_deobfuscated/](src/_deobfuscated/) — semantics-preserving static recovery run from the exact captured JS bytes; formatting is intentionally left untouched here.",
+        "- [src/_readable/](src/_readable/) — formatted analyst view of the safe-deobfuscated result; use this as the normal human reading tree.",
         "- [src/_devirtualized/](src/_devirtualized/) — readable modules/pseudocode for confirmed JavaScript VM interpreters.",
         "- [src/_dynamic/](src/_dynamic/) — statically recovered literal generated-code bodies such as Function(...).",
         "- [src/_sourcemap/](src/_sourcemap/) — original sources recovered from captured source maps.",
-        "- [resources/](resources/) — capture-faithful response bodies arranged by URL.",
-        "- [har-manifest.json](har-manifest.json) — request/response provenance, hashes, headers and capture references.",
+        "- [src/_modules/](src/_modules/) — statically extracted Webpack/Next module wrappers where bundle structure is explicit.",
+        "- [resources/](resources/) — capture-faithful response bodies or saved-page files.",
+        "- [capture-manifest.json](capture-manifest.json) — normalized capture provenance and resource inventory.",
+        "- [har-manifest.json](har-manifest.json) — compatibility manifest consumed by the current analysis stages.",
         "- [analysis/source-graph.json](analysis/source-graph.json) — machine-readable relationship/provenance graph.",
         "",
         "## Capture summary",
@@ -94,6 +114,7 @@ def main():
         f"- Literal JS/module/worker references: **{jsrefs.get('summary', {}).get('references', 0)}**",
         f"- Source-map originals recovered: **{len(recovered_originals)}**",
         f"- Literal generated-code units recovered: **{len(dynamic)}**",
+        f"- Generated-code units recursively scanned: **{len(recursive_generated)}**",
         "",
         "## Safe static deobfuscation",
         "",
@@ -104,19 +125,37 @@ def main():
         "- Encoded string-table proof/provenance: [analysis/string-recovery.json](analysis/string-recovery.json)",
         "- Detailed final-view hashes, pass counts and provenance: [analysis/deobfuscation.json](analysis/deobfuscation.json)",
         "",
+        "## Structured bundle modules",
+        "",
+        f"- Explicit bundle payloads recovered: **{bundle_summary.get('bundles', 0)}**",
+        f"- Readable module wrappers materialized: **{bundle_summary.get('modules', 0)}**",
+        f"- Bundle-analysis failures: **{bundle_summary.get('failed_units', 0)}**",
+        "- Module inventory/provenance: [analysis/bundles.json](analysis/bundles.json)",
+        "",
         "## VM analysis",
         "",
         f"- Confirmed VM-bearing JavaScript units: **{len(confirmed)}**",
         f"- Weaker VM candidates: **{len(candidates)}**",
-        f"- Materialized devirtualized interpreter modules: **{len(devirtualized)}**",
+        f"- Large unlinked handler-table candidates: **{len(large_handler_candidates)}**",
+        f"- Materialized devirtualized interpreter modules: **{len(devirtualized)}** "
+        f"({len(switch_devirtualized)} direct-switch, {len(table_devirtualized)} function-table)",
     ]
 
     if confirmed:
-        lines.extend(["", "Confirmed VM-bearing resources:"])
+        lines.extend(["", "Confirmed VM-bearing resources/code units:"])
         for unit in confirmed:
-            url = unit.get("url") or unit.get("path") or f"scan {unit.get('scan_id')}"
+            label = unit.get("path") or unit.get("url") or f"scan {unit.get('scan_id')}"
             count = len(unit.get("devirtualized_units", []))
-            lines.append(f"- {url} — {count} devirtualized interpreter module(s)")
+            lines.append(f"- {label} — {count} devirtualized interpreter module(s)")
+
+    if large_handler_candidates:
+        lines.extend(["", "Large handler-table candidates not yet linked to a supported dispatcher:"])
+        for unit in large_handler_candidates:
+            label = unit.get("path") or unit.get("url") or f"scan {unit.get('scan_id')}"
+            lines.append(
+                f"- {label} — largest static function table "
+                f"{unit.get('largest_handler_table', 0)} handlers"
+            )
 
     graph_summary = graph.get("summary", {})
     if graph_summary:
@@ -150,7 +189,7 @@ def main():
             "",
             "## Provenance rule",
             "",
-            "resources/ is capture truth. Everything under src/_deobfuscated/, src/_devirtualized/, src/_dynamic/, and src/_sourcemap/ is a derived analyst view and should be traced through the files in analysis/ before treating it as original captured source.",
+            "resources/ is capture truth. Everything under src/, including _deobfuscated/, _readable/, _devirtualized/, _dynamic/, _modules/, and _sourcemap/, is a derived analyst view and should be traced through the files in analysis/ before treating it as original captured source.",
             "",
         ]
     )

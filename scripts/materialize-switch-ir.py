@@ -131,9 +131,53 @@ def render_pseudocode(vm, provenance):
     return "\n".join(lines).rstrip() + "\n"
 
 
+def render_table_pseudocode(vm, provenance):
+    lines = [
+        "Generated semantic pseudocode for a captured function-table JavaScript VM.",
+        "This is analyst-oriented approximate semantics, NOT an executable replacement.",
+        "",
+        f"resource: {provenance.get('url')}",
+        f"handler table: {vm.get('handler_table')}",
+        f"dispatcher: {vm.get('dispatcher_function_id')}",
+        f"architecture: {vm.get('architecture')}",
+        f"handlers: {len(vm.get('handlers', []))}",
+        "",
+        "roles:",
+    ]
+    for role, original in sorted(vm.get("role_bindings", {}).items()):
+        lines.append(f"  {role:20} <- {original}")
+    if vm.get("method_bindings"):
+        lines.append("methods:")
+        for original, role in sorted(vm["method_bindings"].items()):
+            lines.append(f"  {role:20} <- {original}")
+    lines.append("")
+
+    def handler_key(handler):
+        raw = str(handler.get("key", ""))
+        try:
+            return (0, int(raw))
+        except ValueError:
+            return (1, raw)
+
+    for handler in sorted(vm.get("handlers", []), key=handler_key):
+        lines.extend(
+            [
+                f"handler {handler.get('key')}  semantic={handler.get('semantic_hash')}",
+                f"  op kinds: {', '.join(handler.get('op_kinds', []))}",
+            ]
+        )
+        for statement in handler.get("statements", []):
+            ir = statement.get("ir", {})
+            kind = ir.get("kind", "unknown")
+            normalized = statement.get("normalized") or statement.get("source") or ""
+            lines.append(f"  [{kind}] {normalized}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Materialize direct-switch VM semantic IR as readable analyst modules"
+        description="Materialize supported JavaScript VM semantic IR as readable analyst modules"
     )
     ap.add_argument("project", type=Path)
     args = ap.parse_args()
@@ -145,106 +189,187 @@ def main():
 
     index = json.loads(index_path.read_text())
     all_units = []
+    switch_count = 0
+    table_count = 0
+
     for row in index.get("code_units", []):
         row.pop("devirtualized_units", None)
-        switch_ir = row.get("switch_ir")
-        if not switch_ir:
-            continue
-        ir = json.loads((project / switch_ir).read_text())
         units = []
-        for ordinal, vm in enumerate(ir.get("vms", []), 1):
-            stem = safe_name(vm.get("function_name") or vm.get("parent_function_id"))
-            base = Path("src/_devirtualized") / f"{int(row['scan_id']):04}" / f"switch-vm-{ordinal:02}-{stem}"
-            rel = base.with_suffix(".js")
-            pseudo_rel = base.with_suffix(".pseudo.txt")
-            out = project / rel
-            pseudo_out = project / pseudo_rel
-            out.parent.mkdir(parents=True, exist_ok=True)
+        scan_id = int(row["scan_id"])
 
-            provenance = {
-                "resource_id": row.get("resource_id"),
-                "url": row.get("url"),
-                "raw_path": row.get("path"),
-                "scan_report": row.get("report"),
-                "switch_ir": switch_ir,
-                "parent_function_id": vm.get("parent_function_id"),
-                "function_start": vm.get("function_start"),
-                "function_end": vm.get("function_end"),
-                "switch_start": vm.get("switch_start"),
-                "switch_end": vm.get("switch_end"),
-            }
-            handlers = []
-            for handler in vm.get("handlers", []):
-                label = handler.get("semantic_label", "unknown")
-                handlers.append(
-                    {
-                        "opcode": handler.get("opcode"),
-                        "label": label,
-                        "control": control_for(label),
-                        "pseudocode": pseudo_for(label),
-                        "semantic_hash": handler.get("semantic_hash"),
-                        "coarse_semantic_hash": handler.get("coarse_semantic_hash"),
-                        "normalized": [
-                            effect.get("normalized", "")
-                            for effect in handler.get("effects", [])
-                        ],
-                        "original": [
-                            effect.get("source", "")
-                            for effect in handler.get("effects", [])
-                        ],
-                    }
+        switch_ir = row.get("switch_ir")
+        if switch_ir:
+            ir = json.loads((project / switch_ir).read_text())
+            for ordinal, vm in enumerate(ir.get("vms", []), 1):
+                stem = safe_name(vm.get("function_name") or vm.get("parent_function_id"))
+                base = (
+                    Path("src/_devirtualized")
+                    / f"{scan_id:04}"
+                    / f"switch-vm-{ordinal:02}-{stem}"
                 )
+                rel = base.with_suffix(".js")
+                pseudo_rel = base.with_suffix(".pseudo.txt")
+                out = project / rel
+                pseudo_out = project / pseudo_rel
+                out.parent.mkdir(parents=True, exist_ok=True)
 
-            payload = {
-                "schema": "jsvm-readable-switch-module/v1",
-                "provenance": provenance,
-                "function_name": vm.get("function_name"),
-                "selector": vm.get("selector"),
-                "selector_style": vm.get("selector_style"),
-                "role_bindings": vm.get("role_bindings", {}),
-                "helper_bindings": vm.get("helper_bindings", {}),
-                "opcode_map": {
-                    str(handler.get("opcode")): handler.get("semantic_label")
-                    for handler in vm.get("handlers", [])
-                    if handler.get("opcode") is not None
-                },
-                "handlers": handlers,
-            }
-            out.write_text(
-                "// Generated semantic view of a captured JavaScript VM.\n"
-                "// Provenance-preserving analyst output; not an executable replacement.\n"
-                f"// Human-first listing: {pseudo_rel.name}\n"
-                + "export default "
-                + json.dumps(payload, indent=2, ensure_ascii=False)
-                + ";\n"
-            )
-            pseudo_out.write_text(render_pseudocode(vm, provenance))
+                provenance = {
+                    "resource_id": row.get("resource_id"),
+                    "url": row.get("url"),
+                    "captured_raw_path": row.get("raw_path"),
+                    "analysis_path": row.get("path"),
+                    "analysis_origin": row.get("analysis_origin"),
+                    "scan_report": row.get("report"),
+                    "switch_ir": switch_ir,
+                    "parent_function_id": vm.get("parent_function_id"),
+                    "function_start": vm.get("function_start"),
+                    "function_end": vm.get("function_end"),
+                    "switch_start": vm.get("switch_start"),
+                    "switch_end": vm.get("switch_end"),
+                }
+                handlers = []
+                for handler in vm.get("handlers", []):
+                    label = handler.get("semantic_label", "unknown")
+                    handlers.append(
+                        {
+                            "opcode": handler.get("opcode"),
+                            "label": label,
+                            "control": control_for(label),
+                            "pseudocode": pseudo_for(label),
+                            "semantic_hash": handler.get("semantic_hash"),
+                            "coarse_semantic_hash": handler.get("coarse_semantic_hash"),
+                            "normalized": [
+                                effect.get("normalized", "")
+                                for effect in handler.get("effects", [])
+                            ],
+                            "original": [
+                                effect.get("source", "")
+                                for effect in handler.get("effects", [])
+                            ],
+                        }
+                    )
 
-            item = {
-                "parent_scan_id": int(row["scan_id"]),
-                "resource_id": row.get("resource_id"),
-                "vm_ordinal": ordinal,
-                "parent_function_id": vm.get("parent_function_id"),
-                "function_name": vm.get("function_name"),
-                "function_start": vm.get("function_start"),
-                "function_end": vm.get("function_end"),
-                "switch_start": vm.get("switch_start"),
-                "switch_end": vm.get("switch_end"),
-                "selector_style": vm.get("selector_style"),
-                "handler_count": len(vm.get("handlers", [])),
-                "source_path": str(rel),
-                "pseudocode_path": str(pseudo_rel),
-                "ir_path": switch_ir,
-            }
-            units.append(item)
-            all_units.append(item)
+                payload = {
+                    "schema": "jsvm-readable-switch-module/v1",
+                    "provenance": provenance,
+                    "function_name": vm.get("function_name"),
+                    "selector": vm.get("selector"),
+                    "selector_style": vm.get("selector_style"),
+                    "role_bindings": vm.get("role_bindings", {}),
+                    "helper_bindings": vm.get("helper_bindings", {}),
+                    "opcode_map": {
+                        str(handler.get("opcode")): handler.get("semantic_label")
+                        for handler in vm.get("handlers", [])
+                        if handler.get("opcode") is not None
+                    },
+                    "handlers": handlers,
+                }
+                out.write_text(
+                    "// Generated semantic view of a captured JavaScript VM.\n"
+                    "// Provenance-preserving analyst output; not an executable replacement.\n"
+                    f"// Human-first listing: {pseudo_rel.name}\n"
+                    + "export default "
+                    + json.dumps(payload, indent=2, ensure_ascii=False)
+                    + ";\n"
+                )
+                pseudo_out.write_text(render_pseudocode(vm, provenance))
+
+                item = {
+                    "vm_kind": "direct_switch",
+                    "parent_scan_id": scan_id,
+                    "resource_id": row.get("resource_id"),
+                    "vm_ordinal": ordinal,
+                    "parent_function_id": vm.get("parent_function_id"),
+                    "function_name": vm.get("function_name"),
+                    "function_start": vm.get("function_start"),
+                    "function_end": vm.get("function_end"),
+                    "switch_start": vm.get("switch_start"),
+                    "switch_end": vm.get("switch_end"),
+                    "selector_style": vm.get("selector_style"),
+                    "handler_count": len(vm.get("handlers", [])),
+                    "source_path": str(rel),
+                    "pseudocode_path": str(pseudo_rel),
+                    "ir_path": switch_ir,
+                }
+                units.append(item)
+                all_units.append(item)
+                switch_count += 1
+
+        table_ir = row.get("table_ir")
+        if table_ir:
+            ir = json.loads((project / table_ir).read_text())
+            for ordinal, vm in enumerate(ir.get("vms", []), 1):
+                stem = safe_name(vm.get("handler_table") or vm.get("dispatcher_function_id"))
+                base = (
+                    Path("src/_devirtualized")
+                    / f"{scan_id:04}"
+                    / f"table-vm-{ordinal:02}-{stem}"
+                )
+                rel = base.with_suffix(".js")
+                pseudo_rel = base.with_suffix(".pseudo.txt")
+                out = project / rel
+                pseudo_out = project / pseudo_rel
+                out.parent.mkdir(parents=True, exist_ok=True)
+
+                provenance = {
+                    "resource_id": row.get("resource_id"),
+                    "url": row.get("url"),
+                    "captured_raw_path": row.get("raw_path"),
+                    "analysis_path": row.get("path"),
+                    "analysis_origin": row.get("analysis_origin"),
+                    "scan_report": row.get("report"),
+                    "table_ir": table_ir,
+                    "parent_scan_id": scan_id,
+                }
+                payload = {
+                    "schema": "jsvm-readable-table-module/v1",
+                    "provenance": provenance,
+                    "dispatcher_function_id": vm.get("dispatcher_function_id"),
+                    "handler_table": vm.get("handler_table"),
+                    "handler_count": vm.get("handler_count"),
+                    "architecture": vm.get("architecture"),
+                    "producer_method": vm.get("producer_method"),
+                    "linked_transducer": vm.get("linked_transducer"),
+                    "role_bindings": vm.get("role_bindings", {}),
+                    "method_bindings": vm.get("method_bindings", {}),
+                    "handlers": vm.get("handlers", []),
+                }
+                out.write_text(
+                    "// Generated semantic view of a captured function-table JavaScript VM.\n"
+                    "// Provenance-preserving analyst output; not an executable replacement.\n"
+                    f"// Human-first listing: {pseudo_rel.name}\n"
+                    + "export default "
+                    + json.dumps(payload, indent=2, ensure_ascii=False)
+                    + ";\n"
+                )
+                pseudo_out.write_text(render_table_pseudocode(vm, provenance))
+
+                item = {
+                    "vm_kind": "function_table",
+                    "parent_scan_id": scan_id,
+                    "resource_id": row.get("resource_id"),
+                    "vm_ordinal": ordinal,
+                    "parent_function_id": vm.get("dispatcher_function_id"),
+                    "function_name": None,
+                    "handler_table": vm.get("handler_table"),
+                    "architecture": vm.get("architecture"),
+                    "handler_count": len(vm.get("handlers", [])),
+                    "source_path": str(rel),
+                    "pseudocode_path": str(pseudo_rel),
+                    "ir_path": table_ir,
+                }
+                units.append(item)
+                all_units.append(item)
+                table_count += 1
+
         row["devirtualized_units"] = units
 
     index["devirtualized_units"] = all_units
     index_path.write_text(json.dumps(index, indent=2) + "\n")
     print(
-        f"materialized {len(all_units)} direct-switch VM module(s) "
-        "plus human pseudocode under src/_devirtualized/"
+        f"materialized {len(all_units)} VM module(s): "
+        f"{switch_count} direct-switch + {table_count} function-table; "
+        "human pseudocode under src/_devirtualized/"
     )
 
 
