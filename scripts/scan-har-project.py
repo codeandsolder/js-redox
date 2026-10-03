@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_STRING_RECOVERER = ROOT / "scripts/recover-js-obfuscator-strings.py"
 
 
 def direct_summary(report):
@@ -41,9 +44,175 @@ def run_tool(argv, timeout):
     )
 
 
+def sha256_path(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def generated_output_path(root: str, scan_id: int, ordinal: int) -> Path:
+    return Path("src") / root / f"{scan_id:04}" / f"embedded-{ordinal:03}.js"
+
+
+def recover_generated_unit(
+    project: Path,
+    raw: Path,
+    raw_rel: str,
+    scan_id: int,
+    ordinal: int,
+    args,
+):
+    recovery_rel = Path("analysis/generated-recovery") / f"{scan_id:04}-{ordinal:03}"
+    recovery_dir = project / recovery_rel
+    recovery_dir.mkdir(parents=True, exist_ok=True)
+
+    string_tmp = recovery_dir / "string-recovered.js"
+    string_report = recovery_dir / "string-recovery.json"
+    deob_report = recovery_dir / "deobfuscation.json"
+
+    safe_rel = generated_output_path("_dynamic_deobfuscated", scan_id, ordinal)
+    safe_dest = project / safe_rel
+    readable_rel = generated_output_path("_dynamic", scan_id, ordinal)
+    readable_dest = project / readable_rel
+    safe_dest.parent.mkdir(parents=True, exist_ok=True)
+    readable_dest.parent.mkdir(parents=True, exist_ok=True)
+
+    raw_sha = sha256_path(raw)
+    row = {
+        "parent_scan_id": scan_id,
+        "ordinal": ordinal,
+        "raw_path": raw_rel,
+        "raw_sha256": raw_sha,
+        "string_recovery_report": str(string_report.relative_to(project)),
+        "deobfuscation_report": str(deob_report.relative_to(project)),
+    }
+
+    string_cp = run_tool(
+        [
+            "uv",
+            "run",
+            "--no-project",
+            "python",
+            args.string_recoverer,
+            raw,
+            string_tmp,
+            "--report",
+            string_report,
+        ],
+        timeout=180,
+    )
+    selected = raw
+    string_ok = False
+    string_changed = False
+    if string_cp.returncode == 0 and string_tmp.is_file() and string_report.is_file():
+        try:
+            meta = json.loads(string_report.read_text())
+            output_sha = sha256_path(string_tmp)
+            string_ok = (
+                bool(meta.get("safe_static_only"))
+                and meta.get("input_sha256") == raw_sha
+                and meta.get("output_sha256") == output_sha
+            )
+        except (OSError, ValueError, TypeError):
+            meta = {}
+            string_ok = False
+        if string_ok:
+            selected = string_tmp
+            string_changed = bool(meta.get("changed"))
+            row["string_recovery"] = {
+                "exit": 0,
+                "changed": string_changed,
+                "replacements": int(meta.get("replacements", 0)),
+                "output_sha256": output_sha,
+            }
+        else:
+            row["string_recovery"] = {
+                "exit": 1,
+                "changed": False,
+                "replacements": 0,
+                "error": "string-recovery provenance/hash validation failed",
+            }
+    else:
+        row["string_recovery"] = {
+            "exit": string_cp.returncode or 1,
+            "changed": False,
+            "replacements": 0,
+            "error": (string_cp.stdout + string_cp.stderr)[-3000:],
+        }
+
+    selected_sha = sha256_path(selected)
+    deob_cp = run_tool(
+        [
+            args.deobfuscator,
+            selected,
+            safe_dest,
+            "--report",
+            deob_report,
+        ],
+        timeout=180,
+    )
+
+    if deob_cp.returncode == 0 and safe_dest.is_file() and deob_report.is_file():
+        try:
+            meta = json.loads(deob_report.read_text())
+            output_sha = sha256_path(safe_dest)
+            deob_ok = (
+                bool(meta.get("safe_static_only"))
+                and bool(meta.get("runtime_semantics_preserved_by_design", True))
+                and not bool(meta.get("presentation_formatted", False))
+                and meta.get("input_sha256") == selected_sha
+                and meta.get("output_sha256") == output_sha
+            )
+        except (OSError, ValueError, TypeError):
+            meta = {}
+            deob_ok = False
+        if deob_ok:
+            analysis_rel = safe_rel
+            selected_stage = "safe_deobfuscation"
+            row["deobfuscation"] = {
+                "exit": 0,
+                "changed": bool(meta.get("changed")),
+                "iterations": int(meta.get("iterations", 0)),
+                "transforms": meta.get("transforms", {}),
+                "output_sha256": output_sha,
+            }
+        else:
+            deob_cp = subprocess.CompletedProcess([], 1, "", "deob provenance/hash validation failed")
+    if deob_cp.returncode != 0:
+        row["deobfuscation"] = {
+            "exit": deob_cp.returncode or 1,
+            "changed": False,
+            "error": (deob_cp.stdout + deob_cp.stderr)[-3000:],
+        }
+        if string_ok and string_changed:
+            shutil.copyfile(string_tmp, safe_dest)
+            analysis_rel = safe_rel
+            selected_stage = "string_recovery_only"
+        else:
+            analysis_rel = Path(raw_rel)
+            selected_stage = "exact_fallback"
+
+    analysis_source = project / analysis_rel
+    format_cp = run_tool([args.formatter, analysis_source, readable_dest], timeout=120)
+    if format_cp.returncode:
+        shutil.copyfile(analysis_source, readable_dest)
+
+    row.update(
+        {
+            "selected_stage": selected_stage,
+            "analysis_path": str(analysis_rel),
+            "analysis_sha256": sha256_path(analysis_source),
+            "readable_path": str(readable_rel),
+            "readable_formatted": format_cp.returncode == 0,
+            "readable_sha256": sha256_path(readable_dest),
+        }
+    )
+    if format_cp.returncode:
+        row["readable_format_error"] = (format_cp.stdout + format_cp.stderr)[-3000:]
+    return row
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Recursively scan recovered JavaScript code units for generated code and VM structures"
+        description="Recursively recover and scan JavaScript code units for generated code and VM structures"
     )
     ap.add_argument("project", type=Path)
     ap.add_argument(
@@ -66,6 +235,16 @@ def main():
         type=Path,
         default=ROOT / ".cargo-target-nodebug/debug/table-ir",
     )
+    ap.add_argument(
+        "--deobfuscator",
+        type=Path,
+        default=ROOT / ".cargo-target-nodebug/debug/deobfuscate-safe",
+    )
+    ap.add_argument(
+        "--string-recoverer",
+        type=Path,
+        default=DEFAULT_STRING_RECOVERER,
+    )
     ap.add_argument("--max-generated-depth", type=int, default=8)
     ap.add_argument("--max-code-units", type=int, default=256)
     args = ap.parse_args()
@@ -83,6 +262,7 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     code_units = []
+    generated_recovery = []
     seen_scan_paths = set()
 
     def queue(unit):
@@ -189,19 +369,18 @@ def main():
                 continue
             raw = Path(dumped)
             raw_rel = str(raw.relative_to(project))
-            readable = (
-                project
-                / "src"
-                / "_dynamic"
-                / f"{scan_id:04}"
-                / f"embedded-{ordinal:03}.js"
-            )
-            readable.parent.mkdir(parents=True, exist_ok=True)
-            fp = run_tool([args.formatter, raw, readable], timeout=120)
-            if fp.returncode:
-                readable.write_bytes(raw.read_bytes())
-
             depth = parent_depth + 1
+
+            recovery = recover_generated_unit(
+                project,
+                raw,
+                raw_rel,
+                scan_id,
+                ordinal,
+                args,
+            )
+            generated_recovery.append(recovery)
+
             item = {
                 "parent_scan_id": scan_id,
                 "ordinal": ordinal,
@@ -211,8 +390,14 @@ def main():
                 "outer_end": node.get("outer_end"),
                 "body_bytes": node.get("body_bytes"),
                 "raw_dump": raw_rel,
-                "source_path": str(readable.relative_to(project)),
-                "formatted": fp.returncode == 0,
+                "source_path": recovery["readable_path"],
+                "analysis_path": recovery["analysis_path"],
+                "analysis_stage": recovery["selected_stage"],
+                "recovery_report": str(
+                    Path("analysis/generated-recovery")
+                    / f"{scan_id:04}-{ordinal:03}"
+                ),
+                "formatted": recovery["readable_formatted"],
                 "handler_tables": len(node.get("handler_function_tables", [])),
                 "table_vms": len(node.get("table_vms", [])),
                 "opcode_maps": len(node.get("opcode_maps", [])),
@@ -226,9 +411,10 @@ def main():
                         "resource_id": unit.get("resource_id"),
                         "url": unit.get("url"),
                         "raw_path": raw_rel,
-                        "path": raw_rel,
-                        "readable_path": str(readable.relative_to(project)),
-                        "analysis_origin": "generated_code_exact",
+                        "path": recovery["analysis_path"],
+                        "readable_path": recovery["readable_path"],
+                        "analysis_origin": recovery["selected_stage"],
+                        "generated_recovery_ordinal": len(generated_recovery) - 1,
                         "parent_scan_id": scan_id,
                         "parent_dynamic_ordinal": ordinal,
                         "generated_depth": depth,
@@ -298,13 +484,40 @@ def main():
         rows.append(row)
         scan_id += 1
 
+    generated_recovery_index = {
+        "schema": "generated-code-safe-recovery/v1",
+        "safe_static_only": True,
+        "units": generated_recovery,
+        "summary": {
+            "generated_units": len(generated_recovery),
+            "safe_deobfuscation": sum(
+                u.get("selected_stage") == "safe_deobfuscation"
+                for u in generated_recovery
+            ),
+            "string_recovery_only": sum(
+                u.get("selected_stage") == "string_recovery_only"
+                for u in generated_recovery
+            ),
+            "exact_fallback": sum(
+                u.get("selected_stage") == "exact_fallback"
+                for u in generated_recovery
+            ),
+        },
+    }
+    (project / "analysis/generated-recovery.json").write_text(
+        json.dumps(generated_recovery_index, indent=2) + "\n"
+    )
+
     index = {
-        "schema": "har-project-jsvm-analysis/v1",
+        "schema": "har-project-jsvm-analysis/v2",
         "scanner": str(args.scanner),
         "formatter": str(args.formatter),
         "switch_ir": str(args.switch_ir),
         "table_ir": str(args.table_ir),
+        "deobfuscator": str(args.deobfuscator),
+        "string_recoverer": str(args.string_recoverer),
         "recursive_generated_code": True,
+        "generated_recovery": "analysis/generated-recovery.json",
         "max_generated_depth": args.max_generated_depth,
         "max_code_units": args.max_code_units,
         "code_units": rows,
@@ -326,6 +539,9 @@ def main():
     print(
         f"scanned {len(rows)} JavaScript units recursively; "
         f"{len(dynamic_units)} static dynamic-code units materialized; "
+        f"generated recovery safe={generated_recovery_index['summary']['safe_deobfuscation']} "
+        f"string-only={generated_recovery_index['summary']['string_recovery_only']} "
+        f"exact-fallback={generated_recovery_index['summary']['exact_fallback']}; "
         f"{len(confirmed)} confirmed VM units; "
         f"{len(handler_candidates)} large handler-table candidate(s); "
         f"{len(signaled) - len(confirmed) - len(handler_candidates)} other candidate(s); "

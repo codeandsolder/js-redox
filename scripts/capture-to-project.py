@@ -14,6 +14,7 @@ DEFAULT_SWITCH_IR = ROOT / ".cargo-target-nodebug/debug/switch-ir"
 DEFAULT_TABLE_IR = ROOT / ".cargo-target-nodebug/debug/table-ir"
 DEFAULT_JS_REFS = ROOT / ".cargo-target-nodebug/debug/js-refs"
 DEFAULT_DEOBFUSCATOR = ROOT / ".cargo-target-nodebug/debug/deobfuscate-safe"
+DEFAULT_STRING_RECOVERER = ROOT / "scripts/recover-js-obfuscator-strings.py"
 DEFAULT_BUNDLE_INVENTORY = ROOT / ".cargo-target-nodebug/debug/bundle-unpack"
 
 
@@ -68,6 +69,7 @@ def main():
     ap.add_argument("--table-ir", type=Path, default=DEFAULT_TABLE_IR)
     ap.add_argument("--js-refs", type=Path, default=DEFAULT_JS_REFS)
     ap.add_argument("--deobfuscator", type=Path, default=DEFAULT_DEOBFUSCATOR)
+    ap.add_argument("--string-recoverer", type=Path, default=DEFAULT_STRING_RECOVERER)
     ap.add_argument("--bundle-inventory", type=Path, default=DEFAULT_BUNDLE_INVENTORY)
     ap.add_argument("--skip-safe-deobfuscation", action="store_true")
     ap.add_argument("--skip-bundle-unpack", action="store_true")
@@ -134,6 +136,8 @@ def main():
                 output,
                 "--deobfuscator",
                 args.deobfuscator,
+                "--string-recoverer",
+                args.string_recoverer,
                 "--formatter",
                 args.formatter,
             ]
@@ -165,6 +169,10 @@ def main():
                 args.switch_ir,
                 "--table-ir",
                 args.table_ir,
+                "--deobfuscator",
+                args.deobfuscator,
+                "--string-recoverer",
+                args.string_recoverer,
             ]
         )
         run([sys.executable, ROOT / "scripts/materialize-switch-ir.py", output])
@@ -198,8 +206,12 @@ def main():
     devirtualized = 0
     confirmed_vms = 0
     vm_candidates = 0
+    generated_recovery = {"summary": {}}
     if not args.skip_vm_scan:
         analysis = json.loads((output / "analysis/jsvm/index.json").read_text())
+        generated_recovery_path = output / "analysis/generated-recovery.json"
+        if generated_recovery_path.exists():
+            generated_recovery = json.loads(generated_recovery_path.read_text())
         dynamic = len(analysis.get("dynamic_code_units", []))
         devirtualized = len(analysis.get("devirtualized_units", []))
         units = analysis.get("code_units", [])
@@ -223,6 +235,9 @@ def main():
         f"  structured bundle modules: {bundles.get('summary', {}).get('modules', 0)}\n"
         f"  source-map originals: {originals}\n"
         f"  recovered dynamic units: {dynamic}\n"
+        f"  generated recovery: safe={generated_recovery.get('summary', {}).get('safe_deobfuscation', 0)} "
+        f"string-only={generated_recovery.get('summary', {}).get('string_recovery_only', 0)} "
+        f"exact-fallback={generated_recovery.get('summary', {}).get('exact_fallback', 0)}\n"
         f"  readable devirtualized VM modules: {devirtualized}\n"
         f"  confirmed VM units: {confirmed_vms}\n"
         f"  VM candidates:      {vm_candidates}\n"

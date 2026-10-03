@@ -2,14 +2,21 @@ use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
 use oxc_allocator::Allocator;
 use oxc_ast::{
-    ast::{Argument, ArrayExpressionElement, Expression, ObjectPropertyKind, PropertyKey},
+    ast::{
+        Argument, ArrayExpressionElement, BindingPattern, Expression, ObjectPropertyKind,
+        PropertyKey,
+    },
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 use serde::Serialize;
-use std::{collections::HashSet, fs, path::PathBuf};
+use std::{
+    collections::{BTreeSet, HashSet},
+    fs,
+    path::PathBuf,
+};
 
 #[derive(ClapParser, Debug)]
 #[command(about = "Inventory statically explicit Webpack/Next JSONP chunk module tables")]
@@ -26,6 +33,7 @@ struct ModuleRecord {
     value_end: u32,
     value_kind: String,
     method: bool,
+    dependencies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -47,6 +55,40 @@ struct Report {
     diagnostics: usize,
     panicked: bool,
     bundles: Vec<BundleRecord>,
+}
+
+struct DependencyCollector<'n> {
+    require_name: &'n str,
+    dependencies: BTreeSet<String>,
+}
+
+impl<'a> Visit<'a> for DependencyCollector<'_> {
+    fn enter_node(&mut self, kind: AstKind<'a>) {
+        let AstKind::CallExpression(call) = kind else {
+            return;
+        };
+        let Expression::Identifier(callee) = &call.callee else {
+            return;
+        };
+        if callee.name.as_str() != self.require_name {
+            return;
+        }
+        let Some(first) = call.arguments.first() else {
+            return;
+        };
+        let dependency = match first {
+            Argument::NumericLiteral(value)
+                if value.value.is_finite() && value.value.fract() == 0.0 =>
+            {
+                Some(format!("{:.0}", value.value))
+            }
+            Argument::StringLiteral(value) => Some(value.value.to_string()),
+            _ => None,
+        };
+        if let Some(dependency) = dependency {
+            self.dependencies.insert(dependency);
+        }
+    }
 }
 
 struct Collector<'s> {
@@ -88,7 +130,35 @@ impl Collector<'_> {
         Some(ids)
     }
 
+    fn module_dependencies(value: &Expression<'_>) -> Vec<String> {
+        let (params, body) = match value {
+            Expression::FunctionExpression(function) => {
+                let Some(body) = function.body.as_ref() else {
+                    return Vec::new();
+                };
+                (&function.params, body.as_ref())
+            }
+            Expression::ArrowFunctionExpression(function) => {
+                (&function.params, function.body.as_ref())
+            }
+            _ => return Vec::new(),
+        };
+        let Some(require_param) = params.items.get(2) else {
+            return Vec::new();
+        };
+        let BindingPattern::BindingIdentifier(require_id) = &require_param.pattern else {
+            return Vec::new();
+        };
+        let mut collector = DependencyCollector {
+            require_name: require_id.name.as_str(),
+            dependencies: BTreeSet::new(),
+        };
+        collector.visit_function_body(body);
+        collector.dependencies.into_iter().collect()
+    }
+
     fn module_records(
+        &self,
         module_table: &oxc_ast::ast::ObjectExpression<'_>,
     ) -> Option<Vec<ModuleRecord>> {
         let mut modules = Vec::with_capacity(module_table.properties.len());
@@ -113,6 +183,7 @@ impl Collector<'_> {
                 value_end: span.end,
                 value_kind: value_kind.to_string(),
                 method: prop.method,
+                dependencies: Self::module_dependencies(&prop.value),
             });
         }
         (!modules.is_empty()).then_some(modules)
@@ -149,7 +220,7 @@ impl Collector<'_> {
     }
 
     fn record_object(&mut self, module_table: &oxc_ast::ast::ObjectExpression<'_>) {
-        let Some(modules) = Self::module_records(module_table) else {
+        let Some(modules) = self.module_records(module_table) else {
             return;
         };
         if !Self::direct_table_is_webpack_like(module_table, &modules) {
@@ -196,7 +267,7 @@ impl Collector<'_> {
 
         // A Webpack/Next JSONP payload module table is overwhelmingly
         // function-valued. Reject generic or partially dynamic object pushes.
-        let Some(modules) = Self::module_records(module_table) else {
+        let Some(modules) = self.module_records(module_table) else {
             return;
         };
 

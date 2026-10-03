@@ -189,6 +189,7 @@ def main():
     assert bundles["summary"]["failed_units"] == 0
     assert bundles["summary"]["bundles"] >= 1
     assert bundles["summary"]["modules"] >= 2
+    assert bundles["summary"]["literal_module_dependencies"] >= 1
 
     analysis = json.loads((PROJECT / "analysis/jsvm/index.json").read_text())
     app_scan = next(u for u in analysis["code_units"] if u.get("raw_path") == app_resource["output_path"])
@@ -205,6 +206,7 @@ def main():
     assert edge_kinds.get("safe_deobfuscation") == 3
     assert edge_kinds.get("bundle_payload", 0) >= 1
     assert edge_kinds.get("bundle_module", 0) >= 2
+    assert edge_kinds.get("bundle_module_dependency", 0) >= 1
 
     readme = (PROJECT / "README.md").read_text()
     assert "# Recovered source project" in readme

@@ -156,6 +156,7 @@ def main():
                         "value_end": module.get("value_end"),
                         "value_kind": module.get("value_kind"),
                         "method": bool(module.get("method")),
+                        "dependencies": [str(x) for x in module.get("dependencies", [])],
                         "source_path": str(rel),
                         "formatted": formatted,
                         "sha256": hashlib.sha256(dest.read_bytes()).hexdigest(),
@@ -172,6 +173,9 @@ def main():
         "summary": {
             "bundles": len(bundles),
             "modules": len(modules),
+            "literal_module_dependencies": sum(
+                len(module.get("dependencies", [])) for module in modules
+            ),
             "failed_units": len(failures),
         },
     }

@@ -1,0 +1,1 @@
+Function("const table = [\"alpha\", \"beta\"]; const answer = 1 + 2; globalThis.__generatedSafe = table[0] + answer; function keepReadable(){ return 40 + 2; } globalThis.__generatedFn = keepReadable;");

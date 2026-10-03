@@ -23,7 +23,7 @@
 (self.webpackChunkFixture = self.webpackChunkFixture || []).push([
   [77],
   {
-    20001: function (module, exports, require) { exports.name = "a"; },
+    20001: function (module, exports, require) { exports.name = require(20002).name; },
     20002: (module, exports, require) => { exports.name = "b"; }
   }
 ]);

@@ -10,6 +10,7 @@ WORK = ROOT / "work/vm-capture-pipeline-regression"
 CASES = {
     "direct-switch": ROOT / "corpus/generated/js-vm-obfuscator/virtualized.js",
     "function-table": ROOT / "corpus/generated/js-virtualizer/vm.js",
+    "generated-safe": ROOT / "corpus/generated/reversible-obfuscation/generated-child-safe.js",
     "generated-obfuscated": ROOT / "corpus/generated/js-virtualizer/vm-obfuscated.js",
 }
 
@@ -151,6 +152,35 @@ def main():
             graph = load(project, "analysis/source-graph.json")
             assert graph["summary"]["edge_kinds"].get("devirtualized_vm", 0) >= len(devirt)
 
+        elif name == "generated-safe":
+            assert analysis["dynamic_code_units"]
+            generated = [
+                u
+                for u in analysis["code_units"]
+                if u.get("origin") == "generated_dynamic_code"
+            ]
+            assert generated
+            child = generated[0]
+            assert child["analysis_origin"] == "safe_deobfuscation"
+            assert child["path"].startswith("src/_dynamic_deobfuscated/")
+
+            recovery = load(project, "analysis/generated-recovery.json")
+            assert recovery["summary"]["generated_units"] >= 1
+            assert recovery["summary"]["safe_deobfuscation"] >= 1
+            unit = recovery["units"][0]
+            assert unit["selected_stage"] == "safe_deobfuscation"
+            assert unit["deobfuscation"]["changed"] is True
+            assert unit["deobfuscation"]["transforms"].get("constant_fold", 0) >= 1
+            assert (project / unit["analysis_path"]).is_file()
+            assert (project / unit["readable_path"]).is_file()
+            graph = load(project, "analysis/source-graph.json")
+            assert graph["summary"]["edge_kinds"].get("generated_safe_recovery", 0) >= 1
+            recovered_nodes = [
+                n for n in graph["nodes"] if n.get("type") == "generated_recovered_source"
+            ]
+            assert recovered_nodes
+            assert recovered_nodes[0]["recovery_stage"] == "safe_deobfuscation"
+
         else:
             assert analysis["dynamic_code_units"]
             assert len(analysis["code_units"]) >= 2
@@ -164,9 +194,19 @@ def main():
                 generated,
                 key=lambda unit: int(unit.get("largest_handler_table", 0)),
             )
-            assert candidate["analysis_origin"] == "generated_code_exact"
+            assert candidate["analysis_origin"] == "exact_fallback"
             assert candidate["large_handler_table_candidate"] is True
             assert candidate["largest_handler_table"] >= 74
+
+            recovery = load(project, "analysis/generated-recovery.json")
+            assert recovery["summary"]["exact_fallback"] >= 1
+            failed = next(
+                unit
+                for unit in recovery["units"]
+                if unit["selected_stage"] == "exact_fallback"
+            )
+            assert failed["deobfuscation"]["exit"] != 0
+            assert failed["analysis_path"] == failed["raw_path"]
 
             graph = load(project, "analysis/source-graph.json")
             assert graph["summary"]["edge_kinds"].get("generated_code", 0) >= 1
@@ -175,6 +215,7 @@ def main():
             ]
             assert dynamic_nodes
             assert any(n.get("child_scan_id") is not None for n in dynamic_nodes)
+            assert graph["summary"]["edge_kinds"].get("generated_safe_recovery", 0) == 0
 
     print("PASS: capture pipeline VM regressions")
     for name, output in results.items():

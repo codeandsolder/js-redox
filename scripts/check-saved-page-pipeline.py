@@ -131,6 +131,7 @@ def main():
     assert bundles["summary"]["failed_units"] == 0
     assert bundles["summary"]["bundles"] >= 1
     assert bundles["summary"]["modules"] >= 2
+    assert bundles["summary"]["literal_module_dependencies"] >= 1
     assert all((PROJECT / row["source_path"]).is_file() for row in bundles["modules"])
 
     vm = json.loads((PROJECT / "analysis/jsvm/index.json").read_text())
@@ -150,6 +151,7 @@ def main():
     assert edge_kinds.get("js_import_static", 0) >= 1
     assert edge_kinds.get("bundle_payload", 0) >= 1
     assert edge_kinds.get("bundle_module", 0) >= 2
+    assert edge_kinds.get("bundle_module_dependency", 0) >= 1
 
     readme = (PROJECT / "README.md").read_text()
     assert "# Recovered source project" in readme

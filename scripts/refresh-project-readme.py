@@ -28,6 +28,10 @@ def main():
     )
     graph = load(project / "analysis/source-graph.json", {"summary": {}})
     bundles = load(project / "analysis/bundles.json", {"bundles": [], "modules": [], "summary": {}})
+    generated_recovery = load(
+        project / "analysis/generated-recovery.json",
+        {"units": [], "summary": {}},
+    )
 
     resources = manifest.get("resources", [])
     source_units = source_index.get("units", [])
@@ -82,6 +86,7 @@ def main():
     source_kind = manifest.get("source_kind") or "har"
     original_url = manifest.get("original_page_url")
     bundle_summary = bundles.get("summary", {})
+    generated_recovery_summary = generated_recovery.get("summary", {})
 
     lines = [
         "# Recovered source project",
@@ -97,7 +102,8 @@ def main():
         "- [src/_deobfuscated/](src/_deobfuscated/) — semantics-preserving static recovery run from the exact captured JS bytes; formatting is intentionally left untouched here.",
         "- [src/_readable/](src/_readable/) — formatted analyst view of the safe-deobfuscated result; use this as the normal human reading tree.",
         "- [src/_devirtualized/](src/_devirtualized/) — readable modules/pseudocode for confirmed JavaScript VM interpreters.",
-        "- [src/_dynamic/](src/_dynamic/) — statically recovered literal generated-code bodies such as Function(...).",
+        "- [src/_dynamic/](src/_dynamic/) — formatted analyst views of statically recovered generated-code bodies such as Function(...).",
+        "- [src/_dynamic_deobfuscated/](src/_dynamic_deobfuscated/) — proven safe recovery of generated-code children when string/deob passes validate; exact bytes remain the fallback.",
         "- [src/_sourcemap/](src/_sourcemap/) — original sources recovered from captured source maps.",
         "- [src/_modules/](src/_modules/) — statically extracted Webpack/Next module wrappers where bundle structure is explicit.",
         "- [resources/](resources/) — capture-faithful response bodies or saved-page files.",
@@ -115,6 +121,12 @@ def main():
         f"- Source-map originals recovered: **{len(recovered_originals)}**",
         f"- Literal generated-code units recovered: **{len(dynamic)}**",
         f"- Generated-code units recursively scanned: **{len(recursive_generated)}**",
+        f"- Generated-code safe recovery: **{generated_recovery.get('summary', {}).get('safe_deobfuscation', 0)}** safe deob, "
+        f"**{generated_recovery.get('summary', {}).get('string_recovery_only', 0)}** string-only, "
+        f"**{generated_recovery.get('summary', {}).get('exact_fallback', 0)}** exact fallback",
+        f"- Generated children with full safe deobfuscation: **{generated_recovery_summary.get('safe_deobfuscation', 0)}**",
+        f"- Generated children with string-recovery only: **{generated_recovery_summary.get('string_recovery_only', 0)}**",
+        f"- Generated children scanned from exact fallback bytes: **{generated_recovery_summary.get('exact_fallback', 0)}**",
         "",
         "## Safe static deobfuscation",
         "",
@@ -123,12 +135,14 @@ def main():
         f"- Encoded string-decoder recovery: **{encoded_string_replacements}** call sites across **{encoded_string_units}** unit(s)",
         f"- Proven arithmetic-state unflattenings: **{arithmetic_state_proofs}**",
         "- Encoded string-table proof/provenance: [analysis/string-recovery.json](analysis/string-recovery.json)",
-        "- Detailed final-view hashes, pass counts and provenance: [analysis/deobfuscation.json](analysis/deobfuscation.json)",
+        "- Detailed captured-unit final-view hashes, pass counts and provenance: [analysis/deobfuscation.json](analysis/deobfuscation.json)",
+        "- Recursive generated-code recovery/fallback provenance: [analysis/generated-recovery.json](analysis/generated-recovery.json)",
         "",
         "## Structured bundle modules",
         "",
         f"- Explicit bundle payloads recovered: **{bundle_summary.get('bundles', 0)}**",
         f"- Readable module wrappers materialized: **{bundle_summary.get('modules', 0)}**",
+        f"- Literal intra-bundle/module-loader dependencies recovered: **{bundle_summary.get('literal_module_dependencies', 0)}**",
         f"- Bundle-analysis failures: **{bundle_summary.get('failed_units', 0)}**",
         "- Module inventory/provenance: [analysis/bundles.json](analysis/bundles.json)",
         "",
@@ -189,7 +203,7 @@ def main():
             "",
             "## Provenance rule",
             "",
-            "resources/ is capture truth. Everything under src/, including _deobfuscated/, _readable/, _devirtualized/, _dynamic/, _modules/, and _sourcemap/, is a derived analyst view and should be traced through the files in analysis/ before treating it as original captured source.",
+            "resources/ is capture truth. Everything under src/, including _deobfuscated/, _readable/, _dynamic_deobfuscated/, _dynamic/, _devirtualized/, _modules/, and _sourcemap/, is a derived analyst view and should be traced through the files in analysis/ before treating it as original captured source.",
             "",
         ]
     )

@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     // Feed the exact source bytes to the proof-oriented engine. Canonicalizing
     // first is observably unsafe for Function#toString/self-defending code.
     let result = jsvm_safe_core::deobfuscate(&original, args.max_iterations)
-        .ok_or_else(|| anyhow::anyhow!("source stopped parsing during safe deobfuscation"))?;
+        .ok_or_else(|| anyhow::anyhow!("source failed parse or semantic validation during safe deobfuscation"))?;
 
     let arithmetic_state_proofs = result
         .arithmetic_state_proofs

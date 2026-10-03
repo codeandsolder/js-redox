@@ -220,10 +220,16 @@ def main():
                 chunk_ids=bundle.get('chunk_ids', []),
             )
 
+    bundle_module_nodes = {}
+    module_nodes_by_id = defaultdict(list)
+    module_rows = {}
     for module in bundles.get('modules', []):
         bundle_id = int(module['bundle_id'])
         ordinal = int(module.get('module_ordinal', 0))
         node_id = f'bundle-module:{bundle_id}:{ordinal}'
+        bundle_module_nodes[(bundle_id, str(module.get('module_id')))] = node_id
+        module_nodes_by_id[str(module.get('module_id'))].append(node_id)
+        module_rows[node_id] = module
         add_node(
             node_id,
             type='bundle_module',
@@ -237,6 +243,7 @@ def main():
             formatted=bool(module.get('formatted')),
             sha256=module.get('sha256'),
             value_kind=module.get('value_kind'),
+            dependencies=module.get('dependencies', []),
         )
         parent = bundle_nodes.get(bundle_id)
         if parent:
@@ -245,6 +252,46 @@ def main():
                 node_id,
                 'bundle_module',
                 module_id=module.get('module_id'),
+            )
+
+    for source_node, module in module_rows.items():
+        bundle_id = int(module['bundle_id'])
+        for dependency in module.get('dependencies', []):
+            dependency = str(dependency)
+            target = bundle_module_nodes.get((bundle_id, dependency))
+            cross_bundle = False
+            if target is None:
+                candidates = module_nodes_by_id.get(dependency, [])
+                if len(candidates) == 1:
+                    target = candidates[0]
+                    cross_bundle = True
+            if target is not None:
+                add_edge(
+                    source_node,
+                    target,
+                    'bundle_module_dependency',
+                    module_id=dependency,
+                    cross_bundle=cross_bundle,
+                )
+                continue
+
+            ref_key = f"{bundle_id}:{dependency}"
+            ref_id = 'bundle-module-ref:' + hashlib.sha256(ref_key.encode()).hexdigest()[:20]
+            candidates = module_nodes_by_id.get(dependency, [])
+            add_node(
+                ref_id,
+                type='bundle_module_reference',
+                module_id=dependency,
+                source_bundle_id=bundle_id,
+                candidate_nodes=candidates,
+                ambiguous=bool(candidates),
+            )
+            add_edge(
+                source_node,
+                ref_id,
+                'bundle_module_dependency_unresolved',
+                module_id=dependency,
+                candidate_count=len(candidates),
             )
 
     # Source maps link generated JS -> map resource -> recovered original source.
@@ -281,25 +328,7 @@ def main():
             add_edge(map_node or src, node_id, 'source_map_source', ordinal=ordinal)
 
     # Static Function(...) recovery is a generated-code provenance edge.
-    scan_to_parent = {}
-    for unit in jsvm.get('code_units', []):
-        if unit.get('scan_id') is None:
-            continue
-        if unit.get('origin') == 'generated_dynamic_code':
-            parent_scan = unit.get('parent_scan_id')
-            ordinal = unit.get('parent_dynamic_ordinal')
-            if parent_scan is None or ordinal is None:
-                continue
-            parent = f"dynamic:{int(parent_scan)}:{int(ordinal)}"
-        else:
-            deob_ordinal = unit.get('deobfuscation_ordinal')
-            if deob_ordinal is not None and int(deob_ordinal) in deob_nodes:
-                parent = deob_nodes[int(deob_ordinal)]
-            elif unit.get('resource_id') is not None:
-                parent = f"resource:{int(unit['resource_id'])}"
-            else:
-                continue
-        scan_to_parent[int(unit['scan_id'])] = parent
+    generated_analysis_parent = {}
     for dyn in jsvm.get('dynamic_code_units', []):
         scan = int(dyn['parent_scan_id'])
         ordinal = int(dyn['ordinal'])
@@ -316,9 +345,66 @@ def main():
             body_bytes=dyn.get('body_bytes'),
             raw_dump=dyn.get('raw_dump'),
             source_path=dyn.get('source_path'),
+            analysis_path=dyn.get('analysis_path'),
+            analysis_stage=dyn.get('analysis_stage'),
+            recovery_report=dyn.get('recovery_report'),
             formatted=dyn.get('formatted'),
             child_scan_id=dyn.get('child_scan_id'),
         )
+
+        analysis_parent = node_id
+        analysis_path = dyn.get('analysis_path')
+        if analysis_path and analysis_path != dyn.get('raw_dump'):
+            recovery_node = f'generated-recovery:{scan}:{ordinal}'
+            add_node(
+                recovery_node,
+                type='generated_recovered_source',
+                parent_scan_id=scan,
+                ordinal=ordinal,
+                recovery_stage=dyn.get('analysis_stage'),
+                source_path=analysis_path,
+                readable_source_path=dyn.get('source_path'),
+                recovery_report=dyn.get('recovery_report'),
+            )
+            add_edge(
+                node_id,
+                recovery_node,
+                'generated_safe_recovery',
+                recovery_stage=dyn.get('analysis_stage'),
+            )
+            analysis_parent = recovery_node
+
+        child_scan_id = dyn.get('child_scan_id')
+        if child_scan_id is not None:
+            generated_analysis_parent[int(child_scan_id)] = analysis_parent
+
+    scan_to_parent = {}
+    for unit in jsvm.get('code_units', []):
+        if unit.get('scan_id') is None:
+            continue
+        scan_id = int(unit['scan_id'])
+        if unit.get('origin') == 'generated_dynamic_code':
+            parent = generated_analysis_parent.get(scan_id)
+            if parent is None:
+                parent_scan = unit.get('parent_scan_id')
+                ordinal = unit.get('parent_dynamic_ordinal')
+                if parent_scan is None or ordinal is None:
+                    continue
+                parent = f"dynamic:{int(parent_scan)}:{int(ordinal)}"
+        else:
+            deob_ordinal = unit.get('deobfuscation_ordinal')
+            if deob_ordinal is not None and int(deob_ordinal) in deob_nodes:
+                parent = deob_nodes[int(deob_ordinal)]
+            elif unit.get('resource_id') is not None:
+                parent = f"resource:{int(unit['resource_id'])}"
+            else:
+                continue
+        scan_to_parent[scan_id] = parent
+
+    for dyn in jsvm.get('dynamic_code_units', []):
+        scan = int(dyn['parent_scan_id'])
+        ordinal = int(dyn['ordinal'])
+        node_id = f'dynamic:{scan}:{ordinal}'
         parent = scan_to_parent.get(scan)
         if parent:
             add_edge(
