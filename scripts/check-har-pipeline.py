@@ -78,7 +78,8 @@ def main():
     html = (
         "<!doctype html><html><body>"
         '<script src="/assets/app.js"></script>'
-        "<script>globalThis.inlineHar = 1;</script>"
+        '<script type="application/javascript; charset=utf-8">globalThis.inlineHar = 1;</script>'
+        '<script type="speculationrules">{"prefetch":[{"source":"list","urls":["/next"]}]}</script>'
         "</body></html>"
     )
     worker_js = 'postMessage("ready");\n'
@@ -107,6 +108,7 @@ def main():
                 entry("https://fixture.invalid/index.html", "text/html", html),
                 entry("https://fixture.invalid/assets/app.js", "application/javascript", app_js),
                 entry("https://fixture.invalid/assets/worker.js", "application/javascript", worker_js),
+                entry("https://fixture.invalid/assets/worker-copy.js", "application/javascript", worker_js),
                 entry(
                     "https://fixture.invalid/assets/app.js.map",
                     "application/json",
@@ -148,17 +150,44 @@ def main():
 
     manifest = json.loads((PROJECT / "har-manifest.json").read_text())
     assert manifest["schema"] == "har-project/v0"
-    assert len(manifest["resources"]) == 4
+    assert len(manifest["resources"]) == 5
     assert (PROJECT / "capture-manifest.json").is_file()
+    speculation = next(
+        script
+        for script in manifest["inline_scripts"]
+        if script.get("script_type") == "speculationrules"
+    )
+    assert speculation["output_path"].endswith(".json")
+    assert json.loads((PROJECT / speculation["output_path"]).read_text())["prefetch"]
+    executable_inline = next(
+        script
+        for script in manifest["inline_scripts"]
+        if script.get("output_path", "").endswith(".js")
+    )
+    assert executable_inline["script_type"] == "application/javascript"
     app_resource = next(r for r in manifest["resources"] if r["url"].endswith("/app.js"))
     assert app_resource["sha256"] == hashlib.sha256(app_js.encode()).hexdigest()
 
     source_index = json.loads((PROJECT / "analysis/source-index.json").read_text())
     js_units = [u for u in source_index["units"] if u["kind"] == "javascript"]
-    assert len(js_units) == 3
+    assert len(js_units) == 4
+    assert source_index["summary"]["unique_javascript_inputs"] == 3
+    assert source_index["summary"]["deduplicated_javascript_units"] == 1
+    speculation_unit = next(
+        unit
+        for unit in source_index["units"]
+        if unit.get("raw_path") == speculation["output_path"]
+    )
+    assert speculation_unit["kind"] == "json"
 
     deob = json.loads((PROJECT / "analysis/deobfuscation.json").read_text())
     assert deob["summary"]["failed_units"] == 0
+    assert deob["summary"]["javascript_units"] == 4
+    assert deob["summary"]["unique_raw_inputs"] == 3
+    assert deob["summary"]["deduplicated_raw_units"] == 1
+    assert deob["summary"]["string_recovery_invocations"] == 3
+    assert deob["summary"]["safe_deob_invocations"] == 3
+    assert deob["summary"]["readable_format_invocations"] == 3
     app_deob = next(u for u in deob["units"] if u.get("raw_path") == app_resource["output_path"])
     assert app_deob["input_sha256"] == app_resource["sha256"]
     assert app_deob["input_path"] == app_resource["output_path"]
@@ -177,6 +206,10 @@ def main():
     assert "originalAnswer" in (PROJECT / recovered[0]["source_path"]).read_text()
 
     jsrefs = json.loads((PROJECT / "analysis/js-references.json").read_text())
+    assert jsrefs["summary"]["javascript_units"] == 4
+    assert jsrefs["summary"]["unique_input_bodies"] == 3
+    assert jsrefs["summary"]["deduplicated_units"] == 1
+    assert jsrefs["summary"]["extractor_invocations"] == 3
     worker_ref = next(
         ref
         for unit in jsrefs["code_units"]
@@ -187,6 +220,12 @@ def main():
 
     bundles = json.loads((PROJECT / "analysis/bundles.json").read_text())
     assert bundles["summary"]["failed_units"] == 0
+    assert bundles["summary"]["eligible_units"] == 4
+    assert bundles["summary"]["unique_input_bodies"] == 3
+    assert bundles["summary"]["deduplicated_units"] == 1
+    assert bundles["summary"]["inventory_invocations"] == 3
+    assert bundles["summary"]["module_format_invocations"] < bundles["summary"]["modules"]
+    assert bundles["summary"]["deduplicated_module_formats"] > 0
     assert bundles["summary"]["bundles"] >= 1
     assert bundles["summary"]["modules"] >= 2
     assert bundles["summary"]["literal_module_dependencies"] >= 1
@@ -218,14 +257,16 @@ def main():
     assert app_scan["analysis_origin"] == "safe_deobfuscation"
     assert app_scan["path"] == app_deob["output_path"]
     assert app_scan["scanner_exit"] == 0
+    assert analysis["scanner_invocations"] == 3
+    assert analysis["deduplicated_scans"] == 1
 
     graph = json.loads((PROJECT / "analysis/source-graph.json").read_text())
     edge_kinds = graph["summary"]["edge_kinds"]
-    assert edge_kinds.get("inline_script") == 1
+    assert edge_kinds.get("inline_script") == 2
     assert edge_kinds.get("script_src", 0) >= 1
     assert edge_kinds.get("source_map_source") == 1
     assert edge_kinds.get("js_worker") == 1
-    assert edge_kinds.get("safe_deobfuscation") == 3
+    assert edge_kinds.get("safe_deobfuscation") == 4
     assert edge_kinds.get("bundle_payload", 0) >= 1
     assert edge_kinds.get("bundle_module", 0) >= 2
     assert edge_kinds.get("bundle_module_dependency", 0) >= 1
@@ -271,7 +312,7 @@ def main():
     )
     assert truncated_manifest["salvaged"] is True
     assert truncated_manifest["parse_error"]
-    assert len(truncated_manifest["resources"]) == 3
+    assert len(truncated_manifest["resources"]) == 4
 
     print(cp.stdout.rstrip())
     print(

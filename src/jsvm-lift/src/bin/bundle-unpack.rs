@@ -81,6 +81,13 @@ fn expression_symbol(scoping: &Scoping, expr: &Expression<'_>) -> Option<SymbolI
     }
 }
 
+fn unwrap_parenthesized<'a>(mut expr: &'a Expression<'a>) -> &'a Expression<'a> {
+    while let Expression::ParenthesizedExpression(paren) = expr {
+        expr = &paren.expression;
+    }
+    expr
+}
+
 fn computed_string(expr: &Expression<'_>) -> Option<String> {
     match expr {
         Expression::StringLiteral(value) => Some(value.value.to_string()),
@@ -293,6 +300,7 @@ impl Collector<'_, '_> {
     }
 
     fn module_dependencies(&self, value: &Expression<'_>) -> Vec<String> {
+        let value = unwrap_parenthesized(value);
         let (params, body) = match value {
             Expression::FunctionExpression(function) => {
                 let Some(body) = function.body.as_ref() else {
@@ -322,6 +330,7 @@ impl Collector<'_, '_> {
     }
 
     fn module_exports(&self, value: &Expression<'_>) -> (Vec<String>, bool) {
+        let value = unwrap_parenthesized(value);
         let (params, body) = match value {
             Expression::FunctionExpression(function) => {
                 let Some(body) = function.body.as_ref() else {
@@ -374,13 +383,14 @@ impl Collector<'_, '_> {
                 return None;
             }
             let id = Self::property_key(&prop.key)?;
-            let (value_kind, span) = match &prop.value {
+            let value = unwrap_parenthesized(&prop.value);
+            let (value_kind, span) = match value {
                 Expression::FunctionExpression(f) => ("function", f.span),
                 Expression::ArrowFunctionExpression(f) => ("arrow", f.span),
                 _ => return None,
             };
-            let dependencies = self.module_dependencies(&prop.value);
-            let (export_names, commonjs_export) = self.module_exports(&prop.value);
+            let dependencies = self.module_dependencies(value);
+            let (export_names, commonjs_export) = self.module_exports(value);
             modules.push(ModuleRecord {
                 id,
                 property_start: prop.span.start,
@@ -414,7 +424,7 @@ impl Collector<'_, '_> {
             let ObjectPropertyKind::ObjectProperty(prop) = item else {
                 return false;
             };
-            let arity = match &prop.value {
+            let arity = match unwrap_parenthesized(&prop.value) {
                 Expression::FunctionExpression(f) => f.params.items.len(),
                 Expression::ArrowFunctionExpression(f) => f.params.items.len(),
                 _ => return false,

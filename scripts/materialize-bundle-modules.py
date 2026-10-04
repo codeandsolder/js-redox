@@ -5,11 +5,15 @@ import json
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+from content_dedup import default_jobs, sha256_path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INVENTORY = ROOT / ".cargo-target-nodebug/debug/bundle-unpack"
 DEFAULT_FORMATTER = ROOT / ".cargo-target-nodebug/debug/js-format"
+PROVENANCE_PLACEHOLDER = "__JSVM_CAPTURE_PROVENANCE__"
 
 
 def safe_component(value: str, cap: int = 96) -> str:
@@ -139,7 +143,9 @@ def main():
     ap.add_argument("project", type=Path)
     ap.add_argument("--inventory", type=Path, default=DEFAULT_INVENTORY)
     ap.add_argument("--formatter", type=Path, default=DEFAULT_FORMATTER)
+    ap.add_argument("--jobs", type=int, default=default_jobs())
     args = ap.parse_args()
+    jobs = max(1, args.jobs)
 
     project = args.project.resolve()
     deob_path = project / "analysis/deobfuscation.json"
@@ -152,11 +158,14 @@ def main():
 
     bundles = []
     modules = []
+    module_tasks = []
     failures = []
     tmp_root = ROOT / "work/test-tmp/bundle-module-materialization"
     shutil.rmtree(tmp_root, ignore_errors=True)
     tmp_root.mkdir(parents=True, exist_ok=True)
 
+    eligible_units = []
+    inventory_groups = {}
     for unit in deob.get("units", []):
         if unit.get("exit") or not unit.get("output_path"):
             continue
@@ -164,17 +173,65 @@ def main():
         parent = project / parent_rel
         if not parent.is_file():
             continue
-        cp = run([args.inventory, parent])
+        digest = unit.get("output_sha256") or sha256_path(parent)
+        item = {
+            "unit": unit,
+            "parent_rel": parent_rel,
+            "parent": parent,
+            "content_sha256": digest,
+        }
+        eligible_units.append(item)
+        inventory_groups.setdefault(digest, []).append(item)
+
+    def inventory_group(digest, group):
+        canonical = group[0]
+        cp = run([args.inventory, canonical["parent"]])
         if cp.returncode:
+            return {
+                "content_sha256": digest,
+                "exit": cp.returncode,
+                "error": (cp.stdout + cp.stderr)[-3000:],
+                "report": None,
+            }
+        return {
+            "content_sha256": digest,
+            "exit": 0,
+            "error": None,
+            "report": json.loads(cp.stdout),
+        }
+
+    inventory_results = {}
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {
+            pool.submit(inventory_group, digest, group): digest
+            for digest, group in inventory_groups.items()
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            inventory_results[result["content_sha256"]] = result
+
+    seen_digest = {}
+    for item in eligible_units:
+        unit = item["unit"]
+        parent_rel = item["parent_rel"]
+        parent = item["parent"]
+        digest = item["content_sha256"]
+        result = inventory_results[digest]
+        occurrence = seen_digest.get(digest, 0)
+        seen_digest[digest] = occurrence + 1
+        if result["exit"]:
             failures.append(
                 {
                     "ordinal": unit.get("ordinal"),
                     "path": str(parent_rel),
-                    "error": (cp.stdout + cp.stderr)[-3000:],
+                    "content_sha256": digest,
+                    "content_group_size": len(inventory_groups[digest]),
+                    "deduplicated": occurrence > 0,
+                    "error": result["error"],
                 }
             )
             continue
-        report = json.loads(cp.stdout)
+        report = result["report"]
         source = parent.read_bytes()
         for bundle_ordinal, bundle in enumerate(report.get("bundles", [])):
             bundle_id = len(bundles)
@@ -183,6 +240,9 @@ def main():
                 "parent_ordinal": unit.get("ordinal"),
                 "resource_id": unit.get("resource_id"),
                 "parent_path": str(parent_rel),
+                "parent_content_sha256": digest,
+                "inventory_group_size": len(inventory_groups[digest]),
+                "inventory_deduplicated": occurrence > 0,
                 "kind": bundle.get("kind"),
                 "chunk_ids": bundle.get("chunk_ids", []),
                 "start": bundle.get("start"),
@@ -202,18 +262,13 @@ def main():
                     bundle_ordinal,
                 )
                 dest = project / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
                 provenance = (
                     f"parent={parent_rel} bundle_span={bundle['start']}..{bundle['end']} "
                     f"module={module['id']} property_span={module['property_start']}..{module['property_end']}"
                 )
-                raw = build_module_source(source, module, provenance)
-                tmp = tmp_root / f"bundle-{bundle_id}-module-{module_ordinal}.js"
-                tmp.write_text(raw)
-                fmt = run([args.formatter, tmp, dest], timeout=120)
-                formatted = fmt.returncode == 0
-                if not formatted:
-                    dest.write_text(raw)
+                raw = build_module_source(source, module, PROVENANCE_PLACEHOLDER)
+                raw_sha = hashlib.sha256(raw.encode()).hexdigest()
+                module_index = len(modules)
                 modules.append(
                     {
                         "bundle_id": bundle_id,
@@ -221,6 +276,7 @@ def main():
                         "parent_ordinal": unit.get("ordinal"),
                         "resource_id": unit.get("resource_id"),
                         "parent_path": str(parent_rel),
+                        "parent_content_sha256": digest,
                         "chunk_ids": bundle.get("chunk_ids", []),
                         "module_id": str(module["id"]),
                         "property_start": module.get("property_start"),
@@ -233,10 +289,68 @@ def main():
                         "export_names": [str(x) for x in module.get("export_names", [])],
                         "commonjs_export": bool(module.get("commonjs_export")),
                         "source_path": str(rel),
-                        "formatted": formatted,
-                        "sha256": hashlib.sha256(dest.read_bytes()).hexdigest(),
+                        "module_input_sha256": raw_sha,
                     }
                 )
+                module_tasks.append(
+                    {
+                        "module_index": module_index,
+                        "raw": raw,
+                        "raw_sha256": raw_sha,
+                        "provenance": provenance,
+                        "dest": dest,
+                    }
+                )
+
+    module_format_groups = {}
+    for task in module_tasks:
+        module_format_groups.setdefault(task["raw_sha256"], []).append(task)
+
+    format_cache = tmp_root / "formatted"
+    format_cache.mkdir(parents=True, exist_ok=True)
+
+    def format_module_group(raw_sha, group):
+        canonical = group[0]
+        source_tmp = tmp_root / "raw" / f"{raw_sha}.js"
+        source_tmp.parent.mkdir(parents=True, exist_ok=True)
+        source_tmp.write_text(canonical["raw"])
+        formatted_tmp = format_cache / f"{raw_sha}.js"
+        fmt = run([args.formatter, source_tmp, formatted_tmp], timeout=120)
+        formatted = fmt.returncode == 0
+        if not formatted:
+            formatted_tmp.write_text(canonical["raw"])
+        return {
+            "raw_sha256": raw_sha,
+            "formatted": formatted,
+            "formatted_path": formatted_tmp,
+            "group": group,
+        }
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {
+            pool.submit(format_module_group, raw_sha, group): raw_sha
+            for raw_sha, group in module_format_groups.items()
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            canonical_index = result["group"][0]["module_index"]
+            template = result["formatted_path"].read_text()
+            if PROVENANCE_PLACEHOLDER not in template:
+                raise RuntimeError(
+                    f"formatter dropped module provenance placeholder for {result['raw_sha256']}"
+                )
+            for task in result["group"]:
+                record = modules[task["module_index"]]
+                rendered = template.replace(
+                    PROVENANCE_PLACEHOLDER, task["provenance"], 1
+                )
+                task["dest"].parent.mkdir(parents=True, exist_ok=True)
+                task["dest"].write_text(rendered)
+                record["formatted"] = result["formatted"]
+                record["sha256"] = hashlib.sha256(rendered.encode()).hexdigest()
+                record["format_group_size"] = len(result["group"])
+                record["format_deduplicated"] = task["module_index"] != canonical_index
+                record["materialization"] = "rendered_content_template"
 
     index = {
         "schema": "har-bundle-modules/v2",
@@ -246,6 +360,13 @@ def main():
         "modules": modules,
         "failures": failures,
         "summary": {
+            "eligible_units": len(eligible_units),
+            "unique_input_bodies": len(inventory_groups),
+            "deduplicated_units": len(eligible_units) - len(inventory_groups),
+            "inventory_invocations": len(inventory_groups),
+            "module_format_invocations": len(module_format_groups),
+            "deduplicated_module_formats": len(module_tasks) - len(module_format_groups),
+            "jobs": jobs,
             "bundles": len(bundles),
             "modules": len(modules),
             "literal_module_dependencies": sum(
@@ -268,6 +389,8 @@ def main():
     write_module_readme(module_root, bundles, modules)
     print(
         f"bundle modules: {len(bundles)} bundle payload(s), {len(modules)} modules, "
+        f"{len(module_format_groups)} formatter invocation(s) / "
+        f"{len(module_tasks) - len(module_format_groups)} exact-hash reuse(s), "
         f"{len(failures)} failed units"
     )
 

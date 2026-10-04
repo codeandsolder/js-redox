@@ -9,6 +9,12 @@ import shutil
 from pathlib import Path
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
+from browser_script_types import (
+    inline_script_extension,
+    inline_script_kind,
+    is_executable_script,
+)
+
 SAVED_ORIGIN = "https://saved-page.invalid/"
 SAVED_FROM_RE = re.compile(r"saved\s+from\s+url=\(\d+\)(.*?)\s*-->", re.IGNORECASE | re.DOTALL)
 SOURCE_REF_RE = re.compile(r"(?:\/\/[#@]|\/\*[#@])\s*(sourceMappingURL|sourceURL)\s*=\s*([^\s*]+)")
@@ -192,7 +198,11 @@ def html_references(text: str, base: str) -> list[dict]:
         tag_name = match.group(1).lower()
         attrs = parse_attrs(text[match.start():end + 1])
         candidates = []
-        if tag_name == "script" and attrs.get("src"):
+        if (
+            tag_name == "script"
+            and attrs.get("src")
+            and is_executable_script(attrs.get("type"))
+        ):
             candidates.append(("script_src", attrs["src"]))
         elif tag_name == "link" and attrs.get("href"):
             rel = attrs.get("rel", "").lower()
@@ -407,8 +417,9 @@ def main():
         if not body.strip():
             continue
         body_bytes = body.encode("utf-8")
-        structured_json = "json" in ty or ty == "importmap"
-        ext = "json" if structured_json else "js"
+        script_kind = inline_script_kind(ty)
+        structured_json = script_kind == "json"
+        ext = inline_script_extension(ty)
         digest = sha256_hex(body_bytes)
         desired = Path("resources") / page_rel.parent / (page_rel.name + ".inline") / f"script-{ordinal:03}.{ext}"
         out_rel = desired

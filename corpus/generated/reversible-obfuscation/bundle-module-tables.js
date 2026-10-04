@@ -60,9 +60,9 @@
       void shadowExports;
       void nestedModules;
     },
-    20002: (module, exports, require) => {
+    20002: ((module, exports, require) => {
       module.exports = { name: "b" };
-    }
+    })
   }
 ]);
 

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import hashlib
 import json
 import shutil
 import subprocess
 from pathlib import Path
+
+from browser_script_types import is_executable_script
+from content_dedup import sha256_path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STRING_RECOVERER = ROOT / "scripts/recover-js-obfuscator-strings.py"
@@ -261,6 +265,19 @@ def main():
     outdir = project / "analysis" / "jsvm"
     outdir.mkdir(parents=True, exist_ok=True)
 
+    bundle_spans_by_parent = {}
+    bundles_path = project / "analysis/bundles.json"
+    if bundles_path.exists():
+        bundle_index = json.loads(bundles_path.read_text())
+        for bundle in bundle_index.get("bundles", []):
+            parent_path = bundle.get("parent_path")
+            start = bundle.get("module_table_start")
+            end = bundle.get("module_table_end")
+            if parent_path and start is not None and end is not None:
+                bundle_spans_by_parent.setdefault(parent_path, set()).add(
+                    (int(start), int(end))
+                )
+
     code_units = []
     generated_recovery = []
     seen_scan_paths = set()
@@ -294,7 +311,7 @@ def main():
 
     for script in manifest.get("inline_scripts", []):
         raw_path = script.get("output_path")
-        if not raw_path or not raw_path.endswith((".js", ".mjs", ".cjs")):
+        if not raw_path or not is_executable_script(script.get("script_type")):
             continue
         parent = manifest["resources"][script["parent_resource_id"]]
         derived = deob_by_raw.get(raw_path)
@@ -315,6 +332,9 @@ def main():
 
     rows = []
     dynamic_units = []
+    scanner_cache = {}
+    scanner_invocations = 0
+    deduplicated_scans = 0
     scan_id = 0
     while scan_id < len(code_units):
         unit = code_units[scan_id]
@@ -329,37 +349,91 @@ def main():
             scan_id += 1
             continue
 
-        dump_dir = outdir / "embedded" / f"{scan_id:04}"
-        cp = run_tool(
-            [
-                args.scanner,
-                "--json",
-                "--dump-embedded",
-                dump_dir,
-                source,
-            ],
-            timeout=120,
-        )
+        source_sha = sha256_path(source)
+        row["analysis_sha256"] = source_sha
+        cached = scanner_cache.get(source_sha)
+        reused_scan = cached is not None and not cached["report"].get("embedded")
+        if reused_scan:
+            report = copy.deepcopy(cached["report"])
+            row["scanner_exit"] = 0
+            row["scanner_deduplicated"] = True
+            row["scanner_deduplicated_from_scan_id"] = cached["scan_id"]
+            deduplicated_scans += 1
+        else:
+            dump_dir = outdir / "embedded" / f"{scan_id:04}"
+            cp = run_tool(
+                [
+                    args.scanner,
+                    "--json",
+                    "--dump-embedded",
+                    dump_dir,
+                    source,
+                ],
+                timeout=120,
+            )
+            scanner_invocations += 1
+            row["scanner_exit"] = cp.returncode
+            row["scanner_deduplicated"] = False
+            if cp.returncode:
+                row["error"] = cp.stderr[-3000:]
+                rows.append(row)
+                scan_id += 1
+                continue
+
+            lines = [line for line in cp.stdout.splitlines() if line.strip()]
+            if len(lines) != 1:
+                row["error"] = f"expected one JSON report, got {len(lines)}"
+                rows.append(row)
+                scan_id += 1
+                continue
+            report = json.loads(lines[0])
+            if not report.get("embedded"):
+                scanner_cache[source_sha] = {
+                    "scan_id": scan_id,
+                    "report": copy.deepcopy(report),
+                }
+
         row["bytes"] = source.stat().st_size
-        row["scanner_exit"] = cp.returncode
-        if cp.returncode:
-            row["error"] = cp.stderr[-3000:]
-            rows.append(row)
-            scan_id += 1
-            continue
-
-        lines = [line for line in cp.stdout.splitlines() if line.strip()]
-        if len(lines) != 1:
-            row["error"] = f"expected one JSON report, got {len(lines)}"
-            rows.append(row)
-            scan_id += 1
-            continue
-
-        report = json.loads(lines[0])
         report_path = outdir / f"{scan_id:04}.json"
         report_path.write_text(json.dumps(report, indent=2) + "\n")
         row["report"] = str(report_path.relative_to(project))
         row.update(direct_summary(report))
+        known_bundle_spans = bundle_spans_by_parent.get(unit["path"], set())
+        large_handler_tables = [
+            table
+            for table in report.get("handler_function_tables", [])
+            if int(table.get("function_values", 0)) >= 32
+        ]
+        bundle_handler_tables = [
+            table
+            for table in large_handler_tables
+            if (int(table.get("start", -1)), int(table.get("end", -1)))
+            in known_bundle_spans
+        ]
+        non_bundle_handler_tables = [
+            table
+            for table in large_handler_tables
+            if (int(table.get("start", -1)), int(table.get("end", -1)))
+            not in known_bundle_spans
+        ]
+        looped_dynamic_handler_tables = [
+            table
+            for table in non_bundle_handler_tables
+            if int(table.get("looped_dynamic_call_sites", 0)) > 0
+        ]
+        row["bundle_module_table_handler_tables"] = len(bundle_handler_tables)
+        row["largest_non_bundle_handler_table"] = max(
+            (int(table.get("function_values", 0)) for table in non_bundle_handler_tables),
+            default=0,
+        )
+        row["looped_dynamic_handler_tables"] = len(looped_dynamic_handler_tables)
+        row["largest_looped_dynamic_handler_table"] = max(
+            (
+                int(table.get("function_values", 0))
+                for table in looped_dynamic_handler_tables
+            ),
+            default=0,
+        )
 
         embedded = []
         parent_depth = int(unit.get("generated_depth", 0))
@@ -474,7 +548,7 @@ def main():
         )
         row["large_handler_table_candidate"] = (
             not row["confirmed_vm_signal"]
-            and row["largest_handler_table"] >= 32
+            and row["largest_looped_dynamic_handler_table"] >= 32
         )
         row["vm_signal"] = (
             row["confirmed_vm_signal"]
@@ -520,6 +594,8 @@ def main():
         "generated_recovery": "analysis/generated-recovery.json",
         "max_generated_depth": args.max_generated_depth,
         "max_code_units": args.max_code_units,
+        "scanner_invocations": scanner_invocations,
+        "deduplicated_scans": deduplicated_scans,
         "code_units": rows,
         "dynamic_code_units": dynamic_units,
     }
@@ -538,6 +614,7 @@ def main():
     ]
     print(
         f"scanned {len(rows)} JavaScript units recursively; "
+        f"{scanner_invocations} scanner invocations / {deduplicated_scans} exact-hash reuses; "
         f"{len(dynamic_units)} static dynamic-code units materialized; "
         f"generated recovery safe={generated_recovery_index['summary']['safe_deobfuscation']} "
         f"string-only={generated_recovery_index['summary']['string_recovery_only']} "
@@ -559,7 +636,9 @@ def main():
             f"{label} {row['path']}: confirmed={row.get('confirmed_dispatchers',0)} "
             f"opmaps={row.get('opcode_maps',0)} switches={row.get('direct_switch_maps',0)} "
             f"confirmed_switches={row.get('confirmed_direct_switch_maps',0)} "
-            f"handlers={row.get('largest_handler_table',0)} "
+            f"handlers={row.get('largest_looped_dynamic_handler_table',0)} "
+            f"(raw_non_bundle={row.get('largest_non_bundle_handler_table',0)} "
+            f"bundle_tables={row.get('bundle_module_table_handler_tables',0)}) "
             f"transducers={row.get('byte_transducers',0)} table_vms={row.get('table_vms',0)}"
         )
 

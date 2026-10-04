@@ -447,9 +447,51 @@ fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
 fn script_type(attrs: &HashMap<String, String>) -> String {
     attrs
         .get("type")
-        .map(|s| s.trim().to_ascii_lowercase())
+        .map(|s| {
+            s.split_once(';')
+                .map_or(s.as_str(), |(essence, _)| essence)
+                .trim()
+                .to_ascii_lowercase()
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "text/javascript".into())
+}
+
+fn is_executable_script_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "module"
+            | "text/javascript"
+            | "application/javascript"
+            | "application/ecmascript"
+            | "text/ecmascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+    )
+}
+
+fn is_json_script_type(ty: &str) -> bool {
+    matches!(ty, "importmap" | "speculationrules") || ty.contains("json")
+}
+
+fn inline_script_extension(ty: &str) -> &'static str {
+    if is_executable_script_type(ty) {
+        "js"
+    } else if is_json_script_type(ty) {
+        "json"
+    } else {
+        "txt"
+    }
 }
 
 fn resolve_ref(base: &str, raw: &str) -> Option<String> {
@@ -700,11 +742,13 @@ fn main() -> Result<()> {
                             .as_deref()
                             .and_then(|s| resolve_ref(&entry.request.url, s));
                         if let Some(raw_src) = src.as_ref() {
-                            references.push(Reference {
-                                kind: "script_src".into(),
-                                raw: raw_src.clone(),
-                                resolved_url: resolved_src.clone(),
-                            });
+                            if is_executable_script_type(&ty) {
+                                references.push(Reference {
+                                    kind: "script_src".into(),
+                                    raw: raw_src.clone(),
+                                    resolved_url: resolved_src.clone(),
+                                });
+                            }
                             inline_scripts.push(InlineScriptMeta {
                                 parent_resource_id: id,
                                 ordinal,
@@ -718,7 +762,7 @@ fn main() -> Result<()> {
                             continue;
                         }
 
-                        let structured_json = ty.contains("json") || ty == "importmap";
+                        let structured_json = is_json_script_type(&ty);
                         let body = if structured_json {
                             format_json_if_possible(script.body.as_bytes())
                         } else {
@@ -727,7 +771,7 @@ fn main() -> Result<()> {
                         if body.iter().all(|b| b.is_ascii_whitespace()) {
                             continue;
                         }
-                        let ext = if structured_json { "json" } else { "js" };
+                        let ext = inline_script_extension(&ty);
                         let desired = format!("{written}.inline/script-{ordinal:03}.{ext}");
                         let (script_path, _) =
                             write_resource(&args.output, desired, &body, &mut seen)?;

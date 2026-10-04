@@ -39,8 +39,9 @@ def main():
         "<!doctype html><html><head>\n"
         '  <link rel="stylesheet" href="./Saved_files/site.css">\n'
         "</head><body>\n"
-        '  <script src="./Saved_files/app.js"></script>\n'
+        '  <script type="text/javascript; charset=utf-8" src="./Saved_files/app.js"></script>\n'
         '  <script type="module">import "./Saved_files/inline-dep.js"; console.log("inline");</script>\n'
+        '  <script type="speculationrules">{"prefetch":[{"source":"list","urls":["/next"]}]}</script>\n'
         "</body></html>\n"
     )
 
@@ -99,10 +100,29 @@ def main():
         for r in manifest["resources"]
         for ref in r.get("references", [])
     )
-    assert sum(bool(s.get("output_path")) for s in manifest["inline_scripts"]) == 1
+    assert sum(bool(s.get("output_path")) for s in manifest["inline_scripts"]) == 2
+    external_app = next(
+        script
+        for script in manifest["inline_scripts"]
+        if str(script.get("src", "")).endswith("app.js")
+    )
+    assert external_app["script_type"] == "text/javascript; charset=utf-8"
+    speculation = next(
+        script
+        for script in manifest["inline_scripts"]
+        if script.get("script_type") == "speculationrules"
+    )
+    assert speculation["output_path"].endswith(".json")
+    assert json.loads((PROJECT / speculation["output_path"]).read_text())["prefetch"]
 
     source_index = json.loads((PROJECT / "analysis/source-index.json").read_text())
     assert sum(u["kind"] == "javascript" for u in source_index["units"]) == 4
+    speculation_unit = next(
+        unit
+        for unit in source_index["units"]
+        if unit.get("raw_path") == speculation["output_path"]
+    )
+    assert speculation_unit["kind"] == "json"
 
     sourcemaps = json.loads((PROJECT / "analysis/sourcemaps.json").read_text())
     recovered = [

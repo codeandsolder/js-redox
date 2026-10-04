@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import json
 import subprocess
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
+
+from browser_script_types import is_executable_script
+from content_dedup import default_jobs, sha256_path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EXTRACTOR = ROOT / ".cargo-target-nodebug/debug/js-refs"
@@ -285,7 +290,9 @@ def main():
     )
     ap.add_argument("project", type=Path)
     ap.add_argument("--extractor", type=Path, default=DEFAULT_EXTRACTOR)
+    ap.add_argument("--jobs", type=int, default=default_jobs())
     args = ap.parse_args()
+    jobs = max(1, args.jobs)
 
     project = args.project.resolve()
     manifest = json.loads((project / "har-manifest.json").read_text())
@@ -298,6 +305,8 @@ def main():
     units_by_url = defaultdict(list)
     units_by_raw = {}
 
+    javascript_units = []
+    extraction_groups = {}
     for unit in source_index.get("units", []):
         if unit.get("kind") != "javascript":
             continue
@@ -305,28 +314,71 @@ def main():
         if not source_path:
             continue
         source = project / source_path
+        digest = sha256_path(source)
+        item = {
+            "unit": unit,
+            "source": source,
+            "source_path": source_path,
+            "content_sha256": digest,
+        }
+        javascript_units.append(item)
+        extraction_groups.setdefault(digest, []).append(item)
+
+    def extract_group(digest, group):
+        canonical = group[0]
         cp = subprocess.run(
-            [str(args.extractor), str(source)],
+            [str(args.extractor), str(canonical["source"])],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=120,
         )
+        references = json.loads(cp.stdout) if cp.returncode == 0 else []
+        return {
+            "content_sha256": digest,
+            "canonical_source_path": canonical["source_path"],
+            "group_size": len(group),
+            "exit": cp.returncode,
+            "references": references,
+            "error": cp.stderr[-3000:] if cp.returncode else None,
+        }
+
+    extraction_results = {}
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {
+            pool.submit(extract_group, digest, group): digest
+            for digest, group in extraction_groups.items()
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            extraction_results[result["content_sha256"]] = result
+
+    seen_per_digest = defaultdict(int)
+    for item in javascript_units:
+        unit = item["unit"]
+        result = extraction_results[item["content_sha256"]]
+        occurrence = seen_per_digest[item["content_sha256"]]
+        seen_per_digest[item["content_sha256"]] += 1
         row = {
             "resource_id": unit.get("resource_id"),
             "url": unit.get("url"),
             "raw_path": unit.get("raw_path"),
-            "source_path": source_path,
-            "extractor_exit": cp.returncode,
+            "source_path": item["source_path"],
+            "content_sha256": item["content_sha256"],
+            "content_group_size": result["group_size"],
+            "deduplicated": occurrence > 0,
+            "deduplicated_from": (
+                result["canonical_source_path"] if occurrence > 0 else None
+            ),
+            "extractor_exit": result["exit"],
             "document_resource_ids": [],
-            "references": [],
+            "references": copy.deepcopy(result["references"]),
         }
-        if cp.returncode:
+        if result["exit"]:
             failures += 1
-            row["error"] = cp.stderr[-3000:]
+            row["error"] = result["error"]
         else:
-            row["references"] = json.loads(cp.stdout)
             total_refs += len(row["references"])
         row_id = len(rows)
         rows.append(row)
@@ -334,12 +386,13 @@ def main():
             units_by_url[row["url"]].append(row_id)
         if row.get("raw_path"):
             units_by_raw[row["raw_path"]] = row_id
+
     # Seed document execution contexts from actual <script> records. Import maps are
     # document state and intentionally do not flow into Worker/worklet graphs.
     queue = deque()
     contexts = defaultdict(set)
     for script in manifest.get("inline_scripts", []):
-        if is_import_map(script):
+        if is_import_map(script) or not is_executable_script(script.get("script_type")):
             continue
         document_id = int(script["parent_resource_id"])
         if document_id not in import_maps:
@@ -451,6 +504,10 @@ def main():
         "code_units": rows,
         "summary": {
             "javascript_units": len(rows),
+            "unique_input_bodies": len(extraction_groups),
+            "deduplicated_units": len(rows) - len(extraction_groups),
+            "extractor_invocations": len(extraction_groups),
+            "jobs": jobs,
             "references": total_refs,
             "failures": failures,
             "import_map_scripts": import_map_analysis["summary"]["import_map_scripts"],

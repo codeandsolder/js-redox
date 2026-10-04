@@ -38,6 +38,8 @@ def main():
     source_units = source_index.get("units", [])
     js_units = [u for u in source_units if u.get("kind") == "javascript"]
     source_kinds = Counter(u.get("kind", "unknown") for u in source_units)
+    source_summary = source_index.get("summary", {})
+    jsref_summary = jsrefs.get("summary", {})
 
     recovered_originals = [
         rec
@@ -118,6 +120,10 @@ def main():
         f"- Captured resources: **{len(resources)}**",
         f"- Inline scripts: **{len(manifest.get('inline_scripts', []))}**",
         f"- Readable source units: **{len(source_units)}** ({len(js_units)} JavaScript)",
+        f"- Exact-content JS reuse: **{source_summary.get('unique_javascript_inputs', len(js_units))}** unique bodies / "
+        f"**{len(js_units)}** occurrences (**{source_summary.get('deduplicated_javascript_units', 0)}** formatter reuses)",
+        f"- JS-reference extraction: **{jsref_summary.get('extractor_invocations', len(js_units))}** parser invocations / "
+        f"**{jsref_summary.get('deduplicated_units', 0)}** exact-hash reuses",
         f"- Source kinds: {dict(sorted(source_kinds.items()))}",
         f"- Literal JS/module/worker references: **{jsrefs.get('summary', {}).get('references', 0)}**",
         f"- Import-map blocks captured: **{import_maps.get('summary', {}).get('import_map_scripts', 0)}**",
@@ -137,6 +143,10 @@ def main():
         "",
         f"- Changed JavaScript units: **{changed_deob}**",
         f"- Failed units: **{deob_failures}**",
+        f"- Content-addressed work: **{deob_summary.get('unique_raw_inputs', len(js_units))}** unique raw inputs, "
+        f"**{deob_summary.get('safe_deob_invocations', len(js_units))}** safe-deob invocations, "
+        f"**{deob_summary.get('readable_format_invocations', len(js_units))}** readable-format invocations "
+        f"for **{deob_summary.get('javascript_units', len(js_units))}** JS occurrences",
         f"- Encoded string-decoder recovery: **{encoded_string_replacements}** call sites across **{encoded_string_units}** unit(s)",
         f"- Proven arithmetic-state unflattenings: **{arithmetic_state_proofs}**",
         "- Encoded string-table proof/provenance: [analysis/string-recovery.json](analysis/string-recovery.json)",
@@ -145,6 +155,12 @@ def main():
         "",
         "## Structured bundle modules",
         "",
+        f"- Bundle inventory work: **{bundle_summary.get('inventory_invocations', bundle_summary.get('eligible_units', 0))}** parser invocations for "
+        f"**{bundle_summary.get('eligible_units', 0)}** eligible JS occurrences "
+        f"(**{bundle_summary.get('deduplicated_units', 0)}** exact-hash reuses)",
+        f"- Module-wrapper formatting: **{bundle_summary.get('module_format_invocations', bundle_summary.get('modules', 0))}** formatter invocations for "
+        f"**{bundle_summary.get('modules', 0)}** outputs "
+        f"(**{bundle_summary.get('deduplicated_module_formats', 0)}** exact-template reuses)",
         f"- Explicit bundle payloads recovered: **{bundle_summary.get('bundles', 0)}**",
         f"- Readable module wrappers materialized: **{bundle_summary.get('modules', 0)}**",
         f"- Literal intra-bundle/module-loader dependencies recovered: **{bundle_summary.get('literal_module_dependencies', 0)}**",
@@ -156,6 +172,10 @@ def main():
         "",
         "## VM analysis",
         "",
+        f"- Scanner work: **{jsvm.get('scanner_invocations', len(vm_units))}** scanner invocations / "
+        f"**{jsvm.get('deduplicated_scans', 0)}** exact-hash reuses",
+        f"- Proven bundle module tables excluded from handler-table candidate scoring: "
+        f"**{sum(int(u.get('bundle_module_table_handler_tables', 0)) for u in vm_units)}**",
         f"- Confirmed VM-bearing JavaScript units: **{len(confirmed)}**",
         f"- Weaker VM candidates: **{len(candidates)}**",
         f"- Large unlinked handler-table candidates: **{len(large_handler_candidates)}**",
@@ -176,7 +196,7 @@ def main():
             label = unit.get("path") or unit.get("url") or f"scan {unit.get('scan_id')}"
             lines.append(
                 f"- {label} — largest static function table "
-                f"{unit.get('largest_handler_table', 0)} handlers"
+                f"{unit.get('largest_non_bundle_handler_table', unit.get('largest_handler_table', 0))} handlers"
             )
 
     graph_summary = graph.get("summary", {})

@@ -30,6 +30,8 @@ pub struct DetailedHandlerTableCandidate {
     pub container_kind: String,
     pub entries: usize,
     pub function_values: usize,
+    pub dynamic_call_sites: usize,
+    pub looped_dynamic_call_sites: usize,
     pub handlers: Vec<HandlerFunctionSlot>,
 }
 
@@ -374,6 +376,8 @@ impl<'s> Analyzer<'s> {
                 container_kind: "array".into(),
                 entries: n,
                 function_values: handlers.len(),
+                dynamic_call_sites: 0,
+                looped_dynamic_call_sites: 0,
                 handlers,
             });
         }
@@ -410,6 +414,8 @@ impl<'s> Analyzer<'s> {
                 container_kind: "object".into(),
                 entries: n,
                 function_values: handlers.len(),
+                dynamic_call_sites: 0,
+                looped_dynamic_call_sites: 0,
                 handlers,
             });
         }
@@ -550,6 +556,8 @@ impl<'s> Analyzer<'s> {
                 container_kind: "registry".into(),
                 entries: handlers.len(),
                 function_values: handlers.len(),
+                dynamic_call_sites: 0,
+                looped_dynamic_call_sites: 0,
                 handlers,
             });
         }
@@ -583,6 +591,8 @@ impl<'s> Analyzer<'s> {
                 container_kind: "derived-registry".into(),
                 entries: source_table.entries,
                 function_values: source_table.function_values,
+                dynamic_call_sites: 0,
+                looped_dynamic_call_sites: 0,
                 handlers: source_table.handlers.clone(),
             });
         }
@@ -609,6 +619,32 @@ impl<'s> Analyzer<'s> {
         self.transducers.dedup_by(|a, b| {
             a.function_id == b.function_id && a.start == b.start && a.end == b.end
         });
+
+        for table in &mut self.tables {
+            for function in &self.functions {
+                if table.scope_start > function.start || table.scope_end < function.end {
+                    continue;
+                }
+                for call in &function.handler_calls {
+                    if call.table != table.binding {
+                        continue;
+                    }
+                    let index_text = call.index.trim();
+                    let static_numeric_index = index_text.parse::<u64>().is_ok()
+                        || index_text
+                            .strip_prefix("0x")
+                            .or_else(|| index_text.strip_prefix("0X"))
+                            .is_some_and(|hex| u64::from_str_radix(hex, 16).is_ok());
+                    if static_numeric_index {
+                        continue;
+                    }
+                    table.dynamic_call_sites += 1;
+                    if function.loops > 0 {
+                        table.looped_dynamic_call_sites += 1;
+                    }
+                }
+            }
+        }
 
         let mut table_vms = Vec::new();
         for function in &self.functions {

@@ -71,6 +71,7 @@ def main():
     ap.add_argument("--deobfuscator", type=Path, default=DEFAULT_DEOBFUSCATOR)
     ap.add_argument("--string-recoverer", type=Path, default=DEFAULT_STRING_RECOVERER)
     ap.add_argument("--bundle-inventory", type=Path, default=DEFAULT_BUNDLE_INVENTORY)
+    ap.add_argument("--jobs", type=int, help="parallel workers for content-only analysis stages")
     ap.add_argument("--skip-safe-deobfuscation", action="store_true")
     ap.add_argument("--skip-bundle-unpack", action="store_true")
     ap.add_argument("--skip-vm-scan", action="store_true")
@@ -115,7 +116,7 @@ def main():
             output,
             "--formatter",
             args.formatter,
-        ]
+        ] + (["--jobs", str(args.jobs)] if args.jobs else [])
     )
     run([sys.executable, ROOT / "scripts/recover-sourcemaps.py", output])
     run(
@@ -125,7 +126,7 @@ def main():
             output,
             "--extractor",
             args.js_refs,
-        ]
+        ] + (["--jobs", str(args.jobs)] if args.jobs else [])
     )
 
     if not args.skip_safe_deobfuscation:
@@ -140,7 +141,7 @@ def main():
                 args.string_recoverer,
                 "--formatter",
                 args.formatter,
-            ]
+            ] + (["--jobs", str(args.jobs)] if args.jobs else [])
         )
         if not args.skip_bundle_unpack:
             run(
@@ -152,7 +153,7 @@ def main():
                     args.bundle_inventory,
                     "--formatter",
                     args.formatter,
-                ]
+                ] + (["--jobs", str(args.jobs)] if args.jobs else [])
             )
 
     if not args.skip_vm_scan:
