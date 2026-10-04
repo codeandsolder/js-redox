@@ -1,3 +1,5 @@
+mod value_eval;
+
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, CallExpression, ComputedMemberExpression,
@@ -13,288 +15,10 @@ use oxc_syntax::{
     symbol::SymbolId,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-
-#[derive(Debug, Clone)]
-enum Value {
-    String(String),
-    Number(f64),
-    Bool(bool),
-    Null,
-    Undefined,
-}
-
-impl Value {
-    fn truthy(&self) -> bool {
-        match self {
-            Self::String(s) => !s.is_empty(),
-            Self::Number(n) => *n != 0.0 && !n.is_nan(),
-            Self::Bool(v) => *v,
-            Self::Null | Self::Undefined => false,
-        }
-    }
-
-    fn number(&self) -> Option<f64> {
-        match self {
-            Self::Number(n) => Some(*n),
-            Self::Bool(v) => Some(if *v { 1.0 } else { 0.0 }),
-            Self::Null => Some(0.0),
-            Self::Undefined => Some(f64::NAN),
-            Self::String(s) => {
-                let s = s.trim();
-                if s.is_empty() {
-                    Some(0.0)
-                } else {
-                    s.parse().ok()
-                }
-            }
-        }
-    }
-
-    fn js_string(&self) -> Option<String> {
-        match self {
-            Self::String(s) => Some(s.clone()),
-            Self::Number(n) if n.is_finite() => Some(render_number(*n)),
-            Self::Bool(v) => Some(if *v { "true" } else { "false" }.to_string()),
-            Self::Null => Some("null".into()),
-            Self::Undefined => Some("undefined".into()),
-            Self::Number(_) => None,
-        }
-    }
-
-    fn render(&self) -> Option<String> {
-        match self {
-            Self::String(s) => serde_json::to_string(s).ok(),
-            Self::Number(n) if n.is_finite() => Some(render_number(*n)),
-            Self::Bool(v) => Some(v.to_string()),
-            Self::Null => Some("null".into()),
-            Self::Undefined => Some("void 0".into()),
-            Self::Number(_) => None,
-        }
-    }
-}
-
-fn render_number(n: f64) -> String {
-    if n == 0.0 && n.is_sign_negative() {
-        return "-0".into();
-    }
-    if n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0 {
-        format!("{n:.0}")
-    } else {
-        n.to_string()
-    }
-}
-
-fn same_value(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::String(a), Value::String(b)) => a == b,
-        // JavaScript Strict Equality: NaN is never equal to itself, while
-        // +0 and -0 compare equal.
-        (Value::Number(a), Value::Number(b)) => a == b,
-        (Value::Bool(a), Value::Bool(b)) => a == b,
-        (Value::Null, Value::Null) | (Value::Undefined, Value::Undefined) => true,
-        _ => false,
-    }
-}
-
-fn same_values(a: &[Value], b: &[Value]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(left, right)| same_value(left, right))
-}
-
-fn render_value_array(values: &[Value]) -> Option<String> {
-    let rendered = values
-        .iter()
-        .map(Value::render)
-        .collect::<Option<Vec<_>>>()?;
-    Some(format!("[{}]", rendered.join(", ")))
-}
-
-fn eval(expr: &Expression<'_>) -> Option<Value> {
-    match expr {
-        Expression::StringLiteral(v) => Some(Value::String(v.value.to_string())),
-        Expression::NumericLiteral(v) => Some(Value::Number(v.value)),
-        Expression::BooleanLiteral(v) => Some(Value::Bool(v.value)),
-        Expression::NullLiteral(_) => Some(Value::Null),
-        Expression::TemplateLiteral(v) if v.expressions.is_empty() => v
-            .quasis
-            .first()
-            .map(|q| Value::String(q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string())),
-        Expression::ParenthesizedExpression(v) => eval(&v.expression),
-        Expression::UnaryExpression(v) => eval_unary(v),
-        Expression::BinaryExpression(v) => {
-            eval_binary(v.operator.as_str(), eval(&v.left)?, eval(&v.right)?)
-        }
-        Expression::LogicalExpression(v) => eval_logical(v),
-        Expression::ConditionalExpression(v) => {
-            let test = known_bool(&v.test)?;
-            eval(if test { &v.consequent } else { &v.alternate })
-        }
-        _ => None,
-    }
-}
-
-fn known_bool(expr: &Expression<'_>) -> Option<bool> {
-    if let Some(v) = eval(expr) {
-        return Some(v.truthy());
-    }
-    match expr {
-        Expression::ArrayExpression(v) if v.elements.is_empty() => Some(true),
-        Expression::ObjectExpression(v) if v.properties.is_empty() => Some(true),
-        Expression::ParenthesizedExpression(v) => known_bool(&v.expression),
-        _ => None,
-    }
-}
-
-fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
-    let op = v.operator.as_str();
-    if op == "!" {
-        return known_bool(&v.argument).map(|x| Value::Bool(!x));
-    }
-    if op == "void" {
-        eval(&v.argument)?;
-        return Some(Value::Undefined);
-    }
-    let value = eval(&v.argument)?;
-    match op {
-        "+" => value.number().map(Value::Number),
-        "-" => value.number().map(|x| Value::Number(-x)),
-        "~" => value
-            .number()
-            .map(|x| Value::Number((!js_to_int32(x)) as f64)),
-        "typeof" => Some(Value::String(
-            match value {
-                Value::String(_) => "string",
-                Value::Number(_) => "number",
-                Value::Bool(_) => "boolean",
-                Value::Null => "object",
-                Value::Undefined => "undefined",
-            }
-            .into(),
-        )),
-        _ => None,
-    }
-}
-
-fn js_to_uint32(n: f64) -> u32 {
-    if !n.is_finite() || n == 0.0 {
-        return 0;
-    }
-    n.trunc().rem_euclid(4_294_967_296.0) as u32
-}
-
-fn js_to_int32(n: f64) -> i32 {
-    js_to_uint32(n) as i32
-}
-
-fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
-    match op {
-        "+" => {
-            if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
-                Some(Value::String(format!(
-                    "{}{}",
-                    left.js_string()?,
-                    right.js_string()?
-                )))
-            } else {
-                Some(Value::Number(left.number()? + right.number()?))
-            }
-        }
-        "-" => Some(Value::Number(left.number()? - right.number()?)),
-        "*" => Some(Value::Number(left.number()? * right.number()?)),
-        "/" => Some(Value::Number(left.number()? / right.number()?)),
-        "%" => Some(Value::Number(left.number()? % right.number()?)),
-        "**" => Some(Value::Number(left.number()?.powf(right.number()?))),
-        "<<" => {
-            let shift = js_to_uint32(right.number()?) & 31;
-            Some(Value::Number(
-                js_to_int32(left.number()?).wrapping_shl(shift) as f64,
-            ))
-        }
-        ">>" => {
-            let shift = js_to_uint32(right.number()?) & 31;
-            Some(Value::Number((js_to_int32(left.number()?) >> shift) as f64))
-        }
-        ">>>" => {
-            let shift = js_to_uint32(right.number()?) & 31;
-            Some(Value::Number(
-                (js_to_uint32(left.number()?) >> shift) as f64,
-            ))
-        }
-        "|" => Some(Value::Number(
-            (js_to_int32(left.number()?) | js_to_int32(right.number()?)) as f64,
-        )),
-        "^" => Some(Value::Number(
-            (js_to_int32(left.number()?) ^ js_to_int32(right.number()?)) as f64,
-        )),
-        "&" => Some(Value::Number(
-            (js_to_int32(left.number()?) & js_to_int32(right.number()?)) as f64,
-        )),
-        "===" => Some(Value::Bool(same_value(&left, &right))),
-        "!==" => Some(Value::Bool(!same_value(&left, &right))),
-        "==" | "!=" => {
-            let equal = same_value(&left, &right)
-                || matches!(
-                    (&left, &right),
-                    (Value::Null, Value::Undefined) | (Value::Undefined, Value::Null)
-                );
-            if !equal {
-                return None;
-            }
-            Some(Value::Bool(op == "=="))
-        }
-        "<" | "<=" | ">" | ">=" => {
-            let result = match (&left, &right) {
-                (Value::String(a), Value::String(b)) => match op {
-                    "<" => a < b,
-                    "<=" => a <= b,
-                    ">" => a > b,
-                    ">=" => a >= b,
-                    _ => unreachable!(),
-                },
-                _ => {
-                    let a = left.number()?;
-                    let b = right.number()?;
-                    match op {
-                        "<" => a < b,
-                        "<=" => a <= b,
-                        ">" => a > b,
-                        ">=" => a >= b,
-                        _ => unreachable!(),
-                    }
-                }
-            };
-            Some(Value::Bool(result))
-        }
-        _ => None,
-    }
-}
-
-fn eval_logical(v: &LogicalExpression<'_>) -> Option<Value> {
-    let left = eval(&v.left)?;
-    match v.operator.as_str() {
-        "&&" => {
-            if left.truthy() {
-                eval(&v.right)
-            } else {
-                Some(left)
-            }
-        }
-        "||" => {
-            if left.truthy() {
-                Some(left)
-            } else {
-                eval(&v.right)
-            }
-        }
-        "??" => {
-            if matches!(left, Value::Null | Value::Undefined) {
-                eval(&v.right)
-            } else {
-                Some(left)
-            }
-        }
-        _ => None,
-    }
-}
+use value_eval::{
+    eval, eval_binary, eval_logical, eval_unary, eval_with_resolver, js_to_int32, js_to_uint32,
+    known_bool, render_value_array, same_value, same_values, Value,
+};
 
 #[derive(Debug, Clone)]
 pub struct ArithmeticStateProof {
@@ -553,127 +277,23 @@ struct ConstBinding {
     available_after: u32,
 }
 
-fn eval_with_constants(
-    expr: &Expression<'_>,
+fn eval_with_constants<'a>(
+    expr: &Expression<'a>,
     scoping: &Scoping,
     constants: &HashMap<SymbolId, ConstBinding>,
 ) -> Option<Value> {
-    match expr {
-        Expression::Identifier(id) => {
-            let reference_id = id.reference_id.get()?;
-            let reference = scoping.get_reference(reference_id);
-            if !reference.is_read()
-                || reference.is_write()
-                || reference.flags().is_member_write_target()
-            {
-                return None;
-            }
-            let symbol = reference.symbol_id()?;
-            let binding = constants.get(&symbol)?;
-            if id.span.start < binding.available_after {
-                return None;
-            }
-            Some(binding.value.clone())
+    eval_with_resolver(expr, &|id| {
+        let reference_id = id.reference_id.get()?;
+        let reference = scoping.get_reference(reference_id);
+        if !reference.is_read()
+            || reference.is_write()
+            || reference.flags().is_member_write_target()
+        {
+            return None;
         }
-        Expression::StringLiteral(v) => Some(Value::String(v.value.to_string())),
-        Expression::NumericLiteral(v) => Some(Value::Number(v.value)),
-        Expression::BooleanLiteral(v) => Some(Value::Bool(v.value)),
-        Expression::NullLiteral(_) => Some(Value::Null),
-        Expression::TemplateLiteral(v) if v.expressions.is_empty() => v
-            .quasis
-            .first()
-            .map(|q| Value::String(q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string())),
-        Expression::ParenthesizedExpression(v) => {
-            eval_with_constants(&v.expression, scoping, constants)
-        }
-        Expression::UnaryExpression(v) => {
-            let op = v.operator.as_str();
-            if op == "!" {
-                return known_bool_with_constants(&v.argument, scoping, constants)
-                    .map(|x| Value::Bool(!x));
-            }
-            if op == "void" {
-                eval_with_constants(&v.argument, scoping, constants)?;
-                return Some(Value::Undefined);
-            }
-            let value = eval_with_constants(&v.argument, scoping, constants)?;
-            match op {
-                "+" => value.number().map(Value::Number),
-                "-" => value.number().map(|x| Value::Number(-x)),
-                "~" => value.number().map(|x| Value::Number((!(x as i32)) as f64)),
-                "typeof" => Some(Value::String(
-                    match value {
-                        Value::String(_) => "string",
-                        Value::Number(_) => "number",
-                        Value::Bool(_) => "boolean",
-                        Value::Null => "object",
-                        Value::Undefined => "undefined",
-                    }
-                    .into(),
-                )),
-                _ => None,
-            }
-        }
-        Expression::BinaryExpression(v) => eval_binary(
-            v.operator.as_str(),
-            eval_with_constants(&v.left, scoping, constants)?,
-            eval_with_constants(&v.right, scoping, constants)?,
-        ),
-        Expression::LogicalExpression(v) => {
-            let left = eval_with_constants(&v.left, scoping, constants)?;
-            match v.operator.as_str() {
-                "&&" => {
-                    if left.truthy() {
-                        eval_with_constants(&v.right, scoping, constants)
-                    } else {
-                        Some(left)
-                    }
-                }
-                "||" => {
-                    if left.truthy() {
-                        Some(left)
-                    } else {
-                        eval_with_constants(&v.right, scoping, constants)
-                    }
-                }
-                "??" => {
-                    if matches!(left, Value::Null | Value::Undefined) {
-                        eval_with_constants(&v.right, scoping, constants)
-                    } else {
-                        Some(left)
-                    }
-                }
-                _ => None,
-            }
-        }
-        Expression::ConditionalExpression(v) => {
-            let test = known_bool_with_constants(&v.test, scoping, constants)?;
-            eval_with_constants(
-                if test { &v.consequent } else { &v.alternate },
-                scoping,
-                constants,
-            )
-        }
-        _ => None,
-    }
-}
-
-fn known_bool_with_constants(
-    expr: &Expression<'_>,
-    scoping: &Scoping,
-    constants: &HashMap<SymbolId, ConstBinding>,
-) -> Option<bool> {
-    if let Some(v) = eval_with_constants(expr, scoping, constants) {
-        return Some(v.truthy());
-    }
-    match expr {
-        Expression::ArrayExpression(v) if v.elements.is_empty() => Some(true),
-        Expression::ObjectExpression(v) if v.properties.is_empty() => Some(true),
-        Expression::ParenthesizedExpression(v) => {
-            known_bool_with_constants(&v.expression, scoping, constants)
-        }
-        _ => None,
-    }
+        let binding = constants.get(&reference.symbol_id()?)?;
+        (id.span.start >= binding.available_after).then(|| binding.value.clone())
+    })
 }
 
 struct ConstValueCollector<'s, 'c> {
@@ -3631,88 +3251,14 @@ impl Collector<'_, '_> {
     }
 }
 
-fn eval_with_env(expr: &Expression<'_>, env: &HashMap<String, Value>) -> Option<Value> {
-    match expr {
-        Expression::Identifier(id) => {
-            if id.name.as_str() == "undefined" {
-                Some(Value::Undefined)
-            } else {
-                env.get(id.name.as_str()).cloned()
-            }
+fn eval_with_env<'a>(expr: &Expression<'a>, env: &HashMap<String, Value>) -> Option<Value> {
+    eval_with_resolver(expr, &|id| {
+        if id.name.as_str() == "undefined" {
+            Some(Value::Undefined)
+        } else {
+            env.get(id.name.as_str()).cloned()
         }
-        Expression::StringLiteral(v) => Some(Value::String(v.value.to_string())),
-        Expression::NumericLiteral(v) => Some(Value::Number(v.value)),
-        Expression::BooleanLiteral(v) => Some(Value::Bool(v.value)),
-        Expression::NullLiteral(_) => Some(Value::Null),
-        Expression::TemplateLiteral(v) if v.expressions.is_empty() => v
-            .quasis
-            .first()
-            .map(|q| Value::String(q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string())),
-        Expression::ParenthesizedExpression(v) => eval_with_env(&v.expression, env),
-        Expression::UnaryExpression(v) => {
-            if v.operator.as_str() == "void" {
-                eval_with_env(&v.argument, env)?;
-                return Some(Value::Undefined);
-            }
-            let value = eval_with_env(&v.argument, env)?;
-            match v.operator.as_str() {
-                "!" => Some(Value::Bool(!value.truthy())),
-                "+" => value.number().map(Value::Number),
-                "-" => value.number().map(|n| Value::Number(-n)),
-                "~" => value
-                    .number()
-                    .map(|n| Value::Number((!js_to_int32(n)) as f64)),
-                "typeof" => Some(Value::String(
-                    match value {
-                        Value::String(_) => "string",
-                        Value::Number(_) => "number",
-                        Value::Bool(_) => "boolean",
-                        Value::Null => "object",
-                        Value::Undefined => "undefined",
-                    }
-                    .to_string(),
-                )),
-                _ => None,
-            }
-        }
-        Expression::BinaryExpression(v) => eval_binary(
-            v.operator.as_str(),
-            eval_with_env(&v.left, env)?,
-            eval_with_env(&v.right, env)?,
-        ),
-        Expression::LogicalExpression(v) => {
-            let left = eval_with_env(&v.left, env)?;
-            match v.operator.as_str() {
-                "&&" => {
-                    if left.truthy() {
-                        eval_with_env(&v.right, env)
-                    } else {
-                        Some(left)
-                    }
-                }
-                "||" => {
-                    if left.truthy() {
-                        Some(left)
-                    } else {
-                        eval_with_env(&v.right, env)
-                    }
-                }
-                "??" => {
-                    if matches!(left, Value::Null | Value::Undefined) {
-                        eval_with_env(&v.right, env)
-                    } else {
-                        Some(left)
-                    }
-                }
-                _ => None,
-            }
-        }
-        Expression::ConditionalExpression(v) => {
-            let test = eval_with_env(&v.test, env)?.truthy();
-            eval_with_env(if test { &v.consequent } else { &v.alternate }, env)
-        }
-        _ => None,
-    }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
