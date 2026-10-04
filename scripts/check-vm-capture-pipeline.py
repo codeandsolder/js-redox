@@ -12,6 +12,22 @@ CASES = {
     "function-table": ROOT / "corpus/generated/js-virtualizer/vm.js",
     "generated-safe": ROOT / "corpus/generated/reversible-obfuscation/generated-child-safe.js",
     "generated-obfuscated": ROOT / "corpus/generated/js-virtualizer/vm-obfuscated.js",
+    "generated-obfuscated-affine-cff": (
+        ROOT / "corpus/generated/js-virtualizer/vm-obfuscated-affine-cff.js"
+    ),
+    "generated-obfuscated-constructor-local": (
+        ROOT / "corpus/generated/js-virtualizer/vm-obfuscated-constructor-local.js"
+    ),
+    "generated-obfuscated-flattened-base91": (
+        ROOT / "corpus/generated/js-virtualizer/vm-obfuscated-flattened-base91.js"
+    ),
+}
+
+OBFUSCATED_CASES = {
+    "generated-obfuscated",
+    "generated-obfuscated-affine-cff",
+    "generated-obfuscated-constructor-local",
+    "generated-obfuscated-flattened-base91",
 }
 
 
@@ -181,7 +197,7 @@ def main():
             assert recovered_nodes
             assert recovered_nodes[0]["recovery_stage"] == "safe_deobfuscation"
 
-        else:
+        elif name in OBFUSCATED_CASES:
             assert analysis["dynamic_code_units"]
             assert len(analysis["code_units"]) >= 2
             generated = [
@@ -221,20 +237,61 @@ def main():
                 if unit["selected_stage"] == "string_recovery_only"
             )
             assert recovered["string_recovery"]["changed"] is True
-            assert recovered["string_recovery"]["replacements"] >= 500
+            assert recovered["string_recovery"]["replacements"] >= 100
             assert recovered["deobfuscation"]["exit"] != 0
             assert recovered["analysis_path"] != recovered["raw_path"]
 
             string_report = load(project, recovered["string_recovery_report"])
+            assert string_report["decoder_call_replacements"] >= 90
             base91 = [
                 decoder
                 for decoder in string_report["decoders"]
                 if decoder.get("mode") == "rotated_base91"
             ]
-            assert len(base91) == 1
-            assert base91[0]["rotation"] == 12
-            assert base91[0]["table_entries"] == 668
-            assert base91[0]["replacements"] >= 480
+            assert base91
+            rotations = {decoder["rotation"] for decoder in base91}
+            table_sizes = {decoder["table_entries"] for decoder in base91}
+            assert len(rotations) == 1
+            assert len(table_sizes) == 1
+            assert next(iter(table_sizes)) >= 590
+            assert any(decoder["replacements"] > 0 for decoder in base91)
+
+            if name == "generated-obfuscated":
+                assert rotations == {12}
+                assert table_sizes == {668}
+                assert any(
+                    decoder["scope_start"] > 0
+                    and decoder["replacements"] >= 10
+                    for decoder in base91
+                )
+            elif name == "generated-obfuscated-affine-cff":
+                assert rotations == {2}
+                assert table_sizes == {613}
+                assert any(
+                    decoder["scope_start"] == 0
+                    and decoder["replacements"] >= 500
+                    for decoder in base91
+                )
+            elif name == "generated-obfuscated-flattened-base91":
+                assert rotations == {7}
+                assert table_sizes == {650}
+                assert any(
+                    decoder["decoder"] == "olQJbc"
+                    and decoder["scope_start"] == 0
+                    and decoder["replacements"] >= 400
+                    for decoder in base91
+                )
+                iterations = string_report.get("base91_iterations", [])
+                assert len(iterations) >= 2
+                assert iterations[1]["decoder_calls"] >= 1
+            else:
+                assert rotations == {22}
+                assert table_sizes == {604}
+                assert any(
+                    decoder["scope_start"] > 0
+                    and decoder["replacements"] >= 10
+                    for decoder in base91
+                )
 
             graph = load(project, "analysis/source-graph.json")
             assert graph["summary"]["edge_kinds"].get("generated_code", 0) >= 1

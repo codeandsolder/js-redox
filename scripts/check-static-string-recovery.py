@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,8 +36,83 @@ def decoder(report):
     return report["decoders"][0]
 
 
+def load_recover_module():
+    spec = importlib.util.spec_from_file_location("static_string_recover", RECOVER)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def check_immutable_literal_tables():
+    module = load_recover_module()
+    positive = (
+        'const t = ["alpha", "beta"]; '
+        'function f(i) { return t[i] + t[1] + String(t[999]); }\n'
+    )
+    arrays = module.discover_simple_arrays(positive)
+    proven = module.immutable_literal_string_arrays(positive, arrays)
+    assert proven["t"] == ["alpha", "beta"]
+    replaced, count = module.replace_immutable_string_table_reads(positive, proven)
+    assert count == 1
+    assert 't[i]' in replaced
+    assert '"beta"' in replaced
+    assert 't[999]' in replaced
+
+    unsafe = (
+        'const alias = t;',
+        't[0] = "changed";',
+        't[i]++;',
+        'delete t[i];',
+        't.push("changed");',
+        't["push"]("changed");',
+        't["push"]?.("changed");',
+        't["push"].call(t, "changed");',
+        't["push"].bind(t)("changed");',
+    )
+    for ordinal, use in enumerate(unsafe):
+        source = f'const t = ["alpha", "beta"]; {use} console.log(t[0]);\n'
+        arrays = module.discover_simple_arrays(source)
+        proven = module.immutable_literal_string_arrays(source, arrays)
+        assert "t" not in proven, (ordinal, use)
+
+
+def check_semantic_affine_base91():
+    module = load_recover_module()
+    constants = [None] * 24
+    for index, value in {
+        2: 8,
+        3: 255,
+        14: 7,
+        17: 91,
+        18: 8191,
+        19: 88,
+        20: 13,
+        21: 14,
+    }.items():
+        constants[index] = value
+    window = (
+        "alphabet.indexOf(ch); "
+        "pending += index * 91; "
+        "bits += (pending & c[s0 + 18]) > 88 ? c[s0 + 20] : 14; "
+        "out.push(acc & c[s1 + 3]); "
+        "acc >>= c[s2 + 2]; bits -= 8; pending = -1; "
+        "while (bits > c[s2 + 14]); if (pending > -1) out.push(acc & 255);"
+    )
+    assert module.semantic_affine_base91_signature_matches(
+        window, {"c": constants}
+    )
+    broken = list(constants)
+    broken[18] = 8190
+    assert not module.semantic_affine_base91_signature_matches(
+        window, {"c": broken}
+    )
+
+
 def main():
     TMP.mkdir(parents=True, exist_ok=True)
+    check_immutable_literal_tables()
+    check_semantic_affine_base91()
 
     acw1 = ROOT / "corpus/real/searxrs2-antibot/acw-sc-v2/mpall518-challenge.pretty.js"
     acw2 = ROOT / "corpus/real/searxrs2-antibot/acw-sc-v2/mpall518-challenge2.pretty.js"
@@ -73,20 +150,23 @@ def main():
     assert report["replacements"] == 0
     assert out.read_text() == bad_text
 
-    for name, source in (
+    taobao_cases = (
         ("taobao-normal", ROOT / "corpus/taobao/normal_securitySDK.umd.js"),
         ("taobao-captcha", ROOT / "corpus/taobao/captcha_securitySDK.umd.js"),
-    ):
-        out, report = recover(name, source, timeout=180)
-        d = decoder(report)
-        assert d["mode"] == "rc4"
-        assert d["offset"] == 0xC2
-        assert d["rotation"] == 409
-        assert d["table_entries"] == 1855
-        assert d["replacements"] >= 646
-        text = out.read_text()
-        for needle in ('"defineProperty"', '"length"', '"prototype"', '"undefined"'):
-            assert needle in text, (name, needle)
+    )
+    taobao_available = all(source.is_file() for _, source in taobao_cases)
+    if taobao_available:
+        for name, source in taobao_cases:
+            out, report = recover(name, source, timeout=180)
+            d = decoder(report)
+            assert d["mode"] == "rc4"
+            assert d["offset"] == 0xC2
+            assert d["rotation"] == 409
+            assert d["table_entries"] == 1855
+            assert d["replacements"] >= 646
+            text = out.read_text()
+            for needle in ('"defineProperty"', '"length"', '"prototype"', '"undefined"'):
+                assert needle in text, (name, needle)
 
     plain = TMP / "plain.js"
     plain_text = 'const table = ["alpha", "beta"]; function f(x) { return table[x]; } console.log(f(1));\n'
@@ -98,8 +178,12 @@ def main():
     assert run(["node", out]).stdout.strip() == "beta"
 
     print("PASS: static javascript-obfuscator string recovery")
+    print("  immutable literal tables: numeric reads fold; dynamic reads stay; mutation/alias cases reject")
     print("  acw_sc__v2: 2 captures, rotation=8, 57 replacements each")
-    print("  Taobao securitySDK: 2 captures, RC4 rotation=409, >=646 replacements each")
+    if taobao_available:
+        print("  Taobao securitySDK: 2 captures, RC4 rotation=409, >=646 replacements each")
+    else:
+        print("  Taobao securitySDK: skipped (external corpus absent)")
     print("  unresolved-rotation negative: zero rewrites")
     print("  ordinary-JS negative: byte-identical + runtime-equivalent")
 
