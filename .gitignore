@@ -2,3 +2,5 @@
 work/
 *.bak.*
 target/
+__pycache__/
+*.py[cod]
