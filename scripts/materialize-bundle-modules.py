@@ -52,6 +52,8 @@ def module_output_path(
     stem_dir = source_rel.with_name(source_rel.name + ".modules")
     if kind == "amd_named_modules":
         group = "amd-modules"
+    elif kind == "member_named_modules":
+        group = "member-named-modules"
     elif chunk_ids:
         group = "chunk-" + "-".join(safe_component(x, 24) for x in chunk_ids)
     else:
@@ -77,20 +79,22 @@ def build_module_source(
         metadata += f" * Static export names: {export_preview}\n"
     if module.get("commonjs_export"):
         metadata += " * Static CommonJS module.exports write observed.\n"
-    if bundle_kind == "amd_named_modules":
+    if bundle_kind in {"amd_named_modules", "member_named_modules"}:
         dep_preview = ", ".join(str(x) for x in module.get("dependencies", [])[:12])
         if len(module.get("dependencies", [])) > 12:
             dep_preview += f", … (+{len(module['dependencies']) - 12} more)"
         if dep_preview:
-            metadata += f" * Static AMD dependencies: {dep_preview}\n"
+            dep_label = "AMD" if bundle_kind == "amd_named_modules" else "named-loader"
+            metadata += f" * Static {dep_label} dependencies: {dep_preview}\n"
+        family = "named AMD" if bundle_kind == "amd_named_modules" else "member-loader named"
         header = (
-            "/* Statically extracted named AMD module factory.\n"
+            f"/* Statically extracted {family} module factory.\n"
             f" * {provenance}\n"
             + metadata
             + " * The factory body is preserved from the parent analyst view.\n"
             " */\n"
         )
-        return header + "const __amd_module_factory__ = " + value + ";\n"
+        return header + "const __named_module_factory__ = " + value + ";\n"
     header = (
         "/* Statically extracted Webpack/Next module wrapper.\n"
         f" * {provenance}\n"
@@ -141,6 +145,8 @@ def write_module_readme(module_root: Path, bundles: list[dict], modules: list[di
         kind = bundle.get("kind")
         if kind == "amd_named_modules":
             identity = "named AMD modules"
+        elif kind == "member_named_modules":
+            identity = "member-loader named modules"
         elif chunk_ids:
             identity = "chunk " + ", ".join(markdown_text(x) for x in chunk_ids)
         else:
@@ -384,7 +390,7 @@ def main():
                 record["materialization"] = "rendered_content_template"
 
     index = {
-        "schema": "har-bundle-modules/v3",
+        "schema": "har-bundle-modules/v4",
         "safe_static_only": True,
         "inventory": str(args.inventory),
         "bundles": bundles,
@@ -405,8 +411,13 @@ def main():
                 for bundle in bundles
                 for _ in bundle.get("module_ids", [])
             ),
+            "member_named_modules": sum(
+                bundle.get("kind") == "member_named_modules"
+                for bundle in bundles
+                for _ in bundle.get("module_ids", [])
+            ),
             "webpack_modules": sum(
-                bundle.get("kind") != "amd_named_modules"
+                bundle.get("kind") not in {"amd_named_modules", "member_named_modules"}
                 for bundle in bundles
                 for _ in bundle.get("module_ids", [])
             ),

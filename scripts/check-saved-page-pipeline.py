@@ -158,12 +158,47 @@ def main():
     assert "/amd-modules/" in amd_alpha["source_path"]
     assert bundles["summary"]["amd_named_modules"] >= 3
     assert any(row["module_id"] == "amd/local" for row in bundles["modules"])
+    embedded_alpha = next(
+        row for row in bundles["modules"] if row["module_id"] == "embedded/alpha"
+    )
+    embedded_beta = next(
+        row for row in bundles["modules"] if row["module_id"] == "embedded/beta"
+    )
+    embedded_no_deps = next(
+        row for row in bundles["modules"] if row["module_id"] == "embedded/no-deps"
+    )
+    assert embedded_alpha["bundle_kind"] == "member_named_modules"
+    assert embedded_alpha["dependencies"] == ["embedded/beta"]
+    assert embedded_beta["dependencies"] == []
+    assert embedded_no_deps["dependencies"] == []
+    assert "/member-named-modules/" in embedded_alpha["source_path"]
+    assert bundles["summary"]["member_named_modules"] >= 2
     assert not any(row["module_id"] == "not-amd/local-helper" for row in bundles["modules"])
+    assert not any(row["module_id"] == "not-amd/member-helper" for row in bundles["modules"])
+    assert not any(
+        row["module_id"] == "not-amd/single-loaderlike"
+        for row in bundles["modules"]
+    )
+    load_alpha = next(
+        row for row in bundles["modules"] if row["module_id"] == "loadmodules/alpha"
+    )
+    global_alpha = next(
+        row for row in bundles["modules"] if row["module_id"] == "global/alpha"
+    )
+    assert load_alpha["bundle_kind"] == "member_named_modules"
+    assert load_alpha["dependencies"] == ["loadmodules/beta"]
+    assert global_alpha["bundle_kind"] == "member_named_modules"
+    assert global_alpha["dependencies"] == ["global/beta"]
+    assert not any(
+        row["module_id"] == "not-module-inline-function"
+        for row in bundles["modules"]
+    )
     assert bundles["summary"]["literal_module_dependencies"] >= 1
     direct_modules = [
         row
         for row in bundles["modules"]
-        if not row.get("chunk_ids") and row.get("bundle_kind") != "amd_named_modules"
+        if not row.get("chunk_ids")
+        and row.get("bundle_kind") not in {"amd_named_modules", "member_named_modules"}
     ]
     assert direct_modules
     assert all("/module-table-" in row["source_path"] for row in direct_modules)

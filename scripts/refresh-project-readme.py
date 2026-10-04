@@ -167,7 +167,8 @@ def main():
         f"- Explicit bundle payloads recovered: **{bundle_summary.get('bundles', 0)}**",
         f"- Readable module wrappers materialized: **{bundle_summary.get('modules', 0)}** "
         f"(**{bundle_summary.get('webpack_modules', 0)}** Webpack/Next, "
-        f"**{bundle_summary.get('amd_named_modules', 0)}** named AMD)",
+        f"**{bundle_summary.get('amd_named_modules', 0)}** global named AMD, "
+        f"**{bundle_summary.get('member_named_modules', 0)}** member-loader named modules)",
         f"- Literal intra-bundle/module-loader dependencies recovered: **{bundle_summary.get('literal_module_dependencies', 0)}**",
         f"- Modules with statically named exports: **{bundle_summary.get('modules_with_named_exports', 0)}** "
         f"(**{bundle_summary.get('named_exports', 0)}** distinct module-local export names observed)",

@@ -15,7 +15,7 @@ use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::symbol::SymbolId;
 use serde::Serialize;
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::PathBuf,
 };
@@ -259,6 +259,28 @@ impl<'a> Visit<'a> for ExportCollector<'_> {
     }
 }
 
+#[derive(Default)]
+struct AmdLoaderEvidence {
+    define_assignment: bool,
+    require_assignment: bool,
+    requirejs_assignment: bool,
+    load_modules_assignment: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum MemberReceiverKey {
+    Local(SymbolId),
+    Global(String),
+}
+
+struct AmdMemberGroup {
+    callee: String,
+    start: u32,
+    end: u32,
+    explicit_dependency_arrays: usize,
+    modules: Vec<ModuleRecord>,
+}
+
 struct Collector<'s, 'c> {
     source: &'s str,
     scoping: &'c Scoping,
@@ -266,6 +288,8 @@ struct Collector<'s, 'c> {
     amd_modules: Vec<ModuleRecord>,
     amd_start: Option<u32>,
     amd_end: Option<u32>,
+    amd_member_groups: HashMap<MemberReceiverKey, AmdMemberGroup>,
+    amd_loader_evidence: HashMap<SymbolId, AmdLoaderEvidence>,
 }
 
 impl Collector<'_, '_> {
@@ -302,6 +326,32 @@ impl Collector<'_, '_> {
         Some(ids)
     }
 
+    fn amd_factory_expression_parts<'a>(
+        expression: &'a Expression<'a>,
+    ) -> Option<(
+        &'a oxc_ast::ast::FormalParameters<'a>,
+        &'a oxc_ast::ast::FunctionBody<'a>,
+        oxc_span::Span,
+        &'static str,
+    )> {
+        match expression {
+            Expression::FunctionExpression(function) => {
+                let body = function.body.as_ref()?;
+                Some((&function.params, body.as_ref(), function.span, "function"))
+            }
+            Expression::ArrowFunctionExpression(function) => Some((
+                &function.params,
+                function.body.as_ref(),
+                function.span,
+                "arrow",
+            )),
+            Expression::ParenthesizedExpression(paren) => {
+                Self::amd_factory_expression_parts(&paren.expression)
+            }
+            _ => None,
+        }
+    }
+
     fn amd_factory_parts<'a>(
         argument: &'a Argument<'a>,
     ) -> Option<(
@@ -321,6 +371,9 @@ impl Collector<'_, '_> {
                 function.span,
                 "arrow",
             )),
+            Argument::ParenthesizedExpression(paren) => {
+                Self::amd_factory_expression_parts(&paren.expression)
+            }
             _ => None,
         }
     }
@@ -361,42 +414,26 @@ impl Collector<'_, '_> {
         )
     }
 
-    fn record_amd_call(&mut self, call: &oxc_ast::ast::CallExpression<'_>) -> bool {
-        let Expression::Identifier(callee) = &call.callee else {
-            return false;
-        };
-        if callee.name.as_str() != "define" || call.arguments.len() < 3 {
-            return false;
+    fn amd_module_record(&self, call: &oxc_ast::ast::CallExpression<'_>) -> Option<ModuleRecord> {
+        if call.arguments.len() < 2 {
+            return None;
         }
-        let define_is_resolved = reference_symbol(self.scoping, callee).is_some();
-        let Some(Argument::StringLiteral(name)) = call.arguments.first() else {
-            return false;
+        let Argument::StringLiteral(name) = call.arguments.first()? else {
+            return None;
         };
-        let Some(Argument::ArrayExpression(dep_array)) = call.arguments.get(1) else {
-            return false;
+        let (deps, factory_argument) = match call.arguments.get(1)? {
+            Argument::ArrayExpression(dep_array) => {
+                (Self::array_literal_ids(dep_array)?, call.arguments.get(2)?)
+            }
+            factory => (Vec::new(), factory),
         };
-        let Some(deps) = Self::array_literal_ids(dep_array) else {
-            return false;
-        };
-        if define_is_resolved
-            && !matches!(
-                deps.as_slice(),
-                [first, second, ..] if first == "require" && second == "exports"
-            )
-        {
-            return false;
-        }
-        let Some((params, body, span, value_kind)) =
-            call.arguments.get(2).and_then(Self::amd_factory_parts)
-        else {
-            return false;
-        };
+        let (params, body, span, value_kind) = Self::amd_factory_parts(factory_argument)?;
         let (export_names, commonjs_export) = self.amd_exports(&deps, params, body);
         let dependencies = deps
             .into_iter()
             .filter(|dep| !matches!(dep.as_str(), "require" | "exports" | "module"))
             .collect();
-        self.amd_modules.push(ModuleRecord {
+        Some(ModuleRecord {
             id: name.value.to_string(),
             property_start: call.span.start,
             property_end: call.span.end,
@@ -407,16 +444,133 @@ impl Collector<'_, '_> {
             dependencies,
             export_names,
             commonjs_export,
-        });
-        self.amd_start = Some(
-            self.amd_start
-                .map_or(call.span.start, |old| old.min(call.span.start)),
-        );
-        self.amd_end = Some(
-            self.amd_end
-                .map_or(call.span.end, |old| old.max(call.span.end)),
-        );
-        true
+        })
+    }
+
+    fn unresolved_global_path(&self, expr: &Expression<'_>) -> Option<String> {
+        match expr {
+            Expression::Identifier(id) if reference_symbol(self.scoping, id).is_none() => {
+                Some(id.name.to_string())
+            }
+            Expression::StaticMemberExpression(member) => {
+                let base = self.unresolved_global_path(&member.object)?;
+                Some(format!("{base}.{}", member.property.name))
+            }
+            Expression::ComputedMemberExpression(member) => {
+                let base = self.unresolved_global_path(&member.object)?;
+                let property = computed_string(&member.expression)?;
+                Some(format!("{base}.{property}"))
+            }
+            Expression::ParenthesizedExpression(paren) => {
+                self.unresolved_global_path(&paren.expression)
+            }
+            _ => None,
+        }
+    }
+
+    fn amd_member_receiver(&self, callee: &Expression<'_>) -> Option<(MemberReceiverKey, String)> {
+        let object = match callee {
+            Expression::StaticMemberExpression(member)
+                if member.property.name.as_str() == "define" =>
+            {
+                &member.object
+            }
+            Expression::ComputedMemberExpression(member)
+                if computed_string(&member.expression).as_deref() == Some("define") =>
+            {
+                &member.object
+            }
+            _ => return None,
+        };
+        let receiver = expression_symbol(self.scoping, object)
+            .map(MemberReceiverKey::Local)
+            .or_else(|| {
+                self.unresolved_global_path(object)
+                    .map(MemberReceiverKey::Global)
+            })?;
+        Some((receiver, self.fragment(callee.span()).trim().to_string()))
+    }
+
+    fn record_amd_call(&mut self, call: &oxc_ast::ast::CallExpression<'_>) -> bool {
+        let Some(record) = self.amd_module_record(call) else {
+            return false;
+        };
+        match &call.callee {
+            Expression::Identifier(callee) if callee.name.as_str() == "define" => {
+                let define_is_resolved = reference_symbol(self.scoping, callee).is_some();
+                if define_is_resolved
+                    && !matches!(
+                        call.arguments.get(1),
+                        Some(Argument::ArrayExpression(dep_array))
+                            if matches!(
+                                Self::array_literal_ids(dep_array).as_deref(),
+                                Some([first, second, ..])
+                                    if first == "require" && second == "exports"
+                            )
+                    )
+                {
+                    return false;
+                }
+                self.amd_start = Some(
+                    self.amd_start
+                        .map_or(call.span.start, |old| old.min(call.span.start)),
+                );
+                self.amd_end = Some(
+                    self.amd_end
+                        .map_or(call.span.end, |old| old.max(call.span.end)),
+                );
+                self.amd_modules.push(record);
+                true
+            }
+            _ => {
+                let Some((symbol, callee)) = self.amd_member_receiver(&call.callee) else {
+                    return false;
+                };
+                let has_dependency_array =
+                    matches!(call.arguments.get(1), Some(Argument::ArrayExpression(_)));
+                let group =
+                    self.amd_member_groups
+                        .entry(symbol)
+                        .or_insert_with(|| AmdMemberGroup {
+                            callee,
+                            start: call.span.start,
+                            end: call.span.end,
+                            explicit_dependency_arrays: 0,
+                            modules: Vec::new(),
+                        });
+                group.start = group.start.min(call.span.start);
+                group.end = group.end.max(call.span.end);
+                group.explicit_dependency_arrays += usize::from(has_dependency_array);
+                group.modules.push(record);
+                true
+            }
+        }
+    }
+
+    fn record_amd_loader_assignment(&mut self, assign: &oxc_ast::ast::AssignmentExpression<'_>) {
+        let (object, property) = match &assign.left {
+            AssignmentTarget::StaticMemberExpression(member) => {
+                (&member.object, Some(member.property.name.to_string()))
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                (&member.object, computed_string(&member.expression))
+            }
+            _ => return,
+        };
+        let Some(property) = property else {
+            return;
+        };
+        let Some(symbol) = expression_symbol(self.scoping, object) else {
+            return;
+        };
+        let evidence = self.amd_loader_evidence.entry(symbol).or_default();
+        match property.as_str() {
+            "define" => evidence.define_assignment = true,
+            "require" => evidence.require_assignment = true,
+            "requirejs" => evidence.requirejs_assignment = true,
+            "loadModules" => evidence.load_modules_assignment = true,
+            _ => {}
+        }
     }
 
     fn module_dependencies(&self, value: &Expression<'_>) -> Vec<String> {
@@ -628,6 +782,7 @@ impl Collector<'_, '_> {
 impl<'a> Visit<'a> for Collector<'_, '_> {
     fn enter_node(&mut self, kind: AstKind<'a>) {
         match kind {
+            AstKind::AssignmentExpression(assign) => self.record_amd_loader_assignment(assign),
             AstKind::CallExpression(call) => self.record_call(call),
             AstKind::ObjectExpression(object) => self.record_object(object),
             _ => {}
@@ -673,6 +828,8 @@ fn main() -> Result<()> {
             amd_modules: Vec::new(),
             amd_start: None,
             amd_end: None,
+            amd_member_groups: HashMap::new(),
+            amd_loader_evidence: HashMap::new(),
         };
         collector.visit_program(&parsed.program);
         if !collector.amd_modules.is_empty() {
@@ -687,6 +844,38 @@ fn main() -> Result<()> {
                 module_table_start: start,
                 module_table_end: end,
                 modules: std::mem::take(&mut collector.amd_modules),
+            });
+        }
+        let mut member_groups = std::mem::take(&mut collector.amd_member_groups)
+            .into_iter()
+            .filter_map(|(receiver, group)| {
+                let proven = match receiver {
+                    MemberReceiverKey::Global(_) => group.explicit_dependency_arrays > 0,
+                    MemberReceiverKey::Local(symbol) => collector
+                        .amd_loader_evidence
+                        .get(&symbol)
+                        .is_some_and(|evidence| {
+                            evidence.define_assignment
+                                && ((evidence.require_assignment
+                                    && (evidence.requirejs_assignment || group.modules.len() >= 2))
+                                    || (evidence.load_modules_assignment
+                                        && group.modules.len() >= 2))
+                        }),
+                };
+                proven.then_some(group)
+            })
+            .collect::<Vec<_>>();
+        member_groups.sort_by_key(|group| group.start);
+        for group in member_groups {
+            collector.bundles.push(BundleRecord {
+                kind: "member_named_modules".into(),
+                start: group.start,
+                end: group.end,
+                callee: group.callee,
+                chunk_ids: Vec::new(),
+                module_table_start: group.start,
+                module_table_end: group.end,
+                modules: group.modules,
             });
         }
         bundles = collector.bundles;
@@ -707,7 +896,7 @@ fn main() -> Result<()> {
     bundles.sort_by_key(|b| b.start);
 
     let report = Report {
-        schema: "js-bundle-inventory/v3",
+        schema: "js-bundle-inventory/v4",
         input: args.input.display().to_string(),
         diagnostics,
         panicked,

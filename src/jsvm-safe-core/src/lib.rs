@@ -2,7 +2,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, CallExpression, ComputedMemberExpression,
     Expression, ExpressionStatement, IfStatement, LogicalExpression, PropertyKind, Statement,
-    StaticMemberExpression, UnaryExpression, VariableDeclarationKind,
+    StaticMemberExpression, UnaryExpression, VariableDeclarationKind, WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
@@ -5122,11 +5122,50 @@ fn apply(
     out
 }
 
-fn parse<'a>(allocator: &'a Allocator, source: &'a str) -> Option<oxc_ast::ast::Program<'a>> {
-    for source_type in [SourceType::mjs(), SourceType::cjs()] {
-        let parsed = Parser::new(allocator, source, source_type).parse();
-        if !parsed.panicked && parsed.diagnostics.is_empty() {
-            return Some(parsed.program);
+fn parse_as<'a>(
+    allocator: &'a Allocator,
+    source: &'a str,
+    source_type: SourceType,
+) -> Option<oxc_ast::ast::Program<'a>> {
+    let parsed = Parser::new(allocator, source, source_type).parse();
+    (!parsed.panicked && parsed.diagnostics.is_empty()).then_some(parsed.program)
+}
+
+#[derive(Default)]
+struct WithStatementDetector {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for WithStatementDetector {
+    fn visit_with_statement(&mut self, _statement: &WithStatement<'a>) {
+        self.found = true;
+    }
+}
+
+fn contains_with_statement(program: &oxc_ast::ast::Program<'_>) -> bool {
+    let mut detector = WithStatementDetector::default();
+    detector.visit_program(program);
+    detector.found
+}
+
+fn semantically_valid_source_type(source: &str) -> Option<SourceType> {
+    // Browser-captured `.js` is normally either a classic Script or an ES
+    // Module. Let Oxc resolve that from syntax first, then pin the resolved
+    // Program source type for every rewrite iteration. CommonJS is only a
+    // fallback for genuinely CJS-only syntax such as top-level `return`.
+    for source_type in [SourceType::unambiguous(), SourceType::cjs()] {
+        let allocator = Allocator::default();
+        let Some(program) = parse_as(&allocator, source, source_type) else {
+            continue;
+        };
+        if contains_with_statement(&program) {
+            continue;
+        }
+        let semantic_ret = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&program);
+        if semantic_ret.diagnostics.is_empty() {
+            return Some(program.source_type);
         }
     }
     None
@@ -5134,12 +5173,13 @@ fn parse<'a>(allocator: &'a Allocator, source: &'a str) -> Option<oxc_ast::ast::
 
 fn transform_once(
     source: &str,
+    source_type: SourceType,
     counts: &mut Counts,
     arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
 ) -> Option<String> {
     let allocator = Allocator::default();
-    let program = parse(&allocator, source)?;
+    let program = parse_as(&allocator, source, source_type)?;
     let semantic_ret = SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&program);
@@ -5227,12 +5267,11 @@ pub struct SafeTransformResult {
 }
 
 pub fn deobfuscate(source: &str, max_iterations: usize) -> Option<SafeTransformResult> {
-    // Validate before the first rewrite. The caller may canonicalize for presentation,
-    // but the engine intentionally has no codegen dependency so it stays dist-friendly.
-    {
-        let allocator = Allocator::default();
-        parse(&allocator, source)?;
-    }
+    // Select a source mode only after both parsing and semantic validation. Some
+    // legacy browser scripts parse as modules but are invalid under module
+    // strictness (for example duplicate top-level function declarations) while
+    // remaining valid classic scripts/CommonJS. Preserve that distinction.
+    let source_type = semantically_valid_source_type(source)?;
 
     let mut current = source.to_string();
     let mut counts = Counts::default();
@@ -5242,6 +5281,7 @@ pub fn deobfuscate(source: &str, max_iterations: usize) -> Option<SafeTransformR
     for iteration in 1..=max_iterations {
         let next = transform_once(
             &current,
+            source_type,
             &mut counts,
             &mut arithmetic_state_proofs,
             iteration,

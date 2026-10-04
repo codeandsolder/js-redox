@@ -92,3 +92,59 @@ if (typeof define === "function") {
     return dep;
   });
 })(function () {});
+
+
+(function () {
+  const embeddedLoader = {};
+  function embeddedDefine() {}
+  embeddedDefine.amd = { embedded: true };
+  embeddedLoader.require = function (name) { return name; };
+  embeddedLoader.requirejs = embeddedLoader.require;
+  embeddedLoader.define = embeddedDefine;
+  embeddedLoader.define("embedded/alpha", ["embedded/beta"], function (beta) {
+    return { value: beta.value };
+  });
+  embeddedLoader.define("embedded/beta", [], function () {
+    return { value: "beta" };
+  });
+  embeddedLoader.define("embedded/no-deps", function () {
+    return { value: "no-deps" };
+  });
+
+  const arbitrary = {
+    define(name, deps, factory) {
+      return factory(deps[0]);
+    }
+  };
+  arbitrary.define("not-amd/member-helper", ["dep"], function (dep) {
+    return dep;
+  });
+
+  const loaderLike = {};
+  loaderLike.require = function (name) { return name; };
+  loaderLike.define = function (name, deps, factory) { return factory(deps[0]); };
+  loaderLike.define("not-amd/single-loaderlike", ["dep"], function (dep) {
+    return dep;
+  });
+
+  const loadModulesLoader = {};
+  loadModulesLoader.loadModules = function () {};
+  loadModulesLoader.define = function () {};
+  loadModulesLoader.define("loadmodules/alpha", ["loadmodules/beta"], (function (beta) {
+    return beta;
+  }));
+  loadModulesLoader.define("loadmodules/beta", [], (function () {
+    return { value: "beta" };
+  }));
+})();
+
+GlobalLoader.define("global/alpha", ["global/beta"], (function (beta) {
+  return beta;
+}));
+GlobalLoader.define("global/beta", [], function () {
+  return { value: "beta" };
+});
+
+customElements.define("not-module-inline-function", function () {
+  return "not a module factory";
+});

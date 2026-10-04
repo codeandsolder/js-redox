@@ -267,6 +267,45 @@ def main():
         assert totals.get("ordered_switch_unflatten", 0) >= 1, totals
         assert totals.get("arithmetic_state_unflatten", 0) >= 1, totals
 
+        classic_source = ROOT / "corpus/generated/reversible-obfuscation/classic-script-redeclaration.js"
+        classic_out = td / "classic-script-redeclaration.js"
+        classic_report = td / "classic-script-redeclaration.json"
+        before = node_stdout(classic_source)
+        cp = subprocess.run(
+            [str(BIN), str(classic_source), str(classic_out), "--report", str(classic_report)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(
+                f"classic-script semantic fallback deobfuscation failed:\n{cp.stdout}\n{cp.stderr}"
+            )
+        assert node_stdout(classic_out) == before
+        classic_meta = json.loads(classic_report.read_text())
+        assert classic_meta["transforms"].get("constant_fold", 0) >= 1, classic_meta
+        print("classic-script-semantic-fallback", classic_meta["transforms"])
+
+        with_source = td / "with-statement-negative.js"
+        with_out = td / "with-statement-negative.out.js"
+        with_report = td / "with-statement-negative.json"
+        with_source.write_text(
+            "const scope = { x: 1 }; with (scope) { console.log(x, 1 + 2); }\n"
+        )
+        cp = subprocess.run(
+            [str(BIN), str(with_source), str(with_out), "--report", str(with_report)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        assert cp.returncode != 0, "with-statement source must fail closed"
+        assert not with_report.exists(), "unsafe with-statement report must not be emitted"
+        print("with-statement-safety: fail-closed")
+
         duplicate_source = ROOT / "corpus/generated/reversible-obfuscation/duplicate-scope-decoder-negative.js"
         duplicate_out = td / "duplicate-scope-decoder-negative.js"
         duplicate_report = td / "duplicate-scope-decoder-negative.json"
