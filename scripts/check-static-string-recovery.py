@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -177,6 +178,20 @@ def main():
     assert out.read_text() == plain_text
     assert run(["node", out]).stdout.strip() == "beta"
 
+    plain_crlf = TMP / "plain-crlf.js"
+    plain_crlf_bytes = (
+        b'const table = ["alpha", "beta"];\r\n'
+        b'function f(x) { return table[x]; }\r\n'
+        b'console.log(f(1));\r\n'
+    )
+    plain_crlf.write_bytes(plain_crlf_bytes)
+    out, report = recover("plain-crlf", plain_crlf)
+    assert report["decoders"] == []
+    assert report["replacements"] == 0
+    assert report["input_sha256"] == hashlib.sha256(plain_crlf_bytes).hexdigest()
+    assert out.read_bytes() == plain_crlf_bytes
+    assert run(["node", out]).stdout.strip() == "beta"
+
     print("PASS: static javascript-obfuscator string recovery")
     print("  immutable literal tables: numeric reads fold; dynamic reads stay; mutation/alias cases reject")
     print("  acw_sc__v2: 2 captures, rotation=8, 57 replacements each")
@@ -185,7 +200,7 @@ def main():
     else:
         print("  Taobao securitySDK: skipped (external corpus absent)")
     print("  unresolved-rotation negative: zero rewrites")
-    print("  ordinary-JS negative: byte-identical + runtime-equivalent")
+    print("  ordinary-JS negatives: LF/CRLF byte-identical + runtime-equivalent")
 
 
 if __name__ == "__main__":

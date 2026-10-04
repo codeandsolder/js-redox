@@ -1,4 +1,6 @@
 (() => {
+  const unicodeOffsetFixture = "µ";
+  void unicodeOffsetFixture;
   var modules = {
   10000: function (module, exports, require) { exports.value = 0; },
   10001: function (module, exports, require) { exports.value = 1; },
@@ -23,7 +25,52 @@
 (self.webpackChunkFixture = self.webpackChunkFixture || []).push([
   [77],
   {
-    20001: function (module, exports, require) { exports.name = require(20002).name; },
-    20002: (module, exports, require) => { exports.name = "b"; }
+    20001: function (module, exports, require) {
+      exports.name = require(20002).name;
+      function registerNamedExport() {
+        require.d(exports, { named: () => exports.name });
+      }
+      function shadowRequire(require) {
+        return require(29999);
+      }
+      function shadowExports(exports) {
+        exports.shadowed = true;
+      }
+      const nestedModules = {
+        40000: function (module, exports, require) { exports.inner = "private"; },
+        41000: function (module, exports, require) { exports.value = 0; },
+        41001: function (module, exports, require) { exports.value = 1; },
+        41002: function (module, exports, require) { exports.value = 2; },
+        41003: function (module, exports, require) { exports.value = 3; },
+        41004: function (module, exports, require) { exports.value = 4; },
+        41005: function (module, exports, require) { exports.value = 5; },
+        41006: function (module, exports, require) { exports.value = 6; },
+        41007: function (module, exports, require) { exports.value = 7; },
+        41008: function (module, exports, require) { exports.value = 8; },
+        41009: function (module, exports, require) { exports.value = 9; },
+        41010: function (module, exports, require) { exports.value = 10; },
+        41011: function (module, exports, require) { exports.value = 11; },
+        41012: function (module, exports, require) { exports.value = 12; },
+        41013: function (module, exports, require) { exports.value = 13; },
+        41014: function (module, exports, require) { exports.value = 14; }
+      };
+      require(40000);
+      void registerNamedExport;
+      void shadowRequire;
+      void shadowExports;
+      void nestedModules;
+    },
+    20002: (module, exports, require) => {
+      module.exports = { name: "b" };
+    }
+  }
+]);
+
+(self.webpackChunkFixture = self.webpackChunkFixture || []).push([
+  [78],
+  {
+    40000: function (module, exports, require) {
+      exports.peer = "peer";
+    }
   }
 ]);

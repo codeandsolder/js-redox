@@ -148,6 +148,9 @@ def main():
         f"- Explicit bundle payloads recovered: **{bundle_summary.get('bundles', 0)}**",
         f"- Readable module wrappers materialized: **{bundle_summary.get('modules', 0)}**",
         f"- Literal intra-bundle/module-loader dependencies recovered: **{bundle_summary.get('literal_module_dependencies', 0)}**",
+        f"- Modules with statically named exports: **{bundle_summary.get('modules_with_named_exports', 0)}** "
+        f"(**{bundle_summary.get('named_exports', 0)}** distinct module-local export names observed)",
+        f"- Modules with a static CommonJS `module.exports` write: **{bundle_summary.get('commonjs_export_modules', 0)}**",
         f"- Bundle-analysis failures: **{bundle_summary.get('failed_units', 0)}**",
         "- Module inventory/provenance: [analysis/bundles.json](analysis/bundles.json)",
         "",

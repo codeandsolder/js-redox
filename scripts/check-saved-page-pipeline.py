@@ -132,6 +132,28 @@ def main():
     assert bundles["summary"]["bundles"] >= 1
     assert bundles["summary"]["modules"] >= 2
     assert bundles["summary"]["literal_module_dependencies"] >= 1
+    direct_modules = [row for row in bundles["modules"] if not row.get("chunk_ids")]
+    assert direct_modules
+    assert all("/module-table-" in row["source_path"] for row in direct_modules)
+    assert all("/chunk-/" not in row["source_path"] for row in direct_modules)
+    module_20001 = next(row for row in bundles["modules"] if row["module_id"] == "20001")
+    module_20002 = next(row for row in bundles["modules"] if row["module_id"] == "20002")
+    assert module_20001["dependencies"] == ["20002", "40000"]
+    assert module_20001["export_names"] == ["name", "named"]
+    assert "29999" not in module_20001["dependencies"]
+    assert "29996" not in module_20001["dependencies"]
+    assert "shadowed" not in module_20001["export_names"]
+    assert "shadowedNested" not in module_20001["export_names"]
+    assert module_20002["commonjs_export"] is True
+    module_20001_source = (PROJECT / module_20001["source_path"]).read_text()
+    assert "exports.name = require(20002).name" in module_20001_source
+    assert "Static export names: name, named" in module_20001_source
+    assert bundles["summary"]["modules_with_named_exports"] >= 1
+    assert bundles["summary"]["commonjs_export_modules"] >= 1
+    module_readme = (PROJECT / "src/_modules/README.md").read_text()
+    assert "Recovered bundle modules" in module_readme
+    assert "module 20001" in module_readme
+    assert "name, named" in module_readme
     assert all((PROJECT / row["source_path"]).is_file() for row in bundles["modules"])
 
     vm = json.loads((PROJECT / "analysis/jsvm/index.json").read_text())
@@ -152,6 +174,34 @@ def main():
     assert edge_kinds.get("bundle_payload", 0) >= 1
     assert edge_kinds.get("bundle_module", 0) >= 2
     assert edge_kinds.get("bundle_module_dependency", 0) >= 1
+    graph_module_20001 = next(
+        node
+        for node in graph["nodes"]
+        if node.get("type") == "bundle_module" and node.get("module_id") == "20001"
+    )
+    assert graph_module_20001["export_names"] == ["name", "named"]
+    graph_module_40000_peer = next(
+        node
+        for node in graph["nodes"]
+        if node.get("type") == "bundle_module"
+        and node.get("module_id") == "40000"
+        and node.get("chunk_ids") == ["78"]
+    )
+    peer_dependency = next(
+        edge
+        for edge in graph["edges"]
+        if edge.get("from") == graph_module_20001["id"]
+        and edge.get("kind") == "bundle_module_dependency"
+        and edge.get("module_id") == "40000"
+    )
+    assert peer_dependency["to"] == graph_module_40000_peer["id"]
+    assert peer_dependency["excluded_nested_module_tables"] == 1
+    assert not any(
+        edge.get("from") == graph_module_20001["id"]
+        and edge.get("kind") == "bundle_module_dependency_unresolved"
+        and edge.get("module_id") == "40000"
+        for edge in graph["edges"]
+    )
 
     readme = (PROJECT / "README.md").read_text()
     assert "# Recovered source project" in readme

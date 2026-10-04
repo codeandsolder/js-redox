@@ -226,6 +226,9 @@ def main():
                 chunk_ids=bundle.get('chunk_ids', []),
             )
 
+    bundle_rows_by_id = {
+        int(bundle['bundle_id']): bundle for bundle in bundles.get('bundles', [])
+    }
     bundle_module_nodes = {}
     module_nodes_by_id = defaultdict(list)
     module_rows = {}
@@ -250,6 +253,8 @@ def main():
             sha256=module.get('sha256'),
             value_kind=module.get('value_kind'),
             dependencies=module.get('dependencies', []),
+            export_names=module.get('export_names', []),
+            commonjs_export=bool(module.get('commonjs_export')),
         )
         parent = bundle_nodes.get(bundle_id)
         if parent:
@@ -260,14 +265,44 @@ def main():
                 module_id=module.get('module_id'),
             )
 
+    def nested_private_bundle_candidate(candidate_node, source_module):
+        candidate_module = module_rows[candidate_node]
+        candidate_bundle = bundle_rows_by_id[int(candidate_module['bundle_id'])]
+        if candidate_bundle.get('kind') != 'webpack_module_table':
+            return False
+        if candidate_bundle.get('parent_path') != source_module.get('parent_path'):
+            return False
+        source_start = source_module.get('value_start')
+        source_end = source_module.get('value_end')
+        bundle_start = candidate_bundle.get('start')
+        bundle_end = candidate_bundle.get('end')
+        if None in (source_start, source_end, bundle_start, bundle_end):
+            return False
+        return (
+            int(source_start) <= int(bundle_start)
+            and int(bundle_end) <= int(source_end)
+        )
+
     for source_node, module in module_rows.items():
         bundle_id = int(module['bundle_id'])
         for dependency in module.get('dependencies', []):
             dependency = str(dependency)
             target = bundle_module_nodes.get((bundle_id, dependency))
             cross_bundle = False
+            excluded_nested = []
+            candidates = []
             if target is None:
-                candidates = module_nodes_by_id.get(dependency, [])
+                all_candidates = list(module_nodes_by_id.get(dependency, []))
+                excluded_nested = [
+                    candidate
+                    for candidate in all_candidates
+                    if nested_private_bundle_candidate(candidate, module)
+                ]
+                candidates = [
+                    candidate
+                    for candidate in all_candidates
+                    if candidate not in excluded_nested
+                ]
                 if len(candidates) == 1:
                     target = candidates[0]
                     cross_bundle = True
@@ -278,18 +313,19 @@ def main():
                     'bundle_module_dependency',
                     module_id=dependency,
                     cross_bundle=cross_bundle,
+                    excluded_nested_module_tables=len(excluded_nested),
                 )
                 continue
 
             ref_key = f"{bundle_id}:{dependency}"
             ref_id = 'bundle-module-ref:' + hashlib.sha256(ref_key.encode()).hexdigest()[:20]
-            candidates = module_nodes_by_id.get(dependency, [])
             add_node(
                 ref_id,
                 type='bundle_module_reference',
                 module_id=dependency,
                 source_bundle_id=bundle_id,
                 candidate_nodes=candidates,
+                excluded_nested_module_table_nodes=excluded_nested,
                 ambiguous=bool(candidates),
             )
             add_edge(
@@ -298,6 +334,7 @@ def main():
                 'bundle_module_dependency_unresolved',
                 module_id=dependency,
                 candidate_count=len(candidates),
+                excluded_nested_module_table_count=len(excluded_nested),
             )
 
     # Source maps link generated JS -> map resource -> recovered original source.
