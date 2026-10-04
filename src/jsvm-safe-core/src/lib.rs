@@ -1,5 +1,9 @@
+mod decoder_encoding;
 mod value_eval;
 
+use decoder_encoding::{
+    decode_fixed_base64_latin1, decode_lower_alphabet_base64_uri, decode_standard_base64_latin1,
+};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, CallExpression, ComputedMemberExpression,
@@ -95,149 +99,6 @@ impl Decoder {
     fn value_for_raw(&self, raw: i64) -> Option<Value> {
         self.value_for_raw_rotated(raw, 0)
     }
-}
-
-fn decode_standard_base64_latin1(input: &str) -> Option<String> {
-    let compact = input
-        .chars()
-        .filter(|ch| !matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0c'))
-        .collect::<String>();
-    if compact.len() % 4 == 1 {
-        return None;
-    }
-
-    let padding = compact.chars().rev().take_while(|ch| *ch == '=').count();
-    if padding > 2 {
-        return None;
-    }
-    if padding > 0 {
-        if compact.len() % 4 != 0 {
-            return None;
-        }
-        if compact[..compact.len() - padding].contains('=') {
-            return None;
-        }
-    } else if compact.contains('=') {
-        return None;
-    }
-
-    decode_base64_latin1(
-        &compact,
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=",
-    )
-}
-
-fn decode_fixed_base64_latin1(input: &str, alphabet: &str) -> Option<String> {
-    let alphabet = alphabet.chars().collect::<Vec<_>>();
-    if alphabet.len() != 65 {
-        return None;
-    }
-    let unique = alphabet.iter().copied().collect::<HashSet<_>>();
-    if unique.len() != 65 {
-        return None;
-    }
-
-    // Match the observed decoder rather than treating the alphabet as a
-    // generic RFC 4648 alphabet: it first strips everything outside this
-    // character class, then decodes in groups of four. Missing charAt()
-    // positions become "", and alphabet.indexOf("") is 0 in JavaScript.
-    let filtered = input
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '='))
-        .collect::<Vec<_>>();
-
-    let mut out = String::with_capacity(filtered.len().div_ceil(4) * 3);
-    let mut index = 0usize;
-    while index < filtered.len() {
-        let symbol = |offset: usize| -> Option<usize> {
-            match filtered.get(index + offset) {
-                Some(ch) => alphabet.iter().position(|candidate| candidate == ch),
-                None => Some(0),
-            }
-        };
-        let a = symbol(0)?;
-        let b = symbol(1)?;
-        let c = symbol(2)?;
-        let d = symbol(3)?;
-
-        let mut push_code_unit = |value: usize| -> Option<()> {
-            // String.fromCharCode applies ToUint16. These decoder expressions
-            // are small, but mask explicitly so the modeled primitive is exact.
-            out.push(char::from_u32((value & 0xffff) as u32)?);
-            Some(())
-        };
-        push_code_unit((a << 2) | (b >> 4))?;
-        if c != 64 {
-            push_code_unit(((b & 15) << 4) | (c >> 2))?;
-        }
-        if d != 64 {
-            push_code_unit(((c & 3) << 6) | d)?;
-        }
-        index += 4;
-    }
-
-    Some(out)
-}
-
-fn decode_base64_latin1(input: &str, alphabet: &str) -> Option<String> {
-    let alphabet = alphabet.chars().collect::<Vec<_>>();
-    if alphabet.len() != 65 {
-        return None;
-    }
-    let unique = alphabet.iter().copied().collect::<HashSet<_>>();
-    if unique.len() != 65 {
-        return None;
-    }
-
-    let mut bits = 0u32;
-    let mut bit_count = 0u32;
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    for ch in input.chars() {
-        let index = alphabet.iter().position(|candidate| *candidate == ch)?;
-        if index == 64 {
-            break;
-        }
-        bits = (bits << 6) | index as u32;
-        bit_count += 6;
-        while bit_count >= 8 {
-            bit_count -= 8;
-            out.push(((bits >> bit_count) & 0xff) as u8);
-            bits &= if bit_count == 0 {
-                0
-            } else {
-                (1u32 << bit_count) - 1
-            };
-        }
-    }
-
-    Some(out.into_iter().map(char::from).collect())
-}
-
-fn decode_lower_alphabet_base64_uri(input: &str) -> Option<String> {
-    const ALPHABET: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=";
-    let mut bits = 0u32;
-    let mut bit_count = 0u32;
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-
-    for ch in input.chars() {
-        let index = ALPHABET.find(ch)?;
-        if index >= 64 {
-            break;
-        }
-        bits = (bits << 6) | index as u32;
-        bit_count += 6;
-        while bit_count >= 8 {
-            bit_count -= 8;
-            out.push(((bits >> bit_count) & 0xff) as u8);
-            bits &= if bit_count == 0 {
-                0
-            } else {
-                (1u32 << bit_count) - 1
-            };
-        }
-    }
-
-    String::from_utf8(out).ok()
 }
 
 #[derive(Default)]
