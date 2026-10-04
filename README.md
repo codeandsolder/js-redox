@@ -15,20 +15,21 @@ Reusable static JavaScript VM devirtualization research and tooling.
 
 ## Build
 
-Use the helper rather than raw `cargo`:
+The Rust code is one Cargo workspace (`jsvm-safe-core` + `jsvm-lift`) with a single root `Cargo.lock` and shared dependency-version pins. Whole-workspace correctness gates are therefore ordinary Cargo commands:
+
+```sh
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+For normal executable builds, use the project helper rather than raw `cargo`:
 
 ```sh
 scripts/build-jsvm-lift.sh
 ```
 
-It:
-
-1. uses Rust 1.98.1's real Cargo binary;
-2. keeps build artifacts on the spacious `/srv/scratch` filesystem in `.cargo-target/`;
-3. preserves `RUSTC_WRAPPER=/usr/local/libexec/sccache-client`, so rustc work remains distributed;
-4. derives a sensible job count from live sccache-dist capacity and current farm occupancy.
-
-The scheduler currently has 12 remote CPUs. The normal project cap is 8, but the helper leaves a two-slot reserve and reduces jobs when other distributed work is already in flight.
+It pins rustc 1.98.1, preserves the distributed sccache wrapper, derives build parallelism from live farm capacity, and publishes durable executables under `.cargo-target-nodebug/`. The helper asks Cargo for the workspace target directory rather than assuming a member-local `target/` layout.
 
 ## Regression
 

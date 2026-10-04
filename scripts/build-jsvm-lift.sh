@@ -46,7 +46,17 @@ workspace="$(pwd -P)"
 hash="$(printf '%s' "$workspace" | sha256sum | cut -c1-16)"
 name="$(basename "$workspace" | tr -c 'A-Za-z0-9._-' '_')"
 actual="$shim_target_root/${name}-$hash/$profile"
-mirror="$project/target/$profile"
+# Cargo workspaces place durable artifacts in the workspace target directory,
+# not necessarily under this member crate. Ask Cargo instead of duplicating
+# that layout rule here.
+cargo_target="$("$cargo_bin" metadata --no-deps --format-version 1 \
+  | rg -o '"target_directory":"[^"]+' \
+  | cut -d '"' -f 4)"
+if [[ -z "$cargo_target" ]]; then
+  echo "failed to discover Cargo target_directory" >&2
+  exit 2
+fi
+mirror="$cargo_target/$profile"
 canonical="$publish_root/$profile"
 mkdir -p "$canonical"
 

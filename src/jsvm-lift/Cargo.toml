@@ -1,25 +1,24 @@
 [package]
 name = "jsvm-lift"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.98"
+edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 jsvm-safe-core = { path = "../jsvm-safe-core" }
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-oxc_allocator = "0.138.0"
-oxc_ast = "0.138.0"
-oxc_ast_visit = "0.138.0"
-oxc_codegen = "0.138.0"
-oxc_parser = "0.138.0"
-oxc_semantic = "0.138.0"
-oxc_span = "0.138.0"
-oxc_syntax = "0.138.0"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-regex = "1"
-
-base64 = "0.22"
-sha2 = "0.10"
-url = "2"
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+oxc_allocator.workspace = true
+oxc_ast.workspace = true
+oxc_ast_visit.workspace = true
+oxc_codegen.workspace = true
+oxc_parser.workspace = true
+oxc_semantic.workspace = true
+oxc_span.workspace = true
+oxc_syntax.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+url.workspace = true

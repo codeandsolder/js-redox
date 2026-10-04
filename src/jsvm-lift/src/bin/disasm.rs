@@ -47,7 +47,8 @@ struct DecoderCandidate {
 struct PushBuilder {
     start: u32,
     end: u32,
-    receiver: String,
+    #[serde(rename = "receiver")]
+    _receiver: String,
     arguments: usize,
     values: Vec<Option<u64>>,
     unknowns: Vec<BuilderUnknown>,
@@ -61,7 +62,8 @@ struct BuilderUnknown {
 
 #[derive(Debug, Deserialize)]
 struct NormalizedVm {
-    file: String,
+    #[serde(rename = "file")]
+    _file: String,
     decoder: String,
     parent: String,
     role_bindings: BTreeMap<String, BindingInfo>,
