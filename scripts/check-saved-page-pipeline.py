@@ -151,8 +151,20 @@ def main():
     assert bundles["summary"]["failed_units"] == 0
     assert bundles["summary"]["bundles"] >= 1
     assert bundles["summary"]["modules"] >= 2
+    amd_alpha = next(row for row in bundles["modules"] if row["module_id"] == "amd/alpha")
+    assert amd_alpha["bundle_kind"] == "amd_named_modules"
+    assert amd_alpha["dependencies"] == ["amd/beta"]
+    assert amd_alpha["export_names"] == ["value"]
+    assert "/amd-modules/" in amd_alpha["source_path"]
+    assert bundles["summary"]["amd_named_modules"] >= 3
+    assert any(row["module_id"] == "amd/local" for row in bundles["modules"])
+    assert not any(row["module_id"] == "not-amd/local-helper" for row in bundles["modules"])
     assert bundles["summary"]["literal_module_dependencies"] >= 1
-    direct_modules = [row for row in bundles["modules"] if not row.get("chunk_ids")]
+    direct_modules = [
+        row
+        for row in bundles["modules"]
+        if not row.get("chunk_ids") and row.get("bundle_kind") != "amd_named_modules"
+    ]
     assert direct_modules
     assert all("/module-table-" in row["source_path"] for row in direct_modules)
     assert all("/chunk-/" not in row["source_path"] for row in direct_modules)
@@ -171,7 +183,7 @@ def main():
     assert bundles["summary"]["modules_with_named_exports"] >= 1
     assert bundles["summary"]["commonjs_export_modules"] >= 1
     module_readme = (PROJECT / "src/_modules/README.md").read_text()
-    assert "Recovered bundle modules" in module_readme
+    assert "Recovered structured modules" in module_readme
     assert "module 20001" in module_readme
     assert "name, named" in module_readme
     assert all((PROJECT / row["source_path"]).is_file() for row in bundles["modules"])

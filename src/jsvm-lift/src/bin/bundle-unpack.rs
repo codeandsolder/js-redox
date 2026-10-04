@@ -263,6 +263,9 @@ struct Collector<'s, 'c> {
     source: &'s str,
     scoping: &'c Scoping,
     bundles: Vec<BundleRecord>,
+    amd_modules: Vec<ModuleRecord>,
+    amd_start: Option<u32>,
+    amd_end: Option<u32>,
 }
 
 impl Collector<'_, '_> {
@@ -297,6 +300,123 @@ impl Collector<'_, '_> {
             }
         }
         Some(ids)
+    }
+
+    fn amd_factory_parts<'a>(
+        argument: &'a Argument<'a>,
+    ) -> Option<(
+        &'a oxc_ast::ast::FormalParameters<'a>,
+        &'a oxc_ast::ast::FunctionBody<'a>,
+        oxc_span::Span,
+        &'static str,
+    )> {
+        match argument {
+            Argument::FunctionExpression(function) => {
+                let body = function.body.as_ref()?;
+                Some((&function.params, body.as_ref(), function.span, "function"))
+            }
+            Argument::ArrowFunctionExpression(function) => Some((
+                &function.params,
+                function.body.as_ref(),
+                function.span,
+                "arrow",
+            )),
+            _ => None,
+        }
+    }
+
+    fn amd_exports(
+        &self,
+        deps: &[String],
+        params: &oxc_ast::ast::FormalParameters<'_>,
+        body: &oxc_ast::ast::FunctionBody<'_>,
+    ) -> (Vec<String>, bool) {
+        let mut module_symbol = None;
+        let mut exports_symbol = None;
+        let mut require_symbol = None;
+        for (index, dep) in deps.iter().enumerate() {
+            let symbol = params
+                .items
+                .get(index)
+                .and_then(|param| binding_symbol(&param.pattern));
+            match dep.as_str() {
+                "module" => module_symbol = symbol,
+                "exports" => exports_symbol = symbol,
+                "require" => require_symbol = symbol,
+                _ => {}
+            }
+        }
+        let mut collector = ExportCollector {
+            scoping: self.scoping,
+            module_symbol,
+            exports_symbol,
+            require_symbol,
+            names: BTreeSet::new(),
+            commonjs_export: false,
+        };
+        collector.visit_function_body(body);
+        (
+            collector.names.into_iter().collect(),
+            collector.commonjs_export,
+        )
+    }
+
+    fn record_amd_call(&mut self, call: &oxc_ast::ast::CallExpression<'_>) -> bool {
+        let Expression::Identifier(callee) = &call.callee else {
+            return false;
+        };
+        if callee.name.as_str() != "define" || call.arguments.len() < 3 {
+            return false;
+        }
+        let define_is_resolved = reference_symbol(self.scoping, callee).is_some();
+        let Some(Argument::StringLiteral(name)) = call.arguments.first() else {
+            return false;
+        };
+        let Some(Argument::ArrayExpression(dep_array)) = call.arguments.get(1) else {
+            return false;
+        };
+        let Some(deps) = Self::array_literal_ids(dep_array) else {
+            return false;
+        };
+        if define_is_resolved
+            && !matches!(
+                deps.as_slice(),
+                [first, second, ..] if first == "require" && second == "exports"
+            )
+        {
+            return false;
+        }
+        let Some((params, body, span, value_kind)) =
+            call.arguments.get(2).and_then(Self::amd_factory_parts)
+        else {
+            return false;
+        };
+        let (export_names, commonjs_export) = self.amd_exports(&deps, params, body);
+        let dependencies = deps
+            .into_iter()
+            .filter(|dep| !matches!(dep.as_str(), "require" | "exports" | "module"))
+            .collect();
+        self.amd_modules.push(ModuleRecord {
+            id: name.value.to_string(),
+            property_start: call.span.start,
+            property_end: call.span.end,
+            value_start: span.start,
+            value_end: span.end,
+            value_kind: value_kind.to_string(),
+            method: false,
+            dependencies,
+            export_names,
+            commonjs_export,
+        });
+        self.amd_start = Some(
+            self.amd_start
+                .map_or(call.span.start, |old| old.min(call.span.start)),
+        );
+        self.amd_end = Some(
+            self.amd_end
+                .map_or(call.span.end, |old| old.max(call.span.end)),
+        );
+        true
     }
 
     fn module_dependencies(&self, value: &Expression<'_>) -> Vec<String> {
@@ -457,6 +577,9 @@ impl Collector<'_, '_> {
     }
 
     fn record_call(&mut self, call: &oxc_ast::ast::CallExpression<'_>) {
+        if self.record_amd_call(call) {
+            return;
+        }
         let callee = self.fragment(call.callee.span()).trim().to_string();
         if !(callee.ends_with(".push")
             || callee.ends_with("['push']")
@@ -547,8 +670,25 @@ fn main() -> Result<()> {
             source: &source,
             scoping: semantic.scoping(),
             bundles: Vec::new(),
+            amd_modules: Vec::new(),
+            amd_start: None,
+            amd_end: None,
         };
         collector.visit_program(&parsed.program);
+        if !collector.amd_modules.is_empty() {
+            let start = collector.amd_start.unwrap_or_default();
+            let end = collector.amd_end.unwrap_or(start);
+            collector.bundles.push(BundleRecord {
+                kind: "amd_named_modules".into(),
+                start,
+                end,
+                callee: "define".into(),
+                chunk_ids: Vec::new(),
+                module_table_start: start,
+                module_table_end: end,
+                modules: std::mem::take(&mut collector.amd_modules),
+            });
+        }
         bundles = collector.bundles;
     }
 
@@ -567,7 +707,7 @@ fn main() -> Result<()> {
     bundles.sort_by_key(|b| b.start);
 
     let report = Report {
-        schema: "js-bundle-inventory/v2",
+        schema: "js-bundle-inventory/v3",
         input: args.input.display().to_string(),
         diagnostics,
         panicked,

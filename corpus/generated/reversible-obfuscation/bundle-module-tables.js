@@ -74,3 +74,21 @@
     }
   }
 ]);
+
+if (typeof define === "function") {
+  define("amd/alpha", ["require", "exports", "amd/beta"], function (require, exports, beta) {
+    exports.value = beta.value;
+  });
+  define("amd/beta", ["require", "exports"], function (require, exports) {
+    exports.value = "beta";
+  });
+}
+
+(function (define) {
+  define("amd/local", ["require", "exports"], function (require, exports) {
+    exports.local = true;
+  });
+  define("not-amd/local-helper", ["dep"], function (dep) {
+    return dep;
+  });
+})(function () {});

@@ -108,7 +108,7 @@ def main():
         "- [src/_dynamic/](src/_dynamic/) — formatted analyst views of statically recovered generated-code bodies such as Function(...).",
         "- [src/_dynamic_deobfuscated/](src/_dynamic_deobfuscated/) — proven safe recovery of generated-code children when string/deob passes validate; exact bytes remain the fallback.",
         "- [src/_sourcemap/](src/_sourcemap/) — original sources recovered from captured source maps.",
-        "- [src/_modules/](src/_modules/) — statically extracted Webpack/Next module wrappers where bundle structure is explicit.",
+        "- [src/_modules/](src/_modules/) — statically extracted Webpack/Next module wrappers and named AMD factories where module structure is explicit.",
         "- [resources/](resources/) — capture-faithful response bodies or saved-page files.",
         "- [capture-manifest.json](capture-manifest.json) — normalized capture provenance and resource inventory.",
         "- [har-manifest.json](har-manifest.json) — compatibility manifest consumed by the current analysis stages.",
@@ -165,7 +165,9 @@ def main():
         f"**{bundle_summary.get('modules', 0)}** outputs "
         f"(**{bundle_summary.get('deduplicated_module_formats', 0)}** exact-template reuses)",
         f"- Explicit bundle payloads recovered: **{bundle_summary.get('bundles', 0)}**",
-        f"- Readable module wrappers materialized: **{bundle_summary.get('modules', 0)}**",
+        f"- Readable module wrappers materialized: **{bundle_summary.get('modules', 0)}** "
+        f"(**{bundle_summary.get('webpack_modules', 0)}** Webpack/Next, "
+        f"**{bundle_summary.get('amd_named_modules', 0)}** named AMD)",
         f"- Literal intra-bundle/module-loader dependencies recovered: **{bundle_summary.get('literal_module_dependencies', 0)}**",
         f"- Modules with statically named exports: **{bundle_summary.get('modules_with_named_exports', 0)}** "
         f"(**{bundle_summary.get('named_exports', 0)}** distinct module-local export names observed)",

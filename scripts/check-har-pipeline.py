@@ -246,7 +246,11 @@ def main():
     assert bundles["summary"]["bundles"] >= 1
     assert bundles["summary"]["modules"] >= 2
     assert bundles["summary"]["literal_module_dependencies"] >= 1
-    direct_modules = [row for row in bundles["modules"] if not row.get("chunk_ids")]
+    direct_modules = [
+        row
+        for row in bundles["modules"]
+        if not row.get("chunk_ids") and row.get("bundle_kind") != "amd_named_modules"
+    ]
     assert direct_modules
     assert all("/module-table-" in row["source_path"] for row in direct_modules)
     assert all("/chunk-/" not in row["source_path"] for row in direct_modules)
@@ -259,13 +263,23 @@ def main():
     assert "shadowed" not in module_20001["export_names"]
     assert "shadowedNested" not in module_20001["export_names"]
     assert module_20002["commonjs_export"] is True
+    amd_alpha = next(row for row in bundles["modules"] if row["module_id"] == "amd/alpha")
+    amd_beta = next(row for row in bundles["modules"] if row["module_id"] == "amd/beta")
+    assert amd_alpha["bundle_kind"] == "amd_named_modules"
+    assert amd_alpha["dependencies"] == ["amd/beta"]
+    assert amd_alpha["export_names"] == ["value"]
+    assert amd_beta["export_names"] == ["value"]
+    assert "/amd-modules/" in amd_alpha["source_path"]
+    assert bundles["summary"]["amd_named_modules"] >= 3
+    assert any(row["module_id"] == "amd/local" for row in bundles["modules"])
+    assert not any(row["module_id"] == "not-amd/local-helper" for row in bundles["modules"])
     module_20001_source = (PROJECT / module_20001["source_path"]).read_text()
     assert "exports.name = require(20002).name" in module_20001_source
     assert "Static export names: name, named" in module_20001_source
     assert bundles["summary"]["modules_with_named_exports"] >= 1
     assert bundles["summary"]["commonjs_export_modules"] >= 1
     module_readme = (PROJECT / "src/_modules/README.md").read_text()
-    assert "Recovered bundle modules" in module_readme
+    assert "Recovered structured modules" in module_readme
     assert "module 20001" in module_readme
     assert "name, named" in module_readme
 

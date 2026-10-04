@@ -37,6 +37,7 @@ def run(argv, timeout=180):
 
 def module_output_path(
     parent: Path,
+    kind: str,
     chunk_ids: list[str],
     module_id: str,
     bundle_id: int,
@@ -49,15 +50,18 @@ def module_output_path(
         parts = parts[1:]
     source_rel = Path(*parts)
     stem_dir = source_rel.with_name(source_rel.name + ".modules")
-    group = (
-        "chunk-" + "-".join(safe_component(x, 24) for x in chunk_ids)
-        if chunk_ids
-        else f"module-table-{bundle_id + 1:02d}"
-    )
+    if kind == "amd_named_modules":
+        group = "amd-modules"
+    elif chunk_ids:
+        group = "chunk-" + "-".join(safe_component(x, 24) for x in chunk_ids)
+    else:
+        group = f"module-table-{bundle_id + 1:02d}"
     return Path("src/_modules") / stem_dir / group / f"module-{safe_component(module_id)}.js"
 
 
-def build_module_source(source: bytes, module: dict, provenance: str) -> str:
+def build_module_source(
+    source: bytes, module: dict, provenance: str, bundle_kind: str
+) -> str:
     ps = int(module["property_start"])
     pe = int(module["property_end"])
     vs = int(module["value_start"])
@@ -73,6 +77,20 @@ def build_module_source(source: bytes, module: dict, provenance: str) -> str:
         metadata += f" * Static export names: {export_preview}\n"
     if module.get("commonjs_export"):
         metadata += " * Static CommonJS module.exports write observed.\n"
+    if bundle_kind == "amd_named_modules":
+        dep_preview = ", ".join(str(x) for x in module.get("dependencies", [])[:12])
+        if len(module.get("dependencies", [])) > 12:
+            dep_preview += f", … (+{len(module['dependencies']) - 12} more)"
+        if dep_preview:
+            metadata += f" * Static AMD dependencies: {dep_preview}\n"
+        header = (
+            "/* Statically extracted named AMD module factory.\n"
+            f" * {provenance}\n"
+            + metadata
+            + " * The factory body is preserved from the parent analyst view.\n"
+            " */\n"
+        )
+        return header + "const __amd_module_factory__ = " + value + ";\n"
     header = (
         "/* Statically extracted Webpack/Next module wrapper.\n"
         f" * {provenance}\n"
@@ -102,9 +120,9 @@ def write_module_readme(module_root: Path, bundles: list[dict], modules: list[di
     for module in modules:
         by_bundle.setdefault(int(module["bundle_id"]), []).append(module)
     lines = [
-        "# Recovered bundle modules",
+        "# Recovered structured modules",
         "",
-        "Module filenames retain the captured Webpack/Next module ID as canonical identity. "
+        "Module filenames retain captured module identity: explicit AMD names or Webpack/Next module IDs. "
         "Static export names are scope-resolved navigation metadata, not invented filenames.",
         "",
         f"- Bundle payloads: **{len(bundles)}**",
@@ -120,7 +138,13 @@ def write_module_readme(module_root: Path, bundles: list[dict], modules: list[di
         commonjs_only = sum(bool(row.get("commonjs_export")) and not row.get("export_names") for row in rows)
         anonymous = len(rows) - len(named) - commonjs_only
         chunk_ids = bundle.get("chunk_ids", [])
-        identity = ("chunk " + ", ".join(markdown_text(x) for x in chunk_ids)) if chunk_ids else "direct module table"
+        kind = bundle.get("kind")
+        if kind == "amd_named_modules":
+            identity = "named AMD modules"
+        elif chunk_ids:
+            identity = "chunk " + ", ".join(markdown_text(x) for x in chunk_ids)
+        else:
+            identity = "direct module table"
         lines.extend([
             f"## Bundle {bundle_id + 1:02d} — {identity}",
             "",
@@ -138,7 +162,7 @@ def write_module_readme(module_root: Path, bundles: list[dict], modules: list[di
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Materialize statically explicit Webpack/Next chunk modules as readable source files"
+        description="Materialize statically explicit Webpack/Next and named AMD modules as readable source files"
     )
     ap.add_argument("project", type=Path)
     ap.add_argument("--inventory", type=Path, default=DEFAULT_INVENTORY)
@@ -257,6 +281,7 @@ def main():
             for module_ordinal, module in enumerate(bundle.get("modules", [])):
                 rel = module_output_path(
                     parent_rel,
+                    str(bundle.get("kind", "")),
                     bundle.get("chunk_ids", []),
                     str(module["id"]),
                     bundle_ordinal,
@@ -266,7 +291,12 @@ def main():
                     f"parent={parent_rel} bundle_span={bundle['start']}..{bundle['end']} "
                     f"module={module['id']} property_span={module['property_start']}..{module['property_end']}"
                 )
-                raw = build_module_source(source, module, PROVENANCE_PLACEHOLDER)
+                raw = build_module_source(
+                    source,
+                    module,
+                    PROVENANCE_PLACEHOLDER,
+                    str(bundle.get("kind", "")),
+                )
                 raw_sha = hashlib.sha256(raw.encode()).hexdigest()
                 module_index = len(modules)
                 modules.append(
@@ -277,6 +307,7 @@ def main():
                         "resource_id": unit.get("resource_id"),
                         "parent_path": str(parent_rel),
                         "parent_content_sha256": digest,
+                        "bundle_kind": bundle.get("kind"),
                         "chunk_ids": bundle.get("chunk_ids", []),
                         "module_id": str(module["id"]),
                         "property_start": module.get("property_start"),
@@ -353,7 +384,7 @@ def main():
                 record["materialization"] = "rendered_content_template"
 
     index = {
-        "schema": "har-bundle-modules/v2",
+        "schema": "har-bundle-modules/v3",
         "safe_static_only": True,
         "inventory": str(args.inventory),
         "bundles": bundles,
@@ -369,6 +400,16 @@ def main():
             "jobs": jobs,
             "bundles": len(bundles),
             "modules": len(modules),
+            "amd_named_modules": sum(
+                bundle.get("kind") == "amd_named_modules"
+                for bundle in bundles
+                for _ in bundle.get("module_ids", [])
+            ),
+            "webpack_modules": sum(
+                bundle.get("kind") != "amd_named_modules"
+                for bundle in bundles
+                for _ in bundle.get("module_ids", [])
+            ),
             "literal_module_dependencies": sum(
                 len(module.get("dependencies", [])) for module in modules
             ),
