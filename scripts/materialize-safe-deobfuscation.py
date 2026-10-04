@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -24,14 +25,29 @@ def derived_path(raw_path: str, root: str) -> Path:
 
 
 def run(argv, timeout):
-    return subprocess.run(
-        [str(x) for x in argv],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-    )
+    argv = [str(x) for x in argv]
+    try:
+        return subprocess.run(
+            argv,
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", "replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", "replace")
+        return subprocess.CompletedProcess(
+            argv,
+            124,
+            stdout,
+            stderr + f"\ntimed out after {timeout}s",
+        )
 
 
 def main():
@@ -102,10 +118,7 @@ def main():
         report = cache / "report.json"
         cp = run(
             [
-                "uv",
-                "run",
-                "--no-project",
-                "python",
+                sys.executable,
                 args.string_recoverer,
                 canonical["source"],
                 recovered,

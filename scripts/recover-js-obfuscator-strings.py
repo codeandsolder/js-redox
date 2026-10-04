@@ -1308,6 +1308,18 @@ def apply_text_replacements(
 def recover_base91_pass(
     source: str, iteration: int
 ) -> tuple[str, list[dict], dict[str, int]]:
+    # Every Base91 decoder accepted below must expose its exact 91-character,
+    # 91-unique-symbol alphabet as a quoted string literal. Ordinary large app
+    # bundles almost never do. Gate the expensive global array/scope discovery
+    # on that necessary condition so non-Base91 inputs stay linear-time.
+    if not any(len(value) == 91 and len(set(value)) == 91 for value in string_literals(source)):
+        return source, [], {
+            "preflight_skipped": True,
+            "decoder_calls": 0,
+            "immutable_string_table_replacements": 0,
+            "literal_concat_folds": 0,
+        }
+
     simple_arrays = discover_simple_arrays(source)
     immutable_string_arrays = immutable_literal_string_arrays(source, simple_arrays)
     decoders = discover_rotated_base91_decoders(source, simple_arrays)
@@ -1345,6 +1357,7 @@ def recover_base91_pass(
         )
         out, concat_folds = fold_literal_string_concats(out)
     return out, rows, {
+        "preflight_skipped": False,
         "decoder_calls": len(filtered),
         "immutable_string_table_replacements": immutable_table_reads,
         "literal_concat_folds": concat_folds,

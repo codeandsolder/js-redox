@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from browser_script_types import is_executable_script
@@ -43,14 +44,29 @@ def direct_summary(report):
 
 
 def run_tool(argv, timeout):
-    return subprocess.run(
-        [str(x) for x in argv],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-    )
+    argv = [str(x) for x in argv]
+    try:
+        return subprocess.run(
+            argv,
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", "replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", "replace")
+        return subprocess.CompletedProcess(
+            argv,
+            124,
+            stdout,
+            stderr + f"\ntimed out after {timeout}s",
+        )
 
 
 def generated_output_path(root: str, scan_id: int, ordinal: int) -> Path:
@@ -92,10 +108,7 @@ def recover_generated_unit(
 
     string_cp = run_tool(
         [
-            "uv",
-            "run",
-            "--no-project",
-            "python",
+            sys.executable,
             args.string_recoverer,
             raw,
             string_tmp,
@@ -453,15 +466,22 @@ def main():
             for table in report.get("handler_function_tables", [])
             if int(table.get("function_values", 0)) >= 32
         ]
-        bundle_handler_tables = [
+        dense_large_handler_tables = [
             table
             for table in large_handler_tables
+            if int(table.get("entries", 0)) > 0
+            and int(table.get("function_values", 0)) * 4
+            >= int(table.get("entries", 0)) * 3
+        ]
+        bundle_handler_tables = [
+            table
+            for table in dense_large_handler_tables
             if (int(table.get("start", -1)), int(table.get("end", -1)))
             in known_bundle_spans
         ]
         non_bundle_handler_tables = [
             table
-            for table in large_handler_tables
+            for table in dense_large_handler_tables
             if (int(table.get("start", -1)), int(table.get("end", -1)))
             not in known_bundle_spans
         ]
@@ -470,6 +490,8 @@ def main():
             for table in non_bundle_handler_tables
             if int(table.get("looped_dynamic_call_sites", 0)) > 0
         ]
+        row["large_handler_tables"] = len(large_handler_tables)
+        row["dense_large_handler_tables"] = len(dense_large_handler_tables)
         row["bundle_module_table_handler_tables"] = len(bundle_handler_tables)
         row["largest_non_bundle_handler_table"] = max(
             (int(table.get("function_values", 0)) for table in non_bundle_handler_tables),

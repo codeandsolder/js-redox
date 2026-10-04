@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import hashlib
 import json
+import runpy
+import sys
 import os
 import shutil
 import subprocess
@@ -14,6 +16,7 @@ PROJECT = WORK / "project"
 TRUNCATED_HAR = WORK / "fixture-truncated.har"
 TRUNCATED_PROJECT = WORK / "project-truncated"
 BUNDLE_FIXTURE = ROOT / "corpus/generated/reversible-obfuscation/bundle-module-tables.js"
+SAFE_MATERIALIZER = ROOT / "scripts/materialize-safe-deobfuscation.py"
 GENERATED_CHILD_FIXTURE = ROOT / "corpus/generated/reversible-obfuscation/generated-child-safe.js"
 HAR_PROJECT = TOOL_ROOT / "har-project"
 
@@ -66,7 +69,18 @@ def entry(url, mime, text, when="2026-09-29T00:00:00.000Z"):
     }
 
 
+def check_optional_helper_timeout():
+    run_helper = runpy.run_path(SAFE_MATERIALIZER, run_name="safe_materializer_test")["run"]
+    cp = run_helper(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        timeout=0.02,
+    )
+    assert cp.returncode == 124
+    assert "timed out" in cp.stderr
+
+
 def main():
+    check_optional_helper_timeout()
     shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(parents=True)
 

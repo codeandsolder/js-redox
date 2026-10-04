@@ -175,6 +175,7 @@ def main():
     out, report = recover("plain", plain)
     assert report["decoders"] == []
     assert report["replacements"] == 0
+    assert report["base91_iterations"][0]["preflight_skipped"] is True
     assert out.read_text() == plain_text
     assert run(["node", out]).stdout.strip() == "beta"
 
@@ -188,6 +189,7 @@ def main():
     out, report = recover("plain-crlf", plain_crlf)
     assert report["decoders"] == []
     assert report["replacements"] == 0
+    assert report["base91_iterations"][0]["preflight_skipped"] is True
     assert report["input_sha256"] == hashlib.sha256(plain_crlf_bytes).hexdigest()
     assert out.read_bytes() == plain_crlf_bytes
     assert run(["node", out]).stdout.strip() == "beta"
@@ -200,7 +202,7 @@ def main():
     else:
         print("  Taobao securitySDK: skipped (external corpus absent)")
     print("  unresolved-rotation negative: zero rewrites")
-    print("  ordinary-JS negatives: LF/CRLF byte-identical + runtime-equivalent")
+    print("  ordinary-JS negatives: LF/CRLF byte-identical + runtime-equivalent + Base91 preflight skipped")
 
 
 if __name__ == "__main__":
