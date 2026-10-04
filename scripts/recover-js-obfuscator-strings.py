@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Conservatively recover common javascript-obfuscator string-array decoders.
+"""Conservatively recover proven static string-table decoders.
 
-Static only: recognizes a self-redefining string-table provider, the generated
-Base64 or RC4 decoder, and (when present) the generated push/shift checksum
-rotation. It never executes target JavaScript.
+Static only: recognizes common javascript-obfuscator Base64/RC4 tables and a
+strict rotated-Base91 scaffold used by the generated VM corpus. Base91 recovery
+is limited to ASCII-safe outputs and never executes target JavaScript.
 """
 from __future__ import annotations
 
@@ -127,6 +127,444 @@ def parse_string_array(text: str, start: int) -> tuple[list[str], int] | None:
         if i < end - 1 and text[i] not in ",]":
             return None
     return vals, end
+
+
+
+@dataclass
+class Base91Decoder:
+    name: str
+    table_name: str
+    values: list[str]
+    rotation: int
+    alphabet: str
+    transform: str
+
+
+def parse_simple_literal(token: str):
+    token = token.strip()
+    if not token:
+        raise ValueError("empty literal")
+    if token[0] in "'\"":
+        got = decode_js_string(token, 0)
+        if got is None or got[1] != len(token):
+            raise ValueError(token)
+        return got[0]
+    if token == "null":
+        return None
+    if re.fullmatch(r"void\s+" + NUM, token):
+        return None
+    if re.fullmatch(r"!\s*0[xX]?0*", token):
+        return True
+    if re.fullmatch(r"!\s*(?:0[xX]0*1|1)", token):
+        return False
+    if re.fullmatch(NUM, token):
+        return int(token, 0)
+    raise ValueError(token)
+
+
+def parse_simple_array(text: str, start: int) -> tuple[list[object], int] | None:
+    end = match_balanced(text, start, "[", "]")
+    if end is None:
+        return None
+    vals = []
+    item_start = start + 1
+    quote = None
+    esc = False
+    depth = 0
+    for i in range(start + 1, end):
+        ch = text[i]
+        if quote:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in "'\"":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            token = text[item_start:i].strip()
+            if token:
+                try:
+                    vals.append(parse_simple_literal(token))
+                except ValueError:
+                    return None
+            item_start = i + 1
+    token = text[item_start:end - 1].strip()
+    if token:
+        try:
+            vals.append(parse_simple_literal(token))
+        except ValueError:
+            return None
+    return vals, end
+
+
+def discover_simple_arrays(source: str) -> dict[str, list[object]]:
+    arrays = {}
+    for m in re.finditer(rf"\b(?:var|let|const)\s+({IDENT})\s*=\s*\[", source):
+        start = source.find("[", m.start(), m.end() + 1)
+        if start < 0:
+            continue
+        parsed = parse_simple_array(source, start)
+        if parsed is None:
+            continue
+        values, _ = parsed
+        arrays[m.group(1)] = values
+    return arrays
+
+
+
+def enclosing_function_scope(
+    spans: list[tuple[int, int, str]], pos: int
+) -> tuple[int, int] | None:
+    containers = [(start, end) for start, end, _ in spans if start < pos < end]
+    return min(containers, key=lambda span: span[1] - span[0]) if containers else None
+
+
+def named_functions(source: str, name: str):
+    out = []
+    for m in re.finditer(rf"\bfunction\s+{re.escape(name)}\s*\(([^)]*)\)\s*\{{", source):
+        got = function_body(source, m)
+        if not got:
+            continue
+        body, end = got
+        params = [p.strip().lstrip("...").strip() for p in m.group(1).split(",") if p.strip()]
+        out.append((body, m.start(), end, params))
+    return out
+
+def named_function(source: str, name: str) -> tuple[str, int, int, list[str]] | None:
+    m = re.search(rf"\bfunction\s+{re.escape(name)}\s*\(([^)]*)\)\s*\{{", source)
+    if not m:
+        return None
+    got = function_body(source, m)
+    if not got:
+        return None
+    body, end = got
+    params = [p.strip().lstrip("...").strip() for p in m.group(1).split(",") if p.strip()]
+    return body, m.start(), end, params
+
+
+def string_literals(text: str):
+    i = 0
+    while i < len(text):
+        if text[i] not in "'\"":
+            i += 1
+            continue
+        got = decode_js_string(text, i)
+        if got is None:
+            i += 1
+            continue
+        value, end = got
+        yield value
+        i = end
+
+
+def substitute_simple_array_literals(
+    text: str, simple_arrays: dict[str, list[object]]
+) -> str:
+    pattern = re.compile(rf"\b({IDENT})\s*\[\s*({NUM})\s*\]")
+
+    def repl(match: re.Match[str]) -> str:
+        values = simple_arrays.get(match.group(1))
+        if values is None:
+            return match.group(0)
+        index = int(match.group(2), 0)
+        if not 0 <= index < len(values):
+            return match.group(0)
+        value = values[index]
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, str):
+            return json.dumps(value)
+        if value is None:
+            return "void 0"
+        return match.group(0)
+
+    return pattern.sub(repl, text)
+
+
+def looks_like_base91_decoder(
+    body: str, alphabet: str, simple_arrays: dict[str, list[object]]
+) -> bool:
+    if len(alphabet) != 91 or len(set(alphabet)) != 91:
+        return False
+    resolved = substitute_simple_array_literals(body, simple_arrays)
+    compact = re.sub(r"\s+", "", resolved)
+    required_fragments = (
+        ".indexOf(",
+        ".push(",
+        "*91",
+        "&8191",
+        ">88?13:14",
+        "&255",
+        ">>=8",
+        "-=8",
+        "=-1",
+        ">-1",
+    )
+    return all(fragment in compact for fragment in required_fragments)
+
+
+def decode_base91(value: str, alphabet: str) -> str:
+    out = bytearray()
+    acc = 0
+    bits = 0
+    pending = -1
+    for ch in value:
+        index = alphabet.find(ch)
+        if index < 0:
+            continue
+        if pending < 0:
+            pending = index
+            continue
+        pending += index * 91
+        acc |= pending << bits
+        bits += 13 if (pending & 8191) > 88 else 14
+        while bits > 7:
+            out.append(acc & 255)
+            acc >>= 8
+            bits -= 8
+        pending = -1
+    if pending > -1:
+        out.append((acc | pending << bits) & 255)
+    if not out.isascii():
+        raise ValueError("decoded Base91 bytes are not ASCII-safe")
+    return out.decode("ascii")
+
+
+def discover_rotated_base91_decoders(
+    source: str, simple_arrays: dict[str, list[object]]
+) -> list[Base91Decoder]:
+    out = []
+    spans = function_spans(source)
+    assignment = re.compile(rf"\b({IDENT})\s*=\s*({IDENT})\s*\(\s*\[")
+    for m in assignment.finditer(source):
+        table_name, rotator = m.group(1), m.group(2)
+        table_scope = enclosing_function_scope(spans, m.start())
+        array_start = source.find("[", m.start(), m.end())
+        parsed = parse_string_array(source, array_start)
+        if parsed is None:
+            continue
+        values, array_end = parsed
+        suffix = re.match(rf"\s*,\s*({NUM})\s*\)", source[array_end:])
+        if not suffix or not values:
+            continue
+        rotation = int(suffix.group(1), 0) % len(values)
+
+        rotator_fn = next(
+            (
+                found
+                for found in named_functions(source, rotator)
+                if enclosing_function_scope(spans, found[1]) == table_scope
+            ),
+            None,
+        )
+        if not rotator_fn or len(rotator_fn[3]) < 2:
+            continue
+        rotator_body, _, _, rotator_params = rotator_fn
+        array_param, count_param = rotator_params[:2]
+        push_shift = re.search(
+            rf"\b{re.escape(array_param)}\s*\.\s*push\s*\(\s*"
+            rf"{re.escape(array_param)}\s*\.\s*shift\s*\(\s*\)\s*\)",
+            rotator_body,
+        )
+        loop_uses_count = re.search(
+            rf"\bfor\s*\([^;]*;[^;]*<\s*{re.escape(count_param)}\b", rotator_body
+        )
+        returned = re.search(rf"\breturn\s+{re.escape(array_param)}\s*;?", rotator_body)
+        if not (push_shift and loop_uses_count and returned):
+            continue
+
+        for dm in re.finditer(rf"\bfunction\s+({IDENT})\s*\(([^)]*)\)\s*\{{", source):
+            if dm.start() >= m.start():
+                continue
+            if enclosing_function_scope(spans, dm.start()) != table_scope:
+                continue
+            decoder_name = dm.group(1)
+            got = function_body(source, dm)
+            if not got:
+                continue
+            decoder_body, _ = got
+            # The compact wrapper must directly feed an indexed entry from the
+            # rotated table into a named transform and cache/return the result.
+            transform_match = re.search(
+                rf"\b({IDENT})\s*\(\s*{re.escape(table_name)}\s*\[", decoder_body
+            )
+            if (
+                not transform_match
+                or "typeof" not in decoder_body
+                or "return" not in decoder_body
+                or len(decoder_body) > 4096
+            ):
+                continue
+            transform = transform_match.group(1)
+            transform_fn = next(
+                (
+                    found
+                    for found in named_functions(source, transform)
+                    if enclosing_function_scope(spans, found[1]) == table_scope
+                ),
+                None,
+            )
+            if not transform_fn or transform_fn[1] >= dm.start():
+                continue
+            transform_body = transform_fn[0]
+            alphabets = [s for s in string_literals(transform_body) if len(s) == 91]
+            alphabet = next(
+                (
+                    candidate
+                    for candidate in alphabets
+                    if looks_like_base91_decoder(transform_body, candidate, simple_arrays)
+                ),
+                None,
+            )
+            if alphabet is None:
+                continue
+            rotated = values[rotation:] + values[:rotation]
+            out.append(
+                Base91Decoder(
+                    name=decoder_name,
+                    table_name=table_name,
+                    values=rotated,
+                    rotation=rotation,
+                    alphabet=alphabet,
+                    transform=transform,
+                )
+            )
+    unique = {}
+    for decoder in out:
+        unique[(decoder.name, decoder.table_name)] = decoder
+    return list(unique.values())
+
+
+def function_spans(source: str):
+    spans = []
+    for m in re.finditer(rf"\bfunction(?:\s+{IDENT})?\s*\(([^)]*)\)\s*\{{", source):
+        got = function_body(source, m)
+        if not got:
+            continue
+        _, end = got
+        spans.append((m.start(), end, m.group(1)))
+    return spans
+
+
+def shadowed_scopes(source: str, name: str, primary_start: int) -> list[tuple[int, int]]:
+    spans = function_spans(source)
+    shadows = []
+    declaration_positions = [
+        m.start()
+        for m in re.finditer(rf"\bfunction\s+{re.escape(name)}\s*\(", source)
+        if m.start() != primary_start
+    ]
+    declaration_positions.extend(
+        m.start()
+        for m in re.finditer(rf"\b(?:var|let|const)\s+{re.escape(name)}\b", source)
+    )
+    for start, end, params in spans:
+        param_names = [p.strip().lstrip("...").strip() for p in params.split(",") if p.strip()]
+        if name in param_names:
+            shadows.append((start, end))
+    for pos in declaration_positions:
+        containers = [(start, end) for start, end, _ in spans if start < pos < end]
+        if containers:
+            shadows.append(min(containers, key=lambda span: span[1] - span[0]))
+    shadows.sort()
+    merged = []
+    for start, end in shadows:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def in_spans(pos: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= pos < end for start, end in spans)
+
+
+def base91_call_replacements(
+    source: str,
+    decoder: Base91Decoder,
+    simple_arrays: dict[str, list[object]],
+) -> list[tuple[int, int, str, str]]:
+    primary = named_function(source, decoder.name)
+    if not primary:
+        return []
+    excluded = shadowed_scopes(source, decoder.name, primary[1])
+    replacements = []
+    seen = set()
+
+    direct = re.compile(rf"\b{re.escape(decoder.name)}\s*\(\s*({NUM})\s*\)")
+    for m in direct.finditer(source):
+        if in_spans(m.start(), excluded):
+            continue
+        index = int(m.group(1), 0)
+        if not 0 <= index < len(decoder.values):
+            continue
+        try:
+            text = decode_base91(decoder.values[index], decoder.alphabet)
+        except ValueError:
+            continue
+        span = (m.start(), m.end())
+        seen.add(span)
+        replacements.append((*span, json.dumps(text, ensure_ascii=False), decoder.name))
+
+    indirect = re.compile(
+        rf"\b{re.escape(decoder.name)}\s*\(\s*({IDENT})\s*\[\s*({NUM})\s*\]\s*\)"
+    )
+    for m in indirect.finditer(source):
+        if in_spans(m.start(), excluded):
+            continue
+        values = simple_arrays.get(m.group(1))
+        if values is None:
+            continue
+        slot = int(m.group(2), 0)
+        if not 0 <= slot < len(values) or not isinstance(values[slot], int):
+            continue
+        index = values[slot]
+        if not 0 <= index < len(decoder.values):
+            continue
+        span = (m.start(), m.end())
+        if span in seen:
+            continue
+        try:
+            text = decode_base91(decoder.values[index], decoder.alphabet)
+        except ValueError:
+            continue
+        replacements.append((*span, json.dumps(text, ensure_ascii=False), decoder.name))
+    return replacements
+
+
+STRING_TOKEN = r"(?:'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")"
+STRING_CONCAT_RE = re.compile(rf"({STRING_TOKEN})\s*\+\s*({STRING_TOKEN})")
+
+
+def fold_literal_string_concats(source: str) -> tuple[str, int]:
+    folds = 0
+    while True:
+        replacements = []
+        for m in STRING_CONCAT_RE.finditer(source):
+            try:
+                left = literal_string(m.group(1))
+                right = literal_string(m.group(2))
+            except ValueError:
+                continue
+            replacements.append((m.start(), m.end(), json.dumps(left + right, ensure_ascii=False)))
+        if not replacements:
+            break
+        out = source
+        for start, end, text in reversed(replacements):
+            out = out[:start] + text + out[end:]
+        source = out
+        folds += len(replacements)
+    return source, folds
 
 
 @dataclass
@@ -354,18 +792,10 @@ def safe_aliases(source: str, decoder_name: str) -> list[str]:
 
 
 def recover(source: str) -> tuple[str, dict]:
-    if LOWER_B64 not in source:
-        return source, {
-            "schema": "js-static-string-recovery/v1",
-            "safe_static_only": True,
-            "changed": False,
-            "input_sha256": hashlib.sha256(source.encode()).hexdigest(),
-            "output_sha256": hashlib.sha256(source.encode()).hexdigest(),
-            "decoders": [],
-            "replacements": 0,
-        }
-    providers = discover_providers(source)
+    providers = discover_providers(source) if LOWER_B64 in source else []
     decoders = discover_decoders(source, providers)
+    simple_arrays = discover_simple_arrays(source)
+    base91_decoders = discover_rotated_base91_decoders(source, simple_arrays)
     replacements: list[tuple[int, int, str, str]] = []
     rows = []
     for dec in decoders:
@@ -420,6 +850,24 @@ def recover(source: str) -> tuple[str, dict]:
             "aliases": aliases,
             "replacements": len(seen_spans),
         })
+
+    for dec in base91_decoders:
+        recovered = base91_call_replacements(source, dec, simple_arrays)
+        replacements.extend(recovered)
+        rows.append({
+            "decoder": dec.name,
+            "provider": dec.table_name,
+            "mode": "rotated_base91",
+            "offset": 0,
+            "rotation": dec.rotation,
+            "table_entries": len(dec.values),
+            "aliases": [dec.name],
+            "transform": dec.transform,
+            "alphabet_sha256": hashlib.sha256(dec.alphabet.encode()).hexdigest(),
+            "replacements": len(recovered),
+            "status": "proven",
+        })
+
     # Never allow overlap; generated decoder calls are simple and should be disjoint.
     replacements.sort(key=lambda r: (r[0], r[1]))
     filtered = []
@@ -432,14 +880,19 @@ def recover(source: str) -> tuple[str, dict]:
     out = source
     for start, stop, text, _ in reversed(filtered):
         out = out[:start] + text + out[stop:]
+    concat_folds = 0
+    if base91_decoders and filtered:
+        out, concat_folds = fold_literal_string_concats(out)
     return out, {
-        "schema": "js-static-string-recovery/v1",
+        "schema": "js-static-string-recovery/v2",
         "safe_static_only": True,
-        "changed": bool(filtered),
+        "changed": bool(filtered or concat_folds),
         "input_sha256": hashlib.sha256(source.encode()).hexdigest(),
         "output_sha256": hashlib.sha256(out.encode()).hexdigest(),
         "decoders": rows,
-        "replacements": len(filtered),
+        "replacements": len(filtered) + concat_folds,
+        "decoder_call_replacements": len(filtered),
+        "literal_concat_folds": concat_folds,
     }
 
 

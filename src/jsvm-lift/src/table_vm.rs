@@ -225,6 +225,10 @@ fn target_ident(target: &AssignmentTarget<'_>) -> Option<String> {
 fn static_method(call: &CallExpression<'_>) -> Option<String> {
     match unwrap_parens(&call.callee) {
         Expression::StaticMemberExpression(sm) => Some(sm.property.name.to_string()),
+        Expression::ComputedMemberExpression(cm) => match unwrap_parens(&cm.expression) {
+            Expression::StringLiteral(value) => Some(value.value.to_string()),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -443,13 +447,22 @@ impl<'s> Analyzer<'s> {
         let Expression::CallExpression(call) = unwrap_parens(&assign.right) else {
             return;
         };
-        let Expression::StaticMemberExpression(bind) = unwrap_parens(&call.callee) else {
-            return;
+        let bind_object = match unwrap_parens(&call.callee) {
+            Expression::StaticMemberExpression(bind) if bind.property.name.as_str() == "bind" => {
+                &bind.object
+            }
+            Expression::ComputedMemberExpression(bind) => {
+                let Expression::StringLiteral(property) = unwrap_parens(&bind.expression) else {
+                    return;
+                };
+                if property.value.as_str() != "bind" {
+                    return;
+                }
+                &bind.object
+            }
+            _ => return,
         };
-        if bind.property.name.as_str() != "bind" {
-            return;
-        }
-        let Expression::ComputedMemberExpression(src) = unwrap_parens(&bind.object) else {
+        let Expression::ComputedMemberExpression(src) = unwrap_parens(bind_object) else {
             return;
         };
         let source_table = fragment(self.source, src.object.span());
@@ -542,34 +555,31 @@ impl<'s> Analyzer<'s> {
         }
 
         for ((scope_start, scope_end, binding), source) in &self.registry_sources {
+            let key = (*scope_start, *scope_end, binding.clone());
+            let Some((start, end)) = self.registry_spans.get(&key).copied() else {
+                continue;
+            };
+            // The assignment proves where the source handler table is consumed.
+            // An installed instance registry can then be used by sibling methods,
+            // so inherit the source table's enclosing scope instead of widening
+            // to the physical file boundary.
             let Some(source_table) = self
                 .tables
                 .iter()
                 .filter(|table| table.binding == *source)
-                .filter(|table| table.scope_start <= *scope_start && table.scope_end >= *scope_end)
+                .filter(|table| table.scope_start <= start && table.scope_end >= end)
                 .min_by_key(|table| table.scope_end.saturating_sub(table.scope_start))
                 .cloned()
             else {
                 continue;
             };
-            let key = (*scope_start, *scope_end, binding.clone());
-            let (start, end) = self
-                .registry_spans
-                .get(&key)
-                .copied()
-                .unwrap_or((source_table.start, source_table.end));
-            let scope_function_id = self
-                .functions
-                .iter()
-                .find(|f| f.start == *scope_start && f.end == *scope_end)
-                .map(|f| f.id.clone());
             self.tables.push(DetailedHandlerTableCandidate {
                 binding: binding.clone(),
                 start,
                 end,
-                scope_function_id,
-                scope_start: *scope_start,
-                scope_end: *scope_end,
+                scope_function_id: source_table.scope_function_id.clone(),
+                scope_start: source_table.scope_start,
+                scope_end: source_table.scope_end,
                 container_kind: "derived-registry".into(),
                 entries: source_table.entries,
                 function_values: source_table.function_values,

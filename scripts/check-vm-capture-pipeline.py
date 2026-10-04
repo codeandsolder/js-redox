@@ -190,32 +190,61 @@ def main():
                 if u.get("origin") == "generated_dynamic_code"
             ]
             assert generated
-            candidate = max(
+            recovered_vm = max(
                 generated,
                 key=lambda unit: int(unit.get("largest_handler_table", 0)),
             )
-            assert candidate["analysis_origin"] == "exact_fallback"
-            assert candidate["large_handler_table_candidate"] is True
-            assert candidate["largest_handler_table"] >= 74
+            assert recovered_vm["analysis_origin"] == "string_recovery_only"
+            assert recovered_vm["path"].startswith("src/_dynamic_deobfuscated/")
+            assert recovered_vm["largest_handler_table"] >= 74
+            assert recovered_vm["large_handler_table_candidate"] is False
+            assert recovered_vm["confirmed_vm_signal"] is True
+            assert recovered_vm["table_vms"] >= 1
+
+            devirt = [
+                u
+                for u in analysis.get("devirtualized_units", [])
+                if u.get("vm_kind") == "function_table"
+                and u.get("parent_scan_id") == recovered_vm["scan_id"]
+            ]
+            assert devirt
+            assert max(u["handler_count"] for u in devirt) >= 74
+            assert all((project / u["source_path"]).is_file() for u in devirt)
+            assert all((project / u["pseudocode_path"]).is_file() for u in devirt)
 
             recovery = load(project, "analysis/generated-recovery.json")
-            assert recovery["summary"]["exact_fallback"] >= 1
-            failed = next(
+            assert recovery["summary"]["string_recovery_only"] >= 1
+            assert recovery["summary"]["exact_fallback"] == 0
+            recovered = next(
                 unit
                 for unit in recovery["units"]
-                if unit["selected_stage"] == "exact_fallback"
+                if unit["selected_stage"] == "string_recovery_only"
             )
-            assert failed["deobfuscation"]["exit"] != 0
-            assert failed["analysis_path"] == failed["raw_path"]
+            assert recovered["string_recovery"]["changed"] is True
+            assert recovered["string_recovery"]["replacements"] >= 500
+            assert recovered["deobfuscation"]["exit"] != 0
+            assert recovered["analysis_path"] != recovered["raw_path"]
+
+            string_report = load(project, recovered["string_recovery_report"])
+            base91 = [
+                decoder
+                for decoder in string_report["decoders"]
+                if decoder.get("mode") == "rotated_base91"
+            ]
+            assert len(base91) == 1
+            assert base91[0]["rotation"] == 12
+            assert base91[0]["table_entries"] == 668
+            assert base91[0]["replacements"] >= 480
 
             graph = load(project, "analysis/source-graph.json")
             assert graph["summary"]["edge_kinds"].get("generated_code", 0) >= 1
+            assert graph["summary"]["edge_kinds"].get("generated_safe_recovery", 0) >= 1
+            assert graph["summary"]["edge_kinds"].get("devirtualized_vm", 0) >= 1
             dynamic_nodes = [
                 n for n in graph["nodes"] if n.get("type") == "generated_dynamic_code"
             ]
             assert dynamic_nodes
             assert any(n.get("child_scan_id") is not None for n in dynamic_nodes)
-            assert graph["summary"]["edge_kinds"].get("generated_safe_recovery", 0) == 0
 
     print("PASS: capture pipeline VM regressions")
     for name, output in results.items():
