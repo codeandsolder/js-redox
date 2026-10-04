@@ -14,6 +14,7 @@ PROJECT = WORK / "project"
 TRUNCATED_HAR = WORK / "fixture-truncated.har"
 TRUNCATED_PROJECT = WORK / "project-truncated"
 BUNDLE_FIXTURE = ROOT / "corpus/generated/reversible-obfuscation/bundle-module-tables.js"
+GENERATED_CHILD_FIXTURE = ROOT / "corpus/generated/reversible-obfuscation/generated-child-safe.js"
 HAR_PROJECT = TOOL_ROOT / "har-project"
 
 
@@ -69,10 +70,12 @@ def main():
     shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(parents=True)
 
+    generated_child = GENERATED_CHILD_FIXTURE.read_text().strip()
     app_js = (
         BUNDLE_FIXTURE.read_text()
         + '\nnew Worker("./worker.js");\n'
-        + 'globalThis.__generated = Function("return 7");\n'
+        + generated_child + "\n"
+        + generated_child + "\n"
         + '//# sourceMappingURL=app.js.map\n'
     )
     html = (
@@ -257,8 +260,15 @@ def main():
     assert app_scan["analysis_origin"] == "safe_deobfuscation"
     assert app_scan["path"] == app_deob["output_path"]
     assert app_scan["scanner_exit"] == 0
-    assert analysis["scanner_invocations"] == 3
-    assert analysis["deduplicated_scans"] == 1
+    assert analysis["scanner_invocations"] == 4
+    assert analysis["deduplicated_scans"] == 2
+    generated_recovery = json.loads(
+        (PROJECT / "analysis/generated-recovery.json").read_text()
+    )
+    assert generated_recovery["summary"]["generated_units"] == 2
+    assert generated_recovery["summary"]["unique_raw_inputs"] == 1
+    assert generated_recovery["summary"]["deduplicated_units"] == 1
+    assert generated_recovery["summary"]["safe_deobfuscation"] == 2
 
     graph = json.loads((PROJECT / "analysis/source-graph.json").read_text())
     edge_kinds = graph["summary"]["edge_kinds"]
@@ -267,6 +277,8 @@ def main():
     assert edge_kinds.get("source_map_source") == 1
     assert edge_kinds.get("js_worker") == 1
     assert edge_kinds.get("safe_deobfuscation") == 4
+    assert edge_kinds.get("generated_code") == 2
+    assert edge_kinds.get("generated_safe_recovery") == 2
     assert edge_kinds.get("bundle_payload", 0) >= 1
     assert edge_kinds.get("bundle_module", 0) >= 2
     assert edge_kinds.get("bundle_module_dependency", 0) >= 1

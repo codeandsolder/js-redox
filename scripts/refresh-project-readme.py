@@ -135,6 +135,9 @@ def main():
         f"- Generated-code safe recovery: **{generated_recovery.get('summary', {}).get('safe_deobfuscation', 0)}** safe deob, "
         f"**{generated_recovery.get('summary', {}).get('string_recovery_only', 0)}** string-only, "
         f"**{generated_recovery.get('summary', {}).get('exact_fallback', 0)}** exact fallback",
+        f"- Generated-child exact-content reuse: **{generated_recovery_summary.get('unique_raw_inputs', generated_recovery_summary.get('generated_units', 0))}** unique bodies / "
+        f"**{generated_recovery_summary.get('generated_units', 0)}** occurrences "
+        f"(**{generated_recovery_summary.get('deduplicated_units', 0)}** recovery reuses)",
         f"- Generated children with full safe deobfuscation: **{generated_recovery_summary.get('safe_deobfuscation', 0)}**",
         f"- Generated children with string-recovery only: **{generated_recovery_summary.get('string_recovery_only', 0)}**",
         f"- Generated children scanned from exact fallback bytes: **{generated_recovery_summary.get('exact_fallback', 0)}**",

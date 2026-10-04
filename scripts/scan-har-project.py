@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 
 from browser_script_types import is_executable_script
-from content_dedup import sha256_path
+from content_dedup import link_or_copy, sha256_path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STRING_RECOVERER = ROOT / "scripts/recover-js-obfuscator-strings.py"
@@ -25,6 +25,11 @@ def direct_summary(report):
         "direct_switch_maps": len(direct_switches),
         "confirmed_direct_switch_maps": sum(
             bool(m.get("confirmed_vm")) for m in direct_switches
+        ),
+        "weak_direct_switch_maps": sum(
+            not bool(m.get("confirmed_vm"))
+            and int(m.get("vm_evidence_score", 0)) >= 3
+            for m in direct_switches
         ),
         "handler_tables": len(handler_tables),
         "largest_handler_table": max(
@@ -46,10 +51,6 @@ def run_tool(argv, timeout):
         stderr=subprocess.PIPE,
         timeout=timeout,
     )
-
-
-def sha256_path(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def generated_output_path(root: str, scan_id: int, ordinal: int) -> Path:
@@ -214,6 +215,53 @@ def recover_generated_unit(
     return row
 
 
+def reuse_generated_unit(
+    project: Path,
+    raw_rel: str,
+    scan_id: int,
+    ordinal: int,
+    cached: dict,
+):
+    recovery_rel = Path("analysis/generated-recovery") / f"{scan_id:04}-{ordinal:03}"
+    recovery_dir = project / recovery_rel
+    recovery_dir.mkdir(parents=True, exist_ok=True)
+
+    string_report_rel = recovery_rel / "string-recovery.json"
+    deob_report_rel = recovery_rel / "deobfuscation.json"
+    cached_string_report = project / cached["string_recovery_report"]
+    cached_deob_report = project / cached["deobfuscation_report"]
+    if cached_string_report.is_file():
+        link_or_copy(cached_string_report, project / string_report_rel)
+    if cached_deob_report.is_file():
+        link_or_copy(cached_deob_report, project / deob_report_rel)
+
+    safe_rel = generated_output_path("_dynamic_deobfuscated", scan_id, ordinal)
+    readable_rel = generated_output_path("_dynamic", scan_id, ordinal)
+    if cached["selected_stage"] == "exact_fallback":
+        analysis_rel = Path(raw_rel)
+    else:
+        analysis_rel = safe_rel
+        link_or_copy(project / cached["analysis_path"], project / safe_rel)
+    link_or_copy(project / cached["readable_path"], project / readable_rel)
+
+    row = copy.deepcopy(cached)
+    row.update(
+        {
+            "parent_scan_id": scan_id,
+            "ordinal": ordinal,
+            "raw_path": raw_rel,
+            "string_recovery_report": str(string_report_rel),
+            "deobfuscation_report": str(deob_report_rel),
+            "analysis_path": str(analysis_rel),
+            "readable_path": str(readable_rel),
+            "deduplicated": True,
+            "deduplicated_from_parent_scan_id": cached["parent_scan_id"],
+            "deduplicated_from_ordinal": cached["ordinal"],
+        }
+    )
+    return row
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Recursively recover and scan JavaScript code units for generated code and VM structures"
@@ -280,6 +328,7 @@ def main():
 
     code_units = []
     generated_recovery = []
+    generated_recovery_cache = {}
     seen_scan_paths = set()
 
     def queue(unit):
@@ -445,14 +494,27 @@ def main():
             raw_rel = str(raw.relative_to(project))
             depth = parent_depth + 1
 
-            recovery = recover_generated_unit(
-                project,
-                raw,
-                raw_rel,
-                scan_id,
-                ordinal,
-                args,
-            )
+            raw_sha = sha256_path(raw)
+            cached_recovery = generated_recovery_cache.get(raw_sha)
+            if cached_recovery is None:
+                recovery = recover_generated_unit(
+                    project,
+                    raw,
+                    raw_rel,
+                    scan_id,
+                    ordinal,
+                    args,
+                )
+                recovery["deduplicated"] = False
+                generated_recovery_cache[raw_sha] = copy.deepcopy(recovery)
+            else:
+                recovery = reuse_generated_unit(
+                    project,
+                    raw_rel,
+                    scan_id,
+                    ordinal,
+                    cached_recovery,
+                )
             generated_recovery.append(recovery)
 
             item = {
@@ -552,7 +614,7 @@ def main():
         )
         row["vm_signal"] = (
             row["confirmed_vm_signal"]
-            or row["direct_switch_maps"] > 0
+            or row["weak_direct_switch_maps"] > 0
             or row["large_handler_table_candidate"]
         )
         rows.append(row)
@@ -564,6 +626,10 @@ def main():
         "units": generated_recovery,
         "summary": {
             "generated_units": len(generated_recovery),
+            "unique_raw_inputs": len(generated_recovery_cache),
+            "deduplicated_units": sum(
+                bool(u.get("deduplicated")) for u in generated_recovery
+            ),
             "safe_deobfuscation": sum(
                 u.get("selected_stage") == "safe_deobfuscation"
                 for u in generated_recovery
@@ -635,6 +701,7 @@ def main():
         print(
             f"{label} {row['path']}: confirmed={row.get('confirmed_dispatchers',0)} "
             f"opmaps={row.get('opcode_maps',0)} switches={row.get('direct_switch_maps',0)} "
+            f"weak_switches={row.get('weak_direct_switch_maps',0)} "
             f"confirmed_switches={row.get('confirmed_direct_switch_maps',0)} "
             f"handlers={row.get('largest_looped_dynamic_handler_table',0)} "
             f"(raw_non_bundle={row.get('largest_non_bundle_handler_table',0)} "
