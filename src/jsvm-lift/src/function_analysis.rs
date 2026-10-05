@@ -1,6 +1,10 @@
-use crate::decoder::{
-    annotate_bitfield_selectors, derive_candidates, link_candidates, BuilderSite, DecoderCandidate,
-    IndexedAccess,
+use crate::{
+    bytecode::PushBuilderCandidate,
+    decoder::{
+        annotate_bitfield_selectors, complete_selector_masks, derive_candidates, link_candidates,
+        observed_opcodes, BuilderSite, DecoderCandidate, IndexedAccess,
+    },
+    state_flatten::DecoderControlInfo,
 };
 use oxc_ast::{ast::Expression, AstKind};
 use oxc_ast_visit::Visit;
@@ -163,7 +167,7 @@ impl FunctionState {
         }
     }
 
-    pub fn finalize_decoders(&mut self) {
+    fn linked_decoder_candidates(&self) -> Vec<DecoderCandidate> {
         let mut decoder_accesses = self.indexed_accesses.clone();
         decoder_accesses.extend(self.child_indexed_accesses.iter().cloned());
         let mut local_decoders = derive_candidates(&self.m.id, &decoder_accesses);
@@ -173,13 +177,63 @@ impl FunctionState {
             &self.bit_masks,
             &self.aliases,
         );
-        self.decoder_candidates.extend(local_decoders);
+
+        let mut candidates = self.decoder_candidates.clone();
+        candidates.extend(local_decoders);
         link_candidates(
-            &mut self.decoder_candidates,
+            &mut candidates,
             &self.aliases,
             &self.push_builder_vars,
             &self.push_builder_sites,
         );
+        candidates
+    }
+
+    pub fn finalize_decoders(&mut self) {
+        self.decoder_candidates = self.linked_decoder_candidates();
+    }
+
+    pub fn decoder_controls(&self, builders: &[PushBuilderCandidate]) -> Vec<DecoderControlInfo> {
+        let mut candidates = self.linked_decoder_candidates();
+
+        // A selector bit can be decoded in a sibling fetch-control state and
+        // therefore be absent from local AST mask tracking. Once the stream is
+        // linked, observed opcode values give a conservative lower bound for
+        // the selector width. Complete the domain before state simulation.
+        complete_selector_masks(&mut candidates, builders);
+
+        let mut seen = BTreeSet::new();
+        candidates
+            .iter()
+            .filter_map(|decoder| {
+                let selector_var = decoder.selector_var.as_ref()?;
+                if decoder.selector_masks.len() < 2 {
+                    return None;
+                }
+                let key = (
+                    decoder.function_id.clone(),
+                    selector_var.clone(),
+                    decoder.selector_masks.clone(),
+                );
+                if !seen.insert(key.clone()) {
+                    return None;
+                }
+                let observed_source = candidates
+                    .iter()
+                    .find(|candidate| {
+                        candidate.function_id == decoder.function_id
+                            && candidate.selector_var == decoder.selector_var
+                            && candidate.builder_start.is_some()
+                    })
+                    .unwrap_or(decoder);
+                Some(DecoderControlInfo {
+                    function_id: key.0,
+                    selector_var: key.1,
+                    selector_masks: key.2,
+                    observed_opcodes: observed_opcodes(observed_source, builders),
+                })
+            })
+            .collect()
     }
 
     pub fn finalize_metrics(
@@ -320,6 +374,59 @@ mod tests {
             ..ExprEvidence::default()
         };
         assert!(evidence_reaches_computed(&evidence, &vars));
+    }
+
+    #[test]
+    fn prepares_decoder_controls_with_observed_opcodes() {
+        let mut function = FunctionState::new("function", None, 0, 100);
+        function.decoder_candidates.push(DecoderCandidate {
+            function_id: function.m.id.clone(),
+            object: "code".to_string(),
+            builder_var: Some("code".to_string()),
+            builder_start: Some(100),
+            builder_end: Some(200),
+            builder_arguments: Some(8),
+            builder_width_hints: Vec::new(),
+            base: None,
+            ip: "ip".to_string(),
+            width: 2,
+            operand_offsets: vec![0],
+            operand_vars: HashMap::new().into_iter().collect(),
+            selector_var: Some("opcode".to_string()),
+            selector_masks: vec![1, 2],
+            start: 10,
+            end: 20,
+            preview: "code[ip * 2]".to_string(),
+        });
+        let builders = vec![PushBuilderCandidate {
+            start: 100,
+            end: 200,
+            receiver: "code".to_string(),
+            arguments: 8,
+            numeric_literals: 8,
+            byte_literals: 8,
+            call_arguments: 0,
+            other_arguments: 0,
+            width_hints: Vec::new(),
+            values: vec![
+                Some(0),
+                Some(9),
+                Some(1),
+                Some(9),
+                Some(2),
+                Some(9),
+                Some(3),
+                Some(9),
+            ],
+            unknowns: Vec::new(),
+            preview: "code.push(...)".to_string(),
+        }];
+
+        let controls = function.decoder_controls(&builders);
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0].selector_var, "opcode");
+        assert_eq!(controls[0].selector_masks, vec![1, 2]);
+        assert_eq!(controls[0].observed_opcodes, vec![0, 1, 2, 3]);
     }
 
     #[test]

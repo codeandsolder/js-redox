@@ -10,9 +10,8 @@ use anyhow::{Context, Result};
 use bytecode::{detect_numeric_array, detect_push_builder, ArrayCandidate, PushBuilderCandidate};
 use clap::Parser as ClapParser;
 use decoder::{
-    annotate_bitfield_selectors, complete_selector_masks, derive_candidates, expr_ident,
-    index_shape, link_candidates, observed_opcodes, origin_ident, origin_u64, resolve_alias,
-    target_ident, BuilderSite, DecoderCandidate, IndexedAccess,
+    complete_selector_masks, expr_ident, index_shape, observed_opcodes, origin_ident, origin_u64,
+    resolve_alias, target_ident, BuilderSite, DecoderCandidate, IndexedAccess,
 };
 use dispatch::{
     detect_array_handler_table, detect_direct_switch, detect_object_handler_table,
@@ -30,8 +29,8 @@ use oxc_syntax::scope::ScopeFlags;
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use state_flatten::{
-    detect_for_state_machines, DecoderControlInfo, IfLadderStateMachineCandidate,
-    OpcodeMapCandidate, StateMachineCandidate, StateMachineInfo,
+    detect_for_state_machines, IfLadderStateMachineCandidate, OpcodeMapCandidate,
+    StateMachineCandidate, StateMachineInfo,
 };
 use std::{
     collections::{BTreeSet, HashMap},
@@ -155,93 +154,11 @@ impl<'s> Scanner<'s> {
     }
 
     fn analyze_opcode_maps(&mut self, function: &oxc_ast::ast::Function<'_>) {
-        let (
-            parent_function_id,
-            mut decoder_candidates,
-            accesses,
-            indexed_value_vars,
-            bit_masks,
-            aliases,
-            push_builder_vars,
-            push_builder_sites,
-        ) = {
-            let Some(current) = self.stack.last() else {
-                return;
-            };
-            let mut accesses = current.indexed_accesses.clone();
-            accesses.extend(current.child_indexed_accesses.iter().cloned());
-            (
-                current.m.id.clone(),
-                current.decoder_candidates.clone(),
-                accesses,
-                current.indexed_value_vars.clone(),
-                current.bit_masks.clone(),
-                current.aliases.clone(),
-                current.push_builder_vars.clone(),
-                current.push_builder_sites.clone(),
-            )
+        let Some(current) = self.stack.last() else {
+            return;
         };
-
-        // At function-exit child decoders have already propagated, but local
-        // indexed reads have not yet gone through finish_function(). Derive
-        // those here as well so opcode flattening does not depend on a nested
-        // closure layout.
-        let mut local = derive_candidates(&parent_function_id, &accesses);
-        annotate_bitfield_selectors(&mut local, &indexed_value_vars, &bit_masks, &aliases);
-        link_candidates(
-            &mut local,
-            &aliases,
-            &push_builder_vars,
-            &push_builder_sites,
-        );
-        decoder_candidates.extend(local);
-        link_candidates(
-            &mut decoder_candidates,
-            &aliases,
-            &push_builder_vars,
-            &push_builder_sites,
-        );
-
-        // A selector bit can be decoded in a sibling fetch-control state and
-        // therefore be absent from local AST mask tracking. Once the stream is
-        // linked, observed opcode values give a conservative lower bound for
-        // the selector width. Complete the domain before state simulation.
-        complete_selector_masks(&mut decoder_candidates, &self.push_builders);
-
-        let mut seen_decoders = BTreeSet::new();
-        let decoders: Vec<DecoderControlInfo> = decoder_candidates
-            .iter()
-            .filter_map(|decoder| {
-                let selector_var = decoder.selector_var.as_ref()?;
-                if decoder.selector_masks.len() < 2 {
-                    return None;
-                }
-                let key = (
-                    decoder.function_id.clone(),
-                    selector_var.clone(),
-                    decoder.selector_masks.clone(),
-                );
-                if !seen_decoders.insert(key.clone()) {
-                    return None;
-                }
-                let observed_source = decoder_candidates
-                    .iter()
-                    .find(|candidate| {
-                        candidate.function_id == decoder.function_id
-                            && candidate.selector_var == decoder.selector_var
-                            && candidate.builder_start.is_some()
-                    })
-                    .unwrap_or(decoder);
-                let observed_opcodes = observed_opcodes(observed_source, &self.push_builders);
-                Some(DecoderControlInfo {
-                    function_id: key.0,
-                    selector_var: key.1,
-                    selector_masks: key.2,
-                    observed_opcodes,
-                })
-            })
-            .collect();
-
+        let parent_function_id = current.m.id.clone();
+        let decoders = current.decoder_controls(&self.push_builders);
         if decoders.is_empty() {
             return;
         }
@@ -260,7 +177,6 @@ impl<'s> Scanner<'s> {
                 selector_var: machine.selector_var.clone(),
             })
             .collect();
-
         if machines.is_empty() {
             return;
         }
