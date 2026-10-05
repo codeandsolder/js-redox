@@ -10,7 +10,7 @@ use control_flow::{
     collect_dispatch_bindings, collect_reference_spans, detect_reference_identity_tables,
     reference_identity, ReferenceIdentityTable,
 };
-use decoder::{detect_decoders, detect_direct_table_decoders, Decoder};
+use decoder::{analyze_decoders, Decoder};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, CallExpression, ComputedMemberExpression,
@@ -21,10 +21,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_semantic::{ReferenceId, Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
-use oxc_syntax::{
-    scope::{ScopeFlags, ScopeId},
-    symbol::SymbolId,
-};
+use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use proxy::{
     collect_proxy_objects, proxy_literal_kind, static_proxy_member, ProxyObject, ProxyProperty,
 };
@@ -189,52 +186,6 @@ fn array_element(el: &ArrayExpressionElement<'_>) -> Option<Value> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct StaticArrayInfo {
-    symbol: SymbolId,
-    name: String,
-    values: Vec<Value>,
-    span: Span,
-}
-
-#[derive(Default)]
-struct StaticArrayCollector {
-    candidates: Vec<StaticArrayInfo>,
-}
-
-impl<'a> Visit<'a> for StaticArrayCollector {
-    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
-        for d in &it.declarations {
-            let BindingPattern::BindingIdentifier(id) = &d.id else {
-                continue;
-            };
-            let Some(symbol) = id.symbol_id.get() else {
-                continue;
-            };
-            let Some(Expression::ArrayExpression(arr)) = &d.init else {
-                continue;
-            };
-            let Some(values) = arr
-                .elements
-                .iter()
-                .map(array_element)
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
-            if !values.is_empty() {
-                self.candidates.push(StaticArrayInfo {
-                    symbol,
-                    name: id.name.to_string(),
-                    values,
-                    span: arr.span,
-                });
-            }
-        }
-        walk::walk_variable_declaration(self, it);
-    }
-}
-
 fn top_level_arrays(program: &oxc_ast::ast::Program<'_>) -> HashMap<SymbolId, Vec<Value>> {
     let mut out = HashMap::new();
     for stmt in &program.body {
@@ -268,242 +219,6 @@ fn top_level_arrays(program: &oxc_ast::ast::Program<'_>) -> HashMap<SymbolId, Ve
         }
     }
     out
-}
-
-fn decoder_static_arrays(
-    program: &oxc_ast::ast::Program<'_>,
-    scoping: &Scoping,
-) -> Vec<StaticArrayInfo> {
-    let mut collector = StaticArrayCollector::default();
-    collector.visit_program(program);
-    collector.candidates.retain(|candidate| {
-        scoping
-            .get_resolved_reference_ids(candidate.symbol)
-            .iter()
-            .all(|reference_id| {
-                let reference = scoping.get_reference(*reference_id);
-                !reference.is_write() && !reference.flags().is_member_write_target()
-            })
-    });
-    collector.candidates
-}
-
-#[derive(Default)]
-struct DirectCallCounter {
-    count: usize,
-}
-
-impl<'a> Visit<'a> for DirectCallCounter {
-    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
-        self.count += 1;
-        walk::walk_call_expression(self, it);
-    }
-
-    fn visit_function(&mut self, _f: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
-        // Nested functions do not execute as part of the candidate decoder
-        // invocation itself, so do not count calls inside them.
-    }
-}
-
-fn direct_body_call_count(body: &oxc_ast::ast::FunctionBody<'_>) -> usize {
-    let mut counter = DirectCallCounter::default();
-    for statement in &body.statements {
-        counter.visit_statement(statement);
-    }
-    counter.count
-}
-
-fn fixed_decoder_control_shape(body: &oxc_ast::ast::FunctionBody<'_>) -> bool {
-    if body.statements.len() != 3 {
-        return false;
-    }
-    let first = matches!(
-        &body.statements[0],
-        Statement::IfStatement(statement)
-            if statement.alternate.is_none()
-                && matches!(&statement.consequent, Statement::ReturnStatement(_))
-    );
-    let second = match &body.statements[1] {
-        Statement::ForStatement(statement) => match &statement.body {
-            Statement::ExpressionStatement(_) => true,
-            // The generic sequence splitter may already have turned the
-            // decoder's six comma-separated loop operations into six
-            // expression statements by the time the literal table becomes
-            // fully static on a later fixed-point iteration.
-            Statement::BlockStatement(block) => {
-                block.body.len() == 6
-                    && block
-                        .body
-                        .iter()
-                        .all(|statement| matches!(statement, Statement::ExpressionStatement(_)))
-            }
-            _ => false,
-        },
-        _ => false,
-    };
-    let third = matches!(&body.statements[2], Statement::ReturnStatement(_));
-    first && second && third
-}
-
-#[derive(Debug, Clone)]
-struct LocalStaticArrayInfo {
-    values: Vec<Value>,
-    span: Span,
-}
-
-#[derive(Debug)]
-struct FnInfo {
-    name: String,
-    symbol: SymbolId,
-    scope: ScopeId,
-    params: Vec<String>,
-    span: Span,
-    static_arrays: HashMap<String, LocalStaticArrayInfo>,
-}
-
-fn function_info(f: &oxc_ast::ast::Function<'_>, scoping: &Scoping) -> Option<FnInfo> {
-    if f.r#type != oxc_ast::ast::FunctionType::FunctionDeclaration {
-        return None;
-    }
-    let id = f.id.as_ref()?;
-    let symbol = id.symbol_id.get()?;
-    let params = f
-        .params
-        .items
-        .iter()
-        .filter_map(|p| match &p.pattern {
-            BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-            _ => None,
-        })
-        .collect();
-
-    let mut static_arrays = HashMap::new();
-    if let Some(body) = &f.body {
-        for stmt in &body.statements {
-            let Statement::VariableDeclaration(decl) = stmt else {
-                continue;
-            };
-            for d in &decl.declarations {
-                let BindingPattern::BindingIdentifier(array_id) = &d.id else {
-                    continue;
-                };
-                let Some(Expression::ArrayExpression(array)) = &d.init else {
-                    continue;
-                };
-                let Some(values) = array
-                    .elements
-                    .iter()
-                    .map(array_element)
-                    .collect::<Option<Vec<_>>>()
-                else {
-                    continue;
-                };
-                if !values.is_empty() {
-                    static_arrays.insert(
-                        array_id.name.to_string(),
-                        LocalStaticArrayInfo {
-                            values,
-                            span: array.span,
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    Some(FnInfo {
-        name: id.name.to_string(),
-        symbol,
-        scope: scoping.symbol_scope_id(symbol),
-        params,
-        span: f.span,
-        static_arrays,
-    })
-}
-
-struct FunctionDeclarationCollector<'s> {
-    scoping: &'s Scoping,
-    out: Vec<FnInfo>,
-}
-
-impl<'a> Visit<'a> for FunctionDeclarationCollector<'_> {
-    fn visit_function(
-        &mut self,
-        it: &oxc_ast::ast::Function<'a>,
-        flags: oxc_syntax::scope::ScopeFlags,
-    ) {
-        if let Some(info) = function_info(it, self.scoping) {
-            self.out.push(info);
-        }
-        walk::walk_function(self, it, flags);
-    }
-}
-
-fn all_function_declarations(
-    program: &oxc_ast::ast::Program<'_>,
-    scoping: &Scoping,
-) -> Vec<FnInfo> {
-    let mut collector = FunctionDeclarationCollector {
-        scoping,
-        out: Vec::new(),
-    };
-    collector.visit_program(program);
-    collector.out
-}
-
-#[derive(Debug)]
-struct DirectFnInfo {
-    symbol: SymbolId,
-    params: Vec<String>,
-    span: Span,
-    body_statement_count: usize,
-    direct_call_count: usize,
-    fixed_decoder_control_shape: bool,
-}
-
-#[derive(Default)]
-struct DirectFnInfoCollector {
-    out: Vec<DirectFnInfo>,
-}
-
-impl<'a> Visit<'a> for DirectFnInfoCollector {
-    fn visit_function(&mut self, f: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
-        if let Some(id) = &f.id {
-            if let Some(symbol) = id.symbol_id.get() {
-                let params = f
-                    .params
-                    .items
-                    .iter()
-                    .filter_map(|p| match &p.pattern {
-                        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-                        _ => None,
-                    })
-                    .collect();
-
-                self.out.push(DirectFnInfo {
-                    symbol,
-                    params,
-                    span: f.span,
-                    body_statement_count: f.body.as_ref().map_or(0, |body| body.statements.len()),
-                    direct_call_count: f
-                        .body
-                        .as_ref()
-                        .map_or(0, |body| direct_body_call_count(body)),
-                    fixed_decoder_control_shape: f
-                        .body
-                        .as_ref()
-                        .is_some_and(|body| fixed_decoder_control_shape(body)),
-                });
-            }
-        }
-        walk::walk_function(self, f, flags);
-    }
-}
-
-fn all_functions(program: &oxc_ast::ast::Program<'_>) -> Vec<DirectFnInfo> {
-    let mut collector = DirectFnInfoCollector::default();
-    collector.visit_program(program);
-    collector.out
 }
 
 #[derive(Default)]
@@ -1138,9 +853,8 @@ fn has_direct_eval(program: &oxc_ast::ast::Program<'_>) -> bool {
 }
 
 fn remove_unused_proven_helpers(
-    functions: &[FnInfo],
     scoping: &Scoping,
-    decoders: &HashMap<SymbolId, Decoder>,
+    decoder_helpers: &HashMap<SymbolId, Span>,
     pure_functions: &HashMap<SymbolId, PureFunction>,
     direct_eval_present: bool,
 ) -> Vec<Replacement> {
@@ -1148,24 +862,19 @@ fn remove_unused_proven_helpers(
         return Vec::new();
     }
     let root_scope = scoping.root_scope_id();
-    let recognized = decoders
-        .keys()
-        .chain(pure_functions.keys())
-        .copied()
-        .collect::<HashSet<_>>();
 
-    functions
+    decoder_helpers
         .iter()
-        .filter(|function| {
-            function.scope != root_scope
-                && recognized.contains(&function.symbol)
-                && scoping
-                    .get_resolved_reference_ids(function.symbol)
-                    .is_empty()
+        .map(|(symbol, span)| (*symbol, *span))
+        .chain(pure_functions.iter().filter_map(|(symbol, function)| {
+            function.declaration_span().map(|span| (*symbol, span))
+        }))
+        .filter(|(symbol, _)| {
+            scoping.symbol_scope_id(*symbol) != root_scope && scoping.symbol_is_unused(*symbol)
         })
-        .map(|function| Replacement {
-            start: function.span.start as usize,
-            end: function.span.end as usize,
+        .map(|(_, span)| Replacement {
+            start: span.start as usize,
+            end: span.end as usize,
             text: String::new(),
             kind: "remove_unused_proven_helper",
             arithmetic_state_proof: None,
@@ -1308,21 +1017,11 @@ fn transform_once(
     let scoping = semantic.scoping();
 
     let arrays = top_level_arrays(&program);
-    let array_infos = decoder_static_arrays(&program, scoping);
-    let direct_functions = all_functions(&program);
-    let functions = all_function_declarations(&program, scoping);
     let reference_spans = collect_reference_spans(&program);
-    let (mut decoders, mut protected_spans, mut rotation_replacements) =
-        detect_decoders(source, &functions, &program, scoping);
-    for (symbol, decoder) in detect_direct_table_decoders(
-        source,
-        &direct_functions,
-        &array_infos,
-        scoping,
-        &reference_spans,
-    ) {
-        decoders.entry(symbol).or_insert(decoder);
-    }
+    let decoder_analysis = analyze_decoders(source, &program, scoping, &reference_spans);
+    let decoders = decoder_analysis.decoders;
+    let mut protected_spans = decoder_analysis.protected_spans;
+    let mut initial_replacements = decoder_analysis.replacements;
     let constants = collect_const_values(&program, scoping);
     let shorthand_spans = collect_shorthand_spans(&program);
     let proxies = collect_proxy_objects(&program, scoping);
@@ -1337,10 +1036,9 @@ fn transform_once(
     let stable_var_numbers = collect_stable_var_numbers(&program, scoping);
     let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
     let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
-    rotation_replacements.extend(remove_unused_proven_helpers(
-        &functions,
+    initial_replacements.extend(remove_unused_proven_helpers(
         scoping,
-        &decoders,
+        &decoder_analysis.removable_helpers,
         &pure_functions,
         has_direct_eval(&program),
     ));
@@ -1360,7 +1058,7 @@ fn transform_once(
         zero_counters: &zero_counters,
         reference_spans: &reference_spans,
         protected_spans: &protected_spans,
-        replacements: rotation_replacements,
+        replacements: initial_replacements,
     };
     collector.visit_program(&program);
     if collector.replacements.is_empty() {

@@ -2,16 +2,301 @@ use crate::decoder_encoding::{
     decode_fixed_base64_latin1, decode_lower_alphabet_base64_uri, decode_standard_base64_latin1,
 };
 use crate::value_eval::{render_value_array, same_values, Value};
-use crate::{argument_integer, fragment, DirectFnInfo, FnInfo, Replacement, StaticArrayInfo};
+use crate::{argument_integer, array_element, fragment, Replacement};
 use oxc_ast::ast::{
-    Argument, BindingPattern, CallExpression, Expression, ExpressionStatement,
+    Argument, BindingPattern, CallExpression, Expression, ExpressionStatement, Statement,
     VariableDeclarationKind,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{ReferenceId, Scoping};
 use oxc_span::Span;
-use oxc_syntax::symbol::SymbolId;
+use oxc_syntax::{
+    scope::{ScopeFlags, ScopeId},
+    symbol::SymbolId,
+};
 use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Clone)]
+struct StaticArrayInfo {
+    symbol: SymbolId,
+    name: String,
+    values: Vec<Value>,
+    span: Span,
+}
+
+#[derive(Default)]
+struct StaticArrayCollector {
+    candidates: Vec<StaticArrayInfo>,
+}
+
+impl<'a> Visit<'a> for StaticArrayCollector {
+    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        for d in &it.declarations {
+            let BindingPattern::BindingIdentifier(id) = &d.id else {
+                continue;
+            };
+            let Some(symbol) = id.symbol_id.get() else {
+                continue;
+            };
+            let Some(Expression::ArrayExpression(arr)) = &d.init else {
+                continue;
+            };
+            let Some(values) = arr
+                .elements
+                .iter()
+                .map(array_element)
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            if !values.is_empty() {
+                self.candidates.push(StaticArrayInfo {
+                    symbol,
+                    name: id.name.to_string(),
+                    values,
+                    span: arr.span,
+                });
+            }
+        }
+        walk::walk_variable_declaration(self, it);
+    }
+}
+
+fn decoder_static_arrays(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> Vec<StaticArrayInfo> {
+    let mut collector = StaticArrayCollector::default();
+    collector.visit_program(program);
+    collector.candidates.retain(|candidate| {
+        scoping
+            .get_resolved_reference_ids(candidate.symbol)
+            .iter()
+            .all(|reference_id| {
+                let reference = scoping.get_reference(*reference_id);
+                !reference.is_write() && !reference.flags().is_member_write_target()
+            })
+    });
+    collector.candidates
+}
+
+#[derive(Default)]
+struct DirectCallCounter {
+    count: usize,
+}
+
+impl<'a> Visit<'a> for DirectCallCounter {
+    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
+        self.count += 1;
+        walk::walk_call_expression(self, it);
+    }
+
+    fn visit_function(&mut self, _f: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
+        // Nested functions do not execute as part of the candidate decoder
+        // invocation itself, so do not count calls inside them.
+    }
+}
+
+fn direct_body_call_count(body: &oxc_ast::ast::FunctionBody<'_>) -> usize {
+    let mut counter = DirectCallCounter::default();
+    for statement in &body.statements {
+        counter.visit_statement(statement);
+    }
+    counter.count
+}
+
+fn fixed_decoder_control_shape(body: &oxc_ast::ast::FunctionBody<'_>) -> bool {
+    if body.statements.len() != 3 {
+        return false;
+    }
+    let first = matches!(
+        &body.statements[0],
+        Statement::IfStatement(statement)
+            if statement.alternate.is_none()
+                && matches!(&statement.consequent, Statement::ReturnStatement(_))
+    );
+    let second = match &body.statements[1] {
+        Statement::ForStatement(statement) => match &statement.body {
+            Statement::ExpressionStatement(_) => true,
+            // The generic sequence splitter may already have turned the
+            // decoder's six comma-separated loop operations into six
+            // expression statements by the time the literal table becomes
+            // fully static on a later fixed-point iteration.
+            Statement::BlockStatement(block) => {
+                block.body.len() == 6
+                    && block
+                        .body
+                        .iter()
+                        .all(|statement| matches!(statement, Statement::ExpressionStatement(_)))
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    let third = matches!(&body.statements[2], Statement::ReturnStatement(_));
+    first && second && third
+}
+
+#[derive(Debug, Clone)]
+struct LocalStaticArrayInfo {
+    values: Vec<Value>,
+    span: Span,
+}
+
+#[derive(Debug)]
+struct FnInfo {
+    name: String,
+    symbol: SymbolId,
+    scope: ScopeId,
+    params: Vec<String>,
+    span: Span,
+    static_arrays: HashMap<String, LocalStaticArrayInfo>,
+}
+
+fn function_info(f: &oxc_ast::ast::Function<'_>, scoping: &Scoping) -> Option<FnInfo> {
+    if f.r#type != oxc_ast::ast::FunctionType::FunctionDeclaration {
+        return None;
+    }
+    let id = f.id.as_ref()?;
+    let symbol = id.symbol_id.get()?;
+    let params = f
+        .params
+        .items
+        .iter()
+        .filter_map(|p| match &p.pattern {
+            BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+            _ => None,
+        })
+        .collect();
+
+    let mut static_arrays = HashMap::new();
+    if let Some(body) = &f.body {
+        for stmt in &body.statements {
+            let Statement::VariableDeclaration(decl) = stmt else {
+                continue;
+            };
+            for d in &decl.declarations {
+                let BindingPattern::BindingIdentifier(array_id) = &d.id else {
+                    continue;
+                };
+                let Some(Expression::ArrayExpression(array)) = &d.init else {
+                    continue;
+                };
+                let Some(values) = array
+                    .elements
+                    .iter()
+                    .map(array_element)
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                if !values.is_empty() {
+                    static_arrays.insert(
+                        array_id.name.to_string(),
+                        LocalStaticArrayInfo {
+                            values,
+                            span: array.span,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    Some(FnInfo {
+        name: id.name.to_string(),
+        symbol,
+        scope: scoping.symbol_scope_id(symbol),
+        params,
+        span: f.span,
+        static_arrays,
+    })
+}
+
+struct FunctionDeclarationCollector<'s> {
+    scoping: &'s Scoping,
+    out: Vec<FnInfo>,
+}
+
+impl<'a> Visit<'a> for FunctionDeclarationCollector<'_> {
+    fn visit_function(
+        &mut self,
+        it: &oxc_ast::ast::Function<'a>,
+        flags: oxc_syntax::scope::ScopeFlags,
+    ) {
+        if let Some(info) = function_info(it, self.scoping) {
+            self.out.push(info);
+        }
+        walk::walk_function(self, it, flags);
+    }
+}
+
+fn all_function_declarations(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> Vec<FnInfo> {
+    let mut collector = FunctionDeclarationCollector {
+        scoping,
+        out: Vec::new(),
+    };
+    collector.visit_program(program);
+    collector.out
+}
+
+#[derive(Debug)]
+struct DirectFnInfo {
+    symbol: SymbolId,
+    params: Vec<String>,
+    span: Span,
+    body_statement_count: usize,
+    direct_call_count: usize,
+    fixed_decoder_control_shape: bool,
+}
+
+#[derive(Default)]
+struct DirectFnInfoCollector {
+    out: Vec<DirectFnInfo>,
+}
+
+impl<'a> Visit<'a> for DirectFnInfoCollector {
+    fn visit_function(&mut self, f: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        if let Some(id) = &f.id {
+            if let Some(symbol) = id.symbol_id.get() {
+                let params = f
+                    .params
+                    .items
+                    .iter()
+                    .filter_map(|p| match &p.pattern {
+                        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+
+                self.out.push(DirectFnInfo {
+                    symbol,
+                    params,
+                    span: f.span,
+                    body_statement_count: f.body.as_ref().map_or(0, |body| body.statements.len()),
+                    direct_call_count: f
+                        .body
+                        .as_ref()
+                        .map_or(0, |body| direct_body_call_count(body)),
+                    fixed_decoder_control_shape: f
+                        .body
+                        .as_ref()
+                        .is_some_and(|body| fixed_decoder_control_shape(body)),
+                });
+            }
+        }
+        walk::walk_function(self, f, flags);
+    }
+}
+
+fn all_functions(program: &oxc_ast::ast::Program<'_>) -> Vec<DirectFnInfo> {
+    let mut collector = DirectFnInfoCollector::default();
+    collector.visit_program(program);
+    collector.out
+}
 
 #[derive(Debug, Clone)]
 enum DecoderTransform {
@@ -217,7 +502,7 @@ fn function_has_external_write(
     false
 }
 
-pub(super) fn detect_direct_table_decoders(
+fn detect_direct_table_decoders(
     source: &str,
     functions: &[DirectFnInfo],
     arrays: &[StaticArrayInfo],
@@ -812,7 +1097,7 @@ type DecoderDetection = (
     Vec<Replacement>,
 );
 
-pub(super) fn detect_decoders(
+fn detect_decoders(
     source: &str,
     functions: &[FnInfo],
     program: &oxc_ast::ast::Program<'_>,
@@ -1025,6 +1310,45 @@ pub(super) fn detect_decoders(
     }
 
     (out, protected_spans, rotation_replacements)
+}
+
+pub(super) struct DecoderAnalysis {
+    pub(super) decoders: HashMap<SymbolId, Decoder>,
+    pub(super) protected_spans: Vec<(usize, usize)>,
+    pub(super) replacements: Vec<Replacement>,
+    pub(super) removable_helpers: HashMap<SymbolId, Span>,
+}
+
+pub(super) fn analyze_decoders(
+    source: &str,
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> DecoderAnalysis {
+    let arrays = decoder_static_arrays(program, scoping);
+    let direct_functions = all_functions(program);
+    let functions = all_function_declarations(program, scoping);
+
+    let (mut decoders, protected_spans, replacements) =
+        detect_decoders(source, &functions, program, scoping);
+    for (symbol, decoder) in
+        detect_direct_table_decoders(source, &direct_functions, &arrays, scoping, reference_spans)
+    {
+        decoders.entry(symbol).or_insert(decoder);
+    }
+
+    let removable_helpers = functions
+        .iter()
+        .filter(|function| decoders.contains_key(&function.symbol))
+        .map(|function| (function.symbol, function.span))
+        .collect();
+
+    DecoderAnalysis {
+        decoders,
+        protected_spans,
+        replacements,
+        removable_helpers,
+    }
 }
 
 struct SymbolAliasCollector<'s> {

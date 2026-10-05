@@ -2,6 +2,7 @@ use crate::value_eval::{eval_binary, js_to_int32, Value};
 use oxc_ast::ast::{BindingPattern, Expression, Statement};
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
+use oxc_span::Span;
 use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use std::collections::HashMap;
 
@@ -181,12 +182,17 @@ fn compile_pure_expr(expr: &Expression<'_>, params: &HashMap<String, usize>) -> 
 pub(super) struct PureFunction {
     arity: usize,
     expression: PureExpr,
+    declaration_span: Option<Span>,
 }
 
 impl PureFunction {
     pub(super) fn evaluate(&self, args: &[Value]) -> Option<Value> {
         (args.len() == self.arity).then_some(())?;
         self.expression.eval(args)
+    }
+
+    pub(super) fn declaration_span(&self) -> Option<Span> {
+        self.declaration_span
     }
 }
 
@@ -232,6 +238,9 @@ impl<'a> Visit<'a> for PureFunctionCollector<'_> {
                                             PureFunction {
                                                 arity: f.params.items.len(),
                                                 expression,
+                                                declaration_span: (f.r#type
+                                                    == oxc_ast::ast::FunctionType::FunctionDeclaration)
+                                                    .then_some(f.span),
                                             },
                                         );
                                     }
