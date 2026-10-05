@@ -1,3 +1,4 @@
+use crate::source_text::preview;
 use oxc_ast::ast::{
     ArrayExpression, ArrayExpressionElement, Expression, ObjectExpression, ObjectPropertyKind,
     Statement, SwitchStatement,
@@ -36,20 +37,6 @@ pub struct DirectSwitchMapCandidate {
     pub vm_reasons: Vec<String>,
     pub confirmed_vm: bool,
     pub handlers: Vec<DirectSwitchHandler>,
-}
-
-fn preview(source: &str, start: u32, end: u32, cap: usize) -> String {
-    let start = start as usize;
-    let end = (end as usize).min(source.len());
-    let raw = source.get(start..end).unwrap_or_default();
-    let mut out = String::with_capacity(cap.min(raw.len()));
-    for c in raw.chars() {
-        if out.len() >= cap {
-            break;
-        }
-        out.push(if c.is_whitespace() { ' ' } else { c });
-    }
-    out
 }
 
 fn numeric_u64(expr: &Expression<'_>) -> Option<u64> {

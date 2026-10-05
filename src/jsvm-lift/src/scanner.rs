@@ -12,6 +12,7 @@ use crate::{
     function_analysis::{
         evidence_reaches_computed, expression_evidence, FunctionMetrics, FunctionState,
     },
+    source_text::preview,
     state_flatten::{
         self, detect_for_state_machines, IfLadderStateMachineCandidate, OpcodeMapCandidate,
         StateMachineCandidate, StateMachineInfo,
@@ -57,20 +58,6 @@ impl<'s> Scanner<'s> {
             embedded_code: Vec::new(),
             stack: Vec::new(),
         }
-    }
-
-    fn source_preview(&self, start: u32, end: u32, cap: usize) -> String {
-        let start = start as usize;
-        let end = (end as usize).min(self.source.len());
-        let s = self.source.get(start..end).unwrap_or_default();
-        let mut out = String::with_capacity(cap.min(s.len()));
-        for c in s.chars() {
-            if out.len() >= cap {
-                break;
-            }
-            out.push(if c.is_whitespace() { ' ' } else { c });
-        }
-        out
     }
 
     fn push_function(&mut self, kind: &str, name: Option<String>, start: u32, end: u32) {
@@ -330,7 +317,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
                 shape,
                 start: member.span.start,
                 end: member.span.end,
-                preview: self.source_preview(member.span.start, member.span.end, 160),
+                preview: preview(self.source, member.span.start, member.span.end, 160),
             })
         } else {
             None
@@ -360,7 +347,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
                             shape,
                             start: member.span.start,
                             end: member.span.end,
-                            preview: self.source_preview(member.span.start, member.span.end, 160),
+                            preview: preview(self.source, member.span.start, member.span.end, 160),
                         },
                     )
                 })
@@ -459,7 +446,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
                             shape,
                             start: member.span.start,
                             end: member.span.end,
-                            preview: self.source_preview(member.span.start, member.span.end, 160),
+                            preview: preview(self.source, member.span.start, member.span.end, 160),
                         },
                     )
                 })

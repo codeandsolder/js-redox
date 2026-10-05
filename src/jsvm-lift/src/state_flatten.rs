@@ -1,3 +1,4 @@
+use crate::source_text::preview;
 use oxc_ast::{
     ast::{
         Argument, AssignmentTarget, Expression, ForStatement, Function, FunctionBody, Statement,
@@ -62,20 +63,6 @@ pub struct IfLadderStateMachineCandidate {
 pub struct DetectedStateMachines {
     pub switch_machines: Vec<StateMachineCandidate>,
     pub if_ladder_machines: Vec<IfLadderStateMachineCandidate>,
-}
-
-fn preview(source: &str, start: u32, end: u32, cap: usize) -> String {
-    let start = start as usize;
-    let end = (end as usize).min(source.len());
-    let raw = source.get(start..end).unwrap_or_default();
-    let mut out = String::with_capacity(cap.min(raw.len()));
-    for c in raw.chars() {
-        if out.len() >= cap {
-            break;
-        }
-        out.push(if c.is_whitespace() { ' ' } else { c });
-    }
-    out
 }
 
 fn expr_ident<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
@@ -799,7 +786,9 @@ fn derive_bindings(
         if found.len() != 1 || !loop_text.contains(&name) {
             continue;
         }
-        let mask = *found.iter().next().unwrap();
+        let Some(mask) = found.iter().next().copied() else {
+            continue;
+        };
         by_mask.entry(mask).or_default().push((name, last_start));
     }
 

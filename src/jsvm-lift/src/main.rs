@@ -4,6 +4,7 @@ mod dispatch;
 mod embedded;
 mod function_analysis;
 mod scanner;
+mod source_text;
 mod state_flatten;
 mod table_vm;
 

@@ -1,3 +1,4 @@
+use crate::source_text::preview;
 use oxc_ast::ast::{Argument, ArrayExpression, ArrayExpressionElement, CallExpression, Expression};
 use oxc_span::GetSpan;
 use serde::Serialize;
@@ -49,20 +50,6 @@ pub struct PushBuilderCandidate {
 pub struct DetectedPushBuilder {
     pub candidate: PushBuilderCandidate,
     pub receiver_ident: Option<String>,
-}
-
-fn preview(source: &str, start: u32, end: u32, cap: usize) -> String {
-    let start = start as usize;
-    let end = (end as usize).min(source.len());
-    let raw = source.get(start..end).unwrap_or_default();
-    let mut out = String::with_capacity(cap.min(raw.len()));
-    for c in raw.chars() {
-        if out.len() >= cap {
-            break;
-        }
-        out.push(if c.is_whitespace() { ' ' } else { c });
-    }
-    out
 }
 
 fn target_ident(target: &oxc_ast::ast::AssignmentTarget<'_>) -> Option<String> {
