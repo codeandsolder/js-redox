@@ -88,6 +88,7 @@ def main():
     app_js = (
         BUNDLE_FIXTURE.read_text()
         + '\nnew Worker("./worker.js");\n'
+        + 'const dynamicName = globalThis.dynamicName; void import(`./chunks/${dynamicName}.js`);\n'
         + generated_child + "\n"
         + generated_child + "\n"
         + '//# sourceMappingURL=app.js.map\n'
@@ -141,6 +142,21 @@ def main():
                 entry("https://fixture.invalid/assets/worker.js", "application/javascript", worker_js),
                 entry("https://fixture.invalid/assets/worker-copy.js", "application/javascript", worker_js),
                 entry(
+                    "https://fixture.invalid/assets/chunks/en.js",
+                    "application/javascript",
+                    'export const language = "en";\n',
+                ),
+                entry(
+                    "https://fixture.invalid/assets/chunks/pl.js",
+                    "application/javascript",
+                    'export const language = "pl";\n',
+                ),
+                entry(
+                    "https://fixture.invalid/assets/chunks/deep/skip.js",
+                    "application/javascript",
+                    "export const nested = true;\n",
+                ),
+                entry(
                     "https://fixture.invalid/assets/app.js.map",
                     "application/json",
                     json.dumps(source_map),
@@ -188,7 +204,7 @@ def main():
 
     manifest = json.loads((PROJECT / "har-manifest.json").read_text())
     assert manifest["schema"] == "har-project/v0"
-    assert len(manifest["resources"]) == 6
+    assert len(manifest["resources"]) == 9
     assert (PROJECT / "capture-manifest.json").is_file()
     speculation = next(
         script
@@ -208,8 +224,8 @@ def main():
 
     source_index = json.loads((PROJECT / "analysis/source-index.json").read_text())
     js_units = [u for u in source_index["units"] if u["kind"] == "javascript"]
-    assert len(js_units) == 4
-    assert source_index["summary"]["unique_javascript_inputs"] == 3
+    assert len(js_units) == 7
+    assert source_index["summary"]["unique_javascript_inputs"] == 6
     assert source_index["summary"]["deduplicated_javascript_units"] == 1
     speculation_unit = next(
         unit
@@ -220,12 +236,12 @@ def main():
 
     deob = json.loads((PROJECT / "analysis/deobfuscation.json").read_text())
     assert deob["summary"]["failed_units"] == 0
-    assert deob["summary"]["javascript_units"] == 4
-    assert deob["summary"]["unique_raw_inputs"] == 3
+    assert deob["summary"]["javascript_units"] == 7
+    assert deob["summary"]["unique_raw_inputs"] == 6
     assert deob["summary"]["deduplicated_raw_units"] == 1
-    assert deob["summary"]["string_recovery_invocations"] == 3
-    assert deob["summary"]["safe_deob_invocations"] == 3
-    assert deob["summary"]["readable_format_invocations"] == 3
+    assert deob["summary"]["string_recovery_invocations"] == 6
+    assert deob["summary"]["safe_deob_invocations"] == 6
+    assert deob["summary"]["readable_format_invocations"] == 6
     app_deob = next(u for u in deob["units"] if u.get("raw_path") == app_resource["output_path"])
     assert app_deob["input_sha256"] == app_resource["sha256"]
     assert app_deob["input_path"] == app_resource["output_path"]
@@ -262,10 +278,10 @@ def main():
     assert any("preserved" in text for text in final_text)
 
     jsrefs = json.loads((PROJECT / "analysis/js-references.json").read_text())
-    assert jsrefs["summary"]["javascript_units"] == 4
-    assert jsrefs["summary"]["unique_input_bodies"] == 3
+    assert jsrefs["summary"]["javascript_units"] == 7
+    assert jsrefs["summary"]["unique_input_bodies"] == 6
     assert jsrefs["summary"]["deduplicated_units"] == 1
-    assert jsrefs["summary"]["extractor_invocations"] == 3
+    assert jsrefs["summary"]["extractor_invocations"] == 6
     worker_ref = next(
         ref
         for unit in jsrefs["code_units"]
@@ -273,13 +289,34 @@ def main():
         if ref["kind"] == "worker"
     )
     assert worker_ref["resolved_url"] == "https://fixture.invalid/assets/worker.js"
+    dynamic_ref = next(
+        ref
+        for unit in jsrefs["code_units"]
+        for ref in unit["references"]
+        if ref["kind"] == "import_dynamic_glob"
+    )
+    assert dynamic_ref["glob"] == "./chunks/*.js"
+    assert dynamic_ref["absolute_glob"] == "https://fixture.invalid/assets/chunks/*.js"
+    assert dynamic_ref["candidate_count"] == 2
+    assert dynamic_ref["resolved_url"] is None
+    dynamic_candidates = {
+        candidate["resolved_url"] for candidate in dynamic_ref["resolution_candidates"]
+    }
+    assert dynamic_candidates == {
+        "https://fixture.invalid/assets/chunks/en.js",
+        "https://fixture.invalid/assets/chunks/pl.js",
+    }
+    assert "https://fixture.invalid/assets/chunks/deep/skip.js" not in dynamic_candidates
+    assert jsrefs["summary"]["dynamic_import_globs"] == 1
+    assert jsrefs["summary"]["dynamic_import_candidate_urls"] == 2
+    assert jsrefs["summary"]["dynamic_import_unmatched"] == 0
 
     bundles = json.loads((PROJECT / "analysis/bundles.json").read_text())
     assert bundles["summary"]["failed_units"] == 0
-    assert bundles["summary"]["eligible_units"] == 4
-    assert bundles["summary"]["unique_input_bodies"] == 3
+    assert bundles["summary"]["eligible_units"] == 7
+    assert bundles["summary"]["unique_input_bodies"] == 6
     assert bundles["summary"]["deduplicated_units"] == 1
-    assert bundles["summary"]["inventory_invocations"] == 3
+    assert bundles["summary"]["inventory_invocations"] == 6
     assert bundles["summary"]["module_format_invocations"] < bundles["summary"]["modules"]
     assert bundles["summary"]["deduplicated_module_formats"] > 0
     assert bundles["summary"]["bundles"] >= 1
@@ -362,7 +399,7 @@ def main():
     assert app_scan["analysis_origin"] == "safe_deobfuscation"
     assert app_scan["path"] == app_deob["output_path"]
     assert app_scan["scanner_exit"] == 0
-    assert analysis["scanner_invocations"] == 4
+    assert analysis["scanner_invocations"] == 7
     assert analysis["deduplicated_scans"] == 2
     generated_recovery = json.loads(
         (PROJECT / "analysis/generated-recovery.json").read_text()
@@ -382,7 +419,20 @@ def main():
     assert edge_kinds.get("source_map_chain_resource") == 1
     assert edge_kinds.get("source_map_composed_source") == 2
     assert edge_kinds.get("js_worker") == 1
-    assert edge_kinds.get("safe_deobfuscation") == 4
+    assert edge_kinds.get("js_import_dynamic_glob") == 2
+    dynamic_edges = [
+        edge for edge in graph["edges"] if edge.get("kind") == "js_import_dynamic_glob"
+    ]
+    assert {edge.get("glob") for edge in dynamic_edges} == {"./chunks/*.js"}
+    assert {edge.get("glob_match_url") for edge in dynamic_edges} == {
+        "https://fixture.invalid/assets/chunks/en.js",
+        "https://fixture.invalid/assets/chunks/pl.js",
+    }
+    assert {edge.get("resolved_url") for edge in dynamic_edges} == {
+        "https://fixture.invalid/assets/chunks/en.js",
+        "https://fixture.invalid/assets/chunks/pl.js",
+    }
+    assert edge_kinds.get("safe_deobfuscation") == 7
     assert edge_kinds.get("generated_code") == 2
     assert edge_kinds.get("generated_safe_recovery") == 2
     assert edge_kinds.get("bundle_payload", 0) >= 1
@@ -430,7 +480,7 @@ def main():
     )
     assert truncated_manifest["salvaged"] is True
     assert truncated_manifest["parse_error"]
-    assert len(truncated_manifest["resources"]) == 4
+    assert len(truncated_manifest["resources"]) == 7
 
     print(cp.stdout.rstrip())
     print(

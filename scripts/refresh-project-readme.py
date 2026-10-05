@@ -129,7 +129,10 @@ def main():
         f"- JS-reference extraction: **{jsref_summary.get('extractor_invocations', len(js_units))}** parser invocations / "
         f"**{jsref_summary.get('deduplicated_units', 0)}** exact-hash reuses",
         f"- Source kinds: {dict(sorted(source_kinds.items()))}",
-        f"- Literal JS/module/worker references: **{jsrefs.get('summary', {}).get('references', 0)}**",
+        f"- JS/module/worker references: **{jsrefs.get('summary', {}).get('references', 0)}**",
+        f"- Bounded dynamic-import patterns: **{jsrefs.get('summary', {}).get('dynamic_import_globs', 0)}**; "
+        f"captured candidate URLs: **{jsrefs.get('summary', {}).get('dynamic_import_candidate_urls', 0)}**; "
+        f"unmatched patterns: **{jsrefs.get('summary', {}).get('dynamic_import_unmatched', 0)}**",
         f"- Import-map blocks captured: **{import_maps.get('summary', {}).get('import_map_scripts', 0)}**",
         f"- Imports resolved through import maps: **{jsrefs.get('summary', {}).get('resolved_by_import_map', 0)}**",
         f"- Unresolved bare module specifiers: **{jsrefs.get('summary', {}).get('unresolved_bare_specifiers', 0)}**",

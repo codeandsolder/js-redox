@@ -29,7 +29,7 @@ For normal executable builds, use the project helper rather than raw `cargo`:
 scripts/build-jsvm-lift.sh
 ```
 
-It pins rustc 1.98.1, preserves the distributed sccache wrapper, derives build parallelism from live farm capacity, and publishes durable executables under `.cargo-target-nodebug/`. The helper asks Cargo for the workspace target directory rather than assuming a member-local `target/` layout.
+It pins rustc 1.99.0, preserves the distributed sccache wrapper, derives build parallelism from live farm capacity, and publishes durable executables under `.cargo-target-nodebug/`. The helper asks Cargo for the workspace target directory rather than assuming a member-local `target/` layout.
 
 ## Regression
 

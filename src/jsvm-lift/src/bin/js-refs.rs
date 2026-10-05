@@ -7,14 +7,12 @@ use oxc_ast::ast::{
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_span::{GetSpan, SourceType};
-use rolldown_redox::ecmascript::parse_program;
+use rolldown_redox::ecmascript::{dynamic_import_to_glob, parse_program};
 use serde::Serialize;
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 #[derive(ClapParser, Debug)]
-#[command(
-    about = "Extract literal JavaScript module/worker execution-boundary references with Oxc"
-)]
+#[command(about = "Extract JavaScript module/worker execution-boundary references with Oxc")]
 struct Args {
     input: PathBuf,
 }
@@ -23,6 +21,8 @@ struct Args {
 struct JsReference {
     kind: String,
     specifier: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    glob: Option<String>,
     start: u32,
     end: u32,
 }
@@ -37,6 +37,17 @@ impl<'s> Collector<'s> {
         self.refs.insert(JsReference {
             kind: kind.to_string(),
             specifier: specifier.into(),
+            glob: None,
+            start,
+            end,
+        });
+    }
+
+    fn push_glob(&mut self, specifier: impl Into<String>, glob: String, start: u32, end: u32) {
+        self.refs.insert(JsReference {
+            kind: "import_dynamic_glob".to_string(),
+            specifier: specifier.into(),
+            glob: Some(glob),
             start,
             end,
         });
@@ -130,6 +141,13 @@ impl<'a, 's> Visit<'a> for Collector<'s> {
     fn visit_import_expression(&mut self, it: &ImportExpression<'a>) {
         if let Some(specifier) = Self::literal_expr(&it.source) {
             self.push("import_dynamic", specifier, it.span.start, it.span.end);
+        } else if let Ok(Some(glob)) = dynamic_import_to_glob(&it.source) {
+            self.push_glob(
+                self.source_fragment(it.source.span()).to_string(),
+                glob,
+                it.span.start,
+                it.span.end,
+            );
         }
         walk::walk_import_expression(self, it);
     }

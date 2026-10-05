@@ -2,6 +2,7 @@
 import argparse
 import copy
 import json
+import re
 import subprocess
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +15,7 @@ from content_dedup import default_jobs, sha256_path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EXTRACTOR = ROOT / ".cargo-target-nodebug/debug/js-refs"
 IMPORT_KINDS = {"import_static", "import_dynamic"}
+DYNAMIC_GLOB_KIND = "import_dynamic_glob"
 
 
 def url_like(base_url: str | None, specifier: str):
@@ -31,6 +33,35 @@ def url_like(base_url: str | None, specifier: str):
     if specifier.startswith(("./", "../", "/")):
         return urljoin(base_url, specifier) if base_url else None
     return None
+
+
+def decode_dynamic_glob_literals(pattern: str):
+    # rolldown_redox emits conventional glob escapes for literal metacharacters.
+    # Our matcher treats only `*` as special, so restore the literal characters first.
+    return (
+        pattern.replace("[[]", "[")
+        .replace("[]]", "]")
+        .replace("[{]", "{")
+        .replace("[}]", "}")
+        .replace("[?]", "?")
+    )
+
+
+def dynamic_glob_regex(pattern: str):
+    parts = ["^"]
+    for character in pattern:
+        parts.append("[^/]*" if character == "*" else re.escape(character))
+    parts.append("$")
+    return re.compile("".join(parts))
+
+
+def captured_dynamic_glob_matches(base_url: str | None, pattern: str, captured_urls):
+    if not base_url:
+        return None, []
+    decoded = decode_dynamic_glob_literals(pattern)
+    absolute_pattern = urljoin(base_url, decoded)
+    matcher = dynamic_glob_regex(absolute_pattern)
+    return absolute_pattern, sorted(url for url in captured_urls if matcher.fullmatch(url))
 
 
 def normalize_map_key(base_url: str, key: str):
@@ -387,6 +418,19 @@ def main():
         if row.get("raw_path"):
             units_by_raw[row["raw_path"]] = row_id
 
+    dynamic_glob_matches = {}
+    dynamic_glob_patterns = 0
+    for row_id, row in enumerate(rows):
+        for ref_index, ref in enumerate(row["references"]):
+            if ref.get("kind") != DYNAMIC_GLOB_KIND:
+                continue
+            dynamic_glob_patterns += 1
+            absolute_pattern, matches = captured_dynamic_glob_matches(
+                row.get("url"), ref.get("glob") or "", units_by_url.keys()
+            )
+            ref["absolute_glob"] = absolute_pattern
+            dynamic_glob_matches[(row_id, ref_index)] = matches
+
     # Seed document execution contexts from actual <script> records. Import maps are
     # document state and intentionally do not flow into Worker/worklet graphs.
     queue = deque()
@@ -423,16 +467,54 @@ def main():
         row = rows[row_id]
         import_map = import_maps.get(document_id)
         for ref_index, ref in enumerate(row["references"]):
-            if ref.get("kind") not in IMPORT_KINDS:
+            kind = ref.get("kind")
+            if kind == DYNAMIC_GLOB_KIND:
+                matched_urls = dynamic_glob_matches.get((row_id, ref_index), [])
+                for matched_url in matched_urls:
+                    result = resolve_with_import_map(row.get("url"), matched_url, import_map)
+                    resolution = result.get("resolution")
+                    if resolution == "url":
+                        result["resolution"] = "captured_dynamic_glob"
+                    elif resolution:
+                        result["resolution"] = f"captured_dynamic_glob_{resolution}"
+                    candidate = {
+                        "document_resource_id": document_id,
+                        "glob_match_url": matched_url,
+                        **result,
+                    }
+                    candidate_key = (
+                        document_id,
+                        candidate.get("glob_match_url"),
+                        candidate.get("resolved_url"),
+                        candidate.get("resolution"),
+                        candidate.get("import_map_key"),
+                        candidate.get("scope"),
+                    )
+                    per_ref_candidates[(row_id, ref_index)][candidate_key] = candidate
+                    resolved = result.get("resolved_url")
+                    if not resolved:
+                        continue
+                    for target_row_id in units_by_url.get(resolved, []):
+                        if document_id not in contexts[target_row_id]:
+                            contexts[target_row_id].add(document_id)
+                            queue.append((target_row_id, document_id))
                 continue
-            result = resolve_with_import_map(
-                row.get("url"), ref["specifier"], import_map
-            )
+
+            if kind not in IMPORT_KINDS:
+                continue
+            result = resolve_with_import_map(row.get("url"), ref["specifier"], import_map)
             candidate = {
                 "document_resource_id": document_id,
                 **result,
             }
-            per_ref_candidates[(row_id, ref_index)][document_id] = candidate
+            candidate_key = (
+                document_id,
+                candidate.get("resolved_url"),
+                candidate.get("resolution"),
+                candidate.get("import_map_key"),
+                candidate.get("scope"),
+            )
+            per_ref_candidates[(row_id, ref_index)][candidate_key] = candidate
             resolved = result.get("resolved_url")
             if not resolved:
                 continue
@@ -448,6 +530,48 @@ def main():
         row["document_resource_ids"] = sorted(contexts.get(row_id, set()))
         for ref_index, ref in enumerate(row["references"]):
             candidates = list(per_ref_candidates.get((row_id, ref_index), {}).values())
+            if ref.get("kind") == DYNAMIC_GLOB_KIND:
+                raw_matches = dynamic_glob_matches.get((row_id, ref_index), [])
+                if not candidates:
+                    candidates = [
+                        {
+                            "document_resource_id": None,
+                            "glob_match_url": matched_url,
+                            "resolved_url": matched_url,
+                            "bare_specifier": False,
+                            "resolution": "captured_dynamic_glob",
+                            "import_map_key": None,
+                            "scope": None,
+                        }
+                        for matched_url in raw_matches
+                    ]
+                candidates = sorted(
+                    candidates,
+                    key=lambda candidate: (
+                        candidate.get("document_resource_id") is not None,
+                        candidate.get("document_resource_id") or -1,
+                        candidate.get("resolved_url") or "",
+                        candidate.get("glob_match_url") or "",
+                    ),
+                )
+                ref["resolution_candidates"] = candidates
+                resolved_urls = sorted(
+                    {
+                        candidate["resolved_url"]
+                        for candidate in candidates
+                        if candidate.get("resolved_url")
+                    }
+                )
+                ref["candidate_count"] = len(resolved_urls)
+                ref["resolved_url"] = resolved_urls[0] if len(resolved_urls) == 1 else None
+                ref["bare_specifier"] = False
+                ref["resolution"] = (
+                    "captured_dynamic_glob" if raw_matches else "captured_dynamic_glob_unmatched"
+                )
+                ref["import_map_key"] = None
+                ref["scope"] = None
+                continue
+
             if ref.get("kind") not in IMPORT_KINDS or not candidates:
                 result = resolve_with_import_map(row.get("url"), ref["specifier"], None)
                 ref.update(result)
@@ -514,12 +638,21 @@ def main():
             "resolved_by_import_map": resolved_by_import_map,
             "unresolved_bare_specifiers": unresolved_bare,
             "ambiguous_document_contexts": ambiguous,
+            "dynamic_import_globs": dynamic_glob_patterns,
+            "dynamic_import_candidate_urls": sum(
+                len(set(matches)) for matches in dynamic_glob_matches.values()
+            ),
+            "dynamic_import_unmatched": sum(
+                not matches for matches in dynamic_glob_matches.values()
+            ),
         },
     }
     path = project / "analysis/js-references.json"
     path.write_text(json.dumps(out, indent=2) + "\n")
+    dynamic_candidates = sum(len(set(matches)) for matches in dynamic_glob_matches.values())
     print(
-        f"JavaScript references: {len(rows)} units, {total_refs} literal references, "
+        f"JavaScript references: {len(rows)} units, {total_refs} references, "
+        f"{dynamic_glob_patterns} dynamic glob(s) / {dynamic_candidates} captured candidate URL(s), "
         f"{resolved_by_import_map} import-map resolutions, {unresolved_bare} unresolved bare, "
         f"{ambiguous} ambiguous contexts, {failures} failures"
     )

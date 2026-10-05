@@ -334,7 +334,7 @@ def print_project_summary(summary: ProjectSummary) -> None:
         f"  capture state:      {summary.capture_state}\n"
         f"  captured resources: {summary.captured_resources}\n"
         f"  JavaScript units:   {summary.javascript_units}\n"
-        f"  literal JS/module/worker references: {summary.references}\n"
+        f"  JS/module/worker references: {summary.references}\n"
         f"  import-map resolutions: {summary.import_map_resolutions} "
         f"(unresolved bare: {summary.unresolved_bare_specifiers})\n"
         f"  safe-deobfuscated JS units: {summary.safe_deobfuscated_units}\n"

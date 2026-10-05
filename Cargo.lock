@@ -977,7 +977,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rolldown_redox"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=16e02894ed921132b0cf0009a5a3601a83416a6f#16e02894ed921132b0cf0009a5a3601a83416a6f"
+source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=3c8ed78#3c8ed7899f9bb5e0d9aaf130aaebd5272911e19a"
 dependencies = [
  "memchr",
  "oxc_allocator",
@@ -985,6 +985,7 @@ dependencies = [
  "oxc_parser",
  "oxc_sourcemap 9.0.0",
  "oxc_span",
+ "oxc_syntax",
  "self_cell",
 ]
 
@@ -1117,7 +1118,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "string_wizard"
 version = "1.2.12-redox.1"
-source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=16e02894ed921132b0cf0009a5a3601a83416a6f#16e02894ed921132b0cf0009a5a3601a83416a6f"
+source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=3c8ed78#3c8ed7899f9bb5e0d9aaf130aaebd5272911e19a"
 dependencies = [
  "memchr",
  "regex",
