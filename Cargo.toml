@@ -26,5 +26,5 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-string_wizard = { version = "1.2.12", default-features = false }
+string_wizard = { git = "https://github.com/codeandsolder/string-wizard-redox.git", rev = "473b6f2dee8c52e760e2a0cb43085971a670c3e8", default-features = false }
 url = "2"

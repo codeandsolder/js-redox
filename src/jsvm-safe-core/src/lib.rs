@@ -22,7 +22,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_semantic::{ReferenceId, Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
-use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
+use oxc_syntax::{identifier, scope::ScopeFlags, symbol::SymbolId};
 use proxy::{
     collect_proxy_objects, proxy_literal_kind, static_proxy_member, ProxyObject, ProxyProperty,
 };
@@ -51,12 +51,7 @@ fn fragment(source: &str, span: Span) -> &str {
 }
 
 fn valid_property(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first == '$' || first.is_ascii_alphabetic())
-        && chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
+    identifier::is_identifier_name(name)
 }
 
 fn symbol_of(scoping: &Scoping, expr: &Expression<'_>) -> Option<SymbolId> {

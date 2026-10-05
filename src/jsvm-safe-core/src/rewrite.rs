@@ -8,7 +8,7 @@
 
 use crate::ArithmeticStateProof;
 use std::collections::BTreeMap;
-use string_wizard::MagicString;
+use string_wizard::{MagicString, TextEdit};
 
 #[derive(Debug, Clone)]
 pub(super) struct Replacement {
@@ -152,33 +152,17 @@ pub(super) fn apply(
     arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
 ) -> Option<String> {
-    // `MagicString` indexes the original source with `u32`. Validate the
-    // complete edit transaction before constructing it so oversized or
-    // malformed internal spans fail closed even in release builds.
-    if source.len() > u32::MAX as usize
-        || replacements.iter().any(|replacement| {
-            replacement.start >= replacement.end
-                || replacement.end > source.len()
-                || !source.is_char_boundary(replacement.start)
-                || !source.is_char_boundary(replacement.end)
-        })
-    {
-        return None;
-    }
-
     let mut selected = select_replacements(replacements);
     let adjusted = lexically_safe_texts(source, &selected)?;
-    let mut magic = MagicString::new(source);
-
-    for (replacement, text) in selected.iter().zip(adjusted) {
-        magic
-            .update(
-                u32::try_from(replacement.start).ok()?,
-                u32::try_from(replacement.end).ok()?,
-                text,
-            )
-            .ok()?;
-    }
+    let mut magic = MagicString::try_new(source).ok()?;
+    magic
+        .apply_edits(
+            selected
+                .iter()
+                .zip(adjusted)
+                .map(|(replacement, text)| TextEdit::new(replacement.start, replacement.end, text)),
+        )
+        .ok()?;
 
     // Do not publish accounting/proof side effects until every edit was
     // accepted. A malformed range therefore fails closed as one transaction.
