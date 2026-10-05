@@ -1,12 +1,16 @@
 mod bytecode;
+mod decoder;
 mod state_flatten;
 mod table_vm;
 
 use anyhow::{Context, Result};
-use bytecode::{
-    detect_numeric_array, detect_push_builder, ArrayCandidate, PushBuilderCandidate, WidthHint,
-};
+use bytecode::{detect_numeric_array, detect_push_builder, ArrayCandidate, PushBuilderCandidate};
 use clap::Parser as ClapParser;
+use decoder::{
+    annotate_bitfield_selectors, complete_selector_masks, derive_candidates, expr_ident,
+    index_shape, link_candidates, observed_opcodes, origin_ident, origin_u64, resolve_alias,
+    target_ident, BuilderSite, DecoderCandidate, IndexedAccess,
+};
 use oxc_allocator::Allocator;
 use oxc_ast::{
     ast::{Argument, ArrayExpressionElement, Expression, ObjectPropertyKind},
@@ -22,7 +26,7 @@ use state_flatten::{
     OpcodeMapCandidate, StateMachineCandidate, StateMachineInfo,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::PathBuf,
 };
@@ -44,62 +48,6 @@ struct Args {
     /// Materialize statically recovered Function(...) bodies as synthetic JS files.
     #[arg(long)]
     dump_embedded: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-struct BuilderSite {
-    start: u32,
-    end: u32,
-    arguments: usize,
-    width_hints: Vec<WidthHint>,
-}
-
-#[derive(Debug, Clone)]
-enum IndexShape {
-    AssignMul {
-        base: String,
-        ip: String,
-        width: u64,
-    },
-    BaseOffset {
-        base: String,
-        offset: u64,
-    },
-    DirectMul {
-        ip: String,
-        width: u64,
-    },
-    Identifier(String),
-}
-
-#[derive(Debug, Clone)]
-struct IndexedAccess {
-    object: String,
-    shape: IndexShape,
-    start: u32,
-    end: u32,
-    preview: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct DecoderCandidate {
-    function_id: String,
-    object: String,
-    builder_var: Option<String>,
-    builder_start: Option<u32>,
-    builder_end: Option<u32>,
-    builder_arguments: Option<usize>,
-    builder_width_hints: Vec<WidthHint>,
-    base: Option<String>,
-    ip: String,
-    width: u64,
-    operand_offsets: Vec<u64>,
-    operand_vars: BTreeMap<u64, String>,
-    selector_var: Option<String>,
-    selector_masks: Vec<u64>,
-    start: u32,
-    end: u32,
-    preview: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -331,23 +279,6 @@ impl<'s> Scanner<'s> {
         out
     }
 
-    fn expr_ident(expr: &Expression<'_>) -> Option<String> {
-        match expr {
-            Expression::Identifier(id) => Some(id.name.to_string()),
-            Expression::ParenthesizedExpression(p) => Self::expr_ident(&p.expression),
-            _ => None,
-        }
-    }
-
-    fn target_ident(target: &oxc_ast::ast::AssignmentTarget<'_>) -> Option<String> {
-        match target {
-            oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
-                Some(id.name.to_string())
-            }
-            _ => None,
-        }
-    }
-
     fn numeric_u64(expr: &Expression<'_>) -> Option<u64> {
         match expr {
             Expression::NumericLiteral(n)
@@ -358,118 +289,6 @@ impl<'s> Scanner<'s> {
             Expression::ParenthesizedExpression(p) => Self::numeric_u64(&p.expression),
             _ => None,
         }
-    }
-
-    fn origin_ident(expr: &Expression<'_>) -> Option<String> {
-        match expr {
-            Expression::Identifier(id) => Some(id.name.to_string()),
-            Expression::ParenthesizedExpression(p) => Self::origin_ident(&p.expression),
-            Expression::AssignmentExpression(assign) if assign.operator.is_assign() => {
-                Self::origin_ident(&assign.right)
-            }
-            _ => None,
-        }
-    }
-
-    fn origin_u64(expr: &Expression<'_>) -> Option<u64> {
-        match expr {
-            Expression::NumericLiteral(n)
-                if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 =>
-            {
-                Some(n.value as u64)
-            }
-            Expression::ParenthesizedExpression(p) => Self::origin_u64(&p.expression),
-            Expression::AssignmentExpression(assign) if assign.operator.is_assign() => {
-                Self::origin_u64(&assign.right)
-            }
-            _ => None,
-        }
-    }
-
-    fn mul_width_ip(expr: &Expression<'_>) -> Option<(u64, String)> {
-        let Expression::BinaryExpression(bin) = expr else {
-            return None;
-        };
-        if bin.operator.as_str() != "*" {
-            return None;
-        }
-
-        if let (Some(width), Some(ip)) =
-            (Self::numeric_u64(&bin.left), Self::expr_ident(&bin.right))
-        {
-            return Some((width, ip));
-        }
-        if let (Some(ip), Some(width)) =
-            (Self::expr_ident(&bin.left), Self::numeric_u64(&bin.right))
-        {
-            return Some((width, ip));
-        }
-        None
-    }
-
-    fn index_shape(expr: &Expression<'_>) -> Option<IndexShape> {
-        match expr {
-            Expression::ParenthesizedExpression(p) => Self::index_shape(&p.expression),
-            Expression::AssignmentExpression(assign) if assign.operator.is_assign() => {
-                let target = Self::target_ident(&assign.left)?;
-                if let Some((width, ip)) = Self::mul_width_ip(&assign.right) {
-                    return Some(IndexShape::AssignMul {
-                        base: target,
-                        ip,
-                        width,
-                    });
-                }
-                if let Expression::BinaryExpression(bin) = &assign.right {
-                    if bin.operator.as_str() == "+" {
-                        if let (Some(base), Some(offset)) =
-                            (Self::expr_ident(&bin.left), Self::numeric_u64(&bin.right))
-                        {
-                            return Some(IndexShape::BaseOffset { base, offset });
-                        }
-                        if let (Some(offset), Some(base)) =
-                            (Self::numeric_u64(&bin.left), Self::expr_ident(&bin.right))
-                        {
-                            return Some(IndexShape::BaseOffset { base, offset });
-                        }
-                    }
-                }
-                if let Some(base) = Self::expr_ident(&assign.right) {
-                    return Some(IndexShape::Identifier(base));
-                }
-                None
-            }
-            Expression::BinaryExpression(bin) if bin.operator.as_str() == "+" => {
-                if let (Some(base), Some(offset)) =
-                    (Self::expr_ident(&bin.left), Self::numeric_u64(&bin.right))
-                {
-                    return Some(IndexShape::BaseOffset { base, offset });
-                }
-                if let (Some(offset), Some(base)) =
-                    (Self::numeric_u64(&bin.left), Self::expr_ident(&bin.right))
-                {
-                    return Some(IndexShape::BaseOffset { base, offset });
-                }
-                None
-            }
-            Expression::BinaryExpression(_) => {
-                let (width, ip) = Self::mul_width_ip(expr)?;
-                Some(IndexShape::DirectMul { ip, width })
-            }
-            Expression::Identifier(id) => Some(IndexShape::Identifier(id.name.to_string())),
-            _ => None,
-        }
-    }
-
-    fn resolve_alias(name: &str, aliases: &HashMap<String, String>) -> String {
-        let mut current = name.to_string();
-        let mut seen = HashSet::new();
-        while seen.insert(current.clone()) {
-            let Some(next) = aliases.get(&current) else {
-                break;
-            };
-            current = next.clone();
-        }
-        current
     }
 
     fn push_function(&mut self, kind: &str, name: Option<String>, start: u32, end: u32) {
@@ -526,264 +345,6 @@ impl<'s> Scanner<'s> {
         }
     }
 
-    fn derive_decoder_candidates(
-        function_id: &str,
-        accesses: &[IndexedAccess],
-    ) -> Vec<DecoderCandidate> {
-        let mut out = Vec::new();
-
-        for access in accesses {
-            match &access.shape {
-                IndexShape::AssignMul { base, ip, width } => {
-                    if *width < 2 || *width > 16 {
-                        continue;
-                    }
-                    let mut offsets = BTreeSet::new();
-                    offsets.insert(0u64);
-                    let mut end = access.end;
-                    for other in accesses {
-                        if other.object != access.object {
-                            continue;
-                        }
-                        match &other.shape {
-                            IndexShape::BaseOffset {
-                                base: other_base,
-                                offset,
-                            } if other_base == base && *offset < *width => {
-                                offsets.insert(*offset);
-                                end = end.max(other.end);
-                            }
-                            IndexShape::Identifier(other_base) if other_base == base => {
-                                offsets.insert(0);
-                                end = end.max(other.end);
-                            }
-                            _ => {}
-                        }
-                    }
-                    out.push(DecoderCandidate {
-                        function_id: function_id.to_string(),
-                        object: access.object.clone(),
-                        builder_var: None,
-                        builder_start: None,
-                        builder_end: None,
-                        builder_arguments: None,
-                        builder_width_hints: Vec::new(),
-                        base: Some(base.clone()),
-                        ip: ip.clone(),
-                        width: *width,
-                        operand_offsets: offsets.into_iter().collect(),
-                        operand_vars: BTreeMap::new(),
-                        selector_var: None,
-                        selector_masks: Vec::new(),
-                        start: access.start,
-                        end,
-                        preview: access.preview.clone(),
-                    });
-                }
-                IndexShape::DirectMul { ip, width } if *width >= 2 && *width <= 16 => {
-                    out.push(DecoderCandidate {
-                        function_id: function_id.to_string(),
-                        object: access.object.clone(),
-                        builder_var: None,
-                        builder_start: None,
-                        builder_end: None,
-                        builder_arguments: None,
-                        builder_width_hints: Vec::new(),
-                        base: None,
-                        ip: ip.clone(),
-                        width: *width,
-                        operand_offsets: vec![0],
-                        operand_vars: BTreeMap::new(),
-                        selector_var: None,
-                        selector_masks: Vec::new(),
-                        start: access.start,
-                        end: access.end,
-                        preview: access.preview.clone(),
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        out.sort_by(|a, b| {
-            (&a.function_id, &a.object, &a.base, &a.ip, a.width, a.start).cmp(&(
-                &b.function_id,
-                &b.object,
-                &b.base,
-                &b.ip,
-                b.width,
-                b.start,
-            ))
-        });
-        out.dedup_by(|a, b| {
-            a.function_id == b.function_id
-                && a.object == b.object
-                && a.base == b.base
-                && a.ip == b.ip
-                && a.width == b.width
-        });
-        out
-    }
-
-    fn annotate_bitfield_selectors(
-        candidates: &mut [DecoderCandidate],
-        indexed_value_vars: &HashMap<String, IndexedAccess>,
-        bit_masks: &HashMap<String, BTreeSet<u64>>,
-        aliases: &HashMap<String, String>,
-    ) {
-        let mut reads: Vec<_> = indexed_value_vars.iter().collect();
-        reads.sort_by_key(|(_, access)| access.start);
-
-        for candidate in candidates {
-            for (var, access) in &reads {
-                if access.object != candidate.object {
-                    continue;
-                }
-
-                let offset = match (&candidate.base, &access.shape) {
-                    (
-                        Some(base),
-                        IndexShape::AssignMul {
-                            base: other_base,
-                            ip,
-                            width,
-                        },
-                    ) if base == other_base && candidate.ip == *ip && candidate.width == *width => {
-                        Some(0)
-                    }
-                    (
-                        Some(base),
-                        IndexShape::BaseOffset {
-                            base: other_base,
-                            offset,
-                        },
-                    ) if base == other_base && *offset < candidate.width => Some(*offset),
-                    (Some(base), IndexShape::Identifier(other_base)) if base == other_base => {
-                        Some(0)
-                    }
-                    (None, IndexShape::DirectMul { ip, width })
-                        if candidate.ip == *ip && candidate.width == *width =>
-                    {
-                        Some(0)
-                    }
-                    _ => None,
-                };
-
-                let Some(offset) = offset else {
-                    continue;
-                };
-                candidate
-                    .operand_vars
-                    .entry(offset)
-                    .or_insert_with(|| (*var).clone());
-
-                if offset == 0 && candidate.selector_var.is_none() {
-                    let resolved = Self::resolve_alias(var, aliases);
-                    let masks = bit_masks.get(*var).or_else(|| bit_masks.get(&resolved));
-                    if let Some(masks) = masks {
-                        if masks.len() >= 2 {
-                            candidate.selector_var = Some((*var).clone());
-                            candidate.selector_masks = masks.iter().copied().collect();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn link_decoder_candidates(
-        candidates: &mut [DecoderCandidate],
-        aliases: &HashMap<String, String>,
-        push_builder_vars: &BTreeSet<String>,
-        push_builder_sites: &HashMap<String, BuilderSite>,
-    ) {
-        for candidate in candidates {
-            if candidate.builder_var.is_some() {
-                continue;
-            }
-            let resolved = Self::resolve_alias(&candidate.object, aliases);
-            if push_builder_vars.contains(&resolved) {
-                candidate.builder_var = Some(resolved.clone());
-                if let Some(site) = push_builder_sites.get(&resolved) {
-                    candidate.builder_start = Some(site.start);
-                    candidate.builder_end = Some(site.end);
-                    candidate.builder_arguments = Some(site.arguments);
-                    candidate.builder_width_hints = site.width_hints.clone();
-                }
-            }
-        }
-    }
-
-    fn complete_selector_masks(
-        candidates: &mut [DecoderCandidate],
-        builders: &[PushBuilderCandidate],
-    ) {
-        let builders_by_start: HashMap<u32, &PushBuilderCandidate> = builders
-            .iter()
-            .map(|builder| (builder.start, builder))
-            .collect();
-
-        for decoder in candidates {
-            let (Some(builder_start), Ok(width)) =
-                (decoder.builder_start, usize::try_from(decoder.width))
-            else {
-                continue;
-            };
-            if width == 0 {
-                continue;
-            }
-            let Some(builder) = builders_by_start.get(&builder_start) else {
-                continue;
-            };
-            let max_opcode = builder
-                .values
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| index % width == 0)
-                .filter_map(|(_, value)| *value)
-                .max();
-            let Some(max_opcode) = max_opcode else {
-                continue;
-            };
-
-            let mut required = BTreeSet::new();
-            required.extend(decoder.selector_masks.iter().copied());
-            let mut bit = 1u64;
-            while bit <= max_opcode && bit != 0 {
-                required.insert(bit);
-                let Some(next) = bit.checked_mul(2) else {
-                    break;
-                };
-                bit = next;
-            }
-            decoder.selector_masks = required.into_iter().collect();
-        }
-    }
-
-    fn observed_opcodes(decoder: &DecoderCandidate, builders: &[PushBuilderCandidate]) -> Vec<u64> {
-        let (Some(builder_start), Ok(width)) =
-            (decoder.builder_start, usize::try_from(decoder.width))
-        else {
-            return Vec::new();
-        };
-        if width == 0 {
-            return Vec::new();
-        }
-        let Some(builder) = builders
-            .iter()
-            .find(|builder| builder.start == builder_start)
-        else {
-            return Vec::new();
-        };
-        builder
-            .values
-            .chunks(width)
-            .filter_map(|chunk| chunk.first().copied().flatten())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
     fn analyze_opcode_maps(&mut self, function: &oxc_ast::ast::Function<'_>) {
         let (
             parent_function_id,
@@ -816,16 +377,16 @@ impl<'s> Scanner<'s> {
         // indexed reads have not yet gone through finish_function(). Derive
         // those here as well so opcode flattening does not depend on a nested
         // closure layout.
-        let mut local = Self::derive_decoder_candidates(&parent_function_id, &accesses);
-        Self::annotate_bitfield_selectors(&mut local, &indexed_value_vars, &bit_masks, &aliases);
-        Self::link_decoder_candidates(
+        let mut local = derive_candidates(&parent_function_id, &accesses);
+        annotate_bitfield_selectors(&mut local, &indexed_value_vars, &bit_masks, &aliases);
+        link_candidates(
             &mut local,
             &aliases,
             &push_builder_vars,
             &push_builder_sites,
         );
         decoder_candidates.extend(local);
-        Self::link_decoder_candidates(
+        link_candidates(
             &mut decoder_candidates,
             &aliases,
             &push_builder_vars,
@@ -836,7 +397,7 @@ impl<'s> Scanner<'s> {
         // therefore be absent from local AST mask tracking. Once the stream is
         // linked, observed opcode values give a conservative lower bound for
         // the selector width. Complete the domain before state simulation.
-        Self::complete_selector_masks(&mut decoder_candidates, &self.push_builders);
+        complete_selector_masks(&mut decoder_candidates, &self.push_builders);
 
         let mut seen_decoders = BTreeSet::new();
         let decoders: Vec<DecoderControlInfo> = decoder_candidates
@@ -862,7 +423,7 @@ impl<'s> Scanner<'s> {
                             && candidate.builder_start.is_some()
                     })
                     .unwrap_or(decoder);
-                let observed_opcodes = Self::observed_opcodes(observed_source, &self.push_builders);
+                let observed_opcodes = observed_opcodes(observed_source, &self.push_builders);
                 Some(DecoderControlInfo {
                     function_id: key.0,
                     selector_var: key.1,
@@ -912,15 +473,15 @@ impl<'s> Scanner<'s> {
 
         let mut decoder_accesses = b.indexed_accesses.clone();
         decoder_accesses.extend(b.child_indexed_accesses.iter().cloned());
-        let mut local_decoders = Self::derive_decoder_candidates(&b.m.id, &decoder_accesses);
-        Self::annotate_bitfield_selectors(
+        let mut local_decoders = derive_candidates(&b.m.id, &decoder_accesses);
+        annotate_bitfield_selectors(
             &mut local_decoders,
             &b.indexed_value_vars,
             &b.bit_masks,
             &b.aliases,
         );
         b.decoder_candidates.extend(local_decoders);
-        Self::link_decoder_candidates(
+        link_candidates(
             &mut b.decoder_candidates,
             &b.aliases,
             &b.push_builder_vars,
@@ -1507,7 +1068,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
         member: &oxc_ast::ast::ComputedMemberExpression<'a>,
     ) {
         let indexed_access = if let Expression::Identifier(object) = &member.object {
-            Self::index_shape(&member.expression).map(|shape| IndexedAccess {
+            index_shape(&member.expression).map(|shape| IndexedAccess {
                 object: object.name.to_string(),
                 shape,
                 start: member.span.start,
@@ -1534,7 +1095,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
         ) = (&declarator.id, &declarator.init)
         {
             if let Expression::Identifier(object) = &member.object {
-                Self::index_shape(&member.expression).map(|shape| {
+                index_shape(&member.expression).map(|shape| {
                     (
                         id.name.to_string(),
                         IndexedAccess {
@@ -1560,7 +1121,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
                     current
                         .vars
                         .insert(name.clone(), expression_evidence(self.source, init));
-                    if let Some(rhs) = Self::expr_ident(init) {
+                    if let Some(rhs) = expr_ident(init) {
                         current.aliases.insert(name.clone(), rhs);
                     } else {
                         current.aliases.remove(&name);
@@ -1618,16 +1179,16 @@ impl<'a> Visit<'a> for Scanner<'_> {
 
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
         let lhs = if assignment.operator.is_assign() {
-            Self::target_ident(&assignment.left)
+            target_ident(&assignment.left)
         } else {
             None
         };
-        let rhs = Self::expr_ident(&assignment.right);
+        let rhs = expr_ident(&assignment.right);
         let fetched_access = if let (Some(lhs_name), Expression::ComputedMemberExpression(member)) =
             (lhs.as_ref(), &assignment.right)
         {
             if let Expression::Identifier(object) = &member.object {
-                Self::index_shape(&member.expression).map(|shape| {
+                index_shape(&member.expression).map(|shape| {
                     (
                         lhs_name.clone(),
                         IndexedAccess {
@@ -1664,15 +1225,13 @@ impl<'a> Visit<'a> for Scanner<'_> {
 
     fn visit_binary_expression(&mut self, binary: &oxc_ast::ast::BinaryExpression<'a>) {
         let bit_mask = if binary.operator.as_str() == "&" {
-            if let (Some(name), Some(mask)) = (
-                Self::origin_ident(&binary.left),
-                Self::origin_u64(&binary.right),
-            ) {
+            if let (Some(name), Some(mask)) =
+                (origin_ident(&binary.left), origin_u64(&binary.right))
+            {
                 Some((name, mask))
-            } else if let (Some(mask), Some(name)) = (
-                Self::origin_u64(&binary.left),
-                Self::origin_ident(&binary.right),
-            ) {
+            } else if let (Some(mask), Some(name)) =
+                (origin_u64(&binary.left), origin_ident(&binary.right))
+            {
                 Some((name, mask))
             } else {
                 None
@@ -1690,7 +1249,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
                         .entry(name.clone())
                         .or_default()
                         .insert(mask);
-                    let resolved = Self::resolve_alias(&name, &current.aliases);
+                    let resolved = resolve_alias(&name, &current.aliases);
                     if resolved != name {
                         current.bit_masks.entry(resolved).or_default().insert(mask);
                     }
@@ -1823,7 +1382,7 @@ fn scan_source_core(source: &str) -> ScanCore {
 
     // Complete selector width only after every descendant decoder has had a
     // chance to link to its bytecode builder.
-    Scanner::complete_selector_masks(&mut scanner.decoder_candidates, &scanner.push_builders);
+    complete_selector_masks(&mut scanner.decoder_candidates, &scanner.push_builders);
 
     // A decoder is propagated upward so a builder declared in an ancestor can
     // be linked. That must not create a second semantic map against an
@@ -1871,7 +1430,7 @@ fn scan_source_core(source: &str) -> ScanCore {
                     && decoder.builder_start.is_some()
             })
             .max_by_key(|decoder| decoder.selector_masks.len())
-            .map(|decoder| Scanner::observed_opcodes(decoder, &scanner.push_builders))
+            .map(|decoder| observed_opcodes(decoder, &scanner.push_builders))
             .unwrap_or_default();
         let observed_set: BTreeSet<u64> = observed.iter().copied().collect();
         map.observed_opcodes = observed;
