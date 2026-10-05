@@ -7,7 +7,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.98"
+rust-version = "1.99"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -26,5 +26,5 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-string_wizard = { git = "https://github.com/codeandsolder/string-wizard-redox.git", rev = "473b6f2dee8c52e760e2a0cb43085971a670c3e8", default-features = false }
+string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "cca7ccd43415d0034149481b043c7586672f4a85", default-features = false }
 url = "2"

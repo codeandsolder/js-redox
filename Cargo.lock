@@ -1080,8 +1080,8 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "string_wizard"
-version = "1.2.12-fast.1"
-source = "git+https://github.com/codeandsolder/string-wizard-redox.git?rev=473b6f2dee8c52e760e2a0cb43085971a670c3e8#473b6f2dee8c52e760e2a0cb43085971a670c3e8"
+version = "1.2.12-redox.1"
+source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=cca7ccd43415d0034149481b043c7586672f4a85#cca7ccd43415d0034149481b043c7586672f4a85"
 dependencies = [
  "memchr",
  "regex",
