@@ -3,9 +3,9 @@ use clap::Parser as ClapParser;
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
+use rolldown_redox::ecmascript::parse_program;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -178,8 +178,8 @@ fn collect_replacements(
     rename: &HashMap<String, String>,
 ) -> Option<Vec<Replacement>> {
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, candidate, SourceType::cjs()).parse();
-    if parsed.panicked || !parsed.diagnostics.is_empty() {
+    let parsed = parse_program(&allocator, candidate, SourceType::cjs());
+    if !parsed.is_clean() {
         return None;
     }
 

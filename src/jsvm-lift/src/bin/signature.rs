@@ -3,8 +3,8 @@ use clap::Parser as ClapParser;
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
 use oxc_span::SourceType;
+use rolldown_redox::ecmascript::parse_program;
 use serde::Deserialize;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -156,8 +156,8 @@ fn fnv1a64(data: &[u8]) -> u64 {
 fn parse_shape(source: &str) -> String {
     for candidate in [source.to_string(), format!("({source})")] {
         let allocator = Allocator::default();
-        let parsed = Parser::new(&allocator, &candidate, SourceType::cjs()).parse();
-        if parsed.panicked || !parsed.diagnostics.is_empty() {
+        let parsed = parse_program(&allocator, &candidate, SourceType::cjs());
+        if !parsed.is_clean() {
             continue;
         }
         let mut visitor = ShapeVisitor::default();

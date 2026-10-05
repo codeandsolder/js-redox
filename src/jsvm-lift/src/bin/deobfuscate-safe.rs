@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
 use oxc_allocator::Allocator;
 use oxc_codegen::Codegen;
-use oxc_parser::Parser;
 use oxc_span::SourceType;
+use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, path::PathBuf};
@@ -26,8 +26,8 @@ struct Args {
 fn canonicalize(source: &str) -> Option<String> {
     for source_type in [SourceType::mjs(), SourceType::cjs()] {
         let allocator = Allocator::default();
-        let parsed = Parser::new(&allocator, source, source_type).parse();
-        if parsed.panicked || !parsed.diagnostics.is_empty() {
+        let parsed = parse_program(&allocator, source, source_type);
+        if !parsed.is_clean() {
             continue;
         }
         return Some(Codegen::new().build(&parsed.program).code);

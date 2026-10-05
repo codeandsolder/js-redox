@@ -9,10 +9,10 @@ use oxc_ast::{
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
 use oxc_semantic::{Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::symbol::SymbolId;
+use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -798,8 +798,8 @@ fn parse<'a>(
     allocator: &'a Allocator,
     source: &'a str,
     source_type: SourceType,
-) -> oxc_parser::ParserReturn<'a> {
-    Parser::new(allocator, source, source_type).parse()
+) -> rolldown_redox::ecmascript::ParseOutcome<'a> {
+    parse_program(allocator, source, source_type)
 }
 
 fn main() -> Result<()> {
@@ -812,7 +812,7 @@ fn main() -> Result<()> {
         parsed = parse(&allocator, &source, SourceType::cjs());
     }
 
-    let mut diagnostics = parsed.diagnostics.len();
+    let mut diagnostics = parsed.diagnostics;
     let panicked = parsed.panicked;
     let mut bundles = Vec::new();
     if !panicked {

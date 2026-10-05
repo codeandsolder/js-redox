@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{BindingPattern, Expression, Statement};
-use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
+use rolldown_redox::ecmascript::parse_program;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -171,8 +171,8 @@ fn compact(text: &str) -> String {
 fn first_param(raw: &str) -> Option<String> {
     let wrapped = format!("({raw})");
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, &wrapped, SourceType::cjs()).parse();
-    if parsed.panicked || !parsed.diagnostics.is_empty() || parsed.program.body.len() != 1 {
+    let parsed = parse_program(&allocator, &wrapped, SourceType::cjs());
+    if !parsed.is_clean() || parsed.program.body.len() != 1 {
         return None;
     }
     let Statement::ExpressionStatement(es) = &parsed.program.body[0] else {
@@ -197,8 +197,8 @@ fn first_param(raw: &str) -> Option<String> {
 fn body_statements(raw: &str) -> Vec<String> {
     let wrapped = format!("({raw})");
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, &wrapped, SourceType::cjs()).parse();
-    if parsed.panicked || !parsed.diagnostics.is_empty() || parsed.program.body.len() != 1 {
+    let parsed = parse_program(&allocator, &wrapped, SourceType::cjs());
+    if !parsed.is_clean() || parsed.program.body.len() != 1 {
         return vec![raw.to_string()];
     }
     let Statement::ExpressionStatement(es) = &parsed.program.body[0] else {

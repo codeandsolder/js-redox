@@ -18,7 +18,6 @@ oxc_ast = "0.138.0"
 oxc_ast_visit = "0.138.0"
 oxc_codegen = "0.138.0"
 oxc_ecmascript = "0.138.0"
-oxc_parser = "0.138.0"
 oxc_semantic = "0.138.0"
 oxc_span = "0.138.0"
 oxc_syntax = "0.138.0"
@@ -26,5 +25,6 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "cca7ccd43415d0034149481b043c7586672f4a85", default-features = false }
+string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "7566c58c7b95bc15bd68626c50eccbdc0dfed209", default-features = false }
+rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "7566c58c7b95bc15bd68626c50eccbdc0dfed209", default-features = false, features = ["ecmascript"] }
 url = "2"

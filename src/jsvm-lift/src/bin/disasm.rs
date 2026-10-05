@@ -6,8 +6,8 @@ use oxc_ast::{
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
 use oxc_span::SourceType;
+use rolldown_redox::ecmascript::parse_program;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -173,7 +173,7 @@ impl<'a> Visit<'a> for ParseIntAliasVisitor {
 
 fn parse_int_aliases(source: &str) -> BTreeSet<String> {
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, SourceType::cjs()).parse();
+    let parsed = parse_program(&allocator, source, SourceType::cjs());
     if parsed.panicked {
         return BTreeSet::new();
     }
@@ -194,8 +194,8 @@ fn expression_from_program<'a>(
 
 fn resolve_parse_int(preview: &str, aliases: &BTreeSet<String>) -> Option<u64> {
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, preview, SourceType::cjs()).parse();
-    if parsed.panicked || !parsed.diagnostics.is_empty() {
+    let parsed = parse_program(&allocator, preview, SourceType::cjs());
+    if !parsed.is_clean() {
         return None;
     }
 

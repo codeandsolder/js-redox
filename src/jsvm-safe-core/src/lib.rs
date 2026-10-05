@@ -19,7 +19,6 @@ use oxc_ast::ast::{
     StaticMemberExpression, UnaryExpression, VariableDeclarationKind, WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
 use oxc_semantic::{ReferenceId, Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::{identifier, scope::ScopeFlags, symbol::SymbolId};
@@ -28,6 +27,7 @@ use proxy::{
 };
 use pure_function::{collect_pure_functions, PureFunction};
 use rewrite::{apply, Counts, Replacement};
+use rolldown_redox::ecmascript::parse_program;
 use selector::{collect_selector_dispatchers, SelectorDispatcher};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use value_eval::{
@@ -866,8 +866,8 @@ fn parse_as<'a>(
     source: &'a str,
     source_type: SourceType,
 ) -> Option<oxc_ast::ast::Program<'a>> {
-    let parsed = Parser::new(allocator, source, source_type).parse();
-    (!parsed.panicked && parsed.diagnostics.is_empty()).then_some(parsed.program)
+    let parsed = parse_program(allocator, source, source_type);
+    parsed.is_clean().then_some(parsed.program)
 }
 
 #[derive(Default)]

@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{Expression, Statement};
-use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 use regex::Regex;
+use rolldown_redox::ecmascript::parse_program;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -458,8 +458,8 @@ fn fragment(source: &str, start: u32, end: u32) -> String {
 
 fn split_effects(source: &str) -> Vec<String> {
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, SourceType::cjs()).parse();
-    if parsed.panicked || !parsed.diagnostics.is_empty() || parsed.program.body.len() != 1 {
+    let parsed = parse_program(&allocator, source, SourceType::cjs());
+    if !parsed.is_clean() || parsed.program.body.len() != 1 {
         return vec![source.to_string()];
     }
 

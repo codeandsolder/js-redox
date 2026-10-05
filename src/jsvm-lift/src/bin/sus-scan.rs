@@ -7,9 +7,9 @@ use oxc_ast::ast::{
     ComputedMemberExpression, Expression, Function, NewExpression, ObjectExpression,
 };
 use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::scope::ScopeFlags;
+use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -1227,8 +1227,8 @@ fn parse_source<'a>(
         Some("cjs") => SourceType::cjs(),
         _ => SourceType::mjs(),
     };
-    let parsed = Parser::new(allocator, source, source_type).parse();
-    let diagnostics = parsed.diagnostics.len();
+    let parsed = parse_program(allocator, source, source_type);
+    let diagnostics = parsed.diagnostics;
     (parsed.program, diagnostics, parsed.panicked)
 }
 

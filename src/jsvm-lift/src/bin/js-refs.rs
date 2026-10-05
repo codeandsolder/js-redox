@@ -6,8 +6,8 @@ use oxc_ast::ast::{
     ImportDeclaration, ImportExpression, NewExpression,
 };
 use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
+use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
@@ -206,8 +206,8 @@ fn parse<'a>(
     source: &'a str,
     source_type: SourceType,
 ) -> Option<oxc_ast::ast::Program<'a>> {
-    let parsed = Parser::new(allocator, source, source_type).parse();
-    if parsed.panicked || !parsed.diagnostics.is_empty() {
+    let parsed = parse_program(allocator, source, source_type);
+    if !parsed.is_clean() {
         None
     } else {
         Some(parsed.program)

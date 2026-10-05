@@ -2,8 +2,8 @@ use anyhow::{bail, Context, Result};
 use clap::Parser as ClapParser;
 use oxc_allocator::Allocator;
 use oxc_codegen::Codegen;
-use oxc_parser::Parser;
 use oxc_span::SourceType;
+use rolldown_redox::ecmascript::parse_program;
 use std::{fs, path::PathBuf};
 
 #[derive(ClapParser, Debug)]
@@ -15,8 +15,8 @@ struct Args {
 
 fn generate(source: &str, source_type: SourceType) -> Option<String> {
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, source_type).parse();
-    if parsed.panicked || !parsed.diagnostics.is_empty() {
+    let parsed = parse_program(&allocator, source, source_type);
+    if !parsed.is_clean() {
         return None;
     }
     Some(Codegen::new().build(&parsed.program).code)

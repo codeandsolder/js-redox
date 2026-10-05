@@ -3,8 +3,8 @@ use clap::Parser as ClapParser;
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
 use oxc_span::SourceType;
+use rolldown_redox::ecmascript::parse_program;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::PathBuf};
 
@@ -186,9 +186,9 @@ fn fnv1a64(data: &[u8]) -> u64 {
 fn shape_hash(source: &str, coarse_properties: bool) -> Result<String> {
     let wrapped = format!("({source})");
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, &wrapped, SourceType::cjs()).parse();
+    let parsed = parse_program(&allocator, &wrapped, SourceType::cjs());
     anyhow::ensure!(!parsed.panicked, "parser panicked");
-    anyhow::ensure!(parsed.diagnostics.is_empty(), "parse diagnostics");
+    anyhow::ensure!(parsed.diagnostics == 0, "parse diagnostics");
     let mut visitor = ShapeVisitor::new(coarse_properties);
     visitor.visit_program(&parsed.program);
     Ok(format!(

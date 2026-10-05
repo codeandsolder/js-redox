@@ -6,8 +6,8 @@ use oxc_ast::{
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
+use rolldown_redox::ecmascript::parse_program;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::{
@@ -504,7 +504,7 @@ fn derive_env(
 ) -> Result<Env> {
     let wrapped = format!("({parent_source})");
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, &wrapped, SourceType::cjs()).parse();
+    let parsed = parse_program(&allocator, &wrapped, SourceType::cjs());
     if parsed.panicked {
         return Err(anyhow!("parent function parse panicked"));
     }
@@ -694,7 +694,7 @@ fn reduce_state_machine(
     opcode: i64,
 ) -> Result<Vec<ReducedPath>> {
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, raw, SourceType::cjs()).parse();
+    let parsed = parse_program(&allocator, raw, SourceType::cjs());
     if parsed.panicked {
         return Err(anyhow!("state machine parse panicked"));
     }

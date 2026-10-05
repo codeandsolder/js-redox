@@ -9,9 +9,9 @@ use oxc_ast::{
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::scope::ScopeFlags;
+use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use state_flatten::{DecoderControlInfo, OpcodeMapCandidate, StateMachineInfo};
 use std::{
@@ -2281,7 +2281,7 @@ struct ScanCore {
 
 fn scan_source_core(source: &str) -> ScanCore {
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, SourceType::cjs()).parse();
+    let parsed = parse_program(&allocator, source, SourceType::cjs());
 
     let mut scanner = Scanner::new(source);
     scanner.visit_program(&parsed.program);
@@ -2444,7 +2444,7 @@ fn scan_source_core(source: &str) -> ScanCore {
         .sort_by_key(|h| std::cmp::Reverse(h.function_values));
 
     ScanCore {
-        diagnostics: parsed.diagnostics.len(),
+        diagnostics: parsed.diagnostics,
         panicked: parsed.panicked,
         arrays: scanner.arrays,
         push_builders: scanner.push_builders,

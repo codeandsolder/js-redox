@@ -4,8 +4,8 @@ use oxc_ast::{
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
-use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
+use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -132,8 +132,8 @@ fn parse_shape_mode(source: &str, coarse: bool) -> String {
         format!("function __ir_wrap(){{{source}}}"),
     ] {
         let allocator = Allocator::default();
-        let parsed = Parser::new(&allocator, &candidate, SourceType::cjs()).parse();
-        if parsed.panicked || !parsed.diagnostics.is_empty() {
+        let parsed = parse_program(&allocator, &candidate, SourceType::cjs());
+        if !parsed.is_clean() {
             continue;
         }
         let mut visitor = ShapeVisitor {
@@ -363,8 +363,8 @@ pub fn classify_effect(source: &str) -> IrOp {
     }
 
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, SourceType::cjs()).parse();
-    if parsed.panicked || !parsed.diagnostics.is_empty() || parsed.program.body.len() != 1 {
+    let parsed = parse_program(&allocator, source, SourceType::cjs());
+    if !parsed.is_clean() || parsed.program.body.len() != 1 {
         return new_op("raw_js", source, &hash, 0.0);
     }
 
