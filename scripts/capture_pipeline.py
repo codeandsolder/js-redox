@@ -31,6 +31,7 @@ class Toolchain:
     deobfuscator: Path = TOOL_ROOT / "deobfuscate-safe"
     string_recoverer: Path = ROOT / "scripts/recover-js-obfuscator-strings.py"
     bundle_inventory: Path = TOOL_ROOT / "bundle-unpack"
+    sourcemap_composer: Path = TOOL_ROOT / "sourcemap-compose"
 
 
 @dataclass(frozen=True)
@@ -163,7 +164,15 @@ def run_capture_pipeline(
             *_parallel_args(options.jobs),
         ]
     )
-    run_checked([sys.executable, ROOT / "scripts/recover-sourcemaps.py", output])
+    run_checked(
+        [
+            sys.executable,
+            ROOT / "scripts/recover-sourcemaps.py",
+            output,
+            "--composer",
+            tools.sourcemap_composer,
+        ]
+    )
     run_checked(
         [
             sys.executable,
@@ -287,7 +296,9 @@ def load_project_summary(
     originals = sum(
         source.get("status") == "recovered"
         for source_map in maps["source_maps"]
-        for source in source_map.get("recovered", [])
+        for source in (
+            source_map.get("composed_recovered") or source_map.get("recovered", [])
+        )
     )
     return ProjectSummary(
         output=output,

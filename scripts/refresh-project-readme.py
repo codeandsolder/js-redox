@@ -44,9 +44,13 @@ def main():
     recovered_originals = [
         rec
         for sm in sourcemaps.get("source_maps", [])
-        for rec in sm.get("recovered", [])
+        for rec in (sm.get("composed_recovered") or sm.get("recovered", []))
         if rec.get("status") == "recovered"
     ]
+    composed_sourcemap_links = sum(
+        sm.get("composition", {}).get("composed_links", 0)
+        for sm in sourcemaps.get("source_maps", [])
+    )
 
     vm_units = jsvm.get("code_units", [])
     confirmed = [u for u in vm_units if u.get("confirmed_vm_signal")]
@@ -107,7 +111,7 @@ def main():
         "- [src/_devirtualized/](src/_devirtualized/) — readable modules/pseudocode for confirmed JavaScript VM interpreters.",
         "- [src/_dynamic/](src/_dynamic/) — formatted analyst views of statically recovered generated-code bodies such as Function(...).",
         "- [src/_dynamic_deobfuscated/](src/_dynamic_deobfuscated/) — proven safe recovery of generated-code children when string/deob passes validate; exact bytes remain the fallback.",
-        "- [src/_sourcemap/](src/_sourcemap/) — original sources recovered from captured source maps.",
+        "- [src/_sourcemap/](src/_sourcemap/) — direct source-map sources plus `final/` views after nested map chains are composed.",
         "- [src/_modules/](src/_modules/) — statically extracted Webpack/Next module wrappers and named AMD factories where module structure is explicit.",
         "- [resources/](resources/) — capture-faithful response bodies or saved-page files.",
         "- [capture-manifest.json](capture-manifest.json) — normalized capture provenance and resource inventory.",
@@ -130,6 +134,7 @@ def main():
         f"- Imports resolved through import maps: **{jsrefs.get('summary', {}).get('resolved_by_import_map', 0)}**",
         f"- Unresolved bare module specifiers: **{jsrefs.get('summary', {}).get('unresolved_bare_specifiers', 0)}**",
         f"- Source-map originals recovered: **{len(recovered_originals)}**",
+        f"- Nested source-map links composed: **{composed_sourcemap_links}**",
         f"- Literal generated-code units recovered: **{len(dynamic)}**",
         f"- Generated-code units recursively scanned: **{len(recursive_generated)}**",
         f"- Generated-code safe recovery: **{generated_recovery.get('summary', {}).get('safe_deobfuscation', 0)}** safe deob, "

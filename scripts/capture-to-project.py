@@ -28,6 +28,7 @@ def main() -> None:
     ap.add_argument("--deobfuscator", type=Path, default=defaults.deobfuscator)
     ap.add_argument("--string-recoverer", type=Path, default=defaults.string_recoverer)
     ap.add_argument("--bundle-inventory", type=Path, default=defaults.bundle_inventory)
+    ap.add_argument("--sourcemap-composer", type=Path, default=defaults.sourcemap_composer)
     ap.add_argument("--jobs", type=int, help="parallel workers for content-only analysis stages")
     ap.add_argument("--skip-safe-deobfuscation", action="store_true")
     ap.add_argument("--skip-bundle-unpack", action="store_true")
@@ -44,6 +45,7 @@ def main() -> None:
         deobfuscator=args.deobfuscator,
         string_recoverer=args.string_recoverer,
         bundle_inventory=args.bundle_inventory,
+        sourcemap_composer=args.sourcemap_composer,
     )
     options = PipelineOptions(
         overwrite=args.overwrite,

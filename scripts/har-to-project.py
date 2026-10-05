@@ -23,6 +23,7 @@ def main() -> None:
     ap.add_argument("--js-refs", type=Path, default=defaults.js_refs)
     ap.add_argument("--deobfuscator", type=Path, default=defaults.deobfuscator)
     ap.add_argument("--string-recoverer", type=Path, default=defaults.string_recoverer)
+    ap.add_argument("--sourcemap-composer", type=Path, default=defaults.sourcemap_composer)
     ap.add_argument("--jobs", type=int, help="parallel workers for content-only analysis stages")
     ap.add_argument("--skip-safe-deobfuscation", action="store_true")
     ap.add_argument("--skip-vm-scan", action="store_true")
@@ -41,6 +42,7 @@ def main() -> None:
         deobfuscator=args.deobfuscator,
         string_recoverer=args.string_recoverer,
         bundle_inventory=defaults.bundle_inventory,
+        sourcemap_composer=args.sourcemap_composer,
     )
     # Keep the historical HAR-only entry point's behavior: it did not extract
     # structured bundle modules. New callers should use capture-to-project.py.

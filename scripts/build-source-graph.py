@@ -370,6 +370,60 @@ def main():
             )
             add_edge(map_node or src, node_id, 'source_map_source', ordinal=ordinal)
 
+        composition = sm.get('composition') or {}
+        composed_map_path = composition.get('composed_map_path')
+        composed_node = None
+        if composed_map_path:
+            composed_node = f'sourcemap-composed:{int(rid)}'
+            add_node(
+                composed_node,
+                type='composed_source_map',
+                parent_resource_id=int(rid),
+                source_path=composed_map_path,
+                composed_links=composition.get('composed_links', 0),
+                composed_sources=composition.get('composed_sources', 0),
+            )
+            add_edge(map_node or src, composed_node, 'source_map_composed')
+
+        for link_index, link in enumerate(composition.get('links', [])):
+            chain_node = f'sourcemap-chain:{int(rid)}:{link_index}'
+            add_node(
+                chain_node,
+                type='sourcemap_chain_link',
+                parent_resource_id=int(rid),
+                depth=link.get('depth'),
+                source_ordinal=link.get('source_ordinal'),
+                logical_source=link.get('logical_source'),
+                raw_reference=link.get('raw_reference'),
+                map_url=link.get('map_url'),
+                map_resource_id=link.get('map_resource_id'),
+                map_origin=link.get('map_origin'),
+                status=link.get('status'),
+            )
+            add_edge(map_node or src, chain_node, 'source_map_chain')
+            nested_map_rid = link.get('map_resource_id')
+            if nested_map_rid is not None:
+                add_edge(chain_node, f'resource:{int(nested_map_rid)}', 'source_map_chain_resource')
+            elif link.get('map_url'):
+                for dst in targets_for(link['map_url']):
+                    add_edge(chain_node, dst, 'source_map_chain_resource')
+
+        for rec in sm.get('composed_recovered', []):
+            if rec.get('status') != 'recovered':
+                continue
+            ordinal = int(rec.get('ordinal', 0))
+            node_id = f'sourcemap-final:{int(rid)}:{ordinal}'
+            add_node(
+                node_id,
+                type='sourcemap_composed_source',
+                parent_resource_id=int(rid),
+                ordinal=ordinal,
+                logical_source=rec.get('logical_source'),
+                source_path=rec.get('source_path'),
+                bytes=rec.get('bytes'),
+            )
+            add_edge(composed_node or map_node or src, node_id, 'source_map_composed_source', ordinal=ordinal)
+
     # Static Function(...) recovery is a generated-code provenance edge.
     generated_analysis_parent = {}
     for dyn in jsvm.get('dynamic_code_units', []):

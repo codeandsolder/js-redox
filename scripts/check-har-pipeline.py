@@ -103,10 +103,24 @@ def main():
     source_map = {
         "version": 3,
         "file": "app.js",
-        "sources": ["src/app-original.js"],
+        "sources": ["src/intermediate.js", "src/side.js"],
         "names": [],
-        "mappings": "",
-        "sourcesContent": ["export function originalAnswer() { return 42; }\n"],
+        "mappings": "AAAA;ACAA",
+        "sourcesContent": [
+            "export function intermediateAnswer() { return 42; }\n"
+            "//# sourceMappingURL=intermediate.js.map\n",
+            "export const side = 'preserved';\n",
+        ],
+    }
+    nested_source_map = {
+        "version": 3,
+        "file": "intermediate.js",
+        "sources": ["../original/app-original.ts"],
+        "names": [],
+        "mappings": "AAAA",
+        "sourcesContent": [
+            "export function originalAnswer(): number { return 42; }\n"
+        ],
     }
 
     fixture = {
@@ -130,6 +144,11 @@ def main():
                     "https://fixture.invalid/assets/app.js.map",
                     "application/json",
                     json.dumps(source_map),
+                ),
+                entry(
+                    "https://fixture.invalid/assets/src/intermediate.js.map",
+                    "application/json",
+                    json.dumps(nested_source_map),
                 ),
             ],
         }
@@ -163,11 +182,13 @@ def main():
         TOOL_ROOT / "deobfuscate-safe",
         "--bundle-inventory",
         TOOL_ROOT / "bundle-unpack",
+        "--sourcemap-composer",
+        TOOL_ROOT / "sourcemap-compose",
     )
 
     manifest = json.loads((PROJECT / "har-manifest.json").read_text())
     assert manifest["schema"] == "har-project/v0"
-    assert len(manifest["resources"]) == 5
+    assert len(manifest["resources"]) == 6
     assert (PROJECT / "capture-manifest.json").is_file()
     speculation = next(
         script
@@ -213,14 +234,32 @@ def main():
     assert app_deob["readable_formatted"] is True
 
     sourcemaps = json.loads((PROJECT / "analysis/sourcemaps.json").read_text())
-    recovered = [
-        rec
-        for sm in sourcemaps["source_maps"]
-        for rec in sm.get("recovered", [])
-        if rec.get("status") == "recovered"
+    assert sourcemaps["schema"] == "har-sourcemap-recovery/v1"
+    app_sourcemap = next(
+        sm for sm in sourcemaps["source_maps"] if sm.get("resource_id") == app_resource["id"]
+    )
+    recovered = [rec for rec in app_sourcemap["recovered"] if rec.get("status") == "recovered"]
+    assert len(recovered) == 2
+    direct_text = [(PROJECT / rec["source_path"]).read_text() for rec in recovered]
+    assert any("intermediateAnswer" in text for text in direct_text)
+    assert any("preserved" in text for text in direct_text)
+    composition = app_sourcemap["composition"]
+    assert composition["status"] == "composed"
+    assert composition["composed_links"] == 1
+    assert composition["composed_sources"] == 2
+    assert Path(composition["composed_map_path"]).suffix == ".map"
+    composed_map = json.loads((PROJECT / composition["composed_map_path"]).read_text())
+    assert composed_map["sources"] == [
+        "https://fixture.invalid/assets/original/app-original.ts",
+        "https://fixture.invalid/assets/src/side.js",
     ]
-    assert len(recovered) == 1
-    assert "originalAnswer" in (PROJECT / recovered[0]["source_path"]).read_text()
+    final_recovered = [
+        rec for rec in app_sourcemap["composed_recovered"] if rec.get("status") == "recovered"
+    ]
+    assert len(final_recovered) == 2
+    final_text = [(PROJECT / rec["source_path"]).read_text() for rec in final_recovered]
+    assert any("originalAnswer" in text for text in final_text)
+    assert any("preserved" in text for text in final_text)
 
     jsrefs = json.loads((PROJECT / "analysis/js-references.json").read_text())
     assert jsrefs["summary"]["javascript_units"] == 4
@@ -337,7 +376,11 @@ def main():
     edge_kinds = graph["summary"]["edge_kinds"]
     assert edge_kinds.get("inline_script") == 2
     assert edge_kinds.get("script_src", 0) >= 1
-    assert edge_kinds.get("source_map_source") == 1
+    assert edge_kinds.get("source_map_source") == 2
+    assert edge_kinds.get("source_map_composed") == 1
+    assert edge_kinds.get("source_map_chain") == 1
+    assert edge_kinds.get("source_map_chain_resource") == 1
+    assert edge_kinds.get("source_map_composed_source") == 2
     assert edge_kinds.get("js_worker") == 1
     assert edge_kinds.get("safe_deobfuscation") == 4
     assert edge_kinds.get("generated_code") == 2

@@ -675,7 +675,7 @@ dependencies = [
  "oxc_data_structures",
  "oxc_index",
  "oxc_semantic",
- "oxc_sourcemap",
+ "oxc_sourcemap 8.1.2",
  "oxc_span",
  "oxc_str",
  "oxc_syntax",
@@ -800,6 +800,19 @@ name = "oxc_sourcemap"
 version = "8.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b415102a94b483bbd76d13e850fe87961197e5795c79a8523ebec5d82025f94f"
+dependencies = [
+ "base64-simd",
+ "json-escape-simd",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "oxc_sourcemap"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1133371a5fadc14b9f66a8fec14be3564a77647c7ab21b1ef0ec973bd82613ce"
 dependencies = [
  "base64-simd",
  "json-escape-simd",
@@ -964,11 +977,13 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rolldown_redox"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=7566c58c7b95bc15bd68626c50eccbdc0dfed209#7566c58c7b95bc15bd68626c50eccbdc0dfed209"
+source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=16e02894ed921132b0cf0009a5a3601a83416a6f#16e02894ed921132b0cf0009a5a3601a83416a6f"
 dependencies = [
+ "memchr",
  "oxc_allocator",
  "oxc_ast",
  "oxc_parser",
+ "oxc_sourcemap 9.0.0",
  "oxc_span",
  "self_cell",
 ]
@@ -1079,6 +1094,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8e2fb0f499abb4d162f2bedad68f5ef91a1682b5a03596ddb67efd37768d100"
 
 [[package]]
+name = "sourcemap-compose"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rolldown_redox",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1093,7 +1117,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "string_wizard"
 version = "1.2.12-redox.1"
-source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=7566c58c7b95bc15bd68626c50eccbdc0dfed209#7566c58c7b95bc15bd68626c50eccbdc0dfed209"
+source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=16e02894ed921132b0cf0009a5a3601a83416a6f#16e02894ed921132b0cf0009a5a3601a83416a6f"
 dependencies = [
  "memchr",
  "regex",

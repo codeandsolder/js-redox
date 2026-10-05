@@ -4,12 +4,12 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 project="$root/src/jsvm-lift"
 publish_root="$root/.cargo-target-nodebug"
-toolchain="/opt/toolchains/rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu"
+toolchain="/opt/toolchains/rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu"
 cargo_bin="$toolchain/bin/cargo"
 rustc_bin="$toolchain/bin/rustc"
 
 export RUSTC="$rustc_bin"
-export RUSTUP_TOOLCHAIN="1.98.1-x86_64-unknown-linux-gnu"
+export RUSTUP_TOOLCHAIN="1.99.0-x86_64-unknown-linux-gnu"
 export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_PROFILE_DEV_INCREMENTAL=false
 
@@ -34,6 +34,12 @@ echo "RUSTC_WRAPPER=${RUSTC_WRAPPER:-<unset>}"
 
 cd "$project"
 "$cargo_bin" build -j "$jobs" "$@"
+
+composer_args=()
+if [[ "$profile" == "release" ]]; then
+  composer_args+=(--release)
+fi
+"$cargo_bin" build -j "$jobs" -p sourcemap-compose "${composer_args[@]}"
 
 # Site-wrapper target is a disposable compile cache; durable executables are published below.
 shim_target_root="/var/cache/sentinelx/cargo-target"
@@ -64,7 +70,7 @@ mkdir -p "$canonical"
 # deleting its disposable scratch target. Prefer that durable mirror after Cargo
 # returns, while retaining the scratch path as a fallback for older wrappers.
 published=0
-for bin in jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack sus-scan; do
+for bin in jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack sourcemap-compose sus-scan; do
   source_bin=""
   if [[ -f "$mirror/$bin" ]]; then
     source_bin="$mirror/$bin"

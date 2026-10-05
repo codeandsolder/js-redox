@@ -2,6 +2,7 @@
 members = [
     "src/jsvm-lift",
     "src/jsvm-safe-core",
+    "src/sourcemap-compose",
 ]
 resolver = "2"
 
@@ -25,6 +26,6 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "7566c58c7b95bc15bd68626c50eccbdc0dfed209", default-features = false }
-rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "7566c58c7b95bc15bd68626c50eccbdc0dfed209", default-features = false, features = ["ecmascript"] }
+string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "16e02894ed921132b0cf0009a5a3601a83416a6f", default-features = false }
+rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "16e02894ed921132b0cf0009a5a3601a83416a6f", default-features = false }
 url = "2"
