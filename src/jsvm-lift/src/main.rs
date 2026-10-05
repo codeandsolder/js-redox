@@ -1988,276 +1988,331 @@ impl<'s> Scanner<'s> {
 }
 
 impl<'a> Visit<'a> for Scanner<'_> {
-    fn enter_node(&mut self, kind: AstKind<'a>) {
-        match kind {
-            AstKind::Function(f) => {
-                let name = f.id.as_ref().map(|id| id.name.to_string());
-                self.push_function("function", name, f.span.start, f.span.end);
-            }
-            AstKind::ArrowFunctionExpression(f) => {
-                self.push_function("arrow", None, f.span.start, f.span.end);
-            }
-            AstKind::ObjectExpression(o) => self.record_handler_table(o),
-            AstKind::ArrayExpression(a) => {
-                self.record_array(a);
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.arrays += 1;
-                    if a.elements.len() >= 32 {
-                        cur.m.large_arrays += 1;
-                    }
-                }
-            }
-            AstKind::SwitchStatement(s) => {
-                self.record_direct_switch(s);
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.switches += 1;
-                    cur.m.switch_cases += s.cases.len();
-                    cur.switch_inputs
-                        .push(expression_evidence(self.source, &s.discriminant));
-                }
-            }
-            AstKind::ForStatement(f) => {
-                self.record_state_machine(f);
-                self.record_if_ladder_state_machine(f);
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.loops += 1;
-                }
-            }
-            AstKind::WhileStatement(_)
-            | AstKind::DoWhileStatement(_)
-            | AstKind::ForInStatement(_)
-            | AstKind::ForOfStatement(_) => {
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.loops += 1;
-                }
-            }
-            AstKind::ConditionalExpression(_) => {
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.conditionals += 1;
-                }
-            }
-            AstKind::ComputedMemberExpression(cm) => {
-                let indexed_access = if let Expression::Identifier(object) = &cm.object {
-                    Self::index_shape(&cm.expression).map(|shape| IndexedAccess {
-                        object: object.name.to_string(),
-                        shape,
-                        start: cm.span.start,
-                        end: cm.span.end,
-                        preview: self.source_preview(cm.span.start, cm.span.end, 160),
-                    })
-                } else {
-                    None
-                };
+    fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        let name = function.id.as_ref().map(|id| id.name.to_string());
+        self.push_function("function", name, function.span.start, function.span.end);
+        walk::walk_function(self, function, flags);
+        self.analyze_opcode_maps(function);
+        self.finish_function();
+    }
 
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.computed_members += 1;
-                    if let Some(access) = indexed_access {
-                        cur.indexed_accesses.push(access);
-                    }
-                }
-            }
-            AstKind::VariableDeclarator(v) => {
-                let fetched_access = if let (
-                    oxc_ast::ast::BindingPattern::BindingIdentifier(id),
-                    Some(Expression::ComputedMemberExpression(cm)),
-                ) = (&v.id, &v.init)
-                {
-                    if let Expression::Identifier(object) = &cm.object {
-                        Self::index_shape(&cm.expression).map(|shape| {
-                            (
-                                id.name.to_string(),
-                                IndexedAccess {
-                                    object: object.name.to_string(),
-                                    shape,
-                                    start: cm.span.start,
-                                    end: cm.span.end,
-                                    preview: self.source_preview(cm.span.start, cm.span.end, 160),
-                                },
-                            )
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+    fn visit_arrow_function_expression(
+        &mut self,
+        function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        self.push_function("arrow", None, function.span.start, function.span.end);
+        walk::walk_arrow_function_expression(self, function);
+        self.finish_function();
+    }
 
-                if let Some(cur) = self.stack.last_mut() {
-                    if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &v.id {
-                        if let Some(init) = &v.init {
-                            let name = id.name.to_string();
-                            cur.vars
-                                .insert(name.clone(), expression_evidence(self.source, init));
-                            if let Some(rhs) = Self::expr_ident(init) {
-                                cur.aliases.insert(name.clone(), rhs);
-                            } else {
-                                cur.aliases.remove(&name);
-                            }
-                        }
-                    }
-                    if let Some((name, access)) = fetched_access {
-                        cur.indexed_value_vars.insert(name, access);
-                    }
-                }
+    fn visit_object_expression(&mut self, object: &oxc_ast::ast::ObjectExpression<'a>) {
+        self.record_handler_table(object);
+        walk::walk_object_expression(self, object);
+    }
+
+    fn visit_array_expression(&mut self, array: &oxc_ast::ast::ArrayExpression<'a>) {
+        self.record_array(array);
+        if let Some(current) = self.stack.last_mut() {
+            current.m.arrays += 1;
+            if array.elements.len() >= 32 {
+                current.m.large_arrays += 1;
             }
-            AstKind::CallExpression(c) => {
-                self.record_push_builder(c);
-                self.record_literal_string_join(c);
-                let is_function_ctor = matches!(
-                    &c.callee,
-                    Expression::Identifier(id) if id.name.as_str() == "Function"
-                );
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.calls += 1;
-                    if let Expression::ComputedMemberExpression(cm) = &c.callee {
-                        cur.m.computed_calls += 1;
-                        cur.computed_call_indices
-                            .push(expression_evidence(self.source, &cm.expression));
-                    }
-                }
-                if is_function_ctor {
-                    self.record_function_constructor(
-                        "Function",
-                        c.span.start,
-                        c.span.end,
-                        &c.arguments,
-                    );
-                }
+        }
+        walk::walk_array_expression(self, array);
+    }
+
+    fn visit_switch_statement(&mut self, switch: &oxc_ast::ast::SwitchStatement<'a>) {
+        self.record_direct_switch(switch);
+        if let Some(current) = self.stack.last_mut() {
+            current.m.switches += 1;
+            current.m.switch_cases += switch.cases.len();
+            current
+                .switch_inputs
+                .push(expression_evidence(self.source, &switch.discriminant));
+        }
+        walk::walk_switch_statement(self, switch);
+    }
+
+    fn visit_for_statement(&mut self, statement: &oxc_ast::ast::ForStatement<'a>) {
+        self.record_state_machine(statement);
+        self.record_if_ladder_state_machine(statement);
+        if let Some(current) = self.stack.last_mut() {
+            current.m.loops += 1;
+        }
+        walk::walk_for_statement(self, statement);
+    }
+
+    fn visit_while_statement(&mut self, statement: &oxc_ast::ast::WhileStatement<'a>) {
+        if let Some(current) = self.stack.last_mut() {
+            current.m.loops += 1;
+        }
+        walk::walk_while_statement(self, statement);
+    }
+
+    fn visit_do_while_statement(&mut self, statement: &oxc_ast::ast::DoWhileStatement<'a>) {
+        if let Some(current) = self.stack.last_mut() {
+            current.m.loops += 1;
+        }
+        walk::walk_do_while_statement(self, statement);
+    }
+
+    fn visit_for_in_statement(&mut self, statement: &oxc_ast::ast::ForInStatement<'a>) {
+        if let Some(current) = self.stack.last_mut() {
+            current.m.loops += 1;
+        }
+        walk::walk_for_in_statement(self, statement);
+    }
+
+    fn visit_for_of_statement(&mut self, statement: &oxc_ast::ast::ForOfStatement<'a>) {
+        if let Some(current) = self.stack.last_mut() {
+            current.m.loops += 1;
+        }
+        walk::walk_for_of_statement(self, statement);
+    }
+
+    fn visit_conditional_expression(
+        &mut self,
+        expression: &oxc_ast::ast::ConditionalExpression<'a>,
+    ) {
+        if let Some(current) = self.stack.last_mut() {
+            current.m.conditionals += 1;
+        }
+        walk::walk_conditional_expression(self, expression);
+    }
+
+    fn visit_computed_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::ComputedMemberExpression<'a>,
+    ) {
+        let indexed_access = if let Expression::Identifier(object) = &member.object {
+            Self::index_shape(&member.expression).map(|shape| IndexedAccess {
+                object: object.name.to_string(),
+                shape,
+                start: member.span.start,
+                end: member.span.end,
+                preview: self.source_preview(member.span.start, member.span.end, 160),
+            })
+        } else {
+            None
+        };
+
+        if let Some(current) = self.stack.last_mut() {
+            current.m.computed_members += 1;
+            if let Some(access) = indexed_access {
+                current.indexed_accesses.push(access);
             }
-            AstKind::NewExpression(n) => {
-                if matches!(
-                    &n.callee,
-                    Expression::Identifier(id) if id.name.as_str() == "Function"
-                ) {
-                    self.record_function_constructor(
-                        "new Function",
-                        n.span.start,
-                        n.span.end,
-                        &n.arguments,
-                    );
-                }
+        }
+        walk::walk_computed_member_expression(self, member);
+    }
+
+    fn visit_variable_declarator(&mut self, declarator: &oxc_ast::ast::VariableDeclarator<'a>) {
+        let fetched_access = if let (
+            oxc_ast::ast::BindingPattern::BindingIdentifier(id),
+            Some(Expression::ComputedMemberExpression(member)),
+        ) = (&declarator.id, &declarator.init)
+        {
+            if let Expression::Identifier(object) = &member.object {
+                Self::index_shape(&member.expression).map(|shape| {
+                    (
+                        id.name.to_string(),
+                        IndexedAccess {
+                            object: object.name.to_string(),
+                            shape,
+                            start: member.span.start,
+                            end: member.span.end,
+                            preview: self.source_preview(member.span.start, member.span.end, 160),
+                        },
+                    )
+                })
+            } else {
+                None
             }
-            AstKind::AssignmentExpression(assign) => {
-                let lhs = if assign.operator.is_assign() {
-                    Self::target_ident(&assign.left)
-                } else {
-                    None
-                };
-                let rhs = Self::expr_ident(&assign.right);
-                let fetched_access =
-                    if let (Some(lhs_name), Expression::ComputedMemberExpression(cm)) =
-                        (lhs.as_ref(), &assign.right)
-                    {
-                        if let Expression::Identifier(object) = &cm.object {
-                            Self::index_shape(&cm.expression).map(|shape| {
-                                (
-                                    lhs_name.clone(),
-                                    IndexedAccess {
-                                        object: object.name.to_string(),
-                                        shape,
-                                        start: cm.span.start,
-                                        end: cm.span.end,
-                                        preview: self.source_preview(
-                                            cm.span.start,
-                                            cm.span.end,
-                                            160,
-                                        ),
-                                    },
-                                )
-                            })
-                        } else {
-                            None
-                        }
+        } else {
+            None
+        };
+
+        if let Some(current) = self.stack.last_mut() {
+            if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
+                if let Some(init) = &declarator.init {
+                    let name = id.name.to_string();
+                    current
+                        .vars
+                        .insert(name.clone(), expression_evidence(self.source, init));
+                    if let Some(rhs) = Self::expr_ident(init) {
+                        current.aliases.insert(name.clone(), rhs);
                     } else {
-                        None
-                    };
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.assignments += 1;
-                    if let Some(lhs) = lhs {
-                        if let Some(rhs) = rhs {
-                            cur.aliases.insert(lhs, rhs);
-                        } else {
-                            cur.aliases.remove(&lhs);
-                        }
-                    }
-                    if let Some((name, access)) = fetched_access {
-                        cur.indexed_value_vars.insert(name, access);
+                        current.aliases.remove(&name);
                     }
                 }
             }
-            AstKind::BinaryExpression(bin) => {
-                let bit_mask = if bin.operator.as_str() == "&" {
-                    if let (Some(name), Some(mask)) =
-                        (Self::origin_ident(&bin.left), Self::origin_u64(&bin.right))
-                    {
-                        Some((name, mask))
-                    } else if let (Some(mask), Some(name)) =
-                        (Self::origin_u64(&bin.left), Self::origin_ident(&bin.right))
-                    {
-                        Some((name, mask))
-                    } else {
-                        None
-                    }
+            if let Some((name, access)) = fetched_access {
+                current.indexed_value_vars.insert(name, access);
+            }
+        }
+        walk::walk_variable_declarator(self, declarator);
+    }
+
+    fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+        self.record_push_builder(call);
+        self.record_literal_string_join(call);
+        let is_function_ctor = matches!(
+            &call.callee,
+            Expression::Identifier(id) if id.name.as_str() == "Function"
+        );
+        if let Some(current) = self.stack.last_mut() {
+            current.m.calls += 1;
+            if let Expression::ComputedMemberExpression(member) = &call.callee {
+                current.m.computed_calls += 1;
+                current
+                    .computed_call_indices
+                    .push(expression_evidence(self.source, &member.expression));
+            }
+        }
+        if is_function_ctor {
+            self.record_function_constructor(
+                "Function",
+                call.span.start,
+                call.span.end,
+                &call.arguments,
+            );
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_new_expression(&mut self, expression: &oxc_ast::ast::NewExpression<'a>) {
+        if matches!(
+            &expression.callee,
+            Expression::Identifier(id) if id.name.as_str() == "Function"
+        ) {
+            self.record_function_constructor(
+                "new Function",
+                expression.span.start,
+                expression.span.end,
+                &expression.arguments,
+            );
+        }
+        walk::walk_new_expression(self, expression);
+    }
+
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        let lhs = if assignment.operator.is_assign() {
+            Self::target_ident(&assignment.left)
+        } else {
+            None
+        };
+        let rhs = Self::expr_ident(&assignment.right);
+        let fetched_access = if let (Some(lhs_name), Expression::ComputedMemberExpression(member)) =
+            (lhs.as_ref(), &assignment.right)
+        {
+            if let Expression::Identifier(object) = &member.object {
+                Self::index_shape(&member.expression).map(|shape| {
+                    (
+                        lhs_name.clone(),
+                        IndexedAccess {
+                            object: object.name.to_string(),
+                            shape,
+                            start: member.span.start,
+                            end: member.span.end,
+                            preview: self.source_preview(member.span.start, member.span.end, 160),
+                        },
+                    )
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(current) = self.stack.last_mut() {
+            current.m.assignments += 1;
+            if let Some(lhs) = lhs {
+                if let Some(rhs) = rhs {
+                    current.aliases.insert(lhs, rhs);
                 } else {
-                    None
-                };
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.binary_exprs += 1;
-                    if let Some((name, mask)) = bit_mask {
-                        if mask.is_power_of_two() && mask <= (1u64 << 32) {
-                            cur.bit_masks.entry(name.clone()).or_default().insert(mask);
-                            let resolved = Self::resolve_alias(&name, &cur.aliases);
-                            if resolved != name {
-                                cur.bit_masks.entry(resolved).or_default().insert(mask);
-                            }
-                        }
+                    current.aliases.remove(&lhs);
+                }
+            }
+            if let Some((name, access)) = fetched_access {
+                current.indexed_value_vars.insert(name, access);
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+
+    fn visit_binary_expression(&mut self, binary: &oxc_ast::ast::BinaryExpression<'a>) {
+        let bit_mask = if binary.operator.as_str() == "&" {
+            if let (Some(name), Some(mask)) = (
+                Self::origin_ident(&binary.left),
+                Self::origin_u64(&binary.right),
+            ) {
+                Some((name, mask))
+            } else if let (Some(mask), Some(name)) = (
+                Self::origin_u64(&binary.left),
+                Self::origin_ident(&binary.right),
+            ) {
+                Some((name, mask))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(current) = self.stack.last_mut() {
+            current.m.binary_exprs += 1;
+            if let Some((name, mask)) = bit_mask {
+                if mask.is_power_of_two() && mask <= (1u64 << 32) {
+                    current
+                        .bit_masks
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(mask);
+                    let resolved = Self::resolve_alias(&name, &current.aliases);
+                    if resolved != name {
+                        current.bit_masks.entry(resolved).or_default().insert(mask);
                     }
                 }
             }
-            AstKind::UnaryExpression(_) => {
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.unary_exprs += 1;
-                }
-            }
-            AstKind::SequenceExpression(_) => {
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.sequence_exprs += 1;
-                }
-            }
-            AstKind::NumericLiteral(_) => {
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.numeric_literals += 1;
-                }
-            }
-            AstKind::StringLiteral(_) => {
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.string_literals += 1;
-                }
-            }
-            AstKind::TryStatement(_) => {
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.m.tries += 1;
-                }
-            }
-            _ => {}
+        }
+        walk::walk_binary_expression(self, binary);
+    }
+
+    fn visit_unary_expression(&mut self, expression: &oxc_ast::ast::UnaryExpression<'a>) {
+        if let Some(current) = self.stack.last_mut() {
+            current.m.unary_exprs += 1;
+        }
+        walk::walk_unary_expression(self, expression);
+    }
+
+    fn visit_sequence_expression(&mut self, expression: &oxc_ast::ast::SequenceExpression<'a>) {
+        if let Some(current) = self.stack.last_mut() {
+            current.m.sequence_exprs += 1;
+        }
+        walk::walk_sequence_expression(self, expression);
+    }
+
+    fn visit_numeric_literal(&mut self, _literal: &oxc_ast::ast::NumericLiteral<'a>) {
+        if let Some(current) = self.stack.last_mut() {
+            current.m.numeric_literals += 1;
         }
     }
 
-    fn leave_node(&mut self, kind: AstKind<'a>) {
-        match kind {
-            AstKind::Function(function) => {
-                self.analyze_opcode_maps(function);
-                self.finish_function();
-            }
-            AstKind::ArrowFunctionExpression(_) => {
-                self.finish_function();
-            }
-            _ => {}
+    fn visit_string_literal(&mut self, _literal: &oxc_ast::ast::StringLiteral<'a>) {
+        if let Some(current) = self.stack.last_mut() {
+            current.m.string_literals += 1;
         }
     }
 
-    fn visit_program(&mut self, it: &oxc_ast::ast::Program<'a>) {
-        walk::walk_program(self, it);
+    fn visit_try_statement(&mut self, statement: &oxc_ast::ast::TryStatement<'a>) {
+        if let Some(current) = self.stack.last_mut() {
+            current.m.tries += 1;
+        }
+        walk::walk_try_statement(self, statement);
+    }
+
+    fn visit_program(&mut self, program: &oxc_ast::ast::Program<'a>) {
+        walk::walk_program(self, program);
     }
 }
 
