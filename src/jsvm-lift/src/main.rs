@@ -1,5 +1,6 @@
 mod bytecode;
 mod decoder;
+mod dispatch;
 mod state_flatten;
 mod table_vm;
 
@@ -11,13 +12,17 @@ use decoder::{
     index_shape, link_candidates, observed_opcodes, origin_ident, origin_u64, resolve_alias,
     target_ident, BuilderSite, DecoderCandidate, IndexedAccess,
 };
+use dispatch::{
+    detect_array_handler_table, detect_direct_switch, detect_object_handler_table,
+    DirectSwitchMapCandidate, HandlerTableCandidate,
+};
 use oxc_allocator::Allocator;
 use oxc_ast::{
-    ast::{Argument, ArrayExpressionElement, Expression, ObjectPropertyKind},
+    ast::{Argument, ArrayExpressionElement, Expression},
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
-use oxc_span::{GetSpan, SourceType};
+use oxc_span::SourceType;
 use oxc_syntax::scope::ScopeFlags;
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
@@ -48,39 +53,6 @@ struct Args {
     /// Materialize statically recovered Function(...) bodies as synthetic JS files.
     #[arg(long)]
     dump_embedded: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct HandlerTableCandidate {
-    start: u32,
-    end: u32,
-    container_kind: String,
-    properties: usize,
-    function_values: usize,
-    async_function_values: usize,
-    preview: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct DirectSwitchHandler {
-    key: Option<u64>,
-    key_source: Option<String>,
-    semantic: Vec<String>,
-    terminal: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct DirectSwitchMapCandidate {
-    parent_function_id: String,
-    start: u32,
-    end: u32,
-    selector: String,
-    numeric_cases: usize,
-    opcode_max: u64,
-    vm_evidence_score: u32,
-    vm_reasons: Vec<String>,
-    confirmed_vm: bool,
-    handlers: Vec<DirectSwitchHandler>,
 }
 
 #[derive(Debug, Clone)]
@@ -277,18 +249,6 @@ impl<'s> Scanner<'s> {
             out.push(if c.is_whitespace() { ' ' } else { c });
         }
         out
-    }
-
-    fn numeric_u64(expr: &Expression<'_>) -> Option<u64> {
-        match expr {
-            Expression::NumericLiteral(n)
-                if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 =>
-            {
-                Some(n.value as u64)
-            }
-            Expression::ParenthesizedExpression(p) => Self::numeric_u64(&p.expression),
-            _ => None,
-        }
     }
 
     fn push_function(&mut self, kind: &str, name: Option<String>, start: u32, end: u32) {
@@ -719,8 +679,8 @@ impl<'s> Scanner<'s> {
         });
     }
 
-    fn record_direct_switch(&mut self, sw: &oxc_ast::ast::SwitchStatement<'_>) {
-        if sw.cases.len() < 8 {
+    fn record_direct_switch(&mut self, switch: &oxc_ast::ast::SwitchStatement<'_>) {
+        if switch.cases.len() < 8 {
             return;
         }
         let Some(current) = self.stack.last() else {
@@ -729,186 +689,25 @@ impl<'s> Scanner<'s> {
         if current.m.loops == 0 {
             return;
         }
-
-        let evidence = expression_evidence(self.source, &sw.discriminant);
+        let evidence = expression_evidence(self.source, &switch.discriminant);
         let indexed_selector =
             Self::evidence_reaches_computed(&evidence, &current.vars, &mut HashSet::new());
         let call_selector = evidence.calls > 0;
-        if !indexed_selector && !call_selector {
-            return;
+        if let Some(candidate) = detect_direct_switch(
+            self.source,
+            &current.m.id,
+            switch,
+            indexed_selector,
+            call_selector,
+        ) {
+            self.direct_switch_maps.push(candidate);
         }
-
-        let mut handlers = Vec::with_capacity(sw.cases.len());
-        let mut numeric_cases = 0usize;
-        let mut opcode_max = 0u64;
-        for case in &sw.cases {
-            let key = case.test.as_ref().and_then(Self::numeric_u64);
-            if let Some(value) = key {
-                numeric_cases += 1;
-                opcode_max = opcode_max.max(value);
-            }
-            let key_source = case
-                .test
-                .as_ref()
-                .map(|expr| self.source_preview(expr.span().start, expr.span().end, usize::MAX));
-
-            let mut semantic = Vec::new();
-            let mut terminal = "fallthrough".to_string();
-            for stmt in &case.consequent {
-                match stmt {
-                    oxc_ast::ast::Statement::BreakStatement(_) => {
-                        terminal = "break".to_string();
-                    }
-                    oxc_ast::ast::Statement::ContinueStatement(_) => {
-                        terminal = "continue".to_string();
-                    }
-                    oxc_ast::ast::Statement::ReturnStatement(_) => {
-                        terminal = "return".to_string();
-                        semantic.push(self.source_preview(
-                            stmt.span().start,
-                            stmt.span().end,
-                            usize::MAX,
-                        ));
-                    }
-                    oxc_ast::ast::Statement::ThrowStatement(_) => {
-                        terminal = "throw".to_string();
-                        semantic.push(self.source_preview(
-                            stmt.span().start,
-                            stmt.span().end,
-                            usize::MAX,
-                        ));
-                    }
-                    _ => semantic.push(self.source_preview(
-                        stmt.span().start,
-                        stmt.span().end,
-                        usize::MAX,
-                    )),
-                }
-            }
-
-            handlers.push(DirectSwitchHandler {
-                key,
-                key_source,
-                semantic,
-                terminal,
-            });
-        }
-
-        // VM dispatch switches are overwhelmingly numeric opcode tables.
-        // Parser/evaluator switches can have a handful of numeric arms mixed
-        // with symbolic cases, so require a strong numeric-case majority.
-        if numeric_cases < 8 || numeric_cases * 4 < sw.cases.len() * 3 {
-            return;
-        }
-
-        let selector = self.source_preview(
-            sw.discriminant.span().start,
-            sw.discriminant.span().end,
-            usize::MAX,
-        );
-        let semantic_fragments = handlers
-            .iter()
-            .flat_map(|handler| handler.semantic.iter())
-            .collect::<Vec<_>>();
-        let stack_ops = semantic_fragments
-            .iter()
-            .filter(|source| {
-                source.contains(".push(") || source.contains(".pop(") || source.contains(".splice(")
-            })
-            .count();
-        let cursor_ops = semantic_fragments
-            .iter()
-            .filter(|source| {
-                (source.contains("++") || source.contains("--"))
-                    && (source.contains('[') || source.contains(".length"))
-            })
-            .count();
-        let continue_handlers = handlers
-            .iter()
-            .filter(|handler| handler.terminal == "continue")
-            .count();
-
-        let mut vm_evidence_score = 0u32;
-        let mut vm_reasons = Vec::new();
-        if numeric_cases >= 16 {
-            vm_evidence_score += 2;
-            vm_reasons.push(format!("{numeric_cases} numeric opcode-like cases"));
-        }
-        if stack_ops >= 3 {
-            vm_evidence_score += 3;
-            vm_reasons.push(format!("{stack_ops} stack-like handler effects"));
-        }
-        if cursor_ops >= 4 {
-            vm_evidence_score += 2;
-            vm_reasons.push(format!("{cursor_ops} indexed cursor/stack mutations"));
-        }
-        if continue_handlers >= 3 {
-            vm_evidence_score += 2;
-            vm_reasons.push(format!(
-                "{continue_handlers} handlers continue dispatch loop"
-            ));
-        }
-        if call_selector && !indexed_selector {
-            vm_reasons.push("opcode selector is produced by a call".into());
-        }
-        let confirmed_vm = vm_evidence_score >= 5;
-
-        self.direct_switch_maps.push(DirectSwitchMapCandidate {
-            parent_function_id: current.m.id.clone(),
-            start: sw.span.start,
-            end: sw.span.end,
-            selector,
-            numeric_cases,
-            opcode_max,
-            vm_evidence_score,
-            vm_reasons,
-            confirmed_vm,
-            handlers,
-        });
     }
 
-    fn record_handler_table(&mut self, obj: &oxc_ast::ast::ObjectExpression<'_>) {
-        let properties = obj.properties.len();
-        if properties < 8 {
-            return;
+    fn record_handler_table(&mut self, object: &oxc_ast::ast::ObjectExpression<'_>) {
+        if let Some(candidate) = detect_object_handler_table(self.source, object) {
+            self.handler_tables.push(candidate);
         }
-
-        let mut function_values = 0usize;
-        let mut async_function_values = 0usize;
-        for prop in &obj.properties {
-            let ObjectPropertyKind::ObjectProperty(prop) = prop else {
-                continue;
-            };
-            match &prop.value {
-                Expression::FunctionExpression(f) => {
-                    function_values += 1;
-                    if f.r#async {
-                        async_function_values += 1;
-                    }
-                }
-                Expression::ArrowFunctionExpression(f) => {
-                    function_values += 1;
-                    if f.r#async {
-                        async_function_values += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if function_values < 8 || function_values * 2 < properties {
-            return;
-        }
-
-        self.handler_tables.push(HandlerTableCandidate {
-            start: obj.span.start,
-            end: obj.span.end,
-            container_kind: "object".to_string(),
-            properties,
-            function_values,
-            async_function_values,
-            preview: self.source_preview(obj.span.start, obj.span.end, 120),
-        });
     }
 
     fn record_array(&mut self, arr: &oxc_ast::ast::ArrayExpression<'_>) {
@@ -925,38 +724,11 @@ impl<'s> Scanner<'s> {
                 }
             }
 
-            let mut function_values = 0usize;
-            let mut async_function_values = 0usize;
-            for el in &arr.elements {
-                match el {
-                    ArrayExpressionElement::FunctionExpression(f) => {
-                        function_values += 1;
-                        if f.r#async {
-                            async_function_values += 1;
-                        }
-                    }
-                    ArrayExpressionElement::ArrowFunctionExpression(f) => {
-                        function_values += 1;
-                        if f.r#async {
-                            async_function_values += 1;
-                        }
-                    }
-                    _ => {}
+            if let Some(candidate) = detect_array_handler_table(self.source, arr) {
+                if let Some(current) = self.stack.last_mut() {
+                    current.local_function_table_lengths.push(n);
                 }
-            }
-            if function_values >= 4 && function_values * 2 >= n {
-                if let Some(cur) = self.stack.last_mut() {
-                    cur.local_function_table_lengths.push(n);
-                }
-                self.handler_tables.push(HandlerTableCandidate {
-                    start: arr.span.start,
-                    end: arr.span.end,
-                    container_kind: "array".to_string(),
-                    properties: n,
-                    function_values,
-                    async_function_values,
-                    preview: self.source_preview(arr.span.start, arr.span.end, 120),
-                });
+                self.handler_tables.push(candidate);
             }
         }
 
