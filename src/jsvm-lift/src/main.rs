@@ -2,6 +2,7 @@ mod bytecode;
 mod decoder;
 mod dispatch;
 mod embedded;
+mod function_analysis;
 mod state_flatten;
 mod table_vm;
 
@@ -18,11 +19,11 @@ use dispatch::{
     DirectSwitchMapCandidate, HandlerTableCandidate,
 };
 use embedded::{detect_function_constructor, detect_literal_string_join, EmbeddedCodeCandidate};
-use oxc_allocator::Allocator;
-use oxc_ast::{
-    ast::{ArrayExpressionElement, Expression},
-    AstKind,
+use function_analysis::{
+    evidence_reaches_computed, expression_evidence, FunctionMetrics, FunctionState,
 };
+use oxc_allocator::Allocator;
+use oxc_ast::ast::{ArrayExpressionElement, Expression};
 use oxc_ast_visit::{walk, Visit};
 use oxc_span::SourceType;
 use oxc_syntax::scope::ScopeFlags;
@@ -33,7 +34,7 @@ use state_flatten::{
     OpcodeMapCandidate, StateMachineCandidate, StateMachineInfo,
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     fs,
     path::PathBuf,
 };
@@ -81,37 +82,6 @@ struct EmbeddedScanReport {
     embedded: Vec<EmbeddedScanReport>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
-struct FunctionMetrics {
-    id: String,
-    kind: String,
-    name: Option<String>,
-    start: u32,
-    end: u32,
-    bytes: usize,
-    switches: usize,
-    switch_cases: usize,
-    loops: usize,
-    conditionals: usize,
-    computed_members: usize,
-    computed_calls: usize,
-    calls: usize,
-    assignments: usize,
-    binary_exprs: usize,
-    unary_exprs: usize,
-    sequence_exprs: usize,
-    arrays: usize,
-    large_arrays: usize,
-    numeric_literals: usize,
-    string_literals: usize,
-    tries: usize,
-    confirmed_dispatch: bool,
-    dispatch_reasons: Vec<String>,
-    indexed_read_chain: Vec<String>,
-    score: u32,
-    reasons: Vec<String>,
-}
-
 #[derive(Debug, Serialize)]
 struct ScanReport {
     file: String,
@@ -133,70 +103,6 @@ struct ScanReport {
     embedded: Vec<EmbeddedScanReport>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ExprEvidence {
-    computed_members: usize,
-    calls: usize,
-    identifiers: BTreeSet<String>,
-    computed_previews: BTreeSet<String>,
-}
-
-struct EvidenceVisitor<'s> {
-    source: &'s str,
-    evidence: ExprEvidence,
-}
-
-impl<'a> Visit<'a> for EvidenceVisitor<'_> {
-    fn enter_node(&mut self, kind: AstKind<'a>) {
-        match kind {
-            AstKind::ComputedMemberExpression(cm) => {
-                self.evidence.computed_members += 1;
-                let start = cm.span.start as usize;
-                let end = (cm.span.end as usize).min(self.source.len());
-                if let Some(raw) = self.source.get(start..end) {
-                    let mut preview = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-                    if preview.len() > 160 {
-                        preview.truncate(160);
-                    }
-                    self.evidence.computed_previews.insert(preview);
-                }
-            }
-            AstKind::CallExpression(_) => self.evidence.calls += 1,
-            AstKind::IdentifierReference(id) => {
-                self.evidence.identifiers.insert(id.name.to_string());
-            }
-            _ => {}
-        }
-    }
-}
-
-fn expression_evidence(source: &str, expr: &Expression<'_>) -> ExprEvidence {
-    let mut v = EvidenceVisitor {
-        source,
-        evidence: ExprEvidence::default(),
-    };
-    v.visit_expression(expr);
-    v.evidence
-}
-
-#[derive(Default)]
-struct FunctionBuilder {
-    m: FunctionMetrics,
-    vars: HashMap<String, ExprEvidence>,
-    switch_inputs: Vec<ExprEvidence>,
-    computed_call_indices: Vec<ExprEvidence>,
-    local_function_table_lengths: Vec<usize>,
-    local_numeric_array_lengths: Vec<usize>,
-    aliases: HashMap<String, String>,
-    push_builder_vars: BTreeSet<String>,
-    push_builder_sites: HashMap<String, BuilderSite>,
-    indexed_accesses: Vec<IndexedAccess>,
-    child_indexed_accesses: Vec<IndexedAccess>,
-    indexed_value_vars: HashMap<String, IndexedAccess>,
-    bit_masks: HashMap<String, BTreeSet<u64>>,
-    decoder_candidates: Vec<DecoderCandidate>,
-}
-
 struct Scanner<'s> {
     source: &'s str,
     arrays: Vec<ArrayCandidate>,
@@ -209,7 +115,7 @@ struct Scanner<'s> {
     handler_tables: Vec<HandlerTableCandidate>,
     functions: Vec<FunctionMetrics>,
     embedded_code: Vec<EmbeddedCodeCandidate>,
-    stack: Vec<FunctionBuilder>,
+    stack: Vec<FunctionState>,
 }
 
 impl<'s> Scanner<'s> {
@@ -245,57 +151,7 @@ impl<'s> Scanner<'s> {
     }
 
     fn push_function(&mut self, kind: &str, name: Option<String>, start: u32, end: u32) {
-        let bytes = end.saturating_sub(start) as usize;
-        self.stack.push(FunctionBuilder {
-            m: FunctionMetrics {
-                id: format!("fn@{start:x}-{end:x}"),
-                kind: kind.to_string(),
-                name,
-                start,
-                end,
-                bytes,
-                ..FunctionMetrics::default()
-            },
-            ..FunctionBuilder::default()
-        });
-    }
-
-    fn evidence_reaches_computed(
-        evidence: &ExprEvidence,
-        vars: &HashMap<String, ExprEvidence>,
-        seen: &mut HashSet<String>,
-    ) -> bool {
-        if evidence.computed_members > 0 {
-            return true;
-        }
-        for name in &evidence.identifiers {
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            if let Some(next) = vars.get(name) {
-                if Self::evidence_reaches_computed(next, vars, seen) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    fn collect_indexed_reads(
-        evidence: &ExprEvidence,
-        vars: &HashMap<String, ExprEvidence>,
-        seen: &mut HashSet<String>,
-        out: &mut BTreeSet<String>,
-    ) {
-        out.extend(evidence.computed_previews.iter().cloned());
-        for name in &evidence.identifiers {
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            if let Some(next) = vars.get(name) {
-                Self::collect_indexed_reads(next, vars, seen, out);
-            }
-        }
+        self.stack.push(FunctionState::new(kind, name, start, end));
     }
 
     fn analyze_opcode_maps(&mut self, function: &oxc_ast::ast::Function<'_>) {
@@ -420,141 +276,24 @@ impl<'s> Scanner<'s> {
     }
 
     fn finish_function(&mut self) {
-        let Some(mut b) = self.stack.pop() else {
+        let Some(mut function) = self.stack.pop() else {
             return;
         };
 
-        let mut decoder_accesses = b.indexed_accesses.clone();
-        decoder_accesses.extend(b.child_indexed_accesses.iter().cloned());
-        let mut local_decoders = derive_candidates(&b.m.id, &decoder_accesses);
-        annotate_bitfield_selectors(
-            &mut local_decoders,
-            &b.indexed_value_vars,
-            &b.bit_masks,
-            &b.aliases,
-        );
-        b.decoder_candidates.extend(local_decoders);
-        link_candidates(
-            &mut b.decoder_candidates,
-            &b.aliases,
-            &b.push_builder_vars,
-            &b.push_builder_sites,
-        );
-
-        let m = &mut b.m;
-        let mut score = 0u32;
-        let mut reasons = Vec::new();
-        let mut dispatch_reasons = Vec::new();
-
-        // Confirmation follows the stricter retained direct-switch map.
-        // The broad indexed-state heuristic remains useful for scoring, but
-        // alone it is too permissive for parser/evaluator state machines.
+        function.finalize_decoders();
         let switch_from_indexed_state = self
             .direct_switch_maps
             .iter()
-            .any(|map| map.parent_function_id == m.id && map.confirmed_vm);
-        if switch_from_indexed_state {
-            dispatch_reasons
-                .push("large switch discriminant traces to computed/indexed state".to_string());
-        }
-
-        let large_handler_table_present =
-            self.handler_tables.iter().any(|h| h.function_values >= 16);
-        let index_reaches_computed = b
-            .computed_call_indices
+            .any(|map| map.parent_function_id == function.m.id && map.confirmed_vm);
+        let large_handler_table_present = self
+            .handler_tables
             .iter()
-            .any(|e| Self::evidence_reaches_computed(e, &b.vars, &mut HashSet::new()));
-        let local_table_schedule_pair = b
-            .local_function_table_lengths
-            .iter()
-            .any(|len| b.local_numeric_array_lengths.iter().any(|n| n == len));
-        let table_dispatch = m.loops > 0
-            && !b.computed_call_indices.is_empty()
-            && (large_handler_table_present
-                || (local_table_schedule_pair && index_reaches_computed));
-        if table_dispatch {
-            dispatch_reasons.push(if large_handler_table_present {
-                "looped computed call with a large function-valued handler table".to_string()
-            } else {
-                "looped computed call uses a same-sized function table and numeric schedule"
-                    .to_string()
-            });
-        }
+            .any(|table| table.function_values >= 16);
+        function.finalize_metrics(switch_from_indexed_state, large_handler_table_present);
 
-        m.confirmed_dispatch = switch_from_indexed_state || table_dispatch;
-        m.dispatch_reasons = dispatch_reasons;
-        let mut indexed_reads = BTreeSet::new();
-        if switch_from_indexed_state {
-            for e in &b.switch_inputs {
-                Self::collect_indexed_reads(e, &b.vars, &mut HashSet::new(), &mut indexed_reads);
-            }
-        }
-        m.indexed_read_chain = indexed_reads.into_iter().collect();
-
-        if m.switch_cases >= 16 {
-            score += 8;
-            reasons.push(format!("{} switch cases", m.switch_cases));
-        } else if m.switches > 0 {
-            score += 3;
-            reasons.push(format!("{} switch(es)", m.switches));
-        }
-        if m.loops > 0 {
-            score += 3.min(m.loops as u32 + 1);
-            reasons.push(format!("{} loop(s)", m.loops));
-        }
-        if m.conditionals >= 30 {
-            score += 5;
-            reasons.push(format!("{} ternaries", m.conditionals));
-        } else if m.conditionals >= 10 {
-            score += 2;
-            reasons.push(format!("{} ternaries", m.conditionals));
-        }
-        if m.computed_members >= 25 {
-            score += 5;
-            reasons.push(format!(
-                "{} computed member reads/writes",
-                m.computed_members
-            ));
-        } else if m.computed_members >= 8 {
-            score += 2;
-            reasons.push(format!(
-                "{} computed member reads/writes",
-                m.computed_members
-            ));
-        }
-        if m.loops > 0 && m.computed_calls > 0 && m.computed_members >= 2 {
-            score += 6;
-            reasons.push(format!(
-                "{} computed call(s) inside a loop-shaped function",
-                m.computed_calls
-            ));
-        }
-        if m.large_arrays > 0 {
-            score += 6;
-            reasons.push(format!("{} large literal array(s)", m.large_arrays));
-        }
-        if m.sequence_exprs >= 12 {
-            score += 2;
-            reasons.push(format!("{} sequence expressions", m.sequence_exprs));
-        }
-        if m.binary_exprs >= 80 {
-            score += 2;
-            reasons.push(format!("{} binary expressions", m.binary_exprs));
-        }
-        if m.bytes >= 20_000 {
-            score += 4;
-            reasons.push(format!("{} byte function body", m.bytes));
-        } else if m.bytes >= 5_000 {
-            score += 2;
-            reasons.push(format!("{} byte function body", m.bytes));
-        }
-
-        m.score = score;
-        m.reasons = reasons;
-
-        let propagated_decoders = b.decoder_candidates.clone();
-        let propagated_local_accesses = b.indexed_accesses.clone();
-        self.functions.push(b.m);
+        let propagated_decoders = function.decoder_candidates.clone();
+        let propagated_local_accesses = function.indexed_accesses.clone();
+        self.functions.push(function.m);
         if let Some(parent) = self.stack.last_mut() {
             parent.decoder_candidates.extend(propagated_decoders);
             parent
@@ -597,8 +336,7 @@ impl<'s> Scanner<'s> {
             return;
         }
         let evidence = expression_evidence(self.source, &switch.discriminant);
-        let indexed_selector =
-            Self::evidence_reaches_computed(&evidence, &current.vars, &mut HashSet::new());
+        let indexed_selector = evidence_reaches_computed(&evidence, &current.vars);
         let call_selector = evidence.calls > 0;
         if let Some(candidate) = detect_direct_switch(
             self.source,
