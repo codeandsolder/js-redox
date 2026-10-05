@@ -14,19 +14,22 @@ use base64::{
     },
     Engine as _,
 };
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::LazyLock};
 
 const FORGIVING_CONFIG: GeneralPurposeConfig = GeneralPurposeConfig::new()
     .with_decode_padding_mode(DecodePaddingMode::Indifferent)
     .with_decode_allow_trailing_bits(true);
 const STANDARD_ENGINE: GeneralPurpose =
     GeneralPurpose::new(&base64::alphabet::STANDARD, FORGIVING_CONFIG);
-const LOWER_ALPHABET: Alphabet =
-    match Alphabet::new("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/") {
-        Ok(alphabet) => alphabet,
-        Err(_) => panic!("known-valid lower-first Base64 alphabet"),
-    };
-const LOWER_ENGINE: GeneralPurpose = GeneralPurpose::new(&LOWER_ALPHABET, FORGIVING_CONFIG);
+static LOWER_ENGINE: LazyLock<Option<GeneralPurpose>> = LazyLock::new(|| {
+    Alphabet::new("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/")
+        .ok()
+        .map(|alphabet| GeneralPurpose::new(&alphabet, FORGIVING_CONFIG))
+});
+
+fn lower_engine() -> Option<&'static GeneralPurpose> {
+    LOWER_ENGINE.as_ref()
+}
 
 pub(super) fn decode_standard_base64_latin1(input: &str) -> Option<String> {
     // Match browser/atob-style ASCII whitespace handling before delegating the
@@ -64,7 +67,7 @@ pub(super) fn decode_lower_alphabet_base64_uri(input: &str) -> Option<String> {
     if encoded.len() % 4 == 1 {
         encoded = &encoded[..encoded.len().checked_sub(1)?];
     }
-    String::from_utf8(LOWER_ENGINE.decode(encoded).ok()?).ok()
+    String::from_utf8(lower_engine()?.decode(encoded).ok()?).ok()
 }
 
 pub(super) fn decode_fixed_base64_latin1(input: &str, alphabet: &str) -> Option<String> {
@@ -146,7 +149,9 @@ mod tests {
 
     #[test]
     fn lower_first_alphabet_uses_library_engine_without_changing_sentinel_shape() {
-        let encoded = LOWER_ENGINE.encode("hello");
+        let encoded = lower_engine()
+            .map(|engine| engine.encode("hello"))
+            .unwrap_or_default();
         assert_eq!(
             decode_lower_alphabet_base64_uri(&encoded),
             Some("hello".into())

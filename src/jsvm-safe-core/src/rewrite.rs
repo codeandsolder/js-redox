@@ -192,14 +192,15 @@ mod tests {
     }
 
     fn rewrite(source: &str, replacements: Vec<Replacement>) -> String {
-        apply(
+        let rewritten = apply(
             source,
             replacements,
             &mut Counts::default(),
             &mut Vec::new(),
             1,
-        )
-        .unwrap_or_else(|| panic!("rewrite failed for {source:?}"))
+        );
+        assert!(rewritten.is_some(), "rewrite failed for {source:?}");
+        rewritten.unwrap_or_default()
     }
 
     #[test]

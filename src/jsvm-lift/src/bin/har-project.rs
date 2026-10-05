@@ -298,8 +298,7 @@ fn output_path_for(url: &str, kind: &str, mime: &str) -> String {
         .unwrap_or_default();
     if parts.is_empty() {
         parts.push(format!("index.{}", extension_for(kind, mime)));
-    } else {
-        let last = parts.last_mut().unwrap();
+    } else if let Some(last) = parts.last_mut() {
         if !last.contains('.') {
             last.push('.');
             last.push_str(extension_for(kind, mime));

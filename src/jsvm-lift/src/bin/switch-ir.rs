@@ -164,25 +164,28 @@ fn all_semantics(map: &DirectSwitchMap) -> String {
         .join("\n")
 }
 
+fn compile_regex(pattern: &str) -> Option<Regex> {
+    Regex::new(pattern).ok()
+}
+
 fn indexed_selector(selector: &str) -> Option<(String, String)> {
-    let re =
-        Regex::new(r"^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\]\s*$")
-            .unwrap();
+    let re = compile_regex(
+        r"^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\]\s*$",
+    )?;
     let caps = re.captures(selector)?;
     Some((caps[1].to_string(), caps[2].to_string()))
 }
 
 fn call_selector(selector: &str) -> Option<String> {
-    let re = Regex::new(r"^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\(\s*\)\s*$").unwrap();
+    let re = compile_regex(r"^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\(\s*\)\s*$")?;
     re.captures(selector).map(|caps| caps[1].to_string())
 }
 
 fn dominant_stack_pair(text: &str) -> Option<(String, String)> {
-    let pre = Regex::new(r"([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*--\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\]")
-        .unwrap();
+    let pre =
+        compile_regex(r"([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*--\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\]")?;
     let post =
-        Regex::new(r"([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\+\+\s*\]")
-            .unwrap();
+        compile_regex(r"([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\+\+\s*\]")?;
     let mut counts: HashMap<(String, String), usize> = HashMap::new();
     for caps in pre.captures_iter(text).chain(post.captures_iter(text)) {
         *counts
@@ -197,7 +200,7 @@ fn dominant_stack_pair(text: &str) -> Option<(String, String)> {
 }
 
 fn dominant_ip(text: &str, excluded: &HashSet<String>) -> Option<String> {
-    let re = Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:\+\+|--|\+=|-=)").unwrap();
+    let re = compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:\+\+|--|\+=|-=)")?;
     let mut counts: HashMap<String, usize> = HashMap::new();
     for caps in re.captures_iter(text) {
         let name = caps[1].to_string();
@@ -213,7 +216,9 @@ fn dominant_ip(text: &str, excluded: &HashSet<String>) -> Option<String> {
 }
 
 fn empty_array_candidates(function: &str) -> Vec<String> {
-    let re = Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*\[\s*\]").unwrap();
+    let Some(re) = compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*\[\s*\]") else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for caps in re.captures_iter(function) {
         let value = caps[1].to_string();
@@ -229,7 +234,7 @@ fn identifier_count(text: &str, ident: &str) -> usize {
         return 0;
     }
     let pattern = format!(r"\b{}\b", regex::escape(ident));
-    Regex::new(&pattern).unwrap().find_iter(text).count()
+    compile_regex(&pattern).map_or(0, |re| re.find_iter(text).count())
 }
 
 fn named_function_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
@@ -276,11 +281,11 @@ fn call_family_roles(
     let mut helpers = BTreeMap::new();
     helpers.insert("read_byte".into(), selector_helper.to_string());
 
-    let read_re = Regex::new(
+    if let Some(caps) = compile_regex(
         r"return\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\+\+\s*\]\s*\^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\[",
     )
-    .unwrap();
-    if let Some(caps) = read_re.captures(function_prefix) {
+    .and_then(|re| re.captures(function_prefix))
+    {
         roles.insert("bytecode".into(), caps[1].to_string());
         roles.insert("ip".into(), caps[2].to_string());
         roles.insert("decode_key".into(), caps[3].to_string());
@@ -301,19 +306,20 @@ fn call_family_roles(
         }
     }
 
-    let fn_re = Regex::new(r"function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)").unwrap();
-    let declarations = fn_re
-        .captures_iter(function_prefix)
-        .map(|caps| {
-            let name = caps[1].to_string();
-            let argc = if caps[2].trim().is_empty() {
-                0
-            } else {
-                caps[2].split(',').count()
-            };
-            (name, argc)
-        })
-        .collect::<Vec<_>>();
+    let declarations = compile_regex(r"function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)")
+        .map_or_else(Vec::new, |re| {
+            re.captures_iter(function_prefix)
+                .map(|caps| {
+                    let name = caps[1].to_string();
+                    let argc = if caps[2].trim().is_empty() {
+                        0
+                    } else {
+                        caps[2].split(',').count()
+                    };
+                    (name, argc)
+                })
+                .collect()
+        });
 
     if let Some(stack) = roles.get("stack") {
         for (name, argc) in &declarations {
@@ -364,7 +370,9 @@ fn call_family_roles(
         }
     }
 
-    let in_re = Regex::new(r"\bin\s+([A-Za-z_$][A-Za-z0-9_$]*)").unwrap();
+    let Some(in_re) = compile_regex(r"\bin\s+([A-Za-z_$][A-Za-z0-9_$]*)") else {
+        return (roles, helpers);
+    };
     for (name, argc) in &declarations {
         if *argc != 1 {
             continue;

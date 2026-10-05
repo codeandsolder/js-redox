@@ -357,6 +357,10 @@ impl Decoder {
     }
 }
 
+fn compile_regex(pattern: &str) -> Option<regex::Regex> {
+    regex::Regex::new(pattern).ok()
+}
+
 fn fixed_base64_alphabet(body: &str) -> Option<String> {
     if !body.contains("String.fromCharCode")
         || !body.contains(".indexOf")
@@ -364,7 +368,7 @@ fn fixed_base64_alphabet(body: &str) -> Option<String> {
     {
         return None;
     }
-    let re = regex::Regex::new(r#"["']([A-Za-z0-9+/=]{65})["']"#).unwrap();
+    let re = compile_regex(r#"["']([A-Za-z0-9+/=]{65})["']"#)?;
     let standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
         .chars()
         .collect::<HashSet<_>>();
@@ -393,22 +397,24 @@ fn standard_base64_decoder_matches(body: &str, array: &str, param: &str) -> bool
     // expression somewhere inside it. Replacing a call removes the entire
     // function execution, so accepting extra statements could silently drop
     // observable side effects.
-    let direct = regex::Regex::new(&format!(
+    let Some(direct) = compile_regex(&format!(
         r#"(?s)^\s*return\s+atob\s*\(\s*{}\s*\[\s*{}\s*\]\s*\)\s*;?\s*$"#,
         regex::escape(array),
         regex::escape(param)
-    ))
-    .unwrap();
+    )) else {
+        return false;
+    };
     if direct.is_match(inner) {
         return true;
     }
 
-    let sequence = regex::Regex::new(&format!(
+    let Some(sequence) = compile_regex(&format!(
         r#"(?s)^\s*return\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*,\s*atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$"#,
         regex::escape(array),
         regex::escape(param)
-    ))
-    .unwrap();
+    )) else {
+        return false;
+    };
     if sequence
         .captures(inner)
         .is_some_and(|caps| caps.get(1).map(|m| m.as_str()) == caps.get(2).map(|m| m.as_str()))
@@ -416,12 +422,13 @@ fn standard_base64_decoder_matches(body: &str, array: &str, param: &str) -> bool
         return true;
     }
 
-    let assignment = regex::Regex::new(&format!(
+    let Some(assignment) = compile_regex(&format!(
         r#"(?s)^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$"#,
         regex::escape(array),
         regex::escape(param)
-    ))
-    .unwrap();
+    )) else {
+        return false;
+    };
     assignment
         .captures(inner)
         .is_some_and(|caps| caps.get(1).map(|m| m.as_str()) == caps.get(2).map(|m| m.as_str()))
@@ -429,18 +436,16 @@ fn standard_base64_decoder_matches(body: &str, array: &str, param: &str) -> bool
 
 fn fixed_base64_decoder_matches(body: &str, array: &str, param: &str) -> Option<String> {
     let alphabet = fixed_base64_alphabet(body)?;
-    let guarded_load = regex::Regex::new(&format!(
+    let guarded_load = compile_regex(&format!(
         r#"typeof\s*\(?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*\)?"#,
         regex::escape(array),
         regex::escape(param)
-    ))
-    .unwrap();
+    ))?;
 
     let alias = guarded_load
         .captures_iter(body)
         .find_map(|caps| caps.get(1).map(|m| m.as_str()))?;
-    let return_alias =
-        regex::Regex::new(&format!(r#"\breturn\s+{}\s*;"#, regex::escape(alias))).unwrap();
+    let return_alias = compile_regex(&format!(r#"\breturn\s+{}\s*;"#, regex::escape(alias)))?;
     if !return_alias.is_match(body) {
         return None;
     }
@@ -456,7 +461,7 @@ fn fixed_base64_decoder_matches(body: &str, array: &str, param: &str) -> Option<
     {
         return None;
     }
-    let sentinel_checks = regex::Regex::new(r#"(?:64\s*!=|!=\s*64)"#).unwrap();
+    let sentinel_checks = compile_regex(r#"(?:64\s*!=|!=\s*64)"#)?;
     if sentinel_checks.find_iter(body).count() != 2 {
         return None;
     }
@@ -531,11 +536,12 @@ fn detect_direct_table_decoders(
             continue;
         };
         let body = fragment(source, function.span);
-        let access = regex::Regex::new(&format!(
+        let Some(access) = compile_regex(&format!(
             r#"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*{}\s*\]"#,
             regex::escape(param)
-        ))
-        .unwrap();
+        )) else {
+            continue;
+        };
         let mut matched = access
             .captures_iter(body)
             .filter_map(|caps| caps.get(1).map(|capture| capture.as_str()))
@@ -572,11 +578,12 @@ fn detect_direct_table_decoders(
             continue;
         }
 
-        let mutator = regex::Regex::new(&format!(
+        let Some(mutator) = compile_regex(&format!(
             r#"\b{}\s*\.\s*(?:copyWithin|fill|pop|push|reverse|shift|sort|splice|unshift)\s*\("#,
             regex::escape(&array.name)
-        ))
-        .unwrap();
+        )) else {
+            continue;
+        };
         if mutator.is_match(source) {
             continue;
         }
@@ -967,10 +974,11 @@ fn apply_proven_decoder_rotations(
     decoders: &mut HashMap<String, Decoder>,
     rotation_iifes: &[RotationIife],
 ) -> (Vec<(usize, usize)>, Vec<Replacement>) {
-    let checksum_re = regex::Regex::new(
+    let Some(checksum_re) = compile_regex(
         r#"(?s)\btry\s*\{\s*(?:var|let|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(?P<expr>[^;]+);"#,
-    )
-    .unwrap();
+    ) else {
+        return (Vec::new(), Vec::new());
+    };
     let mut protected_spans = Vec::new();
     let mut proven_iifes: Vec<(String, usize, usize)> = Vec::new();
 
@@ -989,11 +997,12 @@ fn apply_proven_decoder_rotations(
             if decoder.provider != iife.provider || decoder.values.is_empty() {
                 continue;
             }
-            let alias_re = regex::Regex::new(&format!(
+            let Some(alias_re) = compile_regex(&format!(
                 r#"\b(?:var|let|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\b"#,
                 regex::escape(decoder_name)
-            ))
-            .unwrap();
+            )) else {
+                continue;
+            };
             let alias = if let Some(alias_caps) = alias_re.captures(body) {
                 alias_caps[1].to_string()
             } else if body.contains(&format!("{decoder_name}(")) {
@@ -1104,18 +1113,21 @@ fn detect_decoders(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
 ) -> DecoderDetection {
-    let local_re = regex::Regex::new(
+    let Some(local_re) = compile_regex(
         r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\(\)\s*;",
-    )
-    .unwrap();
-    let offset_re = regex::Regex::new(
+    ) else {
+        return (HashMap::new(), Vec::new(), Vec::new());
+    };
+    let Some(offset_re) = compile_regex(
         r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*-\s*(0[xX][0-9A-Fa-f]+|[0-9]+)\s*;",
-    )
-    .unwrap();
-    let index_re = regex::Regex::new(
+    ) else {
+        return (HashMap::new(), Vec::new(), Vec::new());
+    };
+    let Some(index_re) = compile_regex(
         r"\b(?:let|const|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\[([A-Za-z_$][A-Za-z0-9_$]*)\]\s*;",
-    )
-    .unwrap();
+    ) else {
+        return (HashMap::new(), Vec::new(), Vec::new());
+    };
 
     let mut name_counts: HashMap<String, usize> = HashMap::new();
     for f in functions {
@@ -1188,18 +1200,20 @@ fn detect_decoders(
         let sequence_value_return =
             body.contains(&format!(", {value_var};")) || body.contains(&format!(",{value_var};"));
 
-        let installs_replacement_re = regex::Regex::new(&format!(
+        let Some(installs_replacement_re) = compile_regex(&format!(
             r#"\b{}\s*=\s*function\s*\(\s*{}\b"#,
             regex::escape(&f.name),
             regex::escape(&param),
-        ))
-        .unwrap();
-        let tail_calls_public_re = regex::Regex::new(&format!(
+        )) else {
+            continue;
+        };
+        let Some(tail_calls_public_re) = compile_regex(&format!(
             r#"(?:\breturn\b|,)\s*{}\s*\(\s*{}\b"#,
             regex::escape(&f.name),
             regex::escape(public_param),
-        ))
-        .unwrap();
+        )) else {
+            continue;
+        };
         let self_rewriting =
             installs_replacement_re.is_match(body) && tail_calls_public_re.is_match(body);
 
@@ -1216,7 +1230,7 @@ fn detect_decoders(
         // Match the complete function body rather than merely looking for the
         // three ingredients, so arbitrary application array accessors are not
         // promoted to decoders.
-        let direct_re = regex::Regex::new(&format!(
+        let Some(direct_re) = compile_regex(&format!(
             r#"(?s)^\s*function\s+{}\s*\([^)]*\)\s*\{{\s*{}\s*=\s*{}\s*-\s*(?:0[xX][0-9A-Fa-f]+|[0-9]+)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\(\s*\)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+{}\s*;\s*\}}\s*$"#,
             regex::escape(&f.name),
             regex::escape(&param),
@@ -1227,8 +1241,9 @@ fn detect_decoders(
             regex::escape(&local_array),
             regex::escape(&param),
             regex::escape(&value_var),
-        ))
-        .unwrap();
+        )) else {
+            continue;
+        };
         let direct_index = direct_re.is_match(body);
 
         if !direct_index && !(self_rewriting && (bare_value_return || sequence_value_return)) {

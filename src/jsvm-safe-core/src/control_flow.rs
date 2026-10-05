@@ -177,43 +177,65 @@ pub(super) fn detect_reference_identity_tables(
 ) -> HashMap<SymbolId, ReferenceIdentityTable> {
     let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
     let ws = r"\s*";
-    let row_re = regex::Regex::new(&format!(
+    let Some(row_re) = regex::Regex::new(&format!(
         r"(?P<table>{identifier}){ws}={ws}\[\]{ws},{ws}(?P<idx>{identifier}){ws}={ws}0{ws};{ws}(?P<test>{identifier}){ws}<{ws}(?P<rows>\d+){ws};{ws}(?P<update>{identifier}){ws}\+\+{ws}\){ws}(?P<table2>{identifier}){ws}\[{ws}(?P<idx2>{identifier}){ws}\]{ws}={ws}new{ws}Array{ws}\({ws}(?P<columns>\d+){ws}\)"
-    ))
-    .unwrap();
-    let timer_re = regex::Regex::new(&format!(
+    )).ok() else {
+        return HashMap::new();
+    };
+    let Some(timer_re) = regex::Regex::new(&format!(
         r"(?P<timer>{identifier}){ws}={ws}function{ws}\({ws}(?P<arg>{identifier}){ws}\){ws}\{{{ws}setTimeout{ws}\({ws}(?P<arg2>{identifier}){ws},{ws}0{ws}\){ws};?{ws}\}}"
-    ))
-    .unwrap();
-    let outer_re = regex::Regex::new(&format!(
+    )).ok() else {
+        return HashMap::new();
+    };
+    let Some(outer_re) = regex::Regex::new(&format!(
         r"for{ws}\({ws}var\s+(?P<loop>{identifier}){ws}={ws}0{ws};{ws}(?P<test>{identifier}){ws}<{ws}(?P<chunks>\d+){ws};{ws}(?P<update>{identifier}){ws}\+\+{ws}\){ws}\({ws}\(?{ws}(?P<callback>{identifier}){ws}\)?{ws}=>{ws}\{{{ws}(?P<timer>{identifier}){ws}\({ws}function{ws}\({ws}\){ws}\{{"
-    ))
-    .unwrap();
-    let fill_re = regex::Regex::new(&format!(
+    )).ok() else {
+        return HashMap::new();
+    };
+    let Some(fill_re) = regex::Regex::new(&format!(
         r"for{ws}\({ws}var\s+(?P<t>{identifier}){ws}={ws}(?P<chunk>\d+){ws}\*{ws}(?P<callback>{identifier}){ws},{ws}(?P<n>{identifier}){ws}={ws}Math{ws}\.{ws}min{ws}\({ws}(?P<t2>{identifier}){ws}\+{ws}(?P<chunk2>\d+){ws},{ws}(?P<columns>\d+){ws}\){ws},{ws}(?P<column>{identifier}){ws}={ws}(?P<t3>{identifier}){ws};{ws}(?P<column2>{identifier}){ws}<{ws}(?P<n2>{identifier}){ws};{ws}(?P<column3>{identifier}){ws}\+\+{ws}\){ws}for{ws}\({ws}(?P<row>{identifier}){ws}={ws}0{ws};{ws}(?P<row2>{identifier}){ws}<{ws}(?P<rows>\d+){ws};{ws}(?P<row3>{identifier}){ws}\+\+{ws}\){ws}(?P<table>{identifier}){ws}\[{ws}(?P<row4>{identifier}){ws}\]{ws}\[{ws}(?P<column4>{identifier}){ws}\]{ws}={ws}(?P<table2>{identifier}){ws}\[{ws}\({ws}(?P<a>\d+){ws}\*{ws}(?P<column5>{identifier}){ws}\^{ws}(?P<b>\d+){ws}\*{ws}(?P<row5>{identifier}){ws}\^{ws}(?P<c>\d+){ws}\*{ws}(?P<k>\d+){ws}\){ws}>>>{ws}0{ws}&{ws}(?P<mask>\d+){ws}-{ws}1{ws}\]"
-    ))
-    .unwrap();
-    let root_re = regex::Regex::new(&format!(
+    )).ok() else {
+        return HashMap::new();
+    };
+    let Some(root_re) = regex::Regex::new(&format!(
         r"(?P<timer>{identifier}){ws}\({ws}function{ws}\({ws}\){ws}\{{{ws}(?P<target>{identifier}){ws}={ws}(?P<table>{identifier}){ws}\[{ws}(?P<root>\d+){ws}\]{ws};?{ws}\}}{ws}\)"
-    ))
-    .unwrap();
+    )).ok() else {
+        return HashMap::new();
+    };
+
+    macro_rules! capture {
+        ($captures:expr, $name:literal) => {
+            match $captures.name($name) {
+                Some(capture) => capture.as_str(),
+                None => continue,
+            }
+        };
+    }
+    macro_rules! capture_match {
+        ($captures:expr, $index:expr) => {
+            match $captures.get($index) {
+                Some(capture) => capture,
+                None => continue,
+            }
+        };
+    }
 
     let mut out = HashMap::new();
     for row_caps in row_re.captures_iter(source) {
-        let row_match = row_caps.get(0).unwrap();
-        let table_name = row_caps.name("table").unwrap().as_str();
-        let row_index = row_caps.name("idx").unwrap().as_str();
-        if row_caps.name("test").unwrap().as_str() != row_index
-            || row_caps.name("update").unwrap().as_str() != row_index
-            || row_caps.name("idx2").unwrap().as_str() != row_index
-            || row_caps.name("table2").unwrap().as_str() != table_name
+        let row_match = capture_match!(row_caps, 0);
+        let table_name = capture!(row_caps, "table");
+        let row_index = capture!(row_caps, "idx");
+        if capture!(row_caps, "test") != row_index
+            || capture!(row_caps, "update") != row_index
+            || capture!(row_caps, "idx2") != row_index
+            || capture!(row_caps, "table2") != table_name
         {
             continue;
         }
-        let Ok(rows) = row_caps.name("rows").unwrap().as_str().parse::<u32>() else {
+        let Ok(rows) = capture!(row_caps, "rows").parse::<u32>() else {
             continue;
         };
-        let Ok(columns) = row_caps.name("columns").unwrap().as_str().parse::<u32>() else {
+        let Ok(columns) = capture!(row_caps, "columns").parse::<u32>() else {
             continue;
         };
         if rows < 2 || columns < 2 || !rows.is_power_of_two() {
@@ -227,67 +249,67 @@ pub(super) fn detect_reference_identity_tables(
         let Some(timer_caps) = timer_re.captures(window) else {
             continue;
         };
-        if timer_caps.name("arg").unwrap().as_str() != timer_caps.name("arg2").unwrap().as_str() {
+        if capture!(timer_caps, "arg") != capture!(timer_caps, "arg2") {
             continue;
         }
-        let timer_name = timer_caps.name("timer").unwrap().as_str();
+        let timer_name = capture!(timer_caps, "timer");
 
         let Some(outer_caps) = outer_re.captures(window) else {
             continue;
         };
-        let outer_loop = outer_caps.name("loop").unwrap().as_str();
-        if outer_caps.name("test").unwrap().as_str() != outer_loop
-            || outer_caps.name("update").unwrap().as_str() != outer_loop
-            || outer_caps.name("timer").unwrap().as_str() != timer_name
+        let outer_loop = capture!(outer_caps, "loop");
+        if capture!(outer_caps, "test") != outer_loop
+            || capture!(outer_caps, "update") != outer_loop
+            || capture!(outer_caps, "timer") != timer_name
         {
             continue;
         }
-        let callback_name = outer_caps.name("callback").unwrap().as_str();
-        let Ok(chunks) = outer_caps.name("chunks").unwrap().as_str().parse::<u32>() else {
+        let callback_name = capture!(outer_caps, "callback");
+        let Ok(chunks) = capture!(outer_caps, "chunks").parse::<u32>() else {
             continue;
         };
 
         let Some(fill_caps) = fill_re.captures(window) else {
             continue;
         };
-        if fill_caps.name("callback").unwrap().as_str() != callback_name
-            || fill_caps.name("table").unwrap().as_str() != table_name
-            || fill_caps.name("table2").unwrap().as_str() != table_name
+        if capture!(fill_caps, "callback") != callback_name
+            || capture!(fill_caps, "table") != table_name
+            || capture!(fill_caps, "table2") != table_name
         {
             continue;
         }
-        let t_name = fill_caps.name("t").unwrap().as_str();
-        let n_name = fill_caps.name("n").unwrap().as_str();
-        let column_name = fill_caps.name("column").unwrap().as_str();
-        let row_name = fill_caps.name("row").unwrap().as_str();
-        if fill_caps.name("t2").unwrap().as_str() != t_name
-            || fill_caps.name("t3").unwrap().as_str() != t_name
-            || fill_caps.name("n2").unwrap().as_str() != n_name
-            || fill_caps.name("column2").unwrap().as_str() != column_name
-            || fill_caps.name("column3").unwrap().as_str() != column_name
-            || fill_caps.name("column4").unwrap().as_str() != column_name
-            || fill_caps.name("column5").unwrap().as_str() != column_name
-            || fill_caps.name("row2").unwrap().as_str() != row_name
-            || fill_caps.name("row3").unwrap().as_str() != row_name
-            || fill_caps.name("row4").unwrap().as_str() != row_name
-            || fill_caps.name("row5").unwrap().as_str() != row_name
+        let t_name = capture!(fill_caps, "t");
+        let n_name = capture!(fill_caps, "n");
+        let column_name = capture!(fill_caps, "column");
+        let row_name = capture!(fill_caps, "row");
+        if capture!(fill_caps, "t2") != t_name
+            || capture!(fill_caps, "t3") != t_name
+            || capture!(fill_caps, "n2") != n_name
+            || capture!(fill_caps, "column2") != column_name
+            || capture!(fill_caps, "column3") != column_name
+            || capture!(fill_caps, "column4") != column_name
+            || capture!(fill_caps, "column5") != column_name
+            || capture!(fill_caps, "row2") != row_name
+            || capture!(fill_caps, "row3") != row_name
+            || capture!(fill_caps, "row4") != row_name
+            || capture!(fill_caps, "row5") != row_name
         {
             continue;
         }
 
-        let Ok(chunk) = fill_caps.name("chunk").unwrap().as_str().parse::<u32>() else {
+        let Ok(chunk) = capture!(fill_caps, "chunk").parse::<u32>() else {
             continue;
         };
-        let Ok(chunk2) = fill_caps.name("chunk2").unwrap().as_str().parse::<u32>() else {
+        let Ok(chunk2) = capture!(fill_caps, "chunk2").parse::<u32>() else {
             continue;
         };
-        let Ok(fill_columns) = fill_caps.name("columns").unwrap().as_str().parse::<u32>() else {
+        let Ok(fill_columns) = capture!(fill_caps, "columns").parse::<u32>() else {
             continue;
         };
-        let Ok(fill_rows) = fill_caps.name("rows").unwrap().as_str().parse::<u32>() else {
+        let Ok(fill_rows) = capture!(fill_caps, "rows").parse::<u32>() else {
             continue;
         };
-        let Ok(mask) = fill_caps.name("mask").unwrap().as_str().parse::<u32>() else {
+        let Ok(mask) = capture!(fill_caps, "mask").parse::<u32>() else {
             continue;
         };
         if chunk == 0
@@ -303,13 +325,12 @@ pub(super) fn detect_reference_identity_tables(
         let Some(root_caps) = root_re.captures(window) else {
             continue;
         };
-        if root_caps.name("timer").unwrap().as_str() != timer_name
-            || root_caps.name("table").unwrap().as_str() != table_name
+        if capture!(root_caps, "timer") != timer_name || capture!(root_caps, "table") != table_name
         {
             continue;
         }
-        let target_name = root_caps.name("target").unwrap().as_str();
-        let Ok(root_row) = root_caps.name("root").unwrap().as_str().parse::<u32>() else {
+        let target_name = capture!(root_caps, "target");
+        let Ok(root_row) = capture!(root_caps, "root").parse::<u32>() else {
             continue;
         };
         if root_row >= rows {
@@ -329,7 +350,7 @@ pub(super) fn detect_reference_identity_tables(
             continue;
         };
 
-        let construction_end = (window_start + root_caps.get(0).unwrap().end()) as u32;
+        let construction_end = (window_start + capture_match!(root_caps, 0).end()) as u32;
         if scoping
             .get_resolved_reference_ids(table_symbol)
             .iter()
@@ -365,9 +386,7 @@ pub(super) fn detect_reference_identity_tables(
         };
 
         let construction_start = window_start
-            + timer_caps
-                .get(0)
-                .unwrap()
+            + capture_match!(timer_caps, 0)
                 .start()
                 .min(row_match.start() - window_start);
         let descriptor = ReferenceIdentityTable {
