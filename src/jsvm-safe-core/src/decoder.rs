@@ -1,8 +1,9 @@
 use crate::decoder_encoding::{
     decode_fixed_base64_latin1, decode_lower_alphabet_base64_uri, decode_standard_base64_latin1,
 };
+use crate::rewrite::Replacement;
 use crate::value_eval::{render_value_array, same_values, Value};
-use crate::{argument_integer, array_element, fragment, Replacement};
+use crate::{argument_integer, array_element, fragment};
 use oxc_ast::ast::{
     Argument, BindingPattern, CallExpression, Expression, ExpressionStatement, Statement,
     VariableDeclarationKind,

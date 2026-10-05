@@ -16,3 +16,4 @@ oxc_span.workspace = true
 oxc_syntax.workspace = true
 regex.workspace = true
 serde_json.workspace = true
+string_wizard.workspace = true

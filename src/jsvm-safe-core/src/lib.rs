@@ -3,6 +3,7 @@ mod decoder;
 mod decoder_encoding;
 mod proxy;
 mod pure_function;
+mod rewrite;
 mod selector;
 mod value_eval;
 
@@ -26,6 +27,7 @@ use proxy::{
     collect_proxy_objects, proxy_literal_kind, static_proxy_member, ProxyObject, ProxyProperty,
 };
 use pure_function::{collect_pure_functions, PureFunction};
+use rewrite::{apply, Counts, Replacement};
 use selector::{collect_selector_dispatchers, SelectorDispatcher};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use value_eval::{
@@ -40,24 +42,6 @@ pub struct ArithmeticStateProof {
     pub state_var: String,
     pub state_path: Vec<String>,
     pub termination: String,
-}
-
-#[derive(Debug, Clone)]
-struct Replacement {
-    start: usize,
-    end: usize,
-    text: String,
-    kind: &'static str,
-    arithmetic_state_proof: Option<ArithmeticStateProof>,
-}
-
-#[derive(Default)]
-struct Counts(BTreeMap<String, usize>);
-
-impl Counts {
-    fn bump(&mut self, kind: &str) {
-        *self.0.entry(kind.to_string()).or_default() += 1;
-    }
 }
 
 fn fragment(source: &str, span: Span) -> &str {
@@ -882,73 +866,6 @@ fn remove_unused_proven_helpers(
         .collect()
 }
 
-fn js_word_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || byte >= 0x80
-}
-
-fn needs_lexical_separator(left: u8, right: u8) -> bool {
-    (js_word_byte(left) && js_word_byte(right))
-        || (left == b'+' && right == b'+')
-        || (left == b'-' && right == b'-')
-        || (left == b'/' && matches!(right, b'/' | b'*'))
-        || (left.is_ascii_digit() && right == b'.')
-}
-
-fn append_with_safe_boundary(out: &mut String, piece: &str) {
-    if piece.is_empty() {
-        return;
-    }
-    if let (Some(left), Some(right)) = (
-        out.as_bytes().last().copied(),
-        piece.as_bytes().first().copied(),
-    ) {
-        if needs_lexical_separator(left, right) {
-            out.push(' ');
-        }
-    }
-    out.push_str(piece);
-}
-
-fn apply(
-    source: &str,
-    mut replacements: Vec<Replacement>,
-    counts: &mut Counts,
-    arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
-    iteration: usize,
-) -> String {
-    replacements.sort_by(|a, b| {
-        (b.end - b.start)
-            .cmp(&(a.end - a.start))
-            .then_with(|| a.start.cmp(&b.start))
-    });
-
-    let mut selected: Vec<Replacement> = Vec::new();
-    'next: for candidate in replacements {
-        for existing in &selected {
-            if candidate.start < existing.end && existing.start < candidate.end {
-                continue 'next;
-            }
-        }
-        selected.push(candidate);
-    }
-    selected.sort_by_key(|replacement| replacement.start);
-
-    let mut out = String::with_capacity(source.len());
-    let mut cursor = 0usize;
-    for mut replacement in selected {
-        append_with_safe_boundary(&mut out, &source[cursor..replacement.start]);
-        append_with_safe_boundary(&mut out, &replacement.text);
-        cursor = replacement.end;
-        counts.bump(replacement.kind);
-        if let Some(mut proof) = replacement.arithmetic_state_proof.take() {
-            proof.iteration = iteration;
-            arithmetic_state_proofs.push(proof);
-        }
-    }
-    append_with_safe_boundary(&mut out, &source[cursor..]);
-    out
-}
-
 fn parse_as<'a>(
     allocator: &'a Allocator,
     source: &'a str,
@@ -1064,13 +981,13 @@ fn transform_once(
     if collector.replacements.is_empty() {
         Some(source.to_string())
     } else {
-        Some(apply(
+        apply(
             source,
             collector.replacements,
             counts,
             arithmetic_state_proofs,
             iteration,
-        ))
+        )
     }
 }
 
@@ -1112,7 +1029,7 @@ pub fn deobfuscate(source: &str, max_iterations: usize) -> Option<SafeTransformR
     Some(SafeTransformResult {
         source: current,
         iterations,
-        transforms: counts.0,
+        transforms: counts.into_inner(),
         arithmetic_state_proofs,
     })
 }

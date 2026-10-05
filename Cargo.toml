@@ -26,4 +26,5 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+string_wizard = { version = "1.2.12", default-features = false }
 url = "2"
