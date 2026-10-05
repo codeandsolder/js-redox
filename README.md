@@ -23,6 +23,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+Workspace lints additionally deny unsafe code and Clippy's `unwrap_used`, `expect_used`, `panic`, `todo`, and `unimplemented` classes across every member and target. Detector mismatches are expected to fail closed instead of terminating analysis.
+
 For normal executable builds, use the project helper rather than raw `cargo`:
 
 ```sh

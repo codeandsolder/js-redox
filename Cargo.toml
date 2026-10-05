@@ -10,6 +10,17 @@ resolver = "2"
 edition = "2021"
 rust-version = "1.99"
 
+[workspace.lints.rust]
+unsafe_code = "deny"
+unfulfilled_lint_expectations = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [workspace.dependencies]
 anyhow = "1"
 base64 = "0.22"
