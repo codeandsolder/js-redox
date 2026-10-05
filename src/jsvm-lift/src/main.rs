@@ -1,6 +1,7 @@
 mod bytecode;
 mod decoder;
 mod dispatch;
+mod embedded;
 mod state_flatten;
 mod table_vm;
 
@@ -16,9 +17,10 @@ use dispatch::{
     detect_array_handler_table, detect_direct_switch, detect_object_handler_table,
     DirectSwitchMapCandidate, HandlerTableCandidate,
 };
+use embedded::{detect_function_constructor, detect_literal_string_join, EmbeddedCodeCandidate};
 use oxc_allocator::Allocator;
 use oxc_ast::{
-    ast::{Argument, ArrayExpressionElement, Expression},
+    ast::{ArrayExpressionElement, Expression},
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
@@ -53,15 +55,6 @@ struct Args {
     /// Materialize statically recovered Function(...) bodies as synthetic JS files.
     #[arg(long)]
     dump_embedded: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-struct EmbeddedCodeCandidate {
-    outer_start: u32,
-    outer_end: u32,
-    kind: String,
-    params: Vec<String>,
-    body: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -593,92 +586,6 @@ impl<'s> Scanner<'s> {
         self.push_builders.push(detected.candidate);
     }
 
-    fn record_literal_string_join(&mut self, call: &oxc_ast::ast::CallExpression<'_>) {
-        if call.optional || call.arguments.len() != 1 {
-            return;
-        }
-        let Expression::StaticMemberExpression(member) = &call.callee else {
-            return;
-        };
-        if member.optional || member.property.name.as_str() != "join" {
-            return;
-        }
-        let Expression::ArrayExpression(array) = &member.object else {
-            return;
-        };
-        let Argument::StringLiteral(separator) = &call.arguments[0] else {
-            return;
-        };
-
-        let mut parts = Vec::with_capacity(array.elements.len());
-        for element in &array.elements {
-            let ArrayExpressionElement::StringLiteral(value) = element else {
-                return;
-            };
-            parts.push(value.value.as_str());
-        }
-        if parts.len() < 2 {
-            return;
-        }
-
-        let body = parts.join(separator.value.as_str());
-        if body.len() < 1024 || body.len() > 5_000_000 {
-            return;
-        }
-        let looks_like_code = body.contains("function")
-            && (body.contains("for(")
-                || body.contains("for (")
-                || body.contains("switch(")
-                || body.contains("switch (")
-                || body.contains("=>"));
-        if !looks_like_code {
-            return;
-        }
-
-        self.embedded_code.push(EmbeddedCodeCandidate {
-            outer_start: call.span.start,
-            outer_end: call.span.end,
-            kind: "literal Array.join".to_string(),
-            params: Vec::new(),
-            body,
-        });
-    }
-
-    fn record_function_constructor(
-        &mut self,
-        kind: &str,
-        start: u32,
-        end: u32,
-        args: &[Argument<'_>],
-    ) {
-        if args.is_empty() {
-            return;
-        }
-
-        let mut strings = Vec::with_capacity(args.len());
-        for arg in args {
-            let Argument::StringLiteral(s) = arg else {
-                return;
-            };
-            strings.push(s.value.to_string());
-        }
-
-        let Some(body) = strings.pop() else {
-            return;
-        };
-        if body.len() < 128 || body.len() > 5_000_000 {
-            return;
-        }
-
-        self.embedded_code.push(EmbeddedCodeCandidate {
-            outer_start: start,
-            outer_end: end,
-            kind: kind.to_string(),
-            params: strings,
-            body,
-        });
-    }
-
     fn record_direct_switch(&mut self, switch: &oxc_ast::ast::SwitchStatement<'_>) {
         if switch.cases.len() < 8 {
             return;
@@ -909,7 +816,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
 
     fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
         self.record_push_builder(call);
-        self.record_literal_string_join(call);
+        if let Some(candidate) = detect_literal_string_join(call) {
+            self.embedded_code.push(candidate);
+        }
         let is_function_ctor = matches!(
             &call.callee,
             Expression::Identifier(id) if id.name.as_str() == "Function"
@@ -924,12 +833,14 @@ impl<'a> Visit<'a> for Scanner<'_> {
             }
         }
         if is_function_ctor {
-            self.record_function_constructor(
+            if let Some(candidate) = detect_function_constructor(
                 "Function",
                 call.span.start,
                 call.span.end,
                 &call.arguments,
-            );
+            ) {
+                self.embedded_code.push(candidate);
+            }
         }
         walk::walk_call_expression(self, call);
     }
@@ -939,12 +850,14 @@ impl<'a> Visit<'a> for Scanner<'_> {
             &expression.callee,
             Expression::Identifier(id) if id.name.as_str() == "Function"
         ) {
-            self.record_function_constructor(
+            if let Some(candidate) = detect_function_constructor(
                 "new Function",
                 expression.span.start,
                 expression.span.end,
                 &expression.arguments,
-            );
+            ) {
+                self.embedded_code.push(candidate);
+            }
         }
         walk::walk_new_expression(self, expression);
     }
