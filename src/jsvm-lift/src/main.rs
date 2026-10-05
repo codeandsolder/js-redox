@@ -1,7 +1,11 @@
+mod bytecode;
 mod state_flatten;
 mod table_vm;
 
 use anyhow::{Context, Result};
+use bytecode::{
+    detect_numeric_array, detect_push_builder, ArrayCandidate, PushBuilderCandidate, WidthHint,
+};
 use clap::Parser as ClapParser;
 use oxc_allocator::Allocator;
 use oxc_ast::{
@@ -40,49 +44,6 @@ struct Args {
     /// Materialize statically recovered Function(...) bodies as synthetic JS files.
     #[arg(long)]
     dump_embedded: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct WidthHint {
-    width: usize,
-    opcode_unique: usize,
-    opcode_max: u64,
-    operand_max: u64,
-    score: i32,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ArrayCandidate {
-    start: u32,
-    end: u32,
-    elements: usize,
-    numeric: usize,
-    byte_values: usize,
-    numeric_ratio: f64,
-    width_hints: Vec<WidthHint>,
-    preview: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct BuilderUnknown {
-    index: usize,
-    preview: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct PushBuilderCandidate {
-    start: u32,
-    end: u32,
-    receiver: String,
-    arguments: usize,
-    numeric_literals: usize,
-    byte_literals: usize,
-    call_arguments: usize,
-    other_arguments: usize,
-    width_hints: Vec<WidthHint>,
-    values: Vec<Option<u64>>,
-    unknowns: Vec<BuilderUnknown>,
-    preview: String,
 }
 
 #[derive(Debug, Clone)]
@@ -509,17 +470,6 @@ impl<'s> Scanner<'s> {
             current = next.clone();
         }
         current
-    }
-
-    fn builder_receiver_ident(expr: &Expression<'_>) -> Option<String> {
-        match expr {
-            Expression::Identifier(id) => Some(id.name.to_string()),
-            Expression::AssignmentExpression(assign) if assign.operator.is_assign() => {
-                Self::target_ident(&assign.left)
-            }
-            Expression::ParenthesizedExpression(p) => Self::builder_receiver_ident(&p.expression),
-            _ => None,
-        }
     }
 
     fn push_function(&mut self, kind: &str, name: Option<String>, start: u32, end: u32) {
@@ -1102,150 +1052,24 @@ impl<'s> Scanner<'s> {
     }
 
     fn record_push_builder(&mut self, call: &oxc_ast::ast::CallExpression<'_>) {
-        let Expression::StaticMemberExpression(member) = &call.callee else {
+        let Some(detected) = detect_push_builder(self.source, call) else {
             return;
         };
-        if member.property.name.as_str() != "push" || call.arguments.len() < 16 {
-            return;
-        }
-
-        let mut numeric_literals = 0usize;
-        let mut byte_literals = 0usize;
-        let mut call_arguments = 0usize;
-        let mut other_arguments = 0usize;
-        let mut values = Vec::with_capacity(call.arguments.len());
-        let mut unknowns = Vec::new();
-
-        for (arg_index, arg) in call.arguments.iter().enumerate() {
-            match arg {
-                Argument::NumericLiteral(n) => {
-                    numeric_literals += 1;
-                    if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 {
-                        let value = n.value as u64;
-                        if value <= 255 {
-                            byte_literals += 1;
-                        }
-                        values.push(Some(value));
-                    } else {
-                        values.push(None);
-                    }
-                }
-                Argument::CallExpression(_) => {
-                    call_arguments += 1;
-                    values.push(None);
-                    let span = arg.span();
-                    unknowns.push(BuilderUnknown {
-                        index: arg_index,
-                        preview: self.source_preview(span.start, span.end, 120),
-                    });
-                }
-                _ => {
-                    other_arguments += 1;
-                    values.push(None);
-                    let span = arg.span();
-                    unknowns.push(BuilderUnknown {
-                        index: arg_index,
-                        preview: self.source_preview(span.start, span.end, 120),
-                    });
-                }
-            }
-        }
-
-        let recognized = numeric_literals + call_arguments;
-        if recognized * 4 < call.arguments.len() * 3 {
-            return;
-        }
-
-        let mut width_hints = Vec::new();
-        for width in 2usize..=8 {
-            if call.arguments.len() < width * 8 || !call.arguments.len().is_multiple_of(width) {
-                continue;
-            }
-            let instructions = call.arguments.len() / width;
-            let mut opcode_values = BTreeSet::new();
-            let mut opcode_max = 0u64;
-            let mut operand_max = 0u64;
-            let mut known_opcodes = 0usize;
-
-            for (i, value) in values.iter().enumerate() {
-                let Some(value) = value else { continue };
-                if i % width == 0 {
-                    known_opcodes += 1;
-                    opcode_values.insert(*value);
-                    opcode_max = opcode_max.max(*value);
-                } else {
-                    operand_max = operand_max.max(*value);
-                }
-            }
-
-            if known_opcodes * 2 < instructions {
-                continue;
-            }
-
-            let mut score = 2i32;
-            if known_opcodes * 4 >= instructions * 3 {
-                score += 3;
-            } else {
-                score += 1;
-            }
-            if opcode_max <= 63 {
-                score += 4;
-            } else if opcode_max <= 127 {
-                score += 2;
-            }
-            if opcode_values.len() <= 64 {
-                score += 2;
-            }
-            if opcode_values.len() * 2 <= instructions {
-                score += 1;
-            }
-            if operand_max > opcode_max.saturating_mul(2) {
-                score += 2;
-            }
-
-            if score >= 7 {
-                width_hints.push(WidthHint {
-                    width,
-                    opcode_unique: opcode_values.len(),
-                    opcode_max,
-                    operand_max,
-                    score,
-                });
-            }
-        }
-        width_hints.sort_by_key(|h| std::cmp::Reverse(h.score));
-
-        let receiver_ident = Self::builder_receiver_ident(&member.object);
-        if let Some(name) = &receiver_ident {
-            if let Some(cur) = self.stack.last_mut() {
-                cur.push_builder_vars.insert(name.clone());
-                cur.push_builder_sites.insert(
+        if let Some(name) = &detected.receiver_ident {
+            if let Some(current) = self.stack.last_mut() {
+                current.push_builder_vars.insert(name.clone());
+                current.push_builder_sites.insert(
                     name.clone(),
                     BuilderSite {
-                        start: call.span.start,
-                        end: call.span.end,
-                        arguments: call.arguments.len(),
-                        width_hints: width_hints.clone(),
+                        start: detected.candidate.start,
+                        end: detected.candidate.end,
+                        arguments: detected.candidate.arguments,
+                        width_hints: detected.candidate.width_hints.clone(),
                     },
                 );
             }
         }
-
-        let span = member.object.span();
-        self.push_builders.push(PushBuilderCandidate {
-            start: call.span.start,
-            end: call.span.end,
-            receiver: self.source_preview(span.start, span.end, 96),
-            arguments: call.arguments.len(),
-            numeric_literals,
-            byte_literals,
-            call_arguments,
-            other_arguments,
-            width_hints,
-            values,
-            unknowns,
-            preview: self.source_preview(call.span.start, call.span.end, 140),
-        });
+        self.push_builders.push(detected.candidate);
     }
 
     fn record_literal_string_join(&mut self, call: &oxc_ast::ast::CallExpression<'_>) {
@@ -1575,104 +1399,9 @@ impl<'s> Scanner<'s> {
             }
         }
 
-        if n < 16 {
-            return;
+        if let Some(candidate) = detect_numeric_array(self.source, arr) {
+            self.arrays.push(candidate);
         }
-
-        let mut numeric = 0usize;
-        let mut byte_values = 0usize;
-        let mut values: Vec<Option<u64>> = Vec::with_capacity(n);
-        for el in &arr.elements {
-            match el {
-                ArrayExpressionElement::NumericLiteral(v)
-                    if v.value.is_finite() && v.value >= 0.0 =>
-                {
-                    let iv = v.value as u64;
-                    if (iv as f64 - v.value).abs() < f64::EPSILON {
-                        numeric += 1;
-                        if iv <= 255 {
-                            byte_values += 1;
-                        }
-                        values.push(Some(iv));
-                    } else {
-                        values.push(None);
-                    }
-                }
-                _ => values.push(None),
-            }
-        }
-
-        if numeric * 4 < n * 3 {
-            return;
-        }
-
-        let mut hints = Vec::new();
-        if numeric == n && n >= 32 {
-            for width in 2usize..=8 {
-                if n < width * 8 {
-                    continue;
-                }
-                let mut op = BTreeSet::new();
-                let mut op_max = 0u64;
-                let mut operand_max = 0u64;
-                let mut complete = true;
-                for (i, v) in values.iter().enumerate() {
-                    let Some(v) = v else {
-                        complete = false;
-                        break;
-                    };
-                    if i % width == 0 {
-                        op.insert(*v);
-                        op_max = op_max.max(*v);
-                    } else {
-                        operand_max = operand_max.max(*v);
-                    }
-                }
-                if !complete {
-                    continue;
-                }
-                let insts = n / width;
-                let mut score = 0i32;
-                if n.is_multiple_of(width) {
-                    score += 2;
-                }
-                if op_max <= 63 {
-                    score += 4;
-                } else if op_max <= 127 {
-                    score += 2;
-                }
-                if operand_max > op_max.saturating_mul(2) {
-                    score += 2;
-                }
-                if op.len() <= 64 {
-                    score += 2;
-                }
-                if op.len() * 2 <= insts {
-                    score += 1;
-                }
-                if score >= 5 {
-                    hints.push(WidthHint {
-                        width,
-                        opcode_unique: op.len(),
-                        opcode_max: op_max,
-                        operand_max,
-                        score,
-                    });
-                }
-            }
-            hints.sort_by_key(|h| std::cmp::Reverse(h.score));
-        }
-
-        self.arrays.push(ArrayCandidate {
-            start: arr.span.start,
-            end: arr.span.end,
-            elements: n,
-            numeric,
-            byte_values,
-            numeric_ratio: numeric as f64 / n as f64,
-            width_hints: hints,
-            preview: self.source_preview(arr.span.start, arr.span.end, 120),
-        });
     }
 }
 
