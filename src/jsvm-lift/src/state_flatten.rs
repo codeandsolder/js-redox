@@ -1,9 +1,12 @@
 use oxc_ast::{
-    ast::{Argument, Expression, ForStatement, Function, FunctionBody, Statement},
+    ast::{
+        Argument, AssignmentTarget, Expression, ForStatement, Function, FunctionBody, Statement,
+    },
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_span::{GetSpan, Span};
+use oxc_syntax::scope::ScopeFlags;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -24,6 +27,312 @@ pub struct StateMachineInfo {
     pub mask: u64,
     pub shift: Option<u64>,
     pub selector_var: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMachineCandidate {
+    pub function_id: String,
+    pub start: u32,
+    pub end: u32,
+    pub state_var: String,
+    pub init_state: u64,
+    pub mask: u64,
+    pub shift: Option<u64>,
+    pub selector_var: Option<String>,
+    pub switch_cases: usize,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IfLadderStateMachineCandidate {
+    pub function_id: String,
+    pub start: u32,
+    pub end: u32,
+    pub state_var: String,
+    pub init_state: u64,
+    pub exit_state: u64,
+    pub compared_states: Vec<u64>,
+    pub state_assignments: usize,
+    pub constant_state_assignments: usize,
+    pub dynamic_state_assignments: usize,
+    pub preview: String,
+}
+
+#[derive(Debug, Default)]
+pub struct DetectedStateMachines {
+    pub switch_machines: Vec<StateMachineCandidate>,
+    pub if_ladder_machines: Vec<IfLadderStateMachineCandidate>,
+}
+
+fn preview(source: &str, start: u32, end: u32, cap: usize) -> String {
+    let start = start as usize;
+    let end = (end as usize).min(source.len());
+    let raw = source.get(start..end).unwrap_or_default();
+    let mut out = String::with_capacity(cap.min(raw.len()));
+    for c in raw.chars() {
+        if out.len() >= cap {
+            break;
+        }
+        out.push(if c.is_whitespace() { ' ' } else { c });
+    }
+    out
+}
+
+fn expr_ident<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
+    match expr {
+        Expression::Identifier(id) => Some(id.name.as_str()),
+        Expression::ParenthesizedExpression(paren) => expr_ident(&paren.expression),
+        _ => None,
+    }
+}
+
+fn numeric_u64(expr: &Expression<'_>) -> Option<u64> {
+    match expr {
+        Expression::NumericLiteral(n)
+            if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 =>
+        {
+            Some(n.value as u64)
+        }
+        Expression::ParenthesizedExpression(paren) => numeric_u64(&paren.expression),
+        _ => None,
+    }
+}
+
+fn target_ident<'a>(target: &'a AssignmentTarget<'a>) -> Option<&'a str> {
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.as_str()),
+        _ => None,
+    }
+}
+
+fn for_state_init(for_stmt: &ForStatement<'_>) -> Option<(String, u64)> {
+    let init = for_stmt.init.as_ref()?;
+    let oxc_ast::ast::ForStatementInit::VariableDeclaration(decl) = init else {
+        return None;
+    };
+    for declarator in &decl.declarations {
+        let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id else {
+            continue;
+        };
+        let value = declarator.init.as_ref().and_then(numeric_u64)?;
+        return Some((id.name.to_string(), value));
+    }
+    None
+}
+
+fn shifted_state(expr: &Expression<'_>, state: &str) -> Option<u64> {
+    let binary = match expr {
+        Expression::ParenthesizedExpression(paren) => {
+            return shifted_state(&paren.expression, state);
+        }
+        Expression::BinaryExpression(binary) => binary,
+        _ => return None,
+    };
+    if binary.operator.as_str() != ">>" || expr_ident(&binary.left) != Some(state) {
+        return None;
+    }
+    numeric_u64(&binary.right)
+}
+
+fn selector_shape(expr: &Expression<'_>, state: &str) -> Option<(u64, u64)> {
+    let Expression::BinaryExpression(binary) = expr else {
+        return None;
+    };
+    if binary.operator.as_str() != "&" {
+        return None;
+    }
+    if let Some(mask) = numeric_u64(&binary.left) {
+        if let Some(shift) = shifted_state(&binary.right, state) {
+            return Some((mask, shift));
+        }
+    }
+    if let Some(mask) = numeric_u64(&binary.right) {
+        if let Some(shift) = shifted_state(&binary.left, state) {
+            return Some((mask, shift));
+        }
+    }
+    None
+}
+
+fn bitand_state(expr: &Expression<'_>, state: &str) -> Option<u64> {
+    let Expression::BinaryExpression(binary) = expr else {
+        return None;
+    };
+    if binary.operator.as_str() != "&" {
+        return None;
+    }
+    if expr_ident(&binary.left) == Some(state) {
+        return numeric_u64(&binary.right);
+    }
+    if expr_ident(&binary.right) == Some(state) {
+        return numeric_u64(&binary.left);
+    }
+    None
+}
+
+fn binary_state_comparison_literal(
+    binary: &oxc_ast::ast::BinaryExpression<'_>,
+    state_var: &str,
+) -> Option<u64> {
+    if !matches!(binary.operator.as_str(), "==" | "===") {
+        return None;
+    }
+    if expr_ident(&binary.left) == Some(state_var) {
+        return numeric_u64(&binary.right);
+    }
+    if expr_ident(&binary.right) == Some(state_var) {
+        return numeric_u64(&binary.left);
+    }
+    None
+}
+
+fn state_exit_literal(expr: &Expression<'_>, state_var: &str) -> Option<u64> {
+    let Expression::BinaryExpression(binary) = expr else {
+        return None;
+    };
+    if !matches!(binary.operator.as_str(), "!=" | "!==") {
+        return None;
+    }
+    if expr_ident(&binary.left) == Some(state_var) {
+        return numeric_u64(&binary.right);
+    }
+    if expr_ident(&binary.right) == Some(state_var) {
+        return numeric_u64(&binary.left);
+    }
+    None
+}
+
+#[derive(Default)]
+struct IfLadderEvidence {
+    compared_states: BTreeSet<u64>,
+    state_assignments: usize,
+    constant_state_assignments: usize,
+    dynamic_state_assignments: usize,
+}
+
+struct IfLadderEvidenceVisitor<'s> {
+    state_var: &'s str,
+    evidence: IfLadderEvidence,
+}
+
+impl<'a> Visit<'a> for IfLadderEvidenceVisitor<'_> {
+    fn enter_node(&mut self, kind: AstKind<'a>) {
+        match kind {
+            AstKind::BinaryExpression(binary) => {
+                if let Some(state) = binary_state_comparison_literal(binary, self.state_var) {
+                    self.evidence.compared_states.insert(state);
+                }
+            }
+            AstKind::AssignmentExpression(assign)
+                if assign.operator.is_assign()
+                    && target_ident(&assign.left) == Some(self.state_var) =>
+            {
+                self.evidence.state_assignments += 1;
+                if numeric_u64(&assign.right).is_some() {
+                    self.evidence.constant_state_assignments += 1;
+                } else {
+                    self.evidence.dynamic_state_assignments += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    fn visit_function(&mut self, _it: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+    }
+}
+
+pub fn detect_for_state_machines(
+    source: &str,
+    function_id: &str,
+    for_stmt: &ForStatement<'_>,
+) -> DetectedStateMachines {
+    let mut detected = DetectedStateMachines::default();
+    let Some((state_var, init_state)) = for_state_init(for_stmt) else {
+        return detected;
+    };
+    if for_stmt.update.is_some() {
+        return detected;
+    }
+    if let Some(test) = for_stmt.test.as_ref() {
+        let test_preview = preview(source, test.span().start, test.span().end, 180);
+        if test_preview.contains(&state_var)
+            && (test_preview.contains("void") || test_preview.contains("undefined"))
+        {
+            if let Statement::BlockStatement(body) = &for_stmt.body {
+                let mut selectors = Vec::new();
+                let mut switches = Vec::new();
+                for stmt in &body.body {
+                    match stmt {
+                        Statement::VariableDeclaration(decl) => {
+                            for declarator in &decl.declarations {
+                                let oxc_ast::ast::BindingPattern::BindingIdentifier(id) =
+                                    &declarator.id
+                                else {
+                                    continue;
+                                };
+                                let Some(init) = declarator.init.as_ref() else {
+                                    continue;
+                                };
+                                if let Some((mask, shift)) = selector_shape(init, &state_var) {
+                                    selectors.push((id.name.to_string(), mask, shift));
+                                }
+                            }
+                        }
+                        Statement::SwitchStatement(switch) => {
+                            if let Some(mask) = bitand_state(&switch.discriminant, &state_var) {
+                                switches.push((mask, switch.cases.len()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for (mask, switch_cases) in switches {
+                    let selector = selectors
+                        .iter()
+                        .find(|(_, selector_mask, _)| *selector_mask == mask);
+                    detected.switch_machines.push(StateMachineCandidate {
+                        function_id: function_id.to_string(),
+                        start: for_stmt.span.start,
+                        end: for_stmt.span.end,
+                        state_var: state_var.clone(),
+                        init_state,
+                        mask,
+                        shift: selector.map(|(_, _, shift)| *shift),
+                        selector_var: selector.map(|(name, _, _)| name.clone()),
+                        switch_cases,
+                        preview: preview(source, for_stmt.span.start, for_stmt.span.end, 180),
+                    });
+                }
+            }
+        }
+        if let Some(exit_state) = state_exit_literal(test, &state_var) {
+            let mut visitor = IfLadderEvidenceVisitor {
+                state_var: &state_var,
+                evidence: IfLadderEvidence::default(),
+            };
+            visitor.visit_statement(&for_stmt.body);
+            let evidence = visitor.evidence;
+            if evidence.compared_states.len() >= 4 && evidence.state_assignments >= 4 {
+                detected
+                    .if_ladder_machines
+                    .push(IfLadderStateMachineCandidate {
+                        function_id: function_id.to_string(),
+                        start: for_stmt.span.start,
+                        end: for_stmt.span.end,
+                        state_var,
+                        init_state,
+                        exit_state,
+                        compared_states: evidence.compared_states.into_iter().collect(),
+                        state_assignments: evidence.state_assignments,
+                        constant_state_assignments: evidence.constant_state_assignments,
+                        dynamic_state_assignments: evidence.dynamic_state_assignments,
+                        preview: preview(source, for_stmt.span.start, for_stmt.span.end, 180),
+                    });
+            }
+        }
+    }
+    detected
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -792,4 +1101,105 @@ pub fn analyze_function<'a>(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_span::SourceType;
+    use rolldown_redox::ecmascript::parse_program;
+
+    #[derive(Default)]
+    struct DetectorHarness<'s> {
+        source: &'s str,
+        detected: DetectedStateMachines,
+    }
+
+    impl<'a> Visit<'a> for DetectorHarness<'_> {
+        fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+            let detected = detect_for_state_machines(self.source, "test-function", statement);
+            self.detected
+                .switch_machines
+                .extend(detected.switch_machines);
+            self.detected
+                .if_ladder_machines
+                .extend(detected.if_ladder_machines);
+            walk::walk_for_statement(self, statement);
+        }
+    }
+
+    fn detect(source: &str) -> DetectedStateMachines {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let mut harness = DetectorHarness {
+            source,
+            detected: DetectedStateMachines::default(),
+        };
+        harness.visit_program(&parsed.program);
+        harness.detected
+    }
+
+    #[test]
+    fn detects_switch_state_machine() {
+        let detected = detect(
+            r#"
+            function vm() {
+                for (let state = 17; state !== undefined;) {
+                    let selector = (state >> 3) & 7;
+                    switch (state & 7) {
+                        case 0: state = 8; break;
+                        case 1: state = 9; break;
+                        default: state = undefined;
+                    }
+                }
+            }
+            "#,
+        );
+
+        assert_eq!(detected.switch_machines.len(), 1);
+        let machine = &detected.switch_machines[0];
+        assert_eq!(machine.function_id, "test-function");
+        assert_eq!(machine.state_var, "state");
+        assert_eq!(machine.init_state, 17);
+        assert_eq!(machine.mask, 7);
+        assert_eq!(machine.shift, Some(3));
+        assert_eq!(machine.selector_var.as_deref(), Some("selector"));
+        assert_eq!(machine.switch_cases, 3);
+        assert!(detected.if_ladder_machines.is_empty());
+    }
+
+    #[test]
+    fn detects_if_ladder_state_machine() {
+        let detected = detect(
+            r#"
+            function flattened() {
+                for (let state = 0; state !== 99;) {
+                    if (state === 0) { state = 1; }
+                    else if (state === 1) { state = 2; }
+                    else if (state === 2) { state = 3; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+            "#,
+        );
+
+        assert!(detected.switch_machines.is_empty());
+        assert_eq!(detected.if_ladder_machines.len(), 1);
+        let machine = &detected.if_ladder_machines[0];
+        assert_eq!(machine.state_var, "state");
+        assert_eq!(machine.init_state, 0);
+        assert_eq!(machine.exit_state, 99);
+        assert_eq!(machine.compared_states, vec![0, 1, 2, 3]);
+        assert_eq!(machine.state_assignments, 4);
+        assert_eq!(machine.constant_state_assignments, 4);
+        assert_eq!(machine.dynamic_state_assignments, 0);
+    }
+
+    #[test]
+    fn ignores_ordinary_counted_loop() {
+        let detected = detect("for (let i = 0; i < 10; i += 1) { work(i); }");
+        assert!(detected.switch_machines.is_empty());
+        assert!(detected.if_ladder_machines.is_empty());
+    }
 }

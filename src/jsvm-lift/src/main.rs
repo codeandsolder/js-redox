@@ -13,7 +13,10 @@ use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::scope::ScopeFlags;
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
-use state_flatten::{DecoderControlInfo, OpcodeMapCandidate, StateMachineInfo};
+use state_flatten::{
+    detect_for_state_machines, DecoderControlInfo, IfLadderStateMachineCandidate,
+    OpcodeMapCandidate, StateMachineCandidate, StateMachineInfo,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
@@ -135,35 +138,6 @@ struct DecoderCandidate {
     selector_masks: Vec<u64>,
     start: u32,
     end: u32,
-    preview: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct StateMachineCandidate {
-    function_id: String,
-    start: u32,
-    end: u32,
-    state_var: String,
-    init_state: u64,
-    mask: u64,
-    shift: Option<u64>,
-    selector_var: Option<String>,
-    switch_cases: usize,
-    preview: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct IfLadderStateMachineCandidate {
-    function_id: String,
-    start: u32,
-    end: u32,
-    state_var: String,
-    init_state: u64,
-    exit_state: u64,
-    compared_states: Vec<u64>,
-    state_assignments: usize,
-    constant_state_assignments: usize,
-    dynamic_state_assignments: usize,
     preview: String,
 }
 
@@ -329,107 +303,6 @@ fn expression_evidence(source: &str, expr: &Expression<'_>) -> ExprEvidence {
     };
     v.visit_expression(expr);
     v.evidence
-}
-
-fn simple_expr_ident<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
-    match expr {
-        Expression::Identifier(id) => Some(id.name.as_str()),
-        Expression::ParenthesizedExpression(paren) => simple_expr_ident(&paren.expression),
-        _ => None,
-    }
-}
-
-fn simple_numeric_u64(expr: &Expression<'_>) -> Option<u64> {
-    match expr {
-        Expression::NumericLiteral(n)
-            if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 =>
-        {
-            Some(n.value as u64)
-        }
-        Expression::ParenthesizedExpression(paren) => simple_numeric_u64(&paren.expression),
-        _ => None,
-    }
-}
-
-fn simple_target_ident<'a>(target: &'a oxc_ast::ast::AssignmentTarget<'a>) -> Option<&'a str> {
-    match target {
-        oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.as_str()),
-        _ => None,
-    }
-}
-
-fn binary_state_comparison_literal(
-    binary: &oxc_ast::ast::BinaryExpression<'_>,
-    state_var: &str,
-) -> Option<u64> {
-    if !matches!(binary.operator.as_str(), "==" | "===") {
-        return None;
-    }
-    if simple_expr_ident(&binary.left) == Some(state_var) {
-        return simple_numeric_u64(&binary.right);
-    }
-    if simple_expr_ident(&binary.right) == Some(state_var) {
-        return simple_numeric_u64(&binary.left);
-    }
-    None
-}
-
-fn state_exit_literal(expr: &Expression<'_>, state_var: &str) -> Option<u64> {
-    let Expression::BinaryExpression(binary) = expr else {
-        return None;
-    };
-    if !matches!(binary.operator.as_str(), "!=" | "!==") {
-        return None;
-    }
-    if simple_expr_ident(&binary.left) == Some(state_var) {
-        return simple_numeric_u64(&binary.right);
-    }
-    if simple_expr_ident(&binary.right) == Some(state_var) {
-        return simple_numeric_u64(&binary.left);
-    }
-    None
-}
-
-#[derive(Default)]
-struct IfLadderEvidence {
-    compared_states: BTreeSet<u64>,
-    state_assignments: usize,
-    constant_state_assignments: usize,
-    dynamic_state_assignments: usize,
-}
-
-struct IfLadderEvidenceVisitor<'s> {
-    state_var: &'s str,
-    evidence: IfLadderEvidence,
-}
-
-impl<'a> Visit<'a> for IfLadderEvidenceVisitor<'_> {
-    fn enter_node(&mut self, kind: AstKind<'a>) {
-        match kind {
-            AstKind::BinaryExpression(binary) => {
-                if let Some(state) = binary_state_comparison_literal(binary, self.state_var) {
-                    self.evidence.compared_states.insert(state);
-                }
-            }
-            AstKind::AssignmentExpression(assign)
-                if assign.operator.is_assign()
-                    && simple_target_ident(&assign.left) == Some(self.state_var) =>
-            {
-                self.evidence.state_assignments += 1;
-                if simple_numeric_u64(&assign.right).is_some() {
-                    self.evidence.constant_state_assignments += 1;
-                } else {
-                    self.evidence.dynamic_state_assignments += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn visit_function(&mut self, _it: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {}
-
-    fn visit_arrow_function_expression(&mut self, _it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
-    }
 }
 
 #[derive(Default)]
@@ -647,190 +520,6 @@ impl<'s> Scanner<'s> {
             Expression::ParenthesizedExpression(p) => Self::builder_receiver_ident(&p.expression),
             _ => None,
         }
-    }
-
-    fn for_state_init(for_stmt: &oxc_ast::ast::ForStatement<'_>) -> Option<(String, u64)> {
-        let init = for_stmt.init.as_ref()?;
-        let oxc_ast::ast::ForStatementInit::VariableDeclaration(decl) = init else {
-            return None;
-        };
-        for d in &decl.declarations {
-            let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &d.id else {
-                continue;
-            };
-            let value = d.init.as_ref().and_then(Self::numeric_u64)?;
-            return Some((id.name.to_string(), value));
-        }
-        None
-    }
-
-    fn bitand_state(expr: &Expression<'_>, state: &str) -> Option<u64> {
-        let Expression::BinaryExpression(bin) = expr else {
-            return None;
-        };
-        if bin.operator.as_str() != "&" {
-            return None;
-        }
-        if Self::expr_ident(&bin.left).as_deref() == Some(state) {
-            return Self::numeric_u64(&bin.right);
-        }
-        if Self::expr_ident(&bin.right).as_deref() == Some(state) {
-            return Self::numeric_u64(&bin.left);
-        }
-        None
-    }
-
-    fn shifted_state(expr: &Expression<'_>, state: &str) -> Option<u64> {
-        let Expression::BinaryExpression(bin) = expr else {
-            return None;
-        };
-        if bin.operator.as_str() != ">>" {
-            return None;
-        }
-        if Self::expr_ident(&bin.left).as_deref() != Some(state) {
-            return None;
-        }
-        Self::numeric_u64(&bin.right)
-    }
-
-    fn selector_shape(expr: &Expression<'_>, state: &str) -> Option<(u64, u64)> {
-        let Expression::BinaryExpression(bin) = expr else {
-            return None;
-        };
-        if bin.operator.as_str() != "&" {
-            return None;
-        }
-
-        if let Some(mask) = Self::numeric_u64(&bin.left) {
-            if let Some(shift) = Self::shifted_state(&bin.right, state) {
-                return Some((mask, shift));
-            }
-        }
-        if let Some(mask) = Self::numeric_u64(&bin.right) {
-            if let Some(shift) = Self::shifted_state(&bin.left, state) {
-                return Some((mask, shift));
-            }
-        }
-        None
-    }
-
-    fn record_state_machine(&mut self, for_stmt: &oxc_ast::ast::ForStatement<'_>) {
-        let Some((state_var, init_state)) = Self::for_state_init(for_stmt) else {
-            return;
-        };
-        if for_stmt.update.is_some() {
-            return;
-        }
-
-        // Require the loop test to mention the state and an undefined/void check.
-        let Some(test) = for_stmt.test.as_ref() else {
-            return;
-        };
-        let test_preview = self.source_preview(test.span().start, test.span().end, 180);
-        if !test_preview.contains(&state_var)
-            || !(test_preview.contains("void") || test_preview.contains("undefined"))
-        {
-            return;
-        }
-
-        let oxc_ast::ast::Statement::BlockStatement(body) = &for_stmt.body else {
-            return;
-        };
-
-        let mut selectors: Vec<(String, u64, u64)> = Vec::new();
-        let mut switches: Vec<(u64, usize)> = Vec::new();
-
-        for stmt in &body.body {
-            match stmt {
-                oxc_ast::ast::Statement::VariableDeclaration(decl) => {
-                    for d in &decl.declarations {
-                        let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &d.id else {
-                            continue;
-                        };
-                        let Some(init) = d.init.as_ref() else {
-                            continue;
-                        };
-                        if let Some((mask, shift)) = Self::selector_shape(init, &state_var) {
-                            selectors.push((id.name.to_string(), mask, shift));
-                        }
-                    }
-                }
-                oxc_ast::ast::Statement::SwitchStatement(sw) => {
-                    if let Some(mask) = Self::bitand_state(&sw.discriminant, &state_var) {
-                        switches.push((mask, sw.cases.len()));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let Some(function_id) = self.stack.last().map(|f| f.m.id.clone()) else {
-            return;
-        };
-
-        for (mask, switch_cases) in switches {
-            let selector = selectors.iter().find(|(_, smask, _)| *smask == mask);
-            self.state_machines.push(StateMachineCandidate {
-                function_id: function_id.clone(),
-                start: for_stmt.span.start,
-                end: for_stmt.span.end,
-                state_var: state_var.clone(),
-                init_state,
-                mask,
-                shift: selector.map(|(_, _, shift)| *shift),
-                selector_var: selector.map(|(name, _, _)| name.clone()),
-                switch_cases,
-                preview: self.source_preview(for_stmt.span.start, for_stmt.span.end, 180),
-            });
-        }
-    }
-
-    fn record_if_ladder_state_machine(&mut self, for_stmt: &oxc_ast::ast::ForStatement<'_>) {
-        let Some((state_var, init_state)) = Self::for_state_init(for_stmt) else {
-            return;
-        };
-        if for_stmt.update.is_some() {
-            return;
-        }
-        let Some(test) = for_stmt.test.as_ref() else {
-            return;
-        };
-        let Some(exit_state) = state_exit_literal(test, &state_var) else {
-            return;
-        };
-
-        let mut visitor = IfLadderEvidenceVisitor {
-            state_var: &state_var,
-            evidence: IfLadderEvidence::default(),
-        };
-        visitor.visit_statement(&for_stmt.body);
-        let evidence = visitor.evidence;
-
-        // This is intentionally only a CFF inventory candidate. Requiring both
-        // repeated numeric state comparisons and repeated writes to the same
-        // loop-state variable keeps ordinary counted loops out without claiming
-        // interpreter semantics.
-        if evidence.compared_states.len() < 4 || evidence.state_assignments < 4 {
-            return;
-        }
-
-        let Some(function_id) = self.stack.last().map(|f| f.m.id.clone()) else {
-            return;
-        };
-        self.if_ladder_state_machines
-            .push(IfLadderStateMachineCandidate {
-                function_id,
-                start: for_stmt.span.start,
-                end: for_stmt.span.end,
-                state_var,
-                init_state,
-                exit_state,
-                compared_states: evidence.compared_states.into_iter().collect(),
-                state_assignments: evidence.state_assignments,
-                constant_state_assignments: evidence.constant_state_assignments,
-                dynamic_state_assignments: evidence.dynamic_state_assignments,
-                preview: self.source_preview(for_stmt.span.start, for_stmt.span.end, 180),
-            });
     }
 
     fn push_function(&mut self, kind: &str, name: Option<String>, start: u32, end: u32) {
@@ -2034,8 +1723,12 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_for_statement(&mut self, statement: &oxc_ast::ast::ForStatement<'a>) {
-        self.record_state_machine(statement);
-        self.record_if_ladder_state_machine(statement);
+        if let Some(function_id) = self.stack.last().map(|current| current.m.id.as_str()) {
+            let detected = detect_for_state_machines(self.source, function_id, statement);
+            self.state_machines.extend(detected.switch_machines);
+            self.if_ladder_state_machines
+                .extend(detected.if_ladder_machines);
+        }
         if let Some(current) = self.stack.last_mut() {
             current.m.loops += 1;
         }
