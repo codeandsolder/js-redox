@@ -13,7 +13,7 @@ use control_flow::{
     reference_identity, ReferenceIdentityTable,
 };
 use decoder::{analyze_decoders, Decoder};
-use numeric::{exact_i64, exact_usize};
+pub use numeric::{exact_i64, exact_u32, exact_u64, exact_usize};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, CallExpression, ComputedMemberExpression,

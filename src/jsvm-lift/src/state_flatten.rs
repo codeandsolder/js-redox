@@ -2,7 +2,7 @@ use crate::{
     ast_utils::{expr_ident, numeric_u64, target_ident},
     source_text::preview,
 };
-use jsvm_lift::numeric::{exact_i64, exact_u64};
+use jsvm_lift::numeric::{eval_js_bitwise_i64, exact_i64, exact_u64, js_int32_from_i64};
 use oxc_ast::{
     ast::{Argument, Expression, ForStatement, Function, FunctionBody, Statement, SwitchStatement},
     AstKind,
@@ -353,29 +353,6 @@ impl Scalar {
     }
 }
 
-const fn low_u32(value: i64) -> u32 {
-    let bytes = value.to_le_bytes();
-    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-const fn low_i32(value: i64) -> i32 {
-    let bytes = value.to_le_bytes();
-    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-fn eval_bitwise(op: &str, lhs: i64, rhs: i64) -> Option<i64> {
-    let shift = low_u32(rhs) & 31;
-    match op {
-        "&" => Some(i64::from(low_i32(lhs) & low_i32(rhs))),
-        "|" => Some(i64::from(low_i32(lhs) | low_i32(rhs))),
-        "^" => Some(i64::from(low_i32(lhs) ^ low_i32(rhs))),
-        "<<" => Some(i64::from(low_i32(lhs).wrapping_shl(shift))),
-        ">>" => Some(i64::from(low_i32(lhs) >> shift)),
-        ">>>" => Some(i64::from(low_u32(lhs) >> shift)),
-        _ => None,
-    }
-}
-
 fn eval_expr(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Option<Scalar> {
     match expr {
         Expression::NumericLiteral(n) => exact_i64(n.value).map(Scalar::Int),
@@ -392,7 +369,7 @@ fn eval_expr(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Option<Sca
             let v = eval_expr(&u.argument, env)?;
             match u.operator.as_str() {
                 "!" => Some(Scalar::Int(i64::from(!v.truthy()))),
-                "~" => Some(Scalar::Int(i64::from(!low_i32(v.int()?)))),
+                "~" => Some(Scalar::Int(i64::from(!js_int32_from_i64(v.int()?)))),
                 "+" => Some(Scalar::Int(v.int()?)),
                 "-" => Some(Scalar::Int(-v.int()?)),
                 "void" => Some(Scalar::Undefined),
@@ -419,7 +396,7 @@ fn eval_expr(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Option<Sca
                 ">" => Some(Scalar::Int(i64::from(lhs.int()? > rhs.int()?))),
                 ">=" => Some(Scalar::Int(i64::from(lhs.int()? >= rhs.int()?))),
                 "&" | "|" | "^" | "<<" | ">>" | ">>>" => {
-                    eval_bitwise(op, lhs.int()?, rhs.int()?).map(Scalar::Int)
+                    eval_js_bitwise_i64(op, lhs.int()?, rhs.int()?).map(Scalar::Int)
                 }
                 "+" => Some(Scalar::Int(lhs.int()?.wrapping_add(rhs.int()?))),
                 "-" => Some(Scalar::Int(lhs.int()?.wrapping_sub(rhs.int()?))),

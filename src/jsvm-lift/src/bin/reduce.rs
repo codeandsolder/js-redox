@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser as ClapParser;
-use jsvm_lift::numeric::exact_i64;
+use jsvm_lift::numeric::{eval_js_bitwise_i64, exact_i64, js_int32_from_i64};
 use oxc_allocator::Allocator;
 use oxc_ast::{
     ast::{Argument, AssignmentExpression, AssignmentTarget, Expression, Statement, SwitchCase},
@@ -296,7 +296,7 @@ fn eval_unary(
         "!" => v.truthy().map_or(Val::Unknown, |x| Val::Bool(!x)),
         "~" => v
             .as_num()
-            .map_or(Val::Unknown, |x| Val::Num(i64::from(!low_i32(x)))),
+            .map_or(Val::Unknown, |x| Val::Num(i64::from(!js_int32_from_i64(x)))),
         "+" => v.as_num().map_or(Val::Unknown, Val::Num),
         "-" => v.as_num().map_or(Val::Unknown, |x| Val::Num(-x)),
         _ => Val::Unknown,
@@ -332,29 +332,6 @@ fn eval_logical(
     }
 }
 
-const fn low_u32(value: i64) -> u32 {
-    let bytes = value.to_le_bytes();
-    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-const fn low_i32(value: i64) -> i32 {
-    let bytes = value.to_le_bytes();
-    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-}
-
-fn eval_bitwise(op: &str, lhs: i64, rhs: i64) -> Option<i64> {
-    let shift = low_u32(rhs) & 31;
-    match op {
-        "&" => Some(i64::from(low_i32(lhs) & low_i32(rhs))),
-        "|" => Some(i64::from(low_i32(lhs) | low_i32(rhs))),
-        "^" => Some(i64::from(low_i32(lhs) ^ low_i32(rhs))),
-        "<<" => Some(i64::from(low_i32(lhs).wrapping_shl(shift))),
-        ">>" => Some(i64::from(low_i32(lhs) >> shift)),
-        ">>>" => Some(i64::from(low_u32(lhs) >> shift)),
-        _ => None,
-    }
-}
-
 fn eval_binary(
     bin: &oxc_ast::ast::BinaryExpression<'_>,
     env: &mut Env,
@@ -374,7 +351,7 @@ fn eval_binary(
         ">" => Val::Bool(a > b),
         ">=" => Val::Bool(a >= b),
         "&" | "|" | "^" | "<<" | ">>" | ">>>" => {
-            eval_bitwise(bin.operator.as_str(), a, b).map_or(Val::Unknown, Val::Num)
+            eval_js_bitwise_i64(bin.operator.as_str(), a, b).map_or(Val::Unknown, Val::Num)
         }
         "+" => Val::Num(a.wrapping_add(b)),
         "-" => Val::Num(a.wrapping_sub(b)),
@@ -1034,15 +1011,18 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::eval_bitwise;
+    use jsvm_lift::numeric::eval_js_bitwise_i64;
 
     #[test]
     fn bitwise_evaluation_matches_javascript_32_bit_semantics() {
-        assert_eq!(eval_bitwise(">>>", -1, 0), Some(4_294_967_295));
-        assert_eq!(eval_bitwise(">>", 0x8000_0000, 0), Some(-2_147_483_648));
-        assert_eq!(eval_bitwise("<<", 1, 33), Some(2));
+        assert_eq!(eval_js_bitwise_i64(">>>", -1, 0), Some(4_294_967_295));
         assert_eq!(
-            eval_bitwise("&", 0xffff_ffff, 0x8000_0000),
+            eval_js_bitwise_i64(">>", 0x8000_0000, 0),
+            Some(-2_147_483_648)
+        );
+        assert_eq!(eval_js_bitwise_i64("<<", 1, 33), Some(2));
+        assert_eq!(
+            eval_js_bitwise_i64("&", 0xffff_ffff, 0x8000_0000),
             Some(-2_147_483_648)
         );
     }
