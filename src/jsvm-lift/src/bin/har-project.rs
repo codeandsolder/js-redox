@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
 };
@@ -885,7 +886,7 @@ fn write_project_metadata(args: &Args, manifest: &ProjectManifest) -> Result<()>
     )?;
     let mut summary = String::new();
     for (kind, count) in &manifest.counts {
-        summary.push_str(&format!("- {kind}: {count}\n"));
+        let _ = writeln!(summary, "- {kind}: {count}");
     }
     fs::write(
         args.output.join("README.md"),

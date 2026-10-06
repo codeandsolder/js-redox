@@ -307,7 +307,7 @@ impl<'s> Analyzer<'s> {
         self.function_stack
             .last()
             .map(|f| (Some(f.id.clone()), f.start, f.end))
-            .unwrap_or((None, 0, self.source.len().min(u32::MAX as usize) as u32))
+            .unwrap_or_else(|| (None, 0, self.source.len().min(u32::MAX as usize) as u32))
     }
 
     fn registry_scope_key(&self, binding: String) -> (u32, u32, String) {

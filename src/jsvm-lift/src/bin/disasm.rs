@@ -11,6 +11,7 @@ use rolldown_redox::ecmascript::parse_program;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
 };
@@ -389,13 +390,14 @@ fn render_disassembly(disasm: &Disassembly) -> String {
         words.extend(instruction.operands.iter().map(field_text));
         let semantic = compact_semantics(&instruction.semantics);
         let clipped: String = semantic.chars().take(500).collect();
-        text.push_str(&format!(
-            "{:04} pc={:04}  {:<32} | {}\n",
+        let _ = writeln!(
+            text,
+            "{:04} pc={:04}  {:<32} | {}",
             instruction.index,
             instruction.pc,
             words.join(" "),
             clipped
-        ));
+        );
     }
     text
 }

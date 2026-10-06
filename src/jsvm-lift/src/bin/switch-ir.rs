@@ -313,9 +313,13 @@ fn infer_stack_helpers(
             continue;
         }
         if *argc == 1 && identifier_count(semantics, name) >= 4 {
-            helpers.entry("stack_push".into()).or_insert(name.clone());
+            helpers
+                .entry("stack_push".into())
+                .or_insert_with(|| name.clone());
         } else if *argc == 0 && body.contains("return") && identifier_count(semantics, name) >= 4 {
-            helpers.entry("stack_pop".into()).or_insert(name.clone());
+            helpers
+                .entry("stack_pop".into())
+                .or_insert_with(|| name.clone());
         }
     }
 }
@@ -373,7 +377,9 @@ fn call_family_roles(
         };
         let read_calls = identifier_count(body, selector_helper);
         if read_calls >= 2 && body.contains("<<8") {
-            helpers.entry("read_u16".into()).or_insert(name.clone());
+            helpers
+                .entry("read_u16".into())
+                .or_insert_with(|| name.clone());
         }
     }
     if let Some(read_u16) = helpers.get("read_u16").cloned() {
@@ -386,7 +392,9 @@ fn call_family_roles(
             };
             if identifier_count(body, &read_u16) > 0 && identifier_count(body, selector_helper) > 0
             {
-                helpers.entry("read_string".into()).or_insert(name.clone());
+                helpers
+                    .entry("read_string".into())
+                    .or_insert_with(|| name.clone());
             }
         }
     }
@@ -409,7 +417,9 @@ fn call_family_roles(
             .map(|caps| caps[1].to_string())
             .collect::<Vec<_>>();
         if let Some(env) = envs.first() {
-            helpers.entry("env_lookup".into()).or_insert(name.clone());
+            helpers
+                .entry("env_lookup".into())
+                .or_insert_with(|| name.clone());
             roles.entry("env".into()).or_insert_with(|| env.clone());
         }
         if let Some(fallback) = envs.get(1) {
