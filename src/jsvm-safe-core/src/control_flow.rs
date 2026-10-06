@@ -168,243 +168,269 @@ fn unique_symbol_named_near(
     matches.next().is_none().then_some(symbol)
 }
 
+struct ReferenceIdentityPatterns {
+    row: regex::Regex,
+    timer: regex::Regex,
+    outer: regex::Regex,
+    fill: regex::Regex,
+    root: regex::Regex,
+}
+
+fn reference_identity_patterns() -> Option<ReferenceIdentityPatterns> {
+    let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
+    let ws = r"\s*";
+    Some(ReferenceIdentityPatterns {
+        row: regex::Regex::new(&format!(
+            r"(?P<table>{identifier}){ws}={ws}\[\]{ws},{ws}(?P<idx>{identifier}){ws}={ws}0{ws};{ws}(?P<test>{identifier}){ws}<{ws}(?P<rows>\d+){ws};{ws}(?P<update>{identifier}){ws}\+\+{ws}\){ws}(?P<table2>{identifier}){ws}\[{ws}(?P<idx2>{identifier}){ws}\]{ws}={ws}new{ws}Array{ws}\({ws}(?P<columns>\d+){ws}\)"
+        )).ok()?,
+        timer: regex::Regex::new(&format!(
+            r"(?P<timer>{identifier}){ws}={ws}function{ws}\({ws}(?P<arg>{identifier}){ws}\){ws}\{{{ws}setTimeout{ws}\({ws}(?P<arg2>{identifier}){ws},{ws}0{ws}\){ws};?{ws}\}}"
+        )).ok()?,
+        outer: regex::Regex::new(&format!(
+            r"for{ws}\({ws}var\s+(?P<loop>{identifier}){ws}={ws}0{ws};{ws}(?P<test>{identifier}){ws}<{ws}(?P<chunks>\d+){ws};{ws}(?P<update>{identifier}){ws}\+\+{ws}\){ws}\({ws}\(?{ws}(?P<callback>{identifier}){ws}\)?{ws}=>{ws}\{{{ws}(?P<timer>{identifier}){ws}\({ws}function{ws}\({ws}\){ws}\{{"
+        )).ok()?,
+        fill: regex::Regex::new(&format!(
+            r"for{ws}\({ws}var\s+(?P<t>{identifier}){ws}={ws}(?P<chunk>\d+){ws}\*{ws}(?P<callback>{identifier}){ws},{ws}(?P<n>{identifier}){ws}={ws}Math{ws}\.{ws}min{ws}\({ws}(?P<t2>{identifier}){ws}\+{ws}(?P<chunk2>\d+){ws},{ws}(?P<columns>\d+){ws}\){ws},{ws}(?P<column>{identifier}){ws}={ws}(?P<t3>{identifier}){ws};{ws}(?P<column2>{identifier}){ws}<{ws}(?P<n2>{identifier}){ws};{ws}(?P<column3>{identifier}){ws}\+\+{ws}\){ws}for{ws}\({ws}(?P<row>{identifier}){ws}={ws}0{ws};{ws}(?P<row2>{identifier}){ws}<{ws}(?P<rows>\d+){ws};{ws}(?P<row3>{identifier}){ws}\+\+{ws}\){ws}(?P<table>{identifier}){ws}\[{ws}(?P<row4>{identifier}){ws}\]{ws}\[{ws}(?P<column4>{identifier}){ws}\]{ws}={ws}(?P<table2>{identifier}){ws}\[{ws}\({ws}(?P<a>\d+){ws}\*{ws}(?P<column5>{identifier}){ws}\^{ws}(?P<b>\d+){ws}\*{ws}(?P<row5>{identifier}){ws}\^{ws}(?P<c>\d+){ws}\*{ws}(?P<k>\d+){ws}\){ws}>>>{ws}0{ws}&{ws}(?P<mask>\d+){ws}-{ws}1{ws}\]"
+        )).ok()?,
+        root: regex::Regex::new(&format!(
+            r"(?P<timer>{identifier}){ws}\({ws}function{ws}\({ws}\){ws}\{{{ws}(?P<target>{identifier}){ws}={ws}(?P<table>{identifier}){ws}\[{ws}(?P<root>\d+){ws}\]{ws};?{ws}\}}{ws}\)"
+        )).ok()?,
+    })
+}
+
+fn capture_str<'h>(captures: &regex::Captures<'h>, name: &str) -> Option<&'h str> {
+    captures.name(name).map(|capture| capture.as_str())
+}
+
+fn capture_u32(captures: &regex::Captures<'_>, name: &str) -> Option<u32> {
+    capture_str(captures, name)?.parse().ok()
+}
+
+#[derive(Debug)]
+struct ReferenceIdentityShape {
+    table_name: String,
+    target_name: String,
+    rows: u32,
+    columns: u32,
+    root_row: u32,
+    column_multiplier: u32,
+    row_multiplier: u32,
+    salt_left: u32,
+    salt_right: u32,
+    window_start: usize,
+    window_end: usize,
+    construction_start: usize,
+    construction_end: usize,
+}
+
+#[derive(Debug)]
+struct ReferenceIdentityFill {
+    column_multiplier: u32,
+    row_multiplier: u32,
+    salt_left: u32,
+    salt_right: u32,
+}
+
+fn parse_reference_identity_fill(
+    fill_caps: &regex::Captures<'_>,
+    callback_name: &str,
+    table_name: &str,
+    rows: u32,
+    columns: u32,
+    chunks: u32,
+) -> Option<ReferenceIdentityFill> {
+    if capture_str(fill_caps, "callback")? != callback_name
+        || capture_str(fill_caps, "table")? != table_name
+        || capture_str(fill_caps, "table2")? != table_name
+    {
+        return None;
+    }
+    let t_name = capture_str(fill_caps, "t")?;
+    let n_name = capture_str(fill_caps, "n")?;
+    let column_name = capture_str(fill_caps, "column")?;
+    let row_name = capture_str(fill_caps, "row")?;
+    if capture_str(fill_caps, "t2")? != t_name
+        || capture_str(fill_caps, "t3")? != t_name
+        || capture_str(fill_caps, "n2")? != n_name
+        || capture_str(fill_caps, "column2")? != column_name
+        || capture_str(fill_caps, "column3")? != column_name
+        || capture_str(fill_caps, "column4")? != column_name
+        || capture_str(fill_caps, "column5")? != column_name
+        || capture_str(fill_caps, "row2")? != row_name
+        || capture_str(fill_caps, "row3")? != row_name
+        || capture_str(fill_caps, "row4")? != row_name
+        || capture_str(fill_caps, "row5")? != row_name
+    {
+        return None;
+    }
+
+    let chunk = capture_u32(fill_caps, "chunk")?;
+    if chunk == 0
+        || capture_u32(fill_caps, "chunk2")? != chunk
+        || capture_u32(fill_caps, "columns")? != columns
+        || capture_u32(fill_caps, "rows")? != rows
+        || capture_u32(fill_caps, "mask")? != rows
+        || chunks.checked_mul(chunk) != Some(columns)
+    {
+        return None;
+    }
+
+    Some(ReferenceIdentityFill {
+        column_multiplier: capture_u32(fill_caps, "a")?,
+        row_multiplier: capture_u32(fill_caps, "b")?,
+        salt_left: capture_u32(fill_caps, "c")?,
+        salt_right: capture_u32(fill_caps, "k")?,
+    })
+}
+
+fn parse_reference_identity_shape(
+    source: &str,
+    patterns: &ReferenceIdentityPatterns,
+    row_caps: &regex::Captures<'_>,
+) -> Option<ReferenceIdentityShape> {
+    let row_match = row_caps.get(0)?;
+    let table_name = capture_str(row_caps, "table")?;
+    let row_index = capture_str(row_caps, "idx")?;
+    if capture_str(row_caps, "test")? != row_index
+        || capture_str(row_caps, "update")? != row_index
+        || capture_str(row_caps, "idx2")? != row_index
+        || capture_str(row_caps, "table2")? != table_name
+    {
+        return None;
+    }
+    let rows = capture_u32(row_caps, "rows")?;
+    let columns = capture_u32(row_caps, "columns")?;
+    if rows < 2 || columns < 2 || !rows.is_power_of_two() {
+        return None;
+    }
+
+    let window_start = row_match.start().saturating_sub(256);
+    let window_end = (row_match.end() + 1800).min(source.len());
+    let window = source.get(window_start..window_end)?;
+
+    let timer_caps = patterns.timer.captures(window)?;
+    if capture_str(&timer_caps, "arg")? != capture_str(&timer_caps, "arg2")? {
+        return None;
+    }
+    let timer_name = capture_str(&timer_caps, "timer")?;
+
+    let outer_caps = patterns.outer.captures(window)?;
+    let outer_loop = capture_str(&outer_caps, "loop")?;
+    if capture_str(&outer_caps, "test")? != outer_loop
+        || capture_str(&outer_caps, "update")? != outer_loop
+        || capture_str(&outer_caps, "timer")? != timer_name
+    {
+        return None;
+    }
+    let callback_name = capture_str(&outer_caps, "callback")?;
+    let chunks = capture_u32(&outer_caps, "chunks")?;
+
+    let fill_caps = patterns.fill.captures(window)?;
+    let fill = parse_reference_identity_fill(
+        &fill_caps,
+        callback_name,
+        table_name,
+        rows,
+        columns,
+        chunks,
+    )?;
+
+    let root_caps = patterns.root.captures(window)?;
+    if capture_str(&root_caps, "timer")? != timer_name
+        || capture_str(&root_caps, "table")? != table_name
+    {
+        return None;
+    }
+    let root_row = capture_u32(&root_caps, "root")?;
+    if root_row >= rows {
+        return None;
+    }
+
+    let construction_start = window_start
+        + timer_caps
+            .get(0)?
+            .start()
+            .min(row_match.start() - window_start);
+    let construction_end = window_start + root_caps.get(0)?.end();
+    Some(ReferenceIdentityShape {
+        table_name: table_name.to_string(),
+        target_name: capture_str(&root_caps, "target")?.to_string(),
+        rows,
+        columns,
+        root_row,
+        column_multiplier: fill.column_multiplier,
+        row_multiplier: fill.row_multiplier,
+        salt_left: fill.salt_left,
+        salt_right: fill.salt_right,
+        window_start,
+        window_end,
+        construction_start,
+        construction_end,
+    })
+}
+
+fn prove_reference_identity_shape(
+    shape: ReferenceIdentityShape,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> Option<(SymbolId, ReferenceIdentityTable)> {
+    let absolute_start = shape.window_start as u32;
+    let absolute_end = shape.window_end as u32;
+    let construction_end = shape.construction_end as u32;
+    let target_symbol =
+        unique_symbol_named_near(scoping, &shape.target_name, absolute_start, absolute_end)?;
+    let table_symbol =
+        unique_symbol_named_near(scoping, &shape.table_name, absolute_start, absolute_end)?;
+    if scoping
+        .get_resolved_reference_ids(table_symbol)
+        .iter()
+        .any(|reference_id| {
+            reference_spans
+                .get(reference_id)
+                .is_none_or(|span| span.start < absolute_start || span.end > construction_end)
+        })
+    {
+        return None;
+    }
+    let target_writes = scoping
+        .get_resolved_reference_ids(target_symbol)
+        .iter()
+        .filter(|reference_id| scoping.get_reference(**reference_id).is_write())
+        .count();
+    if target_writes != 1 {
+        return None;
+    }
+
+    let descriptor = ReferenceIdentityTable {
+        rows: shape.rows,
+        columns: shape.columns,
+        root_row: shape.root_row,
+        column_multiplier: shape.column_multiplier,
+        row_multiplier: shape.row_multiplier,
+        salt_left: shape.salt_left,
+        salt_right: shape.salt_right,
+        construction_start: shape.construction_start,
+        construction_end: shape.construction_end,
+    };
+    let valid = (0..descriptor.rows)
+        .all(|row| (0..descriptor.columns).all(|column| descriptor.row_for(row, column).is_some()));
+    valid.then_some((target_symbol, descriptor))
+}
+
 pub fn detect_reference_identity_tables(
     source: &str,
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> HashMap<SymbolId, ReferenceIdentityTable> {
-    let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
-    let ws = r"\s*";
-    let Some(row_re) = regex::Regex::new(&format!(
-        r"(?P<table>{identifier}){ws}={ws}\[\]{ws},{ws}(?P<idx>{identifier}){ws}={ws}0{ws};{ws}(?P<test>{identifier}){ws}<{ws}(?P<rows>\d+){ws};{ws}(?P<update>{identifier}){ws}\+\+{ws}\){ws}(?P<table2>{identifier}){ws}\[{ws}(?P<idx2>{identifier}){ws}\]{ws}={ws}new{ws}Array{ws}\({ws}(?P<columns>\d+){ws}\)"
-    )).ok() else {
+    let Some(patterns) = reference_identity_patterns() else {
         return HashMap::new();
     };
-    let Some(timer_re) = regex::Regex::new(&format!(
-        r"(?P<timer>{identifier}){ws}={ws}function{ws}\({ws}(?P<arg>{identifier}){ws}\){ws}\{{{ws}setTimeout{ws}\({ws}(?P<arg2>{identifier}){ws},{ws}0{ws}\){ws};?{ws}\}}"
-    )).ok() else {
-        return HashMap::new();
-    };
-    let Some(outer_re) = regex::Regex::new(&format!(
-        r"for{ws}\({ws}var\s+(?P<loop>{identifier}){ws}={ws}0{ws};{ws}(?P<test>{identifier}){ws}<{ws}(?P<chunks>\d+){ws};{ws}(?P<update>{identifier}){ws}\+\+{ws}\){ws}\({ws}\(?{ws}(?P<callback>{identifier}){ws}\)?{ws}=>{ws}\{{{ws}(?P<timer>{identifier}){ws}\({ws}function{ws}\({ws}\){ws}\{{"
-    )).ok() else {
-        return HashMap::new();
-    };
-    let Some(fill_re) = regex::Regex::new(&format!(
-        r"for{ws}\({ws}var\s+(?P<t>{identifier}){ws}={ws}(?P<chunk>\d+){ws}\*{ws}(?P<callback>{identifier}){ws},{ws}(?P<n>{identifier}){ws}={ws}Math{ws}\.{ws}min{ws}\({ws}(?P<t2>{identifier}){ws}\+{ws}(?P<chunk2>\d+){ws},{ws}(?P<columns>\d+){ws}\){ws},{ws}(?P<column>{identifier}){ws}={ws}(?P<t3>{identifier}){ws};{ws}(?P<column2>{identifier}){ws}<{ws}(?P<n2>{identifier}){ws};{ws}(?P<column3>{identifier}){ws}\+\+{ws}\){ws}for{ws}\({ws}(?P<row>{identifier}){ws}={ws}0{ws};{ws}(?P<row2>{identifier}){ws}<{ws}(?P<rows>\d+){ws};{ws}(?P<row3>{identifier}){ws}\+\+{ws}\){ws}(?P<table>{identifier}){ws}\[{ws}(?P<row4>{identifier}){ws}\]{ws}\[{ws}(?P<column4>{identifier}){ws}\]{ws}={ws}(?P<table2>{identifier}){ws}\[{ws}\({ws}(?P<a>\d+){ws}\*{ws}(?P<column5>{identifier}){ws}\^{ws}(?P<b>\d+){ws}\*{ws}(?P<row5>{identifier}){ws}\^{ws}(?P<c>\d+){ws}\*{ws}(?P<k>\d+){ws}\){ws}>>>{ws}0{ws}&{ws}(?P<mask>\d+){ws}-{ws}1{ws}\]"
-    )).ok() else {
-        return HashMap::new();
-    };
-    let Some(root_re) = regex::Regex::new(&format!(
-        r"(?P<timer>{identifier}){ws}\({ws}function{ws}\({ws}\){ws}\{{{ws}(?P<target>{identifier}){ws}={ws}(?P<table>{identifier}){ws}\[{ws}(?P<root>\d+){ws}\]{ws};?{ws}\}}{ws}\)"
-    )).ok() else {
-        return HashMap::new();
-    };
-
-    macro_rules! capture {
-        ($captures:expr, $name:literal) => {
-            match $captures.name($name) {
-                Some(capture) => capture.as_str(),
-                None => continue,
-            }
-        };
-    }
-    macro_rules! capture_match {
-        ($captures:expr, $index:expr) => {
-            match $captures.get($index) {
-                Some(capture) => capture,
-                None => continue,
-            }
-        };
-    }
-
-    let mut out = HashMap::new();
-    for row_caps in row_re.captures_iter(source) {
-        let row_match = capture_match!(row_caps, 0);
-        let table_name = capture!(row_caps, "table");
-        let row_index = capture!(row_caps, "idx");
-        if capture!(row_caps, "test") != row_index
-            || capture!(row_caps, "update") != row_index
-            || capture!(row_caps, "idx2") != row_index
-            || capture!(row_caps, "table2") != table_name
-        {
-            continue;
-        }
-        let Ok(rows) = capture!(row_caps, "rows").parse::<u32>() else {
-            continue;
-        };
-        let Ok(columns) = capture!(row_caps, "columns").parse::<u32>() else {
-            continue;
-        };
-        if rows < 2 || columns < 2 || !rows.is_power_of_two() {
-            continue;
-        }
-
-        let window_start = row_match.start().saturating_sub(256);
-        let window_end = (row_match.end() + 1800).min(source.len());
-        let window = &source[window_start..window_end];
-
-        let Some(timer_caps) = timer_re.captures(window) else {
-            continue;
-        };
-        if capture!(timer_caps, "arg") != capture!(timer_caps, "arg2") {
-            continue;
-        }
-        let timer_name = capture!(timer_caps, "timer");
-
-        let Some(outer_caps) = outer_re.captures(window) else {
-            continue;
-        };
-        let outer_loop = capture!(outer_caps, "loop");
-        if capture!(outer_caps, "test") != outer_loop
-            || capture!(outer_caps, "update") != outer_loop
-            || capture!(outer_caps, "timer") != timer_name
-        {
-            continue;
-        }
-        let callback_name = capture!(outer_caps, "callback");
-        let Ok(chunks) = capture!(outer_caps, "chunks").parse::<u32>() else {
-            continue;
-        };
-
-        let Some(fill_caps) = fill_re.captures(window) else {
-            continue;
-        };
-        if capture!(fill_caps, "callback") != callback_name
-            || capture!(fill_caps, "table") != table_name
-            || capture!(fill_caps, "table2") != table_name
-        {
-            continue;
-        }
-        let t_name = capture!(fill_caps, "t");
-        let n_name = capture!(fill_caps, "n");
-        let column_name = capture!(fill_caps, "column");
-        let row_name = capture!(fill_caps, "row");
-        if capture!(fill_caps, "t2") != t_name
-            || capture!(fill_caps, "t3") != t_name
-            || capture!(fill_caps, "n2") != n_name
-            || capture!(fill_caps, "column2") != column_name
-            || capture!(fill_caps, "column3") != column_name
-            || capture!(fill_caps, "column4") != column_name
-            || capture!(fill_caps, "column5") != column_name
-            || capture!(fill_caps, "row2") != row_name
-            || capture!(fill_caps, "row3") != row_name
-            || capture!(fill_caps, "row4") != row_name
-            || capture!(fill_caps, "row5") != row_name
-        {
-            continue;
-        }
-
-        let Ok(chunk) = capture!(fill_caps, "chunk").parse::<u32>() else {
-            continue;
-        };
-        let Ok(chunk2) = capture!(fill_caps, "chunk2").parse::<u32>() else {
-            continue;
-        };
-        let Ok(fill_columns) = capture!(fill_caps, "columns").parse::<u32>() else {
-            continue;
-        };
-        let Ok(fill_rows) = capture!(fill_caps, "rows").parse::<u32>() else {
-            continue;
-        };
-        let Ok(mask) = capture!(fill_caps, "mask").parse::<u32>() else {
-            continue;
-        };
-        if chunk == 0
-            || chunk != chunk2
-            || fill_columns != columns
-            || fill_rows != rows
-            || mask != rows
-            || chunks.checked_mul(chunk) != Some(columns)
-        {
-            continue;
-        }
-
-        let Some(root_caps) = root_re.captures(window) else {
-            continue;
-        };
-        if capture!(root_caps, "timer") != timer_name || capture!(root_caps, "table") != table_name
-        {
-            continue;
-        }
-        let target_name = capture!(root_caps, "target");
-        let Ok(root_row) = capture!(root_caps, "root").parse::<u32>() else {
-            continue;
-        };
-        if root_row >= rows {
-            continue;
-        }
-
-        let absolute_start = window_start as u32;
-        let absolute_end = window_end as u32;
-        let Some(target_symbol) =
-            unique_symbol_named_near(scoping, target_name, absolute_start, absolute_end)
-        else {
-            continue;
-        };
-        let Some(table_symbol) =
-            unique_symbol_named_near(scoping, table_name, absolute_start, absolute_end)
-        else {
-            continue;
-        };
-
-        let construction_end = (window_start + capture_match!(root_caps, 0).end()) as u32;
-        if scoping
-            .get_resolved_reference_ids(table_symbol)
-            .iter()
-            .any(|reference_id| {
-                reference_spans
-                    .get(reference_id)
-                    .is_none_or(|span| span.start < absolute_start || span.end > construction_end)
-            })
-        {
-            continue;
-        }
-        let target_writes = scoping
-            .get_resolved_reference_ids(target_symbol)
-            .iter()
-            .filter(|reference_id| scoping.get_reference(**reference_id).is_write())
-            .count();
-        if target_writes != 1 {
-            continue;
-        }
-
-        let parse_capture = |name: &str| {
-            fill_caps
-                .name(name)
-                .and_then(|capture| capture.as_str().parse::<u32>().ok())
-        };
-        let (Some(column_multiplier), Some(row_multiplier), Some(salt_left), Some(salt_right)) = (
-            parse_capture("a"),
-            parse_capture("b"),
-            parse_capture("c"),
-            parse_capture("k"),
-        ) else {
-            continue;
-        };
-
-        let construction_start = window_start
-            + capture_match!(timer_caps, 0)
-                .start()
-                .min(row_match.start() - window_start);
-        let descriptor = ReferenceIdentityTable {
-            rows,
-            columns,
-            root_row,
-            column_multiplier,
-            row_multiplier,
-            salt_left,
-            salt_right,
-            construction_start,
-            construction_end: construction_end as usize,
-        };
-        let valid = (0..rows)
-            .all(|row| (0..columns).all(|column| descriptor.row_for(row, column).is_some()));
-        if valid {
-            out.insert(target_symbol, descriptor);
-        }
-    }
-    out
+    patterns
+        .row
+        .captures_iter(source)
+        .filter_map(|row_caps| parse_reference_identity_shape(source, &patterns, &row_caps))
+        .filter_map(|shape| prove_reference_identity_shape(shape, scoping, reference_spans))
+        .collect()
 }
 
 pub fn reference_identity(
