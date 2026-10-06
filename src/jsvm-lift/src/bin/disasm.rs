@@ -282,176 +282,207 @@ fn safe_name(decoder: &str) -> String {
         .collect()
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    fs::create_dir_all(&args.output_dir)
-        .with_context(|| format!("creating {}", args.output_dir.display()))?;
-
-    let scans = read_scan_jsonl(&args.scan)?;
-    let normalized: Vec<NormalizedVm> = serde_json::from_str(
-        &fs::read_to_string(&args.normalized)
-            .with_context(|| format!("reading {}", args.normalized.display()))?,
-    )?;
-    let normalized_by_decoder: HashMap<_, _> = normalized
-        .into_iter()
-        .map(|x| (x.decoder.clone(), x))
+fn resolve_fields(builder: &PushBuilder, aliases: &BTreeSet<String>) -> (Vec<Field>, usize, usize) {
+    let unknowns: HashMap<_, _> = builder
+        .unknowns
+        .iter()
+        .map(|unknown| (unknown.index, unknown.preview.as_str()))
         .collect();
-
-    let mut all = Vec::new();
-
-    for report in scans {
-        let source = fs::read_to_string(&report.file)
-            .with_context(|| format!("reading source {}", report.file))?;
-        let aliases = parse_int_aliases(&source);
-        let builders: HashMap<_, _> = report.push_builders.iter().map(|b| (b.start, b)).collect();
-
-        for decoder in &report.decoder_candidates {
-            if decoder.builder_var.is_none() {
-                continue;
-            }
-            if let Some(wanted) = args.decoder.as_ref() {
-                if &decoder.function_id != wanted {
-                    continue;
+    let mut resolved_symbolic = 0;
+    let mut unresolved = 0;
+    let fields = builder
+        .values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if let Some(value) = value {
+                Field::Known(*value)
+            } else if let Some(preview) = unknowns.get(&index) {
+                if let Some(value) = resolve_parse_int(preview, aliases) {
+                    resolved_symbolic += 1;
+                    Field::Known(value)
+                } else {
+                    unresolved += 1;
+                    Field::Symbolic((*preview).to_string())
                 }
+            } else {
+                unresolved += 1;
+                Field::Missing
             }
-            let Some(vm) = normalized_by_decoder.get(&decoder.function_id) else {
-                continue;
+        })
+        .collect();
+    (fields, resolved_symbolic, unresolved)
+}
+
+fn build_instructions(fields: &[Field], width: usize, vm: &NormalizedVm) -> Vec<Instruction> {
+    let semantics: HashMap<_, _> = vm
+        .opcodes
+        .iter()
+        .map(|opcode| (opcode.opcode, opcode.paths.clone()))
+        .collect();
+    (0..fields.len() / width)
+        .map(|index| {
+            let pc = index * width;
+            let opcode = fields.get(pc).cloned().unwrap_or(Field::Missing);
+            let operands = (1..width)
+                .map(|offset| fields.get(pc + offset).cloned().unwrap_or(Field::Missing))
+                .collect::<Vec<_>>();
+            let semantic_paths = match opcode {
+                Field::Known(value) => semantics.get(&value).cloned().unwrap_or_default(),
+                _ => Vec::new(),
             };
-            let Some(builder_start) = decoder.builder_start else {
-                continue;
-            };
-            let Some(builder) = builders.get(&builder_start) else {
-                continue;
-            };
-            let width = decoder.width as usize;
-            if width == 0 {
-                continue;
+            Instruction {
+                index,
+                pc,
+                opcode,
+                operands,
+                semantics: semantic_paths,
             }
+        })
+        .collect()
+}
 
-            let unknowns: HashMap<_, _> = builder
-                .unknowns
-                .iter()
-                .map(|u| (u.index, u.preview.as_str()))
-                .collect();
-            let semantics: HashMap<_, _> = vm
-                .opcodes
-                .iter()
-                .map(|op| (op.opcode, op.paths.clone()))
-                .collect();
-
-            let mut resolved_symbolic_fields = 0usize;
-            let mut unresolved_fields = 0usize;
-            let mut fields = Vec::with_capacity(builder.values.len());
-            for (index, value) in builder.values.iter().enumerate() {
-                let field = if let Some(v) = value {
-                    Field::Known(*v)
-                } else if let Some(preview) = unknowns.get(&index) {
-                    if let Some(v) = resolve_parse_int(preview, &aliases) {
-                        resolved_symbolic_fields += 1;
-                        Field::Known(v)
-                    } else {
-                        unresolved_fields += 1;
-                        Field::Symbolic((*preview).to_string())
-                    }
-                } else {
-                    unresolved_fields += 1;
-                    Field::Missing
-                };
-                fields.push(field);
-            }
-
-            let count = fields.len() / width;
-            let mut instructions = Vec::with_capacity(count);
-            for index in 0..count {
-                let pc = index * width;
-                let opcode = fields.get(pc).cloned().unwrap_or(Field::Missing);
-                let operands = (1..width)
-                    .map(|off| fields.get(pc + off).cloned().unwrap_or(Field::Missing))
-                    .collect::<Vec<_>>();
-                let op_number = if let Field::Known(v) = opcode {
-                    Some(v)
-                } else {
-                    None
-                };
-                let semantic_paths = op_number
-                    .and_then(|v| semantics.get(&v).cloned())
-                    .unwrap_or_default();
-
-                instructions.push(Instruction {
-                    index,
-                    pc,
-                    opcode,
-                    operands,
-                    semantics: semantic_paths,
-                });
-            }
-
-            let disasm = Disassembly {
-                file: report.file.clone(),
-                decoder: decoder.function_id.clone(),
-                parent: vm.parent.clone(),
-                builder_var: decoder.builder_var.clone().unwrap_or_default(),
-                builder_span: [builder.start, builder.end],
-                width,
-                ip_var: decoder.ip.clone(),
-                operand_vars: decoder.operand_vars.clone(),
-                role_bindings: vm.role_bindings.clone(),
-                arguments: builder.arguments,
-                resolved_symbolic_fields,
-                unresolved_fields,
-                instructions,
-            };
-
-            let text_path = args
-                .output_dir
-                .join(format!("{}.txt", safe_name(&decoder.function_id)));
-            let mut text = String::new();
-            text.push_str(&format!(
-                "# {}\n# source: {}\n# width: {}  instructions: {}  resolved-symbolic: {}  unresolved: {}\n# builder: {} @ {}..{}\n\n",
-                decoder.function_id,
-                report.file,
-                width,
-                disasm.instructions.len(),
-                resolved_symbolic_fields,
-                unresolved_fields,
-                disasm.builder_var,
-                builder.start,
-                builder.end
-            ));
-            for insn in &disasm.instructions {
-                let mut words = vec![field_text(&insn.opcode)];
-                words.extend(insn.operands.iter().map(field_text));
-                let semantic = compact_semantics(&insn.semantics);
-                let clipped: String = semantic.chars().take(500).collect();
-                text.push_str(&format!(
-                    "{:04} pc={:04}  {:<32} | {}\n",
-                    insn.index,
-                    insn.pc,
-                    words.join(" "),
-                    clipped
-                ));
-            }
-            fs::write(&text_path, text)
-                .with_context(|| format!("writing {}", text_path.display()))?;
-            all.push(disasm);
-        }
+fn build_disassembly(
+    report: &ScanReport,
+    decoder: &DecoderCandidate,
+    builder: &PushBuilder,
+    vm: &NormalizedVm,
+    aliases: &BTreeSet<String>,
+) -> Option<Disassembly> {
+    let width = decoder.width as usize;
+    if width == 0 {
+        return None;
     }
+    let (fields, resolved_symbolic_fields, unresolved_fields) = resolve_fields(builder, aliases);
+    Some(Disassembly {
+        file: report.file.clone(),
+        decoder: decoder.function_id.clone(),
+        parent: vm.parent.clone(),
+        builder_var: decoder.builder_var.clone().unwrap_or_default(),
+        builder_span: [builder.start, builder.end],
+        width,
+        ip_var: decoder.ip.clone(),
+        operand_vars: decoder.operand_vars.clone(),
+        role_bindings: vm.role_bindings.clone(),
+        arguments: builder.arguments,
+        resolved_symbolic_fields,
+        unresolved_fields,
+        instructions: build_instructions(&fields, width, vm),
+    })
+}
 
-    let json_path = args.output_dir.join("disassembly.json");
-    fs::write(&json_path, serde_json::to_string_pretty(&all)?)
-        .with_context(|| format!("writing {}", json_path.display()))?;
+fn render_disassembly(disasm: &Disassembly) -> String {
+    let mut text = format!(
+        "# {}\n# source: {}\n# width: {}  instructions: {}  resolved-symbolic: {}  unresolved: {}\n# builder: {} @ {}..{}\n\n",
+        disasm.decoder,
+        disasm.file,
+        disasm.width,
+        disasm.instructions.len(),
+        disasm.resolved_symbolic_fields,
+        disasm.unresolved_fields,
+        disasm.builder_var,
+        disasm.builder_span[0],
+        disasm.builder_span[1]
+    );
+    for instruction in &disasm.instructions {
+        let mut words = vec![field_text(&instruction.opcode)];
+        words.extend(instruction.operands.iter().map(field_text));
+        let semantic = compact_semantics(&instruction.semantics);
+        let clipped: String = semantic.chars().take(500).collect();
+        text.push_str(&format!(
+            "{:04} pc={:04}  {:<32} | {}\n",
+            instruction.index,
+            instruction.pc,
+            words.join(" "),
+            clipped
+        ));
+    }
+    text
+}
 
-    let instructions: usize = all.iter().map(|x| x.instructions.len()).sum();
-    let unresolved: usize = all.iter().map(|x| x.unresolved_fields).sum();
-    let resolved: usize = all.iter().map(|x| x.resolved_symbolic_fields).sum();
+fn disassemble_report(
+    report: &ScanReport,
+    normalized_by_decoder: &HashMap<String, NormalizedVm>,
+    output_dir: &Path,
+    wanted: Option<&str>,
+) -> Result<Vec<Disassembly>> {
+    let source = fs::read_to_string(&report.file)
+        .with_context(|| format!("reading source {}", report.file))?;
+    let aliases = parse_int_aliases(&source);
+    let builders: HashMap<_, _> = report
+        .push_builders
+        .iter()
+        .map(|builder| (builder.start, builder))
+        .collect();
+    let mut output = Vec::new();
+    for decoder in &report.decoder_candidates {
+        if decoder.builder_var.is_none()
+            || wanted.is_some_and(|wanted| decoder.function_id != wanted)
+        {
+            continue;
+        }
+        let Some(vm) = normalized_by_decoder.get(&decoder.function_id) else {
+            continue;
+        };
+        let Some(builder) = decoder
+            .builder_start
+            .and_then(|start| builders.get(&start).copied())
+        else {
+            continue;
+        };
+        let Some(disasm) = build_disassembly(report, decoder, builder, vm, &aliases) else {
+            continue;
+        };
+        let text_path = output_dir.join(format!("{}.txt", safe_name(&decoder.function_id)));
+        fs::write(&text_path, render_disassembly(&disasm))
+            .with_context(|| format!("writing {}", text_path.display()))?;
+        output.push(disasm);
+    }
+    Ok(output)
+}
+
+fn print_summary(all: &[Disassembly], output_dir: &Path) {
+    let instructions: usize = all.iter().map(|disasm| disasm.instructions.len()).sum();
+    let unresolved: usize = all.iter().map(|disasm| disasm.unresolved_fields).sum();
+    let resolved: usize = all
+        .iter()
+        .map(|disasm| disasm.resolved_symbolic_fields)
+        .sum();
     println!(
         "disassembled {} VMs / {} instructions; resolved {} symbolic fields, {} unresolved -> {}",
         all.len(),
         instructions,
         resolved,
         unresolved,
-        args.output_dir.display()
+        output_dir.display()
     );
+}
 
+fn main() -> Result<()> {
+    let args = Args::parse();
+    fs::create_dir_all(&args.output_dir)
+        .with_context(|| format!("creating {}", args.output_dir.display()))?;
+    let scans = read_scan_jsonl(&args.scan)?;
+    let normalized: Vec<NormalizedVm> = serde_json::from_str(
+        &fs::read_to_string(&args.normalized)
+            .with_context(|| format!("reading {}", args.normalized.display()))?,
+    )?;
+    let normalized_by_decoder = normalized
+        .into_iter()
+        .map(|vm| (vm.decoder.clone(), vm))
+        .collect::<HashMap<_, _>>();
+    let mut all = Vec::new();
+    for report in &scans {
+        all.extend(disassemble_report(
+            report,
+            &normalized_by_decoder,
+            &args.output_dir,
+            args.decoder.as_deref(),
+        )?);
+    }
+    let json_path = args.output_dir.join("disassembly.json");
+    fs::write(&json_path, serde_json::to_string_pretty(&all)?)
+        .with_context(|| format!("writing {}", json_path.display()))?;
+    print_summary(&all, &args.output_dir);
     Ok(())
 }
