@@ -6,7 +6,7 @@ use oxc_span::{GetSpan, SourceType};
 use rolldown_redox::ecmascript::parse_program;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     path::PathBuf,
 };
@@ -605,140 +605,139 @@ fn fnv1a64(data: &[u8]) -> u64 {
     h
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let source = fs::read_to_string(&args.source)
-        .with_context(|| format!("reading {}", args.source.display()))?;
-    let report: ScanReport = serde_json::from_str(
-        fs::read_to_string(&args.scan)
-            .with_context(|| format!("reading {}", args.scan.display()))?
-            .trim(),
-    )
-    .with_context(|| format!("parsing {}", args.scan.display()))?;
-
-    let transducers: HashMap<_, _> = report
-        .byte_transducers
+fn matching_table<'a>(report: &'a ScanReport, vm: &TableVm) -> Option<&'a HandlerTable> {
+    report
+        .handler_function_tables
         .iter()
-        .map(|t| (t.function_id.as_str(), t))
-        .collect();
+        .filter(|table| {
+            table.binding == vm.handler_table && table.function_values == vm.handler_count
+        })
+        .min_by_key(|table| table.end.saturating_sub(table.start))
+}
 
-    let mut seen_tables = HashSet::new();
-    let mut vms = Vec::new();
-
-    for vm in &report.table_vms {
-        let table_key = (
-            vm.handler_table.clone(),
-            vm.handler_count,
-            vm.linked_transducer_function_id.clone(),
-        );
-        if !seen_tables.insert(table_key) {
-            continue;
-        }
-
-        let Some(table) = report
-            .handler_function_tables
-            .iter()
-            .filter(|t| t.binding == vm.handler_table && t.function_values == vm.handler_count)
-            .min_by_key(|t| t.end.saturating_sub(t.start))
-        else {
-            continue;
-        };
-
-        let linked = vm
-            .linked_transducer_function_id
-            .as_deref()
-            .and_then(|id| transducers.get(id).copied());
-        let byte_stream = linked.map(|t| t.byte_stream.as_str());
-
-        let mut raw_handlers = Vec::new();
-        let mut raw_for_stats = Vec::new();
-        for slot in &table.handlers {
+fn lift_handlers(
+    source: &str,
+    table: &HandlerTable,
+    roles: &BTreeMap<String, String>,
+    methods: &BTreeMap<String, String>,
+    byte_stream: Option<&str>,
+) -> Vec<HandlerIr> {
+    table
+        .handlers
+        .iter()
+        .filter_map(|slot| {
             let start = slot.start as usize;
             let end = (slot.end as usize).min(source.len());
-            let Some(raw) = source.get(start..end) else {
-                continue;
-            };
-            let param = first_param(raw);
-            if let Some(p) = param.as_ref() {
-                raw_for_stats.push((raw.to_string(), p.clone()));
-            }
-            raw_handlers.push((slot, raw.to_string(), param));
-        }
-
-        let property_stats = collect_property_stats(&raw_for_stats, byte_stream);
-        let roles = infer_roles(&property_stats, linked);
-        let methods = infer_method_bindings(
-            &property_stats,
-            &roles,
-            vm.producer_method.as_deref(),
-            linked.is_some(),
-        );
-
-        let mut handlers = Vec::new();
-        for (slot, raw, param) in raw_handlers {
-            let mut statements = Vec::new();
+            let raw = source.get(start..end)?;
+            let parameter = first_param(raw);
             let mut signature = Vec::new();
-            for stmt in body_statements(&raw) {
-                let normalized =
-                    normalize_statement(&stmt, param.as_deref(), &roles, &methods, byte_stream);
-                let ir = classify_effect(&normalized);
-                signature.push(format!("{}:{}", ir.kind, ir.shape_hash));
-                statements.push(HandlerStatementIr {
-                    source: stmt,
-                    normalized,
-                    ir,
-                });
-            }
-            let semantic_hash = format!("{:016x}", fnv1a64(signature.join("|").as_bytes()));
-            handlers.push(HandlerIr {
+            let statements = body_statements(raw)
+                .into_iter()
+                .map(|statement| {
+                    let normalized = normalize_statement(
+                        &statement,
+                        parameter.as_deref(),
+                        roles,
+                        methods,
+                        byte_stream,
+                    );
+                    let ir = classify_effect(&normalized);
+                    signature.push(format!("{}:{}", ir.kind, ir.shape_hash));
+                    HandlerStatementIr {
+                        source: statement,
+                        normalized,
+                        ir,
+                    }
+                })
+                .collect::<Vec<_>>();
+            Some(HandlerIr {
                 key: slot.key.clone(),
                 start: slot.start,
                 end: slot.end,
-                parameter: param,
-                semantic_hash,
-                op_kinds: statements.iter().map(|s| s.ir.kind.clone()).collect(),
+                parameter,
+                semantic_hash: format!("{:016x}", fnv1a64(signature.join("|").as_bytes())),
+                op_kinds: statements
+                    .iter()
+                    .map(|statement| statement.ir.kind.clone())
+                    .collect(),
                 statements,
-            });
-        }
+            })
+        })
+        .collect()
+}
 
-        vms.push(TableVmIr {
-            dispatcher_function_id: vm.dispatcher_function_id.clone(),
-            handler_table: vm.handler_table.clone(),
-            handler_count: vm.handler_count,
-            architecture: vm.architecture.clone(),
-            producer_method: vm.producer_method.clone(),
-            linked_transducer: linked.cloned(),
-            role_bindings: roles,
-            method_bindings: methods,
-            property_stats,
-            handlers,
-        });
-    }
+fn lift_table_vm(source: &str, report: &ScanReport, vm: &TableVm) -> Option<TableVmIr> {
+    let table = matching_table(report, vm)?;
+    let linked = vm.linked_transducer_function_id.as_deref().and_then(|id| {
+        report
+            .byte_transducers
+            .iter()
+            .find(|transducer| transducer.function_id == id)
+    });
+    let byte_stream = linked.map(|transducer| transducer.byte_stream.as_str());
 
-    let output = Output {
-        schema: "jsvm-table-ir/v0",
-        source: args.source.display().to_string(),
-        vms,
-    };
-    fs::write(
-        &args.output,
-        format!("{}\n", serde_json::to_string_pretty(&output)?),
-    )
-    .with_context(|| format!("writing {}", args.output.display()))?;
+    let raw_for_stats = table
+        .handlers
+        .iter()
+        .filter_map(|slot| {
+            let raw = source.get(slot.start as usize..(slot.end as usize).min(source.len()))?;
+            first_param(raw).map(|parameter| (raw.to_string(), parameter))
+        })
+        .collect::<Vec<_>>();
+    let property_stats = collect_property_stats(&raw_for_stats, byte_stream);
+    let roles = infer_roles(&property_stats, linked);
+    let methods = infer_method_bindings(
+        &property_stats,
+        &roles,
+        vm.producer_method.as_deref(),
+        linked.is_some(),
+    );
+    let handlers = lift_handlers(source, table, &roles, &methods, byte_stream);
 
-    let handler_count: usize = output.vms.iter().map(|v| v.handlers.len()).sum();
+    Some(TableVmIr {
+        dispatcher_function_id: vm.dispatcher_function_id.clone(),
+        handler_table: vm.handler_table.clone(),
+        handler_count: vm.handler_count,
+        architecture: vm.architecture.clone(),
+        producer_method: vm.producer_method.clone(),
+        linked_transducer: linked.cloned(),
+        role_bindings: roles,
+        method_bindings: methods,
+        property_stats,
+        handlers,
+    })
+}
+
+fn lift_table_vms(source: &str, report: &ScanReport) -> Vec<TableVmIr> {
+    let mut seen = HashSet::new();
+    report
+        .table_vms
+        .iter()
+        .filter(|vm| {
+            seen.insert((
+                vm.handler_table.clone(),
+                vm.handler_count,
+                vm.linked_transducer_function_id.clone(),
+            ))
+        })
+        .filter_map(|vm| lift_table_vm(source, report, vm))
+        .collect()
+}
+
+fn print_summary(output: &Output, output_path: &std::path::Path) {
+    let handler_count: usize = output.vms.iter().map(|vm| vm.handlers.len()).sum();
     let statement_count: usize = output
         .vms
         .iter()
-        .flat_map(|v| &v.handlers)
-        .map(|h| h.statements.len())
+        .flat_map(|vm| &vm.handlers)
+        .map(|handler| handler.statements.len())
         .sum();
-    let raw_count: usize = output
+    let raw_count = output
         .vms
         .iter()
-        .flat_map(|v| &v.handlers)
-        .flat_map(|h| &h.statements)
-        .filter(|s| matches!(s.ir.kind.as_str(), "raw_js" | "raw_expression"))
+        .flat_map(|vm| &vm.handlers)
+        .flat_map(|handler| &handler.statements)
+        .filter(|statement| matches!(statement.ir.kind.as_str(), "raw_js" | "raw_expression"))
         .count();
     println!(
         "table IR VMs {} handlers {} statements {} classified {} raw {}",
@@ -757,6 +756,29 @@ fn main() -> Result<()> {
             vm.method_bindings
         );
     }
-    println!("wrote {}", args.output.display());
+    println!("wrote {}", output_path.display());
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let source = fs::read_to_string(&args.source)
+        .with_context(|| format!("reading {}", args.source.display()))?;
+    let report: ScanReport = serde_json::from_str(
+        fs::read_to_string(&args.scan)
+            .with_context(|| format!("reading {}", args.scan.display()))?
+            .trim(),
+    )
+    .with_context(|| format!("parsing {}", args.scan.display()))?;
+    let output = Output {
+        schema: "jsvm-table-ir/v0",
+        source: args.source.display().to_string(),
+        vms: lift_table_vms(&source, &report),
+    };
+    fs::write(
+        &args.output,
+        format!("{}\n", serde_json::to_string_pretty(&output)?),
+    )
+    .with_context(|| format!("writing {}", args.output.display()))?;
+    print_summary(&output, &args.output);
     Ok(())
 }
