@@ -974,6 +974,17 @@ enum ReferenceCaseFlow {
     Throw,
 }
 
+struct ReferenceStateSetup {
+    state_var: String,
+    table_symbol: SymbolId,
+    current: u32,
+    chunks: Vec<String>,
+}
+
+fn render_block(chunks: &[String]) -> String {
+    format!("{{\n{}\n}}", chunks.join("\n"))
+}
+
 impl Collector<'_, '_> {
     fn reference_state_assignment(
         &self,
@@ -1101,68 +1112,84 @@ impl Collector<'_, '_> {
         }
     }
 
-    pub(super) fn reference_state_replacement(
+    fn reference_state_setup(
         &self,
         it: &oxc_ast::ast::ForStatement<'_>,
-    ) -> Option<String> {
+    ) -> Option<ReferenceStateSetup> {
         if it.update.is_some() || !matches!(eval(it.test.as_ref()?), Some(Value::Bool(true))) {
             return None;
         }
-
-        let init = it.init.as_ref()?;
-        let oxc_ast::ast::ForStatementInit::VariableDeclaration(init_decl) = init else {
+        let oxc_ast::ast::ForStatementInit::VariableDeclaration(init_decl) = it.init.as_ref()?
+        else {
             return None;
         };
         if init_decl.kind != VariableDeclarationKind::Var || init_decl.declarations.is_empty() {
             return None;
         }
 
-        let mut state_index = None;
-        let mut state_symbol = None;
-        let mut state_var = None;
-        let mut table_symbol = None;
-        let mut initial_identity = None;
+        let mut state = None;
         for (index, declaration) in init_decl.declarations.iter().enumerate() {
             let Some(init) = &declaration.init else {
                 continue;
             };
-            let Some((symbol, identity)) =
+            let Some((table_symbol, identity)) =
                 reference_identity(init, self.scoping, self.reference_identity_tables)
             else {
                 continue;
             };
-            if state_index.is_some() {
+            if state.is_some() {
                 return None;
             }
             let BindingPattern::BindingIdentifier(id) = &declaration.id else {
                 return None;
             };
-            state_index = Some(index);
-            state_symbol = id.symbol_id.get();
-            state_var = Some(id.name.as_str());
-            table_symbol = Some(symbol);
-            initial_identity = Some(identity);
+            state = Some((
+                index,
+                id.symbol_id.get()?,
+                id.name.to_string(),
+                table_symbol,
+                identity,
+            ));
         }
-
-        let state_index = state_index?;
-        let state_symbol = state_symbol?;
-        let state_var = state_var?;
-        let table_symbol = table_symbol?;
-        let mut current = initial_identity?;
-
+        let (state_index, state_symbol, state_var, table_symbol, current) = state?;
         if !resolved_refs_within(self.scoping, self.reference_spans, state_symbol, it.span) {
             return None;
         }
-        for declaration in &init_decl.declarations {
-            if let Some(init) = &declaration.init {
-                if expression_mentions(init, state_var)
-                    && direct_identifier_name(init) != Some(state_var)
-                {
-                    return None;
-                }
-            }
+        if init_decl.declarations.iter().any(|declaration| {
+            declaration.init.as_ref().is_some_and(|init| {
+                expression_mentions(init, &state_var)
+                    && direct_identifier_name(init) != Some(state_var.as_str())
+            })
+        }) {
+            return None;
         }
 
+        let other_declarations = init_decl
+            .declarations
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != state_index)
+            .map(|(_, declaration)| fragment(self.source, declaration.span))
+            .collect::<Vec<_>>();
+        let chunks = if other_declarations.is_empty() {
+            Vec::new()
+        } else {
+            vec![format!("var {};", other_declarations.join(","))]
+        };
+        Some(ReferenceStateSetup {
+            state_var,
+            table_symbol,
+            current,
+            chunks,
+        })
+    }
+
+    fn reference_state_switch<'a>(
+        &self,
+        it: &'a oxc_ast::ast::ForStatement<'a>,
+        state_var: &str,
+        table_symbol: SymbolId,
+    ) -> Option<(&'a oxc_ast::ast::SwitchStatement<'a>, HashMap<u32, usize>)> {
         let Statement::BlockStatement(body) = &it.body else {
             return None;
         };
@@ -1183,43 +1210,37 @@ impl Collector<'_, '_> {
 
         let mut cases = HashMap::new();
         for (index, case) in switch.cases.iter().enumerate() {
-            let test = case.test.as_ref()?;
-            let (symbol, identity) =
-                reference_identity(test, self.scoping, self.reference_identity_tables)?;
+            let (symbol, identity) = reference_identity(
+                case.test.as_ref()?,
+                self.scoping,
+                self.reference_identity_tables,
+            )?;
             if symbol != table_symbol || cases.insert(identity, index).is_some() {
                 return None;
             }
         }
+        Some((switch, cases))
+    }
 
-        let mut chunks = Vec::new();
-        let other_declarations = init_decl
-            .declarations
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != state_index)
-            .map(|(_, declaration)| fragment(self.source, declaration.span))
-            .collect::<Vec<_>>();
-        if !other_declarations.is_empty() {
-            chunks.push(format!("var {};", other_declarations.join(",")));
-        }
-
+    fn simulate_reference_state(
+        &self,
+        switch: &oxc_ast::ast::SwitchStatement<'_>,
+        cases: &HashMap<u32, usize>,
+        setup: ReferenceStateSetup,
+    ) -> Option<String> {
+        let ReferenceStateSetup {
+            state_var,
+            table_symbol,
+            mut current,
+            mut chunks,
+        } = setup;
         let mut seen = HashSet::new();
         for _ in 0..256 {
             if !seen.insert(current) {
                 return None;
             }
             let Some(start) = cases.get(&current).copied() else {
-                // No case matches, so the switch falls through and the
-                // unconditional break after it terminates the dispatcher.
-                return Some(format!(
-                    "{{
-{}
-}}",
-                    chunks.join(
-                        "
-"
-                    )
-                ));
+                return Some(render_block(&chunks));
             };
 
             let mut next_state = None;
@@ -1227,7 +1248,7 @@ impl Collector<'_, '_> {
             'cases: for case in switch.cases.iter().skip(start) {
                 for stmt in &case.consequent {
                     let (text, next, stmt_flow) =
-                        self.clean_reference_state_statement(stmt, state_var, table_symbol)?;
+                        self.clean_reference_state_statement(stmt, &state_var, table_symbol)?;
                     if !text.trim().is_empty() {
                         chunks.push(text);
                     }
@@ -1242,26 +1263,24 @@ impl Collector<'_, '_> {
             }
 
             match flow {
-                ReferenceCaseFlow::Continue => {
-                    current = next_state?;
-                }
+                ReferenceCaseFlow::Continue => current = next_state?,
                 ReferenceCaseFlow::Break
                 | ReferenceCaseFlow::Return
                 | ReferenceCaseFlow::Throw
-                | ReferenceCaseFlow::Normal => {
-                    return Some(format!(
-                        "{{
-{}
-}}",
-                        chunks.join(
-                            "
-"
-                        )
-                    ));
-                }
+                | ReferenceCaseFlow::Normal => return Some(render_block(&chunks)),
             }
         }
         None
+    }
+
+    pub(super) fn reference_state_replacement(
+        &self,
+        it: &oxc_ast::ast::ForStatement<'_>,
+    ) -> Option<String> {
+        let setup = self.reference_state_setup(it)?;
+        let (switch, cases) =
+            self.reference_state_switch(it, &setup.state_var, setup.table_symbol)?;
+        self.simulate_reference_state(switch, &cases, setup)
     }
 
     pub(super) fn arithmetic_state_replacement(
