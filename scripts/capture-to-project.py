@@ -29,10 +29,12 @@ def main() -> None:
     ap.add_argument("--string-recoverer", type=Path, default=defaults.string_recoverer)
     ap.add_argument("--bundle-inventory", type=Path, default=defaults.bundle_inventory)
     ap.add_argument("--sourcemap-composer", type=Path, default=defaults.sourcemap_composer)
+    ap.add_argument("--wasm-redox", type=Path, default=defaults.wasm_redox)
     ap.add_argument("--jobs", type=int, help="parallel workers for content-only analysis stages")
     ap.add_argument("--skip-safe-deobfuscation", action="store_true")
     ap.add_argument("--skip-bundle-unpack", action="store_true")
     ap.add_argument("--skip-vm-scan", action="store_true")
+    ap.add_argument("--skip-wasm-analysis", action="store_true")
     args = ap.parse_args()
 
     tools = Toolchain(
@@ -46,6 +48,7 @@ def main() -> None:
         string_recoverer=args.string_recoverer,
         bundle_inventory=args.bundle_inventory,
         sourcemap_composer=args.sourcemap_composer,
+        wasm_redox=args.wasm_redox,
     )
     options = PipelineOptions(
         overwrite=args.overwrite,
@@ -54,6 +57,7 @@ def main() -> None:
         safe_deobfuscation=not args.skip_safe_deobfuscation,
         bundle_unpack=not args.skip_bundle_unpack,
         vm_scan=not args.skip_vm_scan,
+        wasm_analysis=not args.skip_wasm_analysis,
     )
     summary = run_capture_pipeline(args.capture, args.output, tools=tools, options=options)
     print_project_summary(summary)

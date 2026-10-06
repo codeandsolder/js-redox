@@ -20,6 +20,9 @@ struct Args {
 
     #[arg(long)]
     skip_wax: bool,
+
+    #[arg(long)]
+    skip_deep: bool,
 }
 
 fn write_wax(input: &Path, output: &Path, wax: &Path) -> Result<()> {
@@ -62,6 +65,13 @@ fn main() -> Result<()> {
     fs::write(&report_path, serde_json::to_vec_pretty(&report)?)
         .with_context(|| format!("write {}", report_path.display()))?;
     fs::write(&wat_path, wat).with_context(|| format!("write {}", wat_path.display()))?;
+
+    if !args.skip_deep {
+        let deep = wasm_redox::deep_analyze(&bytes, &report);
+        let deep_path = args.output_dir.join("module.deep.json");
+        fs::write(&deep_path, serde_json::to_vec_pretty(&deep)?)
+            .with_context(|| format!("write {}", deep_path.display()))?;
+    }
 
     if !args.skip_wax {
         write_wax(

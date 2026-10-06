@@ -32,6 +32,7 @@ class Toolchain:
     string_recoverer: Path = ROOT / "scripts/recover-js-obfuscator-strings.py"
     bundle_inventory: Path = TOOL_ROOT / "bundle-unpack"
     sourcemap_composer: Path = TOOL_ROOT / "sourcemap-compose"
+    wasm_redox: Path = TOOL_ROOT / "wasm-redox"
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class PipelineOptions:
     safe_deobfuscation: bool = True
     bundle_unpack: bool = True
     vm_scan: bool = True
+    wasm_analysis: bool = True
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,8 @@ class ProjectSummary:
     capture_state: str
     captured_resources: int
     javascript_units: int
+    wasm_modules: int
+    wasm_origins: int
     references: int
     import_map_resolutions: int
     unresolved_bare_specifiers: int
@@ -164,6 +168,17 @@ def run_capture_pipeline(
             *_parallel_args(options.jobs),
         ]
     )
+    if options.wasm_analysis:
+        run_checked(
+            [
+                sys.executable,
+                ROOT / "scripts/materialize-wasm.py",
+                output,
+                "--wasm-redox",
+                tools.wasm_redox,
+            ]
+        )
+
     run_checked(
         [
             sys.executable,
@@ -265,6 +280,10 @@ def load_project_summary(
     maps = _read_json(output / "analysis/sourcemaps.json")
     graph = _read_json(output / "analysis/source-graph.json")
     jsrefs = _read_json(output / "analysis/js-references.json")
+    wasm = {"summary": {}}
+    wasm_path = output / "analysis/wasm/index.json"
+    if wasm_path.exists():
+        wasm = _read_json(wasm_path)
 
     deob = _read_json(output / "analysis/deobfuscation.json") if safe_deobfuscation else None
     bundles = {"summary": {}}
@@ -306,6 +325,8 @@ def load_project_summary(
         capture_state="SALVAGED / truncated" if manifest.get("salvaged") else "complete",
         captured_resources=len(manifest["resources"]),
         javascript_units=sum(unit.get("kind") == "javascript" for unit in source_index["units"]),
+        wasm_modules=wasm.get("summary", {}).get("modules", 0),
+        wasm_origins=wasm.get("summary", {}).get("origins", 0),
         references=jsrefs["summary"]["references"],
         import_map_resolutions=jsrefs["summary"].get("resolved_by_import_map", 0),
         unresolved_bare_specifiers=jsrefs["summary"].get("unresolved_bare_specifiers", 0),
@@ -334,6 +355,7 @@ def print_project_summary(summary: ProjectSummary) -> None:
         f"  capture state:      {summary.capture_state}\n"
         f"  captured resources: {summary.captured_resources}\n"
         f"  JavaScript units:   {summary.javascript_units}\n"
+        f"  WebAssembly modules: {summary.wasm_modules} ({summary.wasm_origins} origin(s))\n"
         f"  JS/module/worker references: {summary.references}\n"
         f"  import-map resolutions: {summary.import_map_resolutions} "
         f"(unresolved bare: {summary.unresolved_bare_specifiers})\n"

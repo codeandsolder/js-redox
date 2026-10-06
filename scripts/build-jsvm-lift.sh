@@ -40,6 +40,7 @@ if [[ "$profile" == "release" ]]; then
   composer_args+=(--release)
 fi
 "$cargo_bin" build -j "$jobs" -p sourcemap-compose "${composer_args[@]}"
+"$cargo_bin" build -j "$jobs" -p wasm-redox "${composer_args[@]}"
 
 # Site-wrapper target is a disposable compile cache; durable executables are published below.
 shim_target_root="/var/cache/sentinelx/cargo-target"
@@ -70,7 +71,7 @@ mkdir -p "$canonical"
 # deleting its disposable scratch target. Prefer that durable mirror after Cargo
 # returns, while retaining the scratch path as a fallback for older wrappers.
 published=0
-for bin in jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack sourcemap-compose sus-scan; do
+for bin in jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack sourcemap-compose sus-scan wasm-redox; do
   source_bin=""
   if [[ -f "$mirror/$bin" ]]; then
     source_bin="$mirror/$bin"

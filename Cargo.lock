@@ -1350,8 +1350,7 @@ checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 [[package]]
 name = "waffle"
 version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5961e9d8856d376c62428e5cdb9ccb5bd2dc65124f7fa4c48893331a6d77d34"
+source = "git+https://github.com/codeandsolder/waffle.git?rev=10e4b99e354074bacf83500c7664efd14c102d25#10e4b99e354074bacf83500c7664efd14c102d25"
 dependencies = [
  "anyhow",
  "fxhash",

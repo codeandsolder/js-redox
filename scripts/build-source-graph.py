@@ -29,6 +29,7 @@ def main():
     deobfuscation_path = project / 'analysis/deobfuscation.json'
     bundles_path = project / 'analysis/bundles.json'
     import_maps_path = project / 'analysis/import-maps.json'
+    wasm_path = project / 'analysis/wasm/index.json'
 
     source_index = json.loads(source_index_path.read_text()) if source_index_path.exists() else {'units': []}
     sourcemaps = json.loads(sourcemaps_path.read_text()) if sourcemaps_path.exists() else {'source_maps': []}
@@ -44,6 +45,7 @@ def main():
         if bundles_path.exists()
         else {'bundles': [], 'modules': []}
     )
+    wasm = json.loads(wasm_path.read_text()) if wasm_path.exists() else {'modules': []}
     import_maps = (
         json.loads(import_maps_path.read_text())
         if import_maps_path.exists()
@@ -659,6 +661,40 @@ def main():
                 start=ref.get('start'),
                 end=ref.get('end'),
             )
+
+    # Captured or statically recovered WebAssembly modules are first-class
+    # derived-source nodes with exact provenance back to the carrier resource.
+    for module in wasm.get('modules', []):
+        digest = module['sha256']
+        node_id = f"wasm:{digest[:20]}"
+        add_node(
+            node_id,
+            type='wasm_module',
+            sha256=digest,
+            bytes=module.get('byte_len'),
+            binary_path=module.get('binary_path'),
+            extracted=bool(module.get('extracted')),
+            status=module.get('status'),
+            report_path=module.get('report_path'),
+            readable_wat_path=module.get('wat_path'),
+            deep_analysis_path=module.get('deep_path'),
+        )
+        for origin in module.get('origins', []):
+            kind = origin.get('type')
+            parent = None
+            if kind in {'resource', 'resource_inline_base64'} and origin.get('resource_id') is not None:
+                parent = f"resource:{int(origin['resource_id'])}"
+            elif kind == 'inline_script_base64':
+                parent = f"inline:{int(origin['parent_resource_id'])}:{int(origin['ordinal'])}"
+            if parent:
+                add_edge(
+                    parent,
+                    node_id,
+                    'wasm_resource' if kind == 'resource' else 'wasm_inline_base64',
+                    encoding=origin.get('encoding'),
+                    start=origin.get('byte_start'),
+                    end=origin.get('byte_end'),
+                )
 
     edge_counts = Counter(edge['kind'] for edge in edges)
     node_counts = Counter(node['type'] for node in nodes.values())

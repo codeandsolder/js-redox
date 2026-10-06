@@ -1,8 +1,10 @@
+pub mod state_machine;
+
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use wasmparser::{ExternalKind, Parser, Payload, TypeRef, Validator, WasmFeatures};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use wasmparser::{ExternalKind, Operator, Parser, Payload, TypeRef, Validator, WasmFeatures};
 
 #[derive(Debug, Serialize)]
 pub struct ImportSummary {
@@ -24,6 +26,21 @@ pub struct FunctionSummary {
     pub body_bytes: usize,
     pub exports: Vec<String>,
     pub role: &'static str,
+    pub direct_calls: Vec<u32>,
+    pub reachable_from_exports: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExportReachability {
+    pub export: String,
+    pub function_index: u32,
+    pub reachable_functions: Vec<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CallGraphSummary {
+    pub direct_edges: usize,
+    pub exports: Vec<ExportReachability>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -39,6 +56,21 @@ pub struct SectionCounts {
 }
 
 #[derive(Debug, Serialize)]
+pub struct DeepExportAnalysis {
+    pub export: String,
+    pub function_index: u32,
+    pub body_bytes: usize,
+    pub state_machines: Vec<state_machine::StateMachineReport>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeepModuleReport {
+    pub schema: &'static str,
+    pub exports: Vec<DeepExportAnalysis>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ModuleReport {
     pub sha256: String,
     pub byte_len: usize,
@@ -46,6 +78,7 @@ pub struct ModuleReport {
     pub imports: Vec<ImportSummary>,
     pub exports: Vec<ExportSummary>,
     pub functions: Vec<FunctionSummary>,
+    pub call_graph: CallGraphSummary,
     pub custom_sections: Vec<String>,
     pub strings: Vec<String>,
 }
@@ -184,11 +217,26 @@ pub fn analyze(bytes: &[u8]) -> Result<ModuleReport> {
                 let range = body.range();
                 let body_bytes = usize::try_from(range.end.saturating_sub(range.start))
                     .context("function body length does not fit usize")?;
+                let mut direct_calls = BTreeSet::new();
+                let mut operators = body
+                    .get_operators_reader()
+                    .context("read function operators")?;
+                while !operators.eof() {
+                    match operators.read().context("read function operator")? {
+                        Operator::Call { function_index }
+                        | Operator::ReturnCall { function_index } => {
+                            direct_calls.insert(function_index);
+                        }
+                        _ => {}
+                    }
+                }
                 functions.push(FunctionSummary {
                     index,
                     body_bytes,
                     role: classify_function(&export_names),
                     exports: export_names,
+                    direct_calls: direct_calls.into_iter().collect(),
+                    reachable_from_exports: Vec::new(),
                 });
                 next_defined_function = Some(index.saturating_add(1));
             }
@@ -199,6 +247,40 @@ pub fn analyze(bytes: &[u8]) -> Result<ModuleReport> {
         }
     }
 
+    let adjacency = functions
+        .iter()
+        .map(|function| (function.index, function.direct_calls.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let direct_edges = adjacency.values().map(Vec::len).sum();
+    let function_exports = exports
+        .iter()
+        .filter(|export| export.kind == "function")
+        .map(|export| (export.name.clone(), export.index))
+        .collect::<Vec<_>>();
+    let mut export_reachability = Vec::new();
+    for (export_name, root) in function_exports {
+        let mut queue = VecDeque::from([root]);
+        let mut reachable = BTreeSet::new();
+        while let Some(function_index) = queue.pop_front() {
+            if !reachable.insert(function_index) {
+                continue;
+            }
+            if let Some(callees) = adjacency.get(&function_index) {
+                queue.extend(callees.iter().copied());
+            }
+        }
+        for function in &mut functions {
+            if reachable.contains(&function.index) {
+                function.reachable_from_exports.push(export_name.clone());
+            }
+        }
+        export_reachability.push(ExportReachability {
+            export: export_name,
+            function_index: root,
+            reachable_functions: reachable.into_iter().collect(),
+        });
+    }
+
     Ok(ModuleReport {
         sha256: format!("{digest:x}"),
         byte_len: bytes.len(),
@@ -206,9 +288,45 @@ pub fn analyze(bytes: &[u8]) -> Result<ModuleReport> {
         imports,
         exports,
         functions,
+        call_graph: CallGraphSummary {
+            direct_edges,
+            exports: export_reachability,
+        },
         custom_sections,
         strings: extract_ascii_strings(bytes),
     })
+}
+
+pub fn deep_analyze(bytes: &[u8], report: &ModuleReport) -> DeepModuleReport {
+    let mut exports = Vec::new();
+    for function in &report.functions {
+        if function.role != "exported_core" || function.body_bytes < 128 {
+            continue;
+        }
+        let Some(export) = function.exports.first() else {
+            continue;
+        };
+        match state_machine::analyze_export_state_machines(bytes, export) {
+            Ok(state_machines) => exports.push(DeepExportAnalysis {
+                export: export.clone(),
+                function_index: function.index,
+                body_bytes: function.body_bytes,
+                state_machines,
+                error: None,
+            }),
+            Err(error) => exports.push(DeepExportAnalysis {
+                export: export.clone(),
+                function_index: function.index,
+                body_bytes: function.body_bytes,
+                state_machines: Vec::new(),
+                error: Some(format!("{error:#}")),
+            }),
+        }
+    }
+    DeepModuleReport {
+        schema: "wasm-redox/deep-v1",
+        exports,
+    }
 }
 
 pub fn folded_wat(bytes: &[u8]) -> Result<String> {
@@ -242,6 +360,10 @@ mod tests {
         assert_eq!(report.functions.len(), 1);
         assert_eq!(report.functions[0].exports, ["add"]);
         assert_eq!(report.functions[0].role, "exported_core");
+        assert_eq!(report.functions[0].direct_calls, Vec::<u32>::new());
+        assert_eq!(report.call_graph.exports.len(), 1);
+        assert_eq!(report.call_graph.exports[0].export, "add");
+        assert_eq!(report.call_graph.exports[0].reachable_functions, [1]);
 
         let readable = folded_wat(&bytes)?;
         assert!(readable.contains("i32.add"));

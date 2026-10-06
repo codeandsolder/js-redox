@@ -232,7 +232,9 @@ fn resource_kind(url: &str, mime: &str) -> &'static str {
         .ok()
         .map(|u| u.path().to_ascii_lowercase())
         .unwrap_or_default();
-    if m.contains("javascript")
+    if m == "application/wasm" || path.ends_with(".wasm") {
+        "wasm"
+    } else if m.contains("javascript")
         || m.contains("ecmascript")
         || path.ends_with(".js")
         || path.ends_with(".mjs")
@@ -255,6 +257,7 @@ fn resource_kind(url: &str, mime: &str) -> &'static str {
 fn extension_for(kind: &str, mime: &str) -> &'static str {
     match kind {
         "javascript" => "js",
+        "wasm" => "wasm",
         "html" => "html",
         "json" => "json",
         "css" => "css",
@@ -274,6 +277,7 @@ fn has_plausible_extension(name: &str, kind: &str) -> bool {
     };
     match kind {
         "javascript" => matches!(extension, "js" | "mjs" | "cjs"),
+        "wasm" => extension == "wasm",
         "html" => matches!(extension, "html" | "htm" | "xhtml"),
         "json" => matches!(extension, "json" | "map"),
         "css" => extension == "css",

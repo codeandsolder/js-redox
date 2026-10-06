@@ -55,6 +55,7 @@ jobs:
             target/debug/deobfuscate-safe \
             target/debug/bundle-unpack \
             target/debug/sourcemap-compose \
+            target/debug/wasm-redox \
             .cargo-target-nodebug/debug/
       - name: Safe deobfuscation runtime equivalence
         run: uv run --no-project python scripts/check-safe-deobfuscate.py
@@ -62,3 +63,5 @@ jobs:
         run: uv run --no-project python scripts/check-static-string-recovery.py
       - name: VM capture pipeline
         run: uv run --no-project python scripts/check-vm-capture-pipeline.py
+      - name: WebAssembly capture pipeline
+        run: uv run --no-project python scripts/check-wasm-capture-pipeline.py

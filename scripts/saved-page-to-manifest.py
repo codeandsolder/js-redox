@@ -32,6 +32,8 @@ def canonical_url(rel: Path) -> str:
 def kind_for(path: Path, mime: str | None = None) -> str:
     suffix = path.suffix.lower()
     base = (mime or "").split(";", 1)[0].lower()
+    if suffix == ".wasm" or base == "application/wasm":
+        return "wasm"
     if suffix in {".js", ".mjs", ".cjs", ".jsx"} or "javascript" in base or "ecmascript" in base:
         return "javascript"
     if suffix in {".html", ".htm", ".xhtml"} or "html" in base:
@@ -55,6 +57,8 @@ def guess_mime(path: Path) -> str:
     mime, _ = mimetypes.guess_type(path.name)
     if path.suffix.lower() == ".map":
         return "application/json"
+    if path.suffix.lower() == ".wasm":
+        return "application/wasm"
     return mime or "application/octet-stream"
 
 
