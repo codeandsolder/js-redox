@@ -3,7 +3,7 @@ use crate::{
     source_text::preview,
 };
 use oxc_ast::{
-    ast::{Argument, Expression, ForStatement, Function, FunctionBody, Statement},
+    ast::{Argument, Expression, ForStatement, Function, FunctionBody, Statement, SwitchStatement},
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
@@ -788,132 +788,123 @@ struct LoopRunner<'s, 'm> {
     result: Option<OpcodeMapCandidate>,
 }
 
-impl<'a> Visit<'a> for LoopRunner<'_, '_> {
-    fn visit_for_statement(&mut self, it: &ForStatement<'a>) {
-        if self.result.is_some() {
-            return;
-        }
-        if it.span.start != self.machine.start || it.span.end != self.machine.end {
-            walk::walk_for_statement(self, it);
-            return;
-        }
-
-        let Statement::BlockStatement(body) = &it.body else {
-            return;
-        };
-        let Some(switch) = body.body.iter().find_map(|stmt| {
-            if let Statement::SwitchStatement(sw) = stmt {
-                Some(sw)
-            } else {
-                None
-            }
-        }) else {
-            return;
-        };
-
-        let mut case_map: BTreeMap<u64, &[Statement<'a>]> = BTreeMap::new();
-        for case in &switch.cases {
-            let Some(test) = &case.test else {
-                continue;
+fn numeric_case_map<'a>(switch: &'a SwitchStatement<'a>) -> BTreeMap<u64, &'a [Statement<'a>]> {
+    switch
+        .cases
+        .iter()
+        .filter_map(|case| {
+            let Expression::NumericLiteral(number) = case.test.as_ref()? else {
+                return None;
             };
-            let Expression::NumericLiteral(n) = test else {
-                continue;
+            (number.value.is_finite() && number.value >= 0.0 && number.value.fract() == 0.0)
+                .then_some((number.value as u64, case.consequent.as_slice()))
+        })
+        .collect()
+}
+
+impl LoopRunner<'_, '_> {
+    fn simulate_opcode<'a>(
+        &self,
+        opcode: u64,
+        case_map: &BTreeMap<u64, &'a [Statement<'a>]>,
+        observed_opcodes: &BTreeSet<u64>,
+    ) -> OpcodeHandler {
+        let mut env = self
+            .bindings
+            .iter()
+            .map(|(name, mask)| (name.clone(), Scalar::Int((opcode & mask) as i64)))
+            .collect::<HashMap<_, _>>();
+        let mut state = self.machine.init_state;
+        let mut path = Vec::new();
+        let mut semantic = Vec::new();
+        let mut terminal = "step-limit".to_string();
+
+        for _ in 0..128 {
+            path.push(state);
+            env.insert(self.machine.state_var.clone(), Scalar::Int(state as i64));
+
+            if let (Some(shift), Some(selector)) =
+                (self.machine.shift, self.machine.selector_var.as_ref())
+            {
+                let selected = (state >> shift) & self.machine.mask;
+                env.insert(selector.clone(), Scalar::Int(selected as i64));
+            }
+
+            let low = state & self.machine.mask;
+            let Some(statements) = case_map.get(&low) else {
+                terminal = format!("missing-case-{low}");
+                break;
             };
-            if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 {
-                case_map.insert(n.value as u64, &case.consequent);
+            match exec_statements(
+                statements,
+                self.source,
+                &self.machine.state_var,
+                &mut env,
+                &mut semantic,
+            ) {
+                ExecStatus::Return => {
+                    terminal = "return".to_string();
+                    break;
+                }
+                ExecStatus::Throw => {
+                    terminal = "throw".to_string();
+                    break;
+                }
+                ExecStatus::Break | ExecStatus::Normal => {}
+            }
+
+            match env.get(&self.machine.state_var).copied() {
+                Some(Scalar::Int(next)) if next >= 0 => {
+                    let next = next as u64;
+                    if next == state {
+                        terminal = "stuck".to_string();
+                        break;
+                    }
+                    state = next;
+                }
+                Some(Scalar::Undefined) | None => {
+                    terminal = "exit".to_string();
+                    break;
+                }
+                Some(Scalar::Int(_)) => {
+                    terminal = "negative-state".to_string();
+                    break;
+                }
             }
         }
 
+        OpcodeHandler {
+            opcode,
+            observed: observed_opcodes.contains(&opcode),
+            path,
+            terminal,
+            semantic,
+        }
+    }
+
+    fn build_opcode_map(&self, switch: &SwitchStatement<'_>) -> Option<OpcodeMapCandidate> {
+        let case_map = numeric_case_map(switch);
         let opcode_max = self
             .decoder
             .selector_masks
             .iter()
             .copied()
-            .fold(0u64, |acc, v| acc | v);
+            .fold(0u64, |acc, value| acc | value);
         if opcode_max > 255 {
-            return;
+            return None;
         }
 
-        let observed_opcodes: BTreeSet<u64> =
-            self.decoder.observed_opcodes.iter().copied().collect();
-        let mut handlers = Vec::new();
-        for opcode in 0..=opcode_max {
-            let mut env: HashMap<String, Scalar> = HashMap::new();
-            for (name, mask) in self.bindings {
-                env.insert(name.clone(), Scalar::Int((opcode & mask) as i64));
-            }
+        let observed_opcodes = self
+            .decoder
+            .observed_opcodes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let handlers = (0..=opcode_max)
+            .map(|opcode| self.simulate_opcode(opcode, &case_map, &observed_opcodes))
+            .collect();
 
-            let mut state = self.machine.init_state;
-            let mut path = Vec::new();
-            let mut semantic = Vec::new();
-            let mut terminal = "step-limit".to_string();
-
-            for _ in 0..128 {
-                path.push(state);
-                env.insert(self.machine.state_var.clone(), Scalar::Int(state as i64));
-
-                if let (Some(shift), Some(selector)) =
-                    (self.machine.shift, self.machine.selector_var.as_ref())
-                {
-                    let selected = (state >> shift) & self.machine.mask;
-                    env.insert(selector.clone(), Scalar::Int(selected as i64));
-                }
-
-                let low = state & self.machine.mask;
-                let Some(statements) = case_map.get(&low) else {
-                    terminal = format!("missing-case-{low}");
-                    break;
-                };
-
-                let status = exec_statements(
-                    statements,
-                    self.source,
-                    &self.machine.state_var,
-                    &mut env,
-                    &mut semantic,
-                );
-                match status {
-                    ExecStatus::Return => {
-                        terminal = "return".to_string();
-                        break;
-                    }
-                    ExecStatus::Throw => {
-                        terminal = "throw".to_string();
-                        break;
-                    }
-                    ExecStatus::Break | ExecStatus::Normal => {}
-                }
-
-                match env.get(&self.machine.state_var).copied() {
-                    Some(Scalar::Int(next)) if next >= 0 => {
-                        let next = next as u64;
-                        if next == state {
-                            terminal = "stuck".to_string();
-                            break;
-                        }
-                        state = next;
-                    }
-                    Some(Scalar::Undefined) | None => {
-                        terminal = "exit".to_string();
-                        break;
-                    }
-                    Some(Scalar::Int(_)) => {
-                        terminal = "negative-state".to_string();
-                        break;
-                    }
-                }
-            }
-
-            handlers.push(OpcodeHandler {
-                opcode,
-                observed: observed_opcodes.contains(&opcode),
-                path,
-                terminal,
-                semantic,
-            });
-        }
-
-        self.result = Some(OpcodeMapCandidate {
+        Some(OpcodeMapCandidate {
             parent_function_id: self.parent_function_id.to_string(),
             decoder_function_id: self.decoder.function_id.clone(),
             decoder_selector_var: self.decoder.selector_var.clone(),
@@ -924,7 +915,31 @@ impl<'a> Visit<'a> for LoopRunner<'_, '_> {
             opcode_max,
             observed_opcodes: self.decoder.observed_opcodes.clone(),
             handlers,
+        })
+    }
+}
+
+impl<'a> Visit<'a> for LoopRunner<'_, '_> {
+    fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+        if self.result.is_some() {
+            return;
+        }
+        if statement.span.start != self.machine.start || statement.span.end != self.machine.end {
+            walk::walk_for_statement(self, statement);
+            return;
+        }
+
+        let Statement::BlockStatement(body) = &statement.body else {
+            return;
+        };
+        let switch = body.body.iter().find_map(|statement| {
+            if let Statement::SwitchStatement(switch) = statement {
+                Some(switch)
+            } else {
+                None
+            }
         });
+        self.result = switch.and_then(|switch| self.build_opcode_map(switch));
     }
 }
 
