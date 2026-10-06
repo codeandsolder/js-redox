@@ -288,6 +288,12 @@ fn collect_shorthand_spans(program: &oxc_ast::ast::Program<'_>) -> HashSet<(u32,
     collector.spans
 }
 
+#[derive(Clone, Copy)]
+enum CallRewriteTraversal {
+    Stop,
+    WalkChildren,
+}
+
 struct Collector<'s, 'c> {
     source: &'s str,
     scoping: &'c Scoping,
@@ -351,6 +357,151 @@ impl Collector<'_, '_> {
             kind: "arithmetic_state_unflatten",
             arithmetic_state_proof: Some(proof),
         });
+    }
+    fn is_plain_call(call: &CallExpression<'_>) -> bool {
+        !call.optional && !call.arguments.iter().any(Argument::is_spread)
+    }
+
+    fn try_selector_dispatch_rewrite(
+        &mut self,
+        call: &CallExpression<'_>,
+    ) -> Option<CallRewriteTraversal> {
+        if !Self::is_plain_call(call) {
+            return None;
+        }
+        let symbol = symbol_of(self.scoping, &call.callee)?;
+        let dispatcher = self.selector_dispatchers.get(&symbol)?;
+        let selector = call.arguments.first().and_then(argument_integer)?;
+        let return_span = *dispatcher.returns.get(&selector)?;
+        let used_param_count = dispatcher
+            .param_symbols
+            .iter()
+            .enumerate()
+            .filter_map(|(index, symbol)| {
+                self.scoping
+                    .get_resolved_reference_ids(*symbol)
+                    .iter()
+                    .filter_map(|reference_id| self.reference_spans.get(reference_id))
+                    .any(|span| return_span.start <= span.start && span.end <= return_span.end)
+                    .then_some(index + 1)
+            })
+            .max()
+            .unwrap_or(0);
+        let params = dispatcher.params[..used_param_count].join(", ");
+        let args = call
+            .arguments
+            .iter()
+            .map(|argument| fragment(self.source, argument.span()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let returned = fragment(self.source, return_span);
+        self.push(
+            call.span,
+            format!("(function({params}){{return ({returned});}})({args})"),
+            "selector_dispatch_specialize",
+        );
+        Some(CallRewriteTraversal::Stop)
+    }
+
+    fn try_proxy_call_rewrite(
+        &mut self,
+        call: &CallExpression<'_>,
+    ) -> Option<CallRewriteTraversal> {
+        if !Self::is_plain_call(call) {
+            return None;
+        }
+        let (symbol, key) = static_proxy_member(&call.callee, self.scoping)?;
+        let property = self.proxies.get(&symbol)?.get(&key)?;
+        let rewrite = match property {
+            ProxyProperty::Call { arity } if call.arguments.len() == arity + 1 => {
+                let callee = fragment(self.source, call.arguments[0].span());
+                let args = call.arguments[1..]
+                    .iter()
+                    .map(|argument| fragment(self.source, argument.span()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some((format!("((0, ({callee})))({args})"), "proxy_call"))
+            }
+            ProxyProperty::StaticMember { property } if call.arguments.len() == 1 => {
+                let object = fragment(self.source, call.arguments[0].span());
+                Some((format!("(({object}).{property})"), "proxy_static_member"))
+            }
+            ProxyProperty::ComputedMember if call.arguments.len() == 2 => {
+                let object = fragment(self.source, call.arguments[0].span());
+                let property = fragment(self.source, call.arguments[1].span());
+                Some((format!("(({object})[{property}])"), "proxy_computed_member"))
+            }
+            ProxyProperty::Unary { operator } if call.arguments.len() == 1 => {
+                let argument = fragment(self.source, call.arguments[0].span());
+                let text = if operator == "void" {
+                    format!("(void ({argument}))")
+                } else {
+                    format!("({operator}({argument}))")
+                };
+                Some((text, "proxy_unary"))
+            }
+            ProxyProperty::Binary { operator } if call.arguments.len() == 2 => {
+                let left = fragment(self.source, call.arguments[0].span());
+                let right = fragment(self.source, call.arguments[1].span());
+                Some((format!("(({left}) {operator} ({right}))"), "proxy_binary"))
+            }
+            _ => None,
+        }?;
+        self.push(call.span, rewrite.0, rewrite.1);
+        Some(CallRewriteTraversal::Stop)
+    }
+
+    fn try_pure_function_rewrite(
+        &mut self,
+        call: &CallExpression<'_>,
+    ) -> Option<CallRewriteTraversal> {
+        if !Self::is_plain_call(call) {
+            return None;
+        }
+        let symbol = symbol_of(self.scoping, &call.callee)?;
+        let function = self.pure_functions.get(&symbol)?;
+        let values = call
+            .arguments
+            .iter()
+            .map(eval_static_argument)
+            .collect::<Option<Vec<_>>>()?;
+        let text = function
+            .evaluate(&values)
+            .and_then(|value| value.render())?;
+        self.push(call.span, text, "pure_function_eval");
+        Some(CallRewriteTraversal::WalkChildren)
+    }
+
+    fn try_decoder_rewrite(&mut self, call: &CallExpression<'_>) -> Option<CallRewriteTraversal> {
+        let symbol = symbol_of(self.scoping, &call.callee)?;
+        let decoder = self.decoders.get(&symbol)?;
+        let argument = call.arguments.first()?;
+        if let Some(raw) = argument_integer(argument) {
+            let text = decoder
+                .value_for_raw(raw)
+                .and_then(|value| value.render())?;
+            self.push(call.span, text, "string_array_decode");
+            return Some(CallRewriteTraversal::WalkChildren);
+        }
+
+        let Argument::ConditionalExpression(conditional) = argument else {
+            return None;
+        };
+        let consequent = expression_integer(&conditional.consequent)
+            .and_then(|raw| decoder.value_for_raw(raw))
+            .and_then(|value| value.render())?;
+        let alternate = expression_integer(&conditional.alternate)
+            .and_then(|raw| decoder.value_for_raw(raw))
+            .and_then(|value| value.render())?;
+        let test = fragment(self.source, conditional.test.span());
+        self.push(
+            call.span,
+            format!("(({test}) ? ({consequent}) : ({alternate}))"),
+            "string_array_decode",
+        );
+        // The replacement spans the whole call. Revisit its copied test on the
+        // next fixed-point iteration instead of creating overlapping edits.
+        Some(CallRewriteTraversal::Stop)
     }
 }
 
@@ -559,205 +710,18 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
-        if !it.optional && !it.arguments.iter().any(Argument::is_spread) {
-            if let Some(symbol) = symbol_of(self.scoping, &it.callee) {
-                if let Some(dispatcher) = self.selector_dispatchers.get(&symbol) {
-                    if let Some(selector) = it.arguments.first().and_then(argument_integer) {
-                        if let Some(return_span) = dispatcher.returns.get(&selector) {
-                            let used_param_count = dispatcher
-                                .param_symbols
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(index, symbol)| {
-                                    self.scoping
-                                        .get_resolved_reference_ids(*symbol)
-                                        .iter()
-                                        .filter_map(|reference_id| {
-                                            self.reference_spans.get(reference_id)
-                                        })
-                                        .any(|span| {
-                                            return_span.start <= span.start
-                                                && span.end <= return_span.end
-                                        })
-                                        .then_some(index + 1)
-                                })
-                                .max()
-                                .unwrap_or(0);
-                            let params = dispatcher.params[..used_param_count].join(", ");
-                            let args = it
-                                .arguments
-                                .iter()
-                                .map(|argument| fragment(self.source, argument.span()))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let returned = fragment(self.source, *return_span);
-                            self.push(
-                                it.span,
-                                format!("(function({params}){{return ({returned});}})({args})"),
-                                "selector_dispatch_specialize",
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-        }
+        let rewrite = self
+            .try_selector_dispatch_rewrite(it)
+            .or_else(|| self.try_proxy_call_rewrite(it))
+            .or_else(|| self.try_pure_function_rewrite(it))
+            .or_else(|| self.try_decoder_rewrite(it));
 
-        if !it.optional && !it.arguments.iter().any(Argument::is_spread) {
-            if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
-                if let Some(ProxyProperty::Call { arity }) = self
-                    .proxies
-                    .get(&symbol)
-                    .and_then(|object| object.get(&key))
-                {
-                    if it.arguments.len() == arity + 1 {
-                        let callee = fragment(self.source, it.arguments[0].span());
-                        let args = it.arguments[1..]
-                            .iter()
-                            .map(|argument| fragment(self.source, argument.span()))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        self.push(it.span, format!("((0, ({callee})))({args})"), "proxy_call");
-                        return;
-                    }
-                }
+        match rewrite {
+            Some(CallRewriteTraversal::Stop) => {}
+            Some(CallRewriteTraversal::WalkChildren) | None => {
+                walk::walk_call_expression(self, it);
             }
         }
-
-        if !it.optional && it.arguments.len() == 1 && !it.arguments.iter().any(Argument::is_spread)
-        {
-            if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
-                if let Some(ProxyProperty::StaticMember { property }) = self
-                    .proxies
-                    .get(&symbol)
-                    .and_then(|object| object.get(&key))
-                {
-                    let object = fragment(self.source, it.arguments[0].span());
-                    self.push(
-                        it.span,
-                        format!("(({object}).{property})"),
-                        "proxy_static_member",
-                    );
-                    return;
-                }
-            }
-        }
-
-        if !it.optional && it.arguments.len() == 2 && !it.arguments.iter().any(Argument::is_spread)
-        {
-            if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
-                if let Some(ProxyProperty::ComputedMember) = self
-                    .proxies
-                    .get(&symbol)
-                    .and_then(|object| object.get(&key))
-                {
-                    let object = fragment(self.source, it.arguments[0].span());
-                    let property = fragment(self.source, it.arguments[1].span());
-                    self.push(
-                        it.span,
-                        format!("(({object})[{property}])"),
-                        "proxy_computed_member",
-                    );
-                    return;
-                }
-            }
-        }
-
-        if !it.optional && it.arguments.len() == 1 && !it.arguments.iter().any(Argument::is_spread)
-        {
-            if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
-                if let Some(ProxyProperty::Unary { operator }) = self
-                    .proxies
-                    .get(&symbol)
-                    .and_then(|object| object.get(&key))
-                {
-                    let argument = fragment(self.source, it.arguments[0].span());
-                    let text = if operator == "void" {
-                        format!("(void ({argument}))")
-                    } else {
-                        format!("({operator}({argument}))")
-                    };
-                    self.push(it.span, text, "proxy_unary");
-                    return;
-                }
-            }
-        }
-
-        if !it.optional && it.arguments.len() == 2 && !it.arguments.iter().any(Argument::is_spread)
-        {
-            if let Some((symbol, key)) = static_proxy_member(&it.callee, self.scoping) {
-                if let Some(ProxyProperty::Binary { operator }) = self
-                    .proxies
-                    .get(&symbol)
-                    .and_then(|object| object.get(&key))
-                {
-                    let left = fragment(self.source, it.arguments[0].span());
-                    let right = fragment(self.source, it.arguments[1].span());
-                    self.push(
-                        it.span,
-                        format!("(({left}) {operator} ({right}))"),
-                        "proxy_binary",
-                    );
-                    return;
-                }
-            }
-        }
-        if !it.optional && !it.arguments.iter().any(Argument::is_spread) {
-            if let Some(symbol) = symbol_of(self.scoping, &it.callee) {
-                if let Some(function) = self.pure_functions.get(&symbol) {
-                    let values = it
-                        .arguments
-                        .iter()
-                        .map(eval_static_argument)
-                        .collect::<Option<Vec<_>>>();
-                    if let Some(values) = values {
-                        if let Some(text) =
-                            function.evaluate(&values).and_then(|value| value.render())
-                        {
-                            self.push(it.span, text, "pure_function_eval");
-                            walk::walk_call_expression(self, it);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(symbol) = symbol_of(self.scoping, &it.callee) {
-            if let Some(decoder) = self.decoders.get(&symbol) {
-                if let Some(argument) = it.arguments.first() {
-                    if let Some(raw) = argument_integer(argument) {
-                        if let Some(text) =
-                            decoder.value_for_raw(raw).and_then(|value| value.render())
-                        {
-                            self.push(it.span, text, "string_array_decode");
-                            walk::walk_call_expression(self, it);
-                            return;
-                        }
-                    } else if let Argument::ConditionalExpression(conditional) = argument {
-                        let consequent = expression_integer(&conditional.consequent)
-                            .and_then(|raw| decoder.value_for_raw(raw))
-                            .and_then(|value| value.render());
-                        let alternate = expression_integer(&conditional.alternate)
-                            .and_then(|raw| decoder.value_for_raw(raw))
-                            .and_then(|value| value.render());
-                        if let (Some(consequent), Some(alternate)) = (consequent, alternate) {
-                            let test = fragment(self.source, conditional.test.span());
-                            self.push(
-                                it.span,
-                                format!("(({test}) ? ({consequent}) : ({alternate}))"),
-                                "string_array_decode",
-                            );
-                            // The replacement spans the whole call. Revisit its
-                            // copied test expression on the next fixed-point
-                            // iteration instead of creating overlapping edits.
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        walk::walk_call_expression(self, it);
     }
 }
 
