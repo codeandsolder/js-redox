@@ -715,6 +715,101 @@ fn case_for_state<'a>(cases: &'a [SwitchCase<'a>], state: u64) -> Option<&'a Swi
     None
 }
 
+fn reduce_paths(
+    switch: &oxc_ast::ast::SwitchStatement<'_>,
+    sm: &StateMachine,
+    initial_env: Env,
+    ctx: &EvalCtx<'_>,
+) -> Vec<ReducedPath> {
+    let mut env = initial_env;
+    env.insert(sm.state_var.clone(), Val::Num(sm.init_state as i64));
+
+    let mut queue = VecDeque::new();
+    queue.push_back(PathState {
+        env,
+        effects: Vec::new(),
+        states: Vec::new(),
+        guards: Vec::new(),
+        iterations: 0,
+        terminal: None,
+    });
+    let mut done = Vec::new();
+
+    while let Some(mut path) = queue.pop_front() {
+        let mut forked = false;
+
+        while path.iterations < 128 {
+            path.iterations += 1;
+            let Some(state_i) = path.env.get(&sm.state_var).and_then(Val::as_num) else {
+                break;
+            };
+            let state = state_i as u64;
+            if let (Some(sel), Some(shift)) = (sm.selector_var.as_ref(), sm.shift) {
+                path.env
+                    .insert(sel.clone(), Val::Num(((state >> shift) & sm.mask) as i64));
+            }
+
+            let case_id = state & sm.mask;
+            path.states.push(state);
+            let Some(case) = case_for_state(&switch.cases, case_id) else {
+                break;
+            };
+
+            let body = unwrap_dispatch_body(&case.consequent)
+                .unwrap_or_else(|| case.consequent.as_slice());
+            let before = path.env.get(&sm.state_var).cloned();
+
+            let mut terminal = None;
+            for stmt in body {
+                if matches!(stmt, Statement::BreakStatement(_)) {
+                    break;
+                }
+                match exec_stmt(stmt, &mut path.env, &mut path.effects, ctx) {
+                    Exec::Continue => {}
+                    Exec::Stop(reason) => {
+                        terminal = Some(reason.to_string());
+                        break;
+                    }
+                    Exec::Fork(choices) => {
+                        for choice in choices {
+                            let mut child = path.clone();
+                            child
+                                .env
+                                .insert(sm.state_var.clone(), Val::Num(choice.value));
+                            child.guards.push(choice.guard);
+                            queue.push_back(child);
+                        }
+                        forked = true;
+                        break;
+                    }
+                }
+            }
+
+            if forked {
+                break;
+            }
+            if let Some(reason) = terminal {
+                path.terminal = Some(reason);
+                break;
+            }
+            if path.env.get(&sm.state_var) == before.as_ref() {
+                path.effects.push("[no-state-change]".into());
+                break;
+            }
+        }
+
+        if !forked {
+            done.push(ReducedPath {
+                guards: path.guards,
+                states: path.states,
+                effects: path.effects,
+                terminal: path.terminal,
+            });
+        }
+    }
+    done
+}
+
 fn reduce_state_machine(
     raw: &str,
     sm: &StateMachine,
@@ -762,94 +857,7 @@ fn reduce_state_machine(
         structural,
     };
 
-    let mut env = initial_env;
-    env.insert(sm.state_var.clone(), Val::Num(sm.init_state as i64));
-
-    let mut queue = VecDeque::new();
-    queue.push_back(PathState {
-        env,
-        effects: Vec::new(),
-        states: Vec::new(),
-        guards: Vec::new(),
-        iterations: 0,
-        terminal: None,
-    });
-    let mut done = Vec::new();
-
-    while let Some(mut path) = queue.pop_front() {
-        let mut forked = false;
-
-        while path.iterations < 128 {
-            path.iterations += 1;
-            let Some(state_i) = path.env.get(&sm.state_var).and_then(Val::as_num) else {
-                break;
-            };
-            let state = state_i as u64;
-            if let (Some(sel), Some(shift)) = (sm.selector_var.as_ref(), sm.shift) {
-                path.env
-                    .insert(sel.clone(), Val::Num(((state >> shift) & sm.mask) as i64));
-            }
-
-            let case_id = state & sm.mask;
-            path.states.push(state);
-            let Some(case) = case_for_state(&switch.cases, case_id) else {
-                break;
-            };
-
-            let body = unwrap_dispatch_body(&case.consequent)
-                .unwrap_or_else(|| case.consequent.as_slice());
-            let before = path.env.get(&sm.state_var).cloned();
-
-            let mut terminal = None;
-            for stmt in body {
-                if matches!(stmt, Statement::BreakStatement(_)) {
-                    break;
-                }
-                match exec_stmt(stmt, &mut path.env, &mut path.effects, &ctx) {
-                    Exec::Continue => {}
-                    Exec::Stop(reason) => {
-                        terminal = Some(reason.to_string());
-                        break;
-                    }
-                    Exec::Fork(choices) => {
-                        for choice in choices {
-                            let mut child = path.clone();
-                            child
-                                .env
-                                .insert(sm.state_var.clone(), Val::Num(choice.value));
-                            child.guards.push(choice.guard);
-                            queue.push_back(child);
-                        }
-                        forked = true;
-                        break;
-                    }
-                }
-            }
-
-            if forked {
-                break;
-            }
-            if let Some(reason) = terminal {
-                path.terminal = Some(reason);
-                break;
-            }
-            if path.env.get(&sm.state_var) == before.as_ref() {
-                path.effects.push("[no-state-change]".into());
-                break;
-            }
-        }
-
-        if !forked {
-            done.push(ReducedPath {
-                guards: path.guards,
-                states: path.states,
-                effects: path.effects,
-                terminal: path.terminal,
-            });
-        }
-    }
-
-    Ok(done)
+    Ok(reduce_paths(switch, sm, initial_env, &ctx))
 }
 
 fn choose_machine<'a>(
