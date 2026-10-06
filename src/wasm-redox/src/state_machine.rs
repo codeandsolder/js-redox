@@ -101,11 +101,42 @@ fn push_target(queue: &mut VecDeque<Block>, seen: &BTreeSet<Block>, target: &Blo
 }
 
 #[derive(Debug)]
+struct TransitionEdge {
+    successor: u32,
+    args: Vec<Value>,
+}
+
+#[derive(Debug)]
 struct TransitionTrace {
     next: BTreeSet<u32>,
+    transitions: Vec<TransitionEdge>,
     unresolved_backedges: usize,
     data_forks: usize,
     blocks: BTreeSet<Block>,
+}
+
+fn record_backedge(
+    body: &FunctionBody,
+    state: Value,
+    param_index: usize,
+    current: u32,
+    target: &BlockTarget,
+    next: &mut BTreeSet<u32>,
+    transitions: &mut Vec<TransitionEdge>,
+) -> bool {
+    let Some(successor) = target
+        .args
+        .get(param_index)
+        .and_then(|value| eval_next_state(body, state, *value, current))
+    else {
+        return false;
+    };
+    next.insert(successor);
+    transitions.push(TransitionEdge {
+        successor,
+        args: target.args.clone(),
+    });
+    true
 }
 
 fn transitions_for(
@@ -118,6 +149,7 @@ fn transitions_for(
     let mut queue = VecDeque::from([dispatcher]);
     let mut seen = BTreeSet::new();
     let mut next = BTreeSet::new();
+    let mut transitions = Vec::new();
     let mut unresolved_backedges = 0;
     let mut data_forks = 0;
     while let Some(block) = queue.pop_front() {
@@ -128,13 +160,15 @@ fn transitions_for(
         match term {
             Terminator::Br { target } => {
                 if target.block == dispatcher {
-                    if let Some(value) = target
-                        .args
-                        .get(param_index)
-                        .and_then(|v| eval_next_state(body, state, *v, current))
-                    {
-                        next.insert(value);
-                    } else {
+                    if !record_backedge(
+                        body,
+                        state,
+                        param_index,
+                        current,
+                        target,
+                        &mut next,
+                        &mut transitions,
+                    ) {
                         unresolved_backedges += 1;
                     }
                 } else {
@@ -149,13 +183,15 @@ fn transitions_for(
                 if let Some(take_true) = eval_state_cond(body, state, *cond, current) {
                     let target = if take_true { if_true } else { if_false };
                     if target.block == dispatcher {
-                        if let Some(value) = target
-                            .args
-                            .get(param_index)
-                            .and_then(|v| eval_next_state(body, state, *v, current))
-                        {
-                            next.insert(value);
-                        } else {
+                        if !record_backedge(
+                            body,
+                            state,
+                            param_index,
+                            current,
+                            target,
+                            &mut next,
+                            &mut transitions,
+                        ) {
                             unresolved_backedges += 1;
                         }
                     } else {
@@ -165,13 +201,15 @@ fn transitions_for(
                     data_forks += 1;
                     for target in [if_true, if_false] {
                         if target.block == dispatcher {
-                            if let Some(value) = target
-                                .args
-                                .get(param_index)
-                                .and_then(|v| eval_next_state(body, state, *v, current))
-                            {
-                                next.insert(value);
-                            } else {
+                            if !record_backedge(
+                                body,
+                                state,
+                                param_index,
+                                current,
+                                target,
+                                &mut next,
+                                &mut transitions,
+                            ) {
                                 unresolved_backedges += 1;
                             }
                         } else {
@@ -186,13 +224,15 @@ fn transitions_for(
                 data_forks += 1;
                 for target in targets.iter().chain(std::iter::once(default)) {
                     if target.block == dispatcher {
-                        if let Some(value) = target
-                            .args
-                            .get(param_index)
-                            .and_then(|v| eval_next_state(body, state, *v, current))
-                        {
-                            next.insert(value);
-                        } else {
+                        if !record_backedge(
+                            body,
+                            state,
+                            param_index,
+                            current,
+                            target,
+                            &mut next,
+                            &mut transitions,
+                        ) {
                             unresolved_backedges += 1;
                         }
                     } else {
@@ -205,6 +245,7 @@ fn transitions_for(
     }
     TransitionTrace {
         next,
+        transitions,
         unresolved_backedges,
         data_forks,
         blocks: seen,
@@ -388,11 +429,18 @@ fn is_effectful_operator(op: &Operator) -> bool {
         || rendered.starts_with("elem.drop")
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct StateTransitionReport {
+    pub successor: u32,
+    pub arguments: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StateCaseReport {
     pub state: u32,
     pub blocks: BTreeSet<usize>,
     pub successors: BTreeSet<u32>,
+    pub transitions: Vec<StateTransitionReport>,
     pub nested_machines: BTreeSet<usize>,
     pub direct_nested_machines: BTreeSet<usize>,
     pub operator_counts: BTreeMap<String, usize>,
@@ -404,6 +452,7 @@ fn summarize_state_case(
     body: &FunctionBody,
     dispatcher: Block,
     state: Value,
+    param_index: usize,
     current: u32,
     trace: &TransitionTrace,
     excluded_blocks: &BTreeSet<Block>,
@@ -442,6 +491,29 @@ fn summarize_state_case(
         }
     }
 
+    let mut transitions = Vec::new();
+    for edge in &trace.transitions {
+        let arguments = edge
+            .args
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if index == param_index {
+                    format!("0x{:08x}", edge.successor)
+                } else {
+                    render_value(body, dispatcher, state, *value, 6)
+                }
+            })
+            .collect::<Vec<_>>();
+        let report = StateTransitionReport {
+            successor: edge.successor,
+            arguments,
+        };
+        if !transitions.contains(&report) {
+            transitions.push(report);
+        }
+    }
+
     StateCaseReport {
         state: current,
         blocks: trace
@@ -450,6 +522,7 @@ fn summarize_state_case(
             .map(|block| block.index())
             .collect(),
         successors: trace.next.clone(),
+        transitions,
         nested_machines: BTreeSet::new(),
         direct_nested_machines: BTreeSet::new(),
         operator_counts,
@@ -566,6 +639,7 @@ fn annotate_nested_machines(
                 body,
                 meta.dispatcher,
                 meta.state,
+                meta.param_index,
                 current,
                 &trace,
                 &excluded,
@@ -697,7 +771,15 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<Vec<StateMachineRepo
             .into_iter()
             .map(|current| {
                 let trace = transitions_for(body, dispatcher, state, param_index, current);
-                summarize_state_case(body, dispatcher, state, current, &trace, &BTreeSet::new())
+                summarize_state_case(
+                    body,
+                    dispatcher,
+                    state,
+                    param_index,
+                    current,
+                    &trace,
+                    &BTreeSet::new(),
+                )
             })
             .collect();
 
@@ -778,6 +860,8 @@ mod tests {
         assert_eq!(machine.cases.len(), 5);
         assert_eq!(machine.cases[0].state, 10);
         assert_eq!(machine.cases[0].successors, BTreeSet::from([20]));
+        assert_eq!(machine.cases[0].transitions.len(), 1);
+        assert_eq!(machine.cases[0].transitions[0].successor, 20);
         assert!(machine.cases[0].nested_machines.is_empty());
         assert!(machine.cases[0].direct_nested_machines.is_empty());
         assert_eq!(root_machine_indices(&machines), vec![0]);
