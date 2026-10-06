@@ -985,6 +985,34 @@ fn render_block(chunks: &[String]) -> String {
     format!("{{\n{}\n}}", chunks.join("\n"))
 }
 
+struct ArithmeticStateSetup<'a> {
+    state_var: String,
+    initial_number: f64,
+    init_text: String,
+    selector_stmts: &'a [Statement<'a>],
+    switch: &'a oxc_ast::ast::SwitchStatement<'a>,
+}
+
+fn arithmetic_state_result(
+    span: Span,
+    state_var: &str,
+    state_path: Vec<String>,
+    chunks: &[String],
+    termination: &str,
+) -> (String, ArithmeticStateProof) {
+    (
+        render_block(chunks),
+        ArithmeticStateProof {
+            iteration: 0,
+            input_start: span.start as usize,
+            input_end: span.end as usize,
+            state_var: state_var.to_string(),
+            state_path,
+            termination: termination.to_string(),
+        },
+    )
+}
+
 impl Collector<'_, '_> {
     fn reference_state_assignment(
         &self,
@@ -1283,15 +1311,15 @@ impl Collector<'_, '_> {
         self.simulate_reference_state(switch, &cases, setup)
     }
 
-    pub(super) fn arithmetic_state_replacement(
+    fn arithmetic_state_setup<'a>(
         &self,
-        it: &oxc_ast::ast::ForStatement<'_>,
-    ) -> Option<(String, ArithmeticStateProof)> {
+        it: &'a oxc_ast::ast::ForStatement<'a>,
+    ) -> Option<ArithmeticStateSetup<'a>> {
         if it.update.is_some() {
             return None;
         }
-        let init = it.init.as_ref()?;
-        let oxc_ast::ast::ForStatementInit::VariableDeclaration(init_decl) = init else {
+        let oxc_ast::ast::ForStatementInit::VariableDeclaration(init_decl) = it.init.as_ref()?
+        else {
             return None;
         };
         if init_decl.kind != VariableDeclarationKind::Var || init_decl.declarations.len() != 1 {
@@ -1302,15 +1330,13 @@ impl Collector<'_, '_> {
             return None;
         };
         let state_symbol = state_id.symbol_id.get()?;
-        let state_var = state_id.name.as_str();
-        let initial = eval(state_decl.init.as_ref()?)?;
-        let Value::Number(initial_number) = initial else {
+        let state_var = state_id.name.to_string();
+        let Value::Number(initial_number) = eval(state_decl.init.as_ref()?)? else {
             return None;
         };
-        if !initial_number.is_finite() || initial_number.fract() != 0.0 {
-            return None;
-        }
-        if !state_undefined_test(it.test.as_ref()?, state_var)
+        if !initial_number.is_finite()
+            || initial_number.fract() != 0.0
+            || !state_undefined_test(it.test.as_ref()?, &state_var)
             || !resolved_refs_within(self.scoping, self.reference_spans, state_symbol, it.span)
         {
             return None;
@@ -1327,101 +1353,122 @@ impl Collector<'_, '_> {
             return None;
         };
         if selector_stmts.is_empty()
-            || !selector_stmts
-                .iter()
-                .all(|stmt| matches!(stmt, Statement::VariableDeclaration(decl) if decl.kind == VariableDeclarationKind::Var))
+            || !selector_stmts.iter().all(
+                |stmt| matches!(stmt, Statement::VariableDeclaration(decl) if decl.kind == VariableDeclarationKind::Var),
+            )
         {
             return None;
         }
 
+        Some(ArithmeticStateSetup {
+            state_var,
+            initial_number,
+            init_text: format!("{};", fragment(self.source, init_decl.span)),
+            selector_stmts,
+            switch,
+        })
+    }
+
+    fn simulate_arithmetic_case(
+        &self,
+        switch: &oxc_ast::ast::SwitchStatement<'_>,
+        start: usize,
+        state_var: &str,
+        env: &mut HashMap<String, Value>,
+        chunks: &mut Vec<String>,
+    ) -> Option<StateFlow> {
+        let mut flow = StateFlow::Normal;
+        'cases: for case in switch.cases.iter().skip(start) {
+            for stmt in &case.consequent {
+                match stmt {
+                    Statement::BreakStatement(brk) if brk.label.is_none() => {
+                        break 'cases;
+                    }
+                    Statement::ContinueStatement(cont) if cont.label.is_none() => {
+                        flow = StateFlow::Continue;
+                        break 'cases;
+                    }
+                    _ => {
+                        let stmt_flow = simulate_statement(stmt, state_var, env)?;
+                        chunks.push(fragment(self.source, stmt.span()).to_string());
+                        match stmt_flow {
+                            StateFlow::Normal => {}
+                            StateFlow::Return | StateFlow::Throw => {
+                                flow = stmt_flow;
+                                break 'cases;
+                            }
+                            StateFlow::Break | StateFlow::Continue => return None,
+                        }
+                    }
+                }
+            }
+        }
+        Some(flow)
+    }
+
+    pub(super) fn arithmetic_state_replacement(
+        &self,
+        it: &oxc_ast::ast::ForStatement<'_>,
+    ) -> Option<(String, ArithmeticStateProof)> {
+        let setup = self.arithmetic_state_setup(it)?;
         let mut env = HashMap::new();
-        env.insert(state_var.to_string(), Value::Number(initial_number));
-        let mut chunks = vec![format!("{};", fragment(self.source, init_decl.span))];
+        env.insert(setup.state_var.clone(), Value::Number(setup.initial_number));
+        let mut chunks = vec![setup.init_text];
         let mut seen_states = HashSet::new();
         let mut state_path = Vec::new();
 
         for _ in 0..256 {
-            let state_key = env.get(state_var)?.render()?;
+            let state_key = env.get(&setup.state_var)?.render()?;
             if !seen_states.insert(state_key.clone()) {
                 return None;
             }
             state_path.push(state_key);
 
-            for selector_stmt in selector_stmts {
+            for selector_stmt in setup.selector_stmts {
                 let Statement::VariableDeclaration(decl) = selector_stmt else {
-                    unreachable!();
+                    return None;
                 };
-                simulate_statement(selector_stmt, state_var, &mut env)?;
+                simulate_statement(selector_stmt, &setup.state_var, &mut env)?;
                 chunks.push(fragment(self.source, decl.span).to_string());
             }
 
-            let start = select_switch_case(switch, &env)?;
-            let mut flow = StateFlow::Normal;
-            'cases: for case in switch.cases.iter().skip(start) {
-                for stmt in &case.consequent {
-                    match stmt {
-                        Statement::BreakStatement(brk) if brk.label.is_none() => {
-                            flow = StateFlow::Normal;
-                            break 'cases;
-                        }
-                        Statement::ContinueStatement(cont) if cont.label.is_none() => {
-                            flow = StateFlow::Continue;
-                            break 'cases;
-                        }
-                        _ => {
-                            let stmt_flow = simulate_statement(stmt, state_var, &mut env)?;
-                            chunks.push(fragment(self.source, stmt.span()).to_string());
-                            match stmt_flow {
-                                StateFlow::Normal => {}
-                                StateFlow::Return | StateFlow::Throw => {
-                                    flow = stmt_flow;
-                                    break 'cases;
-                                }
-                                StateFlow::Break | StateFlow::Continue => return None,
-                            }
-                        }
-                    }
-                }
+            let start = select_switch_case(setup.switch, &env)?;
+            let flow = self.simulate_arithmetic_case(
+                setup.switch,
+                start,
+                &setup.state_var,
+                &mut env,
+                &mut chunks,
+            )?;
+            if matches!(flow, StateFlow::Return | StateFlow::Throw) {
+                let termination = if flow == StateFlow::Return {
+                    "return"
+                } else {
+                    "throw"
+                };
+                return Some(arithmetic_state_result(
+                    it.span,
+                    &setup.state_var,
+                    state_path,
+                    &chunks,
+                    termination,
+                ));
+            }
+            if flow == StateFlow::Break {
+                return None;
             }
 
-            match flow {
-                StateFlow::Return | StateFlow::Throw => {
-                    let termination = if flow == StateFlow::Return {
-                        "return"
-                    } else {
-                        "throw"
-                    };
-                    return Some((
-                        format!("{{\n{}\n}}", chunks.join("\n")),
-                        ArithmeticStateProof {
-                            iteration: 0,
-                            input_start: it.span.start as usize,
-                            input_end: it.span.end as usize,
-                            state_var: state_var.to_string(),
-                            state_path,
-                            termination: termination.to_string(),
-                        },
-                    ));
-                }
-                StateFlow::Normal | StateFlow::Continue => {}
-                StateFlow::Break => return None,
-            }
-
-            match env.get(state_var) {
+            match env.get(&setup.state_var) {
                 Some(Value::Undefined) => {
-                    return Some((
-                        format!("{{\n{}\n}}", chunks.join("\n")),
-                        ArithmeticStateProof {
-                            iteration: 0,
-                            input_start: it.span.start as usize,
-                            input_end: it.span.end as usize,
-                            state_var: state_var.to_string(),
-                            state_path,
-                            termination: "undefined".to_string(),
-                        },
+                    return Some(arithmetic_state_result(
+                        it.span,
+                        &setup.state_var,
+                        state_path,
+                        &chunks,
+                        "undefined",
                     ));
                 }
-                Some(Value::Number(n)) if n.is_finite() && n.fract() == 0.0 => {}
+                Some(Value::Number(number)) if number.is_finite() && number.fract() == 0.0 => {}
                 _ => return None,
             }
         }
