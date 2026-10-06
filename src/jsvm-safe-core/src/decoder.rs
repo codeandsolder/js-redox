@@ -1142,216 +1142,181 @@ type DecoderDetection = (
     Vec<Replacement>,
 );
 
-fn detect_decoders(
+struct DecoderPatterns {
+    local: regex::Regex,
+    offset: regex::Regex,
+    index: regex::Regex,
+}
+
+fn decoder_patterns() -> Option<DecoderPatterns> {
+    Some(DecoderPatterns {
+        local: compile_regex(
+            r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\(\)\s*;",
+        )?,
+        offset: compile_regex(
+            r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*-\s*(0[xX][0-9A-Fa-f]+|[0-9]+)\s*;",
+        )?,
+        index: compile_regex(
+            r"\b(?:let|const|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\[([A-Za-z_$][A-Za-z0-9_$]*)\]\s*;",
+        )?,
+    })
+}
+
+fn function_name_counts(functions: &[FnInfo]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for function in functions {
+        *counts.entry(function.name.clone()).or_default() += 1;
+    }
+    counts
+}
+
+fn decoder_providers(
     source: &str,
     functions: &[FnInfo],
-    program: &oxc_ast::ast::Program<'_>,
-    scoping: &Scoping,
-) -> DecoderDetection {
-    let Some(local_re) = compile_regex(
-        r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\(\)\s*;",
-    ) else {
-        return (HashMap::new(), Vec::new(), Vec::new());
-    };
-    let Some(offset_re) = compile_regex(
-        r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*-\s*(0[xX][0-9A-Fa-f]+|[0-9]+)\s*;",
-    ) else {
-        return (HashMap::new(), Vec::new(), Vec::new());
-    };
-    let Some(index_re) = compile_regex(
-        r"\b(?:let|const|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\[([A-Za-z_$][A-Za-z0-9_$]*)\]\s*;",
-    ) else {
-        return (HashMap::new(), Vec::new(), Vec::new());
-    };
-
-    let mut name_counts: HashMap<String, usize> = HashMap::new();
-    for f in functions {
-        *name_counts.entry(f.name.clone()).or_default() += 1;
-    }
-
+) -> HashMap<(ScopeId, String), LocalStaticArrayInfo> {
     let mut providers = HashMap::new();
-    for f in functions {
-        if !f.params.is_empty() {
+    for function in functions {
+        if !function.params.is_empty() {
             continue;
         }
-        let body = fragment(source, f.span);
-        if (!body.contains(&format!("{} = function", f.name))
-            && !body.contains(&format!("{}=function", f.name)))
-            || !body.contains(&format!("return {}();", f.name))
+        let body = fragment(source, function.span);
+        if (!body.contains(&format!("{} = function", function.name))
+            && !body.contains(&format!("{}=function", function.name)))
+            || !body.contains(&format!("return {}();", function.name))
         {
             continue;
         }
-        for (array_name, values) in &f.static_arrays {
+        for (array_name, values) in &function.static_arrays {
             if body.contains(&format!("return {array_name};")) {
-                providers.insert((f.scope, f.name.clone()), values.clone());
+                providers.insert((function.scope, function.name.clone()), values.clone());
                 break;
             }
         }
     }
+    providers
+}
 
-    let mut by_name = HashMap::new();
-    for f in functions {
-        if f.params.is_empty() {
-            continue;
-        }
-        let body = fragment(source, f.span);
-        let Some(local) = local_re.captures(body) else {
-            continue;
-        };
-        let local_array = local[1].to_string();
-        let provider = local[2].to_string();
-        // Rotation proof below is textual. Fail closed if either function name
-        // occurs in more than one lexical scope, so a sibling IIFE cannot
-        // accidentally supply another decoder's rotation.
-        if name_counts.get(&f.name).copied() != Some(1)
-            || name_counts.get(&provider).copied() != Some(1)
-        {
-            continue;
-        }
-        let Some(provider_info) = providers.get(&(f.scope, provider.clone())) else {
-            continue;
-        };
-        let Some(off) = offset_re.captures(body) else {
-            continue;
-        };
-        if off[1] != off[2] {
-            continue;
-        }
-        let param = off[1].to_string();
-        let Some(public_param) = f.params.first() else {
-            continue;
-        };
-        let Some(offset) = parse_i64_literal(&off[3]) else {
-            continue;
-        };
-        let Some(index) = index_re.captures(body) else {
-            continue;
-        };
-        if index[2] != local_array || index[3] != param {
-            continue;
-        }
-        let value_var = index[1].to_string();
-        let bare_value_return = body.contains(&format!("return {value_var};"));
-        let sequence_value_return =
-            body.contains(&format!(", {value_var};")) || body.contains(&format!(",{value_var};"));
-
-        let Some(installs_replacement_re) = compile_regex(&format!(
-            r"\b{}\s*=\s*function\s*\(\s*{}\b",
-            regex::escape(&f.name),
-            regex::escape(&param),
-        )) else {
-            continue;
-        };
-        let Some(tail_calls_public_re) = compile_regex(&format!(
-            r"(?:\breturn\b|,)\s*{}\s*\(\s*{}\b",
-            regex::escape(&f.name),
-            regex::escape(public_param),
-        )) else {
-            continue;
-        };
-        let self_rewriting =
-            installs_replacement_re.is_match(body) && tail_calls_public_re.is_match(body);
-
-        // Some javascript-obfuscator-style outputs use the simpler, equally
-        // static shape directly instead of installing a memoizing replacement:
-        //
-        //   function d(i, unused) {
-        //     i = i - 123;
-        //     const table = provider();
-        //     let value = table[i];
-        //     return value;
-        //   }
-        //
-        // Match the complete function body rather than merely looking for the
-        // three ingredients, so arbitrary application array accessors are not
-        // promoted to decoders.
-        let Some(direct_re) = compile_regex(&format!(
-            r"(?s)^\s*function\s+{}\s*\([^)]*\)\s*\{{\s*{}\s*=\s*{}\s*-\s*(?:0[xX][0-9A-Fa-f]+|[0-9]+)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\(\s*\)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+{}\s*;\s*\}}\s*$",
-            regex::escape(&f.name),
-            regex::escape(&param),
-            regex::escape(&param),
-            regex::escape(&local_array),
-            regex::escape(&provider),
-            regex::escape(&value_var),
-            regex::escape(&local_array),
-            regex::escape(&param),
-            regex::escape(&value_var),
-        )) else {
-            continue;
-        };
-        let direct_index = direct_re.is_match(body);
-
-        if !direct_index && !(self_rewriting && (bare_value_return || sequence_value_return)) {
-            continue;
-        }
-
-        let transform = if body
-            .contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=")
-            && body.contains("decodeURIComponent")
-        {
-            // Recognize the pure javascript-obfuscator Base64 -> percent-URI
-            // decoder by its actual dataflow ingredients, not by whether the
-            // source happens to be minified. Some variants add a source-text
-            // self-defence gate whose result depends on Function#toString /
-            // line layout. Those introduce an additional charCodeAt probe.
-            //
-            // Requiring exactly the one charCodeAt used by the final
-            // percent-encoding loop accepts clean formatted decoders such as
-            // current aclib/suv5 while failing closed on the guarded variant.
-            let char_code_at_count = body.matches(".charCodeAt(").count();
-            let base64_uri_shape = body.contains(".charAt(")
-                && body.contains(".indexOf(")
-                && body.contains("String.fromCharCode")
-                && body.contains(".toString(16)");
-            if !base64_uri_shape || char_code_at_count == 0 {
-                continue;
-            }
-
-            // A single charCodeAt is the ordinary percent-encoding loop and is
-            // source-layout independent. Extra charCodeAt probes are treated as
-            // source-sensitive self-defence: retain the historical proof that
-            // they are safe only when the exact decoder representation is one
-            // physical line.
-            if char_code_at_count > 1 && (body.contains('\n') || body.contains('\r')) {
-                continue;
-            }
-            DecoderTransform::LowerAlphabetBase64Uri
-        } else {
-            DecoderTransform::Plain
-        };
-
-        by_name.insert(
-            f.name.clone(),
-            Decoder {
-                values: provider_info.values.clone(),
-                offset,
-                provider,
-                provider_array_span: provider_info.span,
-                transform,
-            },
-        );
+fn decoder_transform(body: &str) -> Option<DecoderTransform> {
+    if !body.contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=")
+        || !body.contains("decodeURIComponent")
+    {
+        return Some(DecoderTransform::Plain);
     }
 
-    let rotation_iifes = collect_rotation_iifes(program);
-    let (protected_spans, rotation_replacements) =
-        apply_proven_decoder_rotations(source, &mut by_name, &rotation_iifes);
+    // Recognize the pure javascript-obfuscator Base64 -> percent-URI decoder
+    // by its dataflow ingredients. Extra charCodeAt probes are source-sensitive
+    // self-defence unless the exact decoder representation is one physical line.
+    let char_code_at_count = body.matches(".charCodeAt(").count();
+    let base64_uri_shape = body.contains(".charAt(")
+        && body.contains(".indexOf(")
+        && body.contains("String.fromCharCode")
+        && body.contains(".toString(16)");
+    if !base64_uri_shape || char_code_at_count == 0 {
+        return None;
+    }
+    if char_code_at_count > 1 && (body.contains('\n') || body.contains('\r')) {
+        return None;
+    }
+    Some(DecoderTransform::LowerAlphabetBase64Uri)
+}
 
-    let mut out = HashMap::new();
-    for f in functions {
-        if let Some(decoder) = by_name.get(&f.name) {
-            out.insert(f.symbol, decoder.clone());
-        }
+fn detect_decoder_candidate(
+    source: &str,
+    function: &FnInfo,
+    patterns: &DecoderPatterns,
+    name_counts: &HashMap<String, usize>,
+    providers: &HashMap<(ScopeId, String), LocalStaticArrayInfo>,
+) -> Option<Decoder> {
+    if function.params.is_empty() {
+        return None;
+    }
+    let body = fragment(source, function.span);
+    let local = patterns.local.captures(body)?;
+    let local_array = local[1].to_string();
+    let provider = local[2].to_string();
+
+    // Rotation proof below is textual. Fail closed if either function name
+    // occurs in more than one lexical scope, so a sibling IIFE cannot
+    // accidentally supply another decoder's rotation.
+    if name_counts.get(&function.name).copied() != Some(1)
+        || name_counts.get(&provider).copied() != Some(1)
+    {
+        return None;
+    }
+    let provider_info = providers.get(&(function.scope, provider.clone()))?;
+    let offset_match = patterns.offset.captures(body)?;
+    if offset_match[1] != offset_match[2] {
+        return None;
+    }
+    let param = offset_match[1].to_string();
+    let public_param = function.params.first()?;
+    let offset = parse_i64_literal(&offset_match[3])?;
+    let index = patterns.index.captures(body)?;
+    if index[2] != local_array || index[3] != param {
+        return None;
+    }
+    let value_var = index[1].to_string();
+    let bare_value_return = body.contains(&format!("return {value_var};"));
+    let sequence_value_return =
+        body.contains(&format!(", {value_var};")) || body.contains(&format!(",{value_var};"));
+
+    let installs_replacement_re = compile_regex(&format!(
+        r"\b{}\s*=\s*function\s*\(\s*{}\b",
+        regex::escape(&function.name),
+        regex::escape(&param),
+    ))?;
+    let tail_calls_public_re = compile_regex(&format!(
+        r"(?:\breturn\b|,)\s*{}\s*\(\s*{}\b",
+        regex::escape(&function.name),
+        regex::escape(public_param),
+    ))?;
+    let self_rewriting =
+        installs_replacement_re.is_match(body) && tail_calls_public_re.is_match(body);
+
+    // Some javascript-obfuscator-style outputs use a simpler direct static
+    // accessor rather than installing a memoizing replacement. Match the whole
+    // function body so arbitrary application array accessors do not qualify.
+    let direct_re = compile_regex(&format!(
+        r"(?s)^\s*function\s+{}\s*\([^)]*\)\s*\{{\s*{}\s*=\s*{}\s*-\s*(?:0[xX][0-9A-Fa-f]+|[0-9]+)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\(\s*\)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+{}\s*;\s*\}}\s*$",
+        regex::escape(&function.name),
+        regex::escape(&param),
+        regex::escape(&param),
+        regex::escape(&local_array),
+        regex::escape(&provider),
+        regex::escape(&value_var),
+        regex::escape(&local_array),
+        regex::escape(&param),
+        regex::escape(&value_var),
+    ))?;
+    if !direct_re.is_match(body)
+        && !(self_rewriting && (bare_value_return || sequence_value_return))
+    {
+        return None;
     }
 
+    Some(Decoder {
+        values: provider_info.values.clone(),
+        offset,
+        provider,
+        provider_array_span: provider_info.span,
+        transform: decoder_transform(body)?,
+    })
+}
+
+fn propagate_decoder_aliases(
+    decoders: &mut HashMap<SymbolId, Decoder>,
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) {
     let aliases = collect_symbol_aliases(program, scoping);
     loop {
         let mut changed = false;
         for (alias_symbol, target_symbol) in &aliases {
-            if out.contains_key(alias_symbol) {
+            if decoders.contains_key(alias_symbol) {
                 continue;
             }
-            if let Some(decoder) = out.get(target_symbol).cloned() {
-                out.insert(*alias_symbol, decoder);
+            if let Some(decoder) = decoders.get(target_symbol).cloned() {
+                decoders.insert(*alias_symbol, decoder);
                 changed = true;
             }
         }
@@ -1359,6 +1324,41 @@ fn detect_decoders(
             break;
         }
     }
+}
+
+fn detect_decoders(
+    source: &str,
+    functions: &[FnInfo],
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> DecoderDetection {
+    let Some(patterns) = decoder_patterns() else {
+        return (HashMap::new(), Vec::new(), Vec::new());
+    };
+    let name_counts = function_name_counts(functions);
+    let providers = decoder_providers(source, functions);
+    let mut by_name = functions
+        .iter()
+        .filter_map(|function| {
+            detect_decoder_candidate(source, function, &patterns, &name_counts, &providers)
+                .map(|decoder| (function.name.clone(), decoder))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let rotation_iifes = collect_rotation_iifes(program);
+    let (protected_spans, rotation_replacements) =
+        apply_proven_decoder_rotations(source, &mut by_name, &rotation_iifes);
+
+    let mut out = functions
+        .iter()
+        .filter_map(|function| {
+            by_name
+                .get(&function.name)
+                .cloned()
+                .map(|decoder| (function.symbol, decoder))
+        })
+        .collect::<HashMap<_, _>>();
+    propagate_decoder_aliases(&mut out, program, scoping);
 
     (out, protected_spans, rotation_replacements)
 }
