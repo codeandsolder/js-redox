@@ -483,6 +483,185 @@ impl<'s> Analyzer<'s> {
             .or_insert((assign.span.start, assign.span.end));
     }
 
+    fn push_function_state(&mut self, id: String, start: u32, end: u32) {
+        self.function_stack.push(FunctionState {
+            id,
+            start,
+            end,
+            loops: 0,
+            transitions: HashMap::new(),
+            handler_calls: Vec::new(),
+            handler_aliases: HashMap::new(),
+            producers: Vec::new(),
+            numeric_schedules: HashSet::new(),
+        });
+    }
+
+    fn record_handler_alias(&mut self, name: &str, expr: &Expression<'_>) {
+        let Expression::ComputedMemberExpression(member) = unwrap_parens(expr) else {
+            return;
+        };
+        let schedules = self
+            .function_stack
+            .last()
+            .map(|current| current.numeric_schedules.clone())
+            .unwrap_or_default();
+        let alias = HandlerCall {
+            table: fragment(self.source, member.object.span()),
+            index: fragment(self.source, member.expression.span()),
+            start: member.span.start,
+            end: member.span.end,
+            schedule_backed: expression_uses_numeric_schedule(&member.expression, &schedules),
+        };
+        if let Some(current) = self.current_mut() {
+            current.handler_aliases.insert(name.to_string(), alias);
+        }
+    }
+
+    fn record_producer(&mut self, target: String, expr: &Expression<'_>) {
+        let Expression::CallExpression(call) = unwrap_parens(expr) else {
+            return;
+        };
+        let Some(method) = static_method(call) else {
+            return;
+        };
+        if let Some(current) = self.current_mut() {
+            current.producers.push(ProducerCall { target, method });
+        }
+    }
+
+    fn enter_variable_declarator(&mut self, declarator: &oxc_ast::ast::VariableDeclarator<'_>) {
+        let BindingPattern::BindingIdentifier(id) = &declarator.id else {
+            return;
+        };
+        let Some(init) = declarator.init.as_ref() else {
+            return;
+        };
+        let name = id.name.to_string();
+
+        match unwrap_parens(init) {
+            Expression::ArrayExpression(array) => {
+                self.record_array_table(&name, array);
+                if array.elements.len() >= 4
+                    && array
+                        .elements
+                        .iter()
+                        .all(|element| matches!(element, ArrayExpressionElement::NumericLiteral(_)))
+                {
+                    if let Some(current) = self.current_mut() {
+                        current.numeric_schedules.insert(name.clone());
+                    }
+                }
+            }
+            Expression::ObjectExpression(object) => self.record_object_table(&name, object),
+            Expression::FunctionExpression(function) => {
+                self.function_aliases
+                    .insert((function.span.start, function.span.end), name.clone());
+            }
+            Expression::ArrowFunctionExpression(function) => {
+                self.function_aliases
+                    .insert((function.span.start, function.span.end), name.clone());
+            }
+            _ => {}
+        }
+
+        self.record_transition(name.clone(), init);
+        self.record_handler_alias(&name, init);
+        self.record_producer(name, init);
+    }
+
+    fn enter_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'_>) {
+        self.record_registry_assignment(assignment);
+
+        match unwrap_parens(&assignment.right) {
+            Expression::FunctionExpression(function) => {
+                self.function_aliases.insert(
+                    (function.span.start, function.span.end),
+                    target_source(self.source, &assignment.left),
+                );
+            }
+            Expression::ArrowFunctionExpression(function) => {
+                self.function_aliases.insert(
+                    (function.span.start, function.span.end),
+                    target_source(self.source, &assignment.left),
+                );
+            }
+            _ => {}
+        }
+
+        if let Some(name) = target_ident(&assignment.left) {
+            self.record_transition(name.clone(), &assignment.right);
+            self.record_handler_alias(&name, &assignment.right);
+            self.record_producer(name, &assignment.right);
+        }
+
+        let Some((result, index)) = result_index(&assignment.right) else {
+            return;
+        };
+        let target = target_source(self.source, &assignment.left);
+        if let Some(current) = self.current_mut() {
+            if let Some(draft) = current.transitions.get_mut(&result) {
+                draft.state_target = Some(target);
+                draft.state_result_index = Some(index);
+            }
+        }
+    }
+
+    fn enter_return_statement(&mut self, statement: &oxc_ast::ast::ReturnStatement<'_>) {
+        let Some(argument) = statement.argument.as_ref() else {
+            return;
+        };
+        let Some((result, index)) = result_index(argument) else {
+            return;
+        };
+        if let Some(current) = self.current_mut() {
+            if let Some(draft) = current.transitions.get_mut(&result) {
+                draft.opcode_result_index = Some(index);
+            }
+        }
+    }
+
+    fn enter_call_expression(&mut self, call: &CallExpression<'_>) {
+        match unwrap_parens(&call.callee) {
+            Expression::ComputedMemberExpression(member) => {
+                let table = fragment(self.source, member.object.span());
+                if table.is_empty() {
+                    return;
+                }
+                let index = fragment(self.source, member.expression.span());
+                let schedules = self
+                    .function_stack
+                    .last()
+                    .map(|current| current.numeric_schedules.clone())
+                    .unwrap_or_default();
+                let schedule_backed =
+                    expression_uses_numeric_schedule(&member.expression, &schedules);
+                if let Some(current) = self.current_mut() {
+                    current.handler_calls.push(HandlerCall {
+                        table,
+                        index,
+                        start: call.span.start,
+                        end: call.span.end,
+                        schedule_backed,
+                    });
+                }
+            }
+            Expression::Identifier(id) => {
+                let alias = self
+                    .function_stack
+                    .last()
+                    .and_then(|current| current.handler_aliases.get(id.name.as_str()))
+                    .cloned();
+                if let (Some(current), Some(mut alias)) = (self.current_mut(), alias) {
+                    alias.start = call.span.start;
+                    alias.end = call.span.end;
+                    current.handler_calls.push(alias);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn finish_function(&mut self) {
         let Some(state) = self.function_stack.pop() else {
             return;
@@ -766,235 +945,48 @@ impl<'s> Analyzer<'s> {
 impl<'a> Visit<'a> for Analyzer<'_> {
     fn enter_node(&mut self, kind: AstKind<'a>) {
         match kind {
-            AstKind::Function(f) => {
-                let id = format!("fn@{:x}-{:x}", f.span.start, f.span.end);
-                if let Some(name) = f.id.as_ref() {
-                    self.function_aliases
-                        .insert((f.span.start, f.span.end), name.name.to_string());
+            AstKind::Function(function) => {
+                let id = format!("fn@{:x}-{:x}", function.span.start, function.span.end);
+                if let Some(name) = function.id.as_ref() {
+                    self.function_aliases.insert(
+                        (function.span.start, function.span.end),
+                        name.name.to_string(),
+                    );
                 }
-                self.function_stack.push(FunctionState {
-                    id,
-                    start: f.span.start,
-                    end: f.span.end,
-                    loops: 0,
-                    transitions: HashMap::new(),
-                    handler_calls: Vec::new(),
-                    handler_aliases: HashMap::new(),
-                    producers: Vec::new(),
-                    numeric_schedules: HashSet::new(),
-                });
+                self.push_function_state(id, function.span.start, function.span.end);
             }
-            AstKind::ArrowFunctionExpression(f) => {
-                self.function_stack.push(FunctionState {
-                    id: format!("fn@{:x}-{:x}", f.span.start, f.span.end),
-                    start: f.span.start,
-                    end: f.span.end,
-                    loops: 0,
-                    transitions: HashMap::new(),
-                    handler_calls: Vec::new(),
-                    handler_aliases: HashMap::new(),
-                    producers: Vec::new(),
-                    numeric_schedules: HashSet::new(),
-                });
+            AstKind::ArrowFunctionExpression(function) => {
+                self.push_function_state(
+                    format!("fn@{:x}-{:x}", function.span.start, function.span.end),
+                    function.span.start,
+                    function.span.end,
+                );
             }
             AstKind::ForStatement(_)
             | AstKind::WhileStatement(_)
             | AstKind::DoWhileStatement(_)
             | AstKind::ForInStatement(_)
             | AstKind::ForOfStatement(_) => {
-                if let Some(cur) = self.current_mut() {
-                    cur.loops += 1;
+                if let Some(current) = self.current_mut() {
+                    current.loops += 1;
                 }
             }
-            AstKind::VariableDeclarator(v) => {
-                let BindingPattern::BindingIdentifier(id) = &v.id else {
-                    return;
-                };
-                let Some(init) = v.init.as_ref() else {
-                    return;
-                };
-                let name = id.name.to_string();
-
-                match unwrap_parens(init) {
-                    Expression::ArrayExpression(arr) => {
-                        self.record_array_table(&name, arr);
-                        if arr.elements.len() >= 4
-                            && arr
-                                .elements
-                                .iter()
-                                .all(|el| matches!(el, ArrayExpressionElement::NumericLiteral(_)))
-                        {
-                            if let Some(cur) = self.current_mut() {
-                                cur.numeric_schedules.insert(name.clone());
-                            }
-                        }
-                    }
-                    Expression::ObjectExpression(obj) => self.record_object_table(&name, obj),
-                    Expression::FunctionExpression(f) => {
-                        self.function_aliases
-                            .insert((f.span.start, f.span.end), name.clone());
-                    }
-                    Expression::ArrowFunctionExpression(f) => {
-                        self.function_aliases
-                            .insert((f.span.start, f.span.end), name.clone());
-                    }
-                    _ => {}
-                }
-
-                self.record_transition(name.clone(), init);
-
-                if let Expression::ComputedMemberExpression(cm) = unwrap_parens(init) {
-                    let schedules = self
-                        .function_stack
-                        .last()
-                        .map(|cur| cur.numeric_schedules.clone())
-                        .unwrap_or_default();
-                    let alias = HandlerCall {
-                        table: fragment(self.source, cm.object.span()),
-                        index: fragment(self.source, cm.expression.span()),
-                        start: cm.span.start,
-                        end: cm.span.end,
-                        schedule_backed: expression_uses_numeric_schedule(
-                            &cm.expression,
-                            &schedules,
-                        ),
-                    };
-                    if let Some(cur) = self.current_mut() {
-                        cur.handler_aliases.insert(name.clone(), alias);
-                    }
-                }
-
-                if let Expression::CallExpression(call) = unwrap_parens(init) {
-                    if let Some(method) = static_method(call) {
-                        if let Some(cur) = self.current_mut() {
-                            cur.producers.push(ProducerCall {
-                                target: name,
-                                method,
-                            });
-                        }
-                    }
-                }
+            AstKind::VariableDeclarator(declarator) => self.enter_variable_declarator(declarator),
+            AstKind::AssignmentExpression(assignment) => {
+                self.enter_assignment_expression(assignment);
             }
-            AstKind::AssignmentExpression(assign) => {
-                self.record_registry_assignment(assign);
-
-                if let Expression::FunctionExpression(f) = unwrap_parens(&assign.right) {
-                    self.function_aliases.insert(
-                        (f.span.start, f.span.end),
-                        target_source(self.source, &assign.left),
-                    );
-                } else if let Expression::ArrowFunctionExpression(f) = unwrap_parens(&assign.right)
-                {
-                    self.function_aliases.insert(
-                        (f.span.start, f.span.end),
-                        target_source(self.source, &assign.left),
-                    );
-                }
-
-                if let Some(name) = target_ident(&assign.left) {
-                    self.record_transition(name.clone(), &assign.right);
-                    if let Expression::ComputedMemberExpression(cm) = unwrap_parens(&assign.right) {
-                        let schedules = self
-                            .function_stack
-                            .last()
-                            .map(|cur| cur.numeric_schedules.clone())
-                            .unwrap_or_default();
-                        let alias = HandlerCall {
-                            table: fragment(self.source, cm.object.span()),
-                            index: fragment(self.source, cm.expression.span()),
-                            start: cm.span.start,
-                            end: cm.span.end,
-                            schedule_backed: expression_uses_numeric_schedule(
-                                &cm.expression,
-                                &schedules,
-                            ),
-                        };
-                        if let Some(cur) = self.current_mut() {
-                            cur.handler_aliases.insert(name.clone(), alias);
-                        }
-                    }
-                    if let Expression::CallExpression(call) = unwrap_parens(&assign.right) {
-                        if let Some(method) = static_method(call) {
-                            if let Some(cur) = self.current_mut() {
-                                cur.producers.push(ProducerCall {
-                                    target: name,
-                                    method,
-                                });
-                            }
-                        }
-                    }
-                }
-
-                let Some((result, index)) = result_index(&assign.right) else {
-                    return;
-                };
-                let target = target_source(self.source, &assign.left);
-                if let Some(cur) = self.current_mut() {
-                    if let Some(draft) = cur.transitions.get_mut(&result) {
-                        draft.state_target = Some(target);
-                        draft.state_result_index = Some(index);
-                    }
-                }
-            }
-            AstKind::ReturnStatement(ret) => {
-                let Some(arg) = ret.argument.as_ref() else {
-                    return;
-                };
-                let Some((result, index)) = result_index(arg) else {
-                    return;
-                };
-                if let Some(cur) = self.current_mut() {
-                    if let Some(draft) = cur.transitions.get_mut(&result) {
-                        draft.opcode_result_index = Some(index);
-                    }
-                }
-            }
-            AstKind::CallExpression(call) => match unwrap_parens(&call.callee) {
-                Expression::ComputedMemberExpression(cm) => {
-                    let table = fragment(self.source, cm.object.span());
-                    if table.is_empty() {
-                        return;
-                    }
-                    let index = fragment(self.source, cm.expression.span());
-                    let schedules = self
-                        .function_stack
-                        .last()
-                        .map(|cur| cur.numeric_schedules.clone())
-                        .unwrap_or_default();
-                    let schedule_backed =
-                        expression_uses_numeric_schedule(&cm.expression, &schedules);
-                    if let Some(cur) = self.current_mut() {
-                        cur.handler_calls.push(HandlerCall {
-                            table,
-                            index,
-                            start: call.span.start,
-                            end: call.span.end,
-                            schedule_backed,
-                        });
-                    }
-                }
-                Expression::Identifier(id) => {
-                    let alias = self
-                        .function_stack
-                        .last()
-                        .and_then(|cur| cur.handler_aliases.get(id.name.as_str()))
-                        .cloned();
-                    if let (Some(cur), Some(mut alias)) = (self.current_mut(), alias) {
-                        alias.start = call.span.start;
-                        alias.end = call.span.end;
-                        cur.handler_calls.push(alias);
-                    }
-                }
-                _ => {}
-            },
+            AstKind::ReturnStatement(statement) => self.enter_return_statement(statement),
+            AstKind::CallExpression(call) => self.enter_call_expression(call),
             _ => {}
         }
     }
 
     fn leave_node(&mut self, kind: AstKind<'a>) {
-        match kind {
-            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) => self.finish_function(),
-            _ => {}
+        if matches!(
+            kind,
+            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+        ) {
+            self.finish_function();
         }
     }
 
