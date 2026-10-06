@@ -504,6 +504,241 @@ fn regex_is(pattern: &str, text: &str) -> bool {
     Regex::new(pattern).is_ok_and(|re| re.is_match(text))
 }
 
+fn infer_indexed_semantic_label(parts: &[&str], text: &str, kinds: &[&str]) -> String {
+    if parts.is_empty() {
+        return "nop".into();
+    }
+    if text.contains("stack[--sp]?") && text.contains("ip") {
+        if regex_is(r"\?ip=[^:]+:ip\+\+", text) {
+            return "jump_if_truthy".into();
+        }
+        if regex_is(r"\?ip\+\+:ip=", text) {
+            return "jump_if_falsy".into();
+        }
+        return "conditional_jump".into();
+    }
+    if parts.len() == 1 && regex_is(r"^ip=[^;]+$", parts[0]) {
+        return "jump".into();
+    }
+    if parts.contains(&"stack[--sp]") {
+        return "pop".into();
+    }
+    if text.contains("stack[sp-1]") && text.contains("stack[sp++]=e") {
+        return "dup".into();
+    }
+    if text.contains("stack[sp++]=null") {
+        return "push_null".into();
+    }
+    if text.contains("stack[sp++]=void 0") {
+        return "push_undefined".into();
+    }
+    if text.contains("e+1n") && text.contains("stack[sp++]=") {
+        return "increment".into();
+    }
+    if text.contains("e-1n") && text.contains("stack[sp++]=") {
+        return "decrement".into();
+    }
+    if regex_is(r"stack\[sp\+\+\]=typeof e===v\?e:\+e", text) {
+        return "to_number".into();
+    }
+    if (text.contains("Reflect.set")
+        || regex_is(
+            r"\b[A-Za-z_$][A-Za-z0-9_$]*\[[^\]]+\]=e(?:\s*[;,]|\s*$)",
+            text,
+        ))
+        && text.contains("stack[sp++]=e")
+    {
+        return "property_set".into();
+    }
+    if text.contains("stack[sp++]=t[e]") || text.contains("stack[sp++]=e[t]") {
+        return "property_get".into();
+    }
+    if let Some(caps) = Regex::new(r"stack\[sp\+\+\]=t(===|!==|==|!=|<=|>=|<|>|\+|-|\*|/|%)e")
+        .ok()
+        .and_then(|re| re.captures(text))
+    {
+        return match &caps[1] {
+            "===" => "strict_eq",
+            "!==" => "strict_neq",
+            "==" => "loose_eq",
+            "!=" => "loose_neq",
+            "<" => "lt",
+            "<=" => "lte",
+            ">" => "gt",
+            ">=" => "gte",
+            "+" => "add",
+            "-" => "sub",
+            "*" => "mul",
+            "/" => "div",
+            "%" => "mod",
+            _ => "binary_op",
+        }
+        .into();
+    }
+    if kinds.first() == Some(&"computed_store") {
+        return "slot_store".into();
+    }
+    if kinds == ["stack_store", "ip_advance"] {
+        return "slot_load".into();
+    }
+    "indexed_unknown".into()
+}
+
+fn infer_call_control_label(terminal: &str, parts: &[&str], text: &str) -> Option<&'static str> {
+    if parts.is_empty() {
+        return Some("nop");
+    }
+    if text.contains("yield") {
+        return Some("yield");
+    }
+    if parts.iter().any(|part| part.starts_with("throw ")) {
+        return Some("throw");
+    }
+    if terminal == "return" {
+        return Some(
+            if !text.contains("stack_pop()") && text.contains("stack[") {
+                "return_peek"
+            } else {
+                "return"
+            },
+        );
+    }
+    if regex_is(r"stack_pop\(\)\|\|\(ip=", text) {
+        return Some("jump_if_falsy");
+    }
+    if regex_is(r"stack_pop\(\)&&\(ip=", text) {
+        return Some("jump_if_truthy");
+    }
+    if parts.len() == 1 && parts[0] == "ip=read_u16()" {
+        return Some("jump");
+    }
+    if parts.len() == 1 && parts[0] == "stack_pop()" {
+        return Some("pop");
+    }
+    if text.contains("control_stack.pop()") {
+        return Some("control_pop");
+    }
+    if text.contains("control_stack")
+        && (text.contains(".push({") || regex_is(r"control_stack\[[^\]]+\]\(\{", text))
+    {
+        return Some("control_push");
+    }
+    if text.contains("for(") && text.contains("=env;") && text.contains("||env)[") {
+        return Some("env_store");
+    }
+    if text.contains("Object")
+        && text.contains("(env)")
+        && text.contains("function(...e)")
+        && text.contains("ip+=")
+    {
+        return Some("closure_create");
+    }
+    if (text.contains("Reflect.") || text.contains("Reflect["))
+        && text.contains("stack_push")
+        && text.contains("stack_pop()")
+    {
+        return Some("construct");
+    }
+    if text.contains("stack_push(function(){switch(read_byte())") {
+        return Some("push_literal");
+    }
+    if text.contains("if(!stack") && text.contains("stack_push(stack[") {
+        return Some("dup");
+    }
+    if text.contains("for(")
+        && regex_is(r"=2\*", text)
+        && regex_is(r"=\{\}", text)
+        && text.contains("stack_push")
+    {
+        return Some("object_from_pairs");
+    }
+    if text.contains("stack_push(env_lookup(read_string()))") {
+        return Some("env_load");
+    }
+    if text.contains("env_lookup(") && text.contains("stack_push") && text.contains("...") {
+        return Some("env_call");
+    }
+    if text.contains(" in env?") && text.contains("env_fallback") && text.contains("stack_push") {
+        return Some("env_load_soft");
+    }
+    if text.contains(" in ") && text.contains("throw Error") && text.contains("stack_push") {
+        return Some("global_load_checked");
+    }
+    if regex_is(r"\[[^\]]+\]=[^;]+", text) && text.contains("stack_push") {
+        return Some("property_set");
+    }
+    None
+}
+
+fn infer_call_member_label(text: &str, kinds: &[&str]) -> String {
+    // Method calls survive in several equivalent encodings:
+    // receiver[prop].call(receiver, ...args), receiver[prop][decoded_call](receiver,...),
+    // or a member saved to a temporary before decoded invocation.
+    if text.contains("read_string()") && text.contains("stack_push") && text.contains("...") {
+        if text.contains(".call(")
+            || regex_is(
+                r"[A-Za-z_$][A-Za-z0-9_$]*\[[^\]]+\]\[[^\]]+\]\([A-Za-z_$][A-Za-z0-9_$]*,\.\.\.",
+                text,
+            )
+        {
+            return "method_call".into();
+        }
+        if let Some(caps) =
+            Regex::new(r",([A-Za-z_$][A-Za-z0-9_$]*)=([A-Za-z_$][A-Za-z0-9_$]*)\[[^\]]+\]")
+                .ok()
+                .and_then(|re| re.captures(text))
+        {
+            let temp = regex::escape(&caps[1]);
+            let receiver = regex::escape(&caps[2]);
+            let pattern = format!(r"stack_push\({temp}\[[^\]]+\]\({receiver},\.\.\.");
+            if regex_is(&pattern, text) {
+                return "method_call".into();
+            }
+        }
+    }
+    if text.contains("read_string()")
+        && text.contains("stack_push")
+        && regex_is(r"stack_push\([^;]*\[[^\]]+\]\)", text)
+    {
+        return "property_get".into();
+    }
+    if regex_is(r"stack_push\([^;]*\[[^\]]+\]\)", text) && text.contains("stack_pop()") {
+        return "property_get".into();
+    }
+    if text.contains("stack_push([") && text.contains("...") {
+        return "spread_concat".into();
+    }
+    if text.contains("read_u16()")
+        && text.contains("stack_push(")
+        && (text.contains("splice(") || regex_is(r"stack\[[^\]]+\]\(", text))
+    {
+        return "collect_args".into();
+    }
+    if text.contains("stack_push") && text.contains("...") && text.contains("stack_pop()") {
+        return "call".into();
+    }
+    if text.contains("read_byte()")
+        && text.contains("stack_push")
+        && regex_is(r"\[[A-Za-z_$][A-Za-z0-9_$]*\]\(", text)
+    {
+        return "operator_dispatch".into();
+    }
+    if kinds == ["dynamic_call"] {
+        return "control_pop".into();
+    }
+    if text.contains("stack_push") {
+        return "push_value".into();
+    }
+    "call_unknown".into()
+}
+
+fn infer_call_semantic_label(terminal: &str, parts: &[&str], text: &str, kinds: &[&str]) -> String {
+    if let Some(label) = infer_call_control_label(terminal, parts, text) {
+        return label.to_string();
+    }
+    infer_call_member_label(text, kinds)
+}
+
 fn infer_semantic_label(
     selector_style: &str,
     terminal: &str,
@@ -520,225 +755,10 @@ fn infer_semantic_label(
         .collect::<Vec<_>>();
 
     if selector_style == "indexed" {
-        if parts.is_empty() {
-            return "nop".into();
-        }
-        if text.contains("stack[--sp]?") && text.contains("ip") {
-            if regex_is(r"\?ip=[^:]+:ip\+\+", &text) {
-                return "jump_if_truthy".into();
-            }
-            if regex_is(r"\?ip\+\+:ip=", &text) {
-                return "jump_if_falsy".into();
-            }
-            return "conditional_jump".into();
-        }
-        if parts.len() == 1 && regex_is(r"^ip=[^;]+$", parts[0]) {
-            return "jump".into();
-        }
-        if parts.contains(&"stack[--sp]") {
-            return "pop".into();
-        }
-        if text.contains("stack[sp-1]") && text.contains("stack[sp++]=e") {
-            return "dup".into();
-        }
-        if text.contains("stack[sp++]=null") {
-            return "push_null".into();
-        }
-        if text.contains("stack[sp++]=void 0") {
-            return "push_undefined".into();
-        }
-        if text.contains("e+1n") && text.contains("stack[sp++]=") {
-            return "increment".into();
-        }
-        if text.contains("e-1n") && text.contains("stack[sp++]=") {
-            return "decrement".into();
-        }
-        if regex_is(r"stack\[sp\+\+\]=typeof e===v\?e:\+e", &text) {
-            return "to_number".into();
-        }
-        if (text.contains("Reflect.set")
-            || regex_is(
-                r"\b[A-Za-z_$][A-Za-z0-9_$]*\[[^\]]+\]=e(?:\s*[;,]|\s*$)",
-                &text,
-            ))
-            && text.contains("stack[sp++]=e")
-        {
-            return "property_set".into();
-        }
-        if text.contains("stack[sp++]=t[e]") || text.contains("stack[sp++]=e[t]") {
-            return "property_get".into();
-        }
-        if let Some(caps) = Regex::new(r"stack\[sp\+\+\]=t(===|!==|==|!=|<=|>=|<|>|\+|-|\*|/|%)e")
-            .ok()
-            .and_then(|re| re.captures(&text))
-        {
-            return match &caps[1] {
-                "===" => "strict_eq",
-                "!==" => "strict_neq",
-                "==" => "loose_eq",
-                "!=" => "loose_neq",
-                "<" => "lt",
-                "<=" => "lte",
-                ">" => "gt",
-                ">=" => "gte",
-                "+" => "add",
-                "-" => "sub",
-                "*" => "mul",
-                "/" => "div",
-                "%" => "mod",
-                _ => "binary_op",
-            }
-            .into();
-        }
-        if kinds.first() == Some(&"computed_store") {
-            return "slot_store".into();
-        }
-        if kinds == ["stack_store", "ip_advance"] {
-            return "slot_load".into();
-        }
-        return "indexed_unknown".into();
+        infer_indexed_semantic_label(&parts, &text, &kinds)
+    } else {
+        infer_call_semantic_label(terminal, &parts, &text, &kinds)
     }
-
-    if parts.is_empty() {
-        return "nop".into();
-    }
-    if text.contains("yield") {
-        return "yield".into();
-    }
-    if parts.iter().any(|part| part.starts_with("throw ")) {
-        return "throw".into();
-    }
-    if terminal == "return" {
-        return if !text.contains("stack_pop()") && text.contains("stack[") {
-            "return_peek".into()
-        } else {
-            "return".into()
-        };
-    }
-    if regex_is(r"stack_pop\(\)\|\|\(ip=", &text) {
-        return "jump_if_falsy".into();
-    }
-    if regex_is(r"stack_pop\(\)&&\(ip=", &text) {
-        return "jump_if_truthy".into();
-    }
-    if parts.len() == 1 && parts[0] == "ip=read_u16()" {
-        return "jump".into();
-    }
-    if parts.len() == 1 && parts[0] == "stack_pop()" {
-        return "pop".into();
-    }
-    if text.contains("control_stack.pop()") {
-        return "control_pop".into();
-    }
-    if text.contains("control_stack")
-        && (text.contains(".push({") || regex_is(r"control_stack\[[^\]]+\]\(\{", &text))
-    {
-        return "control_push".into();
-    }
-    if text.contains("for(") && text.contains("=env;") && text.contains("||env)[") {
-        return "env_store".into();
-    }
-    if text.contains("Object")
-        && text.contains("(env)")
-        && text.contains("function(...e)")
-        && text.contains("ip+=")
-    {
-        return "closure_create".into();
-    }
-    if (text.contains("Reflect.") || text.contains("Reflect["))
-        && text.contains("stack_push")
-        && text.contains("stack_pop()")
-    {
-        return "construct".into();
-    }
-    if text.contains("stack_push(function(){switch(read_byte())") {
-        return "push_literal".into();
-    }
-    if text.contains("if(!stack") && text.contains("stack_push(stack[") {
-        return "dup".into();
-    }
-    if text.contains("for(")
-        && regex_is(r"=2\*", &text)
-        && regex_is(r"=\{\}", &text)
-        && text.contains("stack_push")
-    {
-        return "object_from_pairs".into();
-    }
-    if text.contains("stack_push(env_lookup(read_string()))") {
-        return "env_load".into();
-    }
-    if text.contains("env_lookup(") && text.contains("stack_push") && text.contains("...") {
-        return "env_call".into();
-    }
-    if text.contains(" in env?") && text.contains("env_fallback") && text.contains("stack_push") {
-        return "env_load_soft".into();
-    }
-    if text.contains(" in ") && text.contains("throw Error") && text.contains("stack_push") {
-        return "global_load_checked".into();
-    }
-    if regex_is(r"\[[^\]]+\]=[^;]+", &text) && text.contains("stack_push") {
-        return "property_set".into();
-    }
-
-    // Method calls survive in several equivalent encodings:
-    // receiver[prop].call(receiver, ...args), receiver[prop][decoded_call](receiver,...),
-    // or a member saved to a temporary before decoded invocation.
-    if text.contains("read_string()") && text.contains("stack_push") && text.contains("...") {
-        if text.contains(".call(")
-            || regex_is(
-                r"[A-Za-z_$][A-Za-z0-9_$]*\[[^\]]+\]\[[^\]]+\]\([A-Za-z_$][A-Za-z0-9_$]*,\.\.\.",
-                &text,
-            )
-        {
-            return "method_call".into();
-        }
-        if let Some(caps) =
-            Regex::new(r",([A-Za-z_$][A-Za-z0-9_$]*)=([A-Za-z_$][A-Za-z0-9_$]*)\[[^\]]+\]")
-                .ok()
-                .and_then(|re| re.captures(&text))
-        {
-            let temp = regex::escape(&caps[1]);
-            let receiver = regex::escape(&caps[2]);
-            let pattern = format!(r"stack_push\({temp}\[[^\]]+\]\({receiver},\.\.\.");
-            if regex_is(&pattern, &text) {
-                return "method_call".into();
-            }
-        }
-    }
-    if text.contains("read_string()")
-        && text.contains("stack_push")
-        && regex_is(r"stack_push\([^;]*\[[^\]]+\]\)", &text)
-    {
-        return "property_get".into();
-    }
-    if regex_is(r"stack_push\([^;]*\[[^\]]+\]\)", &text) && text.contains("stack_pop()") {
-        return "property_get".into();
-    }
-    if text.contains("stack_push([") && text.contains("...") {
-        return "spread_concat".into();
-    }
-    if text.contains("read_u16()")
-        && text.contains("stack_push(")
-        && (text.contains("splice(") || regex_is(r"stack\[[^\]]+\]\(", &text))
-    {
-        return "collect_args".into();
-    }
-    if text.contains("stack_push") && text.contains("...") && text.contains("stack_pop()") {
-        return "call".into();
-    }
-    if text.contains("read_byte()")
-        && text.contains("stack_push")
-        && regex_is(r"\[[A-Za-z_$][A-Za-z0-9_$]*\]\(", &text)
-    {
-        return "operator_dispatch".into();
-    }
-    if kinds == ["dynamic_call"] {
-        return "control_pop".into();
-    }
-    if text.contains("stack_push") {
-        return "push_value".into();
-    }
-    "call_unknown".into()
 }
 
 fn main() -> Result<()> {
