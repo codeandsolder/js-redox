@@ -4,3 +4,6 @@ work/
 target/
 __pycache__/
 *.py[cod]
+
+# Real captured/reference JavaScript is private corpus data.
+/corpus/real/**/*.js

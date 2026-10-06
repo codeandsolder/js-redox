@@ -2,11 +2,13 @@
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_ROOT = Path(os.environ.get("JSVM_FIXTURE_ROOT", ROOT)).resolve()
 RECOVER = ROOT / "scripts/recover-js-obfuscator-strings.py"
 TMP = ROOT / "work/test-tmp/static-string-recovery"
 
@@ -115,45 +117,45 @@ def main():
     check_immutable_literal_tables()
     check_semantic_affine_base91()
 
-    acw1 = ROOT / "corpus/real/searxrs2-antibot/acw-sc-v2/mpall518-challenge.pretty.js"
-    acw2 = ROOT / "corpus/real/searxrs2-antibot/acw-sc-v2/mpall518-challenge2.pretty.js"
-    for name, source in (("acw1", acw1), ("acw2", acw2)):
-        out, report = recover(name, source)
-        d = decoder(report)
-        assert d["mode"] == "base64"
-        assert d["offset"] == 251
-        assert d["rotation"] == 8
-        assert d["table_entries"] == 42
-        assert d["replacements"] == 57
-        assert report["replacements"] == 57
-        text = out.read_text()
-        for needle in (
-            'p = "3000176000856006061501533003690027800375"',
-            'q["join"]("")',
-            'u["slice"](x, x + 2)',
-            'document["cookie"] = "acw_sc__v2="',
-            'document["location"]["reload"]()',
-            'Date["now"]()',
-            '["toGMTString"]()',
-        ):
-            assert needle in text, (name, needle)
+    acw1 = FIXTURE_ROOT / "corpus/real/searxrs2-antibot/acw-sc-v2/mpall518-challenge.pretty.js"
+    acw2 = FIXTURE_ROOT / "corpus/real/searxrs2-antibot/acw-sc-v2/mpall518-challenge2.pretty.js"
+    if acw1.is_file() and acw2.is_file():
+        for name, source in (("acw1", acw1), ("acw2", acw2)):
+            out, report = recover(name, source)
+            d = decoder(report)
+            assert d["mode"] == "base64"
+            assert d["offset"] == 251
+            assert d["rotation"] == 8
+            assert d["table_entries"] == 42
+            assert d["replacements"] == 57
+            assert report["replacements"] == 57
+            text = out.read_text()
+            for needle in (
+                'p = "3000176000856006061501533003690027800375"',
+                'q["join"]("")',
+                'u["slice"](x, x + 2)',
+                'document["cookie"] = "acw_sc__v2="',
+                'document["location"]["reload"]()',
+                'Date["now"]()',
+                '["toGMTString"]()',
+            ):
+                assert needle in text, (name, needle)
 
-    # Safety regression: if the generated rotation checksum no longer proves,
-    # do not decode any call using an assumed table order.
-    bad = TMP / "acw-bad-rotation.js"
-    bad_text = acw1.read_text().replace("})(a0i, 483519)", "})(a0i, 483520)", 1)
-    assert bad_text != acw1.read_text()
-    bad.write_text(bad_text)
-    out, report = recover("acw-bad-rotation", bad)
-    d = decoder(report)
-    assert d["rotation"] is None
-    assert d["status"] == "rotation-unproven"
-    assert report["replacements"] == 0
-    assert out.read_text() == bad_text
+        # Safety regression: an unproven rotation must not decode assumed table order.
+        bad = TMP / "acw-bad-rotation.js"
+        bad_text = acw1.read_text().replace("})(a0i, 483519)", "})(a0i, 483520)", 1)
+        assert bad_text != acw1.read_text()
+        bad.write_text(bad_text)
+        out, report = recover("acw-bad-rotation", bad)
+        d = decoder(report)
+        assert d["rotation"] is None
+        assert d["status"] == "rotation-unproven"
+        assert report["replacements"] == 0
+        assert out.read_text() == bad_text
 
     taobao_cases = (
-        ("taobao-normal", ROOT / "corpus/taobao/normal_securitySDK.umd.js"),
-        ("taobao-captcha", ROOT / "corpus/taobao/captcha_securitySDK.umd.js"),
+        ("taobao-normal", FIXTURE_ROOT / "corpus/taobao/normal_securitySDK.umd.js"),
+        ("taobao-captcha", FIXTURE_ROOT / "corpus/taobao/captcha_securitySDK.umd.js"),
     )
     taobao_available = all(source.is_file() for _, source in taobao_cases)
     if taobao_available:
@@ -196,7 +198,10 @@ def main():
 
     print("PASS: static javascript-obfuscator string recovery")
     print("  immutable literal tables: numeric reads fold; dynamic reads stay; mutation/alias cases reject")
-    print("  acw_sc__v2: 2 captures, rotation=8, 57 replacements each")
+    if acw1.is_file() and acw2.is_file():
+        print("  acw_sc__v2: 2 captures, rotation=8, 57 replacements each")
+    else:
+        print("  acw_sc__v2: skipped (external corpus absent)")
     if taobao_available:
         print("  Taobao securitySDK: 2 captures, RC4 rotation=409, >=646 replacements each")
     else:

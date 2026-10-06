@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CORPUS = ROOT / "corpus/real/searxrs2-antibot"
-MANIFEST = CORPUS / "manifest.json"
+CORPUS_META = ROOT / "corpus/real/searxrs2-antibot"
+FIXTURE_ROOT = Path(os.environ.get("JSVM_FIXTURE_ROOT", ROOT)).resolve()
+CORPUS = FIXTURE_ROOT / "corpus/real/searxrs2-antibot"
+MANIFEST = CORPUS_META / "manifest.json"
 WORK = ROOT / "work/real-antibot-corpus"
 TMP = ROOT / "work/test-tmp/real-antibot-corpus"
 FORMATTER = ROOT / ".cargo-target-nodebug/debug/js-format"
@@ -110,6 +113,14 @@ def main():
             raise SystemExit(f"missing binary: {binary}")
 
     manifest = json.loads(MANIFEST.read_text())
+    missing = [sample["path"] for sample in manifest["samples"] if not (CORPUS / sample["path"]).is_file()]
+    if missing:
+        print(
+            "SKIP: private real-world corpus is not mounted; "
+            "set JSVM_FIXTURE_ROOT to its workspace root "
+            f"({len(missing)} files unavailable)"
+        )
+        return 0
     assert manifest["schema"] == "jsvm-real-corpus/v1"
     samples = manifest["samples"]
     ids = [s["id"] for s in samples]
