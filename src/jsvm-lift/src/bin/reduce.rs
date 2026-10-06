@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser as ClapParser;
+use jsvm_lift::numeric::exact_i64;
 use oxc_allocator::Allocator;
 use oxc_ast::{
     ast::{Argument, AssignmentExpression, AssignmentTarget, Expression, Statement, SwitchCase},
@@ -191,9 +192,7 @@ fn target_ident(target: &AssignmentTarget<'_>) -> Option<String> {
 
 fn num_literal(expr: &Expression<'_>) -> Option<i64> {
     match expr {
-        Expression::NumericLiteral(n) if n.value.is_finite() && n.value.fract() == 0.0 => {
-            Some(n.value as i64)
-        }
+        Expression::NumericLiteral(n) => exact_i64(n.value),
         Expression::ParenthesizedExpression(p) => num_literal(&p.expression),
         _ => None,
     }
@@ -218,6 +217,9 @@ fn computed_decoder_value(
     if expr_ident(&expr.object).as_deref() != Some(dec.object.as_str()) {
         return Val::Unknown;
     }
+    let Ok(width) = i64::try_from(dec.width) else {
+        return Val::Unknown;
+    };
 
     if let Expression::AssignmentExpression(assign) = &expr.expression {
         if assign.operator.is_assign() {
@@ -231,9 +233,9 @@ fn computed_decoder_value(
                             let right_num = num_literal(&bin.right);
                             let left_id = expr_ident(&bin.left);
                             let right_id = expr_ident(&bin.right);
-                            let matched = (left_num == Some(dec.width as i64)
+                            let matched = (left_num == Some(width)
                                 && right_id.as_deref() == Some(dec.ip.as_str()))
-                                || (right_num == Some(dec.width as i64)
+                                || (right_num == Some(width)
                                     && left_id.as_deref() == Some(dec.ip.as_str()));
                             if matched {
                                 env.insert(base, Val::Sym("pc".into()));
@@ -257,7 +259,7 @@ fn computed_decoder_value(
                     None
                 };
                 if let Some(off) = offset {
-                    if off > 0 && off < dec.width as i64 {
+                    if off > 0 && off < width {
                         return Val::Sym(format!("operand{off}"));
                     }
                 }
@@ -268,9 +270,9 @@ fn computed_decoder_value(
     if dec.base.is_none() {
         if let Expression::BinaryExpression(bin) = &expr.expression {
             if bin.operator.as_str() == "*" {
-                let matched = (num_literal(&bin.left) == Some(dec.width as i64)
+                let matched = (num_literal(&bin.left) == Some(width)
                     && expr_ident(&bin.right).as_deref() == Some(dec.ip.as_str()))
-                    || (num_literal(&bin.right) == Some(dec.width as i64)
+                    || (num_literal(&bin.right) == Some(width)
                         && expr_ident(&bin.left).as_deref() == Some(dec.ip.as_str()));
                 if matched {
                     return Val::Num(opcode);
@@ -292,7 +294,9 @@ fn eval_unary(
     match un.operator.as_str() {
         "void" => Val::Undefined,
         "!" => v.truthy().map_or(Val::Unknown, |x| Val::Bool(!x)),
-        "~" => v.as_num().map_or(Val::Unknown, |x| Val::Num(!x)),
+        "~" => v
+            .as_num()
+            .map_or(Val::Unknown, |x| Val::Num(i64::from(!low_i32(x)))),
         "+" => v.as_num().map_or(Val::Unknown, Val::Num),
         "-" => v.as_num().map_or(Val::Unknown, |x| Val::Num(-x)),
         _ => Val::Unknown,
@@ -328,6 +332,29 @@ fn eval_logical(
     }
 }
 
+const fn low_u32(value: i64) -> u32 {
+    let bytes = value.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+const fn low_i32(value: i64) -> i32 {
+    let bytes = value.to_le_bytes();
+    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn eval_bitwise(op: &str, lhs: i64, rhs: i64) -> Option<i64> {
+    let shift = low_u32(rhs) & 31;
+    match op {
+        "&" => Some(i64::from(low_i32(lhs) & low_i32(rhs))),
+        "|" => Some(i64::from(low_i32(lhs) | low_i32(rhs))),
+        "^" => Some(i64::from(low_i32(lhs) ^ low_i32(rhs))),
+        "<<" => Some(i64::from(low_i32(lhs).wrapping_shl(shift))),
+        ">>" => Some(i64::from(low_i32(lhs) >> shift)),
+        ">>>" => Some(i64::from(low_u32(lhs) >> shift)),
+        _ => None,
+    }
+}
+
 fn eval_binary(
     bin: &oxc_ast::ast::BinaryExpression<'_>,
     env: &mut Env,
@@ -346,12 +373,9 @@ fn eval_binary(
         "<=" => Val::Bool(a <= b),
         ">" => Val::Bool(a > b),
         ">=" => Val::Bool(a >= b),
-        "&" => Val::Num(a & b),
-        "|" => Val::Num(a | b),
-        "^" => Val::Num(a ^ b),
-        "<<" => Val::Num(a << (b & 63)),
-        ">>" => Val::Num(a >> (b & 63)),
-        ">>>" => Val::Num(((a as u64) >> (b & 63)) as i64),
+        "&" | "|" | "^" | "<<" | ">>" | ">>>" => {
+            eval_bitwise(bin.operator.as_str(), a, b).map_or(Val::Unknown, Val::Num)
+        }
         "+" => Val::Num(a.wrapping_add(b)),
         "-" => Val::Num(a.wrapping_sub(b)),
         "*" => Val::Num(a.wrapping_mul(b)),
@@ -457,9 +481,7 @@ fn eval_expr(
     ctx: &EvalCtx<'_>,
 ) -> Val {
     match expr {
-        Expression::NumericLiteral(n) if n.value.is_finite() && n.value.fract() == 0.0 => {
-            Val::Num(n.value as i64)
-        }
+        Expression::NumericLiteral(n) => exact_i64(n.value).map_or(Val::Unknown, Val::Num),
         Expression::BooleanLiteral(b) => Val::Bool(b.value),
         Expression::NullLiteral(_) => Val::Unknown,
         Expression::Identifier(id) => env.get(id.name.as_str()).cloned().unwrap_or(Val::Unknown),
@@ -704,11 +726,12 @@ fn exec_stmt(
 }
 
 fn case_for_state<'a>(cases: &'a [SwitchCase<'a>], state: u64) -> Option<&'a SwitchCase<'a>> {
+    let state = i64::try_from(state).ok()?;
     for case in cases {
         let Some(test) = case.test.as_ref() else {
             continue;
         };
-        if num_literal(test) == Some(state as i64) {
+        if num_literal(test) == Some(state) {
             return Some(case);
         }
     }
@@ -721,8 +744,11 @@ fn reduce_paths(
     initial_env: Env,
     ctx: &EvalCtx<'_>,
 ) -> Vec<ReducedPath> {
+    let Ok(initial_state) = i64::try_from(sm.init_state) else {
+        return Vec::new();
+    };
     let mut env = initial_env;
-    env.insert(sm.state_var.clone(), Val::Num(sm.init_state as i64));
+    env.insert(sm.state_var.clone(), Val::Num(initial_state));
 
     let mut queue = VecDeque::new();
     queue.push_back(PathState {
@@ -743,10 +769,15 @@ fn reduce_paths(
             let Some(state_i) = path.env.get(&sm.state_var).and_then(Val::as_num) else {
                 break;
             };
-            let state = state_i as u64;
+            let Ok(state) = u64::try_from(state_i) else {
+                break;
+            };
             if let (Some(sel), Some(shift)) = (sm.selector_var.as_ref(), sm.shift) {
-                path.env
-                    .insert(sel.clone(), Val::Num(((state >> shift) & sm.mask) as i64));
+                let selected = (state >> shift) & sm.mask;
+                let Ok(selected) = i64::try_from(selected) else {
+                    break;
+                };
+                path.env.insert(sel.clone(), Val::Num(selected));
             }
 
             let case_id = state & sm.mask;
@@ -893,7 +924,9 @@ fn observed_opcodes(report: &ScanReport, dec: &DecoderCandidate) -> Vec<u64> {
     let Some(builder) = report.push_builders.iter().find(|b| b.start == start) else {
         return Vec::new();
     };
-    let width = dec.width as usize;
+    let Ok(width) = usize::try_from(dec.width) else {
+        return Vec::new();
+    };
     if width == 0 {
         return Vec::new();
     }
@@ -948,8 +981,11 @@ fn reduce_report(report: &ScanReport, wanted: Option<&str>) -> Result<Vec<Reduce
 
         let mut rows = Vec::new();
         for opcode in observed_opcodes(report, dec) {
-            let env = derive_env(parent_source, pre_handler_limit, dec, opcode as i64)?;
-            let paths = reduce_state_machine(sm_source, sm, env.clone(), opcode as i64)?;
+            let Ok(opcode_i64) = i64::try_from(opcode) else {
+                continue;
+            };
+            let env = derive_env(parent_source, pre_handler_limit, dec, opcode_i64)?;
+            let paths = reduce_state_machine(sm_source, sm, env.clone(), opcode_i64)?;
             let (states, effects) = if paths.len() == 1 {
                 (
                     Some(paths[0].states.clone()),
@@ -994,4 +1030,20 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eval_bitwise;
+
+    #[test]
+    fn bitwise_evaluation_matches_javascript_32_bit_semantics() {
+        assert_eq!(eval_bitwise(">>>", -1, 0), Some(4_294_967_295));
+        assert_eq!(eval_bitwise(">>", 0x8000_0000, 0), Some(-2_147_483_648));
+        assert_eq!(eval_bitwise("<<", 1, 33), Some(2));
+        assert_eq!(
+            eval_bitwise("&", 0xffff_ffff, 0x8000_0000),
+            Some(-2_147_483_648)
+        );
+    }
 }

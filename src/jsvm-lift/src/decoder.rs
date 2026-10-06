@@ -1,7 +1,8 @@
 use crate::{
-    ast_utils::{exact_u64, expr_ident, numeric_u64, target_ident},
+    ast_utils::{expr_ident, numeric_u64, target_ident},
     bytecode::{PushBuilderCandidate, WidthHint},
 };
+use jsvm_lift::numeric::exact_u64;
 use oxc_ast::ast::Expression;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

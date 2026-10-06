@@ -1,5 +1,6 @@
-use crate::ast_utils::{exact_u64, target_ident};
+use crate::ast_utils::target_ident;
 use crate::source_text::preview;
+use jsvm_lift::numeric::exact_u64;
 use oxc_ast::ast::{Argument, ArrayExpression, ArrayExpressionElement, CallExpression, Expression};
 use oxc_span::GetSpan;
 use serde::Serialize;

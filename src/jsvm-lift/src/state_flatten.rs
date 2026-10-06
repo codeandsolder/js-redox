@@ -1,7 +1,8 @@
 use crate::{
-    ast_utils::{exact_i64, exact_u64, expr_ident, numeric_u64, target_ident},
+    ast_utils::{expr_ident, numeric_u64, target_ident},
     source_text::preview,
 };
+use jsvm_lift::numeric::{exact_i64, exact_u64};
 use oxc_ast::{
     ast::{Argument, Expression, ForStatement, Function, FunctionBody, Statement, SwitchStatement},
     AstKind,
