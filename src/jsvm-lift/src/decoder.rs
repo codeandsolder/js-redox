@@ -1,5 +1,5 @@
 use crate::{
-    ast_utils::{expr_ident, numeric_u64, target_ident},
+    ast_utils::{exact_u64, expr_ident, numeric_u64, target_ident},
     bytecode::{PushBuilderCandidate, WidthHint},
 };
 use oxc_ast::ast::Expression;
@@ -75,11 +75,7 @@ pub fn origin_ident(expr: &Expression<'_>) -> Option<String> {
 
 pub fn origin_u64(expr: &Expression<'_>) -> Option<u64> {
     match expr {
-        Expression::NumericLiteral(n)
-            if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 =>
-        {
-            Some(n.value as u64)
-        }
+        Expression::NumericLiteral(n) => exact_u64(n.value),
         Expression::ParenthesizedExpression(paren) => origin_u64(&paren.expression),
         Expression::AssignmentExpression(assign) if assign.operator.is_assign() => {
             origin_u64(&assign.right)

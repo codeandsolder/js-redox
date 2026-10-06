@@ -1,5 +1,5 @@
 use crate::{
-    ast_utils::{expr_ident, numeric_u64, target_ident},
+    ast_utils::{exact_u64, expr_ident, numeric_u64, target_ident},
     source_text::preview,
 };
 use oxc_ast::{
@@ -610,10 +610,9 @@ struct NumericMaskCollector<'m> {
 impl<'a> Visit<'a> for NumericMaskCollector<'_> {
     fn enter_node(&mut self, kind: AstKind<'a>) {
         if let AstKind::NumericLiteral(n) = kind {
-            if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 {
-                let v = n.value as u64;
-                if self.masks.contains(&v) {
-                    self.found.insert(v);
+            if let Some(value) = exact_u64(n.value) {
+                if self.masks.contains(&value) {
+                    self.found.insert(value);
                 }
             }
         }
@@ -796,8 +795,7 @@ fn numeric_case_map<'a>(switch: &'a SwitchStatement<'a>) -> BTreeMap<u64, &'a [S
             let Expression::NumericLiteral(number) = case.test.as_ref()? else {
                 return None;
             };
-            (number.value.is_finite() && number.value >= 0.0 && number.value.fract() == 0.0)
-                .then_some((number.value as u64, case.consequent.as_slice()))
+            exact_u64(number.value).map(|value| (value, case.consequent.as_slice()))
         })
         .collect()
 }

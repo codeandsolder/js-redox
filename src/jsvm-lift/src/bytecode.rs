@@ -1,4 +1,4 @@
-use crate::ast_utils::target_ident;
+use crate::ast_utils::{exact_u64, target_ident};
 use crate::source_text::preview;
 use oxc_ast::ast::{Argument, ArrayExpression, ArrayExpressionElement, CallExpression, Expression};
 use oxc_span::GetSpan;
@@ -87,10 +87,7 @@ fn profile_push_arguments(source: &str, arguments: &[Argument<'_>]) -> PushArgum
         match argument {
             Argument::NumericLiteral(number) => {
                 profile.numeric_literals += 1;
-                let value = (number.value.is_finite()
-                    && number.value >= 0.0
-                    && number.value.fract() == 0.0)
-                    .then(|| number.value as u64);
+                let value = exact_u64(number.value);
                 if value.is_some_and(|value| value <= 255) {
                     profile.byte_literals += 1;
                 }
@@ -225,19 +222,15 @@ pub fn detect_numeric_array(source: &str, array: &ArrayExpression<'_>) -> Option
     let mut values = Vec::with_capacity(n);
     for element in &array.elements {
         match element {
-            ArrayExpressionElement::NumericLiteral(value)
-                if value.value.is_finite() && value.value >= 0.0 =>
-            {
-                let integer = value.value as u64;
-                if (integer as f64 - value.value).abs() < f64::EPSILON {
+            ArrayExpressionElement::NumericLiteral(value) => {
+                let integer = exact_u64(value.value);
+                if let Some(integer) = integer {
                     numeric += 1;
                     if integer <= 255 {
                         byte_values += 1;
                     }
-                    values.push(Some(integer));
-                } else {
-                    values.push(None);
                 }
+                values.push(integer);
             }
             _ => values.push(None),
         }
