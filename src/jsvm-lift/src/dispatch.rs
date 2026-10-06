@@ -1,4 +1,4 @@
-use crate::source_text::preview;
+use crate::{ast_utils::numeric_u64, source_text::preview};
 use oxc_ast::ast::{
     ArrayExpression, ArrayExpressionElement, Expression, ObjectExpression, ObjectPropertyKind,
     Statement, SwitchStatement,
@@ -37,18 +37,6 @@ pub struct DirectSwitchMapCandidate {
     pub vm_reasons: Vec<String>,
     pub confirmed_vm: bool,
     pub handlers: Vec<DirectSwitchHandler>,
-}
-
-fn numeric_u64(expr: &Expression<'_>) -> Option<u64> {
-    match expr {
-        Expression::NumericLiteral(n)
-            if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 =>
-        {
-            Some(n.value as u64)
-        }
-        Expression::ParenthesizedExpression(paren) => numeric_u64(&paren.expression),
-        _ => None,
-    }
 }
 
 pub fn detect_direct_switch(

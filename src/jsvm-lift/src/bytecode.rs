@@ -1,3 +1,4 @@
+use crate::ast_utils::target_ident;
 use crate::source_text::preview;
 use oxc_ast::ast::{Argument, ArrayExpression, ArrayExpressionElement, CallExpression, Expression};
 use oxc_span::GetSpan;
@@ -52,18 +53,11 @@ pub struct DetectedPushBuilder {
     pub receiver_ident: Option<String>,
 }
 
-fn target_ident(target: &oxc_ast::ast::AssignmentTarget<'_>) -> Option<String> {
-    match target {
-        oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.to_string()),
-        _ => None,
-    }
-}
-
 fn builder_receiver_ident(expr: &Expression<'_>) -> Option<String> {
     match expr {
         Expression::Identifier(id) => Some(id.name.to_string()),
         Expression::AssignmentExpression(assign) if assign.operator.is_assign() => {
-            target_ident(&assign.left)
+            target_ident(&assign.left).map(str::to_string)
         }
         Expression::ParenthesizedExpression(paren) => builder_receiver_ident(&paren.expression),
         _ => None,

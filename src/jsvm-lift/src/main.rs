@@ -1,3 +1,4 @@
+mod ast_utils;
 mod bytecode;
 mod decoder;
 mod dispatch;

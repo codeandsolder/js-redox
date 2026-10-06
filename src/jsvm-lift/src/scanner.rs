@@ -1,8 +1,9 @@
 use crate::{
+    ast_utils::{expr_ident, target_ident},
     bytecode::{detect_numeric_array, detect_push_builder, ArrayCandidate, PushBuilderCandidate},
     decoder::{
-        complete_selector_masks, expr_ident, index_shape, observed_opcodes, origin_ident,
-        origin_u64, resolve_alias, target_ident, BuilderSite, DecoderCandidate, IndexedAccess,
+        complete_selector_masks, index_shape, observed_opcodes, origin_ident, origin_u64,
+        resolve_alias, BuilderSite, DecoderCandidate, IndexedAccess,
     },
     dispatch::{
         detect_array_handler_table, detect_direct_switch, detect_object_handler_table,
@@ -366,7 +367,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
                         .vars
                         .insert(name.clone(), expression_evidence(self.source, init));
                     if let Some(rhs) = expr_ident(init) {
-                        current.aliases.insert(name.clone(), rhs);
+                        current.aliases.insert(name.clone(), rhs.to_string());
                     } else {
                         current.aliases.remove(&name);
                     }
@@ -440,7 +441,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
             if let Expression::Identifier(object) = &member.object {
                 index_shape(&member.expression).map(|shape| {
                     (
-                        lhs_name.clone(),
+                        (*lhs_name).to_string(),
                         IndexedAccess {
                             object: object.name.to_string(),
                             shape,
@@ -461,9 +462,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
             current.m.assignments += 1;
             if let Some(lhs) = lhs {
                 if let Some(rhs) = rhs {
-                    current.aliases.insert(lhs, rhs);
+                    current.aliases.insert(lhs.to_string(), rhs.to_string());
                 } else {
-                    current.aliases.remove(&lhs);
+                    current.aliases.remove(lhs);
                 }
             }
             if let Some((name, access)) = fetched_access {

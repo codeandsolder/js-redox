@@ -1,5 +1,8 @@
-use crate::bytecode::{PushBuilderCandidate, WidthHint};
-use oxc_ast::ast::{AssignmentTarget, Expression};
+use crate::{
+    ast_utils::{expr_ident, numeric_u64, target_ident},
+    bytecode::{PushBuilderCandidate, WidthHint},
+};
+use oxc_ast::ast::Expression;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -59,33 +62,6 @@ pub struct DecoderCandidate {
     pub preview: String,
 }
 
-pub fn expr_ident(expr: &Expression<'_>) -> Option<String> {
-    match expr {
-        Expression::Identifier(id) => Some(id.name.to_string()),
-        Expression::ParenthesizedExpression(paren) => expr_ident(&paren.expression),
-        _ => None,
-    }
-}
-
-pub fn target_ident(target: &AssignmentTarget<'_>) -> Option<String> {
-    match target {
-        AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.to_string()),
-        _ => None,
-    }
-}
-
-fn numeric_u64(expr: &Expression<'_>) -> Option<u64> {
-    match expr {
-        Expression::NumericLiteral(n)
-            if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 =>
-        {
-            Some(n.value as u64)
-        }
-        Expression::ParenthesizedExpression(paren) => numeric_u64(&paren.expression),
-        _ => None,
-    }
-}
-
 pub fn origin_ident(expr: &Expression<'_>) -> Option<String> {
     match expr {
         Expression::Identifier(id) => Some(id.name.to_string()),
@@ -120,10 +96,10 @@ fn mul_width_ip(expr: &Expression<'_>) -> Option<(u64, String)> {
         return None;
     }
     if let (Some(width), Some(ip)) = (numeric_u64(&binary.left), expr_ident(&binary.right)) {
-        return Some((width, ip));
+        return Some((width, ip.to_string()));
     }
     if let (Some(ip), Some(width)) = (expr_ident(&binary.left), numeric_u64(&binary.right)) {
-        return Some((width, ip));
+        return Some((width, ip.to_string()));
     }
     None
 }
@@ -132,7 +108,7 @@ pub fn index_shape(expr: &Expression<'_>) -> Option<IndexShape> {
     match expr {
         Expression::ParenthesizedExpression(paren) => index_shape(&paren.expression),
         Expression::AssignmentExpression(assign) if assign.operator.is_assign() => {
-            let target = target_ident(&assign.left)?;
+            let target = target_ident(&assign.left)?.to_string();
             if let Some((width, ip)) = mul_width_ip(&assign.right) {
                 return Some(IndexShape::AssignMul {
                     base: target,
@@ -145,17 +121,23 @@ pub fn index_shape(expr: &Expression<'_>) -> Option<IndexShape> {
                     if let (Some(base), Some(offset)) =
                         (expr_ident(&binary.left), numeric_u64(&binary.right))
                     {
-                        return Some(IndexShape::BaseOffset { base, offset });
+                        return Some(IndexShape::BaseOffset {
+                            base: base.to_string(),
+                            offset,
+                        });
                     }
                     if let (Some(offset), Some(base)) =
                         (numeric_u64(&binary.left), expr_ident(&binary.right))
                     {
-                        return Some(IndexShape::BaseOffset { base, offset });
+                        return Some(IndexShape::BaseOffset {
+                            base: base.to_string(),
+                            offset,
+                        });
                     }
                 }
             }
             if let Some(base) = expr_ident(&assign.right) {
-                return Some(IndexShape::Identifier(base));
+                return Some(IndexShape::Identifier(base.to_string()));
             }
             None
         }
@@ -163,12 +145,18 @@ pub fn index_shape(expr: &Expression<'_>) -> Option<IndexShape> {
             if let (Some(base), Some(offset)) =
                 (expr_ident(&binary.left), numeric_u64(&binary.right))
             {
-                return Some(IndexShape::BaseOffset { base, offset });
+                return Some(IndexShape::BaseOffset {
+                    base: base.to_string(),
+                    offset,
+                });
             }
             if let (Some(offset), Some(base)) =
                 (numeric_u64(&binary.left), expr_ident(&binary.right))
             {
-                return Some(IndexShape::BaseOffset { base, offset });
+                return Some(IndexShape::BaseOffset {
+                    base: base.to_string(),
+                    offset,
+                });
             }
             None
         }

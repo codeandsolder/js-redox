@@ -1,3 +1,4 @@
+use crate::ast_utils::target_ident;
 use oxc_ast::{
     ast::{
         ArrayExpressionElement, AssignmentTarget, BindingPattern, CallExpression, Expression,
@@ -215,13 +216,6 @@ fn nested_transition(
 
 fn target_source(source: &str, target: &AssignmentTarget<'_>) -> String {
     fragment(source, target.span())
-}
-
-fn target_ident(target: &AssignmentTarget<'_>) -> Option<String> {
-    match target {
-        AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.to_string()),
-        _ => None,
-    }
 }
 
 fn static_method(call: &CallExpression<'_>) -> Option<String> {
@@ -599,9 +593,9 @@ impl<'s> Analyzer<'s> {
         }
 
         if let Some(name) = target_ident(&assignment.left) {
-            self.record_transition(name.clone(), &assignment.right);
-            self.record_handler_alias(&name, &assignment.right);
-            self.record_producer(name, &assignment.right);
+            self.record_transition(name.to_string(), &assignment.right);
+            self.record_handler_alias(name, &assignment.right);
+            self.record_producer(name.to_string(), &assignment.right);
         }
 
         let Some((result, index)) = result_index(&assignment.right) else {

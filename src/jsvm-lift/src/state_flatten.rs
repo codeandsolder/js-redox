@@ -1,8 +1,9 @@
-use crate::source_text::preview;
+use crate::{
+    ast_utils::{expr_ident, numeric_u64, target_ident},
+    source_text::preview,
+};
 use oxc_ast::{
-    ast::{
-        Argument, AssignmentTarget, Expression, ForStatement, Function, FunctionBody, Statement,
-    },
+    ast::{Argument, Expression, ForStatement, Function, FunctionBody, Statement},
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
@@ -63,33 +64,6 @@ pub struct IfLadderStateMachineCandidate {
 pub struct DetectedStateMachines {
     pub switch_machines: Vec<StateMachineCandidate>,
     pub if_ladder_machines: Vec<IfLadderStateMachineCandidate>,
-}
-
-fn expr_ident<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
-    match expr {
-        Expression::Identifier(id) => Some(id.name.as_str()),
-        Expression::ParenthesizedExpression(paren) => expr_ident(&paren.expression),
-        _ => None,
-    }
-}
-
-fn numeric_u64(expr: &Expression<'_>) -> Option<u64> {
-    match expr {
-        Expression::NumericLiteral(n)
-            if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 =>
-        {
-            Some(n.value as u64)
-        }
-        Expression::ParenthesizedExpression(paren) => numeric_u64(&paren.expression),
-        _ => None,
-    }
-}
-
-fn target_ident<'a>(target: &'a AssignmentTarget<'a>) -> Option<&'a str> {
-    match target {
-        AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.as_str()),
-        _ => None,
-    }
 }
 
 fn for_state_init(for_stmt: &ForStatement<'_>) -> Option<(String, u64)> {
