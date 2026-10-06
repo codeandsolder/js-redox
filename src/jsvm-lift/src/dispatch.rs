@@ -1,7 +1,7 @@
 use crate::{ast_utils::numeric_u64, source_text::preview};
 use oxc_ast::ast::{
     ArrayExpression, ArrayExpressionElement, Expression, ObjectExpression, ObjectPropertyKind,
-    Statement, SwitchStatement,
+    Statement, SwitchCase, SwitchStatement,
 };
 use oxc_span::GetSpan;
 use serde::Serialize;
@@ -39,6 +39,109 @@ pub struct DirectSwitchMapCandidate {
     pub handlers: Vec<DirectSwitchHandler>,
 }
 
+fn direct_switch_handler(source: &str, case: &SwitchCase<'_>) -> DirectSwitchHandler {
+    let key = case.test.as_ref().and_then(numeric_u64);
+    let key_source = case
+        .test
+        .as_ref()
+        .map(|expr| preview(source, expr.span().start, expr.span().end, usize::MAX));
+    let mut semantic = Vec::new();
+    let mut terminal = "fallthrough";
+
+    for statement in &case.consequent {
+        terminal = match statement {
+            Statement::BreakStatement(_) => "break",
+            Statement::ContinueStatement(_) => "continue",
+            Statement::ReturnStatement(_) => {
+                semantic.push(preview(
+                    source,
+                    statement.span().start,
+                    statement.span().end,
+                    usize::MAX,
+                ));
+                "return"
+            }
+            Statement::ThrowStatement(_) => {
+                semantic.push(preview(
+                    source,
+                    statement.span().start,
+                    statement.span().end,
+                    usize::MAX,
+                ));
+                "throw"
+            }
+            _ => {
+                semantic.push(preview(
+                    source,
+                    statement.span().start,
+                    statement.span().end,
+                    usize::MAX,
+                ));
+                terminal
+            }
+        };
+    }
+
+    DirectSwitchHandler {
+        key,
+        key_source,
+        semantic,
+        terminal: terminal.to_string(),
+    }
+}
+
+fn direct_switch_evidence(
+    handlers: &[DirectSwitchHandler],
+    numeric_cases: usize,
+    indexed_selector: bool,
+    call_selector: bool,
+) -> (u32, Vec<String>) {
+    let stack_ops = handlers
+        .iter()
+        .flat_map(|handler| &handler.semantic)
+        .filter(|text| {
+            text.contains(".push(") || text.contains(".pop(") || text.contains(".splice(")
+        })
+        .count();
+    let cursor_ops = handlers
+        .iter()
+        .flat_map(|handler| &handler.semantic)
+        .filter(|text| {
+            (text.contains("++") || text.contains("--"))
+                && (text.contains('[') || text.contains(".length"))
+        })
+        .count();
+    let continue_handlers = handlers
+        .iter()
+        .filter(|handler| handler.terminal == "continue")
+        .count();
+
+    let mut score = 0u32;
+    let mut reasons = Vec::new();
+    if numeric_cases >= 16 {
+        score += 2;
+        reasons.push(format!("{numeric_cases} numeric opcode-like cases"));
+    }
+    if stack_ops >= 3 {
+        score += 3;
+        reasons.push(format!("{stack_ops} stack-like handler effects"));
+    }
+    if cursor_ops >= 4 {
+        score += 2;
+        reasons.push(format!("{cursor_ops} indexed cursor/stack mutations"));
+    }
+    if continue_handlers >= 3 {
+        score += 2;
+        reasons.push(format!(
+            "{continue_handlers} handlers continue dispatch loop"
+        ));
+    }
+    if call_selector && !indexed_selector {
+        reasons.push("opcode selector is produced by a call".to_string());
+    }
+    (score, reasons)
+}
+
 pub fn detect_direct_switch(
     source: &str,
     parent_function_id: &str,
@@ -50,115 +153,31 @@ pub fn detect_direct_switch(
         return None;
     }
 
-    let mut handlers = Vec::with_capacity(switch.cases.len());
-    let mut numeric_cases = 0usize;
-    let mut opcode_max = 0u64;
-    for case in &switch.cases {
-        let key = case.test.as_ref().and_then(numeric_u64);
-        if let Some(value) = key {
-            numeric_cases += 1;
-            opcode_max = opcode_max.max(value);
-        }
-        let key_source = case
-            .test
-            .as_ref()
-            .map(|expr| preview(source, expr.span().start, expr.span().end, usize::MAX));
-
-        let mut semantic = Vec::new();
-        let mut terminal = "fallthrough".to_string();
-        for stmt in &case.consequent {
-            match stmt {
-                Statement::BreakStatement(_) => terminal = "break".to_string(),
-                Statement::ContinueStatement(_) => terminal = "continue".to_string(),
-                Statement::ReturnStatement(_) => {
-                    terminal = "return".to_string();
-                    semantic.push(preview(
-                        source,
-                        stmt.span().start,
-                        stmt.span().end,
-                        usize::MAX,
-                    ));
-                }
-                Statement::ThrowStatement(_) => {
-                    terminal = "throw".to_string();
-                    semantic.push(preview(
-                        source,
-                        stmt.span().start,
-                        stmt.span().end,
-                        usize::MAX,
-                    ));
-                }
-                _ => semantic.push(preview(
-                    source,
-                    stmt.span().start,
-                    stmt.span().end,
-                    usize::MAX,
-                )),
-            }
-        }
-        handlers.push(DirectSwitchHandler {
-            key,
-            key_source,
-            semantic,
-            terminal,
-        });
-    }
-
+    let handlers = switch
+        .cases
+        .iter()
+        .map(|case| direct_switch_handler(source, case))
+        .collect::<Vec<_>>();
+    let numeric_cases = handlers
+        .iter()
+        .filter(|handler| handler.key.is_some())
+        .count();
     if numeric_cases < 8 || numeric_cases * 4 < switch.cases.len() * 3 {
         return None;
     }
-
+    let opcode_max = handlers
+        .iter()
+        .filter_map(|handler| handler.key)
+        .max()
+        .unwrap_or(0);
     let selector = preview(
         source,
         switch.discriminant.span().start,
         switch.discriminant.span().end,
         usize::MAX,
     );
-    let semantic_fragments = handlers
-        .iter()
-        .flat_map(|handler| handler.semantic.iter())
-        .collect::<Vec<_>>();
-    let stack_ops = semantic_fragments
-        .iter()
-        .filter(|text| {
-            text.contains(".push(") || text.contains(".pop(") || text.contains(".splice(")
-        })
-        .count();
-    let cursor_ops = semantic_fragments
-        .iter()
-        .filter(|text| {
-            (text.contains("++") || text.contains("--"))
-                && (text.contains('[') || text.contains(".length"))
-        })
-        .count();
-    let continue_handlers = handlers
-        .iter()
-        .filter(|handler| handler.terminal == "continue")
-        .count();
-
-    let mut vm_evidence_score = 0u32;
-    let mut vm_reasons = Vec::new();
-    if numeric_cases >= 16 {
-        vm_evidence_score += 2;
-        vm_reasons.push(format!("{numeric_cases} numeric opcode-like cases"));
-    }
-    if stack_ops >= 3 {
-        vm_evidence_score += 3;
-        vm_reasons.push(format!("{stack_ops} stack-like handler effects"));
-    }
-    if cursor_ops >= 4 {
-        vm_evidence_score += 2;
-        vm_reasons.push(format!("{cursor_ops} indexed cursor/stack mutations"));
-    }
-    if continue_handlers >= 3 {
-        vm_evidence_score += 2;
-        vm_reasons.push(format!(
-            "{continue_handlers} handlers continue dispatch loop"
-        ));
-    }
-    if call_selector && !indexed_selector {
-        vm_reasons.push("opcode selector is produced by a call".to_string());
-    }
+    let (vm_evidence_score, vm_reasons) =
+        direct_switch_evidence(&handlers, numeric_cases, indexed_selector, call_selector);
 
     Some(DirectSwitchMapCandidate {
         parent_function_id: parent_function_id.to_string(),
