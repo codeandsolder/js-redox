@@ -115,6 +115,7 @@ fn main() -> Result<()> {
             .len()
             .cmp(&a.1.decoders.len())
             .then_with(|| b.1.count.cmp(&a.1.count))
+            .then_with(|| a.0.cmp(&b.0))
     });
 
     let mut path_rows: Vec<_> = paths
@@ -126,6 +127,7 @@ fn main() -> Result<()> {
             .len()
             .cmp(&a.1.decoders.len())
             .then_with(|| b.1.count.cmp(&a.1.count))
+            .then_with(|| a.0.cmp(&b.0))
     });
 
     println!(
