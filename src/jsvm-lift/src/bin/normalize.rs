@@ -98,7 +98,7 @@ struct Replacement {
 }
 
 struct RenameVisitor<'s> {
-    unresolved: &'s HashSet<u32>,
+    unresolved: &'s HashSet<usize>,
     rename: &'s HashMap<String, String>,
     offset: usize,
     source_len: usize,
@@ -127,7 +127,7 @@ impl<'a> Visit<'a> for RenameVisitor<'_> {
     fn enter_node(&mut self, kind: AstKind<'a>) {
         if let AstKind::IdentifierReference(id) = kind {
             if let Some(reference_id) = id.reference_id.get() {
-                if self.unresolved.contains(&(reference_id.index() as u32)) {
+                if self.unresolved.contains(&reference_id.index()) {
                     self.record(id.name.as_str(), id.span.start, id.span.end);
                 }
             }
@@ -190,11 +190,11 @@ fn collect_replacements(
         return None;
     }
     let semantic = semantic_ret.semantic;
-    let unresolved: HashSet<u32> = semantic
+    let unresolved: HashSet<usize> = semantic
         .scoping()
         .root_unresolved_references_ids()
         .flatten()
-        .map(|reference_id| reference_id.index() as u32)
+        .map(|reference_id| reference_id.index())
         .collect();
 
     let mut visitor = RenameVisitor {

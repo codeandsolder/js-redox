@@ -434,7 +434,9 @@ fn print_summary(output: &[VmRoles]) {
             .push(vm.roles.len());
     }
     for (fam, counts) in by_family {
-        let avg = counts.iter().sum::<usize>() as f64 / counts.len().max(1) as f64;
+        let total_roles = u32::try_from(counts.iter().sum::<usize>()).unwrap_or(u32::MAX);
+        let vm_count = u32::try_from(counts.len().max(1)).unwrap_or(u32::MAX);
+        let avg = f64::from(total_roles) / f64::from(vm_count);
         println!(
             "{} vms {} avg_roles {:.2} >=5 {} >=8 {} >=10 {}",
             fam,

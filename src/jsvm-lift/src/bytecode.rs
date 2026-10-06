@@ -298,13 +298,14 @@ pub fn detect_numeric_array(source: &str, array: &ArrayExpression<'_>) -> Option
         hints.sort_by_key(|hint| std::cmp::Reverse(hint.score));
     }
 
+    let numeric_ratio = f64::from(u32::try_from(numeric).ok()?) / f64::from(u32::try_from(n).ok()?);
     Some(ArrayCandidate {
         start: array.span.start,
         end: array.span.end,
         elements: n,
         numeric,
         byte_values,
-        numeric_ratio: numeric as f64 / n as f64,
+        numeric_ratio,
         width_hints: hints,
         preview: preview(source, array.span.start, array.span.end, 120),
     })

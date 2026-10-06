@@ -299,7 +299,7 @@ impl FunctionState {
             reasons.push(format!("{} switch(es)", self.m.switches));
         }
         if self.m.loops > 0 {
-            score += 3.min(self.m.loops as u32 + 1);
+            score += if self.m.loops == 1 { 2 } else { 3 };
             reasons.push(format!("{} loop(s)", self.m.loops));
         }
         if self.m.conditionals >= 30 {

@@ -822,11 +822,24 @@ impl LoopRunner<'_, '_> {
         case_map: &BTreeMap<u64, &'a [Statement<'a>]>,
         observed_opcodes: &BTreeSet<u64>,
     ) -> OpcodeHandler {
-        let mut env = self
+        let Some(mut env) = self
             .bindings
             .iter()
-            .map(|(name, mask)| (name.clone(), Scalar::Int((opcode & mask) as i64)))
-            .collect::<HashMap<_, _>>();
+            .map(|(name, mask)| {
+                i64::try_from(opcode & mask)
+                    .ok()
+                    .map(|value| (name.clone(), Scalar::Int(value)))
+            })
+            .collect::<Option<HashMap<_, _>>>()
+        else {
+            return OpcodeHandler {
+                opcode,
+                observed: observed_opcodes.contains(&opcode),
+                path: Vec::new(),
+                terminal: "integer-overflow".to_string(),
+                semantic: Vec::new(),
+            };
+        };
         let mut state = self.machine.init_state;
         let mut path = Vec::new();
         let mut semantic = Vec::new();
@@ -834,13 +847,21 @@ impl LoopRunner<'_, '_> {
 
         for _ in 0..128 {
             path.push(state);
-            env.insert(self.machine.state_var.clone(), Scalar::Int(state as i64));
+            let Ok(state_i64) = i64::try_from(state) else {
+                terminal = "integer-overflow".to_string();
+                break;
+            };
+            env.insert(self.machine.state_var.clone(), Scalar::Int(state_i64));
 
             if let (Some(shift), Some(selector)) =
                 (self.machine.shift, self.machine.selector_var.as_ref())
             {
                 let selected = (state >> shift) & self.machine.mask;
-                env.insert(selector.clone(), Scalar::Int(selected as i64));
+                let Ok(selected) = i64::try_from(selected) else {
+                    terminal = "integer-overflow".to_string();
+                    break;
+                };
+                env.insert(selector.clone(), Scalar::Int(selected));
             }
 
             let low = state & self.machine.mask;
@@ -868,7 +889,10 @@ impl LoopRunner<'_, '_> {
 
             match env.get(&self.machine.state_var).copied() {
                 Some(Scalar::Int(next)) if next >= 0 => {
-                    let next = next as u64;
+                    let Ok(next) = u64::try_from(next) else {
+                        terminal = "integer-overflow".to_string();
+                        break;
+                    };
                     if next == state {
                         terminal = "stuck".to_string();
                         break;

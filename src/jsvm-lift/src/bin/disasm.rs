@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
+use jsvm_lift::numeric::exact_u64;
 use oxc_allocator::Allocator;
 use oxc_ast::{
     ast::{Argument, AssignmentTarget, Expression},
@@ -222,10 +223,7 @@ fn resolve_parse_int(preview: &str, aliases: &BTreeSet<String>) -> Option<u64> {
     let Argument::NumericLiteral(radix) = &call.arguments[1] else {
         return None;
     };
-    if !radix.value.is_finite() || radix.value.fract() != 0.0 {
-        return None;
-    }
-    let radix = radix.value as u32;
+    let radix = u32::try_from(exact_u64(radix.value)?).ok()?;
     if !(2..=36).contains(&radix) {
         return None;
     }
@@ -350,7 +348,7 @@ fn build_disassembly(
     vm: &NormalizedVm,
     aliases: &BTreeSet<String>,
 ) -> Option<Disassembly> {
-    let width = decoder.width as usize;
+    let width = usize::try_from(decoder.width).ok()?;
     if width == 0 {
         return None;
     }

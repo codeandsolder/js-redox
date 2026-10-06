@@ -1,4 +1,5 @@
 use crate::ast_utils::target_ident;
+use jsvm_lift::numeric::exact_u64;
 use oxc_ast::{
     ast::{
         ArrayExpressionElement, AssignmentTarget, BindingPattern, CallExpression, Expression,
@@ -168,11 +169,7 @@ fn unwrap_parens<'a>(mut expr: &'a Expression<'a>) -> &'a Expression<'a> {
 
 fn numeric_index(expr: &Expression<'_>) -> Option<usize> {
     match unwrap_parens(expr) {
-        Expression::NumericLiteral(n)
-            if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 =>
-        {
-            Some(n.value as usize)
-        }
+        Expression::NumericLiteral(n) => usize::try_from(exact_u64(n.value)?).ok(),
         _ => None,
     }
 }
@@ -307,12 +304,22 @@ impl<'s> Analyzer<'s> {
         self.function_stack
             .last()
             .map(|f| (Some(f.id.clone()), f.start, f.end))
-            .unwrap_or_else(|| (None, 0, self.source.len().min(u32::MAX as usize) as u32))
+            .unwrap_or_else(|| {
+                (
+                    None,
+                    0,
+                    u32::try_from(self.source.len()).unwrap_or(u32::MAX),
+                )
+            })
     }
 
     fn registry_scope_key(&self, binding: String) -> (u32, u32, String) {
         if binding.starts_with("this.") || binding.starts_with("this[") {
-            return (0, self.source.len().min(u32::MAX as usize) as u32, binding);
+            return (
+                0,
+                u32::try_from(self.source.len()).unwrap_or(u32::MAX),
+                binding,
+            );
         }
         let (_, start, end) = self.current_scope();
         (start, end, binding)
