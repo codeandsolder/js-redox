@@ -1,3 +1,5 @@
+use super::capped_u32;
+use jsvm_lift::numeric::exact_i64;
 use oxc_ast::ast::{
     Argument, AssignmentExpression, BindingPattern, CallExpression, ConditionalExpression,
     Expression, Function, FunctionBody, ObjectExpression, ObjectPropertyKind, PropertyKind,
@@ -199,7 +201,7 @@ fn detect_rotation_checksum_iife(call: &CallExpression<'_>) -> Option<Structural
 
     Some(StructuralSignal {
         kind: "rotation_checksum_iife",
-        weight: 12 + (probe.rotations as u32).min(4) + ((probe.parse_int_calls / 3) as u32).min(4),
+        weight: 12 + capped_u32(probe.rotations, 4) + capped_u32(probe.parse_int_calls / 3, 4),
         span: call.span,
         subject: Some(provider.name.to_string()),
         detail: format!(
@@ -415,7 +417,7 @@ fn detect_operator_proxy_table(object: &ObjectExpression<'_>) -> Option<Structur
 
     Some(StructuralSignal {
         kind: "operator_proxy_table",
-        weight: 6 + (proxy_functions as u32).min(10),
+        weight: 6 + capped_u32(proxy_functions, 10),
         span: object.span,
         subject: None,
         detail: format!(
@@ -508,7 +510,7 @@ fn detect_direct_table_decoder(function: &Function<'_>) -> Option<StructuralSign
     let table = probe.table?;
     Some(StructuralSignal {
         kind: "direct_table_decoder",
-        weight: 12 + (probe.decode_calls as u32).min(4),
+        weight: 12 + capped_u32(probe.decode_calls, 4),
         span: function.span,
         subject: Some(table.clone()),
         detail: format!(
@@ -588,7 +590,7 @@ fn detect_mba_helper(function: &Function<'_>) -> Option<StructuralSignal> {
     }
     Some(StructuralSignal {
         kind: "mba_helper",
-        weight: 2 + (stats.bitwise as u32).min(5),
+        weight: 2 + capped_u32(stats.bitwise, 5),
         span: function.span,
         subject: function_subject(function),
         detail: format!(
@@ -600,18 +602,15 @@ fn detect_mba_helper(function: &Function<'_>) -> Option<StructuralSignal> {
 
 fn integer_literal(expression: &Expression<'_>) -> Option<i64> {
     match expression {
-        Expression::NumericLiteral(number)
-            if number.value.is_finite() && number.value.fract() == 0.0 =>
-        {
-            Some(number.value as i64)
+        Expression::NumericLiteral(number) => exact_i64(number.value),
+        Expression::UnaryExpression(unary) if unary.operator.as_str() == "+" => {
+            integer_literal(&unary.argument)
         }
-        Expression::UnaryExpression(unary) if matches!(unary.operator.as_str(), "+" | "-") => {
-            let value = integer_literal(&unary.argument)?;
-            Some(if unary.operator.as_str() == "-" {
-                -value
-            } else {
-                value
-            })
+        Expression::UnaryExpression(unary) if unary.operator.as_str() == "-" => {
+            match &unary.argument {
+                Expression::NumericLiteral(number) => exact_i64(-number.value),
+                _ => integer_literal(&unary.argument)?.checked_neg(),
+            }
         }
         _ => None,
     }
@@ -668,7 +667,7 @@ fn detect_selector_dispatcher(function: &Function<'_>) -> Option<StructuralSigna
     }
     Some(StructuralSignal {
         kind: "selector_dispatcher",
-        weight: 8 + (probe.literals.len() as u32).min(8),
+        weight: 8 + capped_u32(probe.literals.len(), 8),
         span: function.span,
         subject: function_subject(function),
         detail: format!(

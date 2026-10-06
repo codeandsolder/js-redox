@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use clap::Parser as ClapParser;
+use jsvm_lift::numeric::exact_u64;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, BinaryExpression, CallExpression,
@@ -127,6 +128,14 @@ struct RawSignal {
     detail: String,
 }
 
+fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn capped_u32(value: usize, cap: u32) -> u32 {
+    saturating_u32(value).min(cap)
+}
+
 struct Collector<'s> {
     source: &'s str,
     blob_min_len: usize,
@@ -251,7 +260,7 @@ impl Collector<'_> {
         if parts >= 4 && string_literals >= 1 {
             self.push(
                 "string_plus_chain",
-                2 + (parts as u32 / 4).min(4),
+                2 + capped_u32(parts / 4, 4),
                 it.span,
                 None,
                 format!("{parts} '+' operands; {string_literals} literal string(s)"),
@@ -303,7 +312,7 @@ impl Collector<'_> {
         if strings >= 6 && api_hits >= 3 && api_hits * 4 >= strings {
             self.push(
                 "api_string_table",
-                4 + (api_hits as u32).min(8) + (hot_api_hits as u32).min(4),
+                4 + capped_u32(api_hits, 8) + capped_u32(hot_api_hits, 4),
                 it.span,
                 None,
                 format!("{api_hits}/{strings} API/property names; {hot_api_hits} decoder/dynamic hot names"),
@@ -314,7 +323,7 @@ impl Collector<'_> {
         {
             self.push(
                 "identifier_string_table",
-                3 + ((strings / 16) as u32).min(4),
+                3 + capped_u32(strings / 16, 4),
                 it.span,
                 None,
                 format!("{identifier_strings}/{strings} identifier-like short strings"),
@@ -322,19 +331,22 @@ impl Collector<'_> {
         }
 
         if numeric >= 16 && byte_numeric * 5 >= numeric * 4 {
-            let printable_ratio = printable_numeric as f64 / numeric as f64;
+            let printable_heavy = printable_numeric.saturating_mul(5) >= numeric.saturating_mul(3);
+            let printable_percent = printable_numeric
+                .saturating_mul(100)
+                .saturating_add(numeric / 2)
+                / numeric;
             self.push(
-                if printable_ratio >= 0.60 {
+                if printable_heavy {
                     "charcode_array"
                 } else {
                     "byte_array"
                 },
-                if printable_ratio >= 0.60 { 5 } else { 3 } + ((numeric / 32) as u32).min(4),
+                if printable_heavy { 5 } else { 3 } + capped_u32(numeric / 32, 4),
                 it.span,
                 None,
                 format!(
-                    "{byte_numeric}/{numeric} byte-range integers; {:.0}% printable ASCII",
-                    printable_ratio * 100.0
+                    "{byte_numeric}/{numeric} byte-range integers; {printable_percent}% printable ASCII"
                 ),
             );
         }
@@ -417,7 +429,7 @@ impl Collector<'_> {
                 .count();
             self.push(
                 "charcode_decode_call",
-                6 + ((it.arguments.len() / 4) as u32).min(6),
+                6 + capped_u32(it.arguments.len() / 4, 6),
                 it.span,
                 None,
                 format!(
@@ -539,7 +551,7 @@ impl Collector<'_> {
         if callee.ends_with(".concat") && it.arguments.len() >= 2 {
             self.push(
                 "concat_call",
-                2 + ((it.arguments.len() / 3) as u32).min(3),
+                2 + capped_u32(it.arguments.len() / 3, 3),
                 it.span,
                 None,
                 format!("{} concatenation argument(s)", it.arguments.len()),
@@ -547,10 +559,9 @@ impl Collector<'_> {
         }
 
         if (callee.ends_with(".toString") || callee == "Number.prototype.toString")
-            && it
-                .arguments
-                .first()
-                .is_some_and(|arg| matches!(arg, Argument::NumericLiteral(n) if matches!(n.value as i32, 16 | 32 | 36)))
+            && it.arguments.first().is_some_and(|arg| {
+                matches!(arg, Argument::NumericLiteral(n) if exact_u64(n.value).is_some_and(|value| matches!(value, 16 | 32 | 36)))
+            })
         {
             self.push(
                 "radix_string_call",
@@ -645,7 +656,7 @@ impl<'a> Visit<'a> for Collector<'_> {
             Expression::StringLiteral(value) => self.record_blob(value.span, value.value.as_str()),
             Expression::TemplateLiteral(value) if value.expressions.len() >= 4 => self.push(
                 "template_assembly",
-                3 + ((value.expressions.len() / 4) as u32).min(4),
+                3 + capped_u32(value.expressions.len() / 4, 4),
                 value.span,
                 None,
                 format!("{} interpolated expressions", value.expressions.len()),
@@ -1102,10 +1113,13 @@ fn score_cluster_candidates(
             let repeated_bonus = subject_counts
                 .values()
                 .filter(|&&count| count >= 3)
-                .map(|&count| 3 + count.saturating_sub(3) as u32)
+                .map(|&count| 3_u32.saturating_add(saturating_u32(count.saturating_sub(3))))
                 .sum::<u32>();
-            let mut score =
-                weight_sum + (kind_counts.len().saturating_sub(1) as u32) * 2 + repeated_bonus;
+            let mut score = weight_sum
+                .saturating_add(
+                    saturating_u32(kind_counts.len().saturating_sub(1)).saturating_mul(2),
+                )
+                .saturating_add(repeated_bonus);
             let start = signals[left].start;
             let end = signals[right - 1].end;
             let span = end.saturating_sub(start).max(1);
