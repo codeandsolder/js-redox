@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
 use jsvm_lift::numeric::exact_u64;
+use jsvm_lift::pipeline::{read_jsonl, BindingInfo, NormalizedPath, NormalizedVm};
 use oxc_allocator::Allocator;
 use oxc_ast::{
     ast::{Argument, AssignmentTarget, Expression},
@@ -60,37 +61,6 @@ struct PushBuilder {
 struct BuilderUnknown {
     index: usize,
     preview: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct NormalizedVm {
-    #[serde(rename = "file")]
-    _file: String,
-    decoder: String,
-    parent: String,
-    role_bindings: BTreeMap<String, BindingInfo>,
-    opcodes: Vec<NormalizedOpcode>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct BindingInfo {
-    original: String,
-    normalized: String,
-    source: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct NormalizedOpcode {
-    opcode: u64,
-    paths: Vec<NormalizedPath>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct NormalizedPath {
-    guards: Vec<String>,
-    states: Vec<u64>,
-    effects: Vec<String>,
-    terminal: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -230,18 +200,6 @@ fn resolve_parse_int(preview: &str, aliases: &BTreeSet<String>) -> Option<u64> {
     let raw = text.value.trim();
     let raw = raw.strip_prefix('+').unwrap_or(raw);
     u64::from_str_radix(raw, radix).ok()
-}
-
-fn read_scan_jsonl(path: &Path) -> Result<Vec<ScanReport>> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(i, line)| {
-            serde_json::from_str(line)
-                .with_context(|| format!("parsing {} line {}", path.display(), i + 1))
-        })
-        .collect()
 }
 
 fn compact_semantics(paths: &[NormalizedPath]) -> String {
@@ -462,7 +420,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("creating {}", args.output_dir.display()))?;
-    let scans = read_scan_jsonl(&args.scan)?;
+    let scans: Vec<ScanReport> = read_jsonl(&args.scan)?;
     let normalized: Vec<NormalizedVm> = serde_json::from_str(
         &fs::read_to_string(&args.normalized)
             .with_context(|| format!("reading {}", args.normalized.display()))?,

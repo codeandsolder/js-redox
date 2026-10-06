@@ -101,6 +101,28 @@ fn mul_width_ip(expr: &Expression<'_>) -> Option<(u64, String)> {
     None
 }
 
+fn base_offset_shape(expr: &Expression<'_>) -> Option<IndexShape> {
+    let Expression::BinaryExpression(binary) = expr else {
+        return None;
+    };
+    if binary.operator.as_str() != "+" {
+        return None;
+    }
+    if let (Some(base), Some(offset)) = (expr_ident(&binary.left), numeric_u64(&binary.right)) {
+        return Some(IndexShape::BaseOffset {
+            base: base.to_string(),
+            offset,
+        });
+    }
+    let (Some(offset), Some(base)) = (numeric_u64(&binary.left), expr_ident(&binary.right)) else {
+        return None;
+    };
+    Some(IndexShape::BaseOffset {
+        base: base.to_string(),
+        offset,
+    })
+}
+
 pub fn index_shape(expr: &Expression<'_>) -> Option<IndexShape> {
     match expr {
         Expression::ParenthesizedExpression(paren) => index_shape(&paren.expression),
@@ -113,25 +135,8 @@ pub fn index_shape(expr: &Expression<'_>) -> Option<IndexShape> {
                     width,
                 });
             }
-            if let Expression::BinaryExpression(binary) = &assign.right {
-                if binary.operator.as_str() == "+" {
-                    if let (Some(base), Some(offset)) =
-                        (expr_ident(&binary.left), numeric_u64(&binary.right))
-                    {
-                        return Some(IndexShape::BaseOffset {
-                            base: base.to_string(),
-                            offset,
-                        });
-                    }
-                    if let (Some(offset), Some(base)) =
-                        (numeric_u64(&binary.left), expr_ident(&binary.right))
-                    {
-                        return Some(IndexShape::BaseOffset {
-                            base: base.to_string(),
-                            offset,
-                        });
-                    }
-                }
+            if let Some(shape) = base_offset_shape(&assign.right) {
+                return Some(shape);
             }
             if let Some(base) = expr_ident(&assign.right) {
                 return Some(IndexShape::Identifier(base.to_string()));
@@ -139,23 +144,7 @@ pub fn index_shape(expr: &Expression<'_>) -> Option<IndexShape> {
             None
         }
         Expression::BinaryExpression(binary) if binary.operator.as_str() == "+" => {
-            if let (Some(base), Some(offset)) =
-                (expr_ident(&binary.left), numeric_u64(&binary.right))
-            {
-                return Some(IndexShape::BaseOffset {
-                    base: base.to_string(),
-                    offset,
-                });
-            }
-            if let (Some(offset), Some(base)) =
-                (numeric_u64(&binary.left), expr_ident(&binary.right))
-            {
-                return Some(IndexShape::BaseOffset {
-                    base: base.to_string(),
-                    offset,
-                });
-            }
-            None
+            base_offset_shape(expr)
         }
         Expression::BinaryExpression(_) => {
             let (width, ip) = mul_width_ip(expr)?;

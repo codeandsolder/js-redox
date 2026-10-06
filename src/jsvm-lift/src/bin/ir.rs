@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
+use jsvm_lift::pipeline::{BindingInfo, NormalizedVm};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -15,38 +16,6 @@ struct Args {
     scan: Option<PathBuf>,
     #[arg(long)]
     output: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-struct NormalizedVm {
-    file: String,
-    decoder: String,
-    parent: String,
-    role_bindings: BTreeMap<String, BindingInfo>,
-    state_machine: serde_json::Value,
-    opcodes: Vec<NormalizedOpcode>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct BindingInfo {
-    original: String,
-    normalized: String,
-    source: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct NormalizedOpcode {
-    opcode: u64,
-    derived_env: BTreeMap<String, serde_json::Value>,
-    paths: Vec<NormalizedPath>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NormalizedPath {
-    guards: Vec<String>,
-    states: Vec<u64>,
-    effects: Vec<String>,
-    terminal: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

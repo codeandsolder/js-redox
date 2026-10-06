@@ -28,6 +28,23 @@ use oxc_syntax::scope::ScopeFlags;
 use rolldown_redox::ecmascript::parse_program;
 use std::collections::{BTreeSet, HashMap};
 
+fn indexed_access(source: &str, expr: &Expression<'_>) -> Option<IndexedAccess> {
+    let Expression::ComputedMemberExpression(member) = expr else {
+        return None;
+    };
+    let Expression::Identifier(object) = &member.object else {
+        return None;
+    };
+    let shape = index_shape(&member.expression)?;
+    Some(IndexedAccess {
+        object: object.name.to_string(),
+        shape,
+        start: member.span.start,
+        end: member.span.end,
+        preview: preview(source, member.span.start, member.span.end, 160),
+    })
+}
+
 struct Scanner<'s> {
     source: &'s str,
     arrays: Vec<ArrayCandidate>,
@@ -334,30 +351,14 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &oxc_ast::ast::VariableDeclarator<'a>) {
-        let fetched_access = if let (
-            oxc_ast::ast::BindingPattern::BindingIdentifier(id),
-            Some(Expression::ComputedMemberExpression(member)),
-        ) = (&declarator.id, &declarator.init)
-        {
-            if let Expression::Identifier(object) = &member.object {
-                index_shape(&member.expression).map(|shape| {
-                    (
-                        id.name.to_string(),
-                        IndexedAccess {
-                            object: object.name.to_string(),
-                            shape,
-                            start: member.span.start,
-                            end: member.span.end,
-                            preview: preview(self.source, member.span.start, member.span.end, 160),
-                        },
-                    )
-                })
+        let fetched_access =
+            if let (oxc_ast::ast::BindingPattern::BindingIdentifier(id), Some(init)) =
+                (&declarator.id, &declarator.init)
+            {
+                indexed_access(self.source, init).map(|access| (id.name.to_string(), access))
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         if let Some(current) = self.stack.last_mut() {
             if let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id {
@@ -435,28 +436,10 @@ impl<'a> Visit<'a> for Scanner<'_> {
             None
         };
         let rhs = expr_ident(&assignment.right);
-        let fetched_access = if let (Some(lhs_name), Expression::ComputedMemberExpression(member)) =
-            (lhs.as_ref(), &assignment.right)
-        {
-            if let Expression::Identifier(object) = &member.object {
-                index_shape(&member.expression).map(|shape| {
-                    (
-                        (*lhs_name).to_string(),
-                        IndexedAccess {
-                            object: object.name.to_string(),
-                            shape,
-                            start: member.span.start,
-                            end: member.span.end,
-                            preview: preview(self.source, member.span.start, member.span.end, 160),
-                        },
-                    )
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let fetched_access = lhs.as_ref().and_then(|lhs_name| {
+            indexed_access(self.source, &assignment.right)
+                .map(|access| ((*lhs_name).to_string(), access))
+        });
 
         if let Some(current) = self.stack.last_mut() {
             current.m.assignments += 1;

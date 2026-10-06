@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
+use jsvm_lift::pipeline::{BindingInfo, NormalizedOpcode, NormalizedPath, NormalizedVm, VmRoles};
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 use rolldown_redox::ecmascript::parse_program;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
@@ -40,50 +41,6 @@ struct ReducedOpcode {
 
 #[derive(Debug, Deserialize)]
 struct ReducedPath {
-    guards: Vec<String>,
-    states: Vec<u64>,
-    effects: Vec<String>,
-    terminal: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VmRoles {
-    decoder: String,
-    roles: BTreeMap<String, RoleAssignment>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RoleAssignment {
-    name: String,
-    source: String,
-}
-
-#[derive(Debug, Serialize)]
-struct NormalizedVm {
-    file: String,
-    decoder: String,
-    parent: String,
-    role_bindings: BTreeMap<String, BindingInfo>,
-    state_machine: serde_json::Value,
-    opcodes: Vec<NormalizedOpcode>,
-}
-
-#[derive(Debug, Serialize)]
-struct BindingInfo {
-    original: String,
-    normalized: String,
-    source: String,
-}
-
-#[derive(Debug, Serialize)]
-struct NormalizedOpcode {
-    opcode: u64,
-    derived_env: BTreeMap<String, serde_json::Value>,
-    paths: Vec<NormalizedPath>,
-}
-
-#[derive(Debug, Serialize)]
-struct NormalizedPath {
     guards: Vec<String>,
     states: Vec<u64>,
     effects: Vec<String>,

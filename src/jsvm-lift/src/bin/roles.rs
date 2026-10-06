@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
 use jsvm_lift::effect_shape::{analyze_effect, family_name, EffectShape};
-use serde::{Deserialize, Serialize};
+use jsvm_lift::pipeline::{read_jsonl, RoleAssignment, VmRoles};
+use serde::Deserialize;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 #[derive(ClapParser, Debug)]
@@ -72,18 +73,6 @@ fn path_info(path: &ReducedPath) -> PathInfo {
         .collect();
     let signature = effects.iter().map(|x| x.hash).collect();
     PathInfo { effects, signature }
-}
-
-fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(i, line)| {
-            serde_json::from_str(line)
-                .with_context(|| format!("parsing {} line {}", path.display(), i + 1))
-        })
-        .collect()
 }
 
 fn hard_anchors(scans: &[ScanReport]) -> HashMap<String, BTreeMap<String, String>> {
@@ -215,22 +204,6 @@ fn hungarian_max(
         }
     }
     out
-}
-
-#[derive(Debug, Serialize)]
-struct RoleAssignment {
-    name: String,
-    source: String,
-    votes: Option<i64>,
-    margin: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-struct VmRoles {
-    file: String,
-    decoder: String,
-    matched_paths: usize,
-    roles: BTreeMap<String, RoleAssignment>,
 }
 
 type Votes = HashMap<String, HashMap<String, i64>>;
