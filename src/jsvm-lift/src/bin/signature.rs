@@ -46,15 +46,16 @@ struct Cluster {
     shape: String,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let text = fs::read_to_string(&args.input)
-        .with_context(|| format!("reading {}", args.input.display()))?;
+struct SignatureClusters {
+    vm_count: usize,
+    effects: HashMap<u64, Cluster>,
+    paths: HashMap<String, Cluster>,
+}
 
-    let mut effects: HashMap<u64, Cluster> = HashMap::new();
-    let mut paths: HashMap<String, Cluster> = HashMap::new();
-    let mut vm_count = 0usize;
-
+fn collect_clusters(text: &str) -> Result<SignatureClusters> {
+    let mut effects = HashMap::new();
+    let mut paths = HashMap::new();
+    let mut vm_count = 0;
     for (line_no, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -62,120 +63,156 @@ fn main() -> Result<()> {
         let vm: ReducedVm =
             serde_json::from_str(line).with_context(|| format!("parsing line {}", line_no + 1))?;
         vm_count += 1;
-        let fam = family_name(&vm.file);
-
+        let family = family_name(&vm.file);
         for op in &vm.opcodes {
             for path in &op.paths {
-                let mut hashes = Vec::new();
-
-                for raw in &path.effects {
-                    if raw == "[no-state-change]" {
-                        continue;
-                    }
-                    let analyzed = analyze_effect(raw);
-                    let hash = analyzed.hash;
-                    let shape = analyzed.text;
-                    hashes.push(format!("{hash:016x}"));
-
-                    let cluster = effects.entry(hash).or_default();
-                    cluster.count += 1;
-                    cluster.decoders.insert(vm.decoder.clone());
-                    cluster.families.insert(fam.clone());
-                    if cluster.shape.is_empty() {
-                        cluster.shape = shape;
-                    }
-                    if cluster.samples.len() < 4 && !cluster.samples.contains(raw) {
-                        cluster.samples.push(raw.clone());
-                    }
-                }
-
-                let signature = hashes.join("|");
-                let cluster = paths.entry(signature).or_default();
-                cluster.count += 1;
-                cluster.decoders.insert(vm.decoder.clone());
-                cluster.families.insert(fam.clone());
-                if cluster.samples.len() < 4 {
-                    cluster.samples.push(format!(
-                        "{} op {} :: {}",
-                        vm.decoder,
-                        op.opcode,
-                        path.effects.join(" ; ")
-                    ));
-                }
+                record_path(&mut effects, &mut paths, &vm, op, path, &family);
             }
         }
     }
+    Ok(SignatureClusters {
+        vm_count,
+        effects,
+        paths,
+    })
+}
 
-    let mut effect_rows: Vec<_> = effects
+fn record_path(
+    effects: &mut HashMap<u64, Cluster>,
+    paths: &mut HashMap<String, Cluster>,
+    vm: &ReducedVm,
+    op: &ReducedOpcode,
+    path: &ReducedPath,
+    family: &str,
+) {
+    let mut hashes = Vec::new();
+    for raw in &path.effects {
+        if raw == "[no-state-change]" {
+            continue;
+        }
+        let analyzed = analyze_effect(raw);
+        let hash = analyzed.hash;
+        hashes.push(format!("{hash:016x}"));
+        let cluster = effects.entry(hash).or_default();
+        cluster.count += 1;
+        cluster.decoders.insert(vm.decoder.clone());
+        cluster.families.insert(family.to_string());
+        if cluster.shape.is_empty() {
+            cluster.shape = analyzed.text;
+        }
+        if cluster.samples.len() < 4 && !cluster.samples.contains(raw) {
+            cluster.samples.push(raw.clone());
+        }
+    }
+
+    let signature = hashes.join("|");
+    let cluster = paths.entry(signature).or_default();
+    cluster.count += 1;
+    cluster.decoders.insert(vm.decoder.clone());
+    cluster.families.insert(family.to_string());
+    if cluster.samples.len() < 4 {
+        cluster.samples.push(format!(
+            "{} op {} :: {}",
+            vm.decoder,
+            op.opcode,
+            path.effects.join(" ; ")
+        ));
+    }
+}
+
+fn ranked_effects(effects: HashMap<u64, Cluster>, min_decoders: usize) -> Vec<(u64, Cluster)> {
+    let mut rows: Vec<_> = effects
         .into_iter()
-        .filter(|(_, c)| c.decoders.len() >= args.min_decoders)
+        .filter(|(_, cluster)| cluster.decoders.len() >= min_decoders)
         .collect();
-    effect_rows.sort_by(|a, b| {
+    rows.sort_by(|a, b| {
         b.1.decoders
             .len()
             .cmp(&a.1.decoders.len())
             .then_with(|| b.1.count.cmp(&a.1.count))
             .then_with(|| a.0.cmp(&b.0))
     });
+    rows
+}
 
-    let mut path_rows: Vec<_> = paths
+fn ranked_paths(paths: HashMap<String, Cluster>, min_decoders: usize) -> Vec<(String, Cluster)> {
+    let mut rows: Vec<_> = paths
         .into_iter()
-        .filter(|(_, c)| c.decoders.len() >= args.min_decoders)
+        .filter(|(_, cluster)| cluster.decoders.len() >= min_decoders)
         .collect();
-    path_rows.sort_by(|a, b| {
+    rows.sort_by(|a, b| {
         b.1.decoders
             .len()
             .cmp(&a.1.decoders.len())
             .then_with(|| b.1.count.cmp(&a.1.count))
             .then_with(|| a.0.cmp(&b.0))
     });
+    rows
+}
 
-    println!(
-        "VMs {vm_count} shared_effect_shapes {} shared_path_signatures {}",
-        effect_rows.len(),
-        path_rows.len()
-    );
-    println!(
-        "
-TOP EFFECT SHAPES"
-    );
-    for (hash, c) in effect_rows.into_iter().take(args.top) {
+fn print_effects(rows: impl IntoIterator<Item = (u64, Cluster)>, top: usize) {
+    println!("\nTOP EFFECT SHAPES");
+    for (hash, cluster) in rows.into_iter().take(top) {
         println!(
-            "
-{hash:016x} uses {} decoders {} families {}",
-            c.count,
-            c.decoders.len(),
-            c.families.iter().cloned().collect::<Vec<_>>().join(",")
+            "\n{hash:016x} uses {} decoders {} families {}",
+            cluster.count,
+            cluster.decoders.len(),
+            cluster
+                .families
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
         );
-        for sample in c.samples.iter().take(3) {
+        for sample in cluster.samples.iter().take(3) {
             let clipped: String = sample.chars().take(240).collect();
             println!("  {clipped}");
         }
     }
+}
 
-    println!(
-        "
-SHARED FULL PATH SIGNATURES"
-    );
-    for (sig, c) in path_rows.into_iter().take(args.top) {
-        let effects = if sig.is_empty() {
+fn print_paths(rows: impl IntoIterator<Item = (String, Cluster)>, top: usize) {
+    println!("\nSHARED FULL PATH SIGNATURES");
+    for (signature, cluster) in rows.into_iter().take(top) {
+        let effects = if signature.is_empty() {
             0
         } else {
-            sig.split('|').count()
+            signature.split('|').count()
         };
         println!(
-            "
-uses {} decoders {} families {} effects {}",
-            c.count,
-            c.decoders.len(),
-            c.families.iter().cloned().collect::<Vec<_>>().join(","),
+            "\nuses {} decoders {} families {} effects {}",
+            cluster.count,
+            cluster.decoders.len(),
+            cluster
+                .families
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(","),
             effects
         );
-        for sample in c.samples.iter().take(2) {
+        for sample in cluster.samples.iter().take(2) {
             let clipped: String = sample.chars().take(420).collect();
             println!("  {clipped}");
         }
     }
+}
 
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let text = fs::read_to_string(&args.input)
+        .with_context(|| format!("reading {}", args.input.display()))?;
+    let clusters = collect_clusters(&text)?;
+    let effect_rows = ranked_effects(clusters.effects, args.min_decoders);
+    let path_rows = ranked_paths(clusters.paths, args.min_decoders);
+
+    println!(
+        "VMs {} shared_effect_shapes {} shared_path_signatures {}",
+        clusters.vm_count,
+        effect_rows.len(),
+        path_rows.len()
+    );
+    print_effects(effect_rows, args.top);
+    print_paths(path_rows, args.top);
     Ok(())
 }
