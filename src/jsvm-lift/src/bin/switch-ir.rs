@@ -782,110 +782,102 @@ fn infer_semantic_label(
     }
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let source = fs::read_to_string(&args.source)
-        .with_context(|| format!("reading {}", args.source.display()))?;
-    let report: ScanReport = serde_json::from_str(
-        fs::read_to_string(&args.scan)
-            .with_context(|| format!("reading {}", args.scan.display()))?
-            .trim(),
-    )
-    .with_context(|| format!("parsing {}", args.scan.display()))?;
+fn lift_handler(
+    handler: &DirectSwitchHandler,
+    selector_style: &str,
+    roles: &BTreeMap<String, String>,
+    helpers: &BTreeMap<String, String>,
+) -> SwitchHandlerIr {
+    let mut signature = Vec::new();
+    let mut effects = Vec::new();
+    for semantic in &handler.semantic {
+        for effect in split_effects(semantic) {
+            let normalized = normalize(&effect, roles, helpers);
+            let ir = classify_effect(&normalized);
+            signature.push(format!("{}:{}", ir.kind, ir.shape_hash));
+            effects.push(HandlerEffectIr {
+                source: effect,
+                normalized,
+                ir,
+            });
+        }
+    }
+    signature.push(format!("terminal:{}", handler.terminal));
+    let semantic_label = infer_semantic_label(selector_style, &handler.terminal, &effects);
+    SwitchHandlerIr {
+        opcode: handler.key,
+        key_source: handler.key_source.clone(),
+        terminal: handler.terminal.clone(),
+        semantic_hash: format!("{:016x}", fnv1a64(signature.join("|").as_bytes())),
+        coarse_semantic_hash: format!("{:016x}", fnv1a64(semantic_label.as_bytes())),
+        semantic_label,
+        op_kinds: effects
+            .iter()
+            .map(|effect| effect.ir.kind.clone())
+            .collect(),
+        effects,
+    }
+}
 
+fn lift_switch_vm(source: &str, function: &FunctionInfo, map: &DirectSwitchMap) -> SwitchVmIr {
+    let function_text = function_source(source, function);
+    let semantics = all_semantics(map);
+    let prefix_len = map
+        .start
+        .saturating_sub(function.start)
+        .min(function.end.saturating_sub(function.start)) as usize;
+    let function_prefix = function_text.get(..prefix_len).unwrap_or(function_text);
+    let (selector_style, roles, helpers) = if let Some(helper) = call_selector(&map.selector) {
+        let (roles, helpers) = call_family_roles(function_prefix, &semantics, &helper);
+        ("call".to_string(), roles, helpers)
+    } else {
+        let (roles, helpers) = indexed_family_roles(map, &semantics);
+        ("indexed".to_string(), roles, helpers)
+    };
+    let handlers = map
+        .handlers
+        .iter()
+        .map(|handler| lift_handler(handler, &selector_style, &roles, &helpers))
+        .collect();
+
+    SwitchVmIr {
+        parent_function_id: map.parent_function_id.clone(),
+        function_name: function.name.clone(),
+        function_start: function.start,
+        function_end: function.end,
+        switch_start: map.start,
+        switch_end: map.end,
+        selector: map.selector.clone(),
+        selector_style,
+        numeric_cases: map.numeric_cases,
+        opcode_max: map.opcode_max,
+        vm_evidence_score: map.vm_evidence_score,
+        vm_reasons: map.vm_reasons.clone(),
+        role_bindings: roles,
+        helper_bindings: helpers,
+        handlers,
+    }
+}
+
+fn lift_switch_vms(source: &str, report: &ScanReport) -> Vec<SwitchVmIr> {
     let functions: HashMap<_, _> = report
         .functions
         .iter()
-        .map(|f| (f.id.as_str(), f))
+        .map(|function| (function.id.as_str(), function))
         .collect();
+    report
+        .direct_switch_maps
+        .iter()
+        .filter(|map| map.confirmed_vm)
+        .filter_map(|map| {
+            functions
+                .get(map.parent_function_id.as_str())
+                .map(|function| lift_switch_vm(source, function, map))
+        })
+        .collect()
+}
 
-    let mut vms = Vec::new();
-    for map in report.direct_switch_maps.iter().filter(|m| m.confirmed_vm) {
-        let Some(function) = functions.get(map.parent_function_id.as_str()).copied() else {
-            continue;
-        };
-        let function_text = function_source(&source, function);
-        let semantics = all_semantics(map);
-
-        let prefix_len = map
-            .start
-            .saturating_sub(function.start)
-            .min(function.end.saturating_sub(function.start)) as usize;
-        let function_prefix = function_text.get(..prefix_len).unwrap_or(function_text);
-
-        let (selector_style, roles, helpers) = if let Some(helper) = call_selector(&map.selector) {
-            let (roles, helpers) = call_family_roles(function_prefix, &semantics, &helper);
-            ("call".to_string(), roles, helpers)
-        } else {
-            let (roles, helpers) = indexed_family_roles(map, &semantics);
-            ("indexed".to_string(), roles, helpers)
-        };
-
-        let mut handlers = Vec::new();
-        for handler in &map.handlers {
-            let mut effects = Vec::new();
-            let mut signature = Vec::new();
-            for semantic in &handler.semantic {
-                for effect in split_effects(semantic) {
-                    let normalized = normalize(&effect, &roles, &helpers);
-                    let ir = classify_effect(&normalized);
-                    signature.push(format!("{}:{}", ir.kind, ir.shape_hash));
-                    effects.push(HandlerEffectIr {
-                        source: effect,
-                        normalized,
-                        ir,
-                    });
-                }
-            }
-            signature.push(format!("terminal:{}", handler.terminal));
-            let semantic_label = infer_semantic_label(&selector_style, &handler.terminal, &effects);
-            let semantic_hash = format!("{:016x}", fnv1a64(signature.join("|").as_bytes()));
-            let coarse_semantic_hash = format!("{:016x}", fnv1a64(semantic_label.as_bytes()));
-            handlers.push(SwitchHandlerIr {
-                opcode: handler.key,
-                key_source: handler.key_source.clone(),
-                terminal: handler.terminal.clone(),
-                semantic_label,
-                semantic_hash,
-                coarse_semantic_hash,
-                op_kinds: effects
-                    .iter()
-                    .map(|effect| effect.ir.kind.clone())
-                    .collect(),
-                effects,
-            });
-        }
-
-        vms.push(SwitchVmIr {
-            parent_function_id: map.parent_function_id.clone(),
-            function_name: function.name.clone(),
-            function_start: function.start,
-            function_end: function.end,
-            switch_start: map.start,
-            switch_end: map.end,
-            selector: map.selector.clone(),
-            selector_style,
-            numeric_cases: map.numeric_cases,
-            opcode_max: map.opcode_max,
-            vm_evidence_score: map.vm_evidence_score,
-            vm_reasons: map.vm_reasons.clone(),
-            role_bindings: roles,
-            helper_bindings: helpers,
-            handlers,
-        });
-    }
-
-    let output = Output {
-        schema: "jsvm-switch-ir/v0",
-        source: args.source.display().to_string(),
-        vms,
-    };
-    fs::write(
-        &args.output,
-        format!("{}\n", serde_json::to_string_pretty(&output)?),
-    )
-    .with_context(|| format!("writing {}", args.output.display()))?;
-
+fn print_summary(output: &Output, output_path: &std::path::Path) {
     let handler_count: usize = output.vms.iter().map(|vm| vm.handlers.len()).sum();
     let effect_count: usize = output
         .vms
@@ -893,7 +885,7 @@ fn main() -> Result<()> {
         .flat_map(|vm| &vm.handlers)
         .map(|handler| handler.effects.len())
         .sum();
-    let raw_count: usize = output
+    let raw_count = output
         .vms
         .iter()
         .flat_map(|vm| &vm.handlers)
@@ -919,6 +911,29 @@ fn main() -> Result<()> {
             vm.helper_bindings,
         );
     }
-    println!("wrote {}", args.output.display());
+    println!("wrote {}", output_path.display());
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let source = fs::read_to_string(&args.source)
+        .with_context(|| format!("reading {}", args.source.display()))?;
+    let report: ScanReport = serde_json::from_str(
+        fs::read_to_string(&args.scan)
+            .with_context(|| format!("reading {}", args.scan.display()))?
+            .trim(),
+    )
+    .with_context(|| format!("parsing {}", args.scan.display()))?;
+    let output = Output {
+        schema: "jsvm-switch-ir/v0",
+        source: args.source.display().to_string(),
+        vms: lift_switch_vms(&source, &report),
+    };
+    fs::write(
+        &args.output,
+        format!("{}\n", serde_json::to_string_pretty(&output)?),
+    )
+    .with_context(|| format!("writing {}", args.output.display()))?;
+    print_summary(&output, &args.output);
     Ok(())
 }
