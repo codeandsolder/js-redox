@@ -1,13 +1,9 @@
+use jsvm_lift::effect_shape::{analyze_program, hash_shape_text, PropertyMode};
 use oxc_allocator::Allocator;
-use oxc_ast::{
-    ast::{Argument, AssignmentTarget, Expression, Statement},
-    AstKind,
-};
-use oxc_ast_visit::{walk, Visit};
+use oxc_ast::ast::{Argument, AssignmentTarget, Expression, Statement};
 use oxc_span::{GetSpan, SourceType, Span};
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
-use std::collections::HashMap;
 
 #[derive(Debug, Serialize)]
 pub struct IrOp {
@@ -27,105 +23,7 @@ pub struct IrOp {
     pub provenance: &'static str,
 }
 
-#[derive(Default)]
-struct ShapeVisitor {
-    ids: HashMap<String, usize>,
-    next_id: usize,
-    tokens: Vec<String>,
-    coarse: bool,
-}
-
-impl ShapeVisitor {
-    fn canonical_id(&mut self, name: &str) -> usize {
-        if let Some(id) = self.ids.get(name) {
-            return *id;
-        }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.ids.insert(name.to_string(), id);
-        id
-    }
-
-    fn finish(self) -> String {
-        self.tokens.join("|")
-    }
-}
-
-impl<'a> Visit<'a> for ShapeVisitor {
-    fn enter_node(&mut self, kind: AstKind<'a>) {
-        self.tokens.push(format!("K{}", kind.ty() as u8));
-        match kind {
-            AstKind::IdentifierReference(id) => {
-                let n = self.canonical_id(id.name.as_str());
-                self.tokens.push(format!("I{n}"));
-            }
-            AstKind::BindingIdentifier(id) => {
-                let n = self.canonical_id(id.name.as_str());
-                self.tokens.push(format!("B{n}"));
-            }
-            AstKind::IdentifierName(id) => self.tokens.push(if self.coarse {
-                "P:STATIC".into()
-            } else {
-                format!("P:{}", id.name)
-            }),
-            AstKind::NumericLiteral(_) => self.tokens.push("NUM".into()),
-            AstKind::StringLiteral(_) => self.tokens.push("STR".into()),
-            AstKind::BooleanLiteral(b) => self.tokens.push(format!("BOOL:{}", b.value)),
-            AstKind::NullLiteral(_) => self.tokens.push("NULL".into()),
-            AstKind::BinaryExpression(e) => {
-                self.tokens.push(format!("BIN:{}", e.operator.as_str()));
-            }
-            AstKind::LogicalExpression(e) => {
-                self.tokens.push(format!("LOG:{}", e.operator.as_str()));
-            }
-            AstKind::UnaryExpression(e) => self.tokens.push(format!("UN:{}", e.operator.as_str())),
-            AstKind::UpdateExpression(e) => {
-                self.tokens
-                    .push(format!("UP:{}:{}", e.operator.as_str(), e.prefix));
-            }
-            AstKind::AssignmentExpression(e) => {
-                self.tokens.push(format!("AS:{}", e.operator.as_str()));
-            }
-            AstKind::StaticMemberExpression(e) => self.tokens.push(if self.coarse {
-                "MEM:STATIC".into()
-            } else {
-                format!("MEM:{}", e.property.name)
-            }),
-            AstKind::ComputedMemberExpression(_) => self.tokens.push("MEM:[]".into()),
-            AstKind::CallExpression(e) => {
-                self.tokens
-                    .push(format!("CALL:{}:{}", e.arguments.len(), e.optional));
-            }
-            AstKind::NewExpression(e) => self.tokens.push(format!("NEW:{}", e.arguments.len())),
-            AstKind::Function(f) => self.tokens.push(format!(
-                "FN:{}:{}:{}",
-                f.params.items.len(),
-                f.r#async,
-                f.generator
-            )),
-            AstKind::ArrowFunctionExpression(f) => {
-                self.tokens
-                    .push(format!("ARROW:{}:{}", f.params.items.len(), f.r#async));
-            }
-            _ => {}
-        }
-    }
-
-    fn visit_program(&mut self, it: &oxc_ast::ast::Program<'a>) {
-        walk::walk_program(self, it);
-    }
-}
-
-fn fnv1a64(data: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in data {
-        h ^= u64::from(*byte);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
-}
-
-fn parse_shape_mode(source: &str, coarse: bool) -> String {
+fn parse_shape_mode(source: &str, property_mode: PropertyMode) -> String {
     for candidate in [
         source.to_string(),
         format!("({source})"),
@@ -133,27 +31,21 @@ fn parse_shape_mode(source: &str, coarse: bool) -> String {
     ] {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, &candidate, SourceType::cjs());
-        if !parsed.is_clean() {
-            continue;
+        if parsed.is_clean() {
+            return analyze_program(&parsed.program, property_mode).text;
         }
-        let mut visitor = ShapeVisitor {
-            coarse,
-            ..Default::default()
-        };
-        visitor.visit_program(&parsed.program);
-        return visitor.finish();
     }
     "PARSEFAIL".to_string()
 }
 
 fn parse_shape(source: &str) -> String {
-    parse_shape_mode(source, false)
+    parse_shape_mode(source, PropertyMode::Literal)
 }
 
 fn coarse_shape_hash(source: &str) -> String {
     format!(
         "{:016x}",
-        fnv1a64(parse_shape_mode(source, true).as_bytes())
+        hash_shape_text(&parse_shape_mode(source, PropertyMode::Opaque))
     )
 }
 
@@ -337,7 +229,7 @@ fn classify_call(source: &str, call: &oxc_ast::ast::CallExpression<'_>, hash: &s
 
 pub fn classify_effect(source: &str) -> IrOp {
     let shape = parse_shape(source);
-    let hash = format!("{:016x}", fnv1a64(shape.as_bytes()));
+    let hash = format!("{:016x}", hash_shape_text(&shape));
     let trimmed = source.trim();
 
     if trimmed.starts_with("return") {
