@@ -402,11 +402,7 @@ impl Collector<'_> {
         }
     }
 
-    fn record_call(&mut self, it: &CallExpression<'_>) {
-        self.record_structural_call(it);
-        let callee = self.fragment(it.callee.span()).trim().to_string();
-        let lower = callee.to_ascii_lowercase();
-
+    fn record_decoder_calls(&mut self, it: &CallExpression<'_>, callee: &str, lower: &str) {
         if callee == "String.fromCharCode"
             || callee.ends_with(".fromCharCode")
             || callee.contains("fromCharCode.apply")
@@ -431,9 +427,9 @@ impl Collector<'_> {
             );
         }
 
-        if is_identifierish(&callee)
+        if is_identifierish(callee)
             && !matches!(
-                callee.as_str(),
+                callee,
                 "Number"
                     | "String"
                     | "Boolean"
@@ -482,7 +478,7 @@ impl Collector<'_> {
             );
         }
 
-        if matches!(callee.as_str(), "eval" | "Function")
+        if matches!(callee, "eval" | "Function")
             || callee.ends_with(".eval")
             || lower.ends_with(".constructor")
         {
@@ -495,7 +491,7 @@ impl Collector<'_> {
             );
         }
 
-        if matches!(callee.as_str(), "setTimeout" | "setInterval")
+        if matches!(callee, "setTimeout" | "setInterval")
             && it
                 .arguments
                 .first()
@@ -510,7 +506,9 @@ impl Collector<'_> {
                 format!("{callee} called with literal string"),
             );
         }
+    }
 
+    fn record_string_assembly_calls(&mut self, it: &CallExpression<'_>, callee: &str) {
         if callee.ends_with(".join") {
             if let Expression::StaticMemberExpression(member) = &it.callee {
                 let empty_or_tiny_separator = it
@@ -562,7 +560,9 @@ impl Collector<'_> {
                 format!("radix conversion via {callee}"),
             );
         }
+    }
 
+    fn record_argument_decode_calls(&mut self, it: &CallExpression<'_>, callee: &str) {
         for arg in &it.arguments {
             let Some(value) = Self::argument_string(arg) else {
                 continue;
@@ -593,7 +593,7 @@ impl Collector<'_> {
         }
 
         if matches!(
-            callee.as_str(),
+            callee,
             "decodeURIComponent" | "unescape" | "TextDecoder.prototype.decode"
         ) && it
             .arguments
@@ -609,6 +609,15 @@ impl Collector<'_> {
                 format!("literal decoding via {callee}"),
             );
         }
+    }
+
+    fn record_call(&mut self, it: &CallExpression<'_>) {
+        self.record_structural_call(it);
+        let callee = self.fragment(it.callee.span()).trim().to_string();
+        let lower = callee.to_ascii_lowercase();
+        self.record_decoder_calls(it, &callee, &lower);
+        self.record_string_assembly_calls(it, &callee);
+        self.record_argument_decode_calls(it, &callee);
     }
 
     fn record_new(&mut self, it: &NewExpression<'_>) {
@@ -1050,31 +1059,22 @@ fn normalize_signals(raw: Vec<RawSignal>) -> Vec<RawSignal> {
         .collect()
 }
 
-fn cluster_signals(
-    source: &str,
-    raw: &[RawSignal],
+#[derive(Debug, Clone)]
+struct ClusterCandidate {
+    score: u32,
+    density_per_kib: f64,
+    start: u32,
+    end: u32,
+    left: usize,
+    right: usize,
+}
+
+fn score_cluster_candidates(
+    signals: &[RawSignal],
     window_bytes: usize,
     min_score: u32,
     min_signals: usize,
-    max_clusters: usize,
-) -> Vec<Cluster> {
-    #[derive(Debug, Clone)]
-    struct Candidate {
-        score: u32,
-        density_per_kib: f64,
-        start: u32,
-        end: u32,
-        left: usize,
-        right: usize,
-    }
-
-    if raw.is_empty() || max_clusters == 0 {
-        return Vec::new();
-    }
-
-    let mut signals = raw.to_vec();
-    signals.sort_by_key(|signal| (signal.start, signal.end));
-
+) -> Vec<ClusterCandidate> {
     let mut candidates = Vec::with_capacity(signals.len().min(4096));
     let mut right = 0usize;
     let mut weight_sum = 0u32;
@@ -1106,7 +1106,6 @@ fn cluster_signals(
                 .sum::<u32>();
             let mut score =
                 weight_sum + (kind_counts.len().saturating_sub(1) as u32) * 2 + repeated_bonus;
-
             let start = signals[left].start;
             let end = signals[right - 1].end;
             let span = end.saturating_sub(start).max(1);
@@ -1115,9 +1114,8 @@ fn cluster_signals(
             } else if span as usize <= window_bytes / 2 {
                 score += 1;
             }
-
             if score >= min_score {
-                candidates.push(Candidate {
+                candidates.push(ClusterCandidate {
                     score,
                     density_per_kib: f64::from(score) * 1024.0 / f64::from(span),
                     start,
@@ -1147,17 +1145,22 @@ fn cluster_signals(
             }
         }
     }
+    candidates
+}
 
+fn suppress_overlapping_candidates(
+    mut candidates: Vec<ClusterCandidate>,
+    max_clusters: usize,
+) -> Vec<ClusterCandidate> {
     candidates.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
             .then_with(|| b.density_per_kib.total_cmp(&a.density_per_kib))
             .then_with(|| a.start.cmp(&b.start))
     });
-
-    let mut selected_candidates: Vec<Candidate> = Vec::with_capacity(max_clusters);
+    let mut selected: Vec<ClusterCandidate> = Vec::with_capacity(max_clusters);
     'candidate: for candidate in candidates {
-        for existing in &selected_candidates {
+        for existing in &selected {
             let overlap_start = candidate.start.max(existing.start);
             let overlap_end = candidate.end.min(existing.end);
             let overlap = overlap_end.saturating_sub(overlap_start);
@@ -1170,15 +1173,22 @@ fn cluster_signals(
                 continue 'candidate;
             }
         }
-        selected_candidates.push(candidate);
-        if selected_candidates.len() >= max_clusters {
+        selected.push(candidate);
+        if selected.len() >= max_clusters {
             break;
         }
     }
+    selected
+}
 
+fn materialize_clusters(
+    source: &str,
+    signals: &[RawSignal],
+    candidates: Vec<ClusterCandidate>,
+) -> Vec<Cluster> {
     let lines = line_starts(source);
-    let mut selected = Vec::with_capacity(selected_candidates.len());
-    for candidate in selected_candidates {
+    let mut selected = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
         let window = &signals[candidate.left..candidate.right];
         let mut kinds = BTreeMap::new();
         let mut repeated_counts: HashMap<String, usize> = HashMap::new();
@@ -1194,7 +1204,6 @@ fn cluster_signals(
             .map(|(subject, count)| RepeatedSubject { subject, count })
             .collect::<Vec<_>>();
         repeated_subjects.sort_by_key(|item| std::cmp::Reverse(item.count));
-
         selected.push(Cluster {
             score: candidate.score,
             density_per_kib: candidate.density_per_kib,
@@ -1212,9 +1221,26 @@ fn cluster_signals(
             snippet: compact_snippet(source, candidate.start as usize, candidate.end as usize),
         });
     }
-
     selected.sort_by_key(|cluster| std::cmp::Reverse(cluster.score));
     selected
+}
+
+fn cluster_signals(
+    source: &str,
+    raw: &[RawSignal],
+    window_bytes: usize,
+    min_score: u32,
+    min_signals: usize,
+    max_clusters: usize,
+) -> Vec<Cluster> {
+    if raw.is_empty() || max_clusters == 0 {
+        return Vec::new();
+    }
+    let mut signals = raw.to_vec();
+    signals.sort_by_key(|signal| (signal.start, signal.end));
+    let candidates = score_cluster_candidates(&signals, window_bytes, min_score, min_signals);
+    let selected = suppress_overlapping_candidates(candidates, max_clusters);
+    materialize_clusters(source, &signals, selected)
 }
 
 fn parse_source<'a>(
