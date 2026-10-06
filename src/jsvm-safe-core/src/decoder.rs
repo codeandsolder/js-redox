@@ -322,7 +322,7 @@ impl Decoder {
         if index < 0 || self.values.is_empty() {
             return None;
         }
-        let index = index as usize;
+        let index = usize::try_from(index).ok()?;
         // Array indexing never wraps. Rotation only maps an already-valid
         // logical table index onto the physically rotated backing array.
         // Applying modulo before this bounds check would incorrectly turn an

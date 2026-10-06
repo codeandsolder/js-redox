@@ -106,7 +106,7 @@ pub fn decode_fixed_base64_latin1(input: &str, alphabet: &str) -> Option<String>
         let mut push_code_unit = |value: usize| -> Option<()> {
             // String.fromCharCode applies ToUint16. These decoder expressions
             // are small, but mask explicitly so the modeled primitive is exact.
-            out.push(char::from_u32((value & 0xffff) as u32)?);
+            out.push(char::from_u32(u32::try_from(value & 0xffff).ok()?)?);
             Some(())
         };
         push_code_unit((a << 2) | (b >> 4))?;

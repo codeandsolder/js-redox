@@ -1,6 +1,7 @@
 mod control_flow;
 mod decoder;
 mod decoder_encoding;
+mod numeric;
 mod proxy;
 mod pure_function;
 mod rewrite;
@@ -12,6 +13,7 @@ use control_flow::{
     reference_identity, ReferenceIdentityTable,
 };
 use decoder::{analyze_decoders, Decoder};
+use numeric::{exact_i64, exact_usize};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, CallExpression, ComputedMemberExpression,
@@ -221,14 +223,10 @@ impl<'a> Visit<'a> for StableVarNumberCollector {
                 let Some(Value::Number(number)) = eval(init) else {
                     continue;
                 };
-                if !number.is_finite()
-                    || number.fract() != 0.0
-                    || number < i64::MIN as f64
-                    || number > i64::MAX as f64
-                {
+                let Some(number) = exact_i64(number) else {
                     continue;
-                }
-                self.candidates.insert(symbol, number as i64);
+                };
+                self.candidates.insert(symbol, number);
             }
         }
         walk::walk_variable_declaration(self, it);
@@ -257,14 +255,7 @@ fn expression_integer(expr: &Expression<'_>) -> Option<i64> {
     let Value::Number(number) = eval(expr)? else {
         return None;
     };
-    if !number.is_finite()
-        || number.fract() != 0.0
-        || number < i64::MIN as f64
-        || number > i64::MAX as f64
-    {
-        return None;
-    }
-    Some(number as i64)
+    exact_i64(number)
 }
 
 #[derive(Default)]
@@ -694,8 +685,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 if let Some(values) = self.arrays.get(&symbol) {
                     if let Some(index) = eval(&it.expression)
                         .and_then(|v| v.number())
-                        .filter(|n| n.is_finite() && *n >= 0.0 && n.fract() == 0.0)
-                        .map(|n| n as usize)
+                        .and_then(exact_usize)
                     {
                         if let Some(text) = values.get(index).and_then(Value::render) {
                             self.push(it.span, text, "static_array_lookup");
@@ -751,20 +741,9 @@ fn eval_static_argument(arg: &Argument<'_>) -> Option<Value> {
 
 fn argument_integer(arg: &Argument<'_>) -> Option<i64> {
     match arg {
-        Argument::NumericLiteral(v)
-            if v.value.is_finite()
-                && v.value.fract() == 0.0
-                && v.value >= i64::MIN as f64
-                && v.value <= i64::MAX as f64 =>
-        {
-            Some(v.value as i64)
-        }
+        Argument::NumericLiteral(v) => exact_i64(v.value),
         Argument::UnaryExpression(v) if v.operator.as_str() == "-" => match &v.argument {
-            Expression::NumericLiteral(n)
-                if n.value.is_finite() && n.value.fract() == 0.0 && n.value <= i64::MAX as f64 =>
-            {
-                Some(-(n.value as i64))
-            }
+            Expression::NumericLiteral(n) => exact_i64(-n.value),
             _ => None,
         },
         _ => None,

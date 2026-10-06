@@ -6,6 +6,7 @@
 //! collector remains in `lib.rs`; these methods operate on it so replacement
 //! scheduling and source-protection policy stay centralized.
 
+use crate::numeric::exact_u32;
 use crate::value_eval::{
     eval, eval_binary, eval_with_resolver, js_to_uint32, known_bool, same_value, Value,
 };
@@ -374,9 +375,9 @@ fn prove_reference_identity_shape(
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> Option<(SymbolId, ReferenceIdentityTable)> {
-    let absolute_start = shape.window_start as u32;
-    let absolute_end = shape.window_end as u32;
-    let construction_end = shape.construction_end as u32;
+    let absolute_start = u32::try_from(shape.window_start).ok()?;
+    let absolute_end = u32::try_from(shape.window_end).ok()?;
+    let construction_end = u32::try_from(shape.construction_end).ok()?;
     let target_symbol =
         unique_symbol_named_near(scoping, &shape.target_name, absolute_start, absolute_end)?;
     let table_symbol =
@@ -458,18 +459,9 @@ pub fn reference_identity(
     let Value::Number(second) = eval(&outer.expression)? else {
         return None;
     };
-    if !first.is_finite()
-        || !second.is_finite()
-        || first.fract() != 0.0
-        || second.fract() != 0.0
-        || first < 0.0
-        || second < 0.0
-        || first > f64::from(u32::MAX)
-        || second > f64::from(u32::MAX)
-    {
-        return None;
-    }
-    Some((symbol, table.identity_for(first as u32, second as u32)?))
+    let first = exact_u32(first)?;
+    let second = exact_u32(second)?;
+    Some((symbol, table.identity_for(first, second)?))
 }
 
 fn single_resolved_reference(scoping: &Scoping, symbol: SymbolId, expected: ReferenceId) -> bool {
