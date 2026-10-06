@@ -264,6 +264,27 @@ fn extension_for(kind: &str, mime: &str) -> &'static str {
     }
 }
 
+fn has_plausible_extension(name: &str, kind: &str) -> bool {
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let Some(extension) = extension.as_deref() else {
+        return false;
+    };
+    match kind {
+        "javascript" => matches!(extension, "js" | "mjs" | "cjs"),
+        "html" => matches!(extension, "html" | "htm" | "xhtml"),
+        "json" => matches!(extension, "json" | "map"),
+        "css" => extension == "css",
+        "text" => matches!(extension, "txt" | "xml" | "svg" | "csv" | "md"),
+        // Binary assets have a much wider extension vocabulary. A numeric-only
+        // suffix is far more likely to be a package/version component than a
+        // file extension (for example `typography@2.0.0`).
+        _ => extension.bytes().any(|byte| byte.is_ascii_alphabetic()),
+    }
+}
+
 fn insert_suffix(path: &str, suffix: &str) -> String {
     let p = Path::new(path);
     let parent = p.parent().unwrap_or_else(|| Path::new(""));
@@ -300,7 +321,7 @@ fn output_path_for(url: &str, kind: &str, mime: &str) -> String {
     if parts.is_empty() {
         parts.push(format!("index.{}", extension_for(kind, mime)));
     } else if let Some(last) = parts.last_mut() {
-        if !last.contains('.') {
+        if !has_plausible_extension(last, kind) {
             last.push('.');
             last.push_str(extension_for(kind, mime));
         }
@@ -919,4 +940,28 @@ fn main() -> Result<()> {
     write_project_metadata(&args, &manifest)?;
     print_summary(&args, &manifest);
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::output_path_for;
+
+    #[test]
+    fn version_like_url_component_gets_resource_extension() {
+        assert_eq!(
+            output_path_for(
+                "https://esm.glass.adidas.com/@adl/typography@2.0.0",
+                "javascript",
+                "application/javascript",
+            ),
+            "resources/https/esm.glass.adidas.com/adl/typography_2.0.0.js"
+        );
+        assert_eq!(
+            output_path_for(
+                "https://esm.glass.adidas.com/@adl/typography@2.0.0/fonts/AdihausDIN-Regular.woff2",
+                "binary",
+                "font/woff2",
+            ),
+            "resources/https/esm.glass.adidas.com/adl/typography_2.0.0/fonts/AdihausDIN-Regular.woff2"
+        );
+    }
 }
