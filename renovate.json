@@ -1,0 +1,56 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "dependencyDashboard": true,
+  "minimumReleaseAge": "3 days",
+  "minimumReleaseAgeBehaviour": "timestamp-required",
+  "internalChecksFilter": "strict",
+  "separateMultipleMajor": true,
+  "prConcurrentLimit": 0,
+  "prHourlyLimit": 0,
+  "rebaseWhen": "behind-base-branch",
+  "packageRules": [
+    {
+      "description": "Automerge ordinary compatible updates after CI",
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "matchCurrentVersion": "!/^0/",
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Potentially breaking pre-1.0 updates stay open for review",
+      "matchCurrentVersion": "/^0\\./",
+      "automerge": false
+    },
+    {
+      "description": "Major updates stay open for review",
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    },
+    {
+      "description": "Package replacements stay open for review",
+      "matchUpdateTypes": ["replacement"],
+      "minimumReleaseAge": null,
+      "automerge": false
+    },
+    {
+      "description": "Keep the Rust compiler baseline synchronized and review upgrades",
+      "matchManagers": ["custom.regex"],
+      "matchDepNames": ["Rust toolchain"],
+      "groupName": "Rust toolchain",
+      "automerge": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|\\/)(Cargo\\.toml|rust-toolchain\\.toml)$/"],
+      "matchStrings": ["(?:rust-version|channel)\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""],
+      "depNameTemplate": "Rust toolchain",
+      "packageNameTemplate": "rust-lang/rust",
+      "datasourceTemplate": "github-releases"
+    }
+  ]
+}
