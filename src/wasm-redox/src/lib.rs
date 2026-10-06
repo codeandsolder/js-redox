@@ -60,6 +60,7 @@ pub struct DeepExportAnalysis {
     pub export: String,
     pub function_index: u32,
     pub body_bytes: usize,
+    pub state_machine_roots: Vec<usize>,
     pub state_machines: Vec<state_machine::StateMachineReport>,
     pub error: Option<String>,
 }
@@ -307,24 +308,29 @@ pub fn deep_analyze(bytes: &[u8], report: &ModuleReport) -> DeepModuleReport {
             continue;
         };
         match state_machine::analyze_export_state_machines(bytes, export) {
-            Ok(state_machines) => exports.push(DeepExportAnalysis {
-                export: export.clone(),
-                function_index: function.index,
-                body_bytes: function.body_bytes,
-                state_machines,
-                error: None,
-            }),
+            Ok(state_machines) => {
+                let state_machine_roots = state_machine::root_machine_indices(&state_machines);
+                exports.push(DeepExportAnalysis {
+                    export: export.clone(),
+                    function_index: function.index,
+                    body_bytes: function.body_bytes,
+                    state_machine_roots,
+                    state_machines,
+                    error: None,
+                });
+            }
             Err(error) => exports.push(DeepExportAnalysis {
                 export: export.clone(),
                 function_index: function.index,
                 body_bytes: function.body_bytes,
+                state_machine_roots: Vec::new(),
                 state_machines: Vec::new(),
                 error: Some(format!("{error:#}")),
             }),
         }
     }
     DeepModuleReport {
-        schema: "wasm-redox/deep-v1",
+        schema: "wasm-redox/deep-v2",
         exports,
     }
 }
