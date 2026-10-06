@@ -194,7 +194,7 @@ fn collect_replacements(
         .scoping()
         .root_unresolved_references_ids()
         .flatten()
-        .map(|reference_id| reference_id.index())
+        .map(oxc_semantic::ReferenceId::index)
         .collect();
 
     let mut visitor = RenameVisitor {

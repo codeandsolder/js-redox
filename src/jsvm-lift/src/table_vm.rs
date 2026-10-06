@@ -301,16 +301,16 @@ impl<'s> Analyzer<'s> {
     }
 
     fn current_scope(&self) -> (Option<String>, u32, u32) {
-        self.function_stack
-            .last()
-            .map(|f| (Some(f.id.clone()), f.start, f.end))
-            .unwrap_or_else(|| {
+        self.function_stack.last().map_or_else(
+            || {
                 (
                     None,
                     0,
                     u32::try_from(self.source.len()).unwrap_or(u32::MAX),
                 )
-            })
+            },
+            |f| (Some(f.id.clone()), f.start, f.end),
+        )
     }
 
     fn registry_scope_key(&self, binding: String) -> (u32, u32, String) {

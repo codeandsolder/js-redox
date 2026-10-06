@@ -1,4 +1,4 @@
-pub(super) fn exact_u64(value: f64) -> Option<u64> {
+pub fn exact_u64(value: f64) -> Option<u64> {
     if !value.is_finite() || value < 0.0 {
         return None;
     }
@@ -23,7 +23,7 @@ pub(super) fn exact_u64(value: f64) -> Option<u64> {
     }
 }
 
-pub(super) fn exact_i64(value: f64) -> Option<i64> {
+pub fn exact_i64(value: f64) -> Option<i64> {
     if value == 0.0 {
         return Some(0);
     }
@@ -40,11 +40,11 @@ pub(super) fn exact_i64(value: f64) -> Option<i64> {
     }
 }
 
-pub(super) fn exact_u32(value: f64) -> Option<u32> {
+pub fn exact_u32(value: f64) -> Option<u32> {
     u32::try_from(exact_u64(value)?).ok()
 }
 
-pub(super) fn exact_usize(value: f64) -> Option<usize> {
+pub fn exact_usize(value: f64) -> Option<usize> {
     usize::try_from(exact_u64(value)?).ok()
 }
 

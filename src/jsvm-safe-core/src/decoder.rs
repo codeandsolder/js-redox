@@ -20,13 +20,13 @@ use std::collections::{HashMap, HashSet};
 /// Convert an integer into the JavaScript Number domain. Precision loss above
 /// 2^53 is intentional here: JavaScript itself stores the value as IEEE-754 f64.
 #[allow(clippy::cast_precision_loss)]
-fn js_number_from_u64(value: u64) -> f64 {
+const fn js_number_from_u64(value: u64) -> f64 {
     value as f64
 }
 
 /// Signed counterpart; rounding is intentional JavaScript Number semantics.
 #[allow(clippy::cast_precision_loss)]
-fn js_number_from_i64(value: i64) -> f64 {
+const fn js_number_from_i64(value: i64) -> f64 {
     value as f64
 }
 
@@ -346,22 +346,24 @@ impl Decoder {
         let index = index.checked_add(rotation)? % self.values.len();
         let value = self.values.get(index)?.clone();
         match (&self.transform, value) {
-            (DecoderTransform::Plain, value) => Some(value),
             (DecoderTransform::LowerAlphabetBase64Uri, Value::String(encoded)) => {
                 decode_lower_alphabet_base64_uri(&encoded).map(Value::String)
             }
-            (DecoderTransform::LowerAlphabetBase64Uri, _) => None,
             (DecoderTransform::StandardBase64, Value::String(encoded)) => {
                 decode_standard_base64_latin1(&encoded).map(Value::String)
             }
-            (DecoderTransform::StandardBase64, _) => None,
+            (DecoderTransform::LowerAlphabetBase64Uri | DecoderTransform::StandardBase64, _) => {
+                None
+            }
             (DecoderTransform::FixedBase64Alphabet(alphabet), Value::String(encoded)) => {
                 decode_fixed_base64_latin1(&encoded, alphabet).map(Value::String)
             }
             // DataDome-style tables intentionally mix encoded strings with
             // literal numbers, booleans, and null. The runtime decoder only
             // transforms strings and returns every other table value as-is.
-            (DecoderTransform::FixedBase64Alphabet(_), value) => Some(value),
+            (DecoderTransform::Plain | DecoderTransform::FixedBase64Alphabet(_), value) => {
+                Some(value)
+            }
         }
     }
 

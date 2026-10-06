@@ -139,11 +139,10 @@ fn replace_ident(source: &str, from: &str, to: &str) -> String {
         if before.is_none_or(|c| !is_ident_char(c)) && after.is_none_or(|c| !is_ident_char(c)) {
             out.push_str(&source[from_at..start]);
             out.push_str(to);
-            from_at = end;
         } else {
             out.push_str(&source[from_at..end]);
-            from_at = end;
         }
+        from_at = end;
     }
     out.push_str(&source[from_at..]);
     out

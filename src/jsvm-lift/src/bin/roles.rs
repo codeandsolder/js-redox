@@ -124,6 +124,8 @@ fn hungarian_max(
     roles: &[String],
     names: &[String],
 ) -> HashMap<String, String> {
+    const INF: i64 = i64::MAX / 4;
+
     if roles.is_empty() {
         return HashMap::new();
     }
@@ -137,7 +139,6 @@ fn hungarian_max(
     let mut v = vec![0i64; m + 1];
     let mut p = vec![0usize; m + 1];
     let mut way = vec![0usize; m + 1];
-    const INF: i64 = i64::MAX / 4;
 
     for i in 1..=n {
         p[0] = i;

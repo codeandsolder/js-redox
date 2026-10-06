@@ -1,3 +1,4 @@
+#[must_use]
 pub fn exact_u64(value: f64) -> Option<u64> {
     if !value.is_finite() || value < 0.0 {
         return None;
@@ -23,6 +24,7 @@ pub fn exact_u64(value: f64) -> Option<u64> {
     }
 }
 
+#[must_use]
 pub fn exact_i64(value: f64) -> Option<i64> {
     if value == 0.0 {
         return Some(0);

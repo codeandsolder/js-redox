@@ -520,7 +520,6 @@ impl Collector<'_, '_> {
                         .map_or(call.span.end, |old| old.max(call.span.end)),
                 );
                 self.amd_modules.push(record);
-                true
             }
             _ => {
                 let Some((symbol, callee)) = self.amd_member_receiver(&call.callee) else {
@@ -542,9 +541,9 @@ impl Collector<'_, '_> {
                 group.end = group.end.max(call.span.end);
                 group.explicit_dependency_arrays += usize::from(has_dependency_array);
                 group.modules.push(record);
-                true
             }
         }
+        true
     }
 
     fn record_amd_loader_assignment(&mut self, assign: &oxc_ast::ast::AssignmentExpression<'_>) {
@@ -814,8 +813,7 @@ fn main() -> Result<()> {
 
     let mut diagnostics = parsed.diagnostics;
     let panicked = parsed.panicked;
-    let mut bundles = Vec::new();
-    if !panicked {
+    let mut bundles = if !panicked {
         let semantic_ret = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&parsed.program);
@@ -878,8 +876,10 @@ fn main() -> Result<()> {
                 modules: group.modules,
             });
         }
-        bundles = collector.bundles;
-    }
+        collector.bundles
+    } else {
+        Vec::new()
+    };
 
     // The object inside a JSONP chunk push also satisfies the direct-table
     // shape. Prefer the richer chunk-push record when both describe the same
