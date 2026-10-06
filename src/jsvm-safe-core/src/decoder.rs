@@ -962,83 +962,103 @@ fn collect_rotation_iifes(program: &oxc_ast::ast::Program<'_>) -> Vec<RotationIi
     collector.out
 }
 
-fn apply_proven_decoder_rotations(
-    source: &str,
-    decoders: &mut HashMap<String, Decoder>,
-    rotation_iifes: &[RotationIife],
-) -> (Vec<(usize, usize)>, Vec<Replacement>) {
-    let Some(checksum_re) = compile_regex(
-        r"(?s)\btry\s*\{\s*(?:var|let|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(?P<expr>[^;]+);",
-    ) else {
-        return (Vec::new(), Vec::new());
-    };
-    let mut protected_spans = Vec::new();
-    let mut proven_iifes: Vec<(String, usize, usize)> = Vec::new();
+#[derive(Debug, Clone)]
+struct ProvenRotationIife {
+    provider: String,
+    start: usize,
+    end: usize,
+}
 
-    for iife in rotation_iifes {
-        let body = fragment(source, iife.body_span);
-        if !body.contains("push") || !body.contains("shift") {
+fn prove_rotation_iife(
+    source: &str,
+    iife: &RotationIife,
+    checksum_re: &regex::Regex,
+    decoders: &mut HashMap<String, Decoder>,
+) -> bool {
+    let body = fragment(source, iife.body_span);
+    if !body.contains("push") || !body.contains("shift") {
+        return false;
+    }
+    let Some(checksum) = checksum_re.captures(body) else {
+        return false;
+    };
+    let expression = &checksum["expr"];
+    let mut proven = false;
+
+    for (decoder_name, decoder) in decoders.iter_mut() {
+        if decoder.provider != iife.provider || decoder.values.is_empty() {
             continue;
         }
-        let Some(checksum) = checksum_re.captures(body) else {
+        let Some(alias_re) = compile_regex(&format!(
+            r"\b(?:var|let|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\b",
+            regex::escape(decoder_name)
+        )) else {
             continue;
         };
-        let expression = &checksum["expr"];
-        let mut proven_here = false;
+        let alias = if let Some(alias_caps) = alias_re.captures(body) {
+            alias_caps[1].to_string()
+        } else if body.contains(&format!("{decoder_name}(")) {
+            decoder_name.clone()
+        } else {
+            continue;
+        };
 
-        for (decoder_name, decoder) in decoders.iter_mut() {
-            if decoder.provider != iife.provider || decoder.values.is_empty() {
-                continue;
-            }
-            let Some(alias_re) = compile_regex(&format!(
-                r"\b(?:var|let|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\b",
-                regex::escape(decoder_name)
-            )) else {
+        let mut matches = Vec::new();
+        for rotation in 0..decoder.values.len() {
+            let Some(value) = eval_rotation_checksum(expression, &alias, decoder, rotation) else {
                 continue;
             };
-            let alias = if let Some(alias_caps) = alias_re.captures(body) {
-                alias_caps[1].to_string()
-            } else if body.contains(&format!("{decoder_name}(")) {
-                decoder_name.clone()
-            } else {
-                continue;
-            };
-
-            let mut matches = Vec::new();
-            for rotation in 0..decoder.values.len() {
-                let Some(value) = eval_rotation_checksum(expression, &alias, decoder, rotation)
-                else {
-                    continue;
-                };
-                if value.is_finite() && (value - iife.target as f64).abs() < 1e-9 {
-                    matches.push(rotation);
-                    if matches.len() > 1 {
-                        break;
-                    }
-                }
-            }
-            if matches.len() == 1 {
-                proven_here = true;
-                if matches[0] != 0 {
-                    decoder.values.rotate_left(matches[0]);
+            if value.is_finite() && (value - iife.target as f64).abs() < 1e-9 {
+                matches.push(rotation);
+                if matches.len() > 1 {
+                    break;
                 }
             }
         }
-
-        if proven_here {
-            let start = iife.statement_span.start as usize;
-            let end = iife.statement_span.end as usize;
-            protected_spans.push((start, end));
-            proven_iifes.push((iife.provider.clone(), start, end));
+        if matches.len() == 1 {
+            proven = true;
+            if matches[0] != 0 {
+                decoder.values.rotate_left(matches[0]);
+            }
         }
     }
 
+    proven
+}
+
+fn prove_rotation_iifes(
+    source: &str,
+    rotation_iifes: &[RotationIife],
+    checksum_re: &regex::Regex,
+    decoders: &mut HashMap<String, Decoder>,
+) -> (Vec<(usize, usize)>, Vec<ProvenRotationIife>) {
+    let mut protected_spans = Vec::new();
+    let mut proven_iifes = Vec::new();
+    for iife in rotation_iifes {
+        if !prove_rotation_iife(source, iife, checksum_re, decoders) {
+            continue;
+        }
+        let start = iife.statement_span.start as usize;
+        let end = iife.statement_span.end as usize;
+        protected_spans.push((start, end));
+        proven_iifes.push(ProvenRotationIife {
+            provider: iife.provider.clone(),
+            start,
+            end,
+        });
+    }
+    (protected_spans, proven_iifes)
+}
+
+fn materializable_rotated_providers(
+    decoders: &HashMap<String, Decoder>,
+    proven_iifes: &[ProvenRotationIife],
+) -> HashMap<String, (Span, Vec<Value>)> {
     // Materialization is stricter than decoding. Every detected decoder sharing
-    // a provider must agree on the same final rotated table and the same literal
-    // array span. If that cannot be proved, keep the runtime IIFE intact.
+    // a provider must agree on the same final rotated table and literal array.
     let proven_providers = proven_iifes
         .iter()
-        .map(|(provider, _, _)| provider.clone())
+        .map(|iife| iife.provider.clone())
         .collect::<HashSet<_>>();
     let mut materialized: HashMap<String, (Span, Vec<Value>)> = HashMap::new();
     let mut inconsistent = HashSet::new();
@@ -1061,10 +1081,16 @@ fn apply_proven_decoder_rotations(
             }
         }
     }
-    for provider in &inconsistent {
-        materialized.remove(provider);
+    for provider in inconsistent {
+        materialized.remove(&provider);
     }
+    materialized
+}
 
+fn rotation_replacements(
+    materialized: HashMap<String, (Span, Vec<Value>)>,
+    proven_iifes: &[ProvenRotationIife],
+) -> Vec<Replacement> {
     let mut replacements = Vec::new();
     for (provider, (array_span, values)) in materialized {
         let Some(array_text) = render_value_array(&values) else {
@@ -1077,20 +1103,36 @@ fn apply_proven_decoder_rotations(
             kind: "materialize_decoder_rotation",
             arithmetic_state_proof: None,
         });
-        for (_, start, end) in proven_iifes
-            .iter()
-            .filter(|(iife_provider, _, _)| iife_provider.as_str() == provider.as_str())
-        {
-            replacements.push(Replacement {
-                start: *start,
-                end: *end,
-                text: String::new(),
-                kind: "remove_decoder_rotation_iife",
-                arithmetic_state_proof: None,
-            });
-        }
+        replacements.extend(
+            proven_iifes
+                .iter()
+                .filter(|iife| iife.provider == provider)
+                .map(|iife| Replacement {
+                    start: iife.start,
+                    end: iife.end,
+                    text: String::new(),
+                    kind: "remove_decoder_rotation_iife",
+                    arithmetic_state_proof: None,
+                }),
+        );
     }
+    replacements
+}
 
+fn apply_proven_decoder_rotations(
+    source: &str,
+    decoders: &mut HashMap<String, Decoder>,
+    rotation_iifes: &[RotationIife],
+) -> (Vec<(usize, usize)>, Vec<Replacement>) {
+    let Some(checksum_re) = compile_regex(
+        r"(?s)\btry\s*\{\s*(?:var|let|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(?P<expr>[^;]+);",
+    ) else {
+        return (Vec::new(), Vec::new());
+    };
+    let (protected_spans, proven_iifes) =
+        prove_rotation_iifes(source, rotation_iifes, &checksum_re, decoders);
+    let materialized = materializable_rotated_providers(decoders, &proven_iifes);
+    let replacements = rotation_replacements(materialized, &proven_iifes);
     (protected_spans, replacements)
 }
 
