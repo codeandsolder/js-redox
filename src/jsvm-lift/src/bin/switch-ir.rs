@@ -272,6 +272,54 @@ fn named_function_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
+fn function_declarations(function_prefix: &str) -> Vec<(String, usize)> {
+    compile_regex(r"function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)").map_or_else(
+        Vec::new,
+        |re| {
+            re.captures_iter(function_prefix)
+                .map(|caps| {
+                    let name = caps[1].to_string();
+                    let argc = if caps[2].trim().is_empty() {
+                        0
+                    } else {
+                        caps[2].split(',').count()
+                    };
+                    (name, argc)
+                })
+                .collect()
+        },
+    )
+}
+
+fn infer_stack_helpers(
+    function_prefix: &str,
+    semantics: &str,
+    selector_helper: &str,
+    roles: &BTreeMap<String, String>,
+    declarations: &[(String, usize)],
+    helpers: &mut BTreeMap<String, String>,
+) {
+    let Some(stack) = roles.get("stack") else {
+        return;
+    };
+    for (name, argc) in declarations {
+        if name == selector_helper {
+            continue;
+        }
+        let Some(body) = named_function_body(function_prefix, name) else {
+            continue;
+        };
+        if identifier_count(body, stack) == 0 {
+            continue;
+        }
+        if *argc == 1 && identifier_count(semantics, name) >= 4 {
+            helpers.entry("stack_push".into()).or_insert(name.clone());
+        } else if *argc == 0 && body.contains("return") && identifier_count(semantics, name) >= 4 {
+            helpers.entry("stack_pop".into()).or_insert(name.clone());
+        }
+    }
+}
+
 fn call_family_roles(
     function_prefix: &str,
     semantics: &str,
@@ -306,42 +354,15 @@ fn call_family_roles(
         }
     }
 
-    let declarations = compile_regex(r"function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)")
-        .map_or_else(Vec::new, |re| {
-            re.captures_iter(function_prefix)
-                .map(|caps| {
-                    let name = caps[1].to_string();
-                    let argc = if caps[2].trim().is_empty() {
-                        0
-                    } else {
-                        caps[2].split(',').count()
-                    };
-                    (name, argc)
-                })
-                .collect()
-        });
-
-    if let Some(stack) = roles.get("stack") {
-        for (name, argc) in &declarations {
-            if name == selector_helper {
-                continue;
-            }
-            let Some(body) = named_function_body(function_prefix, name) else {
-                continue;
-            };
-            if identifier_count(body, stack) == 0 {
-                continue;
-            }
-            if *argc == 1 && identifier_count(semantics, name) >= 4 {
-                helpers.entry("stack_push".into()).or_insert(name.clone());
-            } else if *argc == 0
-                && body.contains("return")
-                && identifier_count(semantics, name) >= 4
-            {
-                helpers.entry("stack_pop".into()).or_insert(name.clone());
-            }
-        }
-    }
+    let declarations = function_declarations(function_prefix);
+    infer_stack_helpers(
+        function_prefix,
+        semantics,
+        selector_helper,
+        &roles,
+        &declarations,
+        &mut helpers,
+    );
 
     for (name, argc) in &declarations {
         if *argc != 0 || name == selector_helper {
