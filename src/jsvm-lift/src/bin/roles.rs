@@ -232,133 +232,123 @@ struct VmRoles {
     roles: BTreeMap<String, RoleAssignment>,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let vms: Vec<ReducedVm> = read_jsonl(&args.reduced)?;
-    let scans: Vec<ScanReport> = read_jsonl(&args.scan)?;
-    let gt: GroundTruth = serde_json::from_str(
-        &fs::read_to_string(&args.ground_truth)
-            .with_context(|| format!("reading {}", args.ground_truth.display()))?,
-    )?;
+type Votes = HashMap<String, HashMap<String, i64>>;
 
-    let ground = vms
-        .iter()
-        .find(|x| x.decoder == gt.decoder_function_id)
-        .context("ground decoder missing from reduced input")?;
-
-    let mut role_by_ground_name = gt.register_roles;
-    role_by_ground_name.extend(gt.helper_roles);
-    let anchors = hard_anchors(&scans);
-
-    let mut ground_by_signature: HashMap<Vec<u64>, Vec<PathInfo>> = HashMap::new();
+fn index_ground_paths(ground: &ReducedVm) -> HashMap<Vec<u64>, Vec<PathInfo>> {
+    let mut by_signature = HashMap::new();
     for op in &ground.opcodes {
         for path in &op.paths {
             let info = path_info(path);
-            ground_by_signature
+            by_signature
                 .entry(info.signature.clone())
-                .or_default()
+                .or_insert_with(Vec::new)
                 .push(info);
         }
     }
+    by_signature
+}
 
-    let mut output = Vec::new();
-
-    let mut ground_roles = BTreeMap::new();
-    for (name, role) in &role_by_ground_name {
-        ground_roles.insert(
-            role.clone(),
-            RoleAssignment {
-                name: name.clone(),
-                source: "ground_truth".into(),
-                votes: None,
-                margin: None,
-            },
-        );
-    }
-    output.push(VmRoles {
+fn ground_vm_roles(ground: &ReducedVm, role_by_ground_name: &BTreeMap<String, String>) -> VmRoles {
+    let roles = role_by_ground_name
+        .iter()
+        .map(|(name, role)| {
+            (
+                role.clone(),
+                RoleAssignment {
+                    name: name.clone(),
+                    source: "ground_truth".into(),
+                    votes: None,
+                    margin: None,
+                },
+            )
+        })
+        .collect();
+    VmRoles {
         file: family_name(&ground.file),
         decoder: ground.decoder.clone(),
         matched_paths: ground.opcodes.iter().map(|op| op.paths.len()).sum(),
-        roles: ground_roles,
-    });
+        roles,
+    }
+}
 
-    for vm in &vms {
-        if vm.decoder == ground.decoder {
-            continue;
-        }
-
-        let mut votes: HashMap<String, HashMap<String, i64>> = HashMap::new();
-        let mut matched_paths = 0usize;
-
-        for op in &vm.opcodes {
-            for path in &op.paths {
-                let target = path_info(path);
-                let Some(ground_paths) = ground_by_signature.get(&target.signature) else {
-                    continue;
-                };
-                if ground_paths.len() != 1 {
+fn collect_votes(
+    vm: &ReducedVm,
+    ground_by_signature: &HashMap<Vec<u64>, Vec<PathInfo>>,
+    role_by_ground_name: &BTreeMap<String, String>,
+) -> (Votes, usize) {
+    let mut votes = HashMap::new();
+    let mut matched_paths = 0;
+    for op in &vm.opcodes {
+        for path in &op.paths {
+            let target = path_info(path);
+            let Some(ground_paths) = ground_by_signature.get(&target.signature) else {
+                continue;
+            };
+            if ground_paths.len() != 1 {
+                continue;
+            }
+            matched_paths += 1;
+            for (ground_effect, target_effect) in
+                ground_paths[0].effects.iter().zip(&target.effects)
+            {
+                if ground_effect.hash != target_effect.hash {
                     continue;
                 }
-                let ground_path = &ground_paths[0];
-                matched_paths += 1;
-
-                for (g_effect, t_effect) in ground_path.effects.iter().zip(target.effects.iter()) {
-                    if g_effect.hash != t_effect.hash {
+                for (ground_name, canonical_id) in &ground_effect.ids {
+                    let (Some(role), Some(target_name)) = (
+                        role_by_ground_name.get(ground_name),
+                        target_effect.reverse.get(canonical_id),
+                    ) else {
                         continue;
-                    }
-                    for (ground_name, canonical_id) in &g_effect.ids {
-                        let Some(role) = role_by_ground_name.get(ground_name) else {
-                            continue;
-                        };
-                        let Some(target_name) = t_effect.reverse.get(canonical_id) else {
-                            continue;
-                        };
-                        *votes
-                            .entry(role.clone())
-                            .or_default()
-                            .entry(target_name.clone())
-                            .or_insert(0) += 1;
-                    }
+                    };
+                    *votes
+                        .entry(role.clone())
+                        .or_insert_with(HashMap::new)
+                        .entry(target_name.clone())
+                        .or_insert(0) += 1;
                 }
             }
         }
+    }
+    (votes, matched_paths)
+}
 
-        let hard = anchors.get(&vm.decoder).cloned().unwrap_or_default();
-        let used: BTreeSet<_> = hard.values().cloned().collect();
+fn assign_roles(votes: &Votes, hard: BTreeMap<String, String>) -> BTreeMap<String, RoleAssignment> {
+    let used: BTreeSet<_> = hard.values().cloned().collect();
+    let mut roles: Vec<_> = votes
+        .keys()
+        .filter(|role| !hard.contains_key(*role))
+        .cloned()
+        .collect();
+    roles.sort();
 
-        let mut roles: Vec<String> = votes
-            .keys()
-            .filter(|role| !hard.contains_key(*role))
-            .cloned()
-            .collect();
-        roles.sort();
+    let names: Vec<_> = roles
+        .iter()
+        .flat_map(|role| votes.get(role).into_iter().flat_map(|m| m.keys()))
+        .filter(|name| !used.contains(*name))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let filtered: Votes = roles
+        .iter()
+        .map(|role| {
+            let by_name = votes
+                .get(role)
+                .into_iter()
+                .flat_map(|x| x.iter())
+                .filter(|(name, _)| !used.contains(*name))
+                .map(|(name, score)| (name.clone(), *score))
+                .collect();
+            (role.clone(), by_name)
+        })
+        .collect();
+    let assigned = hungarian_max(&filtered, &roles, &names);
 
-        let names: BTreeSet<String> = roles
-            .iter()
-            .flat_map(|role| votes.get(role).into_iter().flat_map(|m| m.keys()))
-            .filter(|name| !used.contains(*name))
-            .cloned()
-            .collect();
-
-        let filtered: HashMap<String, HashMap<String, i64>> = roles
-            .iter()
-            .map(|role| {
-                let m = votes
-                    .get(role)
-                    .into_iter()
-                    .flat_map(|x| x.iter())
-                    .filter(|(name, _)| !used.contains(*name))
-                    .map(|(name, score)| (name.clone(), *score))
-                    .collect();
-                (role.clone(), m)
-            })
-            .collect();
-
-        let assigned = hungarian_max(&filtered, &roles, &names.into_iter().collect::<Vec<_>>());
-
-        let mut final_roles = BTreeMap::new();
-        for (role, name) in hard {
-            final_roles.insert(
+    let mut final_roles = hard
+        .into_iter()
+        .map(|(role, name)| {
+            (
                 role,
                 RoleAssignment {
                     name,
@@ -366,57 +356,78 @@ fn main() -> Result<()> {
                     votes: None,
                     margin: None,
                 },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (role, name) in assigned {
+        let Some(by_name) = filtered.get(&role) else {
+            continue;
+        };
+        let score = by_name.get(&name).copied().unwrap_or(0);
+        let second = by_name
+            .iter()
+            .filter(|(other, _)| *other != &name)
+            .map(|(_, score)| *score)
+            .max()
+            .unwrap_or(0);
+        let margin = score - second;
+        if score >= 2 && margin >= 1 {
+            final_roles.insert(
+                role,
+                RoleAssignment {
+                    name,
+                    source: "transfer".into(),
+                    votes: Some(score),
+                    margin: Some(margin),
+                },
             );
         }
-
-        for (role, name) in assigned {
-            let Some(by_name) = filtered.get(&role) else {
-                continue;
-            };
-            let score = by_name.get(&name).copied().unwrap_or(0);
-            let second = by_name
-                .iter()
-                .filter(|(other, _)| *other != &name)
-                .map(|(_, score)| *score)
-                .max()
-                .unwrap_or(0);
-            let margin = score - second;
-            if score >= 2 && margin >= 1 {
-                final_roles.insert(
-                    role,
-                    RoleAssignment {
-                        name,
-                        source: "transfer".into(),
-                        votes: Some(score),
-                        margin: Some(margin),
-                    },
-                );
-            }
-        }
-
-        output.push(VmRoles {
-            file: family_name(&vm.file),
-            decoder: vm.decoder.clone(),
-            matched_paths,
-            roles: final_roles,
-        });
     }
+    final_roles
+}
 
+fn transfer_vm_roles(
+    vm: &ReducedVm,
+    ground_by_signature: &HashMap<Vec<u64>, Vec<PathInfo>>,
+    role_by_ground_name: &BTreeMap<String, String>,
+    anchors: &HashMap<String, BTreeMap<String, String>>,
+) -> VmRoles {
+    let (votes, matched_paths) = collect_votes(vm, ground_by_signature, role_by_ground_name);
+    let hard = anchors.get(&vm.decoder).cloned().unwrap_or_default();
+    VmRoles {
+        file: family_name(&vm.file),
+        decoder: vm.decoder.clone(),
+        matched_paths,
+        roles: assign_roles(&votes, hard),
+    }
+}
+
+fn infer_vm_roles(
+    vms: &[ReducedVm],
+    ground: &ReducedVm,
+    role_by_ground_name: &BTreeMap<String, String>,
+    anchors: &HashMap<String, BTreeMap<String, String>>,
+) -> Vec<VmRoles> {
+    let ground_by_signature = index_ground_paths(ground);
+    let mut output = vec![ground_vm_roles(ground, role_by_ground_name)];
+    output.extend(
+        vms.iter()
+            .filter(|vm| vm.decoder != ground.decoder)
+            .map(|vm| transfer_vm_roles(vm, &ground_by_signature, role_by_ground_name, anchors)),
+    );
     output.sort_by(|a, b| {
         b.roles
             .len()
             .cmp(&a.roles.len())
             .then_with(|| a.decoder.cmp(&b.decoder))
     });
+    output
+}
 
-    let json = serde_json::to_string_pretty(&output)?;
-    if let Some(path) = args.output.as_ref() {
-        fs::write(path, &json).with_context(|| format!("writing {}", path.display()))?;
-    }
-
+fn print_summary(output: &[VmRoles]) {
     println!("VMs {}", output.len());
     let mut by_family: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for vm in &output {
+    for vm in output {
         by_family
             .entry(vm.file.clone())
             .or_default()
@@ -434,10 +445,7 @@ fn main() -> Result<()> {
             counts.iter().filter(|x| **x >= 10).count()
         );
     }
-    println!(
-        "
-TOP"
-    );
+    println!("\nTOP");
     for vm in output.iter().take(25) {
         let roles = vm
             .roles
@@ -454,6 +462,28 @@ TOP"
             roles
         );
     }
+}
 
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let vms: Vec<ReducedVm> = read_jsonl(&args.reduced)?;
+    let scans: Vec<ScanReport> = read_jsonl(&args.scan)?;
+    let gt: GroundTruth = serde_json::from_str(
+        &fs::read_to_string(&args.ground_truth)
+            .with_context(|| format!("reading {}", args.ground_truth.display()))?,
+    )?;
+    let ground = vms
+        .iter()
+        .find(|vm| vm.decoder == gt.decoder_function_id)
+        .context("ground decoder missing from reduced input")?;
+    let mut role_by_ground_name = gt.register_roles;
+    role_by_ground_name.extend(gt.helper_roles);
+    let output = infer_vm_roles(&vms, ground, &role_by_ground_name, &hard_anchors(&scans));
+
+    let json = serde_json::to_string_pretty(&output)?;
+    if let Some(path) = args.output.as_ref() {
+        fs::write(path, &json).with_context(|| format!("writing {}", path.display()))?;
+    }
+    print_summary(&output);
     Ok(())
 }
