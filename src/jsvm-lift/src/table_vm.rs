@@ -281,6 +281,15 @@ fn expression_uses_numeric_schedule(expr: &Expression<'_>, schedules: &HashSet<S
     visitor.found
 }
 
+fn is_static_numeric_index(index: &str) -> bool {
+    let index = index.trim();
+    index.parse::<u64>().is_ok()
+        || index
+            .strip_prefix("0x")
+            .or_else(|| index.strip_prefix("0X"))
+            .is_some_and(|hex| u64::from_str_radix(hex, 16).is_ok())
+}
+
 impl<'s> Analyzer<'s> {
     fn new(source: &'s str) -> Self {
         Self {
@@ -713,7 +722,7 @@ impl<'s> Analyzer<'s> {
         });
     }
 
-    fn finish(mut self) -> TableVmAnalysis {
+    fn materialize_registry_tables(&mut self) {
         for ((scope_start, scope_end, binding), handlers) in self.registry_handlers.drain() {
             if handlers.len() < 4 {
                 continue;
@@ -723,8 +732,8 @@ impl<'s> Analyzer<'s> {
             let scope_function_id = self
                 .functions
                 .iter()
-                .find(|f| f.start == scope_start && f.end == scope_end)
-                .map(|f| f.id.clone());
+                .find(|function| function.start == scope_start && function.end == scope_end)
+                .map(|function| function.id.clone());
             self.tables.push(DetailedHandlerTableCandidate {
                 binding,
                 start,
@@ -740,7 +749,9 @@ impl<'s> Analyzer<'s> {
                 handlers,
             });
         }
+    }
 
+    fn materialize_derived_registries(&mut self) {
         for ((scope_start, scope_end, binding), source) in &self.registry_sources {
             let key = (*scope_start, *scope_end, binding.clone());
             let Some((start, end)) = self.registry_spans.get(&key).copied() else {
@@ -775,7 +786,9 @@ impl<'s> Analyzer<'s> {
                 handlers: source_table.handlers.clone(),
             });
         }
+    }
 
+    fn normalize_inventory(&mut self) {
         self.tables.sort_by(|a, b| {
             (&a.binding, a.scope_start, a.scope_end, a.start, a.end).cmp(&(
                 &b.binding,
@@ -798,124 +811,121 @@ impl<'s> Analyzer<'s> {
         self.transducers.dedup_by(|a, b| {
             a.function_id == b.function_id && a.start == b.start && a.end == b.end
         });
+    }
 
+    fn count_dynamic_call_sites(&mut self) {
         for table in &mut self.tables {
             for function in &self.functions {
                 if table.scope_start > function.start || table.scope_end < function.end {
                     continue;
                 }
                 for call in &function.handler_calls {
-                    if call.table != table.binding {
-                        continue;
-                    }
-                    let index_text = call.index.trim();
-                    let static_numeric_index = index_text.parse::<u64>().is_ok()
-                        || index_text
-                            .strip_prefix("0x")
-                            .or_else(|| index_text.strip_prefix("0X"))
-                            .is_some_and(|hex| u64::from_str_radix(hex, 16).is_ok());
-                    if static_numeric_index {
-                        continue;
-                    }
-                    table.dynamic_call_sites += 1;
-                    if function.loops > 0 {
-                        table.looped_dynamic_call_sites += 1;
+                    if call.table == table.binding && !is_static_numeric_index(&call.index) {
+                        table.dynamic_call_sites += 1;
+                        if function.loops > 0 {
+                            table.looped_dynamic_call_sites += 1;
+                        }
                     }
                 }
             }
         }
+    }
 
-        let mut table_vms = Vec::new();
-        for function in &self.functions {
-            if function.loops == 0 {
-                continue;
-            }
-            for call in &function.handler_calls {
-                // A VM dispatcher chooses a handler from runtime state. Calls
-                // through a fixed numeric slot are ordinary helper-table calls,
-                // not dispatch, even when they occur in a loop.
-                let index_text = call.index.trim();
-                let static_numeric_index = index_text.parse::<u64>().is_ok()
-                    || index_text
-                        .strip_prefix("0x")
-                        .or_else(|| index_text.strip_prefix("0X"))
-                        .is_some_and(|hex| u64::from_str_radix(hex, 16).is_ok());
-                if static_numeric_index {
-                    continue;
-                }
+    fn table_for_call<'a>(
+        &'a self,
+        function: &FunctionSummary,
+        call: &HandlerCall,
+    ) -> Option<&'a DetailedHandlerTableCandidate> {
+        self.tables
+            .iter()
+            .filter(|table| table.binding == call.table)
+            .filter(|table| table.scope_start <= function.start && table.scope_end >= function.end)
+            .min_by_key(|table| table.scope_end.saturating_sub(table.scope_start))
+    }
 
-                let Some(table) = self
-                    .tables
+    fn linked_transducer<'a>(
+        &'a self,
+        producer: Option<&ProducerCall>,
+    ) -> Option<&'a ByteTransducerCandidate> {
+        let linked_by_name = producer.and_then(|producer| {
+            self.transducers.iter().find(|transducer| {
+                transducer.binding.as_deref().is_some_and(|binding| {
+                    binding == producer.method
+                        || binding.ends_with(&format!(".{}", producer.method))
+                })
+            })
+        });
+        // Obfuscators can install the decoder through a generic property helper,
+        // erasing its lexical method name. A unique complete transducer still
+        // makes the architecture link unambiguous when an opcode producer exists.
+        linked_by_name.or_else(|| {
+            (producer.is_some() && self.transducers.len() == 1)
+                .then(|| self.transducers.first())
+                .flatten()
+        })
+    }
+
+    fn table_vm_candidate(
+        &self,
+        function: &FunctionSummary,
+        call: &HandlerCall,
+    ) -> Option<TableVmCandidate> {
+        if function.loops == 0 || is_static_numeric_index(&call.index) {
+            return None;
+        }
+        let table = self.table_for_call(function, call)?;
+        if table.function_values < 4 {
+            return None;
+        }
+
+        let index_ident = call
+            .index
+            .trim()
+            .chars()
+            .all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
+            .then(|| call.index.trim().to_string());
+        let producer = index_ident.as_ref().and_then(|target| {
+            function
+                .producers
+                .iter()
+                .find(|producer| &producer.target == target)
+        });
+        let linked = self.linked_transducer(producer);
+
+        // Function tables also implement ordinary module registries and
+        // schedulers. Require provenance for the dynamic handler index.
+        if linked.is_none() && producer.is_none() && !call.schedule_backed {
+            return None;
+        }
+
+        Some(TableVmCandidate {
+            dispatcher_function_id: function.id.clone(),
+            handler_table: call.table.clone(),
+            handler_count: table.function_values,
+            handler_index: call.index.clone(),
+            dispatcher_start: call.start,
+            dispatcher_end: call.end,
+            producer_method: producer.map(|producer| producer.method.clone()),
+            linked_transducer_function_id: linked.map(|transducer| transducer.function_id.clone()),
+            architecture: if linked.is_some() {
+                "stateful-byte-transducer+function-table".into()
+            } else {
+                "function-table-dispatch".into()
+            },
+        })
+    }
+
+    fn derive_table_vms(&self) -> Vec<TableVmCandidate> {
+        let mut table_vms = self
+            .functions
+            .iter()
+            .flat_map(|function| {
+                function
+                    .handler_calls
                     .iter()
-                    .filter(|table| table.binding == call.table)
-                    .filter(|table| {
-                        table.scope_start <= function.start && table.scope_end >= function.end
-                    })
-                    .min_by_key(|table| table.scope_end.saturating_sub(table.scope_start))
-                else {
-                    continue;
-                };
-                if table.function_values < 4 {
-                    continue;
-                }
-
-                let index_ident = call
-                    .index
-                    .trim()
-                    .chars()
-                    .all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
-                    .then(|| call.index.trim().to_string());
-
-                let producer = index_ident
-                    .as_ref()
-                    .and_then(|target| function.producers.iter().find(|p| &p.target == target));
-
-                let linked_by_name = producer.as_ref().and_then(|producer| {
-                    self.transducers.iter().find(|t| {
-                        t.binding.as_deref().is_some_and(|binding| {
-                            binding == producer.method
-                                || binding.ends_with(&format!(".{}", producer.method))
-                        })
-                    })
-                });
-                // Obfuscators often install the decoder method through a generic
-                // property-definition helper, erasing the lexical method name.
-                // When the file has exactly one structurally complete byte
-                // transducer and this dispatcher has an opcode producer, the
-                // architecture link is still unambiguous without protector names.
-                let linked = linked_by_name.or_else(|| {
-                    if producer.is_some() && self.transducers.len() == 1 {
-                        self.transducers.first()
-                    } else {
-                        None
-                    }
-                });
-
-                // Function tables also implement ordinary module registries and
-                // schedulers. A VM candidate needs provenance for its dynamic
-                // handler index from a decoder-like producer or numeric schedule.
-                if linked.is_none() && producer.is_none() && !call.schedule_backed {
-                    continue;
-                }
-
-                table_vms.push(TableVmCandidate {
-                    dispatcher_function_id: function.id.clone(),
-                    handler_table: call.table.clone(),
-                    handler_count: table.function_values,
-                    handler_index: call.index.clone(),
-                    dispatcher_start: call.start,
-                    dispatcher_end: call.end,
-                    producer_method: producer.map(|p| p.method.clone()),
-                    linked_transducer_function_id: linked.map(|t| t.function_id.clone()),
-                    architecture: if linked.is_some() {
-                        "stateful-byte-transducer+function-table".into()
-                    } else {
-                        "function-table-dispatch".into()
-                    },
-                });
-            }
-        }
-
+                    .filter_map(|call| self.table_vm_candidate(function, call))
+            })
+            .collect::<Vec<_>>();
         table_vms.sort_by(|a, b| {
             (
                 &a.dispatcher_function_id,
@@ -933,6 +943,15 @@ impl<'s> Analyzer<'s> {
                 && a.handler_table == b.handler_table
                 && a.dispatcher_start == b.dispatcher_start
         });
+        table_vms
+    }
+
+    fn finish(mut self) -> TableVmAnalysis {
+        self.materialize_registry_tables();
+        self.materialize_derived_registries();
+        self.normalize_inventory();
+        self.count_dynamic_call_sites();
+        let table_vms = self.derive_table_vms();
 
         TableVmAnalysis {
             handler_function_tables: self.tables,
