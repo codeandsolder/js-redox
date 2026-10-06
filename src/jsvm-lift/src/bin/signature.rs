@@ -1,11 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
-use oxc_allocator::Allocator;
-use oxc_ast::AstKind;
-use oxc_ast_visit::{walk, Visit};
-use oxc_span::SourceType;
-use rolldown_redox::ecmascript::parse_program;
+use jsvm_lift::effect_shape::{analyze_effect, family_name};
 use serde::Deserialize;
+
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
@@ -41,138 +38,12 @@ struct ReducedPath {
 }
 
 #[derive(Default)]
-struct ShapeVisitor {
-    ids: HashMap<String, usize>,
-    next_id: usize,
-    tokens: Vec<String>,
-}
-
-impl ShapeVisitor {
-    fn canonical_id(&mut self, name: &str) -> usize {
-        if let Some(id) = self.ids.get(name) {
-            return *id;
-        }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.ids.insert(name.to_string(), id);
-        id
-    }
-
-    fn finish(self) -> String {
-        self.tokens.join("|")
-    }
-}
-
-impl<'a> Visit<'a> for ShapeVisitor {
-    fn enter_node(&mut self, kind: AstKind<'a>) {
-        // AstType discriminants are stable for the pinned Oxc version and give
-        // a compact preorder structural stream.
-        self.tokens.push(format!("K{}", kind.ty() as u8));
-
-        match kind {
-            AstKind::IdentifierReference(id) => {
-                let n = self.canonical_id(id.name.as_str());
-                self.tokens.push(format!("I{n}"));
-            }
-            AstKind::BindingIdentifier(id) => {
-                let n = self.canonical_id(id.name.as_str());
-                self.tokens.push(format!("B{n}"));
-            }
-            AstKind::IdentifierName(id) => {
-                // Static property names are semantic and should survive
-                // variable alpha-renaming.
-                self.tokens.push(format!("P:{}", id.name));
-            }
-            AstKind::NumericLiteral(_) => self.tokens.push("NUM".into()),
-            AstKind::StringLiteral(_) => self.tokens.push("STR".into()),
-            AstKind::BooleanLiteral(b) => self.tokens.push(format!("BOOL:{}", b.value)),
-            AstKind::NullLiteral(_) => self.tokens.push("NULL".into()),
-            AstKind::BinaryExpression(e) => {
-                self.tokens.push(format!("BIN:{}", e.operator.as_str()));
-            }
-            AstKind::LogicalExpression(e) => {
-                self.tokens.push(format!("LOG:{}", e.operator.as_str()));
-            }
-            AstKind::UnaryExpression(e) => {
-                self.tokens.push(format!("UN:{}", e.operator.as_str()));
-            }
-            AstKind::UpdateExpression(e) => {
-                self.tokens
-                    .push(format!("UP:{}:{}", e.operator.as_str(), e.prefix));
-            }
-            AstKind::AssignmentExpression(e) => {
-                self.tokens.push(format!("AS:{}", e.operator.as_str()));
-            }
-            AstKind::StaticMemberExpression(e) => {
-                self.tokens.push(format!("MEM:{}", e.property.name));
-            }
-            AstKind::ComputedMemberExpression(_) => self.tokens.push("MEM:[]".into()),
-            AstKind::CallExpression(e) => {
-                self.tokens
-                    .push(format!("CALL:{}:{}", e.arguments.len(), e.optional));
-            }
-            AstKind::NewExpression(e) => {
-                self.tokens.push(format!("NEW:{}", e.arguments.len()));
-            }
-            AstKind::Function(f) => {
-                self.tokens.push(format!(
-                    "FN:{}:{}:{}",
-                    f.params.items.len(),
-                    f.r#async,
-                    f.generator
-                ));
-            }
-            AstKind::ArrowFunctionExpression(f) => {
-                self.tokens
-                    .push(format!("ARROW:{}:{}", f.params.items.len(), f.r#async));
-            }
-            _ => {}
-        }
-    }
-
-    fn visit_program(&mut self, it: &oxc_ast::ast::Program<'a>) {
-        walk::walk_program(self, it);
-    }
-}
-
-#[derive(Default)]
 struct Cluster {
     count: usize,
     decoders: BTreeSet<String>,
     families: BTreeSet<String>,
     samples: Vec<String>,
     shape: String,
-}
-
-fn fnv1a64(data: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in data {
-        h ^= u64::from(*byte);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
-}
-
-fn parse_shape(source: &str) -> String {
-    for candidate in [source.to_string(), format!("({source})")] {
-        let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, &candidate, SourceType::cjs());
-        if !parsed.is_clean() {
-            continue;
-        }
-        let mut visitor = ShapeVisitor::default();
-        visitor.visit_program(&parsed.program);
-        return visitor.finish();
-    }
-    "PARSEFAIL".to_string()
-}
-
-fn family(file: &str) -> String {
-    PathBuf::from(file)
-        .file_name()
-        .and_then(|x| x.to_str())
-        .unwrap_or(file)
-        .to_string()
 }
 
 fn main() -> Result<()> {
@@ -191,7 +62,7 @@ fn main() -> Result<()> {
         let vm: ReducedVm =
             serde_json::from_str(line).with_context(|| format!("parsing line {}", line_no + 1))?;
         vm_count += 1;
-        let fam = family(&vm.file);
+        let fam = family_name(&vm.file);
 
         for op in &vm.opcodes {
             for path in &op.paths {
@@ -201,8 +72,9 @@ fn main() -> Result<()> {
                     if raw == "[no-state-change]" {
                         continue;
                     }
-                    let shape = parse_shape(raw);
-                    let hash = fnv1a64(shape.as_bytes());
+                    let analyzed = analyze_effect(raw);
+                    let hash = analyzed.hash;
+                    let shape = analyzed.text;
                     hashes.push(format!("{hash:016x}"));
 
                     let cluster = effects.entry(hash).or_default();

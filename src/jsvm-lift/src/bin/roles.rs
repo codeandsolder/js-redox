@@ -1,11 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
-use oxc_allocator::Allocator;
-use oxc_ast::AstKind;
-use oxc_ast_visit::{walk, Visit};
-use oxc_span::SourceType;
-use rolldown_redox::ecmascript::parse_program;
+use jsvm_lift::effect_shape::{analyze_effect, family_name, EffectShape};
 use serde::{Deserialize, Serialize};
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -61,133 +58,9 @@ struct GroundTruth {
 }
 
 #[derive(Clone, Debug)]
-struct EffectShape {
-    hash: u64,
-    ids: HashMap<String, usize>,
-    reverse: HashMap<usize, String>,
-}
-
-#[derive(Clone, Debug)]
 struct PathInfo {
     effects: Vec<EffectShape>,
     signature: Vec<u64>,
-}
-
-#[derive(Default)]
-struct ShapeVisitor {
-    ids: HashMap<String, usize>,
-    reverse: HashMap<usize, String>,
-    next_id: usize,
-    tokens: Vec<String>,
-}
-
-impl ShapeVisitor {
-    fn canonical_id(&mut self, name: &str) -> usize {
-        if let Some(id) = self.ids.get(name) {
-            return *id;
-        }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.ids.insert(name.to_string(), id);
-        self.reverse.insert(id, name.to_string());
-        id
-    }
-
-    fn shape_text(&self) -> String {
-        self.tokens.join("|")
-    }
-}
-
-impl<'a> Visit<'a> for ShapeVisitor {
-    fn enter_node(&mut self, kind: AstKind<'a>) {
-        self.tokens.push(format!("K{}", kind.ty() as u8));
-        match kind {
-            AstKind::IdentifierReference(id) => {
-                let n = self.canonical_id(id.name.as_str());
-                self.tokens.push(format!("I{n}"));
-            }
-            AstKind::BindingIdentifier(id) => {
-                let n = self.canonical_id(id.name.as_str());
-                self.tokens.push(format!("B{n}"));
-            }
-            AstKind::IdentifierName(id) => self.tokens.push(format!("P:{}", id.name)),
-            AstKind::NumericLiteral(_) => self.tokens.push("NUM".into()),
-            AstKind::StringLiteral(_) => self.tokens.push("STR".into()),
-            AstKind::BooleanLiteral(b) => self.tokens.push(format!("BOOL:{}", b.value)),
-            AstKind::NullLiteral(_) => self.tokens.push("NULL".into()),
-            AstKind::BinaryExpression(e) => {
-                self.tokens.push(format!("BIN:{}", e.operator.as_str()));
-            }
-            AstKind::LogicalExpression(e) => {
-                self.tokens.push(format!("LOG:{}", e.operator.as_str()));
-            }
-            AstKind::UnaryExpression(e) => self.tokens.push(format!("UN:{}", e.operator.as_str())),
-            AstKind::UpdateExpression(e) => {
-                self.tokens
-                    .push(format!("UP:{}:{}", e.operator.as_str(), e.prefix));
-            }
-            AstKind::AssignmentExpression(e) => {
-                self.tokens.push(format!("AS:{}", e.operator.as_str()));
-            }
-            AstKind::StaticMemberExpression(e) => {
-                self.tokens.push(format!("MEM:{}", e.property.name));
-            }
-            AstKind::ComputedMemberExpression(_) => self.tokens.push("MEM:[]".into()),
-            AstKind::CallExpression(e) => {
-                self.tokens
-                    .push(format!("CALL:{}:{}", e.arguments.len(), e.optional));
-            }
-            AstKind::NewExpression(e) => self.tokens.push(format!("NEW:{}", e.arguments.len())),
-            AstKind::Function(f) => self.tokens.push(format!(
-                "FN:{}:{}:{}",
-                f.params.items.len(),
-                f.r#async,
-                f.generator
-            )),
-            AstKind::ArrowFunctionExpression(f) => {
-                self.tokens
-                    .push(format!("ARROW:{}:{}", f.params.items.len(), f.r#async));
-            }
-            _ => {}
-        }
-    }
-
-    fn visit_program(&mut self, it: &oxc_ast::ast::Program<'a>) {
-        walk::walk_program(self, it);
-    }
-}
-
-fn fnv1a64(data: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in data {
-        h ^= u64::from(*byte);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
-}
-
-fn effect_shape(source: &str) -> EffectShape {
-    for candidate in [source.to_string(), format!("({source})")] {
-        let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, &candidate, SourceType::cjs());
-        if !parsed.is_clean() {
-            continue;
-        }
-        let mut visitor = ShapeVisitor::default();
-        visitor.visit_program(&parsed.program);
-        let text = visitor.shape_text();
-        return EffectShape {
-            hash: fnv1a64(text.as_bytes()),
-            ids: visitor.ids,
-            reverse: visitor.reverse,
-        };
-    }
-
-    EffectShape {
-        hash: fnv1a64(b"PARSEFAIL"),
-        ids: HashMap::new(),
-        reverse: HashMap::new(),
-    }
 }
 
 fn path_info(path: &ReducedPath) -> PathInfo {
@@ -195,7 +68,7 @@ fn path_info(path: &ReducedPath) -> PathInfo {
         .effects
         .iter()
         .filter(|raw| raw.as_str() != "[no-state-change]")
-        .map(|raw| effect_shape(raw))
+        .map(|raw| analyze_effect(raw))
         .collect();
     let signature = effects.iter().map(|x| x.hash).collect();
     PathInfo { effects, signature }
@@ -211,14 +84,6 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
                 .with_context(|| format!("parsing {} line {}", path.display(), i + 1))
         })
         .collect()
-}
-
-fn family(file: &str) -> String {
-    PathBuf::from(file)
-        .file_name()
-        .and_then(|x| x.to_str())
-        .unwrap_or(file)
-        .to_string()
 }
 
 fn hard_anchors(scans: &[ScanReport]) -> HashMap<String, BTreeMap<String, String>> {
@@ -411,7 +276,7 @@ fn main() -> Result<()> {
         );
     }
     output.push(VmRoles {
-        file: family(&ground.file),
+        file: family_name(&ground.file),
         decoder: ground.decoder.clone(),
         matched_paths: ground.opcodes.iter().map(|op| op.paths.len()).sum(),
         roles: ground_roles,
@@ -530,7 +395,7 @@ fn main() -> Result<()> {
         }
 
         output.push(VmRoles {
-            file: family(&vm.file),
+            file: family_name(&vm.file),
             decoder: vm.decoder.clone(),
             matched_paths,
             roles: final_roles,
