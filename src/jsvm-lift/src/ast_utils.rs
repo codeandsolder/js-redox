@@ -40,6 +40,23 @@ pub fn exact_u64(value: f64) -> Option<u64> {
     }
 }
 
+pub fn exact_i64(value: f64) -> Option<i64> {
+    if value == 0.0 {
+        return Some(0);
+    }
+    let negative = value.is_sign_negative();
+    let magnitude = exact_u64(value.abs())?;
+    if negative {
+        if magnitude == 1_u64 << 63 {
+            Some(i64::MIN)
+        } else {
+            i64::try_from(magnitude).ok()?.checked_neg()
+        }
+    } else {
+        i64::try_from(magnitude).ok()
+    }
+}
+
 pub fn numeric_u64(expr: &Expression<'_>) -> Option<u64> {
     match expr {
         Expression::NumericLiteral(number) => exact_u64(number.value),
@@ -50,7 +67,7 @@ pub fn numeric_u64(expr: &Expression<'_>) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::exact_u64;
+    use super::{exact_i64, exact_u64};
 
     #[test]
     fn exact_u64_checks_ieee754_boundaries() {
@@ -66,5 +83,7 @@ mod tests {
             Some(18_446_744_073_709_549_568_u64)
         );
         assert_eq!(exact_u64(18_446_744_073_709_551_616.0), None);
+        assert_eq!(exact_i64(-9_223_372_036_854_775_808.0), Some(i64::MIN));
+        assert_eq!(exact_i64(9_223_372_036_854_775_808.0), None);
     }
 }

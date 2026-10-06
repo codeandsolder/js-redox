@@ -1,5 +1,5 @@
 use crate::{
-    ast_utils::{exact_u64, expr_ident, numeric_u64, target_ident},
+    ast_utils::{exact_i64, exact_u64, expr_ident, numeric_u64, target_ident},
     source_text::preview,
 };
 use oxc_ast::{
@@ -352,11 +352,32 @@ impl Scalar {
     }
 }
 
+const fn low_u32(value: i64) -> u32 {
+    let bytes = value.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+const fn low_i32(value: i64) -> i32 {
+    let bytes = value.to_le_bytes();
+    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn eval_bitwise(op: &str, lhs: i64, rhs: i64) -> Option<i64> {
+    let shift = low_u32(rhs) & 31;
+    match op {
+        "&" => Some(i64::from(low_i32(lhs) & low_i32(rhs))),
+        "|" => Some(i64::from(low_i32(lhs) | low_i32(rhs))),
+        "^" => Some(i64::from(low_i32(lhs) ^ low_i32(rhs))),
+        "<<" => Some(i64::from(low_i32(lhs).wrapping_shl(shift))),
+        ">>" => Some(i64::from(low_i32(lhs) >> shift)),
+        ">>>" => Some(i64::from(low_u32(lhs) >> shift)),
+        _ => None,
+    }
+}
+
 fn eval_expr(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Option<Scalar> {
     match expr {
-        Expression::NumericLiteral(n) if n.value.is_finite() && n.value.fract() == 0.0 => {
-            Some(Scalar::Int(n.value as i64))
-        }
+        Expression::NumericLiteral(n) => exact_i64(n.value).map(Scalar::Int),
         Expression::BooleanLiteral(b) => Some(Scalar::Int(i64::from(b.value))),
         Expression::Identifier(id) => {
             if id.name.as_str() == "undefined" {
@@ -370,7 +391,7 @@ fn eval_expr(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Option<Sca
             let v = eval_expr(&u.argument, env)?;
             match u.operator.as_str() {
                 "!" => Some(Scalar::Int(i64::from(!v.truthy()))),
-                "~" => Some(Scalar::Int(!v.int()?)),
+                "~" => Some(Scalar::Int(i64::from(!low_i32(v.int()?)))),
                 "+" => Some(Scalar::Int(v.int()?)),
                 "-" => Some(Scalar::Int(-v.int()?)),
                 "void" => Some(Scalar::Undefined),
@@ -396,15 +417,8 @@ fn eval_expr(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Option<Sca
                 "<=" => Some(Scalar::Int(i64::from(lhs.int()? <= rhs.int()?))),
                 ">" => Some(Scalar::Int(i64::from(lhs.int()? > rhs.int()?))),
                 ">=" => Some(Scalar::Int(i64::from(lhs.int()? >= rhs.int()?))),
-                "&" => Some(Scalar::Int(lhs.int()? & rhs.int()?)),
-                "|" => Some(Scalar::Int(lhs.int()? | rhs.int()?)),
-                "^" => Some(Scalar::Int(lhs.int()? ^ rhs.int()?)),
-                "<<" => Some(Scalar::Int(lhs.int()? << rhs.int()?)),
-                ">>" => Some(Scalar::Int(lhs.int()? >> rhs.int()?)),
-                ">>>" => {
-                    let a = lhs.int()? as u64;
-                    let b = rhs.int()? as u32;
-                    Some(Scalar::Int((a >> b) as i64))
+                "&" | "|" | "^" | "<<" | ">>" | ">>>" => {
+                    eval_bitwise(op, lhs.int()?, rhs.int()?).map(Scalar::Int)
                 }
                 "+" => Some(Scalar::Int(lhs.int()?.wrapping_add(rhs.int()?))),
                 "-" => Some(Scalar::Int(lhs.int()?.wrapping_sub(rhs.int()?))),
@@ -1114,6 +1128,36 @@ mod tests {
         };
         harness.visit_program(&parsed.program);
         harness.detected
+    }
+
+    fn eval_integer_expression(source: &str) -> Option<i64> {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        if !parsed.is_clean() {
+            return None;
+        }
+        let Statement::ExpressionStatement(statement) = parsed.program.body.first()? else {
+            return None;
+        };
+        let Scalar::Int(value) = eval_expr(&statement.expression, &HashMap::new())? else {
+            return None;
+        };
+        Some(value)
+    }
+
+    #[test]
+    fn evaluator_uses_javascript_32_bit_bitwise_semantics() {
+        assert_eq!(eval_integer_expression("-1 >>> 0;"), Some(4_294_967_295));
+        assert_eq!(
+            eval_integer_expression("0x80000000 >> 0;"),
+            Some(-2_147_483_648)
+        );
+        assert_eq!(eval_integer_expression("1 << 33;"), Some(2));
+        assert_eq!(
+            eval_integer_expression("0xffffffff & 0x80000000;"),
+            Some(-2_147_483_648)
+        );
+        assert_eq!(eval_integer_expression("~0;"), Some(-1));
     }
 
     #[test]
