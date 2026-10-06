@@ -337,7 +337,7 @@ fn format_json_if_possible(bytes: &[u8]) -> Vec<u8> {
     pretty
 }
 
-fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
+const fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
     let mut quote = None;
     while i < bytes.len() {
         let b = bytes[i];

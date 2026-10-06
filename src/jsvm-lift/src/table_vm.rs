@@ -430,7 +430,7 @@ impl<'s> Analyzer<'s> {
         };
         let receiver = fragment(self.source, dst.object.span());
         let key = fragment(self.source, dst.expression.span());
-        let scope_key = self.registry_scope_key(receiver.clone());
+        let scope_key = self.registry_scope_key(receiver);
 
         if let Some((start, end, params, r#async)) = function_expr_meta(&assign.right) {
             self.registry_handlers

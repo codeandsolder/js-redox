@@ -191,7 +191,7 @@ impl PureFunction {
         self.expression.eval(args)
     }
 
-    pub(super) fn declaration_span(&self) -> Option<Span> {
+    pub(super) const fn declaration_span(&self) -> Option<Span> {
         self.declaration_span
     }
 }

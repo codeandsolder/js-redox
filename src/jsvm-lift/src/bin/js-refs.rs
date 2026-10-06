@@ -224,10 +224,10 @@ fn parse<'a>(
     source_type: SourceType,
 ) -> Option<oxc_ast::ast::Program<'a>> {
     let parsed = parse_program(allocator, source, source_type);
-    if !parsed.is_clean() {
-        None
-    } else {
+    if parsed.is_clean() {
         Some(parsed.program)
+    } else {
+        None
     }
 }
 

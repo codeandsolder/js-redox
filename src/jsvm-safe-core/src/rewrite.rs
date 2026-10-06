@@ -32,11 +32,11 @@ impl Counts {
     }
 }
 
-fn js_word_byte(byte: u8) -> bool {
+const fn js_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || byte >= 0x80
 }
 
-fn needs_lexical_separator(left: u8, right: u8) -> bool {
+const fn needs_lexical_separator(left: u8, right: u8) -> bool {
     (js_word_byte(left) && js_word_byte(right))
         || (left == b'+' && right == b'+')
         || (left == b'-' && right == b'-')

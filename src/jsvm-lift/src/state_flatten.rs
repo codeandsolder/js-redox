@@ -337,14 +337,14 @@ enum Scalar {
 }
 
 impl Scalar {
-    fn truthy(self) -> bool {
+    const fn truthy(self) -> bool {
         match self {
             Self::Int(v) => v != 0,
             Self::Undefined => false,
         }
     }
 
-    fn int(self) -> Option<i64> {
+    const fn int(self) -> Option<i64> {
         match self {
             Self::Int(v) => Some(v),
             Self::Undefined => None,
@@ -943,7 +943,7 @@ impl<'a> Visit<'a> for LoopRunner<'_, '_> {
     }
 }
 
-fn ident_byte(byte: u8) -> bool {
+const fn ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
 }
 

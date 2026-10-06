@@ -108,6 +108,7 @@ fn fnv1a64(data: &[u8]) -> u64 {
     h
 }
 
+#[must_use]
 pub fn analyze_effect(source: &str) -> EffectShape {
     for candidate in [source.to_string(), format!("({source})")] {
         let allocator = Allocator::default();
@@ -135,6 +136,7 @@ pub fn analyze_effect(source: &str) -> EffectShape {
     }
 }
 
+#[must_use]
 pub fn family_name(file: &str) -> String {
     Path::new(file)
         .file_name()

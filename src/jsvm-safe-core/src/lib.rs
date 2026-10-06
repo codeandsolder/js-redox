@@ -958,6 +958,7 @@ pub struct SafeTransformResult {
     pub arithmetic_state_proofs: Vec<ArithmeticStateProof>,
 }
 
+#[must_use]
 pub fn deobfuscate(source: &str, max_iterations: usize) -> Option<SafeTransformResult> {
     // Select a source mode only after both parsing and semantic validation. Some
     // legacy browser scripts parse as modules but are invalid under module

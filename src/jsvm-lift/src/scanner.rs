@@ -44,7 +44,7 @@ struct Scanner<'s> {
 }
 
 impl<'s> Scanner<'s> {
-    fn new(source: &'s str) -> Self {
+    const fn new(source: &'s str) -> Self {
         Self {
             source,
             arrays: Vec::new(),

@@ -134,7 +134,7 @@ struct Output {
     vms: Vec<TableVmIr>,
 }
 
-fn is_ident_char(c: u8) -> bool {
+const fn is_ident_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
 }
 

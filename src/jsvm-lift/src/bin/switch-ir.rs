@@ -121,7 +121,7 @@ fn fnv1a64(data: &[u8]) -> u64 {
     h
 }
 
-fn is_ident_char(c: char) -> bool {
+const fn is_ident_char(c: char) -> bool {
     c == '_' || c == '$' || c.is_ascii_alphanumeric()
 }
 

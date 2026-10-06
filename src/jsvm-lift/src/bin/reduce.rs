@@ -97,7 +97,7 @@ impl Val {
         }
     }
 
-    fn truthy(&self) -> Option<bool> {
+    const fn truthy(&self) -> Option<bool> {
         match self {
             Self::Num(v) => Some(*v != 0),
             Self::Bool(v) => Some(*v),

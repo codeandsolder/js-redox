@@ -254,24 +254,23 @@ pub fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
             Some(Value::Bool(op == "=="))
         }
         "<" | "<=" | ">" | ">=" => {
-            let result = match (&left, &right) {
-                (Value::String(a), Value::String(b)) => match op {
+            let result = if let (Value::String(a), Value::String(b)) = (&left, &right) {
+                match op {
                     "<" => a < b,
                     "<=" => a <= b,
                     ">" => a > b,
                     ">=" => a >= b,
                     _ => unreachable!(),
-                },
-                _ => {
-                    let a = left.number()?;
-                    let b = right.number()?;
-                    match op {
-                        "<" => a < b,
-                        "<=" => a <= b,
-                        ">" => a > b,
-                        ">=" => a >= b,
-                        _ => unreachable!(),
-                    }
+                }
+            } else {
+                let a = left.number()?;
+                let b = right.number()?;
+                match op {
+                    "<" => a < b,
+                    "<=" => a <= b,
+                    ">" => a > b,
+                    ">=" => a >= b,
+                    _ => unreachable!(),
                 }
             };
             Some(Value::Bool(result))

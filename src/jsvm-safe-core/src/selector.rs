@@ -5,7 +5,10 @@
 //! statically unique. Generic JavaScript coercion/evaluation remains delegated
 //! to the shared value evaluator.
 
-use super::*;
+use super::{
+    expression_integer, known_bool, symbol_of, walk, BindingPattern, Expression, GetSpan, HashMap,
+    HashSet, ScopeFlags, Scoping, Span, Statement, SymbolId, Visit,
+};
 
 fn selector_identifier_symbol(expr: &Expression<'_>, scoping: &Scoping) -> Option<SymbolId> {
     match expr {

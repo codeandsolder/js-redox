@@ -19,7 +19,7 @@ pub enum ProxyProperty {
     Call { arity: usize },
 }
 
-pub fn proxy_literal_kind(value: &Value) -> &'static str {
+pub const fn proxy_literal_kind(value: &Value) -> &'static str {
     if matches!(value, Value::String(_)) {
         "proxy_string"
     } else {

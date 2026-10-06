@@ -318,7 +318,7 @@ fn detect_one_shot_wrapper(call: &CallExpression<'_>) -> Option<StructuralSignal
     })
 }
 
-fn is_proxy_return_expression(expr: &Expression<'_>) -> bool {
+const fn is_proxy_return_expression(expr: &Expression<'_>) -> bool {
     matches!(
         expr,
         Expression::BinaryExpression(_)
