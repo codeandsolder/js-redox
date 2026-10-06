@@ -17,6 +17,19 @@ use oxc_syntax::{
 };
 use std::collections::{HashMap, HashSet};
 
+/// Convert an integer into the JavaScript Number domain. Precision loss above
+/// 2^53 is intentional here: JavaScript itself stores the value as IEEE-754 f64.
+#[allow(clippy::cast_precision_loss)]
+fn js_number_from_u64(value: u64) -> f64 {
+    value as f64
+}
+
+/// Signed counterpart; rounding is intentional JavaScript Number semantics.
+#[allow(clippy::cast_precision_loss)]
+fn js_number_from_i64(value: i64) -> f64 {
+    value as f64
+}
+
 #[derive(Debug, Clone)]
 struct StaticArrayInfo {
     symbol: SymbolId,
@@ -660,7 +673,7 @@ fn js_parse_int(text: &str, radix: u32) -> Option<f64> {
     if digits == 0 {
         return None;
     }
-    let value = value as f64;
+    let value = js_number_from_u64(value);
     Some(if negative { -value } else { value })
 }
 
@@ -728,7 +741,7 @@ impl RotationExprParser<'_, '_> {
                 return None;
             }
             let len = 2 + digits;
-            let value = i64::from_str_radix(&rest[2..len], 16).ok()? as f64;
+            let value = js_number_from_i64(i64::from_str_radix(&rest[2..len], 16).ok()?);
             self.pos += len;
             return Some(value);
         }
@@ -1008,7 +1021,7 @@ fn prove_rotation_iife(
             let Some(value) = eval_rotation_checksum(expression, &alias, decoder, rotation) else {
                 continue;
             };
-            if value.is_finite() && (value - iife.target as f64).abs() < 1e-9 {
+            if value.is_finite() && (value - js_number_from_i64(iife.target)).abs() < 1e-9 {
                 matches.push(rotation);
                 if matches.len() > 1 {
                     break;
