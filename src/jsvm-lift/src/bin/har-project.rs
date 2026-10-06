@@ -642,8 +642,7 @@ fn salvage_har(raw: &[u8]) -> Result<Har> {
     })
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+fn prepare_output(args: &Args) -> Result<()> {
     if args.output.exists() {
         if !args.overwrite {
             bail!(
@@ -654,167 +653,214 @@ fn main() -> Result<()> {
         fs::remove_dir_all(&args.output)?;
     }
     fs::create_dir_all(&args.output)?;
+    Ok(())
+}
 
-    let raw = fs::read(&args.har).with_context(|| format!("reading {}", args.har.display()))?;
-    let first = raw.iter().copied().find(|b| !b.is_ascii_whitespace());
+fn read_har(path: &Path) -> Result<(Har, bool, Option<String>)> {
+    let raw = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let first = raw.iter().copied().find(|byte| !byte.is_ascii_whitespace());
     if first != Some(b'{') {
         bail!(
             "{} is not HAR JSON (first non-whitespace byte {:?})",
-            args.har.display(),
+            path.display(),
             first
         );
     }
-    let (har, salvaged, parse_error) = match serde_json::from_slice::<Har>(&raw) {
+    let parsed = match serde_json::from_slice::<Har>(&raw) {
         Ok(har) => (har, false, None),
         Err(error) => {
             let message = error.to_string();
             eprintln!("warning: full HAR JSON parse failed; salvaging complete entries: {message}");
             (
                 salvage_har(&raw)
-                    .with_context(|| format!("salvaging truncated HAR {}", args.har.display()))?,
+                    .with_context(|| format!("salvaging truncated HAR {}", path.display()))?,
                 true,
                 Some(message),
             )
         }
     };
-    if har.log.entries.is_empty() {
+    if parsed.0.log.entries.is_empty() {
         bail!("HAR contains no log.entries");
     }
+    Ok(parsed)
+}
 
-    let pages = har
-        .log
+fn page_metadata(har: &Har) -> Vec<PageMeta> {
+    har.log
         .pages
         .iter()
-        .map(|p| PageMeta {
-            id: p.id.clone(),
-            title: p.title.clone(),
-            started_date_time: p.started_date_time.clone(),
+        .map(|page| PageMeta {
+            id: page.id.clone(),
+            title: page.title.clone(),
+            started_date_time: page.started_date_time.clone(),
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    let mut seen = HashMap::new();
-    let mut resources = Vec::new();
-    let mut inline_scripts = Vec::new();
-    let mut counts = BTreeMap::new();
-
-    for (id, entry) in har.log.entries.iter().enumerate() {
-        let kind = resource_kind(&entry.request.url, &entry.response.content.mime_type).to_string();
-        *counts.entry(format!("resource_{kind}")).or_insert(0) += 1;
-
-        let body = decode_body(&entry.response.content)
-            .with_context(|| format!("entry {id}: {}", entry.request.url))?;
-        let mut output_path = None;
-        let mut body_bytes = 0usize;
-        let mut sha256 = None;
-        let mut reused_body = false;
-        let mut references = Vec::new();
-
-        if let Some(mut body) = body {
-            body_bytes = body.len();
-            sha256 = Some(sha256_hex(&body));
-            if kind == "json" {
-                body = format_json_if_possible(&body);
+#[allow(clippy::too_many_arguments)]
+fn materialize_inline_scripts(
+    parent_resource_id: usize,
+    base_url: &str,
+    html: &str,
+    written: &str,
+    output_root: &Path,
+    seen: &mut HashMap<String, String>,
+    counts: &mut BTreeMap<String, usize>,
+    references: &mut Vec<Reference>,
+    inline_scripts: &mut Vec<InlineScriptMeta>,
+) -> Result<()> {
+    for (ordinal0, script) in extract_script_tags(html).into_iter().enumerate() {
+        let ordinal = ordinal0 + 1;
+        let ty = script_type(&script.attrs);
+        let src = script.attrs.get("src").cloned();
+        let resolved_src = src.as_deref().and_then(|src| resolve_ref(base_url, src));
+        if let Some(raw_src) = src.as_ref() {
+            if is_executable_script_type(&ty) {
+                references.push(Reference {
+                    kind: "script_src".into(),
+                    raw: raw_src.clone(),
+                    resolved_url: resolved_src.clone(),
+                });
             }
-            if kind == "javascript" {
-                if let Ok(source) = std::str::from_utf8(&body) {
-                    references.extend(source_refs(source, &entry.request.url));
-                }
-            }
-            let desired =
-                output_path_for(&entry.request.url, &kind, &entry.response.content.mime_type);
-            let (written, reused) = write_resource(&args.output, desired, &body, &mut seen)?;
-            output_path = Some(written.clone());
-            reused_body = reused;
-
-            if kind == "html" {
-                if let Ok(html) = std::str::from_utf8(&body) {
-                    for (ordinal0, script) in extract_script_tags(html).into_iter().enumerate() {
-                        let ordinal = ordinal0 + 1;
-                        let ty = script_type(&script.attrs);
-                        let src = script.attrs.get("src").cloned();
-                        let resolved_src = src
-                            .as_deref()
-                            .and_then(|s| resolve_ref(&entry.request.url, s));
-                        if let Some(raw_src) = src.as_ref() {
-                            if is_executable_script_type(&ty) {
-                                references.push(Reference {
-                                    kind: "script_src".into(),
-                                    raw: raw_src.clone(),
-                                    resolved_url: resolved_src.clone(),
-                                });
-                            }
-                            inline_scripts.push(InlineScriptMeta {
-                                parent_resource_id: id,
-                                ordinal,
-                                script_type: ty,
-                                src,
-                                resolved_src,
-                                output_path: None,
-                                body_bytes: 0,
-                                sha256: None,
-                            });
-                            continue;
-                        }
-
-                        let structured_json = is_json_script_type(&ty);
-                        let body = if structured_json {
-                            format_json_if_possible(script.body.as_bytes())
-                        } else {
-                            script.body.into_bytes()
-                        };
-                        if body.iter().all(u8::is_ascii_whitespace) {
-                            continue;
-                        }
-                        let ext = inline_script_extension(&ty);
-                        let desired = format!("{written}.inline/script-{ordinal:03}.{ext}");
-                        let (script_path, _) =
-                            write_resource(&args.output, desired, &body, &mut seen)?;
-                        *counts.entry("inline_scripts".into()).or_insert(0) += 1;
-                        inline_scripts.push(InlineScriptMeta {
-                            parent_resource_id: id,
-                            ordinal,
-                            script_type: ty,
-                            src: None,
-                            resolved_src: None,
-                            output_path: Some(script_path),
-                            body_bytes: body.len(),
-                            sha256: Some(sha256_hex(&body)),
-                        });
-                    }
-                }
-            }
-        } else {
-            *counts.entry("resources_without_body".into()).or_insert(0) += 1;
+            inline_scripts.push(InlineScriptMeta {
+                parent_resource_id,
+                ordinal,
+                script_type: ty,
+                src,
+                resolved_src,
+                output_path: None,
+                body_bytes: 0,
+                sha256: None,
+            });
+            continue;
         }
 
-        resources.push(ResourceMeta {
-            id,
-            pageref: entry.pageref.clone(),
-            started_date_time: entry.started_date_time.clone(),
-            time_ms: entry.time,
-            method: entry.request.method.clone(),
-            url: entry.request.url.clone(),
-            status: entry.response.status,
-            status_text: entry.response.status_text.clone(),
-            mime_type: entry.response.content.mime_type.clone(),
-            declared_size: entry.response.content.size,
-            encoding: entry.response.content.encoding.clone(),
-            body_present: entry.response.content.text.is_some(),
-            body_bytes,
-            sha256,
-            kind,
-            output_path,
-            reused_body,
-            request_headers: headers(&entry.request.headers),
-            response_headers: headers(&entry.response.headers),
-            references,
+        let body = if is_json_script_type(&ty) {
+            format_json_if_possible(script.body.as_bytes())
+        } else {
+            script.body.into_bytes()
+        };
+        if body.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let ext = inline_script_extension(&ty);
+        let desired = format!("{written}.inline/script-{ordinal:03}.{ext}");
+        let (script_path, _) = write_resource(output_root, desired, &body, seen)?;
+        *counts.entry("inline_scripts".into()).or_insert(0) += 1;
+        inline_scripts.push(InlineScriptMeta {
+            parent_resource_id,
+            ordinal,
+            script_type: ty,
+            src: None,
+            resolved_src: None,
+            output_path: Some(script_path),
+            body_bytes: body.len(),
+            sha256: Some(sha256_hex(&body)),
         });
     }
+    Ok(())
+}
 
+fn materialize_entry(
+    id: usize,
+    entry: &HarEntry,
+    output_root: &Path,
+    seen: &mut HashMap<String, String>,
+    counts: &mut BTreeMap<String, usize>,
+    inline_scripts: &mut Vec<InlineScriptMeta>,
+) -> Result<ResourceMeta> {
+    let kind = resource_kind(&entry.request.url, &entry.response.content.mime_type).to_string();
+    *counts.entry(format!("resource_{kind}")).or_insert(0) += 1;
+    let body = decode_body(&entry.response.content)
+        .with_context(|| format!("entry {id}: {}", entry.request.url))?;
+    let mut output_path = None;
+    let mut body_bytes = 0;
+    let mut sha256 = None;
+    let mut reused_body = false;
+    let mut references = Vec::new();
+
+    if let Some(mut body) = body {
+        body_bytes = body.len();
+        sha256 = Some(sha256_hex(&body));
+        if kind == "json" {
+            body = format_json_if_possible(&body);
+        }
+        if kind == "javascript" {
+            if let Ok(source) = std::str::from_utf8(&body) {
+                references.extend(source_refs(source, &entry.request.url));
+            }
+        }
+        let desired = output_path_for(&entry.request.url, &kind, &entry.response.content.mime_type);
+        let (written, reused) = write_resource(output_root, desired, &body, seen)?;
+        output_path = Some(written.clone());
+        reused_body = reused;
+        if kind == "html" {
+            if let Ok(html) = std::str::from_utf8(&body) {
+                materialize_inline_scripts(
+                    id,
+                    &entry.request.url,
+                    html,
+                    &written,
+                    output_root,
+                    seen,
+                    counts,
+                    &mut references,
+                    inline_scripts,
+                )?;
+            }
+        }
+    } else {
+        *counts.entry("resources_without_body".into()).or_insert(0) += 1;
+    }
+
+    Ok(ResourceMeta {
+        id,
+        pageref: entry.pageref.clone(),
+        started_date_time: entry.started_date_time.clone(),
+        time_ms: entry.time,
+        method: entry.request.method.clone(),
+        url: entry.request.url.clone(),
+        status: entry.response.status,
+        status_text: entry.response.status_text.clone(),
+        mime_type: entry.response.content.mime_type.clone(),
+        declared_size: entry.response.content.size,
+        encoding: entry.response.content.encoding.clone(),
+        body_present: entry.response.content.text.is_some(),
+        body_bytes,
+        sha256,
+        kind,
+        output_path,
+        reused_body,
+        request_headers: headers(&entry.request.headers),
+        response_headers: headers(&entry.response.headers),
+        references,
+    })
+}
+
+fn build_manifest(
+    args: &Args,
+    har: Har,
+    salvaged: bool,
+    parse_error: Option<String>,
+) -> Result<ProjectManifest> {
+    let pages = page_metadata(&har);
+    let mut seen = HashMap::new();
+    let mut counts = BTreeMap::new();
+    let mut inline_scripts = Vec::new();
+    let mut resources = Vec::with_capacity(har.log.entries.len());
+    for (id, entry) in har.log.entries.iter().enumerate() {
+        resources.push(materialize_entry(
+            id,
+            entry,
+            &args.output,
+            &mut seen,
+            &mut counts,
+            &mut inline_scripts,
+        )?);
+    }
     counts.insert("resources_total".into(), resources.len());
     counts.insert("pages".into(), pages.len());
-
-    let manifest = ProjectManifest {
+    Ok(ProjectManifest {
         schema: "har-project/v0",
         source_har: args.har.display().to_string(),
         har_version: har.log.version,
@@ -824,18 +870,19 @@ fn main() -> Result<()> {
         resources,
         inline_scripts,
         counts,
-    };
+    })
+}
 
+fn write_project_metadata(args: &Args, manifest: &ProjectManifest) -> Result<()> {
     fs::write(
         args.output.join("har-manifest.json"),
-        format!("{}\n", serde_json::to_string_pretty(&manifest)?),
+        format!("{}\n", serde_json::to_string_pretty(manifest)?),
     )?;
     fs::create_dir_all(args.output.join(".vscode"))?;
     fs::write(
         args.output.join(".vscode/settings.json"),
         "{\n  \"editor.maxTokenizationLineLength\": 200000\n}\n",
     )?;
-
     let mut summary = String::new();
     for (kind, count) in &manifest.counts {
         summary.push_str(&format!("- {kind}: {count}\n"));
@@ -848,7 +895,10 @@ fn main() -> Result<()> {
             summary
         ),
     )?;
+    Ok(())
+}
 
+fn print_summary(args: &Args, manifest: &ProjectManifest) {
     println!(
         "HAR project: {} resources, {} script records -> {}",
         manifest.resources.len(),
@@ -858,5 +908,14 @@ fn main() -> Result<()> {
     for (kind, count) in &manifest.counts {
         println!("{kind}\t{count}");
     }
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    prepare_output(&args)?;
+    let (har, salvaged, parse_error) = read_har(&args.har)?;
+    let manifest = build_manifest(&args, har, salvaged, parse_error)?;
+    write_project_metadata(&args, &manifest)?;
+    print_summary(&args, &manifest);
     Ok(())
 }
