@@ -266,7 +266,7 @@ impl<'a> Visit<'a> for SelectorLiteralCollector<'_> {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct SelectorDispatcher {
+pub struct SelectorDispatcher {
     pub(super) params: Vec<String>,
     pub(super) param_symbols: Vec<SymbolId>,
     pub(super) returns: HashMap<i64, Span>,
@@ -362,7 +362,7 @@ impl<'a> Visit<'a> for SelectorDispatcherCollector<'_> {
     }
 }
 
-pub(super) fn collect_selector_dispatchers(
+pub fn collect_selector_dispatchers(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
     stable_var_numbers: &HashMap<SymbolId, i64>,

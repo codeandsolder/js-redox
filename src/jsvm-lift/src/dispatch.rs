@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn detects_confirmed_numeric_dispatch_switch() {
-        let source = r#"
+        let source = r"
             while (true) {
                 switch (code[ip++]) {
                     case 0: stack.push(a); continue;
@@ -346,7 +346,7 @@ mod tests {
                     case 15: x++; break;
                 }
             }
-        "#;
+        ";
         let result = scan(source);
         assert_eq!(result.switches.len(), 1);
         let switch = &result.switches[0];
@@ -358,13 +358,13 @@ mod tests {
 
     #[test]
     fn detects_function_handler_tables() {
-        let source = r#"
+        let source = r"
             const objectHandlers = {
                 a: function(){}, b: function(){}, c: function(){}, d: function(){},
                 e: function(){}, f: function(){}, g: function(){}, h: function(){}
             };
             const arrayHandlers = [()=>0, ()=>1, ()=>2, ()=>3];
-        "#;
+        ";
         let result = scan(source);
         assert_eq!(result.objects.len(), 1);
         assert_eq!(result.objects[0].function_values, 8);

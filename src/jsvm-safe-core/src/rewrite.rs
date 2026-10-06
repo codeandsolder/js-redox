@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use string_wizard::{MagicString, TextEdit};
 
 #[derive(Debug, Clone)]
-pub(super) struct Replacement {
+pub struct Replacement {
     pub(super) start: usize,
     pub(super) end: usize,
     pub(super) text: String,
@@ -20,7 +20,7 @@ pub(super) struct Replacement {
 }
 
 #[derive(Default)]
-pub(super) struct Counts(BTreeMap<String, usize>);
+pub struct Counts(BTreeMap<String, usize>);
 
 impl Counts {
     fn bump(&mut self, kind: &str) {
@@ -145,7 +145,7 @@ fn lexically_safe_texts(source: &str, selected: &[Replacement]) -> Option<Vec<St
     Some(adjusted)
 }
 
-pub(super) fn apply(
+pub fn apply(
     source: &str,
     replacements: Vec<Replacement>,
     counts: &mut Counts,

@@ -113,10 +113,10 @@ struct Output {
 }
 
 fn fnv1a64(data: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
     for byte in data {
         h ^= u64::from(*byte);
-        h = h.wrapping_mul(0x100000001b3);
+        h = h.wrapping_mul(0x0100_0000_01b3);
     }
     h
 }

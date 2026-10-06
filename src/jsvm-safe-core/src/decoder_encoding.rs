@@ -31,7 +31,7 @@ fn lower_engine() -> Option<&'static GeneralPurpose> {
     LOWER_ENGINE.as_ref()
 }
 
-pub(super) fn decode_standard_base64_latin1(input: &str) -> Option<String> {
+pub fn decode_standard_base64_latin1(input: &str) -> Option<String> {
     // Match browser/atob-style ASCII whitespace handling before delegating the
     // actual alphabet and bit decoding.  Keep the pre-validation explicit so
     // internal/overlong padding remains rejected exactly as before.
@@ -59,7 +59,7 @@ pub(super) fn decode_standard_base64_latin1(input: &str) -> Option<String> {
     Some(bytes.into_iter().map(char::from).collect())
 }
 
-pub(super) fn decode_lower_alphabet_base64_uri(input: &str) -> Option<String> {
+pub fn decode_lower_alphabet_base64_uri(input: &str) -> Option<String> {
     // The observed decoder stops at its first `=` sentinel rather than parsing
     // the suffix.  A final lone sextet contributes no complete byte, so drop it
     // before asking the standards engine to decode the useful prefix.
@@ -70,7 +70,7 @@ pub(super) fn decode_lower_alphabet_base64_uri(input: &str) -> Option<String> {
     String::from_utf8(lower_engine()?.decode(encoded).ok()?).ok()
 }
 
-pub(super) fn decode_fixed_base64_latin1(input: &str, alphabet: &str) -> Option<String> {
+pub fn decode_fixed_base64_latin1(input: &str, alphabet: &str) -> Option<String> {
     let alphabet = alphabet.chars().collect::<Vec<_>>();
     if alphabet.len() != 65 {
         return None;

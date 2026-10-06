@@ -11,7 +11,7 @@ use oxc_ecmascript::{StringToNumber, ToInt32, ToUint32};
 use oxc_syntax::number::ToJsString;
 
 #[derive(Debug, Clone)]
-pub(super) enum Value {
+pub enum Value {
     String(String),
     Number(f64),
     Bool(bool),
@@ -71,7 +71,7 @@ fn render_number(n: f64) -> String {
     }
 }
 
-pub(super) fn same_value(a: &Value, b: &Value) -> bool {
+pub fn same_value(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::String(a), Value::String(b)) => a == b,
         // JavaScript Strict Equality: NaN is never equal to itself, while
@@ -83,11 +83,11 @@ pub(super) fn same_value(a: &Value, b: &Value) -> bool {
     }
 }
 
-pub(super) fn same_values(a: &[Value], b: &[Value]) -> bool {
+pub fn same_values(a: &[Value], b: &[Value]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(left, right)| same_value(left, right))
 }
 
-pub(super) fn render_value_array(values: &[Value]) -> Option<String> {
+pub fn render_value_array(values: &[Value]) -> Option<String> {
     let rendered = values
         .iter()
         .map(Value::render)
@@ -95,15 +95,15 @@ pub(super) fn render_value_array(values: &[Value]) -> Option<String> {
     Some(format!("[{}]", rendered.join(", ")))
 }
 
-pub(super) fn eval(expr: &Expression<'_>) -> Option<Value> {
+pub fn eval(expr: &Expression<'_>) -> Option<Value> {
     eval_with_resolver(expr, &|_| None)
 }
 
-pub(super) fn known_bool(expr: &Expression<'_>) -> Option<bool> {
+pub fn known_bool(expr: &Expression<'_>) -> Option<bool> {
     known_bool_with_resolver(expr, &|_| None)
 }
 
-pub(super) fn eval_with_resolver<'a, F>(expr: &Expression<'a>, resolve: &F) -> Option<Value>
+pub fn eval_with_resolver<'a, F>(expr: &Expression<'a>, resolve: &F) -> Option<Value>
 where
     F: Fn(&IdentifierReference<'a>) -> Option<Value>,
 {
@@ -133,7 +133,7 @@ where
     }
 }
 
-pub(super) fn known_bool_with_resolver<'a, F>(expr: &Expression<'a>, resolve: &F) -> Option<bool>
+pub fn known_bool_with_resolver<'a, F>(expr: &Expression<'a>, resolve: &F) -> Option<bool>
 where
     F: Fn(&IdentifierReference<'a>) -> Option<Value>,
 {
@@ -148,7 +148,7 @@ where
     }
 }
 
-pub(super) fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
+pub fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
     eval_unary_with_resolver(v, &|_| None)
 }
 
@@ -170,7 +170,7 @@ where
         "-" => value.number().map(|x| Value::Number(-x)),
         "~" => value
             .number()
-            .map(|x| Value::Number((!js_to_int32(x)) as f64)),
+            .map(|x| Value::Number(f64::from(!js_to_int32(x)))),
         "typeof" => Some(Value::String(
             match value {
                 Value::String(_) => "string",
@@ -186,16 +186,16 @@ where
 }
 
 #[inline]
-pub(super) fn js_to_uint32(n: f64) -> u32 {
+pub fn js_to_uint32(n: f64) -> u32 {
     n.to_uint_32()
 }
 
 #[inline]
-pub(super) fn js_to_int32(n: f64) -> i32 {
+pub fn js_to_int32(n: f64) -> i32 {
     n.to_int_32()
 }
 
-pub(super) fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
+pub fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
     match op {
         "+" => {
             if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
@@ -215,29 +215,31 @@ pub(super) fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> 
         "**" => Some(Value::Number(left.number()?.powf(right.number()?))),
         "<<" => {
             let shift = js_to_uint32(right.number()?) & 31;
-            Some(Value::Number(
-                js_to_int32(left.number()?).wrapping_shl(shift) as f64,
-            ))
+            Some(Value::Number(f64::from(
+                js_to_int32(left.number()?).wrapping_shl(shift),
+            )))
         }
         ">>" => {
             let shift = js_to_uint32(right.number()?) & 31;
-            Some(Value::Number((js_to_int32(left.number()?) >> shift) as f64))
+            Some(Value::Number(f64::from(
+                js_to_int32(left.number()?) >> shift,
+            )))
         }
         ">>>" => {
             let shift = js_to_uint32(right.number()?) & 31;
-            Some(Value::Number(
-                (js_to_uint32(left.number()?) >> shift) as f64,
-            ))
+            Some(Value::Number(f64::from(
+                js_to_uint32(left.number()?) >> shift,
+            )))
         }
-        "|" => Some(Value::Number(
-            (js_to_int32(left.number()?) | js_to_int32(right.number()?)) as f64,
-        )),
-        "^" => Some(Value::Number(
-            (js_to_int32(left.number()?) ^ js_to_int32(right.number()?)) as f64,
-        )),
-        "&" => Some(Value::Number(
-            (js_to_int32(left.number()?) & js_to_int32(right.number()?)) as f64,
-        )),
+        "|" => Some(Value::Number(f64::from(
+            js_to_int32(left.number()?) | js_to_int32(right.number()?),
+        ))),
+        "^" => Some(Value::Number(f64::from(
+            js_to_int32(left.number()?) ^ js_to_int32(right.number()?),
+        ))),
+        "&" => Some(Value::Number(f64::from(
+            js_to_int32(left.number()?) & js_to_int32(right.number()?),
+        ))),
         "===" => Some(Value::Bool(same_value(&left, &right))),
         "!==" => Some(Value::Bool(!same_value(&left, &right))),
         "==" | "!=" => {
@@ -278,7 +280,7 @@ pub(super) fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> 
     }
 }
 
-pub(super) fn eval_logical(v: &LogicalExpression<'_>) -> Option<Value> {
+pub fn eval_logical(v: &LogicalExpression<'_>) -> Option<Value> {
     eval_logical_with_resolver(v, &|_| None)
 }
 

@@ -60,7 +60,7 @@ struct EmbeddedScanReport {
     byte_transducers: Vec<table_vm::ByteTransducerCandidate>,
     table_vms: Vec<table_vm::TableVmCandidate>,
     functions: Vec<FunctionMetrics>,
-    embedded: Vec<EmbeddedScanReport>,
+    embedded: Vec<Self>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,10 +85,10 @@ struct ScanReport {
 }
 
 fn embedded_hash(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
         h ^= u64::from(*byte);
-        h = h.wrapping_mul(0x100000001b3);
+        h = h.wrapping_mul(0x0100_0000_01b3);
     }
     h
 }

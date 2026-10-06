@@ -365,15 +365,15 @@ enum Scalar {
 impl Scalar {
     fn truthy(self) -> bool {
         match self {
-            Scalar::Int(v) => v != 0,
-            Scalar::Undefined => false,
+            Self::Int(v) => v != 0,
+            Self::Undefined => false,
         }
     }
 
     fn int(self) -> Option<i64> {
         match self {
-            Scalar::Int(v) => Some(v),
-            Scalar::Undefined => None,
+            Self::Int(v) => Some(v),
+            Self::Undefined => None,
         }
     }
 }
@@ -485,7 +485,7 @@ fn exec_control_expr(
 ) {
     match expr {
         Expression::ParenthesizedExpression(p) => {
-            exec_control_expr(&p.expression, source, state_var, env, semantic)
+            exec_control_expr(&p.expression, source, state_var, env, semantic);
         }
         Expression::SequenceExpression(s) => {
             for e in &s.expressions {
@@ -517,10 +517,10 @@ fn exec_control_expr(
             if let Some(lhs) = eval_expr(&l.left, env) {
                 match l.operator.as_str() {
                     "&&" if lhs.truthy() => {
-                        exec_control_expr(&l.right, source, state_var, env, semantic)
+                        exec_control_expr(&l.right, source, state_var, env, semantic);
                     }
                     "||" if !lhs.truthy() => {
-                        exec_control_expr(&l.right, source, state_var, env, semantic)
+                        exec_control_expr(&l.right, source, state_var, env, semantic);
                     }
                     "&&" | "||" => {}
                     _ => semantic.push(slice(source, l.span)),
@@ -675,7 +675,7 @@ impl MaskBindingCollector<'_> {
             let Some(next) = self.aliases.get(&cur) else {
                 break;
             };
-            cur = next.clone();
+            cur.clone_from(next);
         }
         cur
     }
@@ -1016,9 +1016,9 @@ fn direct_binding_score(
         .sum()
 }
 
-pub fn analyze_function<'a>(
+pub fn analyze_function(
     source: &str,
-    function: &Function<'a>,
+    function: &Function<'_>,
     parent_function_id: &str,
     decoders: &[DecoderControlInfo],
     machines: &[StateMachineInfo],
@@ -1132,7 +1132,7 @@ mod tests {
     #[test]
     fn detects_switch_state_machine() {
         let detected = detect(
-            r#"
+            r"
             function vm() {
                 for (let state = 17; state !== undefined;) {
                     let selector = (state >> 3) & 7;
@@ -1143,7 +1143,7 @@ mod tests {
                     }
                 }
             }
-            "#,
+            ",
         );
 
         assert_eq!(detected.switch_machines.len(), 1);
@@ -1161,7 +1161,7 @@ mod tests {
     #[test]
     fn detects_if_ladder_state_machine() {
         let detected = detect(
-            r#"
+            r"
             function flattened() {
                 for (let state = 0; state !== 99;) {
                     if (state === 0) { state = 1; }
@@ -1170,7 +1170,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-            "#,
+            ",
         );
 
         assert!(detected.switch_machines.is_empty());

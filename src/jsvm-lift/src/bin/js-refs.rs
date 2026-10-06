@@ -32,7 +32,7 @@ struct Collector<'s> {
     refs: BTreeSet<JsReference>,
 }
 
-impl<'s> Collector<'s> {
+impl Collector<'_> {
     fn push(&mut self, kind: &str, specifier: impl Into<String>, start: u32, end: u32) {
         self.refs.insert(JsReference {
             kind: kind.to_string(),
@@ -105,7 +105,7 @@ impl<'s> Collector<'s> {
     }
 }
 
-impl<'a, 's> Visit<'a> for Collector<'s> {
+impl<'a> Visit<'a> for Collector<'_> {
     fn visit_import_declaration(&mut self, it: &ImportDeclaration<'a>) {
         self.push(
             "import_static",
@@ -206,8 +206,7 @@ impl<'a, 's> Visit<'a> for Collector<'s> {
                 let import_meta_base = it
                     .arguments
                     .get(1)
-                    .map(|arg| self.source_fragment(arg.span()) == "import.meta.url")
-                    .unwrap_or(false);
+                    .is_some_and(|arg| self.source_fragment(arg.span()) == "import.meta.url");
                 if import_meta_base {
                     if let Some(specifier) = it.arguments.first().and_then(Self::literal_arg) {
                         self.push("module_url", specifier, it.span.start, it.span.end);

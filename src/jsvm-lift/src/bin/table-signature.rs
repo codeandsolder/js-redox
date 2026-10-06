@@ -128,18 +128,18 @@ impl<'a> Visit<'a> for ShapeVisitor {
             AstKind::BooleanLiteral(b) => self.tokens.push(format!("BOOL:{}", b.value)),
             AstKind::NullLiteral(_) => self.tokens.push("NULL".into()),
             AstKind::BinaryExpression(e) => {
-                self.tokens.push(format!("BIN:{}", e.operator.as_str()))
+                self.tokens.push(format!("BIN:{}", e.operator.as_str()));
             }
             AstKind::LogicalExpression(e) => {
-                self.tokens.push(format!("LOG:{}", e.operator.as_str()))
+                self.tokens.push(format!("LOG:{}", e.operator.as_str()));
             }
             AstKind::UnaryExpression(e) => self.tokens.push(format!("UN:{}", e.operator.as_str())),
             AstKind::UpdateExpression(e) => {
                 self.tokens
-                    .push(format!("UP:{}:{}", e.operator.as_str(), e.prefix))
+                    .push(format!("UP:{}:{}", e.operator.as_str(), e.prefix));
             }
             AstKind::AssignmentExpression(e) => {
-                self.tokens.push(format!("AS:{}", e.operator.as_str()))
+                self.tokens.push(format!("AS:{}", e.operator.as_str()));
             }
             AstKind::StaticMemberExpression(e) => {
                 if self.coarse_properties {
@@ -152,7 +152,7 @@ impl<'a> Visit<'a> for ShapeVisitor {
             AstKind::ComputedMemberExpression(_) => self.tokens.push("MEM:[]".into()),
             AstKind::CallExpression(e) => {
                 self.tokens
-                    .push(format!("CALL:{}:{}", e.arguments.len(), e.optional))
+                    .push(format!("CALL:{}:{}", e.arguments.len(), e.optional));
             }
             AstKind::NewExpression(e) => self.tokens.push(format!("NEW:{}", e.arguments.len())),
             AstKind::Function(f) => self.tokens.push(format!(
@@ -163,7 +163,7 @@ impl<'a> Visit<'a> for ShapeVisitor {
             )),
             AstKind::ArrowFunctionExpression(f) => {
                 self.tokens
-                    .push(format!("ARROW:{}:{}", f.params.items.len(), f.r#async))
+                    .push(format!("ARROW:{}:{}", f.params.items.len(), f.r#async));
             }
             _ => {}
         }
@@ -175,10 +175,10 @@ impl<'a> Visit<'a> for ShapeVisitor {
 }
 
 fn fnv1a64(data: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
     for byte in data {
         h ^= u64::from(*byte);
-        h = h.wrapping_mul(0x100000001b3);
+        h = h.wrapping_mul(0x0100_0000_01b3);
     }
     h
 }

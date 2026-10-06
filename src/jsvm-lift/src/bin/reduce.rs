@@ -309,10 +309,10 @@ fn eval_expr(
             let v = eval_expr(&un.argument, env, effects, ctx);
             match un.operator.as_str() {
                 "void" => Val::Undefined,
-                "!" => v.truthy().map(|x| Val::Bool(!x)).unwrap_or(Val::Unknown),
-                "~" => v.as_num().map(|x| Val::Num(!x)).unwrap_or(Val::Unknown),
-                "+" => v.as_num().map(Val::Num).unwrap_or(Val::Unknown),
-                "-" => v.as_num().map(|x| Val::Num(-x)).unwrap_or(Val::Unknown),
+                "!" => v.truthy().map_or(Val::Unknown, |x| Val::Bool(!x)),
+                "~" => v.as_num().map_or(Val::Unknown, |x| Val::Num(!x)),
+                "+" => v.as_num().map_or(Val::Unknown, Val::Num),
+                "-" => v.as_num().map_or(Val::Unknown, |x| Val::Num(-x)),
                 _ => Val::Unknown,
             }
         }

@@ -10,7 +10,7 @@ use oxc_syntax::symbol::SymbolId;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
-pub(super) enum ProxyProperty {
+pub enum ProxyProperty {
     Literal(Value),
     Unary { operator: String },
     Binary { operator: String },
@@ -19,7 +19,7 @@ pub(super) enum ProxyProperty {
     Call { arity: usize },
 }
 
-pub(super) fn proxy_literal_kind(value: &Value) -> &'static str {
+pub fn proxy_literal_kind(value: &Value) -> &'static str {
     if matches!(value, Value::String(_)) {
         "proxy_string"
     } else {
@@ -28,7 +28,7 @@ pub(super) fn proxy_literal_kind(value: &Value) -> &'static str {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct ProxyObject {
+pub struct ProxyObject {
     properties: HashMap<String, ProxyProperty>,
 }
 
@@ -195,7 +195,7 @@ fn analyze_proxy_object(
         if prop.kind != PropertyKind::Init || prop.computed || prop.method || prop.shorthand {
             continue;
         }
-        let Some(key) = prop.key.static_name().map(|name| name.into_owned()) else {
+        let Some(key) = prop.key.static_name().map(std::borrow::Cow::into_owned) else {
             continue;
         };
         if let Some(value) = eval(&prop.value) {
@@ -259,7 +259,7 @@ impl<'a> Visit<'a> for ProxyObjectCollector<'_, '_> {
     }
 }
 
-pub(super) fn collect_proxy_objects(
+pub fn collect_proxy_objects(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
 ) -> HashMap<SymbolId, ProxyObject> {
@@ -275,7 +275,7 @@ pub(super) fn collect_proxy_objects(
     collector.objects
 }
 
-pub(super) fn static_proxy_member<'a>(
+pub fn static_proxy_member<'a>(
     expr: &'a Expression<'a>,
     scoping: &Scoping,
 ) -> Option<(SymbolId, String)> {

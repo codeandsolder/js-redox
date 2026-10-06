@@ -358,11 +358,7 @@ fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
 fn parse_attrs(tag: &str) -> HashMap<String, String> {
     let bytes = tag.as_bytes();
     let mut out = HashMap::new();
-    let mut i = tag
-        .to_ascii_lowercase()
-        .find("script")
-        .map(|x| x + 6)
-        .unwrap_or(0);
+    let mut i = tag.to_ascii_lowercase().find("script").map_or(0, |x| x + 6);
     while i < bytes.len() {
         while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
             i += 1;
@@ -435,8 +431,7 @@ fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
         let body = html[body_start..close_start].to_string();
         let close_end = lower[close_start..]
             .find('>')
-            .map(|x| close_start + x + 1)
-            .unwrap_or(close_start + 8);
+            .map_or(close_start + 8, |x| close_start + x + 1);
         out.push(ScriptTag { attrs, body });
         from = close_end.min(html.len());
     }
@@ -767,7 +762,7 @@ fn main() -> Result<()> {
                         } else {
                             script.body.into_bytes()
                         };
-                        if body.iter().all(|b| b.is_ascii_whitespace()) {
+                        if body.iter().all(u8::is_ascii_whitespace) {
                             continue;
                         }
                         let ext = inline_script_extension(&ty);

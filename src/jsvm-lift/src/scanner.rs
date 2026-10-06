@@ -547,7 +547,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 }
 
-pub(crate) struct ScanCore {
+pub struct ScanCore {
     pub(crate) diagnostics: usize,
     pub(crate) panicked: bool,
     pub(crate) arrays: Vec<ArrayCandidate>,
@@ -565,7 +565,7 @@ pub(crate) struct ScanCore {
     pub(crate) embedded_code: Vec<EmbeddedCodeCandidate>,
 }
 
-pub(crate) fn scan_source_core(source: &str) -> ScanCore {
+pub fn scan_source_core(source: &str) -> ScanCore {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::cjs());
 
@@ -754,7 +754,7 @@ mod tests {
 
     #[test]
     fn scanner_integrates_vm_detectors() {
-        let source = r#"
+        let source = r"
             function vm() {
                 const code = [
                     0,200,1,201,2,202,3,203,4,204,5,205,6,206,7,207,
@@ -783,7 +783,7 @@ mod tests {
                     }
                 }
             }
-        "#;
+        ";
 
         let core = scan_source_core(source);
         assert!(!core.panicked);

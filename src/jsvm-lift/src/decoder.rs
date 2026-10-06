@@ -188,7 +188,7 @@ pub fn resolve_alias(name: &str, aliases: &HashMap<String, String>) -> String {
         let Some(next) = aliases.get(&current) else {
             break;
         };
-        current = next.clone();
+        current.clone_from(next);
     }
     current
 }
@@ -364,7 +364,7 @@ pub fn link_candidates(
                 candidate.builder_start = Some(site.start);
                 candidate.builder_end = Some(site.end);
                 candidate.builder_arguments = Some(site.arguments);
-                candidate.builder_width_hints = site.width_hints.clone();
+                candidate.builder_width_hints.clone_from(&site.width_hints);
             }
         }
     }

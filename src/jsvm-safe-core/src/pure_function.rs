@@ -12,22 +12,22 @@ enum PureExpr {
     Param(usize),
     Unary {
         operator: String,
-        argument: Box<PureExpr>,
+        argument: Box<Self>,
     },
     Binary {
         operator: String,
-        left: Box<PureExpr>,
-        right: Box<PureExpr>,
+        left: Box<Self>,
+        right: Box<Self>,
     },
     Logical {
         operator: String,
-        left: Box<PureExpr>,
-        right: Box<PureExpr>,
+        left: Box<Self>,
+        right: Box<Self>,
     },
     Conditional {
-        test: Box<PureExpr>,
-        consequent: Box<PureExpr>,
-        alternate: Box<PureExpr>,
+        test: Box<Self>,
+        consequent: Box<Self>,
+        alternate: Box<Self>,
     },
 }
 
@@ -44,7 +44,7 @@ impl PureExpr {
                     "-" => value.number().map(|n| Value::Number(-n)),
                     "~" => value
                         .number()
-                        .map(|n| Value::Number((!js_to_int32(n)) as f64)),
+                        .map(|n| Value::Number(f64::from(!js_to_int32(n)))),
                     "void" => Some(Value::Undefined),
                     "typeof" => Some(Value::String(
                         match value {
@@ -179,7 +179,7 @@ fn compile_pure_expr(expr: &Expression<'_>, params: &HashMap<String, usize>) -> 
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct PureFunction {
+pub struct PureFunction {
     arity: usize,
     expression: PureExpr,
     declaration_span: Option<Span>,
@@ -255,7 +255,7 @@ impl<'a> Visit<'a> for PureFunctionCollector<'_> {
     }
 }
 
-pub(super) fn collect_pure_functions(
+pub fn collect_pure_functions(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
 ) -> HashMap<SymbolId, PureFunction> {

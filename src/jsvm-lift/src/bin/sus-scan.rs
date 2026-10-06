@@ -517,8 +517,7 @@ impl Collector<'_> {
                     .arguments
                     .first()
                     .and_then(Self::argument_string)
-                    .map(|sep| sep.len() <= 1)
-                    .unwrap_or(it.arguments.is_empty());
+                    .map_or(it.arguments.is_empty(), |sep| sep.len() <= 1);
                 if empty_or_tiny_separator {
                     let literal_parts = match &member.object {
                         Expression::ArrayExpression(array) => array.elements.len(),
@@ -801,7 +800,7 @@ fn decoded_magic(decoded: &[u8]) -> Option<&'static str> {
     } else if decoded
         .iter()
         .copied()
-        .skip_while(|b| b.is_ascii_whitespace())
+        .skip_while(u8::is_ascii_whitespace)
         .take(4)
         .eq(b"<svg".iter().copied())
     {
@@ -1120,7 +1119,7 @@ fn cluster_signals(
             if score >= min_score {
                 candidates.push(Candidate {
                     score,
-                    density_per_kib: score as f64 * 1024.0 / span as f64,
+                    density_per_kib: f64::from(score) * 1024.0 / f64::from(span),
                     start,
                     end,
                     left,
@@ -1261,7 +1260,7 @@ fn scan_file(path: &Path, args: &Args) -> Result<FileReport> {
         args.max_clusters,
     );
     let lines = line_starts(&source);
-    let top_score = clusters.first().map(|cluster| cluster.score).unwrap_or(0);
+    let top_score = clusters.first().map_or(0, |cluster| cluster.score);
 
     Ok(FileReport {
         input: path.display().to_string(),
@@ -1304,7 +1303,7 @@ fn collect_paths(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let mut entries = fs::read_dir(path)
         .with_context(|| format!("reading directory {}", path.display()))?
         .collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let child = entry.path();
         let meta = fs::symlink_metadata(&child)?;
@@ -1375,7 +1374,7 @@ fn print_text(report: &Report) {
                     signal
                         .subject
                         .as_deref()
-                        .map(|subject| format!(" [{}]", subject))
+                        .map(|subject| format!(" [{subject}]"))
                         .unwrap_or_default()
                 );
             }

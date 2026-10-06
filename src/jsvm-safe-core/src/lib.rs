@@ -74,8 +74,8 @@ struct ConstBinding {
     available_after: u32,
 }
 
-fn eval_with_constants<'a>(
-    expr: &Expression<'a>,
+fn eval_with_constants(
+    expr: &Expression<'_>,
     scoping: &Scoping,
     constants: &HashMap<SymbolId, ConstBinding>,
 ) -> Option<Value> {
@@ -453,10 +453,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             let text = if test {
                 fragment(self.source, it.consequent.span()).to_string()
             } else {
-                it.alternate
-                    .as_ref()
-                    .map(|s| fragment(self.source, s.span()).to_string())
-                    .unwrap_or_else(|| ";".into())
+                it.alternate.as_ref().map_or_else(
+                    || ";".into(),
+                    |s| fragment(self.source, s.span()).to_string(),
+                )
             };
             self.push(it.span, text, "dead_branch");
         }
@@ -745,7 +745,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                             let test = fragment(self.source, conditional.test.span());
                             self.push(
                                 it.span,
-                                format!("(({}) ? ({}) : ({}))", test, consequent, alternate),
+                                format!("(({test}) ? ({consequent}) : ({alternate}))"),
                                 "string_array_decode",
                             );
                             // The replacement spans the whole call. Revisit its

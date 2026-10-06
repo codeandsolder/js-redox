@@ -9,7 +9,7 @@ use oxc_syntax::scope::ScopeFlags;
 use std::collections::HashSet;
 
 #[derive(Debug)]
-pub(crate) struct StructuralSignal {
+pub struct StructuralSignal {
     pub kind: &'static str,
     pub weight: u32,
     pub span: Span,
@@ -35,21 +35,21 @@ const FUNCTION_DETECTORS: &[FunctionDetector] = &[
     detect_selector_dispatcher,
 ];
 
-pub(crate) fn call_signals(call: &CallExpression<'_>) -> Vec<StructuralSignal> {
+pub fn call_signals(call: &CallExpression<'_>) -> Vec<StructuralSignal> {
     CALL_DETECTORS
         .iter()
         .filter_map(|detector| detector(call))
         .collect()
 }
 
-pub(crate) fn object_signals(object: &ObjectExpression<'_>) -> Vec<StructuralSignal> {
+pub fn object_signals(object: &ObjectExpression<'_>) -> Vec<StructuralSignal> {
     OBJECT_DETECTORS
         .iter()
         .filter_map(|detector| detector(object))
         .collect()
 }
 
-pub(crate) fn function_signals(function: &Function<'_>) -> Vec<StructuralSignal> {
+pub fn function_signals(function: &Function<'_>) -> Vec<StructuralSignal> {
     FUNCTION_DETECTORS
         .iter()
         .filter_map(|detector| detector(function))

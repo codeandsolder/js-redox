@@ -95,7 +95,7 @@ impl<'a> Visit<'a> for DispatchBindingCollector {
     }
 }
 
-pub(super) fn collect_dispatch_bindings(
+pub fn collect_dispatch_bindings(
     program: &oxc_ast::ast::Program<'_>,
 ) -> (HashMap<SymbolId, Vec<String>>, HashSet<SymbolId>) {
     let mut collector = DispatchBindingCollector::default();
@@ -116,16 +116,14 @@ impl<'a> Visit<'a> for ReferenceSpanCollector {
     }
 }
 
-pub(super) fn collect_reference_spans(
-    program: &oxc_ast::ast::Program<'_>,
-) -> HashMap<ReferenceId, Span> {
+pub fn collect_reference_spans(program: &oxc_ast::ast::Program<'_>) -> HashMap<ReferenceId, Span> {
     let mut collector = ReferenceSpanCollector::default();
     collector.visit_program(program);
     collector.spans
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct ReferenceIdentityTable {
+pub struct ReferenceIdentityTable {
     rows: u32,
     columns: u32,
     root_row: u32,
@@ -142,9 +140,9 @@ impl ReferenceIdentityTable {
         if row >= self.rows || column >= self.columns || !self.rows.is_power_of_two() {
             return None;
         }
-        let column_term = js_to_uint32(self.column_multiplier as f64 * column as f64);
-        let row_term = js_to_uint32(self.row_multiplier as f64 * row as f64);
-        let salt_term = js_to_uint32(self.salt_left as f64 * self.salt_right as f64);
+        let column_term = js_to_uint32(f64::from(self.column_multiplier) * f64::from(column));
+        let row_term = js_to_uint32(f64::from(self.row_multiplier) * f64::from(row));
+        let salt_term = js_to_uint32(f64::from(self.salt_left) * f64::from(self.salt_right));
         Some((column_term ^ row_term ^ salt_term) & (self.rows - 1))
     }
 
@@ -170,7 +168,7 @@ fn unique_symbol_named_near(
     matches.next().is_none().then_some(symbol)
 }
 
-pub(super) fn detect_reference_identity_tables(
+pub fn detect_reference_identity_tables(
     source: &str,
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
@@ -409,7 +407,7 @@ pub(super) fn detect_reference_identity_tables(
     out
 }
 
-pub(super) fn reference_identity(
+pub fn reference_identity(
     expr: &Expression<'_>,
     scoping: &Scoping,
     tables: &HashMap<SymbolId, ReferenceIdentityTable>,
@@ -440,8 +438,8 @@ pub(super) fn reference_identity(
         || second.fract() != 0.0
         || first < 0.0
         || second < 0.0
-        || first > u32::MAX as f64
-        || second > u32::MAX as f64
+        || first > f64::from(u32::MAX)
+        || second > f64::from(u32::MAX)
     {
         return None;
     }
@@ -550,7 +548,7 @@ impl Collector<'_, '_> {
     }
 }
 
-fn eval_with_env<'a>(expr: &Expression<'a>, env: &HashMap<String, Value>) -> Option<Value> {
+fn eval_with_env(expr: &Expression<'_>, env: &HashMap<String, Value>) -> Option<Value> {
     eval_with_resolver(expr, &|id| {
         if id.name.as_str() == "undefined" {
             Some(Value::Undefined)

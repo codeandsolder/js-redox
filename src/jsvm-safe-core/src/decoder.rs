@@ -308,7 +308,7 @@ enum DecoderTransform {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct Decoder {
+pub struct Decoder {
     values: Vec<Value>,
     offset: i64,
     provider: String,
@@ -398,7 +398,7 @@ fn standard_base64_decoder_matches(body: &str, array: &str, param: &str) -> bool
     // function execution, so accepting extra statements could silently drop
     // observable side effects.
     let Some(direct) = compile_regex(&format!(
-        r#"(?s)^\s*return\s+atob\s*\(\s*{}\s*\[\s*{}\s*\]\s*\)\s*;?\s*$"#,
+        r"(?s)^\s*return\s+atob\s*\(\s*{}\s*\[\s*{}\s*\]\s*\)\s*;?\s*$",
         regex::escape(array),
         regex::escape(param)
     )) else {
@@ -409,7 +409,7 @@ fn standard_base64_decoder_matches(body: &str, array: &str, param: &str) -> bool
     }
 
     let Some(sequence) = compile_regex(&format!(
-        r#"(?s)^\s*return\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*,\s*atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$"#,
+        r"(?s)^\s*return\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*,\s*atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$",
         regex::escape(array),
         regex::escape(param)
     )) else {
@@ -423,7 +423,7 @@ fn standard_base64_decoder_matches(body: &str, array: &str, param: &str) -> bool
     }
 
     let Some(assignment) = compile_regex(&format!(
-        r#"(?s)^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$"#,
+        r"(?s)^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$",
         regex::escape(array),
         regex::escape(param)
     )) else {
@@ -437,7 +437,7 @@ fn standard_base64_decoder_matches(body: &str, array: &str, param: &str) -> bool
 fn fixed_base64_decoder_matches(body: &str, array: &str, param: &str) -> Option<String> {
     let alphabet = fixed_base64_alphabet(body)?;
     let guarded_load = compile_regex(&format!(
-        r#"typeof\s*\(?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*\)?"#,
+        r"typeof\s*\(?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*\)?",
         regex::escape(array),
         regex::escape(param)
     ))?;
@@ -445,7 +445,7 @@ fn fixed_base64_decoder_matches(body: &str, array: &str, param: &str) -> Option<
     let alias = guarded_load
         .captures_iter(body)
         .find_map(|caps| caps.get(1).map(|m| m.as_str()))?;
-    let return_alias = compile_regex(&format!(r#"\breturn\s+{}\s*;"#, regex::escape(alias)))?;
+    let return_alias = compile_regex(&format!(r"\breturn\s+{}\s*;", regex::escape(alias)))?;
     if !return_alias.is_match(body) {
         return None;
     }
@@ -461,7 +461,7 @@ fn fixed_base64_decoder_matches(body: &str, array: &str, param: &str) -> Option<
     {
         return None;
     }
-    let sentinel_checks = compile_regex(r#"(?:64\s*!=|!=\s*64)"#)?;
+    let sentinel_checks = compile_regex(r"(?:64\s*!=|!=\s*64)")?;
     if sentinel_checks.find_iter(body).count() != 2 {
         return None;
     }
@@ -537,7 +537,7 @@ fn detect_direct_table_decoders(
         };
         let body = fragment(source, function.span);
         let Some(access) = compile_regex(&format!(
-            r#"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*{}\s*\]"#,
+            r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*{}\s*\]",
             regex::escape(param)
         )) else {
             continue;
@@ -579,7 +579,7 @@ fn detect_direct_table_decoders(
         }
 
         let Some(mutator) = compile_regex(&format!(
-            r#"\b{}\s*\.\s*(?:copyWithin|fill|pop|push|reverse|shift|sort|splice|unshift)\s*\("#,
+            r"\b{}\s*\.\s*(?:copyWithin|fill|pop|push|reverse|shift|sort|splice|unshift)\s*\(",
             regex::escape(&array.name)
         )) else {
             continue;
@@ -652,7 +652,9 @@ fn js_parse_int(text: &str, radix: u32) -> Option<f64> {
         let Some(digit) = ch.to_digit(radix) else {
             break;
         };
-        value = value.checked_mul(radix as u64)?.checked_add(digit as u64)?;
+        value = value
+            .checked_mul(u64::from(radix))?
+            .checked_add(u64::from(digit))?;
         digits += 1;
     }
     if digits == 0 {
@@ -721,10 +723,7 @@ impl RotationExprParser<'_, '_> {
         self.skip_ws();
         let rest = self.rest();
         if rest.starts_with("0x") || rest.starts_with("0X") {
-            let digits = rest[2..]
-                .bytes()
-                .take_while(|byte| byte.is_ascii_hexdigit())
-                .count();
+            let digits = rest[2..].bytes().take_while(u8::is_ascii_hexdigit).count();
             if digits == 0 {
                 return None;
             }
@@ -775,20 +774,14 @@ impl RotationExprParser<'_, '_> {
         }
         let rest = self.rest();
         let len = if rest.starts_with("0x") || rest.starts_with("0X") {
-            let digits = rest[2..]
-                .bytes()
-                .take_while(|byte| byte.is_ascii_hexdigit())
-                .count();
+            let digits = rest[2..].bytes().take_while(u8::is_ascii_hexdigit).count();
             if digits == 0 {
                 self.pos = start;
                 return None;
             }
             2 + digits
         } else {
-            let digits = rest
-                .bytes()
-                .take_while(|byte| byte.is_ascii_digit())
-                .count();
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
             if digits == 0 {
                 self.pos = start;
                 return None;
@@ -975,7 +968,7 @@ fn apply_proven_decoder_rotations(
     rotation_iifes: &[RotationIife],
 ) -> (Vec<(usize, usize)>, Vec<Replacement>) {
     let Some(checksum_re) = compile_regex(
-        r#"(?s)\btry\s*\{\s*(?:var|let|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(?P<expr>[^;]+);"#,
+        r"(?s)\btry\s*\{\s*(?:var|let|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(?P<expr>[^;]+);",
     ) else {
         return (Vec::new(), Vec::new());
     };
@@ -998,7 +991,7 @@ fn apply_proven_decoder_rotations(
                 continue;
             }
             let Some(alias_re) = compile_regex(&format!(
-                r#"\b(?:var|let|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\b"#,
+                r"\b(?:var|let|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\b",
                 regex::escape(decoder_name)
             )) else {
                 continue;
@@ -1201,14 +1194,14 @@ fn detect_decoders(
             body.contains(&format!(", {value_var};")) || body.contains(&format!(",{value_var};"));
 
         let Some(installs_replacement_re) = compile_regex(&format!(
-            r#"\b{}\s*=\s*function\s*\(\s*{}\b"#,
+            r"\b{}\s*=\s*function\s*\(\s*{}\b",
             regex::escape(&f.name),
             regex::escape(&param),
         )) else {
             continue;
         };
         let Some(tail_calls_public_re) = compile_regex(&format!(
-            r#"(?:\breturn\b|,)\s*{}\s*\(\s*{}\b"#,
+            r"(?:\breturn\b|,)\s*{}\s*\(\s*{}\b",
             regex::escape(&f.name),
             regex::escape(public_param),
         )) else {
@@ -1231,7 +1224,7 @@ fn detect_decoders(
         // three ingredients, so arbitrary application array accessors are not
         // promoted to decoders.
         let Some(direct_re) = compile_regex(&format!(
-            r#"(?s)^\s*function\s+{}\s*\([^)]*\)\s*\{{\s*{}\s*=\s*{}\s*-\s*(?:0[xX][0-9A-Fa-f]+|[0-9]+)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\(\s*\)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+{}\s*;\s*\}}\s*$"#,
+            r"(?s)^\s*function\s+{}\s*\([^)]*\)\s*\{{\s*{}\s*=\s*{}\s*-\s*(?:0[xX][0-9A-Fa-f]+|[0-9]+)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\(\s*\)\s*;\s*(?:const|let|var)\s+{}\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+{}\s*;\s*\}}\s*$",
             regex::escape(&f.name),
             regex::escape(&param),
             regex::escape(&param),
@@ -1328,14 +1321,14 @@ fn detect_decoders(
     (out, protected_spans, rotation_replacements)
 }
 
-pub(super) struct DecoderAnalysis {
+pub struct DecoderAnalysis {
     pub(super) decoders: HashMap<SymbolId, Decoder>,
     pub(super) protected_spans: Vec<(usize, usize)>,
     pub(super) replacements: Vec<Replacement>,
     pub(super) removable_helpers: HashMap<SymbolId, Span>,
 }
 
-pub(super) fn analyze_decoders(
+pub fn analyze_decoders(
     source: &str,
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
