@@ -1,18 +1,34 @@
 #!/usr/bin/env python3
 import json
+import os
 import subprocess
 import tempfile
 from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_ROOT = Path(os.environ.get("JSVM_FIXTURE_ROOT", ROOT))
 SCANNER = ROOT / ".cargo-target-nodebug/debug/jsvm-lift"
 LIFTER = ROOT / ".cargo-target-nodebug/debug/switch-ir"
-VIDFAST = ROOT / "corpus/real/vidfast-next-365-71c2a8238d040bc9.js"
+
+
+def fixture(relative: str) -> Path:
+    local = ROOT / relative
+    if local.is_file():
+        return local
+    external = FIXTURE_ROOT / relative
+    if external.is_file():
+        return external
+    raise FileNotFoundError(
+        f"missing regression fixture {relative}; set JSVM_FIXTURE_ROOT to a workspace containing it"
+    )
+
+
+VIDFAST = fixture("corpus/real/vidfast-next-365-71c2a8238d040bc9.js")
 NEGATIVES = [
-    ROOT / "corpus/hard_negatives/portalfluently-sfp-murmurhash.js",
-    ROOT / "corpus/hard_negatives/yandex-tmgrdfrend-generator-state.js",
-    ROOT / "corpus/hard_negatives/bing-parser-switch.js",
+    fixture("corpus/hard_negatives/portalfluently-sfp-murmurhash.js"),
+    fixture("corpus/hard_negatives/yandex-tmgrdfrend-generator-state.js"),
+    fixture("corpus/hard_negatives/bing-parser-switch.js"),
 ]
 
 
