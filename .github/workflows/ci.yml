@@ -29,3 +29,36 @@ jobs:
         run: cargo test --locked --workspace
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+  semantic:
+    name: Semantic/runtime regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: latest-known
+      - name: Build analysis tools
+        run: |
+          cargo build --locked --workspace --bins
+          mkdir -p .cargo-target-nodebug/debug
+          install -m 0755 \
+            target/debug/har-project \
+            target/debug/jsvm-lift \
+            target/debug/js-format \
+            target/debug/switch-ir \
+            target/debug/table-ir \
+            target/debug/js-refs \
+            target/debug/deobfuscate-safe \
+            target/debug/bundle-unpack \
+            target/debug/sourcemap-compose \
+            .cargo-target-nodebug/debug/
+      - name: Safe deobfuscation runtime equivalence
+        run: uv run --no-project python scripts/check-safe-deobfuscate.py
+      - name: Static string recovery
+        run: uv run --no-project python scripts/check-static-string-recovery.py
+      - name: VM capture pipeline
+        run: uv run --no-project python scripts/check-vm-capture-pipeline.py
