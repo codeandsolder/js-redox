@@ -565,18 +565,13 @@ pub struct ScanCore {
     pub(crate) embedded_code: Vec<EmbeddedCodeCandidate>,
 }
 
-pub fn scan_source_core(source: &str) -> ScanCore {
-    let allocator = Allocator::default();
-    let parsed = parse_program(&allocator, source, SourceType::cjs());
-
-    let mut scanner = Scanner::new(source);
-    scanner.visit_program(&parsed.program);
-    let mut table_analysis = table_vm::analyze(source, &parsed.program);
-
+fn suppress_nested_table_vms(
+    scanner: &Scanner<'_>,
+    table_analysis: &mut table_vm::TableVmAnalysis,
+) {
     // A direct-switch interpreter may itself execute helper/function tables in
     // individual opcode handlers. Those are nested semantics, not a second
-    // dispatcher architecture. Suppress table-dispatch labels for any function
-    // lexically contained by a confirmed switch interpreter.
+    // dispatcher architecture.
     let direct_switch_owner_spans: Vec<(u32, u32)> = scanner
         .direct_switch_maps
         .iter()
@@ -594,6 +589,7 @@ pub fn scan_source_core(source: &str) -> ScanCore {
         .iter()
         .map(|function| (function.id.as_str(), (function.start, function.end)))
         .collect();
+
     table_analysis.table_vms.retain(|vm| {
         let Some((start, end)) = function_spans.get(vm.dispatcher_function_id.as_str()) else {
             return true;
@@ -602,7 +598,9 @@ pub fn scan_source_core(source: &str) -> ScanCore {
             .iter()
             .any(|(owner_start, owner_end)| owner_start <= start && end <= owner_end)
     });
+}
 
+fn normalize_decoders(scanner: &mut Scanner<'_>) {
     scanner.decoder_candidates.sort_by(|a, b| {
         (
             a.start,
@@ -633,7 +631,9 @@ pub fn scan_source_core(source: &str) -> ScanCore {
     // Complete selector width only after every descendant decoder has had a
     // chance to link to its bytecode builder.
     complete_selector_masks(&mut scanner.decoder_candidates, &scanner.push_builders);
+}
 
+fn retain_nearest_opcode_maps(scanner: &mut Scanner<'_>) {
     // A decoder is propagated upward so a builder declared in an ancestor can
     // be linked. That must not create a second semantic map against an
     // unrelated ancestor state machine. Keep the smallest lexical parent that
@@ -641,7 +641,7 @@ pub fn scan_source_core(source: &str) -> ScanCore {
     let function_bytes: HashMap<String, usize> = scanner
         .functions
         .iter()
-        .map(|f| (f.id.clone(), f.bytes))
+        .map(|function| (function.id.clone(), function.bytes))
         .collect();
     scanner.opcode_maps.sort_by(|a, b| {
         (
@@ -667,7 +667,9 @@ pub fn scan_source_core(source: &str) -> ScanCore {
         a.decoder_function_id == b.decoder_function_id
             && a.decoder_selector_var == b.decoder_selector_var
     });
+}
 
+fn attach_observed_opcodes(scanner: &mut Scanner<'_>) {
     // Builder linkage and semantic-dispatch ownership are deliberately
     // independent: attach live bytecodes to the retained lexical map here.
     for map in &mut scanner.opcode_maps {
@@ -688,12 +690,14 @@ pub fn scan_source_core(source: &str) -> ScanCore {
             handler.observed = observed_set.contains(&handler.opcode);
         }
     }
+}
 
-    // The legacy table heuristic is intentionally broad enough to surface
-    // candidates before table identity is known. Once table_vm has resolved
-    // exact dispatcher -> table/registry links, make table-based confirmation
-    // depend on that link instead of on an unrelated large table elsewhere in
-    // the file. Large-switch confirmation remains independent.
+fn reconcile_dispatch_confirmation(
+    scanner: &mut Scanner<'_>,
+    table_analysis: &table_vm::TableVmAnalysis,
+) {
+    // The broad table heuristic is useful for candidate discovery, but final
+    // confirmation must use the exact dispatcher -> table/registry link.
     let table_dispatchers: BTreeSet<&str> = table_analysis
         .table_vms
         .iter()
@@ -718,16 +722,34 @@ pub fn scan_source_core(source: &str) -> ScanCore {
             );
         }
     }
+}
 
+fn sort_scan_inventory(scanner: &mut Scanner<'_>) {
     scanner
         .functions
-        .sort_by_key(|f| std::cmp::Reverse(f.score));
+        .sort_by_key(|function| std::cmp::Reverse(function.score));
     scanner
         .arrays
-        .sort_by_key(|a| std::cmp::Reverse(a.elements));
+        .sort_by_key(|array| std::cmp::Reverse(array.elements));
     scanner
         .handler_tables
-        .sort_by_key(|h| std::cmp::Reverse(h.function_values));
+        .sort_by_key(|table| std::cmp::Reverse(table.function_values));
+}
+
+pub fn scan_source_core(source: &str) -> ScanCore {
+    let allocator = Allocator::default();
+    let parsed = parse_program(&allocator, source, SourceType::cjs());
+
+    let mut scanner = Scanner::new(source);
+    scanner.visit_program(&parsed.program);
+    let mut table_analysis = table_vm::analyze(source, &parsed.program);
+
+    suppress_nested_table_vms(&scanner, &mut table_analysis);
+    normalize_decoders(&mut scanner);
+    retain_nearest_opcode_maps(&mut scanner);
+    attach_observed_opcodes(&mut scanner);
+    reconcile_dispatch_confirmation(&mut scanner, &table_analysis);
+    sort_scan_inventory(&mut scanner);
 
     ScanCore {
         diagnostics: parsed.diagnostics,
