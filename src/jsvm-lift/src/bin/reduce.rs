@@ -282,6 +282,174 @@ fn computed_decoder_value(
     Val::Unknown
 }
 
+fn eval_unary(
+    un: &oxc_ast::ast::UnaryExpression<'_>,
+    env: &mut Env,
+    effects: &mut Vec<String>,
+    ctx: &EvalCtx<'_>,
+) -> Val {
+    let v = eval_expr(&un.argument, env, effects, ctx);
+    match un.operator.as_str() {
+        "void" => Val::Undefined,
+        "!" => v.truthy().map_or(Val::Unknown, |x| Val::Bool(!x)),
+        "~" => v.as_num().map_or(Val::Unknown, |x| Val::Num(!x)),
+        "+" => v.as_num().map_or(Val::Unknown, Val::Num),
+        "-" => v.as_num().map_or(Val::Unknown, |x| Val::Num(-x)),
+        _ => Val::Unknown,
+    }
+}
+
+fn eval_logical(
+    log: &oxc_ast::ast::LogicalExpression<'_>,
+    env: &mut Env,
+    effects: &mut Vec<String>,
+    ctx: &EvalCtx<'_>,
+) -> Val {
+    let left = eval_expr(&log.left, env, effects, ctx);
+    let Some(truth) = left.truthy() else {
+        return Val::Unknown;
+    };
+    match log.operator.as_str() {
+        "&&" => {
+            if truth {
+                eval_expr(&log.right, env, effects, ctx)
+            } else {
+                left
+            }
+        }
+        "||" => {
+            if truth {
+                left
+            } else {
+                eval_expr(&log.right, env, effects, ctx)
+            }
+        }
+        _ => Val::Unknown,
+    }
+}
+
+fn eval_binary(
+    bin: &oxc_ast::ast::BinaryExpression<'_>,
+    env: &mut Env,
+    effects: &mut Vec<String>,
+    ctx: &EvalCtx<'_>,
+) -> Val {
+    let l = eval_expr(&bin.left, env, effects, ctx);
+    let r = eval_expr(&bin.right, env, effects, ctx);
+    let (Some(a), Some(b)) = (l.as_num(), r.as_num()) else {
+        return Val::Unknown;
+    };
+    match bin.operator.as_str() {
+        "==" | "===" => Val::Bool(a == b),
+        "!=" | "!==" => Val::Bool(a != b),
+        "<" => Val::Bool(a < b),
+        "<=" => Val::Bool(a <= b),
+        ">" => Val::Bool(a > b),
+        ">=" => Val::Bool(a >= b),
+        "&" => Val::Num(a & b),
+        "|" => Val::Num(a | b),
+        "^" => Val::Num(a ^ b),
+        "<<" => Val::Num(a << (b & 63)),
+        ">>" => Val::Num(a >> (b & 63)),
+        ">>>" => Val::Num(((a as u64) >> (b & 63)) as i64),
+        "+" => Val::Num(a.wrapping_add(b)),
+        "-" => Val::Num(a.wrapping_sub(b)),
+        "*" => Val::Num(a.wrapping_mul(b)),
+        "/" if b != 0 => Val::Num(a / b),
+        "%" if b != 0 => Val::Num(a % b),
+        _ => Val::Unknown,
+    }
+}
+
+fn eval_assignment(
+    assign: &AssignmentExpression<'_>,
+    env: &mut Env,
+    effects: &mut Vec<String>,
+    ctx: &EvalCtx<'_>,
+) -> Val {
+    let Some(name) = target_ident(&assign.left) else {
+        effects.push(source_fragment(ctx.source, assign.span));
+        return Val::Unknown;
+    };
+
+    if ctx.state_var == Some(name.as_str())
+        && assign.operator.is_assign()
+        && matches!(&assign.right, Expression::ConditionalExpression(_))
+    {
+        if let Expression::ConditionalExpression(cond) = &assign.right {
+            let test = eval_expr(&cond.test, env, effects, ctx);
+            if test.truthy().is_none() {
+                let mut yes_env = env.clone();
+                let mut no_env = env.clone();
+                let mut sink = Vec::new();
+                let yes = eval_expr(&cond.consequent, &mut yes_env, &mut sink, ctx);
+                let no = eval_expr(&cond.alternate, &mut no_env, &mut sink, ctx);
+                if let (Some(y), Some(n)) = (yes.as_num(), no.as_num()) {
+                    let guard = source_fragment(ctx.source, cond.test.span());
+                    return Val::Fork(vec![
+                        ForkChoice {
+                            guard: guard.clone(),
+                            value: y,
+                        },
+                        ForkChoice {
+                            guard: format!("!({guard})"),
+                            value: n,
+                        },
+                    ]);
+                }
+            }
+        }
+    }
+
+    let rhs = eval_expr(&assign.right, env, effects, ctx);
+    if matches!(rhs, Val::Fork(_)) {
+        return rhs;
+    }
+    match assign.operator.as_str() {
+        "=" if rhs != Val::Unknown => {
+            env.insert(name.clone(), rhs.clone());
+            if !ctx.structural.contains(&name) {
+                effects.push(source_fragment(ctx.source, assign.span));
+            }
+            rhs
+        }
+        "+=" => {
+            let old = env.get(&name).and_then(Val::as_num);
+            let value = rhs.as_num();
+            if let (Some(a), Some(b)) = (old, value) {
+                let out = Val::Num(a.wrapping_add(b));
+                env.insert(name.clone(), out.clone());
+                if !ctx.structural.contains(&name) {
+                    effects.push(source_fragment(ctx.source, assign.span));
+                }
+                out
+            } else {
+                effects.push(source_fragment(ctx.source, assign.span));
+                Val::Unknown
+            }
+        }
+        "-=" => {
+            let old = env.get(&name).and_then(Val::as_num);
+            let value = rhs.as_num();
+            if let (Some(a), Some(b)) = (old, value) {
+                let out = Val::Num(a.wrapping_sub(b));
+                env.insert(name.clone(), out.clone());
+                if !ctx.structural.contains(&name) {
+                    effects.push(source_fragment(ctx.source, assign.span));
+                }
+                out
+            } else {
+                effects.push(source_fragment(ctx.source, assign.span));
+                Val::Unknown
+            }
+        }
+        _ => {
+            effects.push(source_fragment(ctx.source, assign.span));
+            Val::Unknown
+        }
+    }
+}
+
 fn eval_expr(
     expr: &Expression<'_>,
     env: &mut Env,
@@ -305,67 +473,9 @@ fn eval_expr(
             }
             Val::Unknown
         }
-        Expression::UnaryExpression(un) => {
-            let v = eval_expr(&un.argument, env, effects, ctx);
-            match un.operator.as_str() {
-                "void" => Val::Undefined,
-                "!" => v.truthy().map_or(Val::Unknown, |x| Val::Bool(!x)),
-                "~" => v.as_num().map_or(Val::Unknown, |x| Val::Num(!x)),
-                "+" => v.as_num().map_or(Val::Unknown, Val::Num),
-                "-" => v.as_num().map_or(Val::Unknown, |x| Val::Num(-x)),
-                _ => Val::Unknown,
-            }
-        }
-        Expression::LogicalExpression(log) => {
-            let left = eval_expr(&log.left, env, effects, ctx);
-            let Some(truth) = left.truthy() else {
-                return Val::Unknown;
-            };
-            match log.operator.as_str() {
-                "&&" => {
-                    if truth {
-                        eval_expr(&log.right, env, effects, ctx)
-                    } else {
-                        left
-                    }
-                }
-                "||" => {
-                    if truth {
-                        left
-                    } else {
-                        eval_expr(&log.right, env, effects, ctx)
-                    }
-                }
-                _ => Val::Unknown,
-            }
-        }
-        Expression::BinaryExpression(bin) => {
-            let l = eval_expr(&bin.left, env, effects, ctx);
-            let r = eval_expr(&bin.right, env, effects, ctx);
-            let (Some(a), Some(b)) = (l.as_num(), r.as_num()) else {
-                return Val::Unknown;
-            };
-            match bin.operator.as_str() {
-                "==" | "===" => Val::Bool(a == b),
-                "!=" | "!==" => Val::Bool(a != b),
-                "<" => Val::Bool(a < b),
-                "<=" => Val::Bool(a <= b),
-                ">" => Val::Bool(a > b),
-                ">=" => Val::Bool(a >= b),
-                "&" => Val::Num(a & b),
-                "|" => Val::Num(a | b),
-                "^" => Val::Num(a ^ b),
-                "<<" => Val::Num(a << (b & 63)),
-                ">>" => Val::Num(a >> (b & 63)),
-                ">>>" => Val::Num(((a as u64) >> (b & 63)) as i64),
-                "+" => Val::Num(a.wrapping_add(b)),
-                "-" => Val::Num(a.wrapping_sub(b)),
-                "*" => Val::Num(a.wrapping_mul(b)),
-                "/" if b != 0 => Val::Num(a / b),
-                "%" if b != 0 => Val::Num(a % b),
-                _ => Val::Unknown,
-            }
-        }
+        Expression::UnaryExpression(un) => eval_unary(un, env, effects, ctx),
+        Expression::LogicalExpression(log) => eval_logical(log, env, effects, ctx),
+        Expression::BinaryExpression(bin) => eval_binary(bin, env, effects, ctx),
         Expression::ConditionalExpression(cond) => {
             let test = eval_expr(&cond.test, env, effects, ctx);
             let Some(truth) = test.truthy() else {
@@ -387,89 +497,7 @@ fn eval_expr(
             }
             last
         }
-        Expression::AssignmentExpression(assign) => {
-            let Some(name) = target_ident(&assign.left) else {
-                effects.push(source_fragment(ctx.source, assign.span));
-                return Val::Unknown;
-            };
-
-            if ctx.state_var == Some(name.as_str())
-                && assign.operator.is_assign()
-                && matches!(&assign.right, Expression::ConditionalExpression(_))
-            {
-                if let Expression::ConditionalExpression(cond) = &assign.right {
-                    let test = eval_expr(&cond.test, env, effects, ctx);
-                    if test.truthy().is_none() {
-                        let mut yes_env = env.clone();
-                        let mut no_env = env.clone();
-                        let mut sink = Vec::new();
-                        let yes = eval_expr(&cond.consequent, &mut yes_env, &mut sink, ctx);
-                        let no = eval_expr(&cond.alternate, &mut no_env, &mut sink, ctx);
-                        if let (Some(y), Some(n)) = (yes.as_num(), no.as_num()) {
-                            let guard = source_fragment(ctx.source, cond.test.span());
-                            return Val::Fork(vec![
-                                ForkChoice {
-                                    guard: guard.clone(),
-                                    value: y,
-                                },
-                                ForkChoice {
-                                    guard: format!("!({guard})"),
-                                    value: n,
-                                },
-                            ]);
-                        }
-                    }
-                }
-            }
-
-            let rhs = eval_expr(&assign.right, env, effects, ctx);
-            if matches!(rhs, Val::Fork(_)) {
-                return rhs;
-            }
-            match assign.operator.as_str() {
-                "=" if rhs != Val::Unknown => {
-                    env.insert(name.clone(), rhs.clone());
-                    if !ctx.structural.contains(&name) {
-                        effects.push(source_fragment(ctx.source, assign.span));
-                    }
-                    rhs
-                }
-                "+=" => {
-                    let old = env.get(&name).and_then(Val::as_num);
-                    let value = rhs.as_num();
-                    if let (Some(a), Some(b)) = (old, value) {
-                        let out = Val::Num(a.wrapping_add(b));
-                        env.insert(name.clone(), out.clone());
-                        if !ctx.structural.contains(&name) {
-                            effects.push(source_fragment(ctx.source, assign.span));
-                        }
-                        out
-                    } else {
-                        effects.push(source_fragment(ctx.source, assign.span));
-                        Val::Unknown
-                    }
-                }
-                "-=" => {
-                    let old = env.get(&name).and_then(Val::as_num);
-                    let value = rhs.as_num();
-                    if let (Some(a), Some(b)) = (old, value) {
-                        let out = Val::Num(a.wrapping_sub(b));
-                        env.insert(name.clone(), out.clone());
-                        if !ctx.structural.contains(&name) {
-                            effects.push(source_fragment(ctx.source, assign.span));
-                        }
-                        out
-                    } else {
-                        effects.push(source_fragment(ctx.source, assign.span));
-                        Val::Unknown
-                    }
-                }
-                _ => {
-                    effects.push(source_fragment(ctx.source, assign.span));
-                    Val::Unknown
-                }
-            }
-        }
+        Expression::AssignmentExpression(assign) => eval_assignment(assign, env, effects, ctx),
         _ => {
             effects.push(source_fragment(ctx.source, expr.span()));
             Val::Unknown
