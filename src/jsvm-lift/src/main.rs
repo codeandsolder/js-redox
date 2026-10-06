@@ -271,6 +271,132 @@ fn print_embedded(report: &EmbeddedScanReport, min_score: u32, depth: usize) {
     }
 }
 
+fn print_array_candidates(report: &ScanReport) {
+    for candidate in report.arrays.iter().take(8) {
+        let hints = candidate
+            .width_hints
+            .iter()
+            .take(3)
+            .map(|hint| format!("w{}:{}", hint.width, hint.score))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "  array @{:x}-{:x}: n={} numeric={:.0}% bytes={} hints=[{}] {}",
+            candidate.start,
+            candidate.end,
+            candidate.elements,
+            candidate.numeric_ratio * 100.0,
+            candidate.byte_values,
+            hints,
+            candidate.preview
+        );
+    }
+}
+
+fn print_push_builders(report: &ScanReport) {
+    for builder in report.push_builders.iter().take(8) {
+        println!(
+            "  push builder @{:x}-{:x}: recv={} args={} numeric={} bytes={} calls={} other={} widths={:?} {}",
+            builder.start,
+            builder.end,
+            builder.receiver,
+            builder.arguments,
+            builder.numeric_literals,
+            builder.byte_literals,
+            builder.call_arguments,
+            builder.other_arguments,
+            builder
+                .width_hints
+                .iter()
+                .take(4)
+                .map(|hint| (hint.width, hint.score))
+                .collect::<Vec<_>>(),
+            builder.preview
+        );
+    }
+}
+
+fn print_decoders(report: &ScanReport) {
+    for decoder in report.decoder_candidates.iter().take(16) {
+        println!(
+            "  decoder {}: object={} builder={} width={} ip={} base={} offsets={:?} {}",
+            decoder.function_id,
+            decoder.object,
+            decoder.builder_var.as_deref().unwrap_or("?"),
+            decoder.width,
+            decoder.ip,
+            decoder.base.as_deref().unwrap_or("<inline>"),
+            decoder.operand_offsets,
+            decoder.preview
+        );
+    }
+}
+
+fn print_state_machines(report: &ScanReport) {
+    for machine in report.state_machines.iter().take(20) {
+        println!(
+            "  state-machine {}: state={} init={} mask={} shift={:?} selector={} cases={} @{:x}-{:x}",
+            machine.function_id,
+            machine.state_var,
+            machine.init_state,
+            machine.mask,
+            machine.shift,
+            machine.selector_var.as_deref().unwrap_or("?"),
+            machine.switch_cases,
+            machine.start,
+            machine.end
+        );
+    }
+}
+
+fn print_handler_tables(report: &ScanReport) {
+    for table in report.handler_tables.iter().take(8) {
+        println!(
+            "  handler table ({}) @{:x}-{:x}: entries={} functions={} async={} {}",
+            table.container_kind,
+            table.start,
+            table.end,
+            table.properties,
+            table.function_values,
+            table.async_function_values,
+            table.preview
+        );
+    }
+}
+
+fn print_vm_functions(report: &ScanReport, min_score: u32) {
+    println!("  VM-shaped functions:");
+    for function in report
+        .functions
+        .iter()
+        .filter(|function| function.score >= min_score)
+        .take(20)
+    {
+        println!(
+            "    {} score={:2} {} {} @{:x}-{:x} bytes={} switch_cases={} loops={} ternaries={} computed={} computed_calls={} arrays={} :: {}{}",
+            if function.confirmed_dispatch { "[CONFIRMED]" } else { "[candidate]" },
+            function.score,
+            function.kind,
+            function.name.as_deref().unwrap_or("<anon>"),
+            function.start,
+            function.end,
+            function.bytes,
+            function.switch_cases,
+            function.loops,
+            function.conditionals,
+            function.computed_members,
+            function.computed_calls,
+            function.large_arrays,
+            function.reasons.join("; "),
+            if function.dispatch_reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" | dispatch: {}", function.dispatch_reasons.join("; "))
+            }
+        );
+    }
+}
+
 fn print_report(report: &ScanReport, min_score: u32) {
     println!(
         "{}: {} bytes, {} parse diagnostics, {} array candidates, {} push-builder candidates, {} decoder candidates, {} state machines, {} opcode maps, {} handler-table candidates",
@@ -284,120 +410,12 @@ fn print_report(report: &ScanReport, min_score: u32) {
         report.opcode_maps.len(),
         report.handler_tables.len()
     );
-
-    for a in report.arrays.iter().take(8) {
-        let hints = a
-            .width_hints
-            .iter()
-            .take(3)
-            .map(|h| format!("w{}:{}", h.width, h.score))
-            .collect::<Vec<_>>()
-            .join(",");
-        println!(
-            "  array @{:x}-{:x}: n={} numeric={:.0}% bytes={} hints=[{}] {}",
-            a.start,
-            a.end,
-            a.elements,
-            a.numeric_ratio * 100.0,
-            a.byte_values,
-            hints,
-            a.preview
-        );
-    }
-
-    for b in report.push_builders.iter().take(8) {
-        println!(
-            "  push builder @{:x}-{:x}: recv={} args={} numeric={} bytes={} calls={} other={} widths={:?} {}",
-            b.start,
-            b.end,
-            b.receiver,
-            b.arguments,
-            b.numeric_literals,
-            b.byte_literals,
-            b.call_arguments,
-            b.other_arguments,
-            b.width_hints
-                .iter()
-                .take(4)
-                .map(|h| (h.width, h.score))
-                .collect::<Vec<_>>(),
-            b.preview
-        );
-    }
-
-    for d in report.decoder_candidates.iter().take(16) {
-        println!(
-            "  decoder {}: object={} builder={} width={} ip={} base={} offsets={:?} {}",
-            d.function_id,
-            d.object,
-            d.builder_var.as_deref().unwrap_or("?"),
-            d.width,
-            d.ip,
-            d.base.as_deref().unwrap_or("<inline>"),
-            d.operand_offsets,
-            d.preview
-        );
-    }
-
-    for sm in report.state_machines.iter().take(20) {
-        println!(
-            "  state-machine {}: state={} init={} mask={} shift={:?} selector={} cases={} @{:x}-{:x}",
-            sm.function_id,
-            sm.state_var,
-            sm.init_state,
-            sm.mask,
-            sm.shift,
-            sm.selector_var.as_deref().unwrap_or("?"),
-            sm.switch_cases,
-            sm.start,
-            sm.end
-        );
-    }
-
-    for h in report.handler_tables.iter().take(8) {
-        println!(
-            "  handler table ({}) @{:x}-{:x}: entries={} functions={} async={} {}",
-            h.container_kind,
-            h.start,
-            h.end,
-            h.properties,
-            h.function_values,
-            h.async_function_values,
-            h.preview
-        );
-    }
-
-    println!("  VM-shaped functions:");
-    for f in report
-        .functions
-        .iter()
-        .filter(|f| f.score >= min_score)
-        .take(20)
-    {
-        println!(
-            "    {} score={:2} {} {} @{:x}-{:x} bytes={} switch_cases={} loops={} ternaries={} computed={} computed_calls={} arrays={} :: {}{}",
-            if f.confirmed_dispatch { "[CONFIRMED]" } else { "[candidate]" },
-            f.score,
-            f.kind,
-            f.name.as_deref().unwrap_or("<anon>"),
-            f.start,
-            f.end,
-            f.bytes,
-            f.switch_cases,
-            f.loops,
-            f.conditionals,
-            f.computed_members,
-            f.computed_calls,
-            f.large_arrays,
-            f.reasons.join("; "),
-            if f.dispatch_reasons.is_empty() {
-                String::new()
-            } else {
-                format!(" | dispatch: {}", f.dispatch_reasons.join("; "))
-            }
-        );
-    }
-
+    print_array_candidates(report);
+    print_push_builders(report);
+    print_decoders(report);
+    print_state_machines(report);
+    print_handler_tables(report);
+    print_vm_functions(report, min_score);
     for embedded in &report.embedded {
         print_embedded(embedded, min_score, 1);
     }
