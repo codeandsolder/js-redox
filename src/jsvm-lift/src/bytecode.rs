@@ -64,75 +64,76 @@ fn builder_receiver_ident(expr: &Expression<'_>) -> Option<String> {
     }
 }
 
-pub fn detect_push_builder(source: &str, call: &CallExpression<'_>) -> Option<DetectedPushBuilder> {
-    let Expression::StaticMemberExpression(member) = &call.callee else {
-        return None;
+struct PushArgumentProfile {
+    numeric_literals: usize,
+    byte_literals: usize,
+    call_arguments: usize,
+    other_arguments: usize,
+    values: Vec<Option<u64>>,
+    unknowns: Vec<BuilderUnknown>,
+}
+
+fn profile_push_arguments(source: &str, arguments: &[Argument<'_>]) -> PushArgumentProfile {
+    let mut profile = PushArgumentProfile {
+        numeric_literals: 0,
+        byte_literals: 0,
+        call_arguments: 0,
+        other_arguments: 0,
+        values: Vec::with_capacity(arguments.len()),
+        unknowns: Vec::new(),
     };
-    if member.property.name.as_str() != "push" || call.arguments.len() < 16 {
-        return None;
-    }
 
-    let mut numeric_literals = 0usize;
-    let mut byte_literals = 0usize;
-    let mut call_arguments = 0usize;
-    let mut other_arguments = 0usize;
-    let mut values = Vec::with_capacity(call.arguments.len());
-    let mut unknowns = Vec::new();
-
-    for (arg_index, arg) in call.arguments.iter().enumerate() {
-        match arg {
-            Argument::NumericLiteral(n) => {
-                numeric_literals += 1;
-                if n.value.is_finite() && n.value >= 0.0 && n.value.fract() == 0.0 {
-                    let value = n.value as u64;
-                    if value <= 255 {
-                        byte_literals += 1;
-                    }
-                    values.push(Some(value));
-                } else {
-                    values.push(None);
+    for (index, argument) in arguments.iter().enumerate() {
+        match argument {
+            Argument::NumericLiteral(number) => {
+                profile.numeric_literals += 1;
+                let value = (number.value.is_finite()
+                    && number.value >= 0.0
+                    && number.value.fract() == 0.0)
+                    .then(|| number.value as u64);
+                if value.is_some_and(|value| value <= 255) {
+                    profile.byte_literals += 1;
                 }
+                profile.values.push(value);
             }
             Argument::CallExpression(_) => {
-                call_arguments += 1;
-                values.push(None);
-                let span = arg.span();
-                unknowns.push(BuilderUnknown {
-                    index: arg_index,
+                profile.call_arguments += 1;
+                profile.values.push(None);
+                let span = argument.span();
+                profile.unknowns.push(BuilderUnknown {
+                    index,
                     preview: preview(source, span.start, span.end, 120),
                 });
             }
             _ => {
-                other_arguments += 1;
-                values.push(None);
-                let span = arg.span();
-                unknowns.push(BuilderUnknown {
-                    index: arg_index,
+                profile.other_arguments += 1;
+                profile.values.push(None);
+                let span = argument.span();
+                profile.unknowns.push(BuilderUnknown {
+                    index,
                     preview: preview(source, span.start, span.end, 120),
                 });
             }
         }
     }
+    profile
+}
 
-    let recognized = numeric_literals + call_arguments;
-    if recognized * 4 < call.arguments.len() * 3 {
-        return None;
-    }
-
-    let mut width_hints = Vec::new();
+fn infer_width_hints(values: &[Option<u64>], argument_count: usize) -> Vec<WidthHint> {
+    let mut hints = Vec::new();
     for width in 2usize..=8 {
-        if call.arguments.len() < width * 8 || !call.arguments.len().is_multiple_of(width) {
+        if argument_count < width * 8 || !argument_count.is_multiple_of(width) {
             continue;
         }
-        let instructions = call.arguments.len() / width;
+        let instructions = argument_count / width;
         let mut opcode_values = BTreeSet::new();
         let mut opcode_max = 0u64;
         let mut operand_max = 0u64;
         let mut known_opcodes = 0usize;
 
-        for (i, value) in values.iter().enumerate() {
+        for (index, value) in values.iter().enumerate() {
             let Some(value) = value else { continue };
-            if i % width == 0 {
+            if index % width == 0 {
                 known_opcodes += 1;
                 opcode_values.insert(*value);
                 opcode_max = opcode_max.max(*value);
@@ -140,17 +141,15 @@ pub fn detect_push_builder(source: &str, call: &CallExpression<'_>) -> Option<De
                 operand_max = operand_max.max(*value);
             }
         }
-
         if known_opcodes * 2 < instructions {
             continue;
         }
 
-        let mut score = 2i32;
-        if known_opcodes * 4 >= instructions * 3 {
-            score += 3;
+        let mut score = if known_opcodes * 4 >= instructions * 3 {
+            5
         } else {
-            score += 1;
-        }
+            3
+        };
         if opcode_max <= 63 {
             score += 4;
         } else if opcode_max <= 127 {
@@ -165,9 +164,8 @@ pub fn detect_push_builder(source: &str, call: &CallExpression<'_>) -> Option<De
         if operand_max > opcode_max.saturating_mul(2) {
             score += 2;
         }
-
         if score >= 7 {
-            width_hints.push(WidthHint {
+            hints.push(WidthHint {
                 width,
                 opcode_unique: opcode_values.len(),
                 opcode_max,
@@ -176,23 +174,40 @@ pub fn detect_push_builder(source: &str, call: &CallExpression<'_>) -> Option<De
             });
         }
     }
-    width_hints.sort_by_key(|hint| std::cmp::Reverse(hint.score));
+    hints.sort_by_key(|hint| std::cmp::Reverse(hint.score));
+    hints
+}
 
+pub fn detect_push_builder(source: &str, call: &CallExpression<'_>) -> Option<DetectedPushBuilder> {
+    let Expression::StaticMemberExpression(member) = &call.callee else {
+        return None;
+    };
+    if member.property.name.as_str() != "push" || call.arguments.len() < 16 {
+        return None;
+    }
+
+    let profile = profile_push_arguments(source, &call.arguments);
+    let recognized = profile.numeric_literals + profile.call_arguments;
+    if recognized * 4 < call.arguments.len() * 3 {
+        return None;
+    }
+    let width_hints = infer_width_hints(&profile.values, call.arguments.len());
     let receiver_ident = builder_receiver_ident(&member.object);
     let span = member.object.span();
+
     Some(DetectedPushBuilder {
         candidate: PushBuilderCandidate {
             start: call.span.start,
             end: call.span.end,
             receiver: preview(source, span.start, span.end, 96),
             arguments: call.arguments.len(),
-            numeric_literals,
-            byte_literals,
-            call_arguments,
-            other_arguments,
+            numeric_literals: profile.numeric_literals,
+            byte_literals: profile.byte_literals,
+            call_arguments: profile.call_arguments,
+            other_arguments: profile.other_arguments,
             width_hints,
-            values,
-            unknowns,
+            values: profile.values,
+            unknowns: profile.unknowns,
             preview: preview(source, call.span.start, call.span.end, 140),
         },
         receiver_ident,
