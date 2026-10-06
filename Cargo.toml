@@ -3,6 +3,7 @@ members = [
     "src/jsvm-lift",
     "src/jsvm-safe-core",
     "src/sourcemap-compose",
+    "src/wasm-redox",
 ]
 resolver = "2"
 
@@ -44,3 +45,5 @@ sha2 = "0.10"
 string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "3c8ed78", default-features = false }
 rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "3c8ed78", default-features = false }
 url = "2"
+wasmparser = "0.261.0"
+wasmprinter = "0.261.0"
