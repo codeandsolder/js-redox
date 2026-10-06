@@ -236,7 +236,7 @@ impl FunctionState {
             .collect()
     }
 
-    pub fn finalize_metrics(
+    fn finalize_dispatch(
         &mut self,
         switch_from_indexed_state: bool,
         large_handler_table_present: bool,
@@ -271,6 +271,9 @@ impl FunctionState {
 
         self.m.confirmed_dispatch = switch_from_indexed_state || table_dispatch;
         self.m.dispatch_reasons = dispatch_reasons;
+    }
+
+    fn finalize_indexed_read_chain(&mut self, switch_from_indexed_state: bool) {
         let mut indexed_reads = BTreeSet::new();
         if switch_from_indexed_state {
             for evidence in &self.switch_inputs {
@@ -283,7 +286,9 @@ impl FunctionState {
             }
         }
         self.m.indexed_read_chain = indexed_reads.into_iter().collect();
+    }
 
+    fn score_metrics(&mut self) {
         let mut score = 0u32;
         let mut reasons = Vec::new();
         if self.m.switch_cases >= 16 {
@@ -345,6 +350,16 @@ impl FunctionState {
         }
         self.m.score = score;
         self.m.reasons = reasons;
+    }
+
+    pub fn finalize_metrics(
+        &mut self,
+        switch_from_indexed_state: bool,
+        large_handler_table_present: bool,
+    ) {
+        self.finalize_dispatch(switch_from_indexed_state, large_handler_table_present);
+        self.finalize_indexed_read_chain(switch_from_indexed_state);
+        self.score_metrics();
     }
 }
 
