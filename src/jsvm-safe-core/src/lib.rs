@@ -614,11 +614,15 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push_arithmetic(it.span, text, proof);
             return;
         }
+        if let Some(text) = self.ordered_switch_for_replacement(it) {
+            self.push(it.span, text, "ordered_switch_unflatten");
+            return;
+        }
         walk::walk_for_statement(self, it);
     }
 
     fn visit_while_statement(&mut self, it: &oxc_ast::ast::WhileStatement<'a>) {
-        if let Some(text) = self.ordered_switch_replacement(it) {
+        if let Some(text) = self.ordered_switch_while_replacement(it) {
             self.push(it.span, text, "ordered_switch_unflatten");
             return;
         }

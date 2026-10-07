@@ -108,6 +108,11 @@ CASES = [
         ['out.push("A")', 'out.push("B")', 'out.push("C")', 'out.push("D")'],
     ),
     (
+        "ordered-switch-for",
+        ROOT / "corpus/generated/reversible-obfuscation/ordered-switch-for.js",
+        ['out.push("A")', 'out.push("B")', 'out.push("C")', 'out.push("D")'],
+    ),
+    (
         "arithmetic-state",
         ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state.js",
         ['out += "A"', 'out += "B"', 'out += "C"', 'out += "D"'],
@@ -227,7 +232,7 @@ def main():
             if name == "reference-identity-table":
                 assert meta["transforms"].get("reference_identity_compare", 0) >= 4, meta
                 assert meta["transforms"].get("reference_state_unflatten", 0) >= 1, meta
-            if name == "ordered-switch":
+            if name in {"ordered-switch", "ordered-switch-for"}:
                 assert meta["transforms"].get("ordered_switch_unflatten", 0) >= 1, meta
             if name == "arithmetic-state":
                 assert meta["transforms"].get("arithmetic_state_unflatten", 0) >= 1, meta
@@ -429,6 +434,21 @@ def main():
         ordered_safety_meta = json.loads(ordered_safety_report.read_text())
         assert ordered_safety_meta["transforms"].get("ordered_switch_unflatten", 0) == 0, ordered_safety_meta
         print("ordered-switch-safety", ordered_safety_meta["transforms"])
+
+        ordered_for_safety_source = ROOT / "corpus/generated/reversible-obfuscation/ordered-switch-for-safety.js"
+        ordered_for_safety_out = td / "ordered-switch-for-safety.js"
+        ordered_for_safety_report = td / "ordered-switch-for-safety.json"
+        before = node_stdout(ordered_for_safety_source)
+        cp = subprocess.run(
+            [str(BIN), str(ordered_for_safety_source), str(ordered_for_safety_out), "--report", str(ordered_for_safety_report)],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(f"ordered-switch for-loop safety deobfuscation failed:\n{cp.stdout}\n{cp.stderr}")
+        assert node_stdout(ordered_for_safety_out) == before
+        ordered_for_safety_meta = json.loads(ordered_for_safety_report.read_text())
+        assert ordered_for_safety_meta["transforms"].get("ordered_switch_unflatten", 0) == 0, ordered_for_safety_meta
+        print("ordered-switch-for-safety", ordered_for_safety_meta["transforms"])
 
         arithmetic_safety_source = ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-safety.js"
         arithmetic_safety_out = td / "arithmetic-state-safety.js"
