@@ -469,15 +469,18 @@ fn single_resolved_reference(scoping: &Scoping, symbol: SymbolId, expected: Refe
     refs.len() == 1 && refs[0] == expected
 }
 
+struct OrderedSwitchReplacement {
+    text: String,
+    order_symbol: SymbolId,
+    counter_symbol: SymbolId,
+}
+
 impl Collector<'_, '_> {
-    pub(super) fn ordered_switch_replacement(
+    fn ordered_switch_body_replacement(
         &self,
-        it: &oxc_ast::ast::WhileStatement<'_>,
-    ) -> Option<String> {
-        if known_bool(&it.test) != Some(true) {
-            return None;
-        }
-        let Statement::BlockStatement(body) = &it.body else {
+        body: &Statement<'_>,
+    ) -> Option<OrderedSwitchReplacement> {
+        let Statement::BlockStatement(body) = body else {
             return None;
         };
         if body.body.len() != 2 {
@@ -562,7 +565,74 @@ impl Collector<'_, '_> {
             chunks.push(chunk);
         }
 
-        Some(format!("{{\n{}\n}}", chunks.join("\n")))
+        Some(OrderedSwitchReplacement {
+            text: format!("{{\n{}\n}}", chunks.join("\n")),
+            order_symbol,
+            counter_symbol,
+        })
+    }
+
+    pub(super) fn ordered_switch_while_replacement(
+        &self,
+        it: &oxc_ast::ast::WhileStatement<'_>,
+    ) -> Option<String> {
+        if known_bool(&it.test) != Some(true) {
+            return None;
+        }
+        Some(self.ordered_switch_body_replacement(&it.body)?.text)
+    }
+
+    pub(super) fn ordered_switch_for_replacement(
+        &self,
+        it: &oxc_ast::ast::ForStatement<'_>,
+    ) -> Option<String> {
+        if it.update.is_some()
+            || it
+                .test
+                .as_ref()
+                .is_some_and(|test| known_bool(test) != Some(true))
+        {
+            return None;
+        }
+
+        let replacement = self.ordered_switch_body_replacement(&it.body)?;
+        let Some(init) = &it.init else {
+            return Some(replacement.text);
+        };
+        let oxc_ast::ast::ForStatementInit::VariableDeclaration(declaration) = init else {
+            return None;
+        };
+        // The dispatch counter is incremented by the selector. A `const`
+        // declaration would throw at runtime, so replacing that loop would
+        // incorrectly turn invalid source into valid straight-line code.
+        if declaration.kind == VariableDeclarationKind::Const || declaration.declarations.len() != 2
+        {
+            return None;
+        }
+
+        let mut saw_order = false;
+        let mut saw_counter = false;
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(id) = &declarator.id else {
+                return None;
+            };
+            let symbol = id.symbol_id.get()?;
+            let init = declarator.init.as_ref()?;
+            if symbol == replacement.order_symbol {
+                if static_dispatch_order(init) != self.dispatch_orders.get(&symbol).cloned() {
+                    return None;
+                }
+                saw_order = true;
+            } else if symbol == replacement.counter_symbol {
+                if !matches!(eval(init), Some(Value::Number(n)) if n == 0.0) {
+                    return None;
+                }
+                saw_counter = true;
+            } else {
+                return None;
+            }
+        }
+        (saw_order && saw_counter).then_some(replacement.text)
     }
 }
 
