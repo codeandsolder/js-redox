@@ -306,10 +306,17 @@ fn is_inlineable_scalar(op: &Operator) -> bool {
             | "i32les"
             | "i32gts"
             | "i32ges"
+            | "i32eqz"
     )
 }
 
 fn render_scalar_family(family: &str, args: &[String]) -> Option<String> {
+    if let [a] = args {
+        return match family {
+            "i32eqz" => Some(format!("is_zero({a})")),
+            _ => None,
+        };
+    }
     let [a, b] = args else {
         return None;
     };
@@ -760,7 +767,11 @@ fn reverse_bits_source(body: &FunctionBody, value: Value) -> Option<Value> {
         .then_some(permutation.base)
 }
 
-fn incoming_block_param_values(body: &FunctionBody, block: Block, parameter: Value) -> Vec<Value> {
+fn incoming_block_param_edges(
+    body: &FunctionBody,
+    block: Block,
+    parameter: Value,
+) -> Vec<(Block, Value)> {
     let parameter = body.resolve_alias(parameter);
     let Some(index) = body.blocks[block]
         .params
@@ -769,9 +780,9 @@ fn incoming_block_param_values(body: &FunctionBody, block: Block, parameter: Val
     else {
         return Vec::new();
     };
-    let mut incoming = BTreeSet::new();
+    let mut incoming = Vec::new();
 
-    for (_, predecessor) in body.blocks.entries() {
+    for (predecessor_block, predecessor) in body.blocks.entries() {
         predecessor.terminator.visit_targets(|target| {
             if target.block != block {
                 return;
@@ -781,12 +792,110 @@ fn incoming_block_param_values(body: &FunctionBody, block: Block, parameter: Val
             };
             let value = body.resolve_alias(*value);
             if value != parameter {
-                incoming.insert(value);
+                incoming.push((predecessor_block, value));
             }
         });
     }
+    incoming.sort_unstable_by_key(|(block, value)| (block.index(), value.index()));
+    incoming.dedup();
+    incoming
+}
 
-    incoming.into_iter().collect()
+fn incoming_block_param_values(body: &FunctionBody, block: Block, parameter: Value) -> Vec<Value> {
+    incoming_block_param_edges(body, block, parameter)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn reachable_blocks(body: &FunctionBody) -> BTreeSet<Block> {
+    let mut reachable = BTreeSet::new();
+    let mut queue = VecDeque::from([body.entry]);
+    while let Some(block) = queue.pop_front() {
+        if !reachable.insert(block) {
+            continue;
+        }
+        body.blocks[block]
+            .terminator
+            .visit_targets(|target| queue.push_back(target.block));
+    }
+    reachable
+}
+
+fn reachable_predecessors(
+    body: &FunctionBody,
+    target_block: Block,
+    reachable: &BTreeSet<Block>,
+) -> BTreeSet<Block> {
+    body.blocks
+        .entries()
+        .filter_map(|(block, definition)| {
+            if !reachable.contains(&block) {
+                return None;
+            }
+            let mut reaches_target = false;
+            definition.terminator.visit_targets(|target| {
+                reaches_target |= target.block == target_block;
+            });
+            reaches_target.then_some(block)
+        })
+        .collect()
+}
+
+fn conditional_phi_inputs(
+    body: &FunctionBody,
+    incoming: &[(Block, Value)],
+) -> Option<(Value, Value, Value)> {
+    if incoming.len() != 2 {
+        return None;
+    }
+    let reachable = reachable_blocks(body);
+    let mut candidates = Vec::new();
+    for (branch_block, block) in body.blocks.entries() {
+        if !reachable.contains(&branch_block) {
+            continue;
+        }
+        let Terminator::CondBr {
+            cond,
+            if_true,
+            if_false,
+        } = &block.terminator
+        else {
+            continue;
+        };
+        if if_true.block == if_false.block
+            || reachable_predecessors(body, if_true.block, &reachable)
+                != BTreeSet::from([branch_block])
+            || reachable_predecessors(body, if_false.block, &reachable)
+                != BTreeSet::from([branch_block])
+        {
+            continue;
+        }
+        let Some((_, true_value)) = incoming
+            .iter()
+            .find(|(predecessor, _)| *predecessor == if_true.block)
+        else {
+            continue;
+        };
+        let Some((_, false_value)) = incoming
+            .iter()
+            .find(|(predecessor, _)| *predecessor == if_false.block)
+        else {
+            continue;
+        };
+        candidates.push((
+            body.resolve_alias(*cond),
+            body.resolve_alias(*true_value),
+            body.resolve_alias(*false_value),
+        ));
+    }
+    candidates.sort_unstable_by_key(|(cond, if_true, if_false)| {
+        (cond.index(), if_true.index(), if_false.index())
+    });
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates[0])
 }
 
 #[derive(Default)]
@@ -1111,9 +1220,15 @@ fn render_semantic_value(
             {
                 format!("$arg{index}")
             } else {
-                let incoming = incoming_block_param_values(body, *block, value)
-                    .into_iter()
-                    .map(|incoming| {
+                let incoming_edges = incoming_block_param_edges(body, *block, value);
+                let incoming_values = incoming_edges
+                    .iter()
+                    .map(|(_, incoming)| *incoming)
+                    .collect::<BTreeSet<_>>();
+                match incoming_values.len() {
+                    0 => format!("$block{}p{index}", block.index()),
+                    1 => {
+                        let incoming = incoming_values.into_iter().next().unwrap_or(value);
                         render_semantic_value(
                             body,
                             incoming,
@@ -1121,18 +1236,52 @@ fn render_semantic_value(
                             depth.saturating_sub(1),
                             visiting,
                         )
-                    })
-                    .collect::<BTreeSet<_>>();
-                match incoming.len() {
-                    0 => format!("$block{}p{index}", block.index()),
-                    1 => incoming
-                        .into_iter()
-                        .next()
-                        .unwrap_or_else(|| format!("$block{}p{index}", block.index())),
-                    _ => format!(
-                        "phi({})",
-                        incoming.into_iter().collect::<Vec<_>>().join(", ")
-                    ),
+                    }
+                    _ => {
+                        if let Some((condition, if_true, if_false)) =
+                            conditional_phi_inputs(body, &incoming_edges)
+                        {
+                            let condition = render_semantic_value(
+                                body,
+                                condition,
+                                context,
+                                depth.saturating_sub(1),
+                                visiting,
+                            );
+                            let if_true = render_semantic_value(
+                                body,
+                                if_true,
+                                context,
+                                depth.saturating_sub(1),
+                                visiting,
+                            );
+                            let if_false = render_semantic_value(
+                                body,
+                                if_false,
+                                context,
+                                depth.saturating_sub(1),
+                                visiting,
+                            );
+                            format!("phi_if({condition}, {if_true}, {if_false})")
+                        } else {
+                            let incoming = incoming_values
+                                .into_iter()
+                                .map(|incoming| {
+                                    render_semantic_value(
+                                        body,
+                                        incoming,
+                                        context,
+                                        depth.saturating_sub(1),
+                                        visiting,
+                                    )
+                                })
+                                .collect::<BTreeSet<_>>();
+                            format!(
+                                "phi({})",
+                                incoming.into_iter().collect::<Vec<_>>().join(", ")
+                            )
+                        }
+                    }
                 }
             };
             (rendered, false)
@@ -2505,6 +2654,34 @@ mod tests {
         assert!(!analysis.runtime_bindings[0]
             .expression
             .contains("wasm.heap_alloc"));
+        Ok(())
+    }
+
+    #[test]
+    fn renders_direct_conditional_phi_with_its_guard() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (func (export "run") (param $cond i32) (result i32)
+                    (local $value i32)
+                    i32.const 10
+                    local.set $value
+                    local.get $cond
+                    if
+                        i32.const 20
+                        local.set $value
+                    else
+                        i32.const 30
+                        local.set $value
+                    end
+                    local.get $value))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let expression = analysis
+            .return_expressions
+            .first()
+            .context("return expression")?;
+        assert_eq!(expression, "phi_if($arg0, 0x00000014, 0x0000001e)");
         Ok(())
     }
 }
