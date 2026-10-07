@@ -255,6 +255,7 @@ def main():
             sha256=module.get('sha256'),
             value_kind=module.get('value_kind'),
             dependencies=module.get('dependencies', []),
+            dependency_map=module.get('dependency_map', {}),
             export_names=module.get('export_names', []),
             commonjs_export=bool(module.get('commonjs_export')),
         )

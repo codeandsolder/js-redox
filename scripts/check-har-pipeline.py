@@ -326,7 +326,8 @@ def main():
         row
         for row in bundles["modules"]
         if not row.get("chunk_ids")
-        and row.get("bundle_kind") not in {"amd_named_modules", "member_named_modules"}
+        and row.get("bundle_kind")
+        not in {"amd_named_modules", "member_named_modules", "browserify_module_table"}
     ]
     assert direct_modules
     assert all("/module-table-" in row["source_path"] for row in direct_modules)
@@ -340,6 +341,22 @@ def main():
     assert "shadowed" not in module_20001["export_names"]
     assert "shadowedNested" not in module_20001["export_names"]
     assert module_20002["commonjs_export"] is True
+    browserify_alpha = next(row for row in bundles["modules"] if row["module_id"] == "50001")
+    browserify_beta = next(row for row in bundles["modules"] if row["module_id"] == "50002")
+    assert browserify_alpha["bundle_kind"] == "browserify_module_table"
+    assert browserify_alpha["dependencies"] == ["50002"]
+    assert browserify_alpha["dependency_map"] == {
+        "./beta": "50002",
+        "external-package": "external-package",
+    }
+    assert browserify_alpha["export_names"] == ["value"]
+    assert browserify_beta["commonjs_export"] is True
+    assert "/browserify-modules/" in browserify_alpha["source_path"]
+    assert bundles["summary"]["browserify_modules"] >= 2
+    browserify_source = (PROJECT / browserify_alpha["source_path"]).read_text()
+    assert "Statically extracted Browserify module factory" in browserify_source
+    assert "./beta -> 50002" in browserify_source
+    assert "external-package -> external-package" in browserify_source
     amd_alpha = next(row for row in bundles["modules"] if row["module_id"] == "amd/alpha")
     amd_beta = next(row for row in bundles["modules"] if row["module_id"] == "amd/beta")
     assert amd_alpha["bundle_kind"] == "amd_named_modules"
