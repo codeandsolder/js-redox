@@ -24,6 +24,7 @@ function usage(exitCode = 0) {
 Options:
   -o, --output <dir>        Output directory (default work/captures/<host>-<time>)
       --headed              Show the browser window
+      --fast-scroll         Traverse lazy/ad content quickly with wheel events
       --proxy <url>         CloakBrowser proxy
       --scroll-passes <n>   Bottom-to-top passes (default 2)
       --max-scroll-steps <n> Maximum wheel steps per pass (default 120)
@@ -49,6 +50,7 @@ function parseArgs(argv) {
     url: null,
     output: null,
     headed: false,
+    fastScroll: false,
     proxy: null,
     scrollPasses: 2,
     maxScrollSteps: 120,
@@ -82,6 +84,9 @@ function parseArgs(argv) {
         break;
       case "--headed":
         opts.headed = true;
+        break;
+      case "--fast-scroll":
+        opts.fastScroll = true;
         break;
       case "--proxy":
         opts.proxy = take(i, arg);
@@ -355,7 +360,7 @@ async function humanScroll(page, opts, events) {
   for (let pass = 0; pass < opts.scrollPasses; pass += 1) {
     if (pass > 0) {
       await page.evaluate(() => scrollTo({ top: 0, behavior: "instant" }));
-      await sleep(600);
+      await sleep(opts.fastScroll ? 150 : 600);
     }
 
     let lastHeight = 0;
@@ -372,9 +377,9 @@ async function humanScroll(page, opts, events) {
         ),
       }));
 
-      const delta = randomInt(450, 1051);
+      const delta = opts.fastScroll ? randomInt(1000, 2201) : randomInt(450, 1051);
       await page.mouse.wheel(0, delta);
-      await sleep(randomInt(180, 521));
+      await sleep(opts.fastScroll ? randomInt(50, 121) : randomInt(180, 521));
       steps += 1;
 
       const after = await page.evaluate(() => ({
@@ -388,7 +393,7 @@ async function humanScroll(page, opts, events) {
 
       const atBottom = after.y + after.viewport >= after.height - 8;
       if (atBottom) {
-        await sleep(randomInt(700, 1201));
+        await sleep(opts.fastScroll ? randomInt(300, 501) : randomInt(700, 1201));
         const heightAfterPause = await page.evaluate(() => Math.max(
           document.documentElement.scrollHeight,
           document.body?.scrollHeight || 0,
