@@ -309,6 +309,36 @@ fn is_inlineable_scalar(op: &Operator) -> bool {
     )
 }
 
+fn render_scalar_family(family: &str, args: &[String]) -> Option<String> {
+    let [a, b] = args else {
+        return None;
+    };
+    Some(match family {
+        "i32add" => format!("wrapping_add({a}, {b})"),
+        "i32sub" => format!("wrapping_sub({a}, {b})"),
+        "i32mul" => format!("wrapping_mul({a}, {b})"),
+        "i32and" => format!("({a} & {b})"),
+        "i32or" => format!("({a} | {b})"),
+        "i32xor" => format!("({a} ^ {b})"),
+        "i32shl" => format!("({a} << {b})"),
+        "i32shrs" => format!("ashr({a}, {b})"),
+        "i32shru" => format!("({a} >> {b})"),
+        "i32rotl" => format!("rotl({a}, {b})"),
+        "i32rotr" => format!("rotr({a}, {b})"),
+        "i32eq" => format!("({a} == {b})"),
+        "i32ne" => format!("({a} != {b})"),
+        "i32ltu" => format!("ult({a}, {b})"),
+        "i32leu" => format!("ule({a}, {b})"),
+        "i32gtu" => format!("ugt({a}, {b})"),
+        "i32geu" => format!("uge({a}, {b})"),
+        "i32lts" => format!("slt({a}, {b})"),
+        "i32les" => format!("sle({a}, {b})"),
+        "i32gts" => format!("sgt({a}, {b})"),
+        "i32ges" => format!("sge({a}, {b})"),
+        _ => return None,
+    })
+}
+
 fn render_value(
     body: &FunctionBody,
     dispatcher: Block,
@@ -325,10 +355,23 @@ fn render_value(
             return format!("$p{index}");
         }
     }
+    if let ValueDef::BlockParam(block, index, _) = body.values[value] {
+        if block == body.entry && usize::try_from(index).is_ok_and(|index| index < body.n_params) {
+            return format!("$arg{index}");
+        }
+    }
     if let Some(value) = i32_const(body, value) {
         return format!("0x{value:08x}");
     }
     if depth > 0 {
+        if let Some(source) = reverse_bits_source(body, value) {
+            if source != value {
+                return format!(
+                    "reverse_bits32({})",
+                    render_value(body, dispatcher, state, source, depth.saturating_sub(1))
+                );
+            }
+        }
         if let Some(expression) = render_scalar_expression(body, dispatcher, state, value, depth) {
             return expression;
         }
@@ -355,36 +398,7 @@ fn render_scalar_expression(
         .iter()
         .map(|arg| render_value(body, dispatcher, state, *arg, depth.saturating_sub(1)))
         .collect::<Vec<_>>();
-    if args.len() != 2 {
-        return Some(format!("{family}({})", args.join(", ")));
-    }
-    let a = &args[0];
-    let b = &args[1];
-    let rendered = match family.as_str() {
-        "i32add" => format!("wrapping_add({a}, {b})"),
-        "i32sub" => format!("wrapping_sub({a}, {b})"),
-        "i32mul" => format!("wrapping_mul({a}, {b})"),
-        "i32and" => format!("({a} & {b})"),
-        "i32or" => format!("({a} | {b})"),
-        "i32xor" => format!("({a} ^ {b})"),
-        "i32shl" => format!("({a} << {b})"),
-        "i32shrs" => format!("ashr({a}, {b})"),
-        "i32shru" => format!("({a} >> {b})"),
-        "i32rotl" => format!("rotl({a}, {b})"),
-        "i32rotr" => format!("rotr({a}, {b})"),
-        "i32eq" => format!("({a} == {b})"),
-        "i32ne" => format!("({a} != {b})"),
-        "i32ltu" => format!("ult({a}, {b})"),
-        "i32leu" => format!("ule({a}, {b})"),
-        "i32gtu" => format!("ugt({a}, {b})"),
-        "i32geu" => format!("uge({a}, {b})"),
-        "i32lts" => format!("slt({a}, {b})"),
-        "i32les" => format!("sle({a}, {b})"),
-        "i32gts" => format!("sgt({a}, {b})"),
-        "i32ges" => format!("sge({a}, {b})"),
-        _ => format!("{family}({a}, {b})"),
-    };
-    Some(rendered)
+    render_scalar_family(&family, &args).or_else(|| Some(format!("{family}({})", args.join(", "))))
 }
 
 fn render_instruction(
@@ -410,6 +424,456 @@ fn render_instruction(
     Some(format!("v{} = {}({})", value.index(), op, args.join(", ")))
 }
 
+fn substitute_params(expression: &str, environment: &[String]) -> String {
+    let bytes = expression.as_bytes();
+    let mut output = String::with_capacity(expression.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'$'
+            && index + 2 < bytes.len()
+            && bytes[index + 1] == b'p'
+            && bytes[index + 2].is_ascii_digit()
+        {
+            let mut end = index + 2;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if let Ok(parameter) = expression[index + 2..end].parse::<usize>() {
+                if let Some(replacement) = environment.get(parameter) {
+                    output.push('(');
+                    output.push_str(replacement);
+                    output.push(')');
+                    index = end;
+                    continue;
+                }
+            }
+        }
+        output.push(char::from(bytes[index]));
+        index += 1;
+    }
+    output
+}
+
+fn strip_outer_parentheses(mut expression: &str) -> &str {
+    loop {
+        let bytes = expression.as_bytes();
+        if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+            return expression;
+        }
+        let mut depth = 0usize;
+        let mut closes_before_end = false;
+        for (index, byte) in bytes.iter().enumerate() {
+            match byte {
+                b'(' => depth = depth.saturating_add(1),
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && index + 1 != bytes.len() {
+                        closes_before_end = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if closes_before_end || depth != 0 {
+            return expression;
+        }
+        expression = &expression[1..expression.len() - 1];
+    }
+}
+
+fn split_top_level_binary<'a>(expression: &'a str, operator: &str) -> Option<(&'a str, &'a str)> {
+    let bytes = expression.as_bytes();
+    let operator = operator.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index + operator.len() <= bytes.len() {
+        match bytes[index] {
+            b'(' => depth = depth.saturating_add(1),
+            b')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && &bytes[index..index + operator.len()] == operator => {
+                return Some((&expression[..index], &expression[index + operator.len()..]));
+            }
+            _ => {}
+        }
+        index = index.saturating_add(1);
+    }
+    None
+}
+
+fn split_top_level_arguments(expression: &str) -> Vec<&str> {
+    let bytes = expression.as_bytes();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut arguments = Vec::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => depth = depth.saturating_add(1),
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                arguments.push(expression[start..index].trim());
+                start = index.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    arguments.push(expression[start..].trim());
+    arguments
+}
+
+fn eval_i32_function(name: &str, arguments: &[&str]) -> Option<u32> {
+    match (name, arguments) {
+        ("reverse_bits32", [value]) => Some(try_eval_i32_expression(value)?.reverse_bits()),
+        ("wrapping_add", [left, right]) => {
+            Some(try_eval_i32_expression(left)?.wrapping_add(try_eval_i32_expression(right)?))
+        }
+        ("wrapping_sub", [left, right]) => {
+            Some(try_eval_i32_expression(left)?.wrapping_sub(try_eval_i32_expression(right)?))
+        }
+        ("wrapping_mul", [left, right]) => {
+            Some(try_eval_i32_expression(left)?.wrapping_mul(try_eval_i32_expression(right)?))
+        }
+        ("rotl", [value, amount]) => {
+            Some(try_eval_i32_expression(value)?.rotate_left(try_eval_i32_expression(amount)? & 31))
+        }
+        ("rotr", [value, amount]) => Some(
+            try_eval_i32_expression(value)?.rotate_right(try_eval_i32_expression(amount)? & 31),
+        ),
+        ("ashr", [value, amount]) => Some(
+            (try_eval_i32_expression(value)?.cast_signed()
+                >> (try_eval_i32_expression(amount)? & 31))
+                .cast_unsigned(),
+        ),
+        ("ult", [left, right]) => Some(u32::from(
+            try_eval_i32_expression(left)? < try_eval_i32_expression(right)?,
+        )),
+        ("ule", [left, right]) => Some(u32::from(
+            try_eval_i32_expression(left)? <= try_eval_i32_expression(right)?,
+        )),
+        ("ugt", [left, right]) => Some(u32::from(
+            try_eval_i32_expression(left)? > try_eval_i32_expression(right)?,
+        )),
+        ("uge", [left, right]) => Some(u32::from(
+            try_eval_i32_expression(left)? >= try_eval_i32_expression(right)?,
+        )),
+        ("slt", [left, right]) => Some(u32::from(
+            try_eval_i32_expression(left)?.cast_signed()
+                < try_eval_i32_expression(right)?.cast_signed(),
+        )),
+        ("sle", [left, right]) => Some(u32::from(
+            try_eval_i32_expression(left)?.cast_signed()
+                <= try_eval_i32_expression(right)?.cast_signed(),
+        )),
+        ("sgt", [left, right]) => Some(u32::from(
+            try_eval_i32_expression(left)?.cast_signed()
+                > try_eval_i32_expression(right)?.cast_signed(),
+        )),
+        ("sge", [left, right]) => Some(u32::from(
+            try_eval_i32_expression(left)?.cast_signed()
+                >= try_eval_i32_expression(right)?.cast_signed(),
+        )),
+        _ => None,
+    }
+}
+
+fn try_eval_i32_expression(expression: &str) -> Option<u32> {
+    let expression = strip_outer_parentheses(expression.trim());
+    if let Some(hex) = expression.strip_prefix("0x") {
+        if let Ok(value) = u32::from_str_radix(hex, 16) {
+            return Some(value);
+        }
+    }
+
+    if let Some(open) = expression.find('(') {
+        if expression.ends_with(')') {
+            let name = &expression[..open];
+            if !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                let arguments =
+                    split_top_level_arguments(&expression[open + 1..expression.len() - 1]);
+                if let Some(value) = eval_i32_function(name, &arguments) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    for operator in ["==", "!=", "|", "^", "&", "<<", ">>"] {
+        if let Some((left, right)) = split_top_level_binary(expression, operator) {
+            let left = try_eval_i32_expression(left)?;
+            let right = try_eval_i32_expression(right)?;
+            return Some(match operator {
+                "==" => u32::from(left == right),
+                "!=" => u32::from(left != right),
+                "|" => left | right,
+                "^" => left ^ right,
+                "&" => left & right,
+                "<<" => left.wrapping_shl(right & 31),
+                ">>" => left.wrapping_shr(right & 31),
+                _ => return None,
+            });
+        }
+    }
+    None
+}
+
+fn fold_closed_i32_expression(expression: String) -> String {
+    try_eval_i32_expression(&expression).map_or(expression, |value| format!("0x{value:08x}"))
+}
+
+fn substitute_arguments(arguments: &[String], environment: &[String]) -> Vec<String> {
+    arguments
+        .iter()
+        .map(|argument| fold_closed_i32_expression(substitute_params(argument, environment)))
+        .collect()
+}
+
+#[derive(Clone)]
+struct BitPermutation {
+    base: Value,
+    bits: [Option<u8>; 32],
+}
+
+fn identity_bit_permutation(base: Value) -> BitPermutation {
+    BitPermutation {
+        base,
+        bits: std::array::from_fn(|index| u8::try_from(index).ok()),
+    }
+}
+
+fn zero_bit_permutation(base: Value) -> BitPermutation {
+    BitPermutation {
+        base,
+        bits: [None; 32],
+    }
+}
+
+fn bit_permutation(
+    body: &FunctionBody,
+    value: Value,
+    depth: usize,
+    visiting: &mut BTreeSet<Value>,
+) -> Option<BitPermutation> {
+    let value = body.resolve_alias(value);
+    if depth == 0 || !visiting.insert(value) {
+        return Some(identity_bit_permutation(value));
+    }
+
+    let result = match &body.values[value] {
+        ValueDef::Operator(Operator::I32Const { value: 0 }, _, _) => {
+            Some(zero_bit_permutation(value))
+        }
+        ValueDef::Operator(op, args, _) => {
+            let args = &body.arg_pool[*args];
+            let family = operator_family(op);
+            match (family.as_str(), args) {
+                ("i32and", [left, right]) => {
+                    let (source, mask) = if let Some(mask) = i32_const(body, *right) {
+                        (*left, mask)
+                    } else if let Some(mask) = i32_const(body, *left) {
+                        (*right, mask)
+                    } else {
+                        visiting.remove(&value);
+                        return Some(identity_bit_permutation(value));
+                    };
+                    let mut permutation =
+                        bit_permutation(body, source, depth.saturating_sub(1), visiting)?;
+                    for bit in 0..32 {
+                        if mask & (1u32 << bit) == 0 {
+                            permutation.bits[bit] = None;
+                        }
+                    }
+                    Some(permutation)
+                }
+                ("i32or", [left, right]) => {
+                    let left = bit_permutation(body, *left, depth.saturating_sub(1), visiting)?;
+                    let right = bit_permutation(body, *right, depth.saturating_sub(1), visiting)?;
+                    if left.base != right.base {
+                        None
+                    } else {
+                        let mut bits = [None; 32];
+                        for (bit, merged) in bits.iter_mut().enumerate() {
+                            *merged = match (left.bits[bit], right.bits[bit]) {
+                                (Some(a), Some(b)) if a != b => {
+                                    visiting.remove(&value);
+                                    return None;
+                                }
+                                (Some(a), _) => Some(a),
+                                (_, Some(b)) => Some(b),
+                                (None, None) => None,
+                            };
+                        }
+                        Some(BitPermutation {
+                            base: left.base,
+                            bits,
+                        })
+                    }
+                }
+                ("i32shl", [source, amount])
+                | ("i32shru", [source, amount])
+                | ("i32rotl", [source, amount])
+                | ("i32rotr", [source, amount]) => {
+                    let amount = i32_const(body, *amount)? & 31;
+                    let source = bit_permutation(body, *source, depth.saturating_sub(1), visiting)?;
+                    let mut bits = [None; 32];
+                    for output in 0..32u32 {
+                        let input = match family.as_str() {
+                            "i32shl" => output.checked_sub(amount),
+                            "i32shru" => output.checked_add(amount).filter(|input| *input < 32),
+                            "i32rotl" => Some((output + 32 - amount) & 31),
+                            "i32rotr" => Some((output + amount) & 31),
+                            _ => None,
+                        };
+                        if let Some(input) = input {
+                            bits[usize::try_from(output).ok()?] =
+                                source.bits[usize::try_from(input).ok()?];
+                        }
+                    }
+                    Some(BitPermutation {
+                        base: source.base,
+                        bits,
+                    })
+                }
+                _ => Some(identity_bit_permutation(value)),
+            }
+        }
+        ValueDef::Alias(source) => {
+            bit_permutation(body, *source, depth.saturating_sub(1), visiting)
+        }
+        _ => Some(identity_bit_permutation(value)),
+    };
+    visiting.remove(&value);
+    result
+}
+
+fn reverse_bits_source(body: &FunctionBody, value: Value) -> Option<Value> {
+    let mut visiting = BTreeSet::new();
+    let permutation = bit_permutation(body, value, 24, &mut visiting)?;
+    permutation
+        .bits
+        .iter()
+        .enumerate()
+        .all(|(output, source)| *source == u8::try_from(31usize.saturating_sub(output)).ok())
+        .then_some(permutation.base)
+}
+
+fn incoming_block_param_values(body: &FunctionBody, block: Block, index: u32) -> Vec<Value> {
+    let Ok(index) = usize::try_from(index) else {
+        return Vec::new();
+    };
+    let Some((_, parameter)) = body.blocks[block].params.get(index) else {
+        return Vec::new();
+    };
+    let parameter = body.resolve_alias(*parameter);
+    let mut incoming = BTreeSet::new();
+
+    for (_, predecessor) in body.blocks.entries() {
+        predecessor.terminator.visit_targets(|target| {
+            if target.block != block {
+                return;
+            }
+            let Some(value) = target.args.get(index) else {
+                return;
+            };
+            let value = body.resolve_alias(*value);
+            if value != parameter {
+                incoming.insert(value);
+            }
+        });
+    }
+
+    incoming.into_iter().collect()
+}
+
+fn render_semantic_value(
+    body: &FunctionBody,
+    value: Value,
+    bindings: &BTreeMap<Value, String>,
+    depth: usize,
+    visiting: &mut BTreeSet<Value>,
+) -> String {
+    let value = body.resolve_alias(value);
+    if let Some(binding) = bindings.get(&value) {
+        return binding.clone();
+    }
+    if let Some(constant) = i32_const(body, value) {
+        return format!("0x{constant:08x}");
+    }
+    if let Some(source) = reverse_bits_source(body, value) {
+        if source != value {
+            return format!(
+                "reverse_bits32({})",
+                render_semantic_value(body, source, bindings, depth.saturating_sub(1), visiting)
+            );
+        }
+    }
+    if depth == 0 || !visiting.insert(value) {
+        return format!("v{}", value.index());
+    }
+
+    let rendered = match &body.values[value] {
+        ValueDef::BlockParam(block, index, _) => {
+            if *block == body.entry
+                && usize::try_from(*index).is_ok_and(|index| index < body.n_params)
+            {
+                format!("$arg{index}")
+            } else {
+                let incoming = incoming_block_param_values(body, *block, *index)
+                    .into_iter()
+                    .map(|incoming| {
+                        render_semantic_value(
+                            body,
+                            incoming,
+                            bindings,
+                            depth.saturating_sub(1),
+                            visiting,
+                        )
+                    })
+                    .collect::<BTreeSet<_>>();
+                match incoming.len() {
+                    0 => format!("$block{}p{index}", block.index()),
+                    1 => incoming
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| format!("$block{}p{index}", block.index())),
+                    _ => format!(
+                        "phi({})",
+                        incoming.into_iter().collect::<Vec<_>>().join(", ")
+                    ),
+                }
+            }
+        }
+        ValueDef::Operator(op, args, _) => {
+            let args = body.arg_pool[*args]
+                .iter()
+                .map(|arg| {
+                    render_semantic_value(body, *arg, bindings, depth.saturating_sub(1), visiting)
+                })
+                .collect::<Vec<_>>();
+            let family = operator_family(op);
+            if is_inlineable_scalar(op) {
+                render_scalar_family(&family, &args)
+                    .unwrap_or_else(|| format!("{family}({})", args.join(", ")))
+            } else {
+                format!("{op}({})", args.join(", "))
+            }
+        }
+        ValueDef::PickOutput(source, index, _) => format!(
+            "pick{index}({})",
+            render_semantic_value(body, *source, bindings, depth.saturating_sub(1), visiting,)
+        ),
+        ValueDef::Alias(source) => {
+            render_semantic_value(body, *source, bindings, depth.saturating_sub(1), visiting)
+        }
+        ValueDef::Placeholder(_) | ValueDef::None => format!("v{}", value.index()),
+    };
+    visiting.remove(&value);
+    rendered
+}
+
 fn operator_family(op: &Operator) -> String {
     let rendered = op.to_string();
     rendered
@@ -429,20 +893,30 @@ fn is_effectful_operator(op: &Operator) -> bool {
         || rendered.starts_with("elem.drop")
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct StateTransitionReport {
     pub successor: u32,
     pub arguments: Vec<String>,
+    pub composed_arguments: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct NestedMachineEntryReport {
+    pub machine_index: usize,
+    pub arguments: Vec<String>,
+    pub composed_arguments: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct StateCaseReport {
     pub state: u32,
     pub blocks: BTreeSet<usize>,
+    pub entry_arguments: Vec<String>,
     pub successors: BTreeSet<u32>,
     pub transitions: Vec<StateTransitionReport>,
     pub nested_machines: BTreeSet<usize>,
     pub direct_nested_machines: BTreeSet<usize>,
+    pub nested_entries: Vec<NestedMachineEntryReport>,
     pub operator_counts: BTreeMap<String, usize>,
     pub effects: Vec<String>,
     pub instruction_sample: Vec<String>,
@@ -501,13 +975,14 @@ fn summarize_state_case(
                 if index == param_index {
                     format!("0x{:08x}", edge.successor)
                 } else {
-                    render_value(body, dispatcher, state, *value, 6)
+                    render_value(body, dispatcher, state, *value, 20)
                 }
             })
             .collect::<Vec<_>>();
         let report = StateTransitionReport {
             successor: edge.successor,
             arguments,
+            composed_arguments: Vec::new(),
         };
         if !transitions.contains(&report) {
             transitions.push(report);
@@ -521,10 +996,12 @@ fn summarize_state_case(
             .difference(excluded_blocks)
             .map(|block| block.index())
             .collect(),
+        entry_arguments: Vec::new(),
         successors: trace.next.clone(),
         transitions,
         nested_machines: BTreeSet::new(),
         direct_nested_machines: BTreeSet::new(),
+        nested_entries: Vec::new(),
         operator_counts,
         effects,
         instruction_sample,
@@ -568,6 +1045,263 @@ struct MachineMeta {
     param_index: usize,
 }
 
+fn target_argument_vectors(
+    body: &FunctionBody,
+    source_blocks: &BTreeSet<Block>,
+    target_block: Block,
+    target_state_param_index: usize,
+    target_initial: &BTreeSet<u32>,
+    dispatcher: Block,
+    state: Value,
+) -> Vec<Vec<String>> {
+    let mut result = Vec::new();
+    for block in source_blocks {
+        body.blocks[*block].terminator.visit_targets(|target| {
+            if target.block != target_block {
+                return;
+            }
+            let Some(target_state) = target.args.get(target_state_param_index) else {
+                return;
+            };
+            let Some(target_state) = i32_const(body, *target_state) else {
+                return;
+            };
+            if !target_initial.contains(&target_state) {
+                return;
+            }
+            let arguments = target
+                .args
+                .iter()
+                .map(|value| render_value(body, dispatcher, state, *value, 20))
+                .collect::<Vec<_>>();
+            if !result.contains(&arguments) {
+                result.push(arguments);
+            }
+        });
+    }
+    result
+}
+
+fn annotate_initial_entries(
+    body: &FunctionBody,
+    machines: &mut [StateMachineReport],
+    metadata: &[MachineMeta],
+) {
+    let all_blocks = body
+        .blocks
+        .entries()
+        .map(|(block, _)| block)
+        .collect::<BTreeSet<_>>();
+    let entries = machines
+        .iter()
+        .zip(metadata)
+        .map(|(machine, meta)| {
+            target_argument_vectors(
+                body,
+                &all_blocks,
+                meta.dispatcher,
+                meta.param_index,
+                &machine.initial,
+                meta.dispatcher,
+                meta.state,
+            )
+        })
+        .collect::<Vec<_>>();
+    for (machine, initial_entries) in machines.iter_mut().zip(entries) {
+        machine.initial_entries = initial_entries;
+    }
+}
+
+fn initial_environment(machine: &StateMachineReport) -> Vec<String> {
+    if let [entry] = machine.initial_entries.as_slice() {
+        if entry.len() == machine.parameter_count {
+            return entry.clone();
+        }
+    }
+    let mut environment = (0..machine.parameter_count)
+        .map(|index| format!("$p{index}"))
+        .collect::<Vec<_>>();
+    if machine.initial.len() == 1 {
+        if let Some(value) = machine.initial.iter().next() {
+            if let Some(state) = environment.get_mut(machine.state_param_index) {
+                *state = format!("0x{value:08x}");
+            }
+        }
+    }
+    environment
+}
+
+fn annotate_composed_machine_flows(machines: &mut [StateMachineReport]) {
+    for machine in machines {
+        if machine.linearized.is_none() {
+            continue;
+        }
+        let mut environment = initial_environment(machine);
+        for case in &mut machine.cases {
+            case.entry_arguments = environment.clone();
+            for transition in &mut case.transitions {
+                transition.composed_arguments =
+                    substitute_arguments(&transition.arguments, &environment);
+            }
+            for entry in &mut case.nested_entries {
+                entry.composed_arguments = substitute_arguments(&entry.arguments, &environment);
+            }
+            match case.transitions.as_slice() {
+                [transition] => environment = transition.composed_arguments.clone(),
+                [] => {}
+                _ => break,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct StateMachinePipelineStageReport {
+    pub machine_index: usize,
+    pub state_count: usize,
+    pub entry_arguments: Vec<String>,
+    pub exit_arguments: Vec<String>,
+    pub next_machine: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StateMachinePipelineReport {
+    pub root_machine: usize,
+    pub stages: Vec<StateMachinePipelineStageReport>,
+}
+
+fn unique_direct_entry(machine: &StateMachineReport) -> Option<&NestedMachineEntryReport> {
+    let mut entries = machine
+        .cases
+        .iter()
+        .flat_map(|case| case.nested_entries.iter());
+    let first = entries.next()?;
+    entries.next().is_none().then_some(first)
+}
+
+pub fn compose_machine_pipelines(
+    machines: &[StateMachineReport],
+) -> Vec<StateMachinePipelineReport> {
+    let mut pipelines = Vec::new();
+    for root in root_machine_indices(machines) {
+        let mut current = root;
+        let mut environment = initial_environment(&machines[root]);
+        let mut seen = BTreeSet::new();
+        let mut stages = Vec::new();
+
+        loop {
+            if !seen.insert(current) {
+                break;
+            }
+            let machine = &machines[current];
+            let terminal_local = machine
+                .cases
+                .last()
+                .map(|case| case.entry_arguments.as_slice())
+                .unwrap_or_default();
+            let terminal_absolute = substitute_arguments(terminal_local, &environment);
+
+            let (next_machine, next_environment, exit_arguments) =
+                if let Some(entry) = unique_direct_entry(machine) {
+                    let absolute = substitute_arguments(&entry.composed_arguments, &environment);
+                    if absolute.len() == machines[entry.machine_index].parameter_count {
+                        (Some(entry.machine_index), Some(absolute.clone()), absolute)
+                    } else {
+                        (None, None, terminal_absolute)
+                    }
+                } else {
+                    (None, None, terminal_absolute)
+                };
+
+            stages.push(StateMachinePipelineStageReport {
+                machine_index: current,
+                state_count: machine.cases.len(),
+                entry_arguments: environment.clone(),
+                exit_arguments,
+                next_machine,
+            });
+
+            let (Some(next), Some(next_environment)) = (next_machine, next_environment) else {
+                break;
+            };
+            current = next;
+            environment = next_environment;
+        }
+
+        pipelines.push(StateMachinePipelineReport {
+            root_machine: root,
+            stages,
+        });
+    }
+    pipelines
+}
+
+fn terminal_environment(machine: &StateMachineReport) -> Vec<String> {
+    machine
+        .cases
+        .last()
+        .map(|case| case.entry_arguments.clone())
+        .unwrap_or_else(|| initial_environment(machine))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SemanticBindingReport {
+    pub machine_index: usize,
+    pub parameter_index: usize,
+    pub state_parameter: bool,
+    pub name: String,
+    pub expression: String,
+}
+
+fn terminal_bindings(
+    body: &FunctionBody,
+    machines: &[StateMachineReport],
+    metadata: &[MachineMeta],
+) -> (BTreeMap<Value, String>, Vec<SemanticBindingReport>) {
+    let mut bindings = BTreeMap::new();
+    let mut reports = Vec::new();
+    for (machine, meta) in machines.iter().zip(metadata) {
+        let environment = terminal_environment(machine);
+        for (parameter_index, ((_, parameter), expression)) in body.blocks[meta.dispatcher]
+            .params
+            .iter()
+            .zip(environment)
+            .enumerate()
+        {
+            let name = format!("$m{}_p{parameter_index}", machine.machine_index);
+            bindings.insert(*parameter, name.clone());
+            reports.push(SemanticBindingReport {
+                machine_index: machine.machine_index,
+                parameter_index,
+                state_parameter: parameter_index == machine.state_param_index,
+                name,
+                expression,
+            });
+        }
+    }
+    (bindings, reports)
+}
+
+fn render_return_expressions(
+    body: &FunctionBody,
+    bindings: &BTreeMap<Value, String>,
+) -> Vec<String> {
+    let mut expressions = Vec::new();
+    for (_, block) in body.blocks.entries() {
+        let Terminator::Return { values } = &block.terminator else {
+            continue;
+        };
+        for value in values {
+            let mut visiting = BTreeSet::new();
+            let expression = render_semantic_value(body, *value, bindings, 48, &mut visiting);
+            if !expressions.contains(&expression) {
+                expressions.push(expression);
+            }
+        }
+    }
+    expressions
+}
+
 fn machine_contains(machines: &[StateMachineReport], outer: usize, inner: usize) -> bool {
     let dispatcher = machines[inner].dispatcher_block;
     machines[outer]
@@ -599,6 +1333,10 @@ fn annotate_nested_machines(
                 .map(Block::new)
                 .collect::<BTreeSet<_>>()
         })
+        .collect::<Vec<_>>();
+    let dispatcher_blocks = machines
+        .iter()
+        .map(|machine| Block::new(machine.dispatcher_block))
         .collect::<Vec<_>>();
 
     for machine_index in 0..machines.len() {
@@ -635,6 +1373,28 @@ fn annotate_nested_machines(
                 .iter()
                 .flat_map(|&inner| raw_regions[inner].iter().copied())
                 .collect::<BTreeSet<_>>();
+            let mut nested_entries = Vec::new();
+            for &inner in &direct_nested {
+                for arguments in target_argument_vectors(
+                    body,
+                    &trace.blocks,
+                    dispatcher_blocks[inner],
+                    machines[inner].state_param_index,
+                    &machines[inner].initial,
+                    meta.dispatcher,
+                    meta.state,
+                ) {
+                    let entry = NestedMachineEntryReport {
+                        machine_index: inner,
+                        arguments,
+                        composed_arguments: Vec::new(),
+                    };
+                    if !nested_entries.contains(&entry) {
+                        nested_entries.push(entry);
+                    }
+                }
+            }
+
             let mut case = summarize_state_case(
                 body,
                 meta.dispatcher,
@@ -646,6 +1406,7 @@ fn annotate_nested_machines(
             );
             case.nested_machines = nested;
             case.direct_nested_machines = direct_nested;
+            case.nested_entries = nested_entries;
             cases.push(case);
         }
         machines[machine_index].cases = cases;
@@ -671,6 +1432,9 @@ pub struct StateMachineReport {
     pub machine_index: usize,
     pub state_value: usize,
     pub dispatcher_block: usize,
+    pub parameter_count: usize,
+    pub state_param_index: usize,
+    pub initial_entries: Vec<Vec<String>>,
     pub comparisons: usize,
     pub initial: BTreeSet<u32>,
     pub graph: BTreeMap<u32, BTreeSet<u32>>,
@@ -680,10 +1444,16 @@ pub struct StateMachineReport {
     pub data_forks: usize,
 }
 
-pub fn analyze_export_state_machines(
-    bytes: &[u8],
-    export_name: &str,
-) -> Result<Vec<StateMachineReport>> {
+#[derive(Debug, Serialize)]
+pub struct ExportSemanticAnalysis {
+    pub state_machine_roots: Vec<usize>,
+    pub state_machine_pipelines: Vec<StateMachinePipelineReport>,
+    pub state_machines: Vec<StateMachineReport>,
+    pub terminal_bindings: Vec<SemanticBindingReport>,
+    pub return_expressions: Vec<String>,
+}
+
+pub fn analyze_export_semantics(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalysis> {
     match catch_unwind(AssertUnwindSafe(|| analyze_inner(bytes, export_name))) {
         Ok(result) => result,
         Err(payload) => {
@@ -697,7 +1467,7 @@ pub fn analyze_export_state_machines(
     }
 }
 
-fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<Vec<StateMachineReport>> {
+fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalysis> {
     let mut module = Module::from_wasm_bytes(bytes, &FrontendOptions::default())?;
     let func = module
         .exports
@@ -763,6 +1533,19 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<Vec<StateMachineRepo
             graph.insert(current, trace.next);
         }
 
+        let incoming = graph
+            .values()
+            .flat_map(|successors| successors.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let graph_roots = graph
+            .keys()
+            .copied()
+            .filter(|state| !incoming.contains(state))
+            .collect::<BTreeSet<_>>();
+        if !graph_roots.is_empty() {
+            initial = graph_roots;
+        }
+
         let linearized = linearize_state_graph(&initial, &graph);
         let order = linearized
             .clone()
@@ -788,6 +1571,9 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<Vec<StateMachineRepo
             machine_index,
             state_value: state.index(),
             dispatcher_block: dispatcher.index(),
+            parameter_count: body.blocks[dispatcher].params.len(),
+            state_param_index: param_index,
+            initial_entries: Vec::new(),
             comparisons: cmp_count,
             initial,
             graph,
@@ -802,8 +1588,20 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<Vec<StateMachineRepo
             param_index,
         });
     }
+    annotate_initial_entries(body, &mut machines, &metadata);
     annotate_nested_machines(body, &mut machines, &metadata);
-    Ok(machines)
+    annotate_composed_machine_flows(&mut machines);
+    let state_machine_roots = root_machine_indices(&machines);
+    let state_machine_pipelines = compose_machine_pipelines(&machines);
+    let (bindings, terminal_bindings) = terminal_bindings(body, &machines, &metadata);
+    let return_expressions = render_return_expressions(body, &bindings);
+    Ok(ExportSemanticAnalysis {
+        state_machine_roots,
+        state_machine_pipelines,
+        state_machines: machines,
+        terminal_bindings,
+        return_expressions,
+    })
 }
 
 #[cfg(test)]
@@ -845,7 +1643,8 @@ mod tests {
                     end
                     unreachable))"#,
         )?;
-        let machines = analyze_export_state_machines(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let machines = &analysis.state_machines;
         assert_eq!(machines.len(), 1);
         let machine = &machines[0];
         assert_eq!(machine.initial, BTreeSet::from([10]));
@@ -862,9 +1661,153 @@ mod tests {
         assert_eq!(machine.cases[0].successors, BTreeSet::from([20]));
         assert_eq!(machine.cases[0].transitions.len(), 1);
         assert_eq!(machine.cases[0].transitions[0].successor, 20);
+        assert!(!machine.cases[0].transitions[0]
+            .composed_arguments
+            .is_empty());
         assert!(machine.cases[0].nested_machines.is_empty());
         assert!(machine.cases[0].direct_nested_machines.is_empty());
-        assert_eq!(root_machine_indices(&machines), vec![0]);
+        assert_eq!(root_machine_indices(machines), vec![0]);
+        Ok(())
+    }
+
+    #[test]
+    fn folds_closed_i32_expression_language() {
+        assert_eq!(
+            try_eval_i32_expression(
+                "wrapping_add(reverse_bits32(0x00000001), rotl(0x00000001, 0x00000008))"
+            ),
+            Some(0x8000_0100)
+        );
+        assert_eq!(
+            fold_closed_i32_expression("((0x000000f0 >> 0x00000004) | 0x00000010)".to_owned()),
+            "0x0000001f"
+        );
+        assert_eq!(try_eval_i32_expression("$p1"), None);
+    }
+
+    #[test]
+    fn folds_carried_value_across_linear_state_chain() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (func (export "run") (result i32)
+                    (local $state i32)
+                    (local $value i32)
+                    i32.const 10
+                    local.set $state
+                    i32.const 1
+                    local.set $value
+                    loop $dispatch
+                        local.get $state i32.const 10 i32.eq
+                        if
+                            local.get $value i32.const 3 i32.add local.set $value
+                            i32.const 20 local.set $state
+                            br $dispatch
+                        end
+                        local.get $state i32.const 20 i32.eq
+                        if
+                            local.get $value i32.const 1 i32.rotl local.set $value
+                            i32.const 30 local.set $state
+                            br $dispatch
+                        end
+                        local.get $state i32.const 30 i32.eq
+                        if
+                            local.get $value i32.const 5 i32.xor local.set $value
+                            i32.const 40 local.set $state
+                            br $dispatch
+                        end
+                        local.get $state i32.const 40 i32.eq
+                        if
+                            local.get $value i32.const 7 i32.mul local.set $value
+                            i32.const 50 local.set $state
+                            br $dispatch
+                        end
+                        local.get $state i32.const 50 i32.eq
+                        if local.get $value return end
+                        unreachable
+                    end
+                    unreachable))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(analysis.state_machines.len(), 1);
+        assert_eq!(analysis.state_machine_pipelines.len(), 1);
+        assert!(analysis
+            .terminal_bindings
+            .iter()
+            .filter(|binding| !binding.state_parameter)
+            .any(|binding| binding.expression == "0x0000005b"));
+        Ok(())
+    }
+
+    #[test]
+    fn renders_canonical_i32_bit_reverse() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (func (export "reverse") (param $input i32) (result i32)
+                    (local $value i32)
+                    local.get $input
+                    i32.const 1
+                    i32.shr_u
+                    i32.const 0x55555555
+                    i32.and
+                    local.get $input
+                    i32.const 0x55555555
+                    i32.and
+                    i32.const 1
+                    i32.shl
+                    i32.or
+                    local.set $value
+
+                    local.get $value
+                    i32.const 2
+                    i32.shr_u
+                    i32.const 0x33333333
+                    i32.and
+                    local.get $value
+                    i32.const 0x33333333
+                    i32.and
+                    i32.const 2
+                    i32.shl
+                    i32.or
+                    local.set $value
+
+                    local.get $value
+                    i32.const 4
+                    i32.shr_u
+                    i32.const 0x0f0f0f0f
+                    i32.and
+                    local.get $value
+                    i32.const 0x0f0f0f0f
+                    i32.and
+                    i32.const 4
+                    i32.shl
+                    i32.or
+                    local.set $value
+
+                    local.get $value
+                    i32.const 24
+                    i32.shr_u
+                    local.get $value
+                    i32.const 8
+                    i32.shr_u
+                    i32.const 0x0000ff00
+                    i32.and
+                    i32.or
+                    local.get $value
+                    i32.const 8
+                    i32.shl
+                    i32.const 0x00ff0000
+                    i32.and
+                    i32.or
+                    local.get $value
+                    i32.const 24
+                    i32.shl
+                    i32.or))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "reverse")?;
+        assert_eq!(analysis.return_expressions, ["reverse_bits32($arg0)"]);
+        assert!(analysis.state_machines.is_empty());
         Ok(())
     }
 
@@ -910,9 +1853,10 @@ mod tests {
                     unreachable))"#,
         )?;
 
-        let machines = analyze_export_state_machines(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let machines = &analysis.state_machines;
         assert_eq!(machines.len(), 2);
-        let roots = root_machine_indices(&machines);
+        let roots = &analysis.state_machine_roots;
         assert_eq!(roots.len(), 1);
         let root = roots[0];
         let children = machines[root]
@@ -928,6 +1872,10 @@ mod tests {
             .all(|case| case.direct_nested_machines.is_empty()));
         assert!(machines[root].graph.len() >= 5);
         assert!(machines[child].graph.len() >= 5);
+        let pipelines = compose_machine_pipelines(machines);
+        assert_eq!(pipelines.len(), 1);
+        assert_eq!(pipelines[0].stages.len(), 2);
+        assert_eq!(pipelines[0].stages[0].next_machine, Some(child));
         Ok(())
     }
 }
