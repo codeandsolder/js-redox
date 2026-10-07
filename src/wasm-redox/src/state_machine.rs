@@ -760,14 +760,15 @@ fn reverse_bits_source(body: &FunctionBody, value: Value) -> Option<Value> {
         .then_some(permutation.base)
 }
 
-fn incoming_block_param_values(body: &FunctionBody, block: Block, index: u32) -> Vec<Value> {
-    let Ok(index) = usize::try_from(index) else {
+fn incoming_block_param_values(body: &FunctionBody, block: Block, parameter: Value) -> Vec<Value> {
+    let parameter = body.resolve_alias(parameter);
+    let Some(index) = body.blocks[block]
+        .params
+        .iter()
+        .position(|(_, candidate)| body.resolve_alias(*candidate) == parameter)
+    else {
         return Vec::new();
     };
-    let Some((_, parameter)) = body.blocks[block].params.get(index) else {
-        return Vec::new();
-    };
-    let parameter = body.resolve_alias(*parameter);
     let mut incoming = BTreeSet::new();
 
     for (_, predecessor) in body.blocks.entries() {
@@ -862,8 +863,8 @@ fn call_label<'a>(
                 body.arg_pool[*args].to_vec(),
             )),
             ValueDef::PickOutput(source, 0, _) => inner(body, *source, names, depth - 1),
-            ValueDef::BlockParam(block, index, _) => {
-                let incoming = incoming_block_param_values(body, *block, *index);
+            ValueDef::BlockParam(block, _, _) => {
+                let incoming = incoming_block_param_values(body, *block, value);
                 let [incoming] = incoming.as_slice() else {
                     return None;
                 };
@@ -909,8 +910,8 @@ fn unique_transparent_origin(body: &FunctionBody, value: Value, depth: usize) ->
     let value = body.resolve_alias(value);
     match &body.values[value] {
         ValueDef::PickOutput(source, 0, _) => unique_transparent_origin(body, *source, depth - 1),
-        ValueDef::BlockParam(block, index, _) => {
-            let incoming = incoming_block_param_values(body, *block, *index);
+        ValueDef::BlockParam(block, _, _) => {
+            let incoming = incoming_block_param_values(body, *block, value);
             let [incoming] = incoming.as_slice() else {
                 return value;
             };
@@ -1049,7 +1050,7 @@ fn render_semantic_value(
             {
                 format!("$arg{index}")
             } else {
-                let incoming = incoming_block_param_values(body, *block, *index)
+                let incoming = incoming_block_param_values(body, *block, value)
                     .into_iter()
                     .map(|incoming| {
                         render_semantic_value(
@@ -2295,6 +2296,51 @@ mod tests {
             analysis.return_expressions,
             ["wrapping_add($runtime0, $runtime0)"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn follows_surviving_block_params_after_redundant_param_removal() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (func (export "run") (param $cond i32) (result i32)
+                    (local $a i32)
+                    (local $b i32)
+                    (local $c i32)
+                    (local $d i32)
+                    i32.const 10
+                    local.set $a
+                    i32.const 20
+                    local.set $b
+                    i32.const 30
+                    local.set $c
+                    i32.const 40
+                    local.set $d
+
+                    local.get $cond
+                    if
+                        i32.const 21
+                        local.set $b
+                        i32.const 41
+                        local.set $d
+                    end
+
+                    local.get $a
+                    local.get $b
+                    i32.add
+                    local.get $c
+                    i32.add
+                    local.get $d
+                    i32.add))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let expression = analysis
+            .return_expressions
+            .first()
+            .context("return expression")?;
+        assert!(expression.contains("phi(0x00000014, 0x00000015)"));
+        assert!(expression.contains("phi(0x00000028, 0x00000029)"));
         Ok(())
     }
 }
