@@ -901,6 +901,7 @@ fn conditional_phi_inputs(
 #[derive(Default)]
 struct SemanticCallNames {
     labels: BTreeMap<Func, String>,
+    validated_memory_grow_imports: BTreeSet<Func>,
 }
 
 fn strip_wasm_bindgen_hash(name: &str) -> &str {
@@ -1050,6 +1051,22 @@ fn helper_is_memory_slot(body: &FunctionBody, names: &SemanticCallNames) -> bool
     })
 }
 
+fn memory_slot_from_table_get(
+    body: &FunctionBody,
+    value: Value,
+    names: &SemanticCallNames,
+) -> Option<Value> {
+    let value = body.resolve_alias(value);
+    let ValueDef::Operator(Operator::TableGet { .. }, args, _) = &body.values[value] else {
+        return None;
+    };
+    let [slot] = &body.arg_pool[*args] else {
+        return None;
+    };
+    let (label, call_args) = call_label(body, *slot, names)?;
+    (label == "wbindgen.memory_slot" && call_args.is_empty()).then_some(*slot)
+}
+
 fn classify_wasm_bindgen_helper(
     body: &FunctionBody,
     names: &SemanticCallNames,
@@ -1129,6 +1146,9 @@ fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> SemanticCal
                 function,
                 normalize_import_name(&import.module, &import.name),
             );
+            if import.module == "wbg" && import.name == "__wbg_grow_43d369088a370694" {
+                names.validated_memory_grow_imports.insert(function);
+            }
         }
     }
 
@@ -1303,10 +1323,44 @@ fn render_semantic_value(
                     .collect::<Vec<_>>();
                 let family = operator_family(op);
                 let rendered = if let Operator::Call { function_index } = op {
-                    context.call_names.labels.get(function_index).map_or_else(
-                        || format!("{op}({})", args.join(", ")),
-                        |name| format!("{name}({})", args.join(", ")),
-                    )
+                    if context
+                        .call_names
+                        .validated_memory_grow_imports
+                        .contains(function_index)
+                    {
+                        let [receiver, delta] = raw_args else {
+                            return format!("{op}({})", args.join(", "));
+                        };
+                        if let Some(slot) =
+                            memory_slot_from_table_get(body, *receiver, context.call_names)
+                        {
+                            let slot = render_semantic_value(
+                                body,
+                                slot,
+                                context,
+                                depth.saturating_sub(1),
+                                visiting,
+                            );
+                            let delta = render_semantic_value(
+                                body,
+                                *delta,
+                                context,
+                                depth.saturating_sub(1),
+                                visiting,
+                            );
+                            format!("wasm.memory_grow({delta}, externref_slot={slot})")
+                        } else {
+                            context.call_names.labels.get(function_index).map_or_else(
+                                || format!("{op}({})", args.join(", ")),
+                                |name| format!("{name}({})", args.join(", ")),
+                            )
+                        }
+                    } else {
+                        context.call_names.labels.get(function_index).map_or_else(
+                            || format!("{op}({})", args.join(", ")),
+                            |name| format!("{name}({})", args.join(", ")),
+                        )
+                    }
                 } else if is_inlineable_scalar(op) {
                     render_scalar_family(&family, &args)
                         .unwrap_or_else(|| format!("{family}({})", args.join(", ")))
@@ -2682,6 +2736,41 @@ mod tests {
             .first()
             .context("return expression")?;
         assert_eq!(expression, "phi_if($arg0, 0x00000014, 0x0000001e)");
+        Ok(())
+    }
+    #[test]
+    fn names_captured_memory_grow_only_with_proven_memory_receiver() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "__wbindgen_memory" (func $memory (result externref)))
+                (import "wbg" "__wbg_grow_43d369088a370694"
+                    (func $grow (param externref i32) (result i32)))
+                (import "host" "alloc" (func $alloc (result i32)))
+                (table 2 externref)
+                (func $memory_slot (result i32)
+                    (local $slot i32)
+                    call $alloc
+                    local.tee $slot
+                    call $memory
+                    table.set 0
+                    local.get $slot)
+                (func (export "run") (result i32)
+                    call $memory_slot
+                    table.get 0
+                    i32.const 1
+                    call $grow))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(analysis.runtime_bindings.len(), 2);
+        assert_eq!(
+            analysis.runtime_bindings[0].expression,
+            "wbindgen.memory_slot()"
+        );
+        assert_eq!(
+            analysis.runtime_bindings[1].expression,
+            "wasm.memory_grow(0x00000001, externref_slot=$runtime0)"
+        );
         Ok(())
     }
 }
