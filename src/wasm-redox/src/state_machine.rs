@@ -6,7 +6,7 @@ use std::{
 };
 use waffle::{
     entity::EntityRef, Block, BlockTarget, ExportKind, FrontendOptions, Func, FunctionBody,
-    ImportKind, Module, Operator, OptOptions, Terminator, Value, ValueDef,
+    ImportKind, Module, Operator, OptOptions, Terminator, Type, Value, ValueDef,
 };
 
 fn i32_const(body: &FunctionBody, value: Value) -> Option<u32> {
@@ -961,6 +961,57 @@ fn classify_wasm_bindgen_helper(
     }
 }
 
+fn helper_is_heap_allocator(
+    module: &Module<'_>,
+    function: Func,
+    body: &FunctionBody,
+    imported_functions: &BTreeSet<Func>,
+) -> bool {
+    let signature = &module.signatures[module.funcs[function].sig()];
+    if signature.params.as_slice() != [Type::I32]
+        || signature.returns.as_slice() != [Type::I32]
+        || direct_called_functions(body)
+            .iter()
+            .any(|callee| imported_functions.contains(callee))
+    {
+        return false;
+    }
+
+    let mut memory_grows = 0usize;
+    let mut loads = 0usize;
+    let mut stores = 0usize;
+    for (_, value) in body.values.entries() {
+        let ValueDef::Operator(operator, _, _) = value else {
+            continue;
+        };
+        let family = operator_family(operator);
+        if matches!(operator, Operator::MemoryGrow { .. }) {
+            memory_grows += 1;
+        } else if family.contains("load") {
+            loads += 1;
+        } else if family.contains("store") {
+            stores += 1;
+        }
+    }
+
+    let mut zero_return = false;
+    let mut nonzero_return = false;
+    for (_, block) in body.blocks.entries() {
+        let Terminator::Return { values } = &block.terminator else {
+            continue;
+        };
+        let [value] = values.as_slice() else {
+            continue;
+        };
+        match i32_const(body, *value) {
+            Some(0) => zero_return = true,
+            _ => nonzero_return = true,
+        }
+    }
+
+    memory_grows > 0 && loads >= 4 && stores >= 8 && zero_return && nonzero_return
+}
+
 fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> SemanticCallNames {
     let mut names = SemanticCallNames::default();
     for import in &module.imports {
@@ -972,6 +1023,14 @@ fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> SemanticCal
         }
     }
 
+    let imported_functions = module
+        .imports
+        .iter()
+        .filter_map(|import| match import.kind {
+            ImportKind::Func(function) => Some(function),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     let direct_callees = module.funcs[root]
         .body()
         .map(direct_called_functions)
@@ -985,6 +1044,8 @@ fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> SemanticCal
         };
         if let Some(label) = classify_wasm_bindgen_helper(body, &names) {
             names.labels.insert(callee, label.to_owned());
+        } else if helper_is_heap_allocator(module, callee, body, &imported_functions) {
+            names.labels.insert(callee, "wasm.heap_alloc".to_owned());
         }
     }
     names
@@ -2341,6 +2402,109 @@ mod tests {
             .context("return expression")?;
         assert!(expression.contains("phi(0x00000014, 0x00000015)"));
         assert!(expression.contains("phi(0x00000028, 0x00000029)"));
+        Ok(())
+    }
+
+    #[test]
+    fn names_structurally_proven_heap_allocator() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (memory 1)
+                (func $alloc (param $bytes i32) (result i32)
+                    (local $ptr i32)
+                    local.get $bytes
+                    i32.const 65535
+                    i32.add
+                    i32.const 16
+                    i32.shr_u
+                    memory.grow
+                    local.tee $ptr
+                    i32.const -1
+                    i32.eq
+                    if
+                        i32.const 0
+                        return
+                    end
+                    local.get $ptr
+                    i32.const 16
+                    i32.shl
+                    local.set $ptr
+
+                    local.get $ptr
+                    i32.load
+                    drop
+                    local.get $ptr
+                    i32.load offset=4
+                    drop
+                    local.get $ptr
+                    i32.load offset=8
+                    drop
+                    local.get $ptr
+                    i32.load offset=12
+                    drop
+
+                    local.get $ptr
+                    i32.const 1
+                    i32.store
+                    local.get $ptr
+                    i32.const 2
+                    i32.store offset=4
+                    local.get $ptr
+                    i32.const 3
+                    i32.store offset=8
+                    local.get $ptr
+                    i32.const 4
+                    i32.store offset=12
+                    local.get $ptr
+                    i32.const 5
+                    i32.store offset=16
+                    local.get $ptr
+                    i32.const 6
+                    i32.store offset=20
+                    local.get $ptr
+                    i32.const 7
+                    i32.store offset=24
+                    local.get $ptr
+                    i32.const 8
+                    i32.store offset=28
+
+                    local.get $ptr
+                    i32.const 8
+                    i32.add)
+                (func (export "run") (param $bytes i32) (result i32)
+                    local.get $bytes
+                    call $alloc))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(analysis.return_expressions, ["$runtime0"]);
+        assert_eq!(analysis.runtime_bindings.len(), 1);
+        assert_eq!(
+            analysis.runtime_bindings[0].expression,
+            "wasm.heap_alloc($arg0)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn does_not_name_plain_memory_grow_as_heap_allocator() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (memory 1)
+                (func $grow (param $pages i32) (result i32)
+                    local.get $pages
+                    memory.grow)
+                (func (export "run") (param $pages i32) (result i32)
+                    local.get $pages
+                    call $grow))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(analysis.return_expressions, ["$runtime0"]);
+        assert_eq!(analysis.runtime_bindings.len(), 1);
+        assert!(!analysis.runtime_bindings[0]
+            .expression
+            .contains("wasm.heap_alloc"));
         Ok(())
     }
 }
