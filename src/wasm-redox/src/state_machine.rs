@@ -311,16 +311,34 @@ fn is_inlineable_scalar(op: &Operator) -> bool {
 }
 
 fn render_scalar_family(family: &str, args: &[String]) -> Option<String> {
+    const ZERO: &str = "0x00000000";
+    const ONE: &str = "0x00000001";
+    const ALL_ONES: &str = "0xffffffff";
+
     if let [a] = args {
-        return match family {
-            "i32eqz" => Some(format!("is_zero({a})")),
-            _ => None,
+        let expression = match family {
+            "i32eqz" => format!("is_zero({a})"),
+            _ => return None,
         };
+        return Some(fold_closed_i32_expression(expression));
     }
     let [a, b] = args else {
         return None;
     };
-    Some(match family {
+    let expression = match family {
+        "i32add" if a == ZERO => b.clone(),
+        "i32add" if b == ZERO => a.clone(),
+        "i32sub" if b == ZERO => a.clone(),
+        "i32mul" if a == ZERO || b == ZERO => ZERO.to_owned(),
+        "i32mul" if a == ONE => b.clone(),
+        "i32mul" if b == ONE => a.clone(),
+        "i32and" if a == ZERO || b == ZERO => ZERO.to_owned(),
+        "i32and" if a == ALL_ONES => b.clone(),
+        "i32and" if b == ALL_ONES => a.clone(),
+        "i32or" | "i32xor" if a == ZERO => b.clone(),
+        "i32or" | "i32xor" if b == ZERO => a.clone(),
+        "i32shl" | "i32shrs" | "i32shru" | "i32rotl" | "i32rotr" if a == ZERO => ZERO.to_owned(),
+        "i32shl" | "i32shrs" | "i32shru" | "i32rotl" | "i32rotr" if b == ZERO => a.clone(),
         "i32add" => format!("wrapping_add({a}, {b})"),
         "i32sub" => format!("wrapping_sub({a}, {b})"),
         "i32mul" => format!("wrapping_mul({a}, {b})"),
@@ -343,7 +361,8 @@ fn render_scalar_family(family: &str, args: &[String]) -> Option<String> {
         "i32gts" => format!("sgt({a}, {b})"),
         "i32ges" => format!("sge({a}, {b})"),
         _ => return None,
-    })
+    };
+    Some(fold_closed_i32_expression(expression))
 }
 
 fn render_value(
@@ -902,6 +921,11 @@ fn conditional_phi_inputs(
 struct SemanticCallNames {
     labels: BTreeMap<Func, String>,
     validated_memory_grow_imports: BTreeSet<Func>,
+    validated_buffer_imports: BTreeSet<Func>,
+    validated_byte_length_imports: BTreeSet<Func>,
+    validated_view_new_imports: BTreeSet<Func>,
+    validated_get_u32_imports: BTreeSet<Func>,
+    validated_memory_get_u32_helpers: BTreeSet<Func>,
 }
 
 fn strip_wasm_bindgen_hash(name: &str) -> &str {
@@ -952,38 +976,34 @@ fn unique_return_value(body: &FunctionBody) -> Option<Value> {
         .flatten()
 }
 
+fn call_target(body: &FunctionBody, value: Value, depth: usize) -> Option<(Func, Vec<Value>)> {
+    if depth == 0 {
+        return None;
+    }
+    let value = body.resolve_alias(value);
+    match &body.values[value] {
+        ValueDef::Operator(Operator::Call { function_index }, args, _) => {
+            Some((*function_index, body.arg_pool[*args].to_vec()))
+        }
+        ValueDef::PickOutput(source, 0, _) => call_target(body, *source, depth - 1),
+        ValueDef::BlockParam(block, _, _) => {
+            let incoming = incoming_block_param_values(body, *block, value);
+            let [incoming] = incoming.as_slice() else {
+                return None;
+            };
+            call_target(body, *incoming, depth - 1)
+        }
+        _ => None,
+    }
+}
+
 fn call_label<'a>(
     body: &FunctionBody,
     value: Value,
     names: &'a SemanticCallNames,
 ) -> Option<(&'a str, Vec<Value>)> {
-    fn inner<'a>(
-        body: &FunctionBody,
-        value: Value,
-        names: &'a SemanticCallNames,
-        depth: usize,
-    ) -> Option<(&'a str, Vec<Value>)> {
-        if depth == 0 {
-            return None;
-        }
-        let value = body.resolve_alias(value);
-        match &body.values[value] {
-            ValueDef::Operator(Operator::Call { function_index }, args, _) => Some((
-                names.labels.get(function_index)?.as_str(),
-                body.arg_pool[*args].to_vec(),
-            )),
-            ValueDef::PickOutput(source, 0, _) => inner(body, *source, names, depth - 1),
-            ValueDef::BlockParam(block, _, _) => {
-                let incoming = incoming_block_param_values(body, *block, value);
-                let [incoming] = incoming.as_slice() else {
-                    return None;
-                };
-                inner(body, *incoming, names, depth - 1)
-            }
-            _ => None,
-        }
-    }
-    inner(body, value, names, 8)
+    let (function, args) = call_target(body, value, 8)?;
+    Some((names.labels.get(&function)?.as_str(), args))
 }
 
 fn is_entry_parameter(body: &FunctionBody, value: Value) -> bool {
@@ -995,12 +1015,19 @@ fn is_entry_parameter(body: &FunctionBody, value: Value) -> bool {
     )
 }
 
-fn is_table_get_of_entry_parameter(body: &FunctionBody, value: Value) -> bool {
+fn table_get_slot(body: &FunctionBody, value: Value) -> Option<Value> {
     let value = body.resolve_alias(value);
     let ValueDef::Operator(Operator::TableGet { .. }, args, _) = &body.values[value] else {
-        return false;
+        return None;
     };
-    matches!(&body.arg_pool[*args], [index] if is_entry_parameter(body, *index))
+    let [slot] = &body.arg_pool[*args] else {
+        return None;
+    };
+    Some(*slot)
+}
+
+fn is_table_get_of_entry_parameter(body: &FunctionBody, value: Value) -> bool {
+    table_get_slot(body, value).is_some_and(|index| is_entry_parameter(body, index))
 }
 
 fn helper_returns_import_call(
@@ -1056,18 +1083,129 @@ fn memory_slot_from_table_get(
     value: Value,
     names: &SemanticCallNames,
 ) -> Option<Value> {
-    let value = body.resolve_alias(value);
-    let ValueDef::Operator(Operator::TableGet { .. }, args, _) = &body.values[value] else {
-        return None;
-    };
-    let [slot] = &body.arg_pool[*args] else {
-        return None;
-    };
-    let (label, call_args) = call_label(body, *slot, names)?;
-    (label == "wbindgen.memory_slot" && call_args.is_empty()).then_some(*slot)
+    let slot = table_get_slot(body, value)?;
+    let (label, call_args) = call_label(body, slot, names)?;
+    (label == "wbindgen.memory_slot" && call_args.is_empty()).then_some(slot)
 }
 
-fn classify_wasm_bindgen_helper(
+fn helper_is_buffer_slot(body: &FunctionBody, names: &SemanticCallNames) -> bool {
+    if body.n_params != 1 {
+        return false;
+    }
+    let Some(returned_slot) = unique_return_value(body) else {
+        return false;
+    };
+    let returned_slot = unique_transparent_origin(body, returned_slot, 8);
+    body.values.entries().any(|(_, value)| {
+        let ValueDef::Operator(Operator::TableSet { .. }, args, _) = value else {
+            return false;
+        };
+        let [slot, stored] = &body.arg_pool[*args] else {
+            return false;
+        };
+        if unique_transparent_origin(body, *slot, 8) != returned_slot {
+            return false;
+        }
+        let Some((function, call_args)) = call_target(body, *stored, 8) else {
+            return false;
+        };
+        names.validated_buffer_imports.contains(&function)
+            && matches!(call_args.as_slice(), [receiver]
+                if is_table_get_of_entry_parameter(body, *receiver))
+    })
+}
+
+fn helper_is_memory_get_u32(body: &FunctionBody, names: &SemanticCallNames) -> bool {
+    if body.n_params != 1 {
+        return false;
+    }
+    let Some(returned) = unique_return_value(body) else {
+        return false;
+    };
+    let Some((get_function, get_args)) = call_target(body, returned, 8) else {
+        return false;
+    };
+    if !names.validated_get_u32_imports.contains(&get_function) {
+        return false;
+    }
+    let [receiver, offset] = get_args.as_slice() else {
+        return false;
+    };
+    if !is_entry_parameter(body, *offset) {
+        return false;
+    }
+    let Some(view_slot) = table_get_slot(body, *receiver) else {
+        return false;
+    };
+    let view_slot_origin = unique_transparent_origin(body, view_slot, 8);
+
+    body.values.entries().any(|(_, value)| {
+        let ValueDef::Operator(Operator::TableSet { .. }, args, _) = value else {
+            return false;
+        };
+        let [slot, stored] = &body.arg_pool[*args] else {
+            return false;
+        };
+        if unique_transparent_origin(body, *slot, 8) != view_slot_origin {
+            return false;
+        }
+        let Some((view_function, view_args)) = call_target(body, *stored, 8) else {
+            return false;
+        };
+        if !names.validated_view_new_imports.contains(&view_function) {
+            return false;
+        }
+        let [buffer_ref, start, length] = view_args.as_slice() else {
+            return false;
+        };
+        if i32_const(body, *start) != Some(0) {
+            return false;
+        }
+        let Some(buffer_slot) = table_get_slot(body, *buffer_ref) else {
+            return false;
+        };
+        let buffer_slot_origin = unique_transparent_origin(body, buffer_slot, 8);
+        let Some((buffer_label, buffer_args)) = call_label(body, buffer_slot, names) else {
+            return false;
+        };
+        let [memory_slot] = buffer_args.as_slice() else {
+            return false;
+        };
+        if buffer_label != "wbindgen.buffer_slot" {
+            return false;
+        }
+        let Some((memory_label, memory_args)) = call_label(body, *memory_slot, names) else {
+            return false;
+        };
+        if memory_label != "wbindgen.memory_slot" || !memory_args.is_empty() {
+            return false;
+        }
+        let Some((length_function, length_args)) = call_target(body, *length, 8) else {
+            return false;
+        };
+        if !names
+            .validated_byte_length_imports
+            .contains(&length_function)
+        {
+            return false;
+        }
+        let [length_receiver] = length_args.as_slice() else {
+            return false;
+        };
+        table_get_slot(body, *length_receiver).is_some_and(|length_slot| {
+            unique_transparent_origin(body, length_slot, 8) == buffer_slot_origin
+        })
+    })
+}
+
+fn helper_is_loose_get_u32(body: &FunctionBody, names: &SemanticCallNames) -> bool {
+    helper_returns_import_call(body, names, "wbg.getUint32").is_some_and(|args| {
+        args.into_iter()
+            .any(|value| is_entry_parameter(body, value))
+    })
+}
+
+fn classify_base_wasm_bindgen_helper(
     body: &FunctionBody,
     names: &SemanticCallNames,
 ) -> Option<&'static str> {
@@ -1075,13 +1213,10 @@ fn classify_wasm_bindgen_helper(
         |args| matches!(args.as_slice(), [value] if is_table_get_of_entry_parameter(body, *value)),
     ) {
         Some("wbindgen.externref_length")
-    } else if helper_returns_import_call(body, names, "wbg.getUint32").is_some_and(|args| {
-        args.into_iter()
-            .any(|value| is_entry_parameter(body, value))
-    }) {
-        Some("wbindgen.getUint32_bridge")
     } else if helper_is_memory_slot(body, names) {
         Some("wbindgen.memory_slot")
+    } else if helper_is_buffer_slot(body, names) {
+        Some("wbindgen.buffer_slot")
     } else {
         None
     }
@@ -1146,8 +1281,25 @@ fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> SemanticCal
                 function,
                 normalize_import_name(&import.module, &import.name),
             );
-            if import.module == "wbg" && import.name == "__wbg_grow_43d369088a370694" {
-                names.validated_memory_grow_imports.insert(function);
+            if import.module == "wbg" {
+                match import.name.as_str() {
+                    "__wbg_grow_43d369088a370694" => {
+                        names.validated_memory_grow_imports.insert(function);
+                    }
+                    "__wbg_buffer_609cc3eee51ed158" => {
+                        names.validated_buffer_imports.insert(function);
+                    }
+                    "__wbg_byteLength_ea52ac3de882b483" => {
+                        names.validated_byte_length_imports.insert(function);
+                    }
+                    "__wbg_new_7e079fa25e135eb1" => {
+                        names.validated_view_new_imports.insert(function);
+                    }
+                    "__wbg_getUint32_9c3cc8fde7919ed4" => {
+                        names.validated_get_u32_imports.insert(function);
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1164,17 +1316,79 @@ fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> SemanticCal
         .body()
         .map(direct_called_functions)
         .unwrap_or_default();
+    let mut candidates = direct_callees
+        .iter()
+        .copied()
+        .filter(|callee| !imported_functions.contains(callee))
+        .collect::<BTreeSet<_>>();
+
+    // Inspect exactly one nested helper layer. This is enough for wasm-bindgen
+    // wrappers such as memory -> buffer -> DataView without turning semantic
+    // naming into an unbounded whole-module expansion.
     for callee in direct_callees {
-        if names.labels.contains_key(&callee) || module.expand_func(callee).is_err() {
+        if imported_functions.contains(&callee) || module.expand_func(callee).is_err() {
+            continue;
+        }
+        let nested = module.funcs[callee]
+            .body()
+            .map(direct_called_functions)
+            .unwrap_or_default();
+        candidates.extend(
+            nested
+                .into_iter()
+                .filter(|nested| !imported_functions.contains(nested)),
+        );
+    }
+    for callee in candidates.iter().copied() {
+        let _ = module.expand_func(callee);
+    }
+
+    // Helper labels depend on one another (memory_slot -> buffer_slot), so use
+    // a tiny bounded fixed point over only the candidate set above.
+    for _ in 0..3 {
+        let mut changed = false;
+        for callee in candidates.iter().copied() {
+            if names.labels.contains_key(&callee) {
+                continue;
+            }
+            let Some(body) = module.funcs[callee].body() else {
+                continue;
+            };
+            let label = classify_base_wasm_bindgen_helper(body, &names)
+                .map(str::to_owned)
+                .or_else(|| {
+                    helper_is_heap_allocator(module, callee, body, &imported_functions)
+                        .then(|| "wasm.heap_alloc".to_owned())
+                });
+            if let Some(label) = label {
+                names.labels.insert(callee, label);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // The strong memory-read proof needs the nested buffer/memory helper labels
+    // established above. Fall back to the older loose bridge name when only
+    // the imported getUint32 call and offset parameter can be proven.
+    for callee in candidates {
+        if names.labels.contains_key(&callee) {
             continue;
         }
         let Some(body) = module.funcs[callee].body() else {
             continue;
         };
-        if let Some(label) = classify_wasm_bindgen_helper(body, &names) {
-            names.labels.insert(callee, label.to_owned());
-        } else if helper_is_heap_allocator(module, callee, body, &imported_functions) {
-            names.labels.insert(callee, "wasm.heap_alloc".to_owned());
+        if helper_is_memory_get_u32(body, &names) {
+            names
+                .labels
+                .insert(callee, "wbindgen.memory_get_u32".to_owned());
+            names.validated_memory_get_u32_helpers.insert(callee);
+        } else if helper_is_loose_get_u32(body, &names) {
+            names
+                .labels
+                .insert(callee, "wbindgen.getUint32_bridge".to_owned());
         }
     }
     names
@@ -2224,6 +2438,18 @@ mod tests {
             "0x0000001f"
         );
         assert_eq!(try_eval_i32_expression("$p1"), None);
+        assert_eq!(
+            render_scalar_family("i32mul", &["$x".into(), "0x00000000".into()]),
+            Some("0x00000000".into())
+        );
+        assert_eq!(
+            render_scalar_family("i32or", &["$x".into(), "0x00000000".into()]),
+            Some("$x".into())
+        );
+        assert_eq!(
+            render_scalar_family("i32add", &["0x00000002".into(), "0x00000003".into()]),
+            Some("0x00000005".into())
+        );
     }
 
     #[test]
@@ -2770,6 +2996,84 @@ mod tests {
         assert_eq!(
             analysis.runtime_bindings[1].expression,
             "wasm.memory_grow(0x00000001, externref_slot=$runtime0)"
+        );
+        Ok(())
+    }
+    #[test]
+    fn names_only_proven_module_memory_get_u32_bridge_strongly() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "__wbindgen_memory" (func $memory (result externref)))
+                (import "wbg" "__wbg_buffer_609cc3eee51ed158"
+                    (func $buffer (param externref) (result externref)))
+                (import "wbg" "__wbg_byteLength_ea52ac3de882b483"
+                    (func $byte_length (param externref) (result i32)))
+                (import "wbg" "__wbg_new_7e079fa25e135eb1"
+                    (func $view_new (param externref i32 i32) (result externref)))
+                (import "wbg" "__wbg_getUint32_9c3cc8fde7919ed4"
+                    (func $get_u32 (param externref i32) (result i32)))
+                (import "host" "alloc" (func $alloc (result i32)))
+                (table 16 externref)
+
+                (func $memory_slot (result i32)
+                    (local $slot i32)
+                    call $alloc
+                    local.tee $slot
+                    call $memory
+                    table.set 0
+                    local.get $slot)
+
+                (func $buffer_slot (param $memory_slot i32) (result i32)
+                    (local $buffer externref)
+                    (local $slot i32)
+                    local.get $memory_slot
+                    table.get 0
+                    call $buffer
+                    local.set $buffer
+                    call $alloc
+                    local.tee $slot
+                    local.get $buffer
+                    table.set 0
+                    local.get $slot)
+
+                (func $memory_get (param $offset i32) (result i32)
+                    (local $memory_slot i32)
+                    (local $buffer_slot i32)
+                    (local $length i32)
+                    (local $view externref)
+                    (local $view_slot i32)
+                    call $memory_slot
+                    local.tee $memory_slot
+                    call $buffer_slot
+                    local.tee $buffer_slot
+                    table.get 0
+                    call $byte_length
+                    local.set $length
+                    local.get $buffer_slot
+                    table.get 0
+                    i32.const 0
+                    local.get $length
+                    call $view_new
+                    local.set $view
+                    call $alloc
+                    local.tee $view_slot
+                    local.get $view
+                    table.set 0
+                    local.get $view_slot
+                    table.get 0
+                    local.get $offset
+                    call $get_u32)
+
+                (func (export "run") (result i32)
+                    i32.const 7
+                    call $memory_get))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(analysis.runtime_bindings.len(), 1);
+        assert_eq!(
+            analysis.runtime_bindings[0].expression,
+            "wbindgen.memory_get_u32(0x00000007)"
         );
         Ok(())
     }
