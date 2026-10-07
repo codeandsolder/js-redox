@@ -15,7 +15,7 @@ use oxc_syntax::symbol::SymbolId;
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::PathBuf,
 };
@@ -36,6 +36,7 @@ struct ModuleRecord {
     value_kind: String,
     method: bool,
     dependencies: Vec<String>,
+    dependency_map: BTreeMap<String, String>,
     export_names: Vec<String>,
     commonjs_export: bool,
 }
@@ -442,6 +443,7 @@ impl Collector<'_, '_> {
             value_kind: value_kind.to_string(),
             method: false,
             dependencies,
+            dependency_map: BTreeMap::new(),
             export_names,
             commonjs_export,
         })
@@ -673,11 +675,214 @@ impl Collector<'_, '_> {
                 value_kind: value_kind.to_string(),
                 method: prop.method,
                 dependencies,
+                dependency_map: BTreeMap::new(),
                 export_names,
                 commonjs_export,
             });
         }
         (!modules.is_empty()).then_some(modules)
+    }
+
+    fn browserify_dependency_map(
+        dependency_map: &oxc_ast::ast::ObjectExpression<'_>,
+    ) -> Option<BTreeMap<String, String>> {
+        let mut dependencies = BTreeMap::new();
+        for item in &dependency_map.properties {
+            let ObjectPropertyKind::ObjectProperty(prop) = item else {
+                return None;
+            };
+            if prop.computed || prop.kind != oxc_ast::ast::PropertyKind::Init {
+                return None;
+            }
+            let name = Self::property_key(&prop.key)?;
+            let target = match unwrap_parenthesized(&prop.value) {
+                Expression::NumericLiteral(value)
+                    if value.value.is_finite() && value.value.fract() == 0.0 =>
+                {
+                    format!("{:.0}", value.value)
+                }
+                Expression::StringLiteral(value) => value.value.to_string(),
+                _ => return None,
+            };
+            dependencies.insert(name, target);
+        }
+        Some(dependencies)
+    }
+
+    fn browserify_factory_parts<'a>(
+        element: &'a ArrayExpressionElement<'a>,
+    ) -> Option<(
+        &'a oxc_ast::ast::FormalParameters<'a>,
+        &'a oxc_ast::ast::FunctionBody<'a>,
+        oxc_span::Span,
+        &'static str,
+    )> {
+        match element {
+            ArrayExpressionElement::FunctionExpression(function) => {
+                let body = function.body.as_ref()?;
+                Some((&function.params, body.as_ref(), function.span, "function"))
+            }
+            ArrayExpressionElement::ArrowFunctionExpression(function) => Some((
+                &function.params,
+                function.body.as_ref(),
+                function.span,
+                "arrow",
+            )),
+            _ => None,
+        }
+    }
+
+    fn browserify_exports(
+        &self,
+        params: &oxc_ast::ast::FormalParameters<'_>,
+        body: &oxc_ast::ast::FunctionBody<'_>,
+    ) -> (Vec<String>, bool) {
+        // Browserify factory ABI: (require, module, exports).
+        let require_symbol = params
+            .items
+            .first()
+            .and_then(|param| binding_symbol(&param.pattern));
+        let module_symbol = params
+            .items
+            .get(1)
+            .and_then(|param| binding_symbol(&param.pattern));
+        let exports_symbol = params
+            .items
+            .get(2)
+            .and_then(|param| binding_symbol(&param.pattern));
+        let mut collector = ExportCollector {
+            scoping: self.scoping,
+            module_symbol,
+            exports_symbol,
+            require_symbol,
+            names: BTreeSet::new(),
+            commonjs_export: false,
+        };
+        collector.visit_function_body(body);
+        (
+            collector.names.into_iter().collect(),
+            collector.commonjs_export,
+        )
+    }
+
+    fn browserify_module_records(
+        &self,
+        module_table: &oxc_ast::ast::ObjectExpression<'_>,
+    ) -> Option<Vec<ModuleRecord>> {
+        if module_table.properties.len() < 2 {
+            return None;
+        }
+        let mut modules = Vec::with_capacity(module_table.properties.len());
+        for item in &module_table.properties {
+            let ObjectPropertyKind::ObjectProperty(prop) = item else {
+                return None;
+            };
+            if prop.computed || prop.kind != oxc_ast::ast::PropertyKind::Init {
+                return None;
+            }
+            let id = Self::property_key(&prop.key)?;
+            let Expression::ArrayExpression(pair) = unwrap_parenthesized(&prop.value) else {
+                return None;
+            };
+            if pair.elements.len() != 2 {
+                return None;
+            }
+            let (params, body, span, value_kind) =
+                Self::browserify_factory_parts(&pair.elements[0])?;
+            if params.items.len() < 3 {
+                return None;
+            }
+            let ArrayExpressionElement::ObjectExpression(dependency_object) = &pair.elements[1]
+            else {
+                return None;
+            };
+            let dependency_map = Self::browserify_dependency_map(dependency_object)?;
+            let (export_names, commonjs_export) = self.browserify_exports(params, body);
+            modules.push(ModuleRecord {
+                id,
+                property_start: prop.span.start,
+                property_end: prop.span.end,
+                value_start: span.start,
+                value_end: span.end,
+                value_kind: value_kind.to_string(),
+                method: prop.method,
+                dependencies: Vec::new(),
+                dependency_map,
+                export_names,
+                commonjs_export,
+            });
+        }
+        let module_ids = modules
+            .iter()
+            .map(|module| module.id.clone())
+            .collect::<HashSet<_>>();
+        for module in &mut modules {
+            module.dependencies = module
+                .dependency_map
+                .values()
+                .filter(|dependency| module_ids.contains(dependency.as_str()))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
+        Some(modules)
+    }
+
+    fn browserify_bootstrap_arity(callee: &Expression<'_>) -> Option<usize> {
+        match unwrap_parenthesized(callee) {
+            Expression::FunctionExpression(function) => Some(function.params.items.len()),
+            Expression::ArrowFunctionExpression(function) => Some(function.params.items.len()),
+            _ => None,
+        }
+    }
+
+    fn record_browserify_call(&mut self, call: &oxc_ast::ast::CallExpression<'_>) -> bool {
+        if call.arguments.len() != 3 || Self::browserify_bootstrap_arity(&call.callee) != Some(3) {
+            return false;
+        }
+        let Some(Argument::ObjectExpression(module_table)) = call.arguments.first() else {
+            return false;
+        };
+        let Some(Argument::ObjectExpression(cache)) = call.arguments.get(1) else {
+            return false;
+        };
+        if !cache.properties.is_empty() {
+            return false;
+        }
+        let Some(Argument::ArrayExpression(entries)) = call.arguments.get(2) else {
+            return false;
+        };
+        let Some(entry_ids) = Self::array_literal_ids(entries) else {
+            return false;
+        };
+        if entry_ids.is_empty() {
+            return false;
+        }
+        let Some(modules) = self.browserify_module_records(module_table) else {
+            return false;
+        };
+        let module_ids = modules
+            .iter()
+            .map(|module| module.id.clone())
+            .collect::<HashSet<_>>();
+        if entry_ids
+            .iter()
+            .any(|entry| !module_ids.contains(entry.as_str()))
+        {
+            return false;
+        }
+        self.bundles.push(BundleRecord {
+            kind: "browserify_module_table".into(),
+            start: call.span.start,
+            end: call.span.end,
+            callee: "<browserify-bootstrap>".into(),
+            chunk_ids: Vec::new(),
+            module_table_start: module_table.span.start,
+            module_table_end: module_table.span.end,
+            modules,
+        });
+        true
     }
 
     fn direct_table_is_webpack_like(
@@ -730,6 +935,9 @@ impl Collector<'_, '_> {
     }
 
     fn record_call(&mut self, call: &oxc_ast::ast::CallExpression<'_>) {
+        if self.record_browserify_call(call) {
+            return;
+        }
         if self.record_amd_call(call) {
             return;
         }
@@ -896,7 +1104,7 @@ fn main() -> Result<()> {
     bundles.sort_by_key(|b| b.start);
 
     let report = Report {
-        schema: "js-bundle-inventory/v4",
+        schema: "js-bundle-inventory/v5",
         input: args.input.display().to_string(),
         diagnostics,
         panicked,

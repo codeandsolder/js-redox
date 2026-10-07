@@ -156,6 +156,19 @@
       "pretty_path": "datadome/allegro-interstitial-i.pretty.js",
       "bytes": 15014,
       "sha256": "158a65061f6423a9d6d1f434004fd90f12c76a87ee3a8871784e060db18284c4"
+    },
+    {
+      "id": "datadome-tripadvisor-K89D9F-4.19.3",
+      "family": "DataDome",
+      "role": "raw",
+      "capture_date": "2026-10-04",
+      "path": "datadome/tripadvisor-K89D9F-v4.19.3.raw.js",
+      "source": "https://js.datadome.co/K89D9F.js",
+      "capture_har": "/srv/scratch/js_devirtualization/corpus/www.tripadvisor.com.har",
+      "purpose": "DataDome 4.19.3 production collector captured from Tripadvisor; compact 11-module Browserify bundle with static order-switch flattening, browser fingerprint collection, API request construction and live-event telemetry. Real acceptance target for Browserify extraction and ordered-switch recovery.",
+      "pretty_path": "datadome/tripadvisor-K89D9F-v4.19.3.pretty.js",
+      "bytes": 62928,
+      "sha256": "4ed54d7d53efdc38268abf91688c87edec443db17c62d6101fbc7b156a5b09ad"
     }
   ]
 }

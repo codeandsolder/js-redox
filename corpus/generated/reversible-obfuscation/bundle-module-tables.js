@@ -148,3 +148,25 @@ GlobalLoader.define("global/beta", [], function () {
 customElements.define("not-module-inline-function", function () {
   return "not a module factory";
 });
+
+!function browserify(modules, cache, entries) {
+  function load(id) {
+    if (cache[id]) return cache[id].exports;
+    const module = cache[id] = { exports: {} };
+    const tuple = modules[id];
+    function localRequire(name) {
+      return load(tuple[1][name]);
+    }
+    tuple[0](localRequire, module, module.exports);
+    return module.exports;
+  }
+  for (let i = 0; i < entries.length; i++) load(entries[i]);
+}({
+  50001: [function (require, module, exports) {
+    exports.value = require("./beta").value;
+    void require("external-package");
+  }, { "./beta": 50002, "external-package": "external-package" }],
+  50002: [function (require, module, exports) {
+    module.exports = { value: "beta" };
+  }, {}]
+}, {}, [50001]);

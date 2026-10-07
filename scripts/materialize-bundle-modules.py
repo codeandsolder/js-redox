@@ -54,6 +54,8 @@ def module_output_path(
         group = "amd-modules"
     elif kind == "member_named_modules":
         group = "member-named-modules"
+    elif kind == "browserify_module_table":
+        group = "browserify-modules"
     elif chunk_ids:
         group = "chunk-" + "-".join(safe_component(x, 24) for x in chunk_ids)
     else:
@@ -79,6 +81,23 @@ def build_module_source(
         metadata += f" * Static export names: {export_preview}\n"
     if module.get("commonjs_export"):
         metadata += " * Static CommonJS module.exports write observed.\n"
+    if bundle_kind == "browserify_module_table":
+        dep_map = module.get("dependency_map", {})
+        dep_preview = ", ".join(
+            f"{name} -> {target}" for name, target in list(dep_map.items())[:12]
+        )
+        if len(dep_map) > 12:
+            dep_preview += f", … (+{len(dep_map) - 12} more)"
+        if dep_preview:
+            metadata += f" * Static Browserify dependency map: {dep_preview}\n"
+        header = (
+            "/* Statically extracted Browserify module factory.\n"
+            f" * {provenance}\n"
+            + metadata
+            + " * The factory body is preserved from the parent analyst view.\n"
+            " */\n"
+        )
+        return header + "const __browserify_module_factory__ = " + value + ";\n"
     if bundle_kind in {"amd_named_modules", "member_named_modules"}:
         dep_preview = ", ".join(str(x) for x in module.get("dependencies", [])[:12])
         if len(module.get("dependencies", [])) > 12:
@@ -147,6 +166,8 @@ def write_module_readme(module_root: Path, bundles: list[dict], modules: list[di
             identity = "named AMD modules"
         elif kind == "member_named_modules":
             identity = "member-loader named modules"
+        elif kind == "browserify_module_table":
+            identity = "Browserify module table"
         elif chunk_ids:
             identity = "chunk " + ", ".join(markdown_text(x) for x in chunk_ids)
         else:
@@ -168,7 +189,7 @@ def write_module_readme(module_root: Path, bundles: list[dict], modules: list[di
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Materialize statically explicit Webpack/Next and named AMD modules as readable source files"
+        description="Materialize statically explicit Webpack/Next, Browserify and named AMD modules as readable source files"
     )
     ap.add_argument("project", type=Path)
     ap.add_argument("--inventory", type=Path, default=DEFAULT_INVENTORY)
@@ -323,6 +344,9 @@ def main():
                         "value_kind": module.get("value_kind"),
                         "method": bool(module.get("method")),
                         "dependencies": [str(x) for x in module.get("dependencies", [])],
+                        "dependency_map": {
+                            str(k): str(v) for k, v in module.get("dependency_map", {}).items()
+                        },
                         "export_names": [str(x) for x in module.get("export_names", [])],
                         "commonjs_export": bool(module.get("commonjs_export")),
                         "source_path": str(rel),
@@ -390,7 +414,7 @@ def main():
                 record["materialization"] = "rendered_content_template"
 
     index = {
-        "schema": "har-bundle-modules/v4",
+        "schema": "har-bundle-modules/v5",
         "safe_static_only": True,
         "inventory": str(args.inventory),
         "bundles": bundles,
@@ -416,8 +440,14 @@ def main():
                 for bundle in bundles
                 for _ in bundle.get("module_ids", [])
             ),
+            "browserify_modules": sum(
+                bundle.get("kind") == "browserify_module_table"
+                for bundle in bundles
+                for _ in bundle.get("module_ids", [])
+            ),
             "webpack_modules": sum(
-                bundle.get("kind") not in {"amd_named_modules", "member_named_modules"}
+                bundle.get("kind")
+                not in {"amd_named_modules", "member_named_modules", "browserify_module_table"}
                 for bundle in bundles
                 for _ in bundle.get("module_ids", [])
             ),
