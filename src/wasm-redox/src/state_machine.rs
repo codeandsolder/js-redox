@@ -5,8 +5,8 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
 };
 use waffle::{
-    entity::EntityRef, Block, BlockTarget, ExportKind, FrontendOptions, FunctionBody, Module,
-    Operator, OptOptions, Terminator, Value, ValueDef,
+    entity::EntityRef, Block, BlockTarget, ExportKind, FrontendOptions, Func, FunctionBody,
+    ImportKind, Module, Operator, OptOptions, Terminator, Value, ValueDef,
 };
 
 fn i32_const(body: &FunctionBody, value: Value) -> Option<u32> {
@@ -788,15 +788,243 @@ fn incoming_block_param_values(body: &FunctionBody, block: Block, index: u32) ->
     incoming.into_iter().collect()
 }
 
+#[derive(Default)]
+struct SemanticCallNames {
+    labels: BTreeMap<Func, String>,
+}
+
+fn strip_wasm_bindgen_hash(name: &str) -> &str {
+    let Some((base, suffix)) = name.rsplit_once('_') else {
+        return name;
+    };
+    if suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        base
+    } else {
+        name
+    }
+}
+
+fn normalize_import_name(module: &str, name: &str) -> String {
+    let name = strip_wasm_bindgen_hash(name);
+    if let Some(name) = name.strip_prefix("__wbg_") {
+        format!("{module}.{name}")
+    } else if let Some(name) = name.strip_prefix("__wbindgen_") {
+        format!("wbindgen.{name}")
+    } else {
+        format!("{module}.{name}")
+    }
+}
+
+fn direct_called_functions(body: &FunctionBody) -> BTreeSet<Func> {
+    body.values
+        .entries()
+        .filter_map(|(_, value)| match value {
+            ValueDef::Operator(Operator::Call { function_index }, _, _) => Some(*function_index),
+            _ => None,
+        })
+        .collect()
+}
+
+fn unique_return_value(body: &FunctionBody) -> Option<Value> {
+    let mut values = BTreeSet::new();
+    for (_, block) in body.blocks.entries() {
+        let Terminator::Return { values: returned } = &block.terminator else {
+            continue;
+        };
+        if returned.len() != 1 {
+            return None;
+        }
+        values.insert(body.resolve_alias(returned[0]));
+    }
+    (values.len() == 1)
+        .then(|| values.into_iter().next())
+        .flatten()
+}
+
+fn call_label<'a>(
+    body: &FunctionBody,
+    value: Value,
+    names: &'a SemanticCallNames,
+) -> Option<(&'a str, Vec<Value>)> {
+    fn inner<'a>(
+        body: &FunctionBody,
+        value: Value,
+        names: &'a SemanticCallNames,
+        depth: usize,
+    ) -> Option<(&'a str, Vec<Value>)> {
+        if depth == 0 {
+            return None;
+        }
+        let value = body.resolve_alias(value);
+        match &body.values[value] {
+            ValueDef::Operator(Operator::Call { function_index }, args, _) => Some((
+                names.labels.get(function_index)?.as_str(),
+                body.arg_pool[*args].to_vec(),
+            )),
+            ValueDef::PickOutput(source, 0, _) => inner(body, *source, names, depth - 1),
+            ValueDef::BlockParam(block, index, _) => {
+                let incoming = incoming_block_param_values(body, *block, *index);
+                let [incoming] = incoming.as_slice() else {
+                    return None;
+                };
+                inner(body, *incoming, names, depth - 1)
+            }
+            _ => None,
+        }
+    }
+    inner(body, value, names, 8)
+}
+
+fn is_entry_parameter(body: &FunctionBody, value: Value) -> bool {
+    matches!(
+        body.values[body.resolve_alias(value)],
+        ValueDef::BlockParam(block, index, _)
+            if block == body.entry
+                && usize::try_from(index).is_ok_and(|index| index < body.n_params)
+    )
+}
+
+fn is_table_get_of_entry_parameter(body: &FunctionBody, value: Value) -> bool {
+    let value = body.resolve_alias(value);
+    let ValueDef::Operator(Operator::TableGet { .. }, args, _) = &body.values[value] else {
+        return false;
+    };
+    matches!(&body.arg_pool[*args], [index] if is_entry_parameter(body, *index))
+}
+
+fn helper_returns_import_call(
+    body: &FunctionBody,
+    names: &SemanticCallNames,
+    import_name: &str,
+) -> Option<Vec<Value>> {
+    let returned = unique_return_value(body)?;
+    let (label, args) = call_label(body, returned, names)?;
+    (label == import_name).then_some(args)
+}
+
+fn unique_transparent_origin(body: &FunctionBody, value: Value, depth: usize) -> Value {
+    if depth == 0 {
+        return body.resolve_alias(value);
+    }
+    let value = body.resolve_alias(value);
+    match &body.values[value] {
+        ValueDef::PickOutput(source, 0, _) => unique_transparent_origin(body, *source, depth - 1),
+        ValueDef::BlockParam(block, index, _) => {
+            let incoming = incoming_block_param_values(body, *block, *index);
+            let [incoming] = incoming.as_slice() else {
+                return value;
+            };
+            unique_transparent_origin(body, *incoming, depth - 1)
+        }
+        _ => value,
+    }
+}
+
+fn helper_is_memory_slot(body: &FunctionBody, names: &SemanticCallNames) -> bool {
+    if body.n_params != 0 {
+        return false;
+    }
+    let Some(returned_slot) = unique_return_value(body) else {
+        return false;
+    };
+    let returned_slot = unique_transparent_origin(body, returned_slot, 8);
+    body.values.entries().any(|(_, value)| {
+        let ValueDef::Operator(Operator::TableSet { .. }, args, _) = value else {
+            return false;
+        };
+        let [slot, stored] = &body.arg_pool[*args] else {
+            return false;
+        };
+        unique_transparent_origin(body, *slot, 8) == returned_slot
+            && call_label(body, *stored, names).is_some_and(|(label, _)| label == "wbindgen.memory")
+    })
+}
+
+fn classify_wasm_bindgen_helper(
+    body: &FunctionBody,
+    names: &SemanticCallNames,
+) -> Option<&'static str> {
+    if helper_returns_import_call(body, names, "wbg.length").is_some_and(
+        |args| matches!(args.as_slice(), [value] if is_table_get_of_entry_parameter(body, *value)),
+    ) {
+        Some("wbindgen.externref_length")
+    } else if helper_returns_import_call(body, names, "wbg.getUint32").is_some_and(|args| {
+        args.into_iter()
+            .any(|value| is_entry_parameter(body, value))
+    }) {
+        Some("wbindgen.getUint32_bridge")
+    } else if helper_is_memory_slot(body, names) {
+        Some("wbindgen.memory_slot")
+    } else {
+        None
+    }
+}
+
+fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> SemanticCallNames {
+    let mut names = SemanticCallNames::default();
+    for import in &module.imports {
+        if let ImportKind::Func(function) = import.kind {
+            names.labels.insert(
+                function,
+                normalize_import_name(&import.module, &import.name),
+            );
+        }
+    }
+
+    let direct_callees = module.funcs[root]
+        .body()
+        .map(direct_called_functions)
+        .unwrap_or_default();
+    for callee in direct_callees {
+        if names.labels.contains_key(&callee) || module.expand_func(callee).is_err() {
+            continue;
+        }
+        let Some(body) = module.funcs[callee].body() else {
+            continue;
+        };
+        if let Some(label) = classify_wasm_bindgen_helper(body, &names) {
+            names.labels.insert(callee, label.to_owned());
+        }
+    }
+    names
+}
+
+#[derive(Debug, Serialize)]
+pub struct SemanticRuntimeBindingReport {
+    pub name: String,
+    pub expression: String,
+}
+
+fn is_runtime_boundary(op: &Operator) -> bool {
+    let family = operator_family(op);
+    matches!(op, Operator::Call { .. })
+        || family.starts_with("i32load")
+        || family.starts_with("i64load")
+        || family.starts_with("f32load")
+        || family.starts_with("f64load")
+        || family.starts_with("globalget")
+        || family.starts_with("global_get")
+}
+
+struct SemanticRenderContext<'a> {
+    bindings: &'a BTreeMap<Value, String>,
+    call_names: &'a SemanticCallNames,
+    runtime_names: BTreeMap<Value, String>,
+    runtime_bindings: Vec<SemanticRuntimeBindingReport>,
+}
+
 fn render_semantic_value(
     body: &FunctionBody,
     value: Value,
-    bindings: &BTreeMap<Value, String>,
+    context: &mut SemanticRenderContext<'_>,
     depth: usize,
     visiting: &mut BTreeSet<Value>,
 ) -> String {
     let value = body.resolve_alias(value);
-    if let Some(binding) = bindings.get(&value) {
+    if let Some(binding) = context.bindings.get(&value) {
+        return binding.clone();
+    }
+    if let Some(binding) = context.runtime_names.get(&value) {
         return binding.clone();
     }
     if let Some(constant) = i32_const(body, value) {
@@ -806,7 +1034,7 @@ fn render_semantic_value(
         if source != value {
             return format!(
                 "reverse_bits32({})",
-                render_semantic_value(body, source, bindings, depth.saturating_sub(1), visiting)
+                render_semantic_value(body, source, context, depth.saturating_sub(1), visiting)
             );
         }
     }
@@ -814,9 +1042,9 @@ fn render_semantic_value(
         return format!("v{}", value.index());
     }
 
-    let rendered = match &body.values[value] {
+    let (rendered, runtime_boundary) = match &body.values[value] {
         ValueDef::BlockParam(block, index, _) => {
-            if *block == body.entry
+            let rendered = if *block == body.entry
                 && usize::try_from(*index).is_ok_and(|index| index < body.n_params)
             {
                 format!("$arg{index}")
@@ -827,7 +1055,7 @@ fn render_semantic_value(
                         render_semantic_value(
                             body,
                             incoming,
-                            bindings,
+                            context,
                             depth.saturating_sub(1),
                             visiting,
                         )
@@ -844,34 +1072,64 @@ fn render_semantic_value(
                         incoming.into_iter().collect::<Vec<_>>().join(", ")
                     ),
                 }
+            };
+            (rendered, false)
+        }
+        ValueDef::Operator(op, arg_ref, _) => {
+            let raw_args = &body.arg_pool[*arg_ref];
+            {
+                let args = raw_args
+                    .iter()
+                    .map(|arg| {
+                        render_semantic_value(
+                            body,
+                            *arg,
+                            context,
+                            depth.saturating_sub(1),
+                            visiting,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let family = operator_family(op);
+                let rendered = if let Operator::Call { function_index } = op {
+                    context.call_names.labels.get(function_index).map_or_else(
+                        || format!("{op}({})", args.join(", ")),
+                        |name| format!("{name}({})", args.join(", ")),
+                    )
+                } else if is_inlineable_scalar(op) {
+                    render_scalar_family(&family, &args)
+                        .unwrap_or_else(|| format!("{family}({})", args.join(", ")))
+                } else {
+                    format!("{op}({})", args.join(", "))
+                };
+                (rendered, is_runtime_boundary(op))
             }
         }
-        ValueDef::Operator(op, args, _) => {
-            let args = body.arg_pool[*args]
-                .iter()
-                .map(|arg| {
-                    render_semantic_value(body, *arg, bindings, depth.saturating_sub(1), visiting)
-                })
-                .collect::<Vec<_>>();
-            let family = operator_family(op);
-            if is_inlineable_scalar(op) {
-                render_scalar_family(&family, &args)
-                    .unwrap_or_else(|| format!("{family}({})", args.join(", ")))
-            } else {
-                format!("{op}({})", args.join(", "))
-            }
-        }
-        ValueDef::PickOutput(source, index, _) => format!(
-            "pick{index}({})",
-            render_semantic_value(body, *source, bindings, depth.saturating_sub(1), visiting,)
+        ValueDef::PickOutput(source, index, _) => (
+            format!(
+                "pick{index}({})",
+                render_semantic_value(body, *source, context, depth.saturating_sub(1), visiting,)
+            ),
+            false,
         ),
-        ValueDef::Alias(source) => {
-            render_semantic_value(body, *source, bindings, depth.saturating_sub(1), visiting)
-        }
-        ValueDef::Placeholder(_) | ValueDef::None => format!("v{}", value.index()),
+        ValueDef::Alias(source) => (
+            render_semantic_value(body, *source, context, depth.saturating_sub(1), visiting),
+            false,
+        ),
+        ValueDef::Placeholder(_) | ValueDef::None => (format!("v{}", value.index()), false),
     };
     visiting.remove(&value);
-    rendered
+    if runtime_boundary {
+        let name = format!("$runtime{}", context.runtime_bindings.len());
+        context.runtime_names.insert(value, name.clone());
+        context.runtime_bindings.push(SemanticRuntimeBindingReport {
+            name: name.clone(),
+            expression: rendered,
+        });
+        name
+    } else {
+        rendered
+    }
 }
 
 fn operator_family(op: &Operator) -> String {
@@ -1269,11 +1527,18 @@ fn terminal_bindings(
             .enumerate()
         {
             let name = format!("$m{}_p{parameter_index}", machine.machine_index);
-            bindings.insert(*parameter, name.clone());
+            let state_parameter = parameter_index == machine.state_param_index;
+            let rendered_binding =
+                if !state_parameter && try_eval_i32_expression(&expression).is_some() {
+                    expression.clone()
+                } else {
+                    name.clone()
+                };
+            bindings.insert(*parameter, rendered_binding);
             reports.push(SemanticBindingReport {
                 machine_index: machine.machine_index,
                 parameter_index,
-                state_parameter: parameter_index == machine.state_param_index,
+                state_parameter,
                 name,
                 expression,
             });
@@ -1285,21 +1550,28 @@ fn terminal_bindings(
 fn render_return_expressions(
     body: &FunctionBody,
     bindings: &BTreeMap<Value, String>,
-) -> Vec<String> {
+    call_names: &SemanticCallNames,
+) -> (Vec<String>, Vec<SemanticRuntimeBindingReport>) {
     let mut expressions = Vec::new();
+    let mut context = SemanticRenderContext {
+        bindings,
+        call_names,
+        runtime_names: BTreeMap::new(),
+        runtime_bindings: Vec::new(),
+    };
     for (_, block) in body.blocks.entries() {
         let Terminator::Return { values } = &block.terminator else {
             continue;
         };
         for value in values {
             let mut visiting = BTreeSet::new();
-            let expression = render_semantic_value(body, *value, bindings, 48, &mut visiting);
+            let expression = render_semantic_value(body, *value, &mut context, 48, &mut visiting);
             if !expressions.contains(&expression) {
                 expressions.push(expression);
             }
         }
     }
-    expressions
+    (expressions, context.runtime_bindings)
 }
 
 fn machine_contains(machines: &[StateMachineReport], outer: usize, inner: usize) -> bool {
@@ -1450,6 +1722,7 @@ pub struct ExportSemanticAnalysis {
     pub state_machine_pipelines: Vec<StateMachinePipelineReport>,
     pub state_machines: Vec<StateMachineReport>,
     pub terminal_bindings: Vec<SemanticBindingReport>,
+    pub runtime_bindings: Vec<SemanticRuntimeBindingReport>,
     pub return_expressions: Vec<String>,
 }
 
@@ -1482,6 +1755,7 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
         .body_mut()
         .context("body")?
         .optimize(&OptOptions::default());
+    let call_names = build_semantic_call_names(&mut module, func);
     let body = module.funcs[func].body().context("body")?;
 
     let mut candidates = Vec::new();
@@ -1594,12 +1868,14 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
     let state_machine_roots = root_machine_indices(&machines);
     let state_machine_pipelines = compose_machine_pipelines(&machines);
     let (bindings, terminal_bindings) = terminal_bindings(body, &machines, &metadata);
-    let return_expressions = render_return_expressions(body, &bindings);
+    let (return_expressions, runtime_bindings) =
+        render_return_expressions(body, &bindings, &call_names);
     Ok(ExportSemanticAnalysis {
         state_machine_roots,
         state_machine_pipelines,
         state_machines: machines,
         terminal_bindings,
+        runtime_bindings,
         return_expressions,
     })
 }
@@ -1876,6 +2152,149 @@ mod tests {
         assert_eq!(pipelines.len(), 1);
         assert_eq!(pipelines[0].stages.len(), 2);
         assert_eq!(pipelines[0].stages[0].next_machine, Some(child));
+        Ok(())
+    }
+
+    #[test]
+    fn names_proven_wasm_bindgen_length_wrapper() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "__wbg_length_6ca527665d89694d"
+                    (func $length (param externref) (result i32)))
+                (table 1 externref)
+                (func $length_slot (param $slot i32) (result i32)
+                    local.get $slot
+                    table.get 0
+                    call $length)
+                (func (export "run") (result i32)
+                    i32.const 0
+                    call $length_slot))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(analysis.return_expressions, ["$runtime0"]);
+        assert_eq!(analysis.runtime_bindings.len(), 1);
+        assert_eq!(analysis.runtime_bindings[0].name, "$runtime0");
+        assert_eq!(
+            analysis.runtime_bindings[0].expression,
+            "wbindgen.externref_length(0x00000000)"
+        );
+        assert_eq!(
+            normalize_import_name("wbg", "__wbg_length_6ca527665d89694d"),
+            "wbg.length"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn does_not_name_transformed_length_helper_as_plain_length() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "__wbg_length_6ca527665d89694d"
+                    (func $length (param externref) (result i32)))
+                (table 1 externref)
+                (func $length_plus_one (param $slot i32) (result i32)
+                    local.get $slot
+                    table.get 0
+                    call $length
+                    i32.const 1
+                    i32.add)
+                (func (export "run") (result i32)
+                    i32.const 0
+                    call $length_plus_one))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(analysis.return_expressions.len(), 1);
+        assert!(analysis
+            .runtime_bindings
+            .iter()
+            .all(|binding| !binding.expression.contains("wbindgen.externref_length")));
+        Ok(())
+    }
+
+    #[test]
+    fn names_proven_wasm_bindgen_memory_slot_wrapper() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "__wbindgen_memory" (func $memory (result externref)))
+                (import "host" "alloc" (func $alloc (result i32)))
+                (table 2 externref)
+                (func $memory_slot (result i32)
+                    (local $slot i32)
+                    call $alloc
+                    local.tee $slot
+                    call $memory
+                    table.set 0
+                    local.get $slot)
+                (func (export "run") (result externref)
+                    call $memory_slot
+                    table.get 0))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(
+            analysis.return_expressions,
+            ["table_get<table0>($runtime0)"]
+        );
+        assert_eq!(analysis.runtime_bindings.len(), 1);
+        assert_eq!(
+            analysis.runtime_bindings[0].expression,
+            "wbindgen.memory_slot()"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn names_proven_wasm_bindgen_get_u32_bridge() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "__wbg_getUint32_9c3cc8fde7919ed4"
+                    (func $get (param externref i32) (result i32)))
+                (func $bridge (param $offset i32) (result i32)
+                    ref.null extern
+                    local.get $offset
+                    call $get)
+                (func (export "run") (result i32)
+                    i32.const 7
+                    call $bridge))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(analysis.return_expressions, ["$runtime0"]);
+        assert_eq!(analysis.runtime_bindings.len(), 1);
+        assert_eq!(
+            analysis.runtime_bindings[0].expression,
+            "wbindgen.getUint32_bridge(0x00000007)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_dag_reuses_one_ssa_call_value() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "host" "read" (func $read (param i32) (result i32)))
+                (func (export "run") (result i32)
+                    (local $value i32)
+                    i32.const 3
+                    call $read
+                    local.set $value
+                    local.get $value
+                    local.get $value
+                    i32.add))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(analysis.runtime_bindings.len(), 1);
+        assert_eq!(
+            analysis.runtime_bindings[0].expression,
+            "host.read(0x00000003)"
+        );
+        assert_eq!(
+            analysis.return_expressions,
+            ["wrapping_add($runtime0, $runtime0)"]
+        );
         Ok(())
     }
 }

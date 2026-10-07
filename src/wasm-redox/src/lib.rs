@@ -324,7 +324,7 @@ pub fn deep_analyze(bytes: &[u8], report: &ModuleReport) -> DeepModuleReport {
         }
     }
     DeepModuleReport {
-        schema: "wasm-redox/deep-v3",
+        schema: "wasm-redox/deep-v4",
         exports,
     }
 }
