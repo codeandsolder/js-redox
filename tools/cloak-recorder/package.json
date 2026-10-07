@@ -1,0 +1,20 @@
+{
+  "name": "cloak-recorder",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "node build-autoconsent.mjs",
+    "record": "npm run build --silent && node recorder.mjs"
+  },
+  "keywords": [],
+  "type": "module",
+  "dependencies": {
+    "@duckduckgo/autoconsent": "^16.47.0",
+    "cloakbrowser": "^0.5.12",
+    "esbuild": "^0.28.2",
+    "playwright-core": "^1.63.0"
+  },
+  "private": "true"
+}
