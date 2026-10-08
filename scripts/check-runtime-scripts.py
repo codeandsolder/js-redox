@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from collections import Counter
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "work/runtime-script-regression"
 ANALYZER = ROOT / "scripts/analyze-runtime-scripts.py"
+CAPTURE_TO_PROJECT = ROOT / "scripts/capture-to-project.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 from capture_pipeline import detect_capture  # noqa: E402
 
@@ -74,7 +76,8 @@ def main() -> None:
     model = alpine("form.name = __placeholder")
     xfor = alpine("items")
     instrumentation = "() => Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)"
-    sources = [network, inline, exact, model, xfor, instrumentation]
+    gtm = '(function(){return google_tag_manager["rm"]["123"](7).href})();'
+    sources = [network, inline, exact, model, xfor, instrumentation, gtm]
 
     for source in sources:
         (runtime / f"{digest(source)}.js").write_text(source)
@@ -127,16 +130,18 @@ def main() -> None:
     )
     report = json.loads(report_path.read_text())
     summary = report["summary"]
-    assert summary["script_parsed_events"] == 6, summary
-    assert summary["unique_javascript_sources"] == 6, summary
+    assert summary["script_parsed_events"] == 7, summary
+    assert summary["unique_javascript_sources"] == 7, summary
     assert summary["classifications"] == {
         "alpine_expression": 3,
         "capture_instrumentation": 1,
+        "gtm_custom_javascript": 1,
         "inline_script": 1,
         "network_response": 1,
     }, summary
     assert summary["alpine_dom_mapped_sources"] == 3, summary
     assert summary["alpine_expression_shapes"] == 3, summary
+    assert summary["gtm_expression_shapes"] == 1, summary
     assert summary["anonymous_runtime_sources"] == 0, summary
     mappings = {
         source["alpine"]["dom_mapping_kind"]
@@ -144,7 +149,54 @@ def main() -> None:
         if source["classification"] == "alpine_expression"
     }
     assert mappings == {"exact", "x-model-setter", "x-for-rhs"}, mappings
-    print("PASS: recorder runtime provenance -> network/inline/Alpine/instrumentation with DOM mappings")
+
+    project = WORK / "project"
+    subprocess.run(
+        [
+            sys.executable,
+            str(CAPTURE_TO_PROJECT),
+            str(capture),
+            str(project),
+            "--overwrite",
+            "--jobs",
+            "2",
+            "--skip-safe-deobfuscation",
+            "--skip-bundle-unpack",
+            "--skip-vm-scan",
+            "--skip-wasm-analysis",
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+    graph = json.loads((project / "analysis/source-graph.json").read_text())
+    node_types = Counter(node["type"] for node in graph["nodes"])
+    edge_kinds = Counter(edge["kind"] for edge in graph["edges"])
+    assert node_types["runtime_script"] == 7, node_types
+    assert node_types["runtime_expression_family"] == 4, node_types
+    assert node_types["dom_snapshot"] == 1, node_types
+    assert node_types["dom_directive"] == 3, node_types
+    assert edge_kinds["runtime_execution"] == 2, edge_kinds
+    assert edge_kinds["runtime_expression_family"] == 4, edge_kinds
+    assert edge_kinds["dom_directive"] == 3, edge_kinds
+    assert edge_kinds["runtime_alpine_compile"] == 3, edge_kinds
+    gtm_family = next(
+        node
+        for node in graph["nodes"]
+        if node.get("type") == "runtime_expression_family"
+        and node.get("framework") == "google_tag_manager"
+    )
+    assert gtm_family["source_count"] == 1, gtm_family
+    helper = next(
+        node
+        for node in graph["nodes"]
+        if node.get("type") == "runtime_script"
+        and node.get("classification") == "capture_instrumentation"
+    )
+    assert helper["application_source"] is False, helper
+    print(
+        "PASS: recorder runtime provenance -> network/inline/Alpine/GTM/instrumentation "
+        "+ DOM/runtime source graph"
+    )
 
 
 if __name__ == "__main__":

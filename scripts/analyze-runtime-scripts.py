@@ -148,6 +148,15 @@ def normalize_expression_shape(expression: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def recover_gtm_custom_javascript(source: str) -> str | None:
+    value = source.strip()
+    if not (value.startswith("(function(){") or value.startswith("(function () {")):
+        return None
+    if "google_tag_manager" not in value and "googletagmanager" not in value.lower():
+        return None
+    return normalize_expression_shape(value)
+
+
 def match_directives(expression: str, directives: dict[str, list[dict]]) -> tuple[str, list[dict]]:
     exact = directives.get(expression)
     if exact:
@@ -214,6 +223,7 @@ def analyze(capture: Path) -> dict:
     class_bytes = Counter()
     instrumentation_counts = Counter()
     alpine_shapes: dict[str, list[str]] = defaultdict(list)
+    gtm_shapes: dict[str, list[str]] = defaultdict(list)
     alpine_dom_mapped = 0
     alpine_dom_matches = 0
 
@@ -256,13 +266,19 @@ def analyze(capture: Path) -> dict:
                     alpine_dom_mapped += 1
                     alpine_dom_matches += len(matches)
             else:
-                helper = instrumentation_kind(source)
-                if helper:
-                    classification = "capture_instrumentation"
-                    row["instrumentation_kind"] = helper
-                    instrumentation_counts[helper] += 1
+                gtm_shape = recover_gtm_custom_javascript(source)
+                if gtm_shape:
+                    classification = "gtm_custom_javascript"
+                    row["gtm"] = {"shape": gtm_shape}
+                    gtm_shapes[gtm_shape].append(digest)
                 else:
-                    classification = "anonymous_runtime"
+                    helper = instrumentation_kind(source)
+                    if helper:
+                        classification = "capture_instrumentation"
+                        row["instrumentation_kind"] = helper
+                        instrumentation_counts[helper] += 1
+                    else:
+                        classification = "anonymous_runtime"
         row["classification"] = classification
         class_counts[classification] += 1
         class_bytes[classification] += row["size"]
@@ -275,6 +291,15 @@ def analyze(capture: Path) -> dict:
             "source_hashes": hashes,
         }
         for shape, hashes in sorted(alpine_shapes.items(), key=lambda item: (-len(item[1]), item[0]))
+    ]
+
+    gtm_families = [
+        {
+            "shape": shape,
+            "source_count": len(hashes),
+            "source_hashes": hashes,
+        }
+        for shape, hashes in sorted(gtm_shapes.items(), key=lambda item: (-len(item[1]), item[0]))
     ]
 
     return {
@@ -290,10 +315,12 @@ def analyze(capture: Path) -> dict:
             "alpine_dom_mapped_sources": alpine_dom_mapped,
             "alpine_dom_match_occurrences": alpine_dom_matches,
             "alpine_expression_shapes": len(alpine_shapes),
+            "gtm_expression_shapes": len(gtm_shapes),
             "capture_instrumentation_kinds": dict(sorted(instrumentation_counts.items())),
             "anonymous_runtime_sources": class_counts["anonymous_runtime"],
         },
         "alpine_families": families,
+        "gtm_families": gtm_families,
         "sources": sources,
     }
 

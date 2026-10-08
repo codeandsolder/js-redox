@@ -30,6 +30,7 @@ def main():
     bundles_path = project / 'analysis/bundles.json'
     import_maps_path = project / 'analysis/import-maps.json'
     wasm_path = project / 'analysis/wasm/index.json'
+    runtime_path = project / 'analysis/runtime-scripts.json'
 
     source_index = json.loads(source_index_path.read_text()) if source_index_path.exists() else {'units': []}
     sourcemaps = json.loads(sourcemaps_path.read_text()) if sourcemaps_path.exists() else {'source_maps': []}
@@ -46,6 +47,11 @@ def main():
         else {'bundles': [], 'modules': []}
     )
     wasm = json.loads(wasm_path.read_text()) if wasm_path.exists() else {'modules': []}
+    runtime = (
+        json.loads(runtime_path.read_text())
+        if runtime_path.exists()
+        else {'sources': [], 'alpine_families': [], 'gtm_families': []}
+    )
     import_maps = (
         json.loads(import_maps_path.read_text())
         if import_maps_path.exists()
@@ -79,6 +85,7 @@ def main():
         edges.append({'from': src, 'to': dst, 'kind': kind, **fields})
 
     url_to_resources = defaultdict(list)
+    resource_nodes_by_sha = defaultdict(list)
     for r in manifest.get('resources', []):
         rid = int(r['id'])
         node_id = f'resource:{rid}'
@@ -97,6 +104,8 @@ def main():
         )
         if r.get('url'):
             url_to_resources[r['url']].append(node_id)
+        if r.get('sha256'):
+            resource_nodes_by_sha[r['sha256']].append(node_id)
 
     external_nodes = {}
 
@@ -135,6 +144,7 @@ def main():
 
     # Inline scripts are generated source nodes owned by their HTML resource.
     inline_node_by_raw = {}
+    inline_nodes_by_sha = defaultdict(list)
     for item in manifest.get('inline_scripts', []):
         if not item.get('output_path'):
             continue
@@ -154,6 +164,129 @@ def main():
         add_edge(f'resource:{parent}', node_id, 'inline_script', ordinal=ordinal)
         if item.get('output_path'):
             inline_node_by_raw[item['output_path']] = node_id
+        if item.get('sha256'):
+            inline_nodes_by_sha[item['sha256']].append(node_id)
+
+    # Debugger-observed runtime scripts are provenance, not independent network
+    # resources. Preserve exact runtime identities while linking network/inline
+    # executions back to captured source and generated Alpine expressions back
+    # to the DOM directives that caused the browser to compile them.
+    family_counts = {
+        row.get('shape'): row.get('source_count', 0)
+        for row in runtime.get('alpine_families', [])
+        if row.get('shape')
+    }
+    gtm_family_counts = {
+        row.get('shape'): row.get('source_count', 0)
+        for row in runtime.get('gtm_families', [])
+        if row.get('shape')
+    }
+    for source in runtime.get('sources', []):
+        digest = source.get('sha256')
+        if not digest:
+            continue
+        runtime_node = f"runtime:{digest[:20]}"
+        classification = source.get('classification')
+        alpine = source.get('alpine') or {}
+        gtm = source.get('gtm') or {}
+        add_node(
+            runtime_node,
+            type='runtime_script',
+            classification=classification,
+            sha256=digest,
+            bytes=source.get('size'),
+            capture_path=source.get('path'),
+            event_count=source.get('event_count'),
+            script_ids=source.get('script_ids', []),
+            execution_context_ids=source.get('execution_context_ids', []),
+            urls=source.get('urls', []),
+            instrumentation_kind=source.get('instrumentation_kind'),
+            application_source=classification != 'capture_instrumentation',
+        )
+
+        if classification == 'network_response':
+            parents = list(resource_nodes_by_sha.get(digest, []))
+            if not parents:
+                for url in source.get('urls', []):
+                    parents.extend(url_to_resources.get(url, []))
+            for parent in dict.fromkeys(parents):
+                add_edge(parent, runtime_node, 'runtime_execution')
+        elif classification == 'inline_script':
+            for parent in inline_nodes_by_sha.get(digest, []):
+                add_edge(parent, runtime_node, 'runtime_execution')
+        elif classification == 'alpine_expression':
+            shape = alpine.get('shape')
+            if shape:
+                family_digest = hashlib.sha256(shape.encode()).hexdigest()[:20]
+                family_node = f'runtime-family:{family_digest}'
+                add_node(
+                    family_node,
+                    type='runtime_expression_family',
+                    framework='alpine',
+                    shape=shape,
+                    source_count=family_counts.get(shape),
+                )
+                add_edge(runtime_node, family_node, 'runtime_expression_family')
+
+            for match in alpine.get('dom_matches', []):
+                snapshot_key = json.dumps(
+                    [match.get('source'), match.get('path')],
+                    separators=(',', ':'),
+                )
+                snapshot_digest = hashlib.sha256(snapshot_key.encode()).hexdigest()[:20]
+                snapshot_node = f'dom-snapshot:{snapshot_digest}'
+                add_node(
+                    snapshot_node,
+                    type='dom_snapshot',
+                    source=match.get('source'),
+                    path=match.get('path'),
+                )
+                directive_key = json.dumps(
+                    [
+                        match.get('source'),
+                        match.get('path'),
+                        match.get('tag_ordinal'),
+                        match.get('tag'),
+                        match.get('attribute'),
+                    ],
+                    separators=(',', ':'),
+                )
+                directive_digest = hashlib.sha256(directive_key.encode()).hexdigest()[:20]
+                directive_node = f'dom-directive:{directive_digest}'
+                add_node(
+                    directive_node,
+                    type='dom_directive',
+                    source=match.get('source'),
+                    path=match.get('path'),
+                    tag_ordinal=match.get('tag_ordinal'),
+                    tag=match.get('tag'),
+                    attribute=match.get('attribute'),
+                )
+                add_edge(snapshot_node, directive_node, 'dom_directive')
+                add_edge(
+                    directive_node,
+                    runtime_node,
+                    'runtime_alpine_compile',
+                    mapping_kind=alpine.get('dom_mapping_kind'),
+                    expression=alpine.get('expression'),
+                    compiled_expression=alpine.get('compiled_expression'),
+                    shape=shape,
+                )
+        elif classification == 'gtm_custom_javascript':
+            shape = gtm.get('shape')
+            if shape:
+                family_digest = hashlib.sha256(
+                    ('google_tag_manager\0' + shape).encode()
+                ).hexdigest()[:20]
+                family_node = f'runtime-family:{family_digest}'
+                add_node(
+                    family_node,
+                    type='runtime_expression_family',
+                    framework='google_tag_manager',
+                    shape=shape,
+                    source_count=gtm_family_counts.get(shape),
+                )
+                add_edge(runtime_node, family_node, 'runtime_expression_family')
 
     # Safe static deobfuscation is a provenance-preserving source transform.
     deob_nodes = {}
