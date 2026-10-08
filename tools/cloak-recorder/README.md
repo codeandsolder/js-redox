@@ -47,10 +47,11 @@ export after the fact:
 - Playwright request/response events retain request metadata and immediately
   request response bodies. This is the cross-frame/OOPIF path.
 - CDP `Network.streamResourceContent` starts at `responseReceived` for the main
-  target and streams bytes as they arrive, reducing dependence on Chromium's
-  inspector response cache.
+  target and every out-of-process iframe target, streaming bytes as they arrive
+  and reducing dependence on Chromium's inspector response cache.
 - CDP `Debugger.scriptParsed` + `getScriptSource` retain runtime/eval/inline/blob
-  JavaScript that may never exist as a network response. `scriptParsed` generation stack
+  JavaScript from the main page and out-of-process iframe targets even when it
+  never exists as a network response. `scriptParsed` generation stack
   traces and execution-context auxiliary data are retained so nested `eval`/Function
   children can be linked back to the captured script that compiled them.
 - WebSocket frames and SSE/EventSource messages are recorded separately.
@@ -80,8 +81,9 @@ site bodies to the public repository.
 
 ## Known gap
 
-The main-page debugger session captures runtime-created scripts for the page
-target. Dedicated/shared/service-worker target-local `eval` source is not yet
-attached with its own debugger session. Their network-fetched scripts are still
-captured normally. If a corpus sample proves worker-local generated code matters,
-add target auto-attach rather than pretending the current capture is complete.
+The main-page and out-of-process-iframe debugger sessions capture runtime-created
+scripts for page/frame targets. Dedicated/shared/service-worker target-local `eval`
+source is not yet attached with its own debugger session. Their network-fetched
+scripts are still captured normally. If a corpus sample proves worker-local
+generated code matters, add worker-target sessions rather than pretending the
+current capture is complete.

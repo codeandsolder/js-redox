@@ -182,12 +182,17 @@ def match_directives(expression: str, directives: dict[str, list[dict]]) -> tupl
     return "unmatched", []
 
 
+def event_cdp_session(event: dict) -> str:
+    return str(event.get("cdpSession") or "main")
+
+
 def generation_origins(
-    event_rows: list[dict], events_by_script_id: dict[str, dict], max_depth: int = 32
+    event_rows: list[dict], events_by_script_id: dict[tuple[str, str], dict], max_depth: int = 32
 ) -> list[dict]:
     origins: list[dict] = []
     seen_origins: set[str] = set()
     for event in event_rows:
+        cdp_session = event_cdp_session(event)
         child_script_id = str(event.get("scriptId") or "")
         current = event
         visited = {child_script_id} if child_script_id else set()
@@ -201,10 +206,11 @@ def generation_origins(
             parent_script_id = str(frame.get("scriptId") or "")
             if not parent_script_id or parent_script_id in visited:
                 break
-            parent = events_by_script_id.get(parent_script_id)
+            parent = events_by_script_id.get((cdp_session, parent_script_id))
             captured = (parent or {}).get("captured") or {}
             chain.append(
                 {
+                    "cdp_session": cdp_session,
                     "script_id": parent_script_id,
                     "sha256": captured.get("sha256"),
                     "url": (parent or {}).get("url") or frame.get("url") or "",
@@ -219,11 +225,42 @@ def generation_origins(
             current = parent
         if not chain:
             continue
-        origin = {"child_script_id": child_script_id, "chain": chain}
+        origin = {"cdp_session": cdp_session, "child_script_id": child_script_id, "chain": chain}
         frozen = json.dumps(origin, sort_keys=True, separators=(",", ":"))
         if frozen not in seen_origins:
             seen_origins.add(frozen)
             origins.append(origin)
+    return origins
+
+
+def document_inline_origins(event_rows: list[dict]) -> list[dict]:
+    origins: list[dict] = []
+    for event in event_rows:
+        url = str(event.get("url") or "")
+        if not (url in {"about:blank", "about:srcdoc"} or url.startswith("data:text/html")):
+            continue
+        if event.get("stackTrace"):
+            continue
+        aux = event.get("executionContextAuxData") or {}
+        if aux.get("isDefault") is not True:
+            continue
+        start_line = event.get("startLine") or 0
+        start_column = event.get("startColumn") or 0
+        if url != "about:srcdoc" and start_line == 0 and start_column == 0:
+            continue
+        origins.append(
+            {
+                "cdp_session": event_cdp_session(event),
+                "script_id": event.get("scriptId"),
+                "url": url,
+                "frame_id": aux.get("frameId"),
+                "start_line": event.get("startLine"),
+                "start_column": event.get("startColumn"),
+                "end_line": event.get("endLine"),
+                "end_column": event.get("endColumn"),
+                "embedder_name": event.get("embedderName"),
+            }
+        )
     return origins
 
 
@@ -278,7 +315,7 @@ def analyze(capture: Path) -> dict:
 
     events_by_hash: dict[str, list[dict]] = defaultdict(list)
     events_by_script_id = {
-        str(event.get("scriptId")): event
+        (event_cdp_session(event), str(event.get("scriptId"))): event
         for event in events
         if event.get("scriptId") is not None
     }
@@ -308,10 +345,22 @@ def analyze(capture: Path) -> dict:
             "path": str(source_path.relative_to(capture)),
             "event_count": len(event_rows),
             "script_ids": [event.get("scriptId") for event in event_rows],
+            "cdp_sessions": sorted({event_cdp_session(event) for event in event_rows}),
             "execution_context_ids": sorted({event.get("executionContextId") for event in event_rows}),
+            "script_instances": [
+                {
+                    "cdp_session": event_cdp_session(event),
+                    "script_id": event.get("scriptId"),
+                    "execution_context_id": event.get("executionContextId"),
+                }
+                for event in event_rows
+            ],
             "urls": urls,
         }
         origins = generation_origins(event_rows, events_by_script_id)
+        inline_runtime_origins = document_inline_origins(event_rows)
+        if inline_runtime_origins:
+            row["document_inline_origins"] = inline_runtime_origins
         if origins:
             roots = [origin["chain"][-1] for origin in origins if origin.get("chain")]
             row["generated"] = {
@@ -330,6 +379,8 @@ def analyze(capture: Path) -> dict:
             row["inline_origins"] = inline_by_hash[digest]
         elif urls and any(url in network_urls for url in urls):
             classification = "network_observed"
+        elif inline_runtime_origins:
+            classification = "document_inline_script"
         else:
             alpine = recover_alpine_expression(source)
             if alpine:

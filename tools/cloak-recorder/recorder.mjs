@@ -585,7 +585,10 @@ async function main() {
   const runtimeEvents = [];
   const runtimeScripts = new Map();
   const streamed = new Map();
-  const cdpRequests = new Map();
+  const frameCdpStates = new WeakMap();
+  let nextFrameCdpSession = 1;
+  let oopifCdpSessionsAttached = 0;
+  let recorderClosing = false;
   let nextRequest = 1;
 
   const queueJob = (promise, label) => {
@@ -791,177 +794,251 @@ async function main() {
     });
   }
 
-  const cdp = await context.newCDPSession(page);
-  await Promise.all([
-    cdp.send("Page.enable"),
-    cdp.send("Runtime.enable"),
-    cdp.send("Debugger.enable"),
-    cdp.send("Log.enable"),
-    cdp.send("Network.enable", {
-      maxTotalBufferSize: 512 * 1024 * 1024,
-      maxResourceBufferSize: 128 * 1024 * 1024,
-      maxPostDataSize: 16 * 1024 * 1024,
-      enableDurableMessages: true,
-    }),
-  ]);
-  if (!opts.keepCache) await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
+  async function configureCdpCapture(cdpSession, cdpSessionName, { enablePage = false } = {}) {
+    const requests = new Map();
+    const enables = [
+      cdpSession.send("Runtime.enable"),
+      cdpSession.send("Debugger.enable"),
+      cdpSession.send("Log.enable"),
+      cdpSession.send("Network.enable", {
+        maxTotalBufferSize: 512 * 1024 * 1024,
+        maxResourceBufferSize: 128 * 1024 * 1024,
+        maxPostDataSize: 16 * 1024 * 1024,
+        enableDurableMessages: true,
+      }),
+    ];
+    if (enablePage) enables.push(cdpSession.send("Page.enable"));
+    await Promise.all(enables);
+    if (!opts.keepCache) await cdpSession.send("Network.setCacheDisabled", { cacheDisabled: true });
 
-  cdp.on("Network.requestWillBeSent", (event) => {
-    cdpRequests.set(event.requestId, {
-      method: event.request.method,
-      url: event.request.url,
-      requestHeaders: event.request.headers,
-      postData: event.request.postData || null,
-      initiator: event.initiator || null,
-      documentURL: event.documentURL || null,
-      frameId: event.frameId || null,
-      resourceType: event.type || null,
+    const streamKey = (requestId) => `${cdpSessionName}:${requestId}`;
+
+    cdpSession.on("Network.requestWillBeSent", (event) => {
+      requests.set(event.requestId, {
+        method: event.request.method,
+        url: event.request.url,
+        requestHeaders: event.request.headers,
+        postData: event.request.postData || null,
+        initiator: event.initiator || null,
+        documentURL: event.documentURL || null,
+        frameId: event.frameId || null,
+        resourceType: event.type || null,
+      });
     });
-  });
 
-  // CDP streaming starts at responseReceived, before normal HAR export could evict
-  // response content from Chromium's inspector cache.
-  cdp.on("Network.responseReceived", (event) => {
-    const request = cdpRequests.get(event.requestId) || {};
-    const record = {
-      requestId: event.requestId,
-      url: event.response.url,
-      status: event.response.status,
-      mimeType: event.response.mimeType,
-      resourceType: event.type,
-      responseHeaders: event.response.headers,
-      method: request.method || "GET",
-      requestHeaders: request.requestHeaders || {},
-      postData: request.postData || null,
-      initiator: request.initiator || null,
-      documentURL: request.documentURL || null,
-      frameId: request.frameId || null,
-      chunks: [],
-      streamEnabled: false,
-      streamStart: null,
-      body: null,
-      error: null,
-    };
-    streamed.set(event.requestId, record);
+    // Streaming begins at responseReceived so short-lived OOPIFs can persist bytes
+    // before their renderer target disappears.
+    cdpSession.on("Network.responseReceived", (event) => {
+      const request = requests.get(event.requestId) || {};
+      const record = {
+        cdpSession: cdpSessionName,
+        requestId: event.requestId,
+        url: event.response.url,
+        status: event.response.status,
+        mimeType: event.response.mimeType,
+        resourceType: event.type,
+        responseHeaders: event.response.headers,
+        method: request.method || "GET",
+        requestHeaders: request.requestHeaders || {},
+        postData: request.postData || null,
+        initiator: request.initiator || null,
+        documentURL: request.documentURL || null,
+        frameId: request.frameId || null,
+        chunks: [],
+        streamEnabled: false,
+        streamStart: null,
+        body: null,
+        error: null,
+      };
+      streamed.set(streamKey(event.requestId), record);
 
-    const policy = shouldKeepBody(record, opts.allBodies);
-    if (!policy.keep) {
-      record.error = `skipped:${policy.reason}`;
+      const policy = shouldKeepBody(record, opts.allBodies);
+      if (!policy.keep) {
+        record.error = `skipped:${policy.reason}`;
+        return;
+      }
+
+      record.streamStart = (async () => {
+        try {
+          const result = await withTimeout(
+            cdpSession.send("Network.streamResourceContent", { requestId: event.requestId }),
+            Math.min(opts.timeoutMs, 15_000),
+            "streamResourceContent",
+          );
+          if (result.bufferedData) record.chunks.push(Buffer.from(result.bufferedData, "base64"));
+          record.streamEnabled = true;
+        } catch (error) {
+          record.error = `streamResourceContent:${String(error)}`;
+        }
+      })();
+      queueJob(record.streamStart, `stream-start ${cdpSessionName} ${record.url}`);
+    });
+
+    cdpSession.on("Network.dataReceived", (event) => {
+      const record = streamed.get(streamKey(event.requestId));
+      if (!record?.streamEnabled || !event.data) return;
+      record.chunks.push(Buffer.from(event.data, "base64"));
+    });
+
+    cdpSession.on("Network.loadingFinished", (event) => {
+      const record = streamed.get(streamKey(event.requestId));
+      if (!record) return;
+      queueJob((async () => {
+        if (record.streamStart) await record.streamStart;
+        if (!record.streamEnabled) return;
+        const body = Buffer.concat(record.chunks);
+        if (body.length > opts.maxBodyMiB * 1024 * 1024) {
+          record.error = `body-over-limit:${body.length}`;
+          record.chunks = [];
+          return;
+        }
+        record.body = await writeCas(body);
+        record.chunks = [];
+      })(), `stream-finish ${cdpSessionName} ${record.url}`);
+    });
+
+    cdpSession.on("Network.loadingFailed", (event) => {
+      const record = streamed.get(streamKey(event.requestId));
+      if (record) {
+        record.error = `loadingFailed:${event.errorText}`;
+        record.chunks = [];
+      }
+    });
+
+    cdpSession.on("Network.eventSourceMessageReceived", (event) => {
+      eventSourceEvents.push({ at: Date.now(), cdpSession: cdpSessionName, ...safeJson(event) });
+    });
+
+    cdpSession.on("Log.entryAdded", ({ entry }) => {
+      runtimeEvents.push({ at: Date.now(), type: "cdp-log", cdpSession: cdpSessionName, entry: safeJson(entry) });
+    });
+
+    cdpSession.on("Runtime.exceptionThrown", (event) => {
+      runtimeEvents.push({ at: Date.now(), type: "exception", cdpSession: cdpSessionName, event: safeJson(event) });
+    });
+
+    cdpSession.on("Debugger.scriptParsed", (script) => {
+      const url = script.url || "";
+      if (url.startsWith("js-redox-recorder://")) return;
+      const key = `${cdpSessionName}:${script.scriptId}:${script.hash || ""}`;
+      if (runtimeScripts.has(key)) return;
+
+      const row = {
+        cdpSession: cdpSessionName,
+        scriptId: script.scriptId,
+        url,
+        hash: script.hash || null,
+        sourceMapURL: script.sourceMapURL || null,
+        startLine: script.startLine,
+        startColumn: script.startColumn,
+        endLine: script.endLine,
+        endColumn: script.endColumn,
+        executionContextId: script.executionContextId,
+        executionContextAuxData: safeJson(script.executionContextAuxData || null),
+        stackTrace: safeJson(script.stackTrace || null),
+        isModule: script.isModule,
+        hasSourceURL: script.hasSourceURL,
+        isLiveEdit: script.isLiveEdit || false,
+        scriptLanguage: script.scriptLanguage || null,
+        buildId: script.buildId || null,
+        embedderName: script.embedderName || null,
+        length: script.length || null,
+        captured: null,
+        error: null,
+      };
+      runtimeScripts.set(key, row);
+
+      queueJob((async () => {
+        try {
+          const result = await withTimeout(
+            cdpSession.send("Debugger.getScriptSource", { scriptId: script.scriptId }),
+            Math.min(opts.timeoutMs, 15_000),
+            "getScriptSource",
+          );
+          if (typeof result.scriptSource === "string" && result.scriptSource.length > 0) {
+            const buffer = Buffer.from(result.scriptSource, "utf8");
+            if (buffer.length <= opts.maxBodyMiB * 1024 * 1024) {
+              const digest = sha256(buffer);
+              const rel = path.posix.join("runtime-scripts", `${digest}.js`);
+              await writeFile(path.join(out, rel), buffer);
+              row.captured = { sha256: digest, size: buffer.length, path: rel, kind: "javascript" };
+            } else {
+              row.error = `script-over-limit:${buffer.length}`;
+            }
+          } else if (script.scriptLanguage === "WebAssembly") {
+            const wasm = await withTimeout(
+              cdpSession.send("Debugger.getWasmBytecode", { scriptId: script.scriptId }),
+              Math.min(opts.timeoutMs, 15_000),
+              "getWasmBytecode",
+            );
+            if (wasm.bytecode) {
+              const buffer = Buffer.from(wasm.bytecode, "base64");
+              const digest = sha256(buffer);
+              const rel = path.posix.join("runtime-scripts", `${digest}.wasm`);
+              await writeFile(path.join(out, rel), buffer);
+              row.captured = { sha256: digest, size: buffer.length, path: rel, kind: "wasm" };
+            }
+          }
+        } catch (error) {
+          row.error = String(error);
+        }
+      })(), `script-source ${cdpSessionName} ${url || script.scriptId}`);
+    });
+  }
+
+  const cdp = await context.newCDPSession(page);
+  await configureCdpCapture(cdp, "main", { enablePage: true });
+
+  async function maybeAttachFrameCdp(frame) {
+    if (frame === page.mainFrame() || frame.isDetached()) return;
+    const existing = frameCdpStates.get(frame);
+    if (existing?.status === "attaching" || existing?.status === "attached") return;
+    frameCdpStates.set(frame, { status: "attaching" });
+
+    let session;
+    try {
+      session = await context.newCDPSession(frame);
+    } catch (error) {
+      frameCdpStates.delete(frame);
+      const message = String(error);
+      if (frame.isDetached() || message.includes("does not have a separate CDP session")) return;
+      failures.push({ at: Date.now(), label: `oopif-cdp-attach ${frame.url()}`, error: message });
       return;
     }
 
-    record.streamStart = (async () => {
-      try {
-        const result = await withTimeout(cdp.send("Network.streamResourceContent", { requestId: event.requestId }), Math.min(opts.timeoutMs, 15_000), "streamResourceContent");
-        if (result.bufferedData) record.chunks.push(Buffer.from(result.bufferedData, "base64"));
-        record.streamEnabled = true;
-      } catch (error) {
-        record.error = `streamResourceContent:${String(error)}`;
-      }
-    })();
-    queueJob(record.streamStart, `stream-start ${record.url}`);
-  });
-
-  cdp.on("Network.dataReceived", (event) => {
-    const record = streamed.get(event.requestId);
-    if (!record?.streamEnabled || !event.data) return;
-    record.chunks.push(Buffer.from(event.data, "base64"));
-  });
-
-  cdp.on("Network.loadingFinished", (event) => {
-    const record = streamed.get(event.requestId);
-    if (!record) return;
-    queueJob((async () => {
-      if (record.streamStart) await record.streamStart;
-      if (!record.streamEnabled) return;
-      const body = Buffer.concat(record.chunks);
-      if (body.length > opts.maxBodyMiB * 1024 * 1024) {
-        record.error = `body-over-limit:${body.length}`;
-        record.chunks = [];
-        return;
-      }
-      record.body = await writeCas(body);
-      record.chunks = [];
-    })(), `stream-finish ${record.url}`);
-  });
-
-  cdp.on("Network.loadingFailed", (event) => {
-    const record = streamed.get(event.requestId);
-    if (record) {
-      record.error = `loadingFailed:${event.errorText}`;
-      record.chunks = [];
+    const name = `oopif-${nextFrameCdpSession++}`;
+    const state = { status: "attached", session, name };
+    frameCdpStates.set(frame, state);
+    try {
+      await configureCdpCapture(session, name);
+      oopifCdpSessionsAttached += 1;
+      events.push({ at: Date.now(), type: "oopif-cdp-attached", cdpSession: name, url: frame.url() });
+    } catch (error) {
+      frameCdpStates.delete(frame);
+      failures.push({ at: Date.now(), label: `oopif-cdp-configure ${frame.url()}`, error: String(error) });
+      try { await session.detach(); } catch {}
+      return;
     }
-  });
 
-  cdp.on("Network.eventSourceMessageReceived", (event) => {
-    eventSourceEvents.push({ at: Date.now(), ...safeJson(event) });
-  });
-
-  cdp.on("Log.entryAdded", ({ entry }) => {
-    runtimeEvents.push({ at: Date.now(), type: "cdp-log", entry: safeJson(entry) });
-  });
-
-  cdp.on("Runtime.exceptionThrown", (event) => {
-    runtimeEvents.push({ at: Date.now(), type: "exception", event: safeJson(event) });
-  });
-
-  cdp.on("Debugger.scriptParsed", (script) => {
-    const url = script.url || "";
-    if (url.startsWith("js-redox-recorder://")) return;
-    const key = `${script.scriptId}:${script.hash || ""}`;
-    if (runtimeScripts.has(key)) return;
-
-    const row = {
-      scriptId: script.scriptId,
-      url,
-      hash: script.hash || null,
-      sourceMapURL: script.sourceMapURL || null,
-      startLine: script.startLine,
-      startColumn: script.startColumn,
-      endLine: script.endLine,
-      endColumn: script.endColumn,
-      executionContextId: script.executionContextId,
-      executionContextAuxData: safeJson(script.executionContextAuxData || null),
-      stackTrace: safeJson(script.stackTrace || null),
-      isModule: script.isModule,
-      hasSourceURL: script.hasSourceURL,
-      isLiveEdit: script.isLiveEdit || false,
-      scriptLanguage: script.scriptLanguage || null,
-      buildId: script.buildId || null,
-      embedderName: script.embedderName || null,
-      length: script.length || null,
-      captured: null,
-      error: null,
-    };
-    runtimeScripts.set(key, row);
-
-    queueJob((async () => {
-      try {
-        const result = await withTimeout(cdp.send("Debugger.getScriptSource", { scriptId: script.scriptId }), Math.min(opts.timeoutMs, 15_000), "getScriptSource");
-        if (typeof result.scriptSource === "string" && result.scriptSource.length > 0) {
-          const buffer = Buffer.from(result.scriptSource, "utf8");
-          if (buffer.length <= opts.maxBodyMiB * 1024 * 1024) {
-            const digest = sha256(buffer);
-            const rel = path.posix.join("runtime-scripts", `${digest}.js`);
-            await writeFile(path.join(out, rel), buffer);
-            row.captured = { sha256: digest, size: buffer.length, path: rel, kind: "javascript" };
-          } else {
-            row.error = `script-over-limit:${buffer.length}`;
-          }
-        } else if (script.scriptLanguage === "WebAssembly") {
-          const wasm = await withTimeout(cdp.send("Debugger.getWasmBytecode", { scriptId: script.scriptId }), Math.min(opts.timeoutMs, 15_000), "getWasmBytecode");
-          if (wasm.bytecode) {
-            const buffer = Buffer.from(wasm.bytecode, "base64");
-            const digest = sha256(buffer);
-            const rel = path.posix.join("runtime-scripts", `${digest}.wasm`);
-            await writeFile(path.join(out, rel), buffer);
-            row.captured = { sha256: digest, size: buffer.length, path: rel, kind: "wasm" };
-          }
-        }
-      } catch (error) {
-        row.error = String(error);
+    session.on("close", () => {
+      if (frameCdpStates.get(frame) === state) frameCdpStates.delete(frame);
+      events.push({ at: Date.now(), type: "oopif-cdp-closed", cdpSession: name, url: frame.url() });
+      if (!recorderClosing && !frame.isDetached()) {
+        queueJob((async () => {
+          await sleep(25);
+          await maybeAttachFrameCdp(frame);
+        })(), `oopif-cdp-reattach ${frame.url()}`);
       }
-    })(), `script-source ${url || script.scriptId}`);
+    });
+  }
+
+  page.on("frameattached", (frame) => {
+    queueJob(maybeAttachFrameCdp(frame), `oopif-cdp-frameattached ${frame.url()}`);
+  });
+  page.on("framenavigated", (frame) => {
+    if (frame !== page.mainFrame()) {
+      queueJob(maybeAttachFrameCdp(frame), `oopif-cdp-framenavigated ${frame.url()}`);
+    }
   });
 
   let navigationError = null;
@@ -1124,6 +1201,7 @@ async function main() {
   }
 
   const streamRows = [...streamed.values()].map((row) => ({
+    cdpSession: row.cdpSession,
     requestId: row.requestId,
     url: row.url,
     status: row.status,
@@ -1158,6 +1236,7 @@ async function main() {
     missingRelevantBodies: missingBodies.length,
     failedRelevantBodies: failedBodies.length,
     abortedRelevantResponses: abortedRelevantResponses.length,
+    oopifCdpSessionsAttached,
     cdpStreams: streamRows.length,
     capturedCdpStreams: streamRows.filter((r) => r.body).length,
     runtimeScriptsSeen: runtimeScripts.size,
@@ -1217,7 +1296,7 @@ async function main() {
         failure: r.failure,
         bodyCapture: r.bodyCapture,
       })),
-      note: "Relevant responses that fail/abort after headers are reported separately because no complete response body is expected to exist. Playwright response.body is the cross-frame body channel; CDP streamResourceContent is an independent early-stream channel for the main target. Runtime Debugger capture preserves eval/inline/blob-created script source when Chromium exposes it.",
+      note: "Relevant responses that fail/abort after headers are reported separately because no complete response body is expected to exist. Playwright response.body is the cross-frame body channel; CDP streamResourceContent independently streams the main target and attached out-of-process iframe targets. Runtime Debugger capture preserves eval/inline/blob-created script source when Chromium exposes it.",
     },
     artifacts: {
       har: "capture.har",
@@ -1237,7 +1316,7 @@ async function main() {
       failures: "failures.json",
     },
     limitations: [
-      "Runtime Debugger capture is attached to the main page target; worker-created eval source may require a worker-target session in a future revision.",
+      "Runtime Debugger/Network capture covers the main page plus out-of-process iframe targets; dedicated/shared worker-created eval source may require worker-target sessions in a future revision.",
       "Bodies larger than maxBodyMiB are intentionally reported but not persisted unless the limit is increased.",
       "Image/media/font bodies are intentionally omitted unless --all-bodies is used.",
     ],
@@ -1265,6 +1344,7 @@ async function main() {
     console.log(`[recorder] all eligible relevant response bodies captured`);
   }
 
+  recorderClosing = true;
   await context.close();
   console.log(`[recorder] done: ${out}`);
 }

@@ -199,7 +199,9 @@ def main():
             capture_path=source.get('path'),
             event_count=source.get('event_count'),
             script_ids=source.get('script_ids', []),
+            cdp_sessions=source.get('cdp_sessions', []),
             execution_context_ids=source.get('execution_context_ids', []),
+            script_instances=source.get('script_instances', []),
             urls=source.get('urls', []),
             instrumentation_kind=source.get('instrumentation_kind'),
             generated_root_sha256s=generated.get('root_sha256s', []),
@@ -214,6 +216,7 @@ def main():
                 continue
             parent = chain[0]
             edge_fields = {
+                'cdp_session': origin.get('cdp_session') or parent.get('cdp_session') or 'main',
                 'child_script_id': origin.get('child_script_id'),
                 'parent_script_id': parent.get('script_id'),
                 'function_name': parent.get('function_name'),
@@ -248,6 +251,31 @@ def main():
         elif classification == 'inline_script':
             for parent in inline_nodes_by_sha.get(digest, []):
                 add_edge(parent, runtime_node, 'runtime_execution')
+        elif classification == 'document_inline_script':
+            for origin in source.get('document_inline_origins', []):
+                document_key = json.dumps(
+                    [origin.get('cdp_session'), origin.get('url'), origin.get('frame_id')],
+                    separators=(',', ':'),
+                )
+                document_digest = hashlib.sha256(document_key.encode()).hexdigest()[:20]
+                document_node = f'runtime-document:{document_digest}'
+                add_node(
+                    document_node,
+                    type='runtime_document',
+                    cdp_session=origin.get('cdp_session'),
+                    url=origin.get('url'),
+                    frame_id=origin.get('frame_id'),
+                )
+                add_edge(
+                    document_node,
+                    runtime_node,
+                    'runtime_document_inline',
+                    script_id=origin.get('script_id'),
+                    start_line=origin.get('start_line'),
+                    start_column=origin.get('start_column'),
+                    end_line=origin.get('end_line'),
+                    end_column=origin.get('end_column'),
+                )
         elif classification == 'alpine_expression':
             shape = alpine.get('shape')
             if shape:
