@@ -14,6 +14,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { evaluateDuringScroll } from "./scroll-retry.mjs";
+import { classifyRelevantBodies } from "./network-completeness.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../..");
@@ -1139,9 +1140,15 @@ async function main() {
     error: row.error,
   }));
 
-  const expectedBodies = networkRecords.filter((r) => shouldKeepBody(r, opts.allBodies).expected && r.status > 0);
-  const missingBodies = expectedBodies.filter((r) => !r.body);
-  const failedBodies = expectedBodies.filter((r) => r.bodyCapture?.status === "failed");
+  const {
+    abortedRelevantResponses,
+    expectedBodies,
+    missingBodies,
+    failedBodies,
+  } = classifyRelevantBodies(
+    networkRecords,
+    (record) => shouldKeepBody(record, opts.allBodies).expected,
+  );
 
   const summary = {
     requests: networkRecords.length,
@@ -1150,6 +1157,7 @@ async function main() {
     expectedRelevantBodies: expectedBodies.length,
     missingRelevantBodies: missingBodies.length,
     failedRelevantBodies: failedBodies.length,
+    abortedRelevantResponses: abortedRelevantResponses.length,
     cdpStreams: streamRows.length,
     capturedCdpStreams: streamRows.filter((r) => r.body).length,
     runtimeScriptsSeen: runtimeScripts.size,
@@ -1199,7 +1207,17 @@ async function main() {
         bodyCapture: r.bodyCapture,
         inflightAtFinish: r.inflightAtFinish || false,
       })),
-      note: "Playwright response.body is the cross-frame body channel; CDP streamResourceContent is an independent early-stream channel for the main target. Runtime Debugger capture preserves eval/inline/blob-created script source when Chromium exposes it.",
+      abortedRelevantResponses: abortedRelevantResponses.map((r) => ({
+        id: r.id,
+        method: r.method,
+        url: r.url,
+        status: r.status,
+        resourceType: r.resourceType,
+        mimeType: r.mimeType,
+        failure: r.failure,
+        bodyCapture: r.bodyCapture,
+      })),
+      note: "Relevant responses that fail/abort after headers are reported separately because no complete response body is expected to exist. Playwright response.body is the cross-frame body channel; CDP streamResourceContent is an independent early-stream channel for the main target. Runtime Debugger capture preserves eval/inline/blob-created script source when Chromium exposes it.",
     },
     artifacts: {
       har: "capture.har",
