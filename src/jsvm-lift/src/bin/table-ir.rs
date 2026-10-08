@@ -210,7 +210,10 @@ fn body_statements(raw: &str) -> Vec<String> {
     }
     let statements = match expr {
         Expression::FunctionExpression(fun) => fun.body.as_ref().map(|b| b.statements.as_slice()),
-        Expression::ArrowFunctionExpression(fun) => Some(fun.body.statements.as_slice()),
+        Expression::ArrowFunctionExpression(fun) => match &fun.body {
+            oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => Some(body.statements.as_slice()),
+            _ => None,
+        },
         _ => None,
     };
     let Some(statements) = statements else {

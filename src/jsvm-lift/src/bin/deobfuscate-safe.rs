@@ -5,7 +5,6 @@ use oxc_codegen::Codegen;
 use oxc_span::SourceType;
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 #[derive(ClapParser, Debug)]
@@ -36,9 +35,7 @@ fn canonicalize(source: &str) -> Option<String> {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    format!("{:x}", h.finalize())
+    jsvm_lift::sha256_hex(bytes)
 }
 
 #[derive(Serialize)]

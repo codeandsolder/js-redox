@@ -167,7 +167,7 @@ fn analyze_proxy_function(function: &oxc_ast::ast::Function<'_>) -> Option<Proxy
 fn analyze_proxy_arrow(
     function: &oxc_ast::ast::ArrowFunctionExpression<'_>,
 ) -> Option<ProxyProperty> {
-    if function.r#async || !function.body.directives.is_empty() {
+    if function.r#async {
         return None;
     }
 
@@ -175,10 +175,13 @@ fn analyze_proxy_arrow(
         return analyze_proxy_return(&function.params, returned);
     }
 
-    if function.body.statements.len() != 1 {
+    let oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) = &function.body else {
+        return None;
+    };
+    if !body.directives.is_empty() || body.statements.len() != 1 {
         return None;
     }
-    let Statement::ReturnStatement(ret) = &function.body.statements[0] else {
+    let Statement::ReturnStatement(ret) = &body.statements[0] else {
         return None;
     };
     analyze_proxy_return(&function.params, ret.argument.as_ref()?)

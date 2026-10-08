@@ -64,7 +64,7 @@ fn shape_hash(source: &str, coarse_properties: bool) -> Result<String> {
     let wrapped = format!("({source})");
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, &wrapped, SourceType::cjs());
-    anyhow::ensure!(!parsed.panicked, "parser panicked");
+    anyhow::ensure!(!parsed.fatal_error, "parser fatal_error");
     anyhow::ensure!(parsed.diagnostics == 0, "parse diagnostics");
     let property_mode = if coarse_properties {
         PropertyMode::Canonical

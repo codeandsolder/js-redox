@@ -2,7 +2,6 @@ use anyhow::{bail, Context, Result};
 use base64::Engine;
 use clap::Parser as ClapParser;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Write as _,
@@ -193,9 +192,7 @@ fn headers(src: &[NameValue]) -> Vec<HeaderMeta> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(bytes);
-    format!("{:x}", h.finalize())
+    jsvm_lift::sha256_hex(bytes)
 }
 
 fn short_hash(text: &str) -> String {

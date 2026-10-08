@@ -58,7 +58,7 @@ struct Report {
     schema: &'static str,
     input: String,
     diagnostics: usize,
-    panicked: bool,
+    fatal_error: bool,
     bundles: Vec<BundleRecord>,
 }
 
@@ -87,6 +87,15 @@ fn unwrap_parenthesized<'a>(mut expr: &'a Expression<'a>) -> &'a Expression<'a> 
         expr = &paren.expression;
     }
     expr
+}
+
+fn arrow_block_body<'a>(
+    function: &'a oxc_ast::ast::ArrowFunctionExpression<'a>,
+) -> Option<&'a oxc_ast::ast::FunctionBody<'a>> {
+    match &function.body {
+        oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => Some(&**body),
+        _ => None,
+    }
 }
 
 fn computed_string(expr: &Expression<'_>) -> Option<String> {
@@ -342,7 +351,7 @@ impl Collector<'_, '_> {
             }
             Expression::ArrowFunctionExpression(function) => Some((
                 &function.params,
-                function.body.as_ref(),
+                arrow_block_body(function)?,
                 function.span,
                 "arrow",
             )),
@@ -368,7 +377,7 @@ impl Collector<'_, '_> {
             }
             Argument::ArrowFunctionExpression(function) => Some((
                 &function.params,
-                function.body.as_ref(),
+                arrow_block_body(function)?,
                 function.span,
                 "arrow",
             )),
@@ -584,7 +593,10 @@ impl Collector<'_, '_> {
                 (&function.params, body.as_ref())
             }
             Expression::ArrowFunctionExpression(function) => {
-                (&function.params, function.body.as_ref())
+                let Some(body) = arrow_block_body(function) else {
+                    return Vec::new();
+                };
+                (&function.params, body)
             }
             _ => return Vec::new(),
         };
@@ -614,7 +626,10 @@ impl Collector<'_, '_> {
                 (&function.params, body.as_ref())
             }
             Expression::ArrowFunctionExpression(function) => {
-                (&function.params, function.body.as_ref())
+                let Some(body) = arrow_block_body(function) else {
+                    return (Vec::new(), false);
+                };
+                (&function.params, body)
             }
             _ => return (Vec::new(), false),
         };
@@ -724,7 +739,7 @@ impl Collector<'_, '_> {
             }
             ArrayExpressionElement::ArrowFunctionExpression(function) => Some((
                 &function.params,
-                function.body.as_ref(),
+                arrow_block_body(function)?,
                 function.span,
                 "arrow",
             )),
@@ -1015,13 +1030,13 @@ fn main() -> Result<()> {
         .with_context(|| format!("reading {}", args.input.display()))?;
     let allocator = Allocator::default();
     let mut parsed = parse(&allocator, &source, SourceType::mjs());
-    if parsed.panicked {
+    if parsed.fatal_error {
         parsed = parse(&allocator, &source, SourceType::cjs());
     }
 
     let mut diagnostics = parsed.diagnostics;
-    let panicked = parsed.panicked;
-    let mut bundles = if !panicked {
+    let fatal_error = parsed.fatal_error;
+    let mut bundles = if !fatal_error {
         let semantic_ret = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&parsed.program);
@@ -1107,7 +1122,7 @@ fn main() -> Result<()> {
         schema: "js-bundle-inventory/v5",
         input: args.input.display().to_string(),
         diagnostics,
-        panicked,
+        fatal_error,
         bundles,
     };
     println!("{}", serde_json::to_string(&report)?);

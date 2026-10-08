@@ -146,7 +146,7 @@ impl<'a> Visit<'a> for ParseIntAliasVisitor {
 fn parse_int_aliases(source: &str) -> BTreeSet<String> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::cjs());
-    if parsed.panicked {
+    if parsed.fatal_error {
         return BTreeSet::new();
     }
     let mut visitor = ParseIntAliasVisitor::default();

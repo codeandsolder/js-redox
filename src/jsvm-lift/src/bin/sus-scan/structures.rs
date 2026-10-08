@@ -267,7 +267,10 @@ impl<'a> Visit<'a> for OneShotProbe<'_> {
 fn returned_function_body<'a>(expr: &'a Expression<'a>) -> Option<&'a FunctionBody<'a>> {
     match expr {
         Expression::FunctionExpression(function) => function.body.as_deref(),
-        Expression::ArrowFunctionExpression(function) => Some(&function.body),
+        Expression::ArrowFunctionExpression(function) => match &function.body {
+            oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => Some(&**body),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -350,14 +353,20 @@ fn is_tiny_proxy_function(expr: &Expression<'_>) -> bool {
             )
         }
         Expression::ArrowFunctionExpression(function) => {
-            if function.r#async || !function.body.directives.is_empty() {
+            if function.r#async {
                 return false;
             }
             if let Some(returned) = function.get_expression() {
                 return is_proxy_return_expression(returned);
             }
+            let oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) = &function.body else {
+                return false;
+            };
+            if !body.directives.is_empty() {
+                return false;
+            }
             matches!(
-                function.body.statements.as_slice(),
+                body.statements.as_slice(),
                 [Statement::ReturnStatement(ret)]
                     if ret.argument.as_ref().is_some_and(is_proxy_return_expression)
             )

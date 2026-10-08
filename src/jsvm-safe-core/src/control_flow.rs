@@ -786,11 +786,12 @@ fn iife_body<'a>(expr: &'a Expression<'a>) -> Option<&'a oxc_ast::ast::FunctionB
                     body.directives.is_empty().then_some(&**body)
                 }
                 Expression::ArrowFunctionExpression(fun)
-                    if !fun.r#async
-                        && fun.params.items.is_empty()
-                        && fun.body.directives.is_empty() =>
+                    if !fun.r#async && fun.params.items.is_empty() =>
                 {
-                    Some(&fun.body)
+                    let oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) = &fun.body else {
+                        return None;
+                    };
+                    body.directives.is_empty().then_some(&**body)
                 }
                 Expression::ParenthesizedExpression(p) => iife_body(&p.expression),
                 _ => None,
