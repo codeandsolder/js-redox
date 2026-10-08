@@ -96,7 +96,7 @@ def main():
     html = (
         "<!doctype html><html><body>"
         '<script src="/assets/app.js"></script>'
-        '<script type="application/javascript; charset=utf-8">globalThis.inlineHar = 1;</script>'
+        '<script type="80bb470769a376240e5e4e06-text/javascript">globalThis.inlineHar = 1;</script>'
         '<script type="speculationrules">{"prefetch":[{"source":"list","urls":["/next"]}]}</script>'
         "</body></html>"
     )
@@ -218,7 +218,7 @@ def main():
         for script in manifest["inline_scripts"]
         if script.get("output_path", "").endswith(".js")
     )
-    assert executable_inline["script_type"] == "application/javascript"
+    assert executable_inline["script_type"] == "80bb470769a376240e5e4e06-text/javascript"
     app_resource = next(r for r in manifest["resources"] if r["url"].endswith("/app.js"))
     assert app_resource["sha256"] == hashlib.sha256(app_js.encode()).hexdigest()
 

@@ -311,6 +311,36 @@ def main():
         assert not with_report.exists(), "unsafe with-statement report must not be emitted"
         print("with-statement-safety: fail-closed")
 
+        rotated_source = td / "fixed-rotated-direct-decoder.js"
+        rotated_out = td / "fixed-rotated-direct-decoder.out.js"
+        rotated_report = td / "fixed-rotated-direct-decoder.json"
+        rotated_source.write_text(
+            "const table=['SEED','cookie=','array'];"
+            "(function(a,n){const rotate=function(k){while(--k){a['push'](a['shift']());}};"
+            "rotate(++n);}(table,4));"
+            "const decode=function(i,_unused){i=i-0x0;let value=table[i];return value;};"
+            "console.log(decode('0x2'),decode('0x1'),decode('0x0'));\n"
+        )
+        before = node_stdout(rotated_source)
+        cp = subprocess.run(
+            [str(BIN), str(rotated_source), str(rotated_out), "--report", str(rotated_report)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(
+                f"fixed rotated direct decoder deobfuscation failed:\n{cp.stdout}\n{cp.stderr}"
+            )
+        assert node_stdout(rotated_out) == before
+        rotated_meta = json.loads(rotated_report.read_text())
+        assert rotated_meta["transforms"].get("materialize_fixed_decoder_rotation", 0) >= 1, rotated_meta
+        assert rotated_meta["transforms"].get("remove_fixed_decoder_rotation_iife", 0) >= 1, rotated_meta
+        assert rotated_meta["transforms"].get("string_array_decode", 0) >= 3, rotated_meta
+        print("fixed-rotated-direct-decoder", rotated_meta["transforms"])
+
         duplicate_source = ROOT / "corpus/generated/reversible-obfuscation/duplicate-scope-decoder-negative.js"
         duplicate_out = td / "duplicate-scope-decoder-negative.js"
         duplicate_report = td / "duplicate-scope-decoder-negative.json"

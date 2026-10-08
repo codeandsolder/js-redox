@@ -33,6 +33,10 @@ def main():
         project / "analysis/generated-recovery.json",
         {"units": [], "summary": {}},
     )
+    runtime_scripts = load(
+        project / "analysis/runtime-scripts.json",
+        {"sources": [], "alpine_families": [], "summary": {}},
+    )
 
     resources = manifest.get("resources", [])
     source_units = source_index.get("units", [])
@@ -94,6 +98,8 @@ def main():
     original_url = manifest.get("original_page_url")
     bundle_summary = bundles.get("summary", {})
     generated_recovery_summary = generated_recovery.get("summary", {})
+    runtime_summary = runtime_scripts.get("summary", {})
+    runtime_classes = runtime_summary.get("classifications", {})
 
     lines = [
         "# Recovered source project",
@@ -118,11 +124,17 @@ def main():
         "- [har-manifest.json](har-manifest.json) — compatibility manifest consumed by the current analysis stages.",
         "- [analysis/import-maps.json](analysis/import-maps.json) — captured import-map definitions, normalized mappings and merge diagnostics.",
         "- [analysis/source-graph.json](analysis/source-graph.json) — machine-readable relationship/provenance graph.",
+        *(["- [analysis/runtime-scripts.json](analysis/runtime-scripts.json) — Debugger runtime-script provenance, generated-expression recovery, and capture-instrumentation classification."] if runtime_summary else []),
         "",
         "## Capture summary",
         "",
         f"- Captured resources: **{len(resources)}**",
         f"- Inline scripts: **{len(manifest.get('inline_scripts', []))}**",
+        *([
+            f"- Runtime debugger scripts: **{runtime_summary.get('script_parsed_events', 0)}** scriptParsed events / **{runtime_summary.get('unique_javascript_sources', 0)}** unique JavaScript sources",
+            f"- Runtime provenance: **{runtime_classes.get('network_response', 0)}** network-backed, **{runtime_classes.get('inline_script', 0)}** inline, **{runtime_classes.get('alpine_expression', 0)}** Alpine-generated expressions, **{runtime_classes.get('capture_instrumentation', 0)}** capture helpers, **{runtime_summary.get('anonymous_runtime_sources', 0)}** unexplained",
+            f"- Alpine runtime reduction: **{runtime_classes.get('alpine_expression', 0)}** generated sources -> **{runtime_summary.get('alpine_expression_shapes', 0)}** literal-normalized expression families; **{runtime_summary.get('alpine_dom_mapped_sources', 0)}** mapped back to captured DOM directives",
+        ] if runtime_summary else []),
         f"- Readable source units: **{len(source_units)}** ({len(js_units)} JavaScript)",
         f"- Exact-content JS reuse: **{source_summary.get('unique_javascript_inputs', len(js_units))}** unique bodies / "
         f"**{len(js_units)}** occurrences (**{source_summary.get('deduplicated_javascript_units', 0)}** formatter reuses)",

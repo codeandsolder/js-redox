@@ -477,7 +477,7 @@ fn script_type(attrs: &HashMap<String, String>) -> String {
         .unwrap_or_else(|| "text/javascript".into())
 }
 
-fn is_executable_script_type(ty: &str) -> bool {
+fn is_standard_executable_script_type(ty: &str) -> bool {
     matches!(
         ty,
         "module"
@@ -498,6 +498,18 @@ fn is_executable_script_type(ty: &str) -> bool {
             | "text/x-ecmascript"
             | "text/x-javascript"
     )
+}
+
+fn is_executable_script_type(ty: &str) -> bool {
+    if is_standard_executable_script_type(ty) {
+        return true;
+    }
+    let Some((prefix, suffix)) = ty.split_once('-') else {
+        return false;
+    };
+    prefix.len() >= 16
+        && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && is_standard_executable_script_type(suffix)
 }
 
 fn is_json_script_type(ty: &str) -> bool {

@@ -11,8 +11,8 @@ def main() -> None:
     defaults = Toolchain()
     ap = argparse.ArgumentParser(
         description=(
-            "Recover a readable, provenance-preserving JavaScript project from a browser HAR "
-            "or a saved HTML/Webpage Complete capture"
+            "Recover a readable, provenance-preserving JavaScript project from a CloakBrowser "
+            "recorder bundle, browser HAR, or saved HTML/Webpage Complete capture"
         )
     )
     ap.add_argument("capture", type=Path)
