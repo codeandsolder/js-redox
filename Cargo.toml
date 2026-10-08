@@ -30,20 +30,20 @@ cast_precision_loss = "deny"
 anyhow = "1"
 base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
-oxc_allocator = "0.138.0"
-oxc_ast = "0.138.0"
-oxc_ast_visit = "0.138.0"
-oxc_codegen = "0.138.0"
-oxc_ecmascript = "0.138.0"
-oxc_semantic = "0.138.0"
-oxc_span = "0.138.0"
-oxc_syntax = "0.138.0"
+oxc_allocator = "0.153.0"
+oxc_ast = "0.153.0"
+oxc_ast_visit = "0.153.0"
+oxc_codegen = "0.153.0"
+oxc_ecmascript = "0.153.0"
+oxc_semantic = "0.153.0"
+oxc_span = "0.153.0"
+oxc_syntax = "0.153.0"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "3c8ed78", default-features = false }
-rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "3c8ed78", default-features = false }
+sha2 = "0.11"
+string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "e93e85e", default-features = false }
+rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "e93e85e", default-features = false }
 url = "2"
 wasmparser = "0.261.0"
 wasmprinter = "0.261.0"

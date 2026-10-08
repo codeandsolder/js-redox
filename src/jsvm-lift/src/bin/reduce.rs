@@ -532,8 +532,8 @@ fn derive_env(
     let wrapped = format!("({parent_source})");
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, &wrapped, SourceType::cjs());
-    if parsed.panicked {
-        return Err(anyhow!("parent function parse panicked"));
+    if parsed.fatal_error {
+        return Err(anyhow!("parent function parse fatal_error"));
     }
 
     let mut collector = AssignmentCollector {
@@ -603,12 +603,20 @@ fn unwrap_dispatch_body<'a>(statements: &'a [Statement<'a>]) -> Option<&'a [Stat
         Argument::FunctionExpression(fun) => {
             fun.body.as_ref().map(|body| body.statements.as_slice())
         }
-        Argument::ArrowFunctionExpression(fun) => Some(fun.body.statements.as_slice()),
+        Argument::ArrowFunctionExpression(fun) => match &fun.body {
+            oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => Some(body.statements.as_slice()),
+            _ => None,
+        },
         Argument::ParenthesizedExpression(paren) => match &paren.expression {
             Expression::FunctionExpression(fun) => {
                 fun.body.as_ref().map(|body| body.statements.as_slice())
             }
-            Expression::ArrowFunctionExpression(fun) => Some(fun.body.statements.as_slice()),
+            Expression::ArrowFunctionExpression(fun) => match &fun.body {
+                oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => {
+                    Some(body.statements.as_slice())
+                }
+                _ => None,
+            },
             _ => None,
         },
         _ => None,
@@ -826,8 +834,8 @@ fn reduce_state_machine(
 ) -> Result<Vec<ReducedPath>> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, raw, SourceType::cjs());
-    if parsed.panicked {
-        return Err(anyhow!("state machine parse panicked"));
+    if parsed.fatal_error {
+        return Err(anyhow!("state machine parse fatal_error"));
     }
     let Statement::ForStatement(for_stmt) = parsed
         .program

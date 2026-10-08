@@ -528,7 +528,10 @@ fn exec_function_body(
 fn expression_function_body<'a>(expr: &'a Expression<'a>) -> Option<&'a FunctionBody<'a>> {
     match expr {
         Expression::FunctionExpression(fun) => fun.body.as_deref(),
-        Expression::ArrowFunctionExpression(fun) => Some(&fun.body),
+        Expression::ArrowFunctionExpression(fun) => match &fun.body {
+            oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => Some(&**body),
+            _ => None,
+        },
         Expression::ParenthesizedExpression(paren) => expression_function_body(&paren.expression),
         _ => None,
     }
@@ -537,7 +540,10 @@ fn expression_function_body<'a>(expr: &'a Expression<'a>) -> Option<&'a Function
 fn argument_function_body<'a>(arg: &'a Argument<'a>) -> Option<&'a FunctionBody<'a>> {
     match arg {
         Argument::FunctionExpression(fun) => fun.body.as_deref(),
-        Argument::ArrowFunctionExpression(fun) => Some(&fun.body),
+        Argument::ArrowFunctionExpression(fun) => match &fun.body {
+            oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => Some(&**body),
+            _ => None,
+        },
         Argument::ParenthesizedExpression(paren) => expression_function_body(&paren.expression),
         _ => None,
     }

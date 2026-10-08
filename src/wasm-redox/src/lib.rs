@@ -6,6 +6,16 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use wasmparser::{ExternalKind, Operator, Parser, Payload, TypeRef, Validator, WasmFeatures};
 
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
 #[derive(Debug, Serialize)]
 pub struct ImportSummary {
     pub module: String,
@@ -282,7 +292,7 @@ pub fn analyze(bytes: &[u8]) -> Result<ModuleReport> {
     }
 
     Ok(ModuleReport {
-        sha256: format!("{digest:x}"),
+        sha256: lowercase_hex(digest.as_ref()),
         byte_len: bytes.len(),
         sections,
         imports,

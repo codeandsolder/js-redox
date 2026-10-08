@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, CallExpression, ExportAllDeclaration, ExportNamedDeclaration, Expression,
-    ImportDeclaration, ImportExpression, NewExpression,
+    Argument, CallExpression, ExportAllDeclaration, ExportFromDeclaration, ExportNamedDeclaration,
+    Expression, ImportDeclaration, ImportExpression, NewExpression,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_span::{GetSpan, SourceType};
@@ -117,15 +117,17 @@ impl<'a> Visit<'a> for Collector<'_> {
     }
 
     fn visit_export_named_declaration(&mut self, it: &ExportNamedDeclaration<'a>) {
-        if let Some(source) = &it.source {
-            self.push(
-                "reexport_named",
-                source.value.to_string(),
-                it.span.start,
-                it.span.end,
-            );
-        }
         walk::walk_export_named_declaration(self, it);
+    }
+
+    fn visit_export_from_declaration(&mut self, it: &ExportFromDeclaration<'a>) {
+        self.push(
+            "reexport_named",
+            it.source.value.to_string(),
+            it.span.start,
+            it.span.end,
+        );
+        walk::walk_export_from_declaration(self, it);
     }
 
     fn visit_export_all_declaration(&mut self, it: &ExportAllDeclaration<'a>) {

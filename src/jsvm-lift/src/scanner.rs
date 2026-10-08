@@ -533,7 +533,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
 
 pub struct ScanCore {
     pub(crate) diagnostics: usize,
-    pub(crate) panicked: bool,
+    pub(crate) fatal_error: bool,
     pub(crate) arrays: Vec<ArrayCandidate>,
     pub(crate) push_builders: Vec<PushBuilderCandidate>,
     pub(crate) decoder_candidates: Vec<DecoderCandidate>,
@@ -737,7 +737,7 @@ pub fn scan_source_core(source: &str) -> ScanCore {
 
     ScanCore {
         diagnostics: parsed.diagnostics,
-        panicked: parsed.panicked,
+        fatal_error: parsed.fatal_error,
         arrays: scanner.arrays,
         push_builders: scanner.push_builders,
         decoder_candidates: scanner.decoder_candidates,
@@ -792,7 +792,7 @@ mod tests {
         ";
 
         let core = scan_source_core(source);
-        assert!(!core.panicked);
+        assert!(!core.fatal_error);
         assert_eq!(core.diagnostics, 0);
         assert_eq!(core.arrays.len(), 1);
         assert_eq!(core.direct_switch_maps.len(), 1);

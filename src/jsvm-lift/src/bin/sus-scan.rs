@@ -97,7 +97,7 @@ struct FileReport {
     input: String,
     bytes: usize,
     diagnostics: usize,
-    panicked: bool,
+    fatal_error: bool,
     signal_count: usize,
     signal_kinds: BTreeMap<String, usize>,
     top_score: u32,
@@ -1268,21 +1268,21 @@ fn parse_source<'a>(
     };
     let parsed = parse_program(allocator, source, source_type);
     let diagnostics = parsed.diagnostics;
-    (parsed.program, diagnostics, parsed.panicked)
+    (parsed.program, diagnostics, parsed.fatal_error)
 }
 
 fn scan_file(path: &Path, args: &Args) -> Result<FileReport> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("reading JavaScript {}", path.display()))?;
     let allocator = Allocator::default();
-    let (program, diagnostics, panicked) = parse_source(&allocator, &source, path);
+    let (program, diagnostics, fatal_error) = parse_source(&allocator, &source, path);
 
     let mut collector = Collector {
         source: &source,
         blob_min_len: args.blob_min_len,
         signals: Vec::new(),
     };
-    if !panicked {
+    if !fatal_error {
         collector.visit_program(&program);
     }
 
@@ -1306,7 +1306,7 @@ fn scan_file(path: &Path, args: &Args) -> Result<FileReport> {
         input: path.display().to_string(),
         bytes: source.len(),
         diagnostics,
-        panicked,
+        fatal_error,
         signal_count: signals.len(),
         signal_kinds,
         top_score,
@@ -1368,7 +1368,11 @@ fn print_text(report: &Report) {
             file.signal_count,
             file.top_score,
             file.diagnostics,
-            if file.panicked { " PANICKED" } else { "" }
+            if file.fatal_error {
+                " FATAL_PARSE_ERROR"
+            } else {
+                ""
+            }
         );
         for (index, cluster) in file.clusters.iter().enumerate() {
             let kinds = cluster
