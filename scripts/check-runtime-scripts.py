@@ -79,6 +79,7 @@ def main() -> None:
     gtm = '(function(){return google_tag_manager["rm"]["123"](7).href})();'
     generated = "globalThis.dynamicFixture = 1;"
     generated_leaf = "globalThis.dynamicLeaf = 2;"
+    observed_network = "globalThis.crlfFixture = 1;\r\n"
     sources = [
         network,
         inline,
@@ -89,10 +90,12 @@ def main() -> None:
         gtm,
         generated,
         generated_leaf,
+        observed_network,
     ]
 
     for source in sources:
-        (runtime / f"{digest(source)}.js").write_text(source)
+        raw = source.encode()
+        (runtime / f"{hashlib.sha256(raw).hexdigest()}.js").write_bytes(raw)
     (bodies / digest(network)).write_text(network)
 
     initial_html = f"<!doctype html><script>{inline}</script>"
@@ -104,6 +107,7 @@ def main() -> None:
             "entries": [
                 har_entry("https://fixture.invalid/", "text/html", initial_html),
                 har_entry("https://fixture.invalid/app.js", "application/javascript", network),
+                har_entry("https://fixture.invalid/body-missed.js", "application/javascript", ""),
             ],
         }
     }
@@ -122,7 +126,13 @@ def main() -> None:
             {
                 "scriptId": str(index),
                 "executionContextId": 1,
-                "url": "https://fixture.invalid/app.js" if source == network else "",
+                "url": (
+                    "https://fixture.invalid/app.js"
+                    if source == network
+                    else "https://fixture.invalid/body-missed.js"
+                    if source == observed_network
+                    else ""
+                ),
                 "captured": {
                     "kind": "javascript",
                     "sha256": sha,
@@ -131,7 +141,7 @@ def main() -> None:
                 },
             }
         )
-    events[-2]["stackTrace"] = {
+    events[-3]["stackTrace"] = {
         "callFrames": [
             {
                 "functionName": "eval",
@@ -142,7 +152,7 @@ def main() -> None:
             }
         ]
     }
-    events[-1]["stackTrace"] = {
+    events[-2]["stackTrace"] = {
         "callFrames": [
             {
                 "functionName": "eval",
@@ -164,14 +174,15 @@ def main() -> None:
     )
     report = json.loads(report_path.read_text())
     summary = report["summary"]
-    assert summary["script_parsed_events"] == 9, summary
-    assert summary["unique_javascript_sources"] == 9, summary
+    assert summary["script_parsed_events"] == 10, summary
+    assert summary["unique_javascript_sources"] == 10, summary
     assert summary["classifications"] == {
         "alpine_expression": 3,
         "capture_instrumentation": 1,
         "generated_runtime": 2,
         "gtm_custom_javascript": 1,
         "inline_script": 1,
+        "network_observed": 1,
         "network_response": 1,
     }, summary
     assert summary["alpine_dom_mapped_sources"] == 3, summary
@@ -207,11 +218,11 @@ def main() -> None:
     graph = json.loads((project / "analysis/source-graph.json").read_text())
     node_types = Counter(node["type"] for node in graph["nodes"])
     edge_kinds = Counter(edge["kind"] for edge in graph["edges"])
-    assert node_types["runtime_script"] == 9, node_types
+    assert node_types["runtime_script"] == 10, node_types
     assert node_types["runtime_expression_family"] == 4, node_types
     assert node_types["dom_snapshot"] == 1, node_types
     assert node_types["dom_directive"] == 3, node_types
-    assert edge_kinds["runtime_execution"] == 2, edge_kinds
+    assert edge_kinds["runtime_execution"] == 3, edge_kinds
     assert edge_kinds["runtime_generated_code"] == 2, edge_kinds
     assert edge_kinds["runtime_expression_family"] == 4, edge_kinds
     assert edge_kinds["dom_directive"] == 3, edge_kinds
@@ -231,6 +242,13 @@ def main() -> None:
     )
     assert generated_leaf_node["generation_max_depth"] == 2, generated_leaf_node
     assert generated_leaf_node["generated_root_sha256s"] == [digest(network)], generated_leaf_node
+    observed = next(
+        source
+        for source in report["sources"]
+        if source.get("classification") == "network_observed"
+    )
+    assert observed["sha256"] == hashlib.sha256(observed_network.encode()).hexdigest(), observed
+    assert observed["event_count"] == 1, observed
     helper = next(
         node
         for node in graph["nodes"]
@@ -239,7 +257,7 @@ def main() -> None:
     )
     assert helper["application_source"] is False, helper
     print(
-        "PASS: recorder runtime provenance -> network/inline/Alpine/GTM/generated/instrumentation "
+        "PASS: recorder runtime provenance -> network/network-observed/inline/Alpine/GTM/generated/instrumentation "
         "+ DOM/runtime source graph"
     )
 

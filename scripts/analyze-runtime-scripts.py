@@ -256,6 +256,25 @@ def analyze(capture: Path) -> dict:
     events = json.loads(runtime_manifest_path.read_text())
     inline_by_hash, directives = html_provenance(capture)
     body_hashes = {path.name for path in (capture / "bodies").iterdir()} if (capture / "bodies").is_dir() else set()
+    network_urls: set[str] = set()
+    network_path = capture / "network.json"
+    if network_path.is_file():
+        try:
+            for record in json.loads(network_path.read_text()):
+                url = record.get("url")
+                if isinstance(url, str) and url:
+                    network_urls.add(url)
+        except (json.JSONDecodeError, OSError):
+            pass
+    har_path = capture / "capture.har"
+    if har_path.is_file():
+        try:
+            for entry in json.loads(har_path.read_text()).get("log", {}).get("entries", []):
+                url = entry.get("request", {}).get("url")
+                if isinstance(url, str) and url:
+                    network_urls.add(url)
+        except (json.JSONDecodeError, OSError):
+            pass
 
     events_by_hash: dict[str, list[dict]] = defaultdict(list)
     events_by_script_id = {
@@ -278,13 +297,14 @@ def analyze(capture: Path) -> dict:
     alpine_dom_matches = 0
 
     for source_path in sorted(runtime_dir.glob("*.js")):
-        source = source_path.read_text(errors="replace")
-        digest = hashlib.sha256(source.encode()).hexdigest()
+        raw_source = source_path.read_bytes()
+        digest = hashlib.sha256(raw_source).hexdigest()
+        source = raw_source.decode("utf-8", errors="replace")
         event_rows = events_by_hash.get(digest, [])
         urls = sorted({row.get("url") or "" for row in event_rows if row.get("url")})
         row: dict = {
             "sha256": digest,
-            "size": len(source.encode()),
+            "size": len(raw_source),
             "path": str(source_path.relative_to(capture)),
             "event_count": len(event_rows),
             "script_ids": [event.get("scriptId") for event in event_rows],
@@ -308,6 +328,8 @@ def analyze(capture: Path) -> dict:
         elif digest in inline_by_hash:
             classification = "inline_script"
             row["inline_origins"] = inline_by_hash[digest]
+        elif urls and any(url in network_urls for url in urls):
+            classification = "network_observed"
         else:
             alpine = recover_alpine_expression(source)
             if alpine:

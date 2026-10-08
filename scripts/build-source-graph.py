@@ -238,7 +238,7 @@ def main():
                         **edge_fields,
                     )
 
-        if classification == 'network_response':
+        if classification in {'network_response', 'network_observed'}:
             parents = list(resource_nodes_by_sha.get(digest, []))
             if not parents:
                 for url in source.get('urls', []):
