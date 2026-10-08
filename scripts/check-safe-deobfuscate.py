@@ -69,12 +69,17 @@ CASES = [
     (
         "proven-helper-prune",
         ROOT / "corpus/generated/reversible-obfuscation/proven-helper-prune.js",
-        ["function keepMe", "console.log"],
+        ["function keepMe", "console.log", "5"],
     ),
     (
         "const-aliases",
         ROOT / "corpus/generated/reversible-obfuscation/const-aliases.js",
         ['"hello"', "42", "return later", "{ answer }"],
+    ),
+    (
+        "from-char-code-alias",
+        ROOT / "corpus/generated/reversible-obfuscation/from-char-code-alias.js",
+        ['"ABC"', '"😀"', '"D"', "c(0xd800)", "mutable(65)", "before(65)", "outer(65)"],
     ),
     (
         "control-flow-storage",
@@ -202,6 +207,11 @@ def main():
                 # the runtime rotation IIFE has been eliminated.
                 assert "return alias1(index)" in text, text
                 assert "while (true)" not in text, text
+            if name == "from-char-code-alias":
+                assert meta["transforms"].get("from_char_code_alias", 0) >= 4, meta
+                assert "c(68)" not in text, text
+                assert "c(0xd800)" in text, text
+                assert "mutable(65)" in text, text
             if name == "token-boundaries":
                 # These merged forms are valid JavaScript identifiers, so a
                 # syntax check alone cannot detect the semantic corruption.
@@ -224,7 +234,9 @@ def main():
             if name == "proven-helper-prune":
                 assert "function pruneMe" not in text, text
                 assert "function keepMe" in text, text
-                assert meta["transforms"].get("pure_function_eval", 0) >= 1, meta
+                assert "function trailingUnused" not in text, text
+                assert "function scratchParam" not in text, text
+                assert meta["transforms"].get("pure_function_eval", 0) >= 3, meta
                 assert meta["transforms"].get("remove_unused_proven_helper", 0) >= 1, meta
             if name == "selector-trailing-params":
                 assert meta["transforms"].get("selector_dispatch_specialize", 0) >= 2, meta

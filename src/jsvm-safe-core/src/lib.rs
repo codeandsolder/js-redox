@@ -23,7 +23,11 @@ use oxc_ast::ast::{
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{ReferenceId, Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
-use oxc_syntax::{identifier, scope::ScopeFlags, symbol::SymbolId};
+use oxc_syntax::{
+    identifier,
+    scope::{ScopeFlags, ScopeId},
+    symbol::SymbolId,
+};
 use proxy::{
     collect_proxy_objects, proxy_literal_kind, static_proxy_member, ProxyObject, ProxyProperty,
 };
@@ -33,7 +37,8 @@ use rolldown_redox::ecmascript::parse_program;
 use selector::{collect_selector_dispatchers, SelectorDispatcher};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use value_eval::{
-    eval, eval_binary, eval_logical, eval_unary, eval_with_resolver, known_bool, Value,
+    eval, eval_binary, eval_logical, eval_unary, eval_with_resolver, js_to_uint32, known_bool,
+    Value,
 };
 
 #[derive(Debug, Clone)]
@@ -279,6 +284,61 @@ fn collect_shorthand_spans(program: &oxc_ast::ast::Program<'_>) -> HashSet<(u32,
     collector.spans
 }
 
+struct FromCharCodeAliasCollector<'c> {
+    scoping: &'c Scoping,
+    candidates: HashMap<SymbolId, u32>,
+}
+
+impl<'a> Visit<'a> for FromCharCodeAliasCollector<'_> {
+    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        for declaration in &it.declarations {
+            let BindingPattern::BindingIdentifier(binding) = &declaration.id else {
+                continue;
+            };
+            let Some(symbol) = binding.symbol_id.get() else {
+                continue;
+            };
+            let Some(Expression::StaticMemberExpression(member)) = &declaration.init else {
+                continue;
+            };
+            if member.optional || member.property.name.as_str() != "fromCharCode" {
+                continue;
+            }
+            let Expression::Identifier(object) = &member.object else {
+                continue;
+            };
+            // Match the ordinary global String builtin only. A locally shadowed
+            // `String` binding is not evidence for builtin fromCharCode semantics.
+            if object.name.as_str() == "String" && symbol_of(self.scoping, &member.object).is_none()
+            {
+                self.candidates.insert(symbol, declaration.span().end);
+            }
+        }
+        walk::walk_variable_declaration(self, it);
+    }
+}
+
+fn collect_from_char_code_aliases(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> HashMap<SymbolId, u32> {
+    let mut collector = FromCharCodeAliasCollector {
+        scoping,
+        candidates: HashMap::new(),
+    };
+    collector.visit_program(program);
+    collector.candidates.retain(|symbol, _initialized_after| {
+        scoping
+            .get_resolved_reference_ids(*symbol)
+            .iter()
+            .all(|reference_id| {
+                let reference = scoping.get_reference(*reference_id);
+                !reference.is_write() && !reference.flags().is_member_write_target()
+            })
+    });
+    collector.candidates
+}
+
 #[derive(Clone, Copy)]
 enum CallRewriteTraversal {
     Stop,
@@ -294,6 +354,7 @@ struct Collector<'s, 'c> {
     shorthand_spans: &'c HashSet<(u32, u32)>,
     proxies: &'c HashMap<SymbolId, ProxyObject>,
     pure_functions: &'c HashMap<SymbolId, PureFunction>,
+    from_char_code_aliases: &'c HashMap<SymbolId, u32>,
     reference_identity_tables: &'c HashMap<SymbolId, ReferenceIdentityTable>,
     selector_dispatchers: &'c HashMap<SymbolId, SelectorDispatcher>,
     dispatch_orders: &'c HashMap<SymbolId, Vec<String>>,
@@ -439,6 +500,67 @@ impl Collector<'_, '_> {
             _ => None,
         }?;
         self.push(call.span, rewrite.0, rewrite.1);
+        Some(CallRewriteTraversal::Stop)
+    }
+
+    fn same_function_or_descendant_block_scope(
+        scoping: &Scoping,
+        mut scope: ScopeId,
+        binding_scope: ScopeId,
+    ) -> bool {
+        if scope == binding_scope {
+            return true;
+        }
+        loop {
+            if scoping.scope_flags(scope).is_function() {
+                return false;
+            }
+            let Some(parent) = scoping.scope_parent_id(scope) else {
+                return false;
+            };
+            if parent == binding_scope {
+                return true;
+            }
+            scope = parent;
+        }
+    }
+
+    fn try_from_char_code_alias_rewrite(
+        &mut self,
+        call: &CallExpression<'_>,
+    ) -> Option<CallRewriteTraversal> {
+        if !Self::is_plain_call(call) || call.arguments.is_empty() {
+            return None;
+        }
+        let Expression::Identifier(callee) = &call.callee else {
+            return None;
+        };
+        let reference_id = callee.reference_id.get()?;
+        let reference = self.scoping.get_reference(reference_id);
+        let symbol = reference.symbol_id()?;
+        let initialized_after = self.from_char_code_aliases.get(&symbol)?;
+        if call.span.start < *initialized_after
+            || !Self::same_function_or_descendant_block_scope(
+                self.scoping,
+                reference.scope_id(),
+                self.scoping.symbol_scope_id(symbol),
+            )
+        {
+            return None;
+        }
+        let units = call
+            .arguments
+            .iter()
+            .map(|argument| {
+                let number = eval_static_argument(argument)?.number()?;
+                Some((js_to_uint32(number) & 0xffff) as u16)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        // Rust strings cannot represent an unpaired UTF-16 surrogate. Fail
+        // closed in that uncommon case; paired surrogates round-trip exactly.
+        let value = String::from_utf16(&units).ok()?;
+        let text = Value::String(value).render()?;
+        self.push(call.span, text, "from_char_code_alias");
         Some(CallRewriteTraversal::Stop)
     }
 
@@ -707,6 +829,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         let rewrite = self
             .try_selector_dispatch_rewrite(it)
             .or_else(|| self.try_proxy_call_rewrite(it))
+            .or_else(|| self.try_from_char_code_alias_rewrite(it))
             .or_else(|| self.try_pure_function_rewrite(it))
             .or_else(|| self.try_decoder_rewrite(it));
 
@@ -911,6 +1034,7 @@ fn transform_once(
     let shorthand_spans = collect_shorthand_spans(&program);
     let proxies = collect_proxy_objects(&program, scoping);
     let pure_functions = collect_pure_functions(&program, scoping);
+    let from_char_code_aliases = collect_from_char_code_aliases(&program, scoping);
     let reference_identity_tables =
         detect_reference_identity_tables(source, scoping, &reference_spans);
     protected_spans.extend(
@@ -937,6 +1061,7 @@ fn transform_once(
         shorthand_spans: &shorthand_spans,
         proxies: &proxies,
         pure_functions: &pure_functions,
+        from_char_code_aliases: &from_char_code_aliases,
         reference_identity_tables: &reference_identity_tables,
         selector_dispatchers: &selector_dispatchers,
         dispatch_orders: &dispatch_orders,

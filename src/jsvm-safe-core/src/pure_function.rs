@@ -10,6 +10,10 @@ use std::collections::HashMap;
 enum PureExpr {
     Value(Value),
     Param(usize),
+    AssignParam {
+        index: usize,
+        value: Box<Self>,
+    },
     Unary {
         operator: String,
         argument: Box<Self>,
@@ -32,12 +36,17 @@ enum PureExpr {
 }
 
 impl PureExpr {
-    fn eval(&self, args: &[Value]) -> Option<Value> {
+    fn eval(&self, params: &mut [Value]) -> Option<Value> {
         match self {
             Self::Value(value) => Some(value.clone()),
-            Self::Param(index) => args.get(*index).cloned(),
+            Self::Param(index) => params.get(*index).cloned(),
+            Self::AssignParam { index, value } => {
+                let value = value.eval(params)?;
+                *params.get_mut(*index)? = value.clone();
+                Some(value)
+            }
             Self::Unary { operator, argument } => {
-                let value = argument.eval(args)?;
+                let value = argument.eval(params)?;
                 match operator.as_str() {
                     "!" => Some(Value::Bool(!value.truthy())),
                     "+" => value.number().map(Value::Number),
@@ -63,17 +72,21 @@ impl PureExpr {
                 operator,
                 left,
                 right,
-            } => eval_binary(operator, left.eval(args)?, right.eval(args)?),
+            } => {
+                let left = left.eval(params)?;
+                let right = right.eval(params)?;
+                eval_binary(operator, left, right)
+            }
             Self::Logical {
                 operator,
                 left,
                 right,
             } => {
-                let left = left.eval(args)?;
+                let left = left.eval(params)?;
                 match operator.as_str() {
                     "&&" => {
                         if left.truthy() {
-                            right.eval(args)
+                            right.eval(params)
                         } else {
                             Some(left)
                         }
@@ -82,12 +95,12 @@ impl PureExpr {
                         if left.truthy() {
                             Some(left)
                         } else {
-                            right.eval(args)
+                            right.eval(params)
                         }
                     }
                     "??" => {
                         if matches!(left, Value::Null | Value::Undefined) {
-                            right.eval(args)
+                            right.eval(params)
                         } else {
                             Some(left)
                         }
@@ -100,10 +113,10 @@ impl PureExpr {
                 consequent,
                 alternate,
             } => {
-                if test.eval(args)?.truthy() {
-                    consequent.eval(args)
+                if test.eval(params)?.truthy() {
+                    consequent.eval(params)
                 } else {
-                    alternate.eval(args)
+                    alternate.eval(params)
                 }
             }
         }
@@ -123,6 +136,15 @@ fn compile_pure_expr(expr: &Expression<'_>, params: &HashMap<String, usize>) -> 
             ))
         }),
         Expression::ParenthesizedExpression(v) => compile_pure_expr(&v.expression, params),
+        Expression::AssignmentExpression(v) if v.operator.as_str() == "=" => {
+            let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(target) = &v.left else {
+                return None;
+            };
+            Some(PureExpr::AssignParam {
+                index: *params.get(target.name.as_str())?,
+                value: Box::new(compile_pure_expr(&v.right, params)?),
+            })
+        }
         Expression::UnaryExpression(v)
             if matches!(
                 v.operator.as_str(),
@@ -180,15 +202,18 @@ fn compile_pure_expr(expr: &Expression<'_>, params: &HashMap<String, usize>) -> 
 
 #[derive(Debug, Clone)]
 pub struct PureFunction {
-    arity: usize,
+    param_count: usize,
     expression: PureExpr,
     declaration_span: Option<Span>,
 }
 
 impl PureFunction {
     pub(super) fn evaluate(&self, args: &[Value]) -> Option<Value> {
-        (args.len() == self.arity).then_some(())?;
-        self.expression.eval(args)
+        let mut params = vec![Value::Undefined; self.param_count];
+        for (target, value) in params.iter_mut().zip(args.iter().cloned()) {
+            *target = value;
+        }
+        self.expression.eval(&mut params)
     }
 
     pub(super) const fn declaration_span(&self) -> Option<Span> {
@@ -236,7 +261,7 @@ impl<'a> Visit<'a> for PureFunctionCollector<'_> {
                                         self.functions.insert(
                                             symbol,
                                             PureFunction {
-                                                arity: f.params.items.len(),
+                                                param_count: f.params.items.len(),
                                                 expression,
                                                 declaration_span: (f.r#type
                                                     == oxc_ast::ast::FunctionType::FunctionDeclaration)
