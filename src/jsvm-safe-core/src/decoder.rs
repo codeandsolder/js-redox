@@ -76,13 +76,18 @@ impl<'a> Visit<'a> for StaticArrayCollector {
     }
 }
 
+fn all_static_arrays(program: &oxc_ast::ast::Program<'_>) -> Vec<StaticArrayInfo> {
+    let mut collector = StaticArrayCollector::default();
+    collector.visit_program(program);
+    collector.candidates
+}
+
 fn decoder_static_arrays(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
 ) -> Vec<StaticArrayInfo> {
-    let mut collector = StaticArrayCollector::default();
-    collector.visit_program(program);
-    collector.candidates.retain(|candidate| {
+    let mut candidates = all_static_arrays(program);
+    candidates.retain(|candidate| {
         scoping
             .get_resolved_reference_ids(candidate.symbol)
             .iter()
@@ -91,7 +96,7 @@ fn decoder_static_arrays(
                 !reference.is_write() && !reference.flags().is_member_write_target()
             })
     });
-    collector.candidates
+    candidates
 }
 
 #[derive(Default)]
@@ -308,6 +313,58 @@ impl<'a> Visit<'a> for DirectFnInfoCollector {
 
 fn all_functions(program: &oxc_ast::ast::Program<'_>) -> Vec<DirectFnInfo> {
     let mut collector = DirectFnInfoCollector::default();
+    collector.visit_program(program);
+    collector.out
+}
+
+#[derive(Debug)]
+struct VariableFunctionInfo {
+    symbol: SymbolId,
+    span: Span,
+    params: Vec<String>,
+}
+
+#[derive(Default)]
+struct VariableFunctionCollector {
+    out: Vec<VariableFunctionInfo>,
+}
+
+impl<'a> Visit<'a> for VariableFunctionCollector {
+    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        for declaration in &it.declarations {
+            let BindingPattern::BindingIdentifier(id) = &declaration.id else {
+                continue;
+            };
+            let Some(symbol) = id.symbol_id.get() else {
+                continue;
+            };
+            let Some(Expression::FunctionExpression(function)) = &declaration.init else {
+                continue;
+            };
+            let Some(params) = function
+                .params
+                .items
+                .iter()
+                .map(|param| match &param.pattern {
+                    BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            self.out.push(VariableFunctionInfo {
+                symbol,
+                span: function.span,
+                params,
+            });
+        }
+        walk::walk_variable_declaration(self, it);
+    }
+}
+
+fn variable_functions(program: &oxc_ast::ast::Program<'_>) -> Vec<VariableFunctionInfo> {
+    let mut collector = VariableFunctionCollector::default();
     collector.visit_program(program);
     collector.out
 }
@@ -912,6 +969,8 @@ fn eval_rotation_checksum(
 struct RotationIife {
     provider: String,
     target: i64,
+    array_param: String,
+    count_param: String,
     body_span: Span,
     statement_span: Span,
 }
@@ -956,10 +1015,22 @@ impl<'a> Visit<'a> for RotationIifeCollector {
             let function = rotation_iife_function(&call.callee);
             if let (Some(provider), Some(target), Some(function)) = (provider, target, function) {
                 if !function.r#async && !function.generator && function.params.items.len() == 2 {
-                    if let Some(body) = &function.body {
+                    let array_param = match &function.params.items[0].pattern {
+                        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                        _ => None,
+                    };
+                    let count_param = match &function.params.items[1].pattern {
+                        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                        _ => None,
+                    };
+                    if let (Some(array_param), Some(count_param), Some(body)) =
+                        (array_param, count_param, &function.body)
+                    {
                         self.out.push(RotationIife {
                             provider,
                             target,
+                            array_param,
+                            count_param,
                             body_span: body.span,
                             statement_span: it.span,
                         });
@@ -975,6 +1046,176 @@ fn collect_rotation_iifes(program: &oxc_ast::ast::Program<'_>) -> Vec<RotationIi
     let mut collector = RotationIifeCollector::default();
     collector.visit_program(program);
     collector.out
+}
+
+fn fixed_count_rotation(source: &str, iife: &RotationIife, table_len: usize) -> Option<usize> {
+    if iife.target < 0 || table_len == 0 {
+        return None;
+    }
+    let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
+    let body = fragment(source, iife.body_span);
+    let pattern = format!(
+        r#"(?s)^\{{\s*(?:const|let|var)\s+(?P<helper>{identifier})\s*=\s*function\s*\(\s*(?P<arg>{identifier})\s*\)\s*\{{\s*while\s*\(\s*--\s*(?P<while_arg>{identifier})\s*\)\s*\{{\s*{}\s*(?:\.\s*push|\[\s*["']push["']\s*\])\s*\(\s*{}\s*(?:\.\s*shift|\[\s*["']shift["']\s*\])\s*\(\s*\)\s*\)\s*;\s*\}}\s*;?\s*\}}\s*;\s*(?P<call_helper>{identifier})\s*\(\s*\+\+\s*{}\s*\)\s*;\s*\}}\s*$"#,
+        regex::escape(&iife.array_param),
+        regex::escape(&iife.array_param),
+        regex::escape(&iife.count_param),
+    );
+    let captures = compile_regex(&pattern)?.captures(body)?;
+    if captures.name("helper")?.as_str() != captures.name("call_helper")?.as_str()
+        || captures.name("arg")?.as_str() != captures.name("while_arg")?.as_str()
+    {
+        return None;
+    }
+    usize::try_from(iife.target)
+        .ok()
+        .map(|count| count % table_len)
+}
+
+fn simple_direct_decoder_offset(
+    source: &str,
+    function: &VariableFunctionInfo,
+    array: &StaticArrayInfo,
+) -> Option<i64> {
+    let public_param = function.params.first()?;
+    let params = function
+        .params
+        .iter()
+        .map(|param| regex::escape(param))
+        .collect::<Vec<_>>()
+        .join(r"\s*,\s*");
+    let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
+    let pattern = format!(
+        r"(?s)^function\s*\(\s*{params}\s*\)\s*\{{\s*{}\s*=\s*{}\s*-\s*(?P<offset>0[xX][0-9A-Fa-f]+|[0-9]+)\s*;\s*(?:const|let|var)\s+(?P<value>{identifier})\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+(?P<returned>{identifier})\s*;\s*\}}\s*$",
+        regex::escape(public_param),
+        regex::escape(public_param),
+        regex::escape(&array.name),
+        regex::escape(public_param),
+    );
+    let captures = compile_regex(&pattern)?.captures(fragment(source, function.span))?;
+    if captures.name("value")?.as_str() != captures.name("returned")?.as_str() {
+        return None;
+    }
+    parse_i64_literal(captures.name("offset")?.as_str())
+}
+
+fn span_contains(outer: Span, inner: Span) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
+}
+
+fn detect_fixed_rotated_direct_decoders(
+    source: &str,
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> DecoderDetection {
+    let arrays = all_static_arrays(program);
+    let functions = variable_functions(program);
+    let rotations = collect_rotation_iifes(program);
+    let mut decoders = HashMap::new();
+    let mut protected_spans = Vec::new();
+    let mut replacements = Vec::new();
+
+    for function in &functions {
+        if scoping
+            .get_resolved_reference_ids(function.symbol)
+            .iter()
+            .any(|reference_id| scoping.get_reference(*reference_id).is_write())
+        {
+            continue;
+        }
+
+        for array in &arrays {
+            let Some(offset) = simple_direct_decoder_offset(source, function, array) else {
+                continue;
+            };
+            let matching_rotations = rotations
+                .iter()
+                .filter(|rotation| {
+                    rotation.provider == array.name
+                        && rotation.statement_span.end <= function.span.start
+                })
+                .collect::<Vec<_>>();
+            if matching_rotations.len() != 1 {
+                continue;
+            }
+            let rotation = matching_rotations[0];
+            let Some(amount) = fixed_count_rotation(source, rotation, array.values.len()) else {
+                continue;
+            };
+
+            // The table must become observable only through the proven rotation
+            // IIFE and the direct decoder. In particular, require the rotation
+            // to be adjacent to the literal declaration so pre-materializing the
+            // final table cannot change an intervening observation (including
+            // direct eval or another aliasing call).
+            let between = &source[array.span.end as usize..rotation.statement_span.start as usize];
+            if !between.chars().all(|ch| ch.is_whitespace() || ch == ';') {
+                continue;
+            }
+            let mut decoder_reads = 0usize;
+            let mut rotation_reads = 0usize;
+            let mut safe_references = true;
+            for reference_id in scoping.get_resolved_reference_ids(array.symbol) {
+                let Some(span) = reference_spans.get(reference_id).copied() else {
+                    safe_references = false;
+                    break;
+                };
+                let reference = scoping.get_reference(*reference_id);
+                if reference.is_write() || reference.flags().is_member_write_target() {
+                    safe_references = false;
+                    break;
+                }
+                if span_contains(function.span, span) {
+                    decoder_reads += 1;
+                } else if span_contains(rotation.statement_span, span) {
+                    rotation_reads += 1;
+                } else {
+                    safe_references = false;
+                    break;
+                }
+            }
+            if !safe_references || decoder_reads != 1 || rotation_reads != 1 {
+                continue;
+            }
+
+            let mut values = array.values.clone();
+            values.rotate_left(amount);
+            let Some(array_text) = render_value_array(&values) else {
+                continue;
+            };
+            replacements.push(Replacement {
+                start: array.span.start as usize,
+                end: array.span.end as usize,
+                text: array_text,
+                kind: "materialize_fixed_decoder_rotation",
+                arithmetic_state_proof: None,
+            });
+            replacements.push(Replacement {
+                start: rotation.statement_span.start as usize,
+                end: rotation.statement_span.end as usize,
+                text: String::new(),
+                kind: "remove_fixed_decoder_rotation_iife",
+                arithmetic_state_proof: None,
+            });
+            protected_spans.push((
+                rotation.statement_span.start as usize,
+                rotation.statement_span.end as usize,
+            ));
+            decoders.insert(
+                function.symbol,
+                Decoder {
+                    values,
+                    offset,
+                    provider: array.name.clone(),
+                    provider_array_span: array.span,
+                    transform: DecoderTransform::Plain,
+                },
+            );
+            break;
+        }
+    }
+
+    (decoders, protected_spans, replacements)
 }
 
 #[derive(Debug, Clone)]
@@ -1395,13 +1636,20 @@ pub fn analyze_decoders(
     let direct_functions = all_functions(program);
     let functions = all_function_declarations(program, scoping);
 
-    let (mut decoders, protected_spans, replacements) =
+    let (mut decoders, mut protected_spans, mut replacements) =
         detect_decoders(source, &functions, program, scoping);
     for (symbol, decoder) in
         detect_direct_table_decoders(source, &direct_functions, &arrays, scoping, reference_spans)
     {
         decoders.entry(symbol).or_insert(decoder);
     }
+    let (fixed_decoders, fixed_protected, fixed_replacements) =
+        detect_fixed_rotated_direct_decoders(source, program, scoping, reference_spans);
+    for (symbol, decoder) in fixed_decoders {
+        decoders.entry(symbol).or_insert(decoder);
+    }
+    protected_spans.extend(fixed_protected);
+    replacements.extend(fixed_replacements);
 
     let removable_helpers = functions
         .iter()

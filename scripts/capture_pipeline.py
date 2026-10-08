@@ -70,6 +70,12 @@ class ProjectSummary:
     devirtualized_modules: int
     confirmed_vm_units: int
     vm_candidates: int
+    runtime_script_events: int
+    runtime_unique_sources: int
+    runtime_alpine_expressions: int
+    runtime_alpine_families: int
+    runtime_capture_instrumentation: int
+    runtime_anonymous_sources: int
     graph_nodes: int
     graph_edges: int
 
@@ -92,6 +98,13 @@ def run_checked(args: Sequence[object]) -> None:
 
 
 def detect_capture(path: Path) -> str:
+    if path.is_dir():
+        if (path / "recorder-manifest.json").is_file() and (path / "capture.har").is_file():
+            return "recorder"
+        raise SystemExit(
+            f"unsupported capture directory: {path}\n"
+            "Expected a CloakBrowser recorder bundle containing recorder-manifest.json and capture.har."
+        )
     suffix = path.suffix.lower()
     if suffix in {".html", ".htm", ".xhtml"}:
         return "saved_page"
@@ -101,7 +114,7 @@ def detect_capture(path: Path) -> str:
         return "har"
     raise SystemExit(
         f"unsupported capture input: {path}\n"
-        "Expected a HAR/JSON HAR or the HTML file from browser Save Page / Webpage, Complete."
+        "Expected a CloakBrowser recorder bundle, HAR/JSON HAR, or the HTML file from browser Save Page / Webpage, Complete."
     )
 
 
@@ -116,8 +129,9 @@ def _import_capture(
     tools: Toolchain,
     options: PipelineOptions,
 ) -> Path:
-    if kind == "har":
-        importer: list[object] = [tools.har_project, capture, "--output", output]
+    if kind in {"har", "recorder"}:
+        har_input = capture / "capture.har" if kind == "recorder" else capture
+        importer: list[object] = [tools.har_project, har_input, "--output", output]
     else:
         importer = [
             sys.executable,
@@ -135,8 +149,13 @@ def _import_capture(
     manifest_path = output / "har-manifest.json"
     if not manifest_path.is_file():
         raise SystemExit(f"capture importer did not create {manifest_path}")
+    if kind == "recorder":
+        manifest = json.loads(manifest_path.read_text())
+        manifest["source_kind"] = "recorder"
+        manifest["recorder_bundle"] = str(capture)
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
     capture_manifest = output / "capture-manifest.json"
-    if not capture_manifest.exists():
+    if not capture_manifest.exists() or kind == "recorder":
         shutil.copyfile(manifest_path, capture_manifest)
     return manifest_path
 
@@ -152,11 +171,21 @@ def run_capture_pipeline(
     options = options or PipelineOptions()
     capture = capture.resolve()
     output = output.resolve()
-    if not capture.is_file():
+    if not capture.exists():
         raise SystemExit(f"capture does not exist: {capture}")
 
     kind = detect_capture(capture)
     manifest_path = _import_capture(capture, output, kind, tools, options)
+    if kind == "recorder":
+        run_checked(
+            [
+                sys.executable,
+                ROOT / "scripts/analyze-runtime-scripts.py",
+                capture,
+                "--output",
+                output / "analysis/runtime-scripts.json",
+            ]
+        )
 
     run_checked(
         [
@@ -312,6 +341,12 @@ def load_project_summary(
         )
 
     generated = generated_recovery.get("summary", {})
+    runtime = {"summary": {}}
+    runtime_path = output / "analysis/runtime-scripts.json"
+    if runtime_path.exists():
+        runtime = _read_json(runtime_path)
+    runtime_summary = runtime.get("summary", {})
+    runtime_classes = runtime_summary.get("classifications", {})
     originals = sum(
         source.get("status") == "recovered"
         for source_map in maps["source_maps"]
@@ -342,6 +377,12 @@ def load_project_summary(
         devirtualized_modules=devirtualized,
         confirmed_vm_units=confirmed_vms,
         vm_candidates=vm_candidates,
+        runtime_script_events=runtime_summary.get("script_parsed_events", 0),
+        runtime_unique_sources=runtime_summary.get("unique_javascript_sources", 0),
+        runtime_alpine_expressions=runtime_classes.get("alpine_expression", 0),
+        runtime_alpine_families=runtime_summary.get("alpine_expression_shapes", 0),
+        runtime_capture_instrumentation=runtime_classes.get("capture_instrumentation", 0),
+        runtime_anonymous_sources=runtime_summary.get("anonymous_runtime_sources", 0),
         graph_nodes=graph["summary"]["nodes"],
         graph_edges=graph["summary"]["edges"],
     )
@@ -370,5 +411,14 @@ def print_project_summary(summary: ProjectSummary) -> None:
         f"  readable devirtualized VM modules: {summary.devirtualized_modules}\n"
         f"  confirmed VM units: {summary.confirmed_vm_units}\n"
         f"  VM candidates:      {summary.vm_candidates}\n"
-        f"  source graph:       {summary.graph_nodes} nodes / {summary.graph_edges} edges"
+        + (
+            f"  runtime scripts:    {summary.runtime_script_events} events -> "
+            f"{summary.runtime_unique_sources} unique; "
+            f"Alpine={summary.runtime_alpine_expressions}/{summary.runtime_alpine_families} families, "
+            f"instrumentation={summary.runtime_capture_instrumentation}, "
+            f"anonymous={summary.runtime_anonymous_sources}\n"
+            if summary.runtime_script_events
+            else ""
+        )
+        + f"  source graph:       {summary.graph_nodes} nodes / {summary.graph_edges} edges"
     )

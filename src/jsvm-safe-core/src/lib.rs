@@ -467,7 +467,7 @@ impl Collector<'_, '_> {
         let symbol = symbol_of(self.scoping, &call.callee)?;
         let decoder = self.decoders.get(&symbol)?;
         let argument = call.arguments.first()?;
-        if let Some(raw) = argument_integer(argument) {
+        if let Some(raw) = decoder_argument_integer(argument) {
             let text = decoder
                 .value_for_raw(raw)
                 .and_then(|value| value.render())?;
@@ -748,6 +748,32 @@ fn argument_integer(arg: &Argument<'_>) -> Option<i64> {
         },
         _ => None,
     }
+}
+
+fn decoder_argument_integer(arg: &Argument<'_>) -> Option<i64> {
+    if let Some(value) = argument_integer(arg) {
+        return Some(value);
+    }
+    let Argument::StringLiteral(literal) = arg else {
+        return None;
+    };
+    let text = literal.value.trim();
+    let (negative, text) = if let Some(rest) = text.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = text.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, text)
+    };
+    let value = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()?
+    } else {
+        text.parse::<i64>().ok()?
+    };
+    value
+        .checked_neg()
+        .filter(|_| negative)
+        .or_else(|| (!negative).then_some(value))
 }
 
 #[derive(Default)]
