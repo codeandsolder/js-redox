@@ -1220,6 +1220,7 @@ async function main() {
 
   const {
     abortedRelevantResponses,
+    inflightRelevantResponses,
     expectedBodies,
     missingBodies,
     failedBodies,
@@ -1236,6 +1237,7 @@ async function main() {
     missingRelevantBodies: missingBodies.length,
     failedRelevantBodies: failedBodies.length,
     abortedRelevantResponses: abortedRelevantResponses.length,
+    inflightRelevantResponses: inflightRelevantResponses.length,
     oopifCdpSessionsAttached,
     cdpStreams: streamRows.length,
     capturedCdpStreams: streamRows.filter((r) => r.body).length,
@@ -1296,7 +1298,16 @@ async function main() {
         failure: r.failure,
         bodyCapture: r.bodyCapture,
       })),
-      note: "Relevant responses that fail/abort after headers are reported separately because no complete response body is expected to exist. Playwright response.body is the cross-frame body channel; CDP streamResourceContent independently streams the main target and attached out-of-process iframe targets. Runtime Debugger capture preserves eval/inline/blob-created script source when Chromium exposes it.",
+      inflightRelevantResponses: inflightRelevantResponses.map((r) => ({
+        id: r.id,
+        method: r.method,
+        url: r.url,
+        status: r.status,
+        resourceType: r.resourceType,
+        mimeType: r.mimeType,
+        bodyCapture: r.bodyCapture,
+      })),
+      note: "Relevant responses that fail/abort after headers or remain in flight when the capture window ends are reported separately because no completed response body is expected to exist. Playwright response.body is the cross-frame body channel; CDP streamResourceContent independently streams the main target and attached out-of-process iframe targets. Runtime Debugger capture preserves eval/inline/blob-created script source when Chromium exposes it.",
     },
     artifacts: {
       har: "capture.har",

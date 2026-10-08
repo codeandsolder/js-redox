@@ -3,8 +3,20 @@ export function classifyRelevantBodies(records, isExpected) {
   const abortedRelevantResponses = relevantResponses.filter(
     (record) => !record.body && record.failure,
   );
-  const expectedBodies = relevantResponses.filter((record) => !record.failure);
+  const inflightRelevantResponses = relevantResponses.filter(
+    (record) => !record.body && !record.failure && record.inflightAtFinish,
+  );
+  const expectedBodies = relevantResponses.filter(
+    (record) => record.body || (!record.failure && !record.inflightAtFinish),
+  );
   const missingBodies = expectedBodies.filter((record) => !record.body);
   const failedBodies = missingBodies.filter((record) => record.bodyCapture?.status === "failed");
-  return { relevantResponses, abortedRelevantResponses, expectedBodies, missingBodies, failedBodies };
+  return {
+    relevantResponses,
+    abortedRelevantResponses,
+    inflightRelevantResponses,
+    expectedBodies,
+    missingBodies,
+    failedBodies,
+  };
 }

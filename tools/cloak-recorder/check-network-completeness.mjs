@@ -5,13 +5,16 @@ const records = [
   { id: "captured", status: 200, relevant: true, body: { path: "x" }, failure: null, bodyCapture: { status: "captured" } },
   { id: "missing", status: 200, relevant: true, body: null, failure: null, bodyCapture: { status: "failed" } },
   { id: "aborted", status: 200, relevant: true, body: null, failure: { errorText: "net::ERR_ABORTED" }, bodyCapture: { status: "failed" } },
+  { id: "inflight", status: 200, relevant: true, body: null, failure: null, inflightAtFinish: true, bodyCapture: { status: "failed" } },
+  { id: "captured-inflight", status: 200, relevant: true, body: { path: "y" }, failure: null, inflightAtFinish: true, bodyCapture: { status: "captured" } },
   { id: "irrelevant", status: 200, relevant: false, body: null, failure: null },
   { id: "no-response", status: 0, relevant: true, body: null, failure: { errorText: "net::ERR_FAILED" } },
 ];
 const result = classifyRelevantBodies(records, (record) => record.relevant);
-assert.deepEqual(result.relevantResponses.map((x) => x.id), ["captured", "missing", "aborted"]);
+assert.deepEqual(result.relevantResponses.map((x) => x.id), ["captured", "missing", "aborted", "inflight", "captured-inflight"]);
 assert.deepEqual(result.abortedRelevantResponses.map((x) => x.id), ["aborted"]);
-assert.deepEqual(result.expectedBodies.map((x) => x.id), ["captured", "missing"]);
+assert.deepEqual(result.inflightRelevantResponses.map((x) => x.id), ["inflight"]);
+assert.deepEqual(result.expectedBodies.map((x) => x.id), ["captured", "missing", "captured-inflight"]);
 assert.deepEqual(result.missingBodies.map((x) => x.id), ["missing"]);
 assert.deepEqual(result.failedBodies.map((x) => x.id), ["missing"]);
-console.log("PASS: aborted responses remain explicit but do not count as missing complete bodies");
+console.log("PASS: aborted and still-inflight responses remain explicit without becoming false body-loss failures");

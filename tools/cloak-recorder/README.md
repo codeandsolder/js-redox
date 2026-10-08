@@ -64,9 +64,9 @@ export after the fact:
 By default the body policy keeps script, document, stylesheet, fetch/XHR, JSON,
 WASM/octet-stream and unknown response types while omitting obvious images,
 media, fonts and PDF. Every eligible response is represented in the manifest
-with capture success/failure. A response that Chromium explicitly aborts after headers is
-reported separately from a completed response whose body was lost; only the latter makes the
-relevant-body completeness check fail.
+with capture success/failure. A response that Chromium explicitly aborts after headers, or
+that is still in flight when the capture window ends, is reported separately from a completed
+response whose body was lost; only the latter makes the relevant-body completeness check fail.
 
 ## Feed into js-redox
 
