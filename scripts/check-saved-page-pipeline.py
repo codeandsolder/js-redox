@@ -198,11 +198,24 @@ def main():
         row
         for row in bundles["modules"]
         if not row.get("chunk_ids")
-        and row.get("bundle_kind") not in {"amd_named_modules", "member_named_modules"}
+        and row.get("bundle_kind")
+        not in {"amd_named_modules", "member_named_modules", "browserify_module_table"}
     ]
     assert direct_modules
     assert all("/module-table-" in row["source_path"] for row in direct_modules)
     assert all("/chunk-/" not in row["source_path"] for row in direct_modules)
+    browserify_alpha = next(row for row in bundles["modules"] if row["module_id"] == "50001")
+    browserify_beta = next(row for row in bundles["modules"] if row["module_id"] == "50002")
+    assert browserify_alpha["bundle_kind"] == "browserify_module_table"
+    assert browserify_alpha["dependencies"] == ["50002"]
+    assert browserify_alpha["dependency_map"] == {
+        "./beta": "50002",
+        "external-package": "external-package",
+    }
+    assert browserify_alpha["export_names"] == ["value"]
+    assert browserify_beta["commonjs_export"] is True
+    assert "/browserify-modules/" in browserify_alpha["source_path"]
+    assert bundles["summary"]["browserify_modules"] >= 2
     module_20001 = next(row for row in bundles["modules"] if row["module_id"] == "20001")
     module_20002 = next(row for row in bundles["modules"] if row["module_id"] == "20002")
     assert module_20001["dependencies"] == ["20002", "40000"]
