@@ -76,6 +76,7 @@ class ProjectSummary:
     runtime_alpine_families: int
     runtime_gtm_scripts: int
     runtime_gtm_families: int
+    runtime_generated_sources: int
     runtime_capture_instrumentation: int
     runtime_anonymous_sources: int
     graph_nodes: int
@@ -385,6 +386,7 @@ def load_project_summary(
         runtime_alpine_families=runtime_summary.get("alpine_expression_shapes", 0),
         runtime_gtm_scripts=runtime_classes.get("gtm_custom_javascript", 0),
         runtime_gtm_families=runtime_summary.get("gtm_expression_shapes", 0),
+        runtime_generated_sources=runtime_classes.get("generated_runtime", 0),
         runtime_capture_instrumentation=runtime_classes.get("capture_instrumentation", 0),
         runtime_anonymous_sources=runtime_summary.get("anonymous_runtime_sources", 0),
         graph_nodes=graph["summary"]["nodes"],
@@ -420,6 +422,7 @@ def print_project_summary(summary: ProjectSummary) -> None:
             f"{summary.runtime_unique_sources} unique; "
             f"Alpine={summary.runtime_alpine_expressions}/{summary.runtime_alpine_families} families, "
             f"GTM={summary.runtime_gtm_scripts}/{summary.runtime_gtm_families} families, "
+            f"generated={summary.runtime_generated_sources}, "
             f"instrumentation={summary.runtime_capture_instrumentation}, "
             f"anonymous={summary.runtime_anonymous_sources}\n"
             if summary.runtime_script_events

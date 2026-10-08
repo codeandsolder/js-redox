@@ -77,7 +77,19 @@ def main() -> None:
     xfor = alpine("items")
     instrumentation = "() => Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0)"
     gtm = '(function(){return google_tag_manager["rm"]["123"](7).href})();'
-    sources = [network, inline, exact, model, xfor, instrumentation, gtm]
+    generated = "globalThis.dynamicFixture = 1;"
+    generated_leaf = "globalThis.dynamicLeaf = 2;"
+    sources = [
+        network,
+        inline,
+        exact,
+        model,
+        xfor,
+        instrumentation,
+        gtm,
+        generated,
+        generated_leaf,
+    ]
 
     for source in sources:
         (runtime / f"{digest(source)}.js").write_text(source)
@@ -119,6 +131,28 @@ def main() -> None:
                 },
             }
         )
+    events[-2]["stackTrace"] = {
+        "callFrames": [
+            {
+                "functionName": "eval",
+                "scriptId": "1",
+                "url": "https://fixture.invalid/app.js",
+                "lineNumber": 0,
+                "columnNumber": 1,
+            }
+        ]
+    }
+    events[-1]["stackTrace"] = {
+        "callFrames": [
+            {
+                "functionName": "eval",
+                "scriptId": "8",
+                "url": "",
+                "lineNumber": 0,
+                "columnNumber": 2,
+            }
+        ]
+    }
     (capture / "runtime-scripts.json").write_text(json.dumps(events))
 
     assert detect_capture(capture) == "recorder"
@@ -130,11 +164,12 @@ def main() -> None:
     )
     report = json.loads(report_path.read_text())
     summary = report["summary"]
-    assert summary["script_parsed_events"] == 7, summary
-    assert summary["unique_javascript_sources"] == 7, summary
+    assert summary["script_parsed_events"] == 9, summary
+    assert summary["unique_javascript_sources"] == 9, summary
     assert summary["classifications"] == {
         "alpine_expression": 3,
         "capture_instrumentation": 1,
+        "generated_runtime": 2,
         "gtm_custom_javascript": 1,
         "inline_script": 1,
         "network_response": 1,
@@ -142,6 +177,7 @@ def main() -> None:
     assert summary["alpine_dom_mapped_sources"] == 3, summary
     assert summary["alpine_expression_shapes"] == 3, summary
     assert summary["gtm_expression_shapes"] == 1, summary
+    assert summary["generated_runtime_sources"] == 2, summary
     assert summary["anonymous_runtime_sources"] == 0, summary
     mappings = {
         source["alpine"]["dom_mapping_kind"]
@@ -171,11 +207,12 @@ def main() -> None:
     graph = json.loads((project / "analysis/source-graph.json").read_text())
     node_types = Counter(node["type"] for node in graph["nodes"])
     edge_kinds = Counter(edge["kind"] for edge in graph["edges"])
-    assert node_types["runtime_script"] == 7, node_types
+    assert node_types["runtime_script"] == 9, node_types
     assert node_types["runtime_expression_family"] == 4, node_types
     assert node_types["dom_snapshot"] == 1, node_types
     assert node_types["dom_directive"] == 3, node_types
     assert edge_kinds["runtime_execution"] == 2, edge_kinds
+    assert edge_kinds["runtime_generated_code"] == 2, edge_kinds
     assert edge_kinds["runtime_expression_family"] == 4, edge_kinds
     assert edge_kinds["dom_directive"] == 3, edge_kinds
     assert edge_kinds["runtime_alpine_compile"] == 3, edge_kinds
@@ -186,6 +223,14 @@ def main() -> None:
         and node.get("framework") == "google_tag_manager"
     )
     assert gtm_family["source_count"] == 1, gtm_family
+    generated_leaf_node = next(
+        node
+        for node in graph["nodes"]
+        if node.get("type") == "runtime_script"
+        and node.get("sha256") == digest(generated_leaf)
+    )
+    assert generated_leaf_node["generation_max_depth"] == 2, generated_leaf_node
+    assert generated_leaf_node["generated_root_sha256s"] == [digest(network)], generated_leaf_node
     helper = next(
         node
         for node in graph["nodes"]
@@ -194,7 +239,7 @@ def main() -> None:
     )
     assert helper["application_source"] is False, helper
     print(
-        "PASS: recorder runtime provenance -> network/inline/Alpine/GTM/instrumentation "
+        "PASS: recorder runtime provenance -> network/inline/Alpine/GTM/generated/instrumentation "
         "+ DOM/runtime source graph"
     )
 

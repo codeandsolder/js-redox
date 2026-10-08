@@ -182,6 +182,51 @@ def match_directives(expression: str, directives: dict[str, list[dict]]) -> tupl
     return "unmatched", []
 
 
+def generation_origins(
+    event_rows: list[dict], events_by_script_id: dict[str, dict], max_depth: int = 32
+) -> list[dict]:
+    origins: list[dict] = []
+    seen_origins: set[str] = set()
+    for event in event_rows:
+        child_script_id = str(event.get("scriptId") or "")
+        current = event
+        visited = {child_script_id} if child_script_id else set()
+        chain: list[dict] = []
+        for _ in range(max_depth):
+            stack = current.get("stackTrace") or {}
+            frames = stack.get("callFrames") or []
+            if not frames:
+                break
+            frame = frames[0]
+            parent_script_id = str(frame.get("scriptId") or "")
+            if not parent_script_id or parent_script_id in visited:
+                break
+            parent = events_by_script_id.get(parent_script_id)
+            captured = (parent or {}).get("captured") or {}
+            chain.append(
+                {
+                    "script_id": parent_script_id,
+                    "sha256": captured.get("sha256"),
+                    "url": (parent or {}).get("url") or frame.get("url") or "",
+                    "function_name": frame.get("functionName") or "",
+                    "line_number": frame.get("lineNumber"),
+                    "column_number": frame.get("columnNumber"),
+                }
+            )
+            visited.add(parent_script_id)
+            if parent is None:
+                break
+            current = parent
+        if not chain:
+            continue
+        origin = {"child_script_id": child_script_id, "chain": chain}
+        frozen = json.dumps(origin, sort_keys=True, separators=(",", ":"))
+        if frozen not in seen_origins:
+            seen_origins.add(frozen)
+            origins.append(origin)
+    return origins
+
+
 def instrumentation_kind(source: str) -> str | None:
     if "// packages/injected/src/utilityScript.ts" in source or "utilityScript.evaluate" in source:
         return "playwright-utility"
@@ -213,6 +258,11 @@ def analyze(capture: Path) -> dict:
     body_hashes = {path.name for path in (capture / "bodies").iterdir()} if (capture / "bodies").is_dir() else set()
 
     events_by_hash: dict[str, list[dict]] = defaultdict(list)
+    events_by_script_id = {
+        str(event.get("scriptId")): event
+        for event in events
+        if event.get("scriptId") is not None
+    }
     for event in events:
         captured = event.get("captured")
         if captured and captured.get("kind") == "javascript" and captured.get("sha256"):
@@ -241,6 +291,17 @@ def analyze(capture: Path) -> dict:
             "execution_context_ids": sorted({event.get("executionContextId") for event in event_rows}),
             "urls": urls,
         }
+        origins = generation_origins(event_rows, events_by_script_id)
+        if origins:
+            roots = [origin["chain"][-1] for origin in origins if origin.get("chain")]
+            row["generated"] = {
+                "origins": origins,
+                "root_sha256s": sorted(
+                    {root.get("sha256") for root in roots if root.get("sha256")}
+                ),
+                "root_urls": sorted({root.get("url") for root in roots if root.get("url")}),
+                "max_depth": max(len(origin["chain"]) for origin in origins),
+            }
 
         if digest in body_hashes:
             classification = "network_response"
@@ -277,6 +338,8 @@ def analyze(capture: Path) -> dict:
                         classification = "capture_instrumentation"
                         row["instrumentation_kind"] = helper
                         instrumentation_counts[helper] += 1
+                    elif origins:
+                        classification = "generated_runtime"
                     else:
                         classification = "anonymous_runtime"
         row["classification"] = classification
@@ -317,6 +380,7 @@ def analyze(capture: Path) -> dict:
             "alpine_expression_shapes": len(alpine_shapes),
             "gtm_expression_shapes": len(gtm_shapes),
             "capture_instrumentation_kinds": dict(sorted(instrumentation_counts.items())),
+            "generated_runtime_sources": class_counts["generated_runtime"],
             "anonymous_runtime_sources": class_counts["anonymous_runtime"],
         },
         "alpine_families": families,

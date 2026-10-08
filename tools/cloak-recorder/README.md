@@ -49,7 +49,9 @@ export after the fact:
   target and streams bytes as they arrive, reducing dependence on Chromium's
   inspector response cache.
 - CDP `Debugger.scriptParsed` + `getScriptSource` retain runtime/eval/inline/blob
-  JavaScript that may never exist as a network response.
+  JavaScript that may never exist as a network response. `scriptParsed` generation stack
+  traces and execution-context auxiliary data are retained so nested `eval`/Function
+  children can be linked back to the captured script that compiled them.
 - WebSocket frames and SSE/EventSource messages are recorded separately.
 - Final per-frame DOM, MHTML, cookies/localStorage/sessionStorage/IndexedDB state,
   console/exception data and a screenshot are retained.

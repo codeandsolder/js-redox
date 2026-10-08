@@ -189,6 +189,7 @@ def main():
         classification = source.get('classification')
         alpine = source.get('alpine') or {}
         gtm = source.get('gtm') or {}
+        generated = source.get('generated') or {}
         add_node(
             runtime_node,
             type='runtime_script',
@@ -201,8 +202,41 @@ def main():
             execution_context_ids=source.get('execution_context_ids', []),
             urls=source.get('urls', []),
             instrumentation_kind=source.get('instrumentation_kind'),
+            generated_root_sha256s=generated.get('root_sha256s', []),
+            generated_root_urls=generated.get('root_urls', []),
+            generation_max_depth=generated.get('max_depth'),
             application_source=classification != 'capture_instrumentation',
         )
+
+        for origin in generated.get('origins', []):
+            chain = origin.get('chain') or []
+            if not chain:
+                continue
+            parent = chain[0]
+            edge_fields = {
+                'child_script_id': origin.get('child_script_id'),
+                'parent_script_id': parent.get('script_id'),
+                'function_name': parent.get('function_name'),
+                'line_number': parent.get('line_number'),
+                'column_number': parent.get('column_number'),
+                'generation_depth': len(chain),
+            }
+            parent_sha = parent.get('sha256')
+            if parent_sha:
+                add_edge(
+                    f"runtime:{parent_sha[:20]}",
+                    runtime_node,
+                    'runtime_generated_code',
+                    **edge_fields,
+                )
+            elif parent.get('url'):
+                for parent_node in targets_for(parent['url']):
+                    add_edge(
+                        parent_node,
+                        runtime_node,
+                        'runtime_generated_code',
+                        **edge_fields,
+                    )
 
         if classification == 'network_response':
             parents = list(resource_nodes_by_sha.get(digest, []))
