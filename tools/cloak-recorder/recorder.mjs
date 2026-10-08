@@ -13,6 +13,7 @@ import {
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { evaluateDuringScroll } from "./scroll-retry.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../..");
@@ -359,7 +360,10 @@ async function humanScroll(page, opts, events) {
   const state = [];
   for (let pass = 0; pass < opts.scrollPasses; pass += 1) {
     if (pass > 0) {
-      await page.evaluate(() => scrollTo({ top: 0, behavior: "instant" }));
+      await evaluateDuringScroll(
+        page, opts, events, "reset-top",
+        () => scrollTo({ top: 0, behavior: "instant" }),
+      );
       await sleep(opts.fastScroll ? 150 : 600);
     }
 
@@ -368,36 +372,47 @@ async function humanScroll(page, opts, events) {
     let steps = 0;
 
     while (steps < opts.maxScrollSteps) {
-      const before = await page.evaluate(() => ({
+      const resetBottomState = () => {
+        lastHeight = 0;
+        stableBottoms = 0;
+      };
+      const before = await evaluateDuringScroll(page, opts, events, "before-wheel", () => ({
+        url: location.href,
         y: scrollY,
         viewport: innerHeight,
         height: Math.max(
           document.documentElement.scrollHeight,
           document.body?.scrollHeight || 0,
         ),
-      }));
+      }), resetBottomState);
 
       const delta = opts.fastScroll ? randomInt(1000, 2201) : randomInt(450, 1051);
       await page.mouse.wheel(0, delta);
       await sleep(opts.fastScroll ? randomInt(50, 121) : randomInt(180, 521));
       steps += 1;
 
-      const after = await page.evaluate(() => ({
+      const after = await evaluateDuringScroll(page, opts, events, "after-wheel", () => ({
+        url: location.href,
         y: scrollY,
         viewport: innerHeight,
         height: Math.max(
           document.documentElement.scrollHeight,
           document.body?.scrollHeight || 0,
         ),
-      }));
+      }), resetBottomState);
 
+      if (before.url !== after.url) resetBottomState();
       const atBottom = after.y + after.viewport >= after.height - 8;
       if (atBottom) {
         await sleep(opts.fastScroll ? randomInt(300, 501) : randomInt(700, 1201));
-        const heightAfterPause = await page.evaluate(() => Math.max(
-          document.documentElement.scrollHeight,
-          document.body?.scrollHeight || 0,
-        ));
+        const heightAfterPause = await evaluateDuringScroll(
+          page, opts, events, "bottom-height",
+          () => Math.max(
+            document.documentElement.scrollHeight,
+            document.body?.scrollHeight || 0,
+          ),
+          resetBottomState,
+        );
         if (heightAfterPause <= Math.max(after.height, lastHeight) + 4) {
           stableBottoms += 1;
         } else {
@@ -410,7 +425,8 @@ async function humanScroll(page, opts, events) {
       if (before.y === after.y && atBottom) stableBottoms += 1;
     }
 
-    const final = await page.evaluate(() => ({
+    const final = await evaluateDuringScroll(page, opts, events, "final-state", () => ({
+      url: location.href,
       y: scrollY,
       viewport: innerHeight,
       height: Math.max(

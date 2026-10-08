@@ -2,7 +2,8 @@
 
 `recorder.mjs` drives a fresh persistent CloakBrowser profile, accepts consent,
 scrolls through the page to exercise lazy/ad loading, and writes a provenance-rich
-capture for `js-redox`.
+capture for `js-redox`. Scrolling tolerates bounded page-initiated navigation/context
+churn and records every retry instead of aborting the capture on a transient context loss.
 
 ## Run
 
