@@ -28,7 +28,7 @@ cast_precision_loss = "deny"
 
 [workspace.dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 oxc_allocator = "0.138.0"
 oxc_ast = "0.138.0"
