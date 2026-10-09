@@ -351,8 +351,16 @@ def main():
     }
     assert browserify_alpha["export_names"] == ["value"]
     assert browserify_beta["commonjs_export"] is True
+    returned_browserify = next(row for row in bundles["modules"] if row["module_id"] == "51001")
+    assert returned_browserify["bundle_kind"] == "browserify_module_table"
+    assert returned_browserify["dependencies"] == ["51002"]
+    assert returned_browserify["dependency_map"] == {
+        "./beta": "51002",
+        "external-missing": "external-missing",
+    }
+    assert not any(row["module_id"] in {"52001", "52002"} for row in bundles["modules"])
     assert "/browserify-modules/" in browserify_alpha["source_path"]
-    assert bundles["summary"]["browserify_modules"] >= 2
+    assert bundles["summary"]["browserify_modules"] >= 4
     browserify_source = (PROJECT / browserify_alpha["source_path"]).read_text()
     assert "Statically extracted Browserify module factory" in browserify_source
     assert "./beta -> 50002" in browserify_source

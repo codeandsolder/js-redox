@@ -170,3 +170,43 @@ customElements.define("not-module-inline-function", function () {
     module.exports = { value: "beta" };
   }, {}]
 }, {}, [50001]);
+
+
+(function () {
+  function browserifyReturned(modules, cache, entries) {
+    function load(id) {
+      if (cache[id]) return cache[id].exports;
+      const module = cache[id] = { exports: {} };
+      const tuple = modules[id];
+      function localRequire(name) {
+        return load(tuple[1][name]);
+      }
+      tuple[0](localRequire, module, module.exports);
+      return module.exports;
+    }
+    for (let i = 0; i < entries.length; i++) load(entries[i]);
+    return load;
+  }
+  return browserifyReturned;
+})()({
+  51001: [function (require, module, exports) {
+    exports.value = require("./beta").value;
+  }, { "./beta": 51002, "external-missing": undefined }],
+  51002: [function (require, module, exports) {
+    module.exports = { value: "returned-bootstrap" };
+  }, {}]
+}, {}, [51001]);
+
+(function () {
+  let mutableBootstrap = function (modules, cache, entries) {
+    return [modules, cache, entries];
+  };
+  return mutableBootstrap;
+})()({
+  52001: [function (require, module, exports) {
+    exports.value = require("./beta").value;
+  }, { "./beta": 52002 }],
+  52002: [function (require, module, exports) {
+    module.exports = { value: "must-not-detect" };
+  }, {}]
+}, {}, [52001]);

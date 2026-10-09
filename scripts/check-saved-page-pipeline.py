@@ -87,6 +87,8 @@ def main():
         TOOL_ROOT / "deobfuscate-safe",
         "--bundle-inventory",
         TOOL_ROOT / "bundle-unpack",
+        "--sourcemap-composer",
+        TOOL_ROOT / "sourcemap-compose",
     )
 
     manifest = json.loads((PROJECT / "capture-manifest.json").read_text())
@@ -214,8 +216,16 @@ def main():
     }
     assert browserify_alpha["export_names"] == ["value"]
     assert browserify_beta["commonjs_export"] is True
+    returned_browserify = next(row for row in bundles["modules"] if row["module_id"] == "51001")
+    assert returned_browserify["bundle_kind"] == "browserify_module_table"
+    assert returned_browserify["dependencies"] == ["51002"]
+    assert returned_browserify["dependency_map"] == {
+        "./beta": "51002",
+        "external-missing": "external-missing",
+    }
+    assert not any(row["module_id"] in {"52001", "52002"} for row in bundles["modules"])
     assert "/browserify-modules/" in browserify_alpha["source_path"]
-    assert bundles["summary"]["browserify_modules"] >= 2
+    assert bundles["summary"]["browserify_modules"] >= 4
     module_20001 = next(row for row in bundles["modules"] if row["module_id"] == "20001")
     module_20002 = next(row for row in bundles["modules"] if row["module_id"] == "20002")
     assert module_20001["dependencies"] == ["20002", "40000"]

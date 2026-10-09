@@ -4,7 +4,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::{
     ast::{
         Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, Expression,
-        IdentifierReference, ObjectPropertyKind, PropertyKey,
+        IdentifierReference, ObjectPropertyKind, PropertyKey, Statement,
     },
     AstKind,
 };
@@ -699,6 +699,7 @@ impl Collector<'_, '_> {
     }
 
     fn browserify_dependency_map(
+        &self,
         dependency_map: &oxc_ast::ast::ObjectExpression<'_>,
     ) -> Option<BTreeMap<String, String>> {
         let mut dependencies = BTreeMap::new();
@@ -717,6 +718,12 @@ impl Collector<'_, '_> {
                     format!("{:.0}", value.value)
                 }
                 Expression::StringLiteral(value) => value.value.to_string(),
+                Expression::Identifier(value)
+                    if value.name.as_str() == "undefined"
+                        && reference_symbol(self.scoping, value).is_none() =>
+                {
+                    name.clone()
+                }
                 _ => return None,
             };
             dependencies.insert(name, target);
@@ -783,8 +790,9 @@ impl Collector<'_, '_> {
     fn browserify_module_records(
         &self,
         module_table: &oxc_ast::ast::ObjectExpression<'_>,
+        minimum_modules: usize,
     ) -> Option<Vec<ModuleRecord>> {
-        if module_table.properties.len() < 2 {
+        if module_table.properties.len() < minimum_modules {
             return None;
         }
         let mut modules = Vec::with_capacity(module_table.properties.len());
@@ -811,7 +819,7 @@ impl Collector<'_, '_> {
             else {
                 return None;
             };
-            let dependency_map = Self::browserify_dependency_map(dependency_object)?;
+            let dependency_map = self.browserify_dependency_map(dependency_object)?;
             let (export_names, commonjs_export) = self.browserify_exports(params, body);
             modules.push(ModuleRecord {
                 id,
@@ -844,16 +852,60 @@ impl Collector<'_, '_> {
         Some(modules)
     }
 
-    fn browserify_bootstrap_arity(callee: &Expression<'_>) -> Option<usize> {
+    fn browserify_returned_bootstrap_arity(
+        &self,
+        call: &oxc_ast::ast::CallExpression<'_>,
+    ) -> Option<usize> {
+        if call.optional || !call.arguments.is_empty() {
+            return None;
+        }
+        let Expression::FunctionExpression(factory) = unwrap_parenthesized(&call.callee) else {
+            return None;
+        };
+        if factory.r#async
+            || factory.generator
+            || factory.params.rest.is_some()
+            || !factory.params.items.is_empty()
+        {
+            return None;
+        }
+        let body = factory.body.as_ref()?;
+        if !body.directives.is_empty() {
+            return None;
+        }
+        let [Statement::FunctionDeclaration(bootstrap), Statement::ReturnStatement(ret)] =
+            body.statements.as_slice()
+        else {
+            return None;
+        };
+        if bootstrap.r#async || bootstrap.generator || bootstrap.params.rest.is_some() {
+            return None;
+        }
+        let bootstrap_symbol = bootstrap.id.as_ref()?.symbol_id.get()?;
+        let returned = ret.argument.as_ref()?;
+        (expression_symbol(self.scoping, returned) == Some(bootstrap_symbol))
+            .then_some(bootstrap.params.items.len())
+    }
+
+    fn browserify_bootstrap_arity(&self, callee: &Expression<'_>) -> Option<(usize, bool)> {
         match unwrap_parenthesized(callee) {
-            Expression::FunctionExpression(function) => Some(function.params.items.len()),
-            Expression::ArrowFunctionExpression(function) => Some(function.params.items.len()),
+            Expression::FunctionExpression(function) => Some((function.params.items.len(), false)),
+            Expression::ArrowFunctionExpression(function) => {
+                Some((function.params.items.len(), false))
+            }
+            Expression::CallExpression(call) => self
+                .browserify_returned_bootstrap_arity(call)
+                .map(|arity| (arity, true)),
             _ => None,
         }
     }
 
     fn record_browserify_call(&mut self, call: &oxc_ast::ast::CallExpression<'_>) -> bool {
-        if call.arguments.len() != 3 || Self::browserify_bootstrap_arity(&call.callee) != Some(3) {
+        let Some((arity, returned_bootstrap)) = self.browserify_bootstrap_arity(&call.callee)
+        else {
+            return false;
+        };
+        if call.arguments.len() != 3 || arity != 3 {
             return false;
         }
         let Some(Argument::ObjectExpression(module_table)) = call.arguments.first() else {
@@ -874,7 +926,8 @@ impl Collector<'_, '_> {
         if entry_ids.is_empty() {
             return false;
         }
-        let Some(modules) = self.browserify_module_records(module_table) else {
+        let minimum_modules = if returned_bootstrap { 1 } else { 2 };
+        let Some(modules) = self.browserify_module_records(module_table, minimum_modules) else {
             return false;
         };
         let module_ids = modules
