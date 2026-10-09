@@ -1051,7 +1051,9 @@ fn render_block(chunks: &[String]) -> String {
 struct ArithmeticStateSetup<'a> {
     state_var: String,
     initial_number: f64,
-    init_text: String,
+    init_text: Option<String>,
+    test: &'a Expression<'a>,
+    loop_termination: &'static str,
     selector_stmts: &'a [Statement<'a>],
     switch: &'a oxc_ast::ast::SwitchStatement<'a>,
 }
@@ -1374,6 +1376,41 @@ impl Collector<'_, '_> {
         self.simulate_reference_state(switch, &cases, setup)
     }
 
+    fn external_arithmetic_state(
+        &self,
+        test: &Expression<'_>,
+        loop_span: Span,
+    ) -> Option<(String, f64)> {
+        let Expression::BinaryExpression(binary) = test else {
+            return None;
+        };
+        if !matches!(binary.operator.as_str(), "!=" | "!==") {
+            return None;
+        }
+
+        let (state_expr, terminal_expr) = match (
+            direct_identifier_name(&binary.left),
+            direct_identifier_name(&binary.right),
+        ) {
+            (Some(_), None) => (&binary.left, &binary.right),
+            (None, Some(_)) => (&binary.right, &binary.left),
+            _ => return None,
+        };
+        let state_var = direct_identifier_name(state_expr)?.to_string();
+        let state_symbol = symbol_of(self.scoping, state_expr)?;
+        let initializer = self.var_number_initializers.get(&state_symbol)?;
+        if initializer.available_after > loop_span.start
+            || !matches!(
+                eval(terminal_expr),
+                Some(Value::Number(number)) if number.is_finite() && number.fract() == 0.0
+            )
+            || !resolved_refs_within(self.scoping, self.reference_spans, state_symbol, loop_span)
+        {
+            return None;
+        }
+        Some((state_var, initializer.value))
+    }
+
     fn arithmetic_state_setup<'a>(
         &self,
         it: &'a oxc_ast::ast::ForStatement<'a>,
@@ -1381,52 +1418,71 @@ impl Collector<'_, '_> {
         if it.update.is_some() {
             return None;
         }
-        let oxc_ast::ast::ForStatementInit::VariableDeclaration(init_decl) = it.init.as_ref()?
-        else {
-            return None;
+        let test = it.test.as_ref()?;
+        let (state_var, initial_number, init_text, loop_termination) = match it.init.as_ref() {
+            Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(init_decl)) => {
+                if init_decl.kind != VariableDeclarationKind::Var
+                    || init_decl.declarations.len() != 1
+                {
+                    return None;
+                }
+                let state_decl = &init_decl.declarations[0];
+                let BindingPattern::BindingIdentifier(state_id) = &state_decl.id else {
+                    return None;
+                };
+                let state_symbol = state_id.symbol_id.get()?;
+                let state_var = state_id.name.to_string();
+                let Value::Number(initial_number) = eval(state_decl.init.as_ref()?)? else {
+                    return None;
+                };
+                if !initial_number.is_finite()
+                    || initial_number.fract() != 0.0
+                    || !state_undefined_test(test, &state_var)
+                    || !resolved_refs_within(
+                        self.scoping,
+                        self.reference_spans,
+                        state_symbol,
+                        it.span,
+                    )
+                {
+                    return None;
+                }
+                (
+                    state_var,
+                    initial_number,
+                    Some(format!("{};", fragment(self.source, init_decl.span))),
+                    "undefined",
+                )
+            }
+            None => {
+                let (state_var, initial_number) = self.external_arithmetic_state(test, it.span)?;
+                (state_var, initial_number, None, "loop_test")
+            }
+            _ => return None,
         };
-        if init_decl.kind != VariableDeclarationKind::Var || init_decl.declarations.len() != 1 {
-            return None;
-        }
-        let state_decl = &init_decl.declarations[0];
-        let BindingPattern::BindingIdentifier(state_id) = &state_decl.id else {
-            return None;
-        };
-        let state_symbol = state_id.symbol_id.get()?;
-        let state_var = state_id.name.to_string();
-        let Value::Number(initial_number) = eval(state_decl.init.as_ref()?)? else {
-            return None;
-        };
-        if !initial_number.is_finite()
-            || initial_number.fract() != 0.0
-            || !state_undefined_test(it.test.as_ref()?, &state_var)
-            || !resolved_refs_within(self.scoping, self.reference_spans, state_symbol, it.span)
-        {
-            return None;
-        }
 
         let Statement::BlockStatement(body) = &it.body else {
             return None;
         };
-        if body.body.len() < 2 {
+        if body.body.is_empty() {
             return None;
         }
         let (switch_stmt, selector_stmts) = body.body.split_last()?;
         let Statement::SwitchStatement(switch) = switch_stmt else {
             return None;
         };
-        if selector_stmts.is_empty()
-            || !selector_stmts.iter().all(
-                |stmt| matches!(stmt, Statement::VariableDeclaration(decl) if decl.kind == VariableDeclarationKind::Var),
-            )
-        {
+        if !selector_stmts.iter().all(
+            |stmt| matches!(stmt, Statement::VariableDeclaration(decl) if decl.kind == VariableDeclarationKind::Var),
+        ) {
             return None;
         }
 
         Some(ArithmeticStateSetup {
             state_var,
             initial_number,
-            init_text: format!("{};", fragment(self.source, init_decl.span)),
+            init_text,
+            test,
+            loop_termination,
             selector_stmts,
             switch,
         })
@@ -1476,11 +1532,20 @@ impl Collector<'_, '_> {
         let setup = self.arithmetic_state_setup(it)?;
         let mut env = HashMap::new();
         env.insert(setup.state_var.clone(), Value::Number(setup.initial_number));
-        let mut chunks = vec![setup.init_text];
+        let mut chunks = setup.init_text.into_iter().collect::<Vec<_>>();
         let mut seen_states = HashSet::new();
         let mut state_path = Vec::new();
 
         for _ in 0..256 {
+            if !eval_with_env(setup.test, &env)?.truthy() {
+                return Some(arithmetic_state_result(
+                    it.span,
+                    &setup.state_var,
+                    state_path,
+                    &chunks,
+                    setup.loop_termination,
+                ));
+            }
             let state_key = env.get(&setup.state_var)?.render()?;
             if !seen_states.insert(state_key.clone()) {
                 return None;

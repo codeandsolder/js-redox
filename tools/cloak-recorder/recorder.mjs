@@ -13,7 +13,7 @@ import {
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { evaluateDuringScroll } from "./scroll-retry.mjs";
+import { evaluateDuringScroll, isTerminalTargetClosedError } from "./scroll-retry.mjs";
 import { classifyRelevantBodies } from "./network-completeness.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -463,7 +463,16 @@ function buildHar(records, bodyMemory) {
           mime === ""
         );
         if (textual) {
-          text = body.toString("utf8");
+          const utf8 = body.toString("utf8");
+          if (Buffer.from(utf8, "utf8").equals(body)) {
+            text = utf8;
+          } else {
+            // HAR `text` is Unicode, so forcing arbitrary legacy bytes through
+            // UTF-8 would silently corrupt recorder provenance. Preserve any
+            // non-round-trippable textual response as base64 instead.
+            text = body.toString("base64");
+            encoding = "base64";
+          }
         } else {
           text = body.toString("base64");
           encoding = "base64";
@@ -589,6 +598,9 @@ async function main() {
   let nextFrameCdpSession = 1;
   let oopifCdpSessionsAttached = 0;
   let recorderClosing = false;
+  let finalCaptureComplete = false;
+  let targetClosedError = null;
+  let lastKnownUrl = opts.url;
   let nextRequest = 1;
 
   const queueJob = (promise, label) => {
@@ -618,6 +630,35 @@ async function main() {
   const context = await launchPersistentContext(browserOptions);
   let page = context.pages()[0] || await context.newPage();
   page.setDefaultTimeout(opts.timeoutMs);
+
+  const currentPageUrl = () => {
+    try {
+      const url = page.url();
+      if (url) lastKnownUrl = url;
+    } catch {}
+    return lastKnownUrl;
+  };
+
+  const markTargetClosed = (phase, error) => {
+    if (!isTerminalTargetClosedError(error)) return false;
+    if (targetClosedError) return true;
+    const at = Date.now();
+    const message = String(error?.stack || error);
+    const row = { at, phase, error: message, url: currentPageUrl() };
+    targetClosedError = row;
+    failures.push({ at, label: `target-closed ${phase}`, error: message });
+    events.push({ at, type: "target-closed", phase, error: message, url: row.url });
+    return true;
+  };
+
+  page.on("close", () => {
+    if (recorderClosing || finalCaptureComplete || targetClosedError) return;
+    const at = Date.now();
+    const error = "Page closed before capture finalization";
+    targetClosedError = { at, phase: "page-close-event", error, url: currentPageUrl() };
+    failures.push({ at, label: "target-closed page-close-event", error });
+    events.push({ at, type: "target-closed", phase: "page-close-event", error, url: lastKnownUrl });
+  });
 
   // Playwright-level capture is deliberately retained in addition to CDP.
   // It sees OOPIF/subframe traffic that may live on a different CDP target.
@@ -1023,7 +1064,7 @@ async function main() {
     session.on("close", () => {
       if (frameCdpStates.get(frame) === state) frameCdpStates.delete(frame);
       events.push({ at: Date.now(), type: "oopif-cdp-closed", cdpSession: name, url: frame.url() });
-      if (!recorderClosing && !frame.isDetached()) {
+      if (!recorderClosing && !targetClosedError && !frame.isDetached()) {
         queueJob((async () => {
           await sleep(25);
           await maybeAttachFrameCdp(frame);
@@ -1049,45 +1090,74 @@ async function main() {
       waitUntil: "domcontentloaded",
       timeout: opts.timeoutMs,
     });
+    currentPageUrl();
   } catch (error) {
     navigationError = String(error);
-    failures.push({ at: Date.now(), label: "navigation", error: navigationError });
+    if (!markTargetClosed("navigation", error)) {
+      failures.push({ at: Date.now(), label: "navigation", error: navigationError });
+    }
     console.warn(`[recorder] navigation warning: ${navigationError}`);
   }
-  events.push({ at: Date.now(), type: "navigation-domcontentloaded-or-timeout", url: page.url() });
+  events.push({
+    at: Date.now(),
+    type: "navigation-domcontentloaded-or-timeout",
+    url: currentPageUrl(),
+  });
 
   await sleep(800);
 
   let consent = { enabled: opts.consent, beforeFallback: [], fallbackClicks: [], afterFallback: [] };
-  if (opts.consent) {
+  if (page.isClosed() && !targetClosedError) {
+    markTargetClosed("post-navigation", new Error("Page closed"));
+  }
+  if (opts.consent && !targetClosedError) {
     console.log(`[recorder] allowing AutoConsent ${opts.consentMs} ms`);
-    await sleep(opts.consentMs);
-    consent.beforeFallback = await getAutoConsentState(page);
+    try {
+      await sleep(opts.consentMs);
+      consent.beforeFallback = await getAutoConsentState(page);
 
-    const successfulAutoClick = consent.beforeFallback.some((row) =>
-      ["optInSucceeded", "runningOptIn"].includes(row.state?.lifecycle) ||
-      (row.state?.clicks || 0) > 0
-    );
+      const successfulAutoClick = consent.beforeFallback.some((row) =>
+        ["optInSucceeded", "runningOptIn"].includes(row.state?.lifecycle) ||
+        (row.state?.clicks || 0) > 0
+      );
 
-    if (!successfulAutoClick) {
-      consent.fallbackClicks = await clickConsentFallback(page);
-      if (consent.fallbackClicks.some((row) => row.clicked)) await sleep(1200);
+      if (!successfulAutoClick) {
+        consent.fallbackClicks = await clickConsentFallback(page);
+        if (consent.fallbackClicks.some((row) => row.clicked)) await sleep(1200);
+      }
+      consent.afterFallback = await getAutoConsentState(page);
+    } catch (error) {
+      if (!markTargetClosed("consent", error)) throw error;
     }
-    consent.afterFallback = await getAutoConsentState(page);
   }
 
-  console.log(`[recorder] scrolling to exercise lazy page/ad loading`);
-  const scroll = await humanScroll(page, opts, events);
+  let scroll = [];
+  if (!targetClosedError && !page.isClosed()) {
+    console.log(`[recorder] scrolling to exercise lazy page/ad loading`);
+    try {
+      scroll = await humanScroll(page, opts, events);
+      currentPageUrl();
+    } catch (error) {
+      if (!markTargetClosed("scroll", error)) throw error;
+    }
+  } else {
+    console.warn(`[recorder] page target closed before scrolling completed; salvaging captured channels`);
+  }
 
   console.log(`[recorder] waiting for network quiescence`);
   const networkQuiet = await waitForNetworkQuiet(inflight, Math.min(1500, opts.settleMs), opts.settleMs);
   await sleep(500);
 
   // One final bottom poke catches IntersectionObserver/ad slots that arm on the last paint.
-  try {
-    await page.evaluate(() => scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" }));
-    await sleep(800);
-  } catch {}
+  if (!targetClosedError && !page.isClosed()) {
+    try {
+      await page.evaluate(() => scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" }));
+      await sleep(800);
+      currentPageUrl();
+    } catch (error) {
+      markTargetClosed("final-bottom-poke", error);
+    }
+  }
   await waitForNetworkQuiet(inflight, 700, 2500);
 
   await drainJobs();
@@ -1102,8 +1172,9 @@ async function main() {
   console.log(`[recorder] saving DOM, MHTML, state and manifests`);
 
   const frameRows = [];
-  for (let i = 0; i < page.frames().length; i += 1) {
-    const frame = page.frames()[i];
+  const finalFrames = (!targetClosedError && !page.isClosed()) ? page.frames() : [];
+  for (let i = 0; i < finalFrames.length; i += 1) {
+    const frame = finalFrames[i];
     const row = {
       index: i,
       url: frame.url(),
@@ -1121,6 +1192,7 @@ async function main() {
       row.html = rel;
     } catch (error) {
       row.errors.push(`content:${String(error)}`);
+      markTargetClosed("frame-content", error);
     }
 
     try {
@@ -1141,38 +1213,60 @@ async function main() {
       });
     } catch (error) {
       row.errors.push(`storage:${String(error)}`);
+      markTargetClosed("frame-storage", error);
     }
     frameRows.push(row);
+    if (targetClosedError) break;
   }
 
   let mhtml = null;
-  try {
-    const snapshot = await withTimeout(cdp.send("Page.captureSnapshot", { format: "mhtml" }), Math.min(opts.timeoutMs, 15_000), "captureSnapshot");
-    mhtml = "page.mhtml";
-    await writeFile(path.join(out, mhtml), snapshot.data);
-  } catch (error) {
-    failures.push({ at: Date.now(), label: "mhtml", error: String(error) });
+  if (!targetClosedError && !page.isClosed()) {
+    try {
+      const snapshot = await withTimeout(
+        cdp.send("Page.captureSnapshot", { format: "mhtml" }),
+        Math.min(opts.timeoutMs, 15_000),
+        "captureSnapshot",
+      );
+      mhtml = "page.mhtml";
+      await writeFile(path.join(out, mhtml), snapshot.data);
+    } catch (error) {
+      if (!markTargetClosed("mhtml", error)) {
+        failures.push({ at: Date.now(), label: "mhtml", error: String(error) });
+      }
+    }
   }
 
   let screenshot = null;
-  if (opts.screenshot) {
+  if (opts.screenshot && !targetClosedError && !page.isClosed()) {
     try {
       screenshot = "page.png";
       await page.screenshot({ path: path.join(out, screenshot), fullPage: true });
     } catch (error) {
-      failures.push({ at: Date.now(), label: "screenshot", error: String(error) });
+      if (!markTargetClosed("screenshot", error)) {
+        failures.push({ at: Date.now(), label: "screenshot", error: String(error) });
+      }
     }
   }
 
-  let storageState = null;
+  let storageStatePath = null;
   try {
-    storageState = await context.storageState({ indexedDB: true });
-  } catch {
-    storageState = await context.storageState();
+    let storageState;
+    try {
+      storageState = await context.storageState({ indexedDB: true });
+    } catch (error) {
+      if (isTerminalTargetClosedError(error)) throw error;
+      storageState = await context.storageState();
+    }
+    storageStatePath = "storage-state.json";
+    await writeFile(path.join(out, storageStatePath), JSON.stringify(storageState, null, 2));
+  } catch (error) {
+    if (!markTargetClosed("storage-state", error)) {
+      failures.push({ at: Date.now(), label: "storage-state", error: String(error) });
+    }
   }
-  await writeFile(path.join(out, "storage-state.json"), JSON.stringify(storageState, null, 2));
 
   await drainJobs();
+  finalCaptureComplete = true;
 
   // Recover a body missed by Playwright from the independent early CDP stream,
   // but only when the exact method/status/URL key has one observed byte value.
@@ -1247,6 +1341,7 @@ async function main() {
     eventSourceEvents: eventSourceEvents.length,
     frames: frameRows.length,
     networkQuiet,
+    captureSalvaged: Boolean(targetClosedError),
   };
 
   await Promise.all([
@@ -1266,8 +1361,10 @@ async function main() {
     schema: "js-redox-cloak-capture/v1",
     createdAt: new Date().toISOString(),
     requestedUrl: opts.url,
-    finalUrl: page.url(),
+    finalUrl: currentPageUrl(),
     navigationError,
+    salvaged: Boolean(targetClosedError),
+    salvageReason: targetClosedError,
     options: {
       ...opts,
       output: undefined,
@@ -1320,13 +1417,16 @@ async function main() {
       frameManifest: "frames.json",
       mhtml,
       screenshot,
-      storageState: "storage-state.json",
+      storageState: storageStatePath,
       websockets: "websockets.json",
       eventSource: "eventsource.json",
       runtimeEvents: "runtime-events.json",
       failures: "failures.json",
     },
     limitations: [
+      ...(targetClosedError ? [
+        `Top page/context/browser target closed during ${targetClosedError.phase}; final page-only artifacts may be unavailable. Network/CDP/runtime channels captured before closure are preserved.`,
+      ] : []),
       "Runtime Debugger/Network capture covers the main page plus out-of-process iframe targets; dedicated/shared worker-created eval source may require worker-target sessions in a future revision.",
       "Bodies larger than maxBodyMiB are intentionally reported but not persisted unless the limit is increased.",
       "Image/media/font bodies are intentionally omitted unless --all-bodies is used.",
@@ -1337,7 +1437,8 @@ async function main() {
   await writeFile(path.join(out, "README.txt"), [
     "js-redox CloakBrowser capture",
     `requested: ${opts.url}`,
-    `final: ${page.url()}`,
+    `final: ${manifest.finalUrl}`,
+    `capture state: ${manifest.salvaged ? "SALVAGED / truncated" : "complete"}`,
     `relevant body completeness: ${manifest.completeness.relevantNetworkBodiesComplete}`,
     `requests: ${summary.requests}`,
     `captured response bodies: ${summary.capturedResponseBodies}`,
@@ -1356,7 +1457,11 @@ async function main() {
   }
 
   recorderClosing = true;
-  await context.close();
+  try {
+    await context.close();
+  } catch (error) {
+    if (!isTerminalTargetClosedError(error)) throw error;
+  }
   console.log(`[recorder] done: ${out}`);
 }
 

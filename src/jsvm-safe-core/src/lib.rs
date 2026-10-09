@@ -256,6 +256,62 @@ fn collect_stable_var_numbers(
     collector.candidates
 }
 
+#[derive(Debug, Clone, Copy)]
+struct VarNumberInitializer {
+    value: f64,
+    available_after: u32,
+}
+
+#[derive(Default)]
+struct VarNumberInitializerCollector {
+    candidates: HashMap<SymbolId, VarNumberInitializer>,
+    seen: HashSet<SymbolId>,
+}
+
+impl<'a> Visit<'a> for VarNumberInitializerCollector {
+    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        if it.kind == VariableDeclarationKind::Var {
+            for declaration in &it.declarations {
+                let BindingPattern::BindingIdentifier(id) = &declaration.id else {
+                    continue;
+                };
+                let Some(symbol) = id.symbol_id.get() else {
+                    continue;
+                };
+                if !self.seen.insert(symbol) {
+                    self.candidates.remove(&symbol);
+                    continue;
+                }
+                let Some(init) = &declaration.init else {
+                    continue;
+                };
+                let Some(Value::Number(number)) = eval(init) else {
+                    continue;
+                };
+                if !number.is_finite() || number.fract() != 0.0 {
+                    continue;
+                }
+                self.candidates.insert(
+                    symbol,
+                    VarNumberInitializer {
+                        value: number,
+                        available_after: declaration.span.end,
+                    },
+                );
+            }
+        }
+        walk::walk_variable_declaration(self, it);
+    }
+}
+
+fn collect_var_number_initializers(
+    program: &oxc_ast::ast::Program<'_>,
+) -> HashMap<SymbolId, VarNumberInitializer> {
+    let mut collector = VarNumberInitializerCollector::default();
+    collector.visit_program(program);
+    collector.candidates
+}
+
 fn expression_integer(expr: &Expression<'_>) -> Option<i64> {
     let Value::Number(number) = eval(expr)? else {
         return None;
@@ -359,6 +415,7 @@ struct Collector<'s, 'c> {
     selector_dispatchers: &'c HashMap<SymbolId, SelectorDispatcher>,
     dispatch_orders: &'c HashMap<SymbolId, Vec<String>>,
     zero_counters: &'c HashSet<SymbolId>,
+    var_number_initializers: &'c HashMap<SymbolId, VarNumberInitializer>,
     reference_spans: &'c HashMap<ReferenceId, Span>,
     protected_spans: &'c [(usize, usize)],
     replacements: Vec<Replacement>,
@@ -1043,6 +1100,7 @@ fn transform_once(
             .map(|table| (table.construction_start, table.construction_end)),
     );
     let stable_var_numbers = collect_stable_var_numbers(&program, scoping);
+    let var_number_initializers = collect_var_number_initializers(&program);
     let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
     let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
     initial_replacements.extend(remove_unused_proven_helpers(
@@ -1066,6 +1124,7 @@ fn transform_once(
         selector_dispatchers: &selector_dispatchers,
         dispatch_orders: &dispatch_orders,
         zero_counters: &zero_counters,
+        var_number_initializers: &var_number_initializers,
         reference_spans: &reference_spans,
         protected_spans: &protected_spans,
         replacements: initial_replacements,

@@ -9,7 +9,10 @@ use crate::{
         detect_array_handler_table, detect_direct_switch, detect_object_handler_table,
         DirectSwitchMapCandidate, HandlerTableCandidate,
     },
-    embedded::{detect_function_constructor, detect_literal_string_join, EmbeddedCodeCandidate},
+    embedded::{
+        detect_function_constructor, detect_literal_string_join, detect_packer_eval,
+        EmbeddedCodeCandidate,
+    },
     function_analysis::{
         evidence_reaches_computed, expression_evidence, FunctionMetrics, FunctionState,
     },
@@ -383,6 +386,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
 
     fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
         self.record_push_builder(call);
+        if let Some(candidate) = detect_packer_eval(call) {
+            self.embedded_code.push(candidate);
+        }
         if let Some(candidate) = detect_literal_string_join(call) {
             self.embedded_code.push(candidate);
         }

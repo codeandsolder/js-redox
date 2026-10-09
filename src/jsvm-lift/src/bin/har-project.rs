@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use base64::Engine;
 use clap::Parser as ClapParser;
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,10 @@ struct HarEntry {
     time: f64,
     request: HarRequest,
     response: HarResponse,
+    #[serde(default, rename = "_resourceType")]
+    resource_type: Option<String>,
+    #[serde(default, rename = "_failure")]
+    failure: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +81,17 @@ struct HarResponse {
     #[serde(default)]
     headers: Vec<NameValue>,
     content: HarContent,
+    #[serde(default, rename = "_jsRedoxBody")]
+    js_redox_body: Option<JsRedoxBodyRef>,
+    #[serde(default, rename = "_jsRedoxBodyCapture")]
+    js_redox_body_capture: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsRedoxBodyRef {
+    path: String,
+    sha256: String,
+    size: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,12 +147,19 @@ struct ResourceMeta {
     status: i64,
     status_text: String,
     mime_type: String,
+    resource_type: Option<String>,
     declared_size: i64,
     encoding: Option<String>,
     body_present: bool,
+    body_complete: bool,
     body_bytes: usize,
     sha256: Option<String>,
+    transport_kind: String,
     kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_failure: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_capture: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_path: Option<String>,
     reused_body: bool,
@@ -334,7 +356,41 @@ fn output_path_for(url: &str, kind: &str, mime: &str) -> String {
     path
 }
 
-fn decode_body(content: &HarContent) -> Result<Option<Vec<u8>>> {
+fn decode_body(
+    content: &HarContent,
+    recorder_body: Option<&JsRedoxBodyRef>,
+    har_root: &Path,
+) -> Result<Option<Vec<u8>>> {
+    if let Some(reference) = recorder_body {
+        let root = fs::canonicalize(har_root)
+            .with_context(|| format!("canonicalizing HAR root {}", har_root.display()))?;
+        let path = fs::canonicalize(har_root.join(&reference.path)).with_context(|| {
+            format!(
+                "resolving recorder body {}",
+                har_root.join(&reference.path).display()
+            )
+        })?;
+        ensure!(
+            path.starts_with(&root),
+            "recorder body escapes HAR root: {}",
+            reference.path
+        );
+        let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        ensure!(
+            bytes.len() == reference.size,
+            "recorder body size mismatch for {}: manifest={} actual={}",
+            reference.path,
+            reference.size,
+            bytes.len()
+        );
+        ensure!(
+            sha256_hex(&bytes) == reference.sha256,
+            "recorder body SHA-256 mismatch for {}",
+            reference.path
+        );
+        return Ok(Some(bytes));
+    }
+
     let Some(text) = content.text.as_ref() else {
         return Ok(None);
     };
@@ -347,6 +403,86 @@ fn decode_body(content: &HarContent) -> Result<Option<Vec<u8>>> {
     } else {
         Ok(Some(text.as_bytes().to_vec()))
     }
+}
+
+fn trim_transport_prefix(text: &str) -> (&str, bool) {
+    let mut text = text.trim_start_matches(|c: char| c == '\u{feff}' || c.is_ascii_whitespace());
+    for prefix in ["for (;;);", "for(;;);", "while (1);", "while(1);", ")]}'"] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            return (text, true);
+        }
+    }
+    (text, false)
+}
+
+fn looks_like_plain_text_error(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty()
+        || text.len() > 512
+        || !text
+            .chars()
+            .all(|c| !c.is_control() || c.is_ascii_whitespace())
+    {
+        return false;
+    }
+    if (16..=128).contains(&text.len()) && text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return true;
+    }
+    let has_js_structure = text
+        .bytes()
+        .any(|byte| matches!(byte, b'{' | b'}' | b'[' | b']' | b'(' | b')' | b';' | b'='));
+    !has_js_structure && text.split_ascii_whitespace().count() >= 2
+}
+
+fn refine_resource_kind(
+    transport_kind: &str,
+    resource_type: Option<&str>,
+    mime: &str,
+    body: &[u8],
+) -> String {
+    if transport_kind != "javascript" {
+        return transport_kind.to_string();
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return transport_kind.to_string();
+    };
+    let (candidate, had_xssi_prefix) = trim_transport_prefix(text);
+    let lower_prefix = candidate
+        .chars()
+        .take(256)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if lower_prefix.starts_with("<!doctype")
+        || lower_prefix.starts_with("<html")
+        || lower_prefix.starts_with("<head")
+        || lower_prefix.starts_with("<body")
+        || lower_prefix.starts_with("<script")
+    {
+        return "html".into();
+    }
+    if lower_prefix.starts_with("<?xml") || lower_prefix.starts_with("<svg") {
+        return "text".into();
+    }
+    if (had_xssi_prefix || matches!(candidate.as_bytes().first(), Some(b'{') | Some(b'[')))
+        && serde_json::from_str::<serde_json::Value>(candidate).is_ok()
+    {
+        return "json".into();
+    }
+    if matches!(
+        resource_type.map(str::to_ascii_lowercase).as_deref(),
+        Some("xhr" | "fetch" | "ping" | "eventsource")
+    ) {
+        return "text".into();
+    }
+    if mime_base(mime).eq_ignore_ascii_case("text/plain") && looks_like_plain_text_error(candidate)
+    {
+        return "text".into();
+    }
+    if looks_like_plain_text_error(candidate) {
+        return "text".into();
+    }
+    transport_kind.to_string()
 }
 
 fn format_json_if_possible(bytes: &[u8]) -> Vec<u8> {
@@ -799,28 +935,44 @@ fn materialize_inline_scripts(
 fn materialize_entry(
     id: usize,
     entry: &HarEntry,
+    har_root: &Path,
     output_root: &Path,
     seen: &mut HashMap<String, String>,
     counts: &mut BTreeMap<String, usize>,
     inline_scripts: &mut Vec<InlineScriptMeta>,
 ) -> Result<ResourceMeta> {
-    let kind = resource_kind(&entry.request.url, &entry.response.content.mime_type).to_string();
-    *counts.entry(format!("resource_{kind}")).or_insert(0) += 1;
-    let body = decode_body(&entry.response.content)
-        .with_context(|| format!("entry {id}: {}", entry.request.url))?;
+    let transport_kind =
+        resource_kind(&entry.request.url, &entry.response.content.mime_type).to_string();
+    let body = decode_body(
+        &entry.response.content,
+        entry.response.js_redox_body.as_ref(),
+        har_root,
+    )
+    .with_context(|| format!("entry {id}: {}", entry.request.url))?;
+    let body_present = body.is_some();
+    let body_complete = entry.failure.is_none();
+    let mut kind = transport_kind.clone();
     let mut output_path = None;
     let mut body_bytes = 0;
     let mut sha256 = None;
     let mut reused_body = false;
     let mut references = Vec::new();
 
-    if let Some(mut body) = body {
+    if let Some(body) = body {
         body_bytes = body.len();
         sha256 = Some(sha256_hex(&body));
-        if kind == "json" {
-            body = format_json_if_possible(&body);
+        kind = refine_resource_kind(
+            &transport_kind,
+            entry.resource_type.as_deref(),
+            &entry.response.content.mime_type,
+            &body,
+        );
+        if kind != transport_kind {
+            *counts
+                .entry("resources_content_reclassified".into())
+                .or_insert(0) += 1;
         }
-        if kind == "javascript" {
+        if kind == "javascript" && body_complete {
             if let Ok(source) = std::str::from_utf8(&body) {
                 references.extend(source_refs(source, &entry.request.url));
             }
@@ -829,7 +981,7 @@ fn materialize_entry(
         let (written, reused) = write_resource(output_root, desired, &body, seen)?;
         output_path = Some(written.clone());
         reused_body = reused;
-        if kind == "html" {
+        if kind == "html" && body_complete {
             if let Ok(html) = std::str::from_utf8(&body) {
                 materialize_inline_scripts(
                     id,
@@ -847,6 +999,10 @@ fn materialize_entry(
     } else {
         *counts.entry("resources_without_body".into()).or_insert(0) += 1;
     }
+    *counts.entry(format!("resource_{kind}")).or_insert(0) += 1;
+    if !body_complete {
+        *counts.entry("resources_incomplete".into()).or_insert(0) += 1;
+    }
 
     Ok(ResourceMeta {
         id,
@@ -858,12 +1014,17 @@ fn materialize_entry(
         status: entry.response.status,
         status_text: entry.response.status_text.clone(),
         mime_type: entry.response.content.mime_type.clone(),
+        resource_type: entry.resource_type.clone(),
         declared_size: entry.response.content.size,
         encoding: entry.response.content.encoding.clone(),
-        body_present: entry.response.content.text.is_some(),
+        body_present,
+        body_complete,
         body_bytes,
         sha256,
+        transport_kind,
         kind,
+        network_failure: entry.failure.clone(),
+        body_capture: entry.response.js_redox_body_capture.clone(),
         output_path,
         reused_body,
         request_headers: headers(&entry.request.headers),
@@ -883,10 +1044,12 @@ fn build_manifest(
     let mut counts = BTreeMap::new();
     let mut inline_scripts = Vec::new();
     let mut resources = Vec::with_capacity(har.log.entries.len());
+    let har_root = args.har.parent().unwrap_or_else(|| Path::new("."));
     for (id, entry) in har.log.entries.iter().enumerate() {
         resources.push(materialize_entry(
             id,
             entry,
+            har_root,
             &args.output,
             &mut seen,
             &mut counts,

@@ -122,6 +122,11 @@ CASES = [
         ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state.js",
         ['out += "A"', 'out += "B"', 'out += "C"', 'out += "D"'],
     ),
+    (
+        "arithmetic-state-external",
+        ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-external.js",
+        ['out += "A"', 'out += "B"'],
+    ),
 ]
 
 
@@ -255,6 +260,15 @@ def main():
                 assert proof["state_var"] == "state", proof
                 assert proof["state_path"] == ["6", "1", "16", "0"], proof
                 assert proof["termination"] == "undefined", proof
+                assert 0 <= proof["input_start"] < proof["input_end"], proof
+            if name == "arithmetic-state-external":
+                assert meta["transforms"].get("arithmetic_state_unflatten", 0) >= 1, meta
+                proofs = meta["arithmetic_state_proofs"]
+                assert len(proofs) == 1, proofs
+                proof = proofs[0]
+                assert proof["state_var"] == "state", proof
+                assert proof["state_path"] == ["2", "4"], proof
+                assert proof["termination"] == "loop_test", proof
                 assert 0 <= proof["input_start"] < proof["input_end"], proof
             assert meta["safe_static_only"] is True
             assert meta["changed"] is True
@@ -507,6 +521,22 @@ def main():
         assert arithmetic_safety_meta["transforms"].get("arithmetic_state_unflatten", 0) == 0, arithmetic_safety_meta
         assert arithmetic_safety_meta["arithmetic_state_proofs"] == [], arithmetic_safety_meta
         print("arithmetic-state-safety", arithmetic_safety_meta["transforms"])
+
+        arithmetic_external_safety_source = ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-external-safety.js"
+        arithmetic_external_safety_out = td / "arithmetic-state-external-safety.js"
+        arithmetic_external_safety_report = td / "arithmetic-state-external-safety.json"
+        before = node_stdout(arithmetic_external_safety_source)
+        cp = subprocess.run(
+            [str(BIN), str(arithmetic_external_safety_source), str(arithmetic_external_safety_out), "--report", str(arithmetic_external_safety_report)],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(f"external arithmetic-state safety deobfuscation failed:\n{cp.stdout}\n{cp.stderr}")
+        assert node_stdout(arithmetic_external_safety_out) == before
+        arithmetic_external_safety_meta = json.loads(arithmetic_external_safety_report.read_text())
+        assert arithmetic_external_safety_meta["transforms"].get("arithmetic_state_unflatten", 0) == 0, arithmetic_external_safety_meta
+        assert arithmetic_external_safety_meta["arithmetic_state_proofs"] == [], arithmetic_external_safety_meta
+        print("arithmetic-state-external-safety", arithmetic_external_safety_meta["transforms"])
 
         arithmetic_iife_safety_source = ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-iife-safety.js"
         arithmetic_iife_safety_out = td / "arithmetic-state-iife-safety.js"

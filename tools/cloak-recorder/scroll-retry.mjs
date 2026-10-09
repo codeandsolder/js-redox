@@ -1,5 +1,15 @@
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+export function isTerminalTargetClosedError(error) {
+  const message = String(error?.message || error);
+  return (
+    message.includes("Target page, context or browser has been closed") ||
+    message.includes("Target closed") ||
+    message.includes("Page closed") ||
+    message.includes("Browser has been closed")
+  );
+}
+
 export function isTransientScrollNavigationError(error) {
   const message = String(error?.message || error);
   return (
