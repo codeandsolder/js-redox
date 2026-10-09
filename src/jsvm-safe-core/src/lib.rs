@@ -49,6 +49,10 @@ pub struct ArithmeticStateProof {
     pub state_var: String,
     pub state_path: Vec<String>,
     pub termination: String,
+    pub register_reads_rewritten: usize,
+    pub branch_test: Option<String>,
+    pub branch_paths: Vec<Vec<String>>,
+    pub branch_terminations: Vec<String>,
 }
 
 fn fragment(source: &str, span: Span) -> &str {
