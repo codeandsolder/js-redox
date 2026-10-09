@@ -53,6 +53,20 @@ struct ArithmeticStateProofReport {
 }
 
 #[derive(Serialize)]
+struct StaticAliasInstallerCallReport {
+    start: u32,
+    end: u32,
+    installer: String,
+    resolver: String,
+    resolver_member: Option<String>,
+    source_property: String,
+    target_selector: u8,
+    target_hint: Option<String>,
+    alias_property: String,
+    semantics_proven: bool,
+}
+
+#[derive(Serialize)]
 struct Report {
     schema: &'static str,
     input: String,
@@ -62,6 +76,8 @@ struct Report {
     iterations: usize,
     transforms: BTreeMap<String, usize>,
     arithmetic_state_proofs: Vec<ArithmeticStateProofReport>,
+    analysis_source_sha256: String,
+    static_alias_installer_calls: Vec<StaticAliasInstallerCallReport>,
     safe_static_only: bool,
     presentation_formatted: bool,
     runtime_semantics_preserved_by_design: bool,
@@ -95,6 +111,31 @@ fn main() -> Result<()> {
         })
         .collect::<Vec<_>>();
     let iterations = result.iterations;
+    let analysis_source_sha256 = sha256(result.source.as_bytes());
+    let static_alias_installer_calls =
+        jsvm_lift::forwarding_alias::static_alias_installer_calls(&result.source)
+            .into_iter()
+            .map(|call| {
+                let target_hint = match (&call.resolver_member, call.target_selector) {
+                    (Some(member), 0) => Some(member.clone()),
+                    (Some(member), 1) => Some(format!("{member}.prototype")),
+                    (None, _) => None,
+                    _ => None,
+                };
+                StaticAliasInstallerCallReport {
+                    start: call.start,
+                    end: call.end,
+                    installer: call.installer,
+                    resolver: call.resolver,
+                    resolver_member: call.resolver_member,
+                    source_property: call.source_property,
+                    target_selector: call.target_selector,
+                    target_hint,
+                    alias_property: call.alias_property,
+                    semantics_proven: call.semantics_proven,
+                }
+            })
+            .collect::<Vec<_>>();
 
     let mut transforms = result.transforms;
     let source = if args.format_output {
@@ -115,7 +156,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("writing {}", args.output.display()))?;
 
     let report = Report {
-        schema: "js-safe-deobfuscate/v0",
+        schema: "js-safe-deobfuscate/v1",
         input: args.input.display().to_string(),
         input_sha256: sha256(original.as_bytes()),
         output_sha256: sha256(source.as_bytes()),
@@ -123,6 +164,8 @@ fn main() -> Result<()> {
         iterations,
         transforms,
         arithmetic_state_proofs,
+        analysis_source_sha256,
+        static_alias_installer_calls,
         safe_static_only: true,
         presentation_formatted: args.format_output,
         runtime_semantics_preserved_by_design: !args.format_output,

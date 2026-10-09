@@ -142,6 +142,11 @@ CASES = [
         ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-conditional.js",
         ['if (choose(flag))', 'out += "T"', 'out += "F"', 'out += "!"'],
     ),
+    (
+        "static-alias-installer-calls",
+        ROOT / "corpus/generated/reversible-obfuscation/static-alias-installer-calls.js",
+        ['install(getArray, "push", 1, "f2AA")', 'install(identity, "__residual", 0, "i2AA")'],
+    ),
 ]
 
 
@@ -210,10 +215,11 @@ def main():
                 assert compact_needle in compact_text, (name, needle, text[:2000])
 
             meta = json.loads(report.read_text())
-            assert meta["schema"] == "js-safe-deobfuscate/v0"
+            assert meta["schema"] == "js-safe-deobfuscate/v1"
             assert meta["safe_static_only"] is True
             assert meta["presentation_formatted"] is False
             assert meta["runtime_semantics_preserved_by_design"] is True
+            assert meta["analysis_source_sha256"] == meta["output_sha256"], meta
             if name in {
                 "rotated-base64-string-array",
                 "direct-rotated-string-array",
@@ -304,8 +310,26 @@ def main():
                 assert proof["branch_test"] == "choose(flag)", proof
                 assert proof["branch_paths"] == [["3"], ["5", "7"]], proof
                 assert proof["branch_terminations"] == ["loop_test", "loop_test"], proof
+            if name == "static-alias-installer-calls":
+                calls = meta["static_alias_installer_calls"]
+                assert len(calls) == 2, calls
+                assert calls[0]["installer"] == "install", calls
+                assert calls[0]["resolver"] == "getArray", calls
+                assert calls[0]["resolver_member"] == "Array", calls
+                assert calls[0]["source_property"] == "push", calls
+                assert calls[0]["target_selector"] == 1, calls
+                assert calls[0]["target_hint"] == "Array.prototype", calls
+                assert calls[0]["alias_property"] == "f2AA", calls
+                assert calls[0]["semantics_proven"] is False, calls
+                assert calls[1]["resolver"] == "identity", calls
+                assert calls[1]["resolver_member"] is None, calls
+                assert calls[1]["target_hint"] is None, calls
+                assert meta["analysis_source_sha256"] == meta["output_sha256"], meta
             assert meta["safe_static_only"] is True
-            assert meta["changed"] is True
+            if name == "static-alias-installer-calls":
+                assert meta["changed"] is False, meta
+            else:
+                assert meta["changed"] is True
             for kind, count in meta["transforms"].items():
                 totals[kind] = totals.get(kind, 0) + count
             print(name, meta["transforms"])
@@ -331,6 +355,34 @@ def main():
         assert totals.get("reference_state_unflatten", 0) >= 1, totals
         assert totals.get("ordered_switch_unflatten", 0) >= 1, totals
         assert totals.get("arithmetic_state_unflatten", 0) >= 1, totals
+
+        alias_source = ROOT / "corpus/generated/reversible-obfuscation/static-alias-installer-calls.js"
+        alias_formatted_out = td / "static-alias-installer-calls-formatted.js"
+        alias_formatted_report = td / "static-alias-installer-calls-formatted.json"
+        cp = subprocess.run(
+            [
+                str(BIN),
+                str(alias_source),
+                str(alias_formatted_out),
+                "--report",
+                str(alias_formatted_report),
+                "--format-output",
+            ],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(
+                f"formatted alias evidence check failed:\n{cp.stdout}\n{cp.stderr}"
+            )
+        alias_formatted_meta = json.loads(alias_formatted_report.read_text())
+        assert alias_formatted_meta["presentation_formatted"] is True, alias_formatted_meta
+        assert alias_formatted_meta["analysis_source_sha256"] != alias_formatted_meta["output_sha256"], alias_formatted_meta
+        assert len(alias_formatted_meta["static_alias_installer_calls"]) == 2, alias_formatted_meta
+        print("static-alias-installer-calls-formatted", alias_formatted_meta["transforms"])
 
         classic_source = ROOT / "corpus/generated/reversible-obfuscation/classic-script-redeclaration.js"
         classic_out = td / "classic-script-redeclaration.js"
