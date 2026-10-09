@@ -20,6 +20,7 @@ pub struct StaticAliasInstallerCall {
     pub source_property: String,
     pub target_selector: u8,
     pub alias_property: String,
+    pub semantics_proven: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +346,7 @@ impl<'a> Visit<'a> for CallCollector<'_> {
                 source_property: source_property.value.to_string(),
                 target_selector,
                 alias_property: alias_property.value.to_string(),
+                semantics_proven: false,
             });
         }
         walk::walk_call_expression(self, it);

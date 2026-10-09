@@ -132,7 +132,7 @@ fn main() -> Result<()> {
                     target_selector: call.target_selector,
                     target_hint,
                     alias_property: call.alias_property,
-                    semantics_proven: false,
+                    semantics_proven: call.semantics_proven,
                 }
             })
             .collect::<Vec<_>>();
