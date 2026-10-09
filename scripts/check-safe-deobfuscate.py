@@ -122,6 +122,26 @@ CASES = [
         ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state.js",
         ['out += "A"', 'out += "B"', 'out += "C"', 'out += "D"'],
     ),
+    (
+        "arithmetic-state-external",
+        ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-external.js",
+        ['out += "A"', 'out += "B"'],
+    ),
+    (
+        "arithmetic-state-registers",
+        ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-registers.js",
+        ['out = "RegExp:test:1:t2AA"'],
+    ),
+    (
+        "arithmetic-state-try",
+        ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-try.js",
+        ['out += "A"', 'out += "C"', 'out += "B"'],
+    ),
+    (
+        "arithmetic-state-conditional",
+        ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-conditional.js",
+        ['if (choose(flag))', 'out += "T"', 'out += "F"', 'out += "!"'],
+    ),
 ]
 
 
@@ -256,6 +276,34 @@ def main():
                 assert proof["state_path"] == ["6", "1", "16", "0"], proof
                 assert proof["termination"] == "undefined", proof
                 assert 0 <= proof["input_start"] < proof["input_end"], proof
+            if name == "arithmetic-state-external":
+                assert meta["transforms"].get("arithmetic_state_unflatten", 0) >= 1, meta
+                proofs = meta["arithmetic_state_proofs"]
+                assert len(proofs) == 1, proofs
+                proof = proofs[0]
+                assert proof["state_var"] == "state", proof
+                assert proof["state_path"] == ["2", "4"], proof
+                assert proof["termination"] == "loop_test", proof
+                assert 0 <= proof["input_start"] < proof["input_end"], proof
+            if name == "arithmetic-state-registers":
+                assert meta["transforms"].get("arithmetic_state_unflatten", 0) >= 1, meta
+                assert 'regs[5] = "t"' in text, text
+                assert 'regs[5] += "2"' in text, text
+                assert 'regs[5] += "AA"' in text, text
+                assert 'out = "RegExp:test:1:t2AA"' in text, text
+                assert "return regs[0][0]" in text, text
+                assert meta["arithmetic_state_proofs"][0]["register_reads_rewritten"] >= 4, meta
+            if name == "arithmetic-state-conditional":
+                assert meta["transforms"].get("arithmetic_state_unflatten", 0) >= 1, meta
+                proofs = meta["arithmetic_state_proofs"]
+                assert len(proofs) == 1, proofs
+                proof = proofs[0]
+                assert proof["state_var"] == "state", proof
+                assert proof["state_path"] == ["2"], proof
+                assert proof["termination"] == "conditional", proof
+                assert proof["branch_test"] == "choose(flag)", proof
+                assert proof["branch_paths"] == [["3"], ["5", "7"]], proof
+                assert proof["branch_terminations"] == ["loop_test", "loop_test"], proof
             assert meta["safe_static_only"] is True
             assert meta["changed"] is True
             for kind, count in meta["transforms"].items():
@@ -504,9 +552,82 @@ def main():
             raise RuntimeError(f"arithmetic-state safety deobfuscation failed:\n{cp.stdout}\n{cp.stderr}")
         assert node_stdout(arithmetic_safety_out) == before
         arithmetic_safety_meta = json.loads(arithmetic_safety_report.read_text())
-        assert arithmetic_safety_meta["transforms"].get("arithmetic_state_unflatten", 0) == 0, arithmetic_safety_meta
-        assert arithmetic_safety_meta["arithmetic_state_proofs"] == [], arithmetic_safety_meta
-        print("arithmetic-state-safety", arithmetic_safety_meta["transforms"])
+        assert arithmetic_safety_meta["transforms"].get("arithmetic_state_unflatten", 0) == 1, arithmetic_safety_meta
+        arithmetic_safety_proofs = arithmetic_safety_meta["arithmetic_state_proofs"]
+        assert len(arithmetic_safety_proofs) == 1, arithmetic_safety_proofs
+        arithmetic_safety_proof = arithmetic_safety_proofs[0]
+        assert arithmetic_safety_proof["termination"] == "conditional", arithmetic_safety_proof
+        assert arithmetic_safety_proof["branch_test"] == "flag", arithmetic_safety_proof
+        assert arithmetic_safety_proof["branch_paths"] == [["0"], ["2"]], arithmetic_safety_proof
+        assert arithmetic_safety_proof["branch_terminations"] == ["undefined", "undefined"], arithmetic_safety_proof
+        print("arithmetic-state-legacy-conditional", arithmetic_safety_meta["transforms"])
+
+        arithmetic_external_safety_source = ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-external-safety.js"
+        arithmetic_external_safety_out = td / "arithmetic-state-external-safety.js"
+        arithmetic_external_safety_report = td / "arithmetic-state-external-safety.json"
+        before = node_stdout(arithmetic_external_safety_source)
+        cp = subprocess.run(
+            [str(BIN), str(arithmetic_external_safety_source), str(arithmetic_external_safety_out), "--report", str(arithmetic_external_safety_report)],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(f"external arithmetic-state safety deobfuscation failed:\n{cp.stdout}\n{cp.stderr}")
+        assert node_stdout(arithmetic_external_safety_out) == before
+        arithmetic_external_safety_meta = json.loads(arithmetic_external_safety_report.read_text())
+        assert arithmetic_external_safety_meta["transforms"].get("arithmetic_state_unflatten", 0) == 0, arithmetic_external_safety_meta
+        assert arithmetic_external_safety_meta["arithmetic_state_proofs"] == [], arithmetic_external_safety_meta
+        print("arithmetic-state-external-safety", arithmetic_external_safety_meta["transforms"])
+
+        arithmetic_register_safety_source = ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-registers-safety.js"
+        arithmetic_register_safety_out = td / "arithmetic-state-registers-safety.js"
+        arithmetic_register_safety_report = td / "arithmetic-state-registers-safety.json"
+        before = node_stdout(arithmetic_register_safety_source)
+        cp = subprocess.run(
+            [str(BIN), str(arithmetic_register_safety_source), str(arithmetic_register_safety_out), "--report", str(arithmetic_register_safety_report)],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(f"arithmetic-state register safety deobfuscation failed:\n{cp.stdout}\n{cp.stderr}")
+        assert node_stdout(arithmetic_register_safety_out) == before
+        arithmetic_register_safety_text = arithmetic_register_safety_out.read_text()
+        arithmetic_register_safety_meta = json.loads(arithmetic_register_safety_report.read_text())
+        assert arithmetic_register_safety_meta["transforms"].get("arithmetic_state_unflatten", 0) >= 1, arithmetic_register_safety_meta
+        assert "regs[1]" in arithmetic_register_safety_text, arithmetic_register_safety_text
+        assert 'out = "A"' not in arithmetic_register_safety_text, arithmetic_register_safety_text
+        assert arithmetic_register_safety_meta["arithmetic_state_proofs"][0]["register_reads_rewritten"] == 0, arithmetic_register_safety_meta
+        print("arithmetic-state-registers-safety", arithmetic_register_safety_meta["transforms"])
+
+        arithmetic_try_safety_source = ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-try-safety.js"
+        arithmetic_try_safety_out = td / "arithmetic-state-try-safety.js"
+        arithmetic_try_safety_report = td / "arithmetic-state-try-safety.json"
+        before = node_stdout(arithmetic_try_safety_source)
+        cp = subprocess.run(
+            [str(BIN), str(arithmetic_try_safety_source), str(arithmetic_try_safety_out), "--report", str(arithmetic_try_safety_report)],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(f"arithmetic-state try safety deobfuscation failed:\n{cp.stdout}\n{cp.stderr}")
+        assert node_stdout(arithmetic_try_safety_out) == before
+        arithmetic_try_safety_meta = json.loads(arithmetic_try_safety_report.read_text())
+        assert arithmetic_try_safety_meta["transforms"].get("arithmetic_state_unflatten", 0) == 0, arithmetic_try_safety_meta
+        assert arithmetic_try_safety_meta["arithmetic_state_proofs"] == [], arithmetic_try_safety_meta
+        print("arithmetic-state-try-safety", arithmetic_try_safety_meta["transforms"])
+
+        arithmetic_conditional_safety_source = ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-conditional-safety.js"
+        arithmetic_conditional_safety_out = td / "arithmetic-state-conditional-safety.js"
+        arithmetic_conditional_safety_report = td / "arithmetic-state-conditional-safety.json"
+        before = node_stdout(arithmetic_conditional_safety_source)
+        cp = subprocess.run(
+            [str(BIN), str(arithmetic_conditional_safety_source), str(arithmetic_conditional_safety_out), "--report", str(arithmetic_conditional_safety_report)],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+        if cp.returncode:
+            raise RuntimeError(f"arithmetic-state conditional safety deobfuscation failed:\n{cp.stdout}\n{cp.stderr}")
+        assert node_stdout(arithmetic_conditional_safety_out) == before
+        arithmetic_conditional_safety_meta = json.loads(arithmetic_conditional_safety_report.read_text())
+        assert arithmetic_conditional_safety_meta["transforms"].get("arithmetic_state_unflatten", 0) == 0, arithmetic_conditional_safety_meta
+        assert arithmetic_conditional_safety_meta["arithmetic_state_proofs"] == [], arithmetic_conditional_safety_meta
+        print("arithmetic-state-conditional-safety", arithmetic_conditional_safety_meta["transforms"])
 
         arithmetic_iife_safety_source = ROOT / "corpus/generated/reversible-obfuscation/arithmetic-state-iife-safety.js"
         arithmetic_iife_safety_out = td / "arithmetic-state-iife-safety.js"

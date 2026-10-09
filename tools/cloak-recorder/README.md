@@ -68,6 +68,8 @@ with capture success/failure. A response that Chromium explicitly aborts after h
 that is still in flight when the capture window ends, is reported separately from a completed
 response whose body was lost; only the latter makes the relevant-body completeness check fail.
 
+If the top page/context/browser target closes itself after acquisition has begun, the recorder emits a `salvaged: true` partial bundle instead of discarding already captured evidence. Network/CDP/runtime/HAR/failure artifacts are drained and written normally; unavailable final-page artifacts such as frame HTML, MHTML, screenshot or storage state are represented as missing/null and the terminal-close phase is retained in `salvageReason`. Non-target-close recorder errors still fail normally.
+
 ## Feed into js-redox
 
 ```bash

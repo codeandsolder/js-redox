@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
-import { evaluateDuringScroll, isTransientScrollNavigationError } from "./scroll-retry.mjs";
+import {
+  evaluateDuringScroll,
+  isTerminalTargetClosedError,
+  isTransientScrollNavigationError,
+} from "./scroll-retry.mjs";
 
 assert.equal(isTransientScrollNavigationError(new Error("Execution context was destroyed, most likely because of a navigation")), true);
 assert.equal(isTransientScrollNavigationError(new Error("ordinary failure")), false);
+assert.equal(isTerminalTargetClosedError(new Error("Target page, context or browser has been closed")), true);
+assert.equal(isTerminalTargetClosedError(new Error("ordinary failure")), false);
+assert.equal(isTransientScrollNavigationError(new Error("Target page, context or browser has been closed")), false);
 
 {
   let calls = 0;

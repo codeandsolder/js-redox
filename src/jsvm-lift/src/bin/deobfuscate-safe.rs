@@ -46,6 +46,10 @@ struct ArithmeticStateProofReport {
     state_var: String,
     state_path: Vec<String>,
     termination: String,
+    register_reads_rewritten: usize,
+    branch_test: Option<String>,
+    branch_paths: Vec<Vec<String>>,
+    branch_terminations: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -84,6 +88,10 @@ fn main() -> Result<()> {
             state_var: proof.state_var.clone(),
             state_path: proof.state_path.clone(),
             termination: proof.termination.clone(),
+            register_reads_rewritten: proof.register_reads_rewritten,
+            branch_test: proof.branch_test.clone(),
+            branch_paths: proof.branch_paths.clone(),
+            branch_terminations: proof.branch_terminations.clone(),
         })
         .collect::<Vec<_>>();
     let iterations = result.iterations;

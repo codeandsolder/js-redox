@@ -8,7 +8,7 @@
 
 use crate::numeric::exact_u32;
 use crate::value_eval::{
-    eval, eval_binary, eval_with_resolver, js_to_uint32, known_bool, same_value, Value,
+    eval, eval_binary, js_to_int32, js_to_uint32, known_bool, same_value, Value,
 };
 use crate::{
     array_element, direct_identifier_name, fragment, symbol_of, ArithmeticStateProof, Collector,
@@ -636,14 +636,106 @@ impl Collector<'_, '_> {
     }
 }
 
+const REGISTER_MARKER_PREFIX: &str = "\0register:";
+const REGISTER_SLOT_PREFIX: &str = "\0slot:";
+
+fn register_marker(name: &str) -> String {
+    format!("{REGISTER_MARKER_PREFIX}{name}")
+}
+
+fn register_slot(name: &str, index: u32) -> String {
+    format!("{REGISTER_SLOT_PREFIX}{name}:{index}")
+}
+
+fn register_active(env: &HashMap<String, Value>, name: &str) -> bool {
+    env.contains_key(&register_marker(name))
+}
+
 fn eval_with_env(expr: &Expression<'_>, env: &HashMap<String, Value>) -> Option<Value> {
-    eval_with_resolver(expr, &|id| {
-        if id.name.as_str() == "undefined" {
-            Some(Value::Undefined)
-        } else {
-            env.get(id.name.as_str()).cloned()
+    match expr {
+        Expression::Identifier(id) => {
+            if id.name.as_str() == "undefined" {
+                Some(Value::Undefined)
+            } else {
+                env.get(id.name.as_str()).cloned()
+            }
         }
-    })
+        Expression::StringLiteral(v) => Some(Value::String(v.value.to_string())),
+        Expression::NumericLiteral(v) => Some(Value::Number(v.value)),
+        Expression::BooleanLiteral(v) => Some(Value::Bool(v.value)),
+        Expression::NullLiteral(_) => Some(Value::Null),
+        Expression::TemplateLiteral(v) if v.expressions.is_empty() => v
+            .quasis
+            .first()
+            .map(|q| Value::String(q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string())),
+        Expression::ParenthesizedExpression(v) => eval_with_env(&v.expression, env),
+        Expression::ComputedMemberExpression(member) if !member.optional => {
+            let Expression::Identifier(object) = &member.object else {
+                return None;
+            };
+            if !register_active(env, object.name.as_str()) {
+                return None;
+            }
+            let index = eval_with_env(&member.expression, env)
+                .and_then(|value| value.number())
+                .and_then(exact_u32)?;
+            env.get(&register_slot(object.name.as_str(), index))
+                .cloned()
+        }
+        Expression::UnaryExpression(v) => {
+            let op = v.operator.as_str();
+            if op == "!" {
+                return eval_with_env(&v.argument, env).map(|value| Value::Bool(!value.truthy()));
+            }
+            if op == "void" {
+                eval_with_env(&v.argument, env)?;
+                return Some(Value::Undefined);
+            }
+            let value = eval_with_env(&v.argument, env)?;
+            match op {
+                "+" => value.number().map(Value::Number),
+                "-" => value.number().map(|number| Value::Number(-number)),
+                "~" => value
+                    .number()
+                    .map(|number| Value::Number(f64::from(!js_to_int32(number)))),
+                "typeof" => Some(Value::String(
+                    match value {
+                        Value::String(_) => "string",
+                        Value::Number(_) => "number",
+                        Value::Bool(_) => "boolean",
+                        Value::Null => "object",
+                        Value::Undefined => "undefined",
+                    }
+                    .to_string(),
+                )),
+                _ => None,
+            }
+        }
+        Expression::BinaryExpression(v) => eval_binary(
+            v.operator.as_str(),
+            eval_with_env(&v.left, env)?,
+            eval_with_env(&v.right, env)?,
+        ),
+        Expression::LogicalExpression(v) => {
+            let left = eval_with_env(&v.left, env)?;
+            match v.operator.as_str() {
+                "&&" if left.truthy() => eval_with_env(&v.right, env),
+                "&&" => Some(left),
+                "||" if left.truthy() => Some(left),
+                "||" => eval_with_env(&v.right, env),
+                "??" if matches!(left, Value::Null | Value::Undefined) => {
+                    eval_with_env(&v.right, env)
+                }
+                "??" => Some(left),
+                _ => None,
+            }
+        }
+        Expression::ConditionalExpression(v) => {
+            let test = eval_with_env(&v.test, env)?.truthy();
+            eval_with_env(if test { &v.consequent } else { &v.alternate }, env)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,6 +745,23 @@ enum StateFlow {
     Continue,
     Return,
     Throw,
+}
+
+#[derive(Debug)]
+enum ArithmeticCaseOutcome {
+    Flow(StateFlow),
+    Conditional {
+        test: String,
+        consequent: f64,
+        alternate: f64,
+    },
+}
+
+struct ArithmeticBranchResult {
+    chunks: Vec<String>,
+    state_path: Vec<String>,
+    termination: String,
+    register_reads_rewritten: usize,
 }
 
 #[derive(Default)]
@@ -681,20 +790,65 @@ fn statement_mentions(stmt: &Statement<'_>, name: &str) -> bool {
 #[derive(Default)]
 struct LoopControlDetector {
     found: bool,
+    break_depth: usize,
+    continue_depth: usize,
+}
+
+impl LoopControlDetector {
+    fn walk_loop(&mut self, walk: impl FnOnce(&mut Self)) {
+        self.break_depth += 1;
+        self.continue_depth += 1;
+        walk(self);
+        self.continue_depth -= 1;
+        self.break_depth -= 1;
+    }
 }
 
 impl<'a> Visit<'a> for LoopControlDetector {
-    fn visit_break_statement(&mut self, _it: &oxc_ast::ast::BreakStatement<'a>) {
-        self.found = true;
+    fn visit_break_statement(&mut self, it: &oxc_ast::ast::BreakStatement<'a>) {
+        if it.label.is_some() || self.break_depth == 0 {
+            self.found = true;
+        }
     }
 
-    fn visit_continue_statement(&mut self, _it: &oxc_ast::ast::ContinueStatement<'a>) {
-        self.found = true;
+    fn visit_continue_statement(&mut self, it: &oxc_ast::ast::ContinueStatement<'a>) {
+        if it.label.is_some() || self.continue_depth == 0 {
+            self.found = true;
+        }
+    }
+
+    fn visit_switch_statement(&mut self, it: &oxc_ast::ast::SwitchStatement<'a>) {
+        self.break_depth += 1;
+        walk::walk_switch_statement(self, it);
+        self.break_depth -= 1;
+    }
+
+    fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
+        self.walk_loop(|this| walk::walk_for_statement(this, it));
+    }
+
+    fn visit_while_statement(&mut self, it: &oxc_ast::ast::WhileStatement<'a>) {
+        self.walk_loop(|this| walk::walk_while_statement(this, it));
+    }
+
+    fn visit_do_while_statement(&mut self, it: &oxc_ast::ast::DoWhileStatement<'a>) {
+        self.walk_loop(|this| walk::walk_do_while_statement(this, it));
+    }
+
+    fn visit_for_in_statement(&mut self, it: &oxc_ast::ast::ForInStatement<'a>) {
+        self.walk_loop(|this| walk::walk_for_in_statement(this, it));
+    }
+
+    fn visit_for_of_statement(&mut self, it: &oxc_ast::ast::ForOfStatement<'a>) {
+        self.walk_loop(|this| walk::walk_for_of_statement(this, it));
     }
 
     fn visit_function(&mut self, _it: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
-        // A nested function's control flow cannot target the surrounding
-        // dispatcher loop, so do not descend into it.
+        // Nested function control flow cannot target the surrounding statement.
+    }
+
+    fn visit_arrow_function_expression(&mut self, _it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+        // Nested function control flow cannot target the surrounding statement.
     }
 }
 
@@ -711,6 +865,50 @@ fn direct_assignment_name<'a>(target: &'a oxc_ast::ast::AssignmentTarget<'a>) ->
     }
 }
 
+fn computed_register_slot(
+    member: &oxc_ast::ast::ComputedMemberExpression<'_>,
+    env: &HashMap<String, Value>,
+) -> Option<(String, u32)> {
+    if member.optional {
+        return None;
+    }
+    let Expression::Identifier(object) = &member.object else {
+        return None;
+    };
+    if !register_active(env, object.name.as_str()) {
+        return None;
+    }
+    let index = eval_with_env(&member.expression, env)
+        .and_then(|value| value.number())
+        .and_then(exact_u32)?;
+    Some((object.name.to_string(), index))
+}
+
+fn direct_assignment_slot(
+    target: &oxc_ast::ast::AssignmentTarget<'_>,
+    env: &HashMap<String, Value>,
+) -> Option<(String, u32)> {
+    let oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(member) = target else {
+        return None;
+    };
+    computed_register_slot(member, env)
+}
+
+fn direct_update_slot(
+    target: &oxc_ast::ast::SimpleAssignmentTarget<'_>,
+    env: &HashMap<String, Value>,
+) -> Option<(String, u32)> {
+    let oxc_ast::ast::SimpleAssignmentTarget::ComputedMemberExpression(member) = target else {
+        return None;
+    };
+    computed_register_slot(member, env)
+}
+
+fn clear_register_slots(env: &mut HashMap<String, Value>, name: &str) {
+    let prefix = format!("{REGISTER_SLOT_PREFIX}{name}:");
+    env.retain(|key, _| !key.starts_with(&prefix));
+}
+
 fn direct_update_name<'a>(target: &'a oxc_ast::ast::SimpleAssignmentTarget<'a>) -> Option<&'a str> {
     match target {
         oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
@@ -721,6 +919,20 @@ fn direct_update_name<'a>(target: &'a oxc_ast::ast::SimpleAssignmentTarget<'a>) 
 }
 
 fn invalidate_non_state(env: &mut HashMap<String, Value>, state_var: &str) {
+    let retained = env
+        .iter()
+        .filter(|(key, _)| {
+            key.as_str() == state_var
+                || key.starts_with(REGISTER_MARKER_PREFIX)
+                || key.starts_with(REGISTER_SLOT_PREFIX)
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    env.clear();
+    env.extend(retained);
+}
+
+fn invalidate_opaque_state(env: &mut HashMap<String, Value>, state_var: &str) {
     let state = env.get(state_var).cloned();
     env.clear();
     if let Some(state) = state {
@@ -805,14 +1017,15 @@ fn simulate_expression(
     expr: &Expression<'_>,
     state_var: &str,
     env: &mut HashMap<String, Value>,
+    register_arrays: &HashSet<String>,
 ) -> Option<StateFlow> {
     match expr {
         Expression::ParenthesizedExpression(p) => {
-            simulate_expression(&p.expression, state_var, env)
+            simulate_expression(&p.expression, state_var, env, register_arrays)
         }
         Expression::SequenceExpression(seq) => {
             for item in &seq.expressions {
-                let flow = simulate_expression(item, state_var, env)?;
+                let flow = simulate_expression(item, state_var, env, register_arrays)?;
                 if flow != StateFlow::Normal {
                     return Some(flow);
                 }
@@ -820,6 +1033,11 @@ fn simulate_expression(
             Some(StateFlow::Normal)
         }
         Expression::AssignmentExpression(assign) => {
+            if let Some((name, index)) = direct_assignment_slot(&assign.left, env) {
+                let slot = register_slot(&name, index);
+                apply_known_assignment(assign.operator.as_str(), &slot, &assign.right, env);
+                return Some(StateFlow::Normal);
+            }
             if let Some(name) = direct_assignment_name(&assign.left) {
                 let known =
                     apply_known_assignment(assign.operator.as_str(), name, &assign.right, env);
@@ -835,6 +1053,20 @@ fn simulate_expression(
             Some(StateFlow::Normal)
         }
         Expression::UpdateExpression(update) => {
+            if let Some((name, index)) = direct_update_slot(&update.argument, env) {
+                let slot = register_slot(&name, index);
+                let Some(Value::Number(current)) = env.get(&slot).cloned() else {
+                    env.remove(&slot);
+                    return Some(StateFlow::Normal);
+                };
+                let next = match update.operator.as_str() {
+                    "++" => current + 1.0,
+                    "--" => current - 1.0,
+                    _ => return None,
+                };
+                env.insert(slot, Value::Number(next));
+                return Some(StateFlow::Normal);
+            }
             let Some(name) = direct_update_name(&update.argument) else {
                 if expression_mentions(expr, state_var) {
                     return None;
@@ -857,6 +1089,19 @@ fn simulate_expression(
             env.insert(name.to_string(), Value::Number(next));
             Some(StateFlow::Normal)
         }
+        Expression::UnaryExpression(unary) if unary.operator.as_str() == "delete" => {
+            if let Expression::ComputedMemberExpression(member) = &unary.argument {
+                if let Some((name, index)) = computed_register_slot(member, env) {
+                    env.remove(&register_slot(&name, index));
+                    return Some(StateFlow::Normal);
+                }
+            }
+            if expression_mentions(expr, state_var) {
+                return None;
+            }
+            invalidate_non_state(env, state_var);
+            Some(StateFlow::Normal)
+        }
         _ => {
             if let Some(body) = iife_body(expr) {
                 // Name-only abstract environments cannot safely model function-local
@@ -868,7 +1113,8 @@ fn simulate_expression(
 
                 let outer_names = env.keys().cloned().collect::<Vec<_>>();
                 let mut nested = env.clone();
-                let flow = simulate_statements(&body.statements, state_var, &mut nested)?;
+                let flow =
+                    simulate_statements(&body.statements, state_var, &mut nested, register_arrays)?;
 
                 // An immediately invoked function can mutate free variables used by
                 // later state transitions. Propagate every already-known outer name,
@@ -920,11 +1166,12 @@ fn simulate_switch(
     switch: &oxc_ast::ast::SwitchStatement<'_>,
     state_var: &str,
     env: &mut HashMap<String, Value>,
+    register_arrays: &HashSet<String>,
 ) -> Option<StateFlow> {
     let start = select_switch_case(switch, env)?;
     for case in switch.cases.iter().skip(start) {
         for stmt in &case.consequent {
-            match simulate_statement(stmt, state_var, env)? {
+            match simulate_statement(stmt, state_var, env, register_arrays)? {
                 StateFlow::Normal => {}
                 StateFlow::Break => return Some(StateFlow::Normal),
                 flow => return Some(flow),
@@ -938,9 +1185,12 @@ fn simulate_statement(
     stmt: &Statement<'_>,
     state_var: &str,
     env: &mut HashMap<String, Value>,
+    register_arrays: &HashSet<String>,
 ) -> Option<StateFlow> {
     match stmt {
-        Statement::BlockStatement(block) => simulate_statements(&block.body, state_var, env),
+        Statement::BlockStatement(block) => {
+            simulate_statements(&block.body, state_var, env, register_arrays)
+        }
         Statement::VariableDeclaration(decl) => {
             if decl.kind != VariableDeclarationKind::Var {
                 return None;
@@ -955,24 +1205,44 @@ fn simulate_statement(
                     } else {
                         env.remove(id.name.as_str());
                     }
+                    if register_arrays.contains(id.name.as_str())
+                        && matches!(init, Expression::ArrayExpression(_))
+                    {
+                        clear_register_slots(env, id.name.as_str());
+                        env.insert(register_marker(id.name.as_str()), Value::Bool(true));
+                    }
                 } else {
                     env.insert(id.name.to_string(), Value::Undefined);
                 }
             }
             Some(StateFlow::Normal)
         }
-        Statement::ExpressionStatement(es) => simulate_expression(&es.expression, state_var, env),
+        Statement::ExpressionStatement(es) => {
+            simulate_expression(&es.expression, state_var, env, register_arrays)
+        }
         Statement::IfStatement(branch) => {
             let test = eval_with_env(&branch.test, env)?.truthy();
             if test {
-                simulate_statement(&branch.consequent, state_var, env)
+                simulate_statement(&branch.consequent, state_var, env, register_arrays)
             } else if let Some(alt) = &branch.alternate {
-                simulate_statement(alt, state_var, env)
+                simulate_statement(alt, state_var, env, register_arrays)
             } else {
                 Some(StateFlow::Normal)
             }
         }
-        Statement::SwitchStatement(switch) => simulate_switch(switch, state_var, env),
+        Statement::SwitchStatement(switch) => {
+            simulate_switch(switch, state_var, env, register_arrays)
+        }
+        Statement::TryStatement(_) => {
+            if statement_mentions(stmt, state_var) || statement_has_loop_control(stmt) {
+                return None;
+            }
+            // Preserve opaque exception behavior verbatim. The try/catch may mutate
+            // arbitrary non-state locals or register slots, so only the proven
+            // dispatcher state survives abstract interpretation across it.
+            invalidate_opaque_state(env, state_var);
+            Some(StateFlow::Normal)
+        }
         Statement::BreakStatement(brk) if brk.label.is_none() => Some(StateFlow::Break),
         Statement::ContinueStatement(cont) if cont.label.is_none() => Some(StateFlow::Continue),
         Statement::ReturnStatement(_) => Some(StateFlow::Return),
@@ -986,9 +1256,10 @@ fn simulate_statements(
     statements: &[Statement<'_>],
     state_var: &str,
     env: &mut HashMap<String, Value>,
+    register_arrays: &HashSet<String>,
 ) -> Option<StateFlow> {
     for stmt in statements {
-        let flow = simulate_statement(stmt, state_var, env)?;
+        let flow = simulate_statement(stmt, state_var, env, register_arrays)?;
         if flow != StateFlow::Normal {
             return Some(flow);
         }
@@ -1028,6 +1299,133 @@ fn resolved_refs_within(
         })
 }
 
+#[derive(Default)]
+struct RegisterArrayShapeCollector {
+    candidates: Vec<(SymbolId, String)>,
+    numeric_member_refs: HashSet<ReferenceId>,
+    function_depth: usize,
+}
+
+impl RegisterArrayShapeCollector {
+    fn record_numeric_member(&mut self, it: &oxc_ast::ast::ComputedMemberExpression<'_>) {
+        if it.optional
+            || eval(&it.expression)
+                .and_then(|value| value.number())
+                .and_then(exact_u32)
+                .is_none()
+        {
+            return;
+        }
+        let Expression::Identifier(object) = &it.object else {
+            return;
+        };
+        if let Some(reference_id) = object.reference_id.get() {
+            self.numeric_member_refs.insert(reference_id);
+        }
+    }
+}
+
+impl<'a> Visit<'a> for RegisterArrayShapeCollector {
+    fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
+        if self.function_depth == 0 && it.kind == VariableDeclarationKind::Var {
+            for declaration in &it.declarations {
+                let BindingPattern::BindingIdentifier(id) = &declaration.id else {
+                    continue;
+                };
+                let Some(Expression::ArrayExpression(_)) = &declaration.init else {
+                    continue;
+                };
+                let Some(symbol) = id.symbol_id.get() else {
+                    continue;
+                };
+                self.candidates.push((symbol, id.name.to_string()));
+            }
+        }
+        walk::walk_variable_declaration(self, it);
+    }
+
+    fn visit_computed_member_expression(
+        &mut self,
+        it: &oxc_ast::ast::ComputedMemberExpression<'a>,
+    ) {
+        self.record_numeric_member(it);
+        walk::walk_computed_member_expression(self, it);
+    }
+
+    fn visit_assignment_expression(&mut self, it: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if let oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(member) = &it.left {
+            self.record_numeric_member(member);
+        }
+        walk::walk_assignment_expression(self, it);
+    }
+
+    fn visit_update_expression(&mut self, it: &oxc_ast::ast::UpdateExpression<'a>) {
+        if let oxc_ast::ast::SimpleAssignmentTarget::ComputedMemberExpression(member) = &it.argument
+        {
+            self.record_numeric_member(member);
+        }
+        walk::walk_update_expression(self, it);
+    }
+
+    fn visit_function(&mut self, it: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        self.function_depth += 1;
+        walk::walk_function(self, it, flags);
+        self.function_depth -= 1;
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+        self.function_depth += 1;
+        walk::walk_arrow_function_expression(self, it);
+        self.function_depth -= 1;
+    }
+}
+
+struct KnownRegisterReadCollector<'c, 'e> {
+    scoping: &'c Scoping,
+    env: &'e HashMap<String, Value>,
+    replacements: Vec<(Span, String)>,
+}
+
+impl<'a> Visit<'a> for KnownRegisterReadCollector<'_, '_> {
+    fn visit_computed_member_expression(
+        &mut self,
+        it: &oxc_ast::ast::ComputedMemberExpression<'a>,
+    ) {
+        if !it.optional {
+            if let Expression::Identifier(object) = &it.object {
+                if let Some(reference_id) = object.reference_id.get() {
+                    let reference = self.scoping.get_reference(reference_id);
+                    if reference.is_read()
+                        && !reference.is_write()
+                        && !reference.flags().is_member_write_target()
+                        && register_active(self.env, object.name.as_str())
+                    {
+                        if let Some(index) = eval_with_env(&it.expression, self.env)
+                            .and_then(|value| value.number())
+                            .and_then(exact_u32)
+                        {
+                            if let Some(text) = self
+                                .env
+                                .get(&register_slot(object.name.as_str(), index))
+                                .and_then(Value::render)
+                            {
+                                self.replacements.push((it.span, text));
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_computed_member_expression(self, it);
+    }
+
+    fn visit_function(&mut self, _it: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(&mut self, _it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReferenceCaseFlow {
     Normal,
@@ -1051,9 +1449,12 @@ fn render_block(chunks: &[String]) -> String {
 struct ArithmeticStateSetup<'a> {
     state_var: String,
     initial_number: f64,
-    init_text: String,
+    init_text: Option<String>,
+    test: &'a Expression<'a>,
+    loop_termination: &'static str,
     selector_stmts: &'a [Statement<'a>],
     switch: &'a oxc_ast::ast::SwitchStatement<'a>,
+    register_arrays: HashSet<String>,
 }
 
 fn arithmetic_state_result(
@@ -1062,6 +1463,7 @@ fn arithmetic_state_result(
     state_path: Vec<String>,
     chunks: &[String],
     termination: &str,
+    register_reads_rewritten: usize,
 ) -> (String, ArithmeticStateProof) {
     (
         render_block(chunks),
@@ -1072,6 +1474,10 @@ fn arithmetic_state_result(
             state_var: state_var.to_string(),
             state_path,
             termination: termination.to_string(),
+            register_reads_rewritten,
+            branch_test: None,
+            branch_paths: Vec::new(),
+            branch_terminations: Vec::new(),
         },
     )
 }
@@ -1374,6 +1780,103 @@ impl Collector<'_, '_> {
         self.simulate_reference_state(switch, &cases, setup)
     }
 
+    fn external_arithmetic_state(
+        &self,
+        test: &Expression<'_>,
+        loop_span: Span,
+    ) -> Option<(String, f64)> {
+        let Expression::BinaryExpression(binary) = test else {
+            return None;
+        };
+        if !matches!(binary.operator.as_str(), "!=" | "!==") {
+            return None;
+        }
+
+        let (state_expr, terminal_expr) = match (
+            direct_identifier_name(&binary.left),
+            direct_identifier_name(&binary.right),
+        ) {
+            (Some(_), None) => (&binary.left, &binary.right),
+            (None, Some(_)) => (&binary.right, &binary.left),
+            _ => return None,
+        };
+        let state_var = direct_identifier_name(state_expr)?.to_string();
+        let state_symbol = symbol_of(self.scoping, state_expr)?;
+        let initializer = self.var_number_initializers.get(&state_symbol)?;
+        if initializer.available_after > loop_span.start
+            || !matches!(
+                eval(terminal_expr),
+                Some(Value::Number(number)) if number.is_finite() && number.fract() == 0.0
+            )
+            || !resolved_refs_within(self.scoping, self.reference_spans, state_symbol, loop_span)
+        {
+            return None;
+        }
+        Some((state_var, initializer.value))
+    }
+
+    fn confined_register_arrays(&self, it: &oxc_ast::ast::ForStatement<'_>) -> HashSet<String> {
+        let mut collector = RegisterArrayShapeCollector::default();
+        collector.visit_for_statement(it);
+        collector
+            .candidates
+            .into_iter()
+            .filter_map(|(symbol, name)| {
+                let binding_scope = self.scoping.symbol_scope_id(symbol);
+                let references = self.scoping.get_resolved_reference_ids(symbol);
+                (!references.is_empty()
+                    && references.iter().all(|reference_id| {
+                        collector.numeric_member_refs.contains(reference_id)
+                            && self.reference_spans.get(reference_id).is_some_and(|span| {
+                                it.span.start <= span.start && span.end <= it.span.end
+                            })
+                            && {
+                                let reference = self.scoping.get_reference(*reference_id);
+                                Self::same_function_or_descendant_block_scope(
+                                    self.scoping,
+                                    reference.scope_id(),
+                                    binding_scope,
+                                ) || (reference.is_read()
+                                    && !reference.is_write()
+                                    && !reference.flags().is_member_write_target())
+                            }
+                    }))
+                .then_some(name)
+            })
+            .collect()
+    }
+
+    fn render_statement_with_env(
+        &self,
+        stmt: &Statement<'_>,
+        env: &HashMap<String, Value>,
+    ) -> (String, usize) {
+        let span = stmt.span();
+        let mut text = fragment(self.source, span).to_string();
+        let mut collector = KnownRegisterReadCollector {
+            scoping: self.scoping,
+            env,
+            replacements: Vec::new(),
+        };
+        collector.visit_statement(stmt);
+        collector
+            .replacements
+            .sort_by_key(|(replacement_span, _)| std::cmp::Reverse(replacement_span.start));
+        let mut rewritten = 0;
+        for (replacement_span, replacement) in collector.replacements {
+            if replacement_span.start < span.start || replacement_span.end > span.end {
+                continue;
+            }
+            let start = (replacement_span.start - span.start) as usize;
+            let end = (replacement_span.end - span.start) as usize;
+            if text.is_char_boundary(start) && text.is_char_boundary(end) {
+                text.replace_range(start..end, &replacement);
+                rewritten += 1;
+            }
+        }
+        (text, rewritten)
+    }
+
     fn arithmetic_state_setup<'a>(
         &self,
         it: &'a oxc_ast::ast::ForStatement<'a>,
@@ -1381,55 +1884,110 @@ impl Collector<'_, '_> {
         if it.update.is_some() {
             return None;
         }
-        let oxc_ast::ast::ForStatementInit::VariableDeclaration(init_decl) = it.init.as_ref()?
-        else {
-            return None;
+        let test = it.test.as_ref()?;
+        let (state_var, initial_number, init_text, loop_termination) = match it.init.as_ref() {
+            Some(oxc_ast::ast::ForStatementInit::VariableDeclaration(init_decl)) => {
+                if init_decl.kind != VariableDeclarationKind::Var
+                    || init_decl.declarations.len() != 1
+                {
+                    return None;
+                }
+                let state_decl = &init_decl.declarations[0];
+                let BindingPattern::BindingIdentifier(state_id) = &state_decl.id else {
+                    return None;
+                };
+                let state_symbol = state_id.symbol_id.get()?;
+                let state_var = state_id.name.to_string();
+                let Value::Number(initial_number) = eval(state_decl.init.as_ref()?)? else {
+                    return None;
+                };
+                if !initial_number.is_finite()
+                    || initial_number.fract() != 0.0
+                    || !state_undefined_test(test, &state_var)
+                    || !resolved_refs_within(
+                        self.scoping,
+                        self.reference_spans,
+                        state_symbol,
+                        it.span,
+                    )
+                {
+                    return None;
+                }
+                (
+                    state_var,
+                    initial_number,
+                    Some(format!("{};", fragment(self.source, init_decl.span))),
+                    "undefined",
+                )
+            }
+            None => {
+                let (state_var, initial_number) = self.external_arithmetic_state(test, it.span)?;
+                (state_var, initial_number, None, "loop_test")
+            }
+            _ => return None,
         };
-        if init_decl.kind != VariableDeclarationKind::Var || init_decl.declarations.len() != 1 {
-            return None;
-        }
-        let state_decl = &init_decl.declarations[0];
-        let BindingPattern::BindingIdentifier(state_id) = &state_decl.id else {
-            return None;
-        };
-        let state_symbol = state_id.symbol_id.get()?;
-        let state_var = state_id.name.to_string();
-        let Value::Number(initial_number) = eval(state_decl.init.as_ref()?)? else {
-            return None;
-        };
-        if !initial_number.is_finite()
-            || initial_number.fract() != 0.0
-            || !state_undefined_test(it.test.as_ref()?, &state_var)
-            || !resolved_refs_within(self.scoping, self.reference_spans, state_symbol, it.span)
-        {
-            return None;
-        }
 
         let Statement::BlockStatement(body) = &it.body else {
             return None;
         };
-        if body.body.len() < 2 {
+        if body.body.is_empty() {
             return None;
         }
         let (switch_stmt, selector_stmts) = body.body.split_last()?;
         let Statement::SwitchStatement(switch) = switch_stmt else {
             return None;
         };
-        if selector_stmts.is_empty()
-            || !selector_stmts.iter().all(
-                |stmt| matches!(stmt, Statement::VariableDeclaration(decl) if decl.kind == VariableDeclarationKind::Var),
-            )
-        {
+        if !selector_stmts.iter().all(
+            |stmt| matches!(stmt, Statement::VariableDeclaration(decl) if decl.kind == VariableDeclarationKind::Var),
+        ) {
             return None;
         }
 
         Some(ArithmeticStateSetup {
             state_var,
             initial_number,
-            init_text: format!("{};", fragment(self.source, init_decl.span)),
+            init_text,
+            test,
+            loop_termination,
             selector_stmts,
             switch,
+            register_arrays: self.confined_register_arrays(it),
         })
+    }
+
+    fn conditional_state_split(
+        &self,
+        stmt: &Statement<'_>,
+        state_var: &str,
+    ) -> Option<(String, f64, f64)> {
+        let Statement::ExpressionStatement(expression_stmt) = stmt else {
+            return None;
+        };
+        let Expression::AssignmentExpression(assignment) = &expression_stmt.expression else {
+            return None;
+        };
+        if assignment.operator.as_str() != "="
+            || direct_assignment_name(&assignment.left) != Some(state_var)
+        {
+            return None;
+        }
+        let Expression::ConditionalExpression(conditional) = &assignment.right else {
+            return None;
+        };
+        let consequent = eval(&conditional.consequent)?.number()?;
+        let alternate = eval(&conditional.alternate)?.number()?;
+        if !consequent.is_finite()
+            || consequent.fract() != 0.0
+            || !alternate.is_finite()
+            || alternate.fract() != 0.0
+        {
+            return None;
+        }
+        Some((
+            fragment(self.source, conditional.test.span()).to_string(),
+            consequent,
+            alternate,
+        ))
     }
 
     fn simulate_arithmetic_case(
@@ -1439,10 +1997,12 @@ impl Collector<'_, '_> {
         state_var: &str,
         env: &mut HashMap<String, Value>,
         chunks: &mut Vec<String>,
-    ) -> Option<StateFlow> {
+        register_arrays: &HashSet<String>,
+    ) -> Option<(ArithmeticCaseOutcome, usize)> {
         let mut flow = StateFlow::Normal;
+        let mut register_reads_rewritten = 0;
         'cases: for case in switch.cases.iter().skip(start) {
-            for stmt in &case.consequent {
+            for (statement_index, stmt) in case.consequent.iter().enumerate() {
                 match stmt {
                     Statement::BreakStatement(brk) if brk.label.is_none() => {
                         break 'cases;
@@ -1452,8 +2012,32 @@ impl Collector<'_, '_> {
                         break 'cases;
                     }
                     _ => {
-                        let stmt_flow = simulate_statement(stmt, state_var, env)?;
-                        chunks.push(fragment(self.source, stmt.span()).to_string());
+                        if let Some((test, consequent, alternate)) =
+                            self.conditional_state_split(stmt, state_var)
+                        {
+                            let tail = &case.consequent[statement_index + 1..];
+                            if !tail.iter().all(|tail_stmt| {
+                                matches!(tail_stmt, Statement::BreakStatement(brk) if brk.label.is_none())
+                            }) {
+                                return None;
+                            }
+                            return Some((
+                                ArithmeticCaseOutcome::Conditional {
+                                    test,
+                                    consequent,
+                                    alternate,
+                                },
+                                register_reads_rewritten,
+                            ));
+                        }
+                        let (rendered, rewritten) = if matches!(stmt, Statement::TryStatement(_)) {
+                            (fragment(self.source, stmt.span()).to_string(), 0)
+                        } else {
+                            self.render_statement_with_env(stmt, env)
+                        };
+                        register_reads_rewritten += rewritten;
+                        let stmt_flow = simulate_statement(stmt, state_var, env, register_arrays)?;
+                        chunks.push(rendered);
                         match stmt_flow {
                             StateFlow::Normal => {}
                             StateFlow::Return | StateFlow::Throw => {
@@ -1466,7 +2050,102 @@ impl Collector<'_, '_> {
                 }
             }
         }
-        Some(flow)
+        Some((ArithmeticCaseOutcome::Flow(flow), register_reads_rewritten))
+    }
+
+    fn finish_arithmetic_branch(
+        &self,
+        setup: &ArithmeticStateSetup<'_>,
+        base_env: &HashMap<String, Value>,
+        target: f64,
+    ) -> Option<ArithmeticBranchResult> {
+        let target_text = Value::Number(target).render()?;
+        let mut env = base_env.clone();
+        // Evaluating an arbitrary runtime branch condition may call user code or
+        // mutate any previously known non-state value. The conditional assignment
+        // itself overwrites the dispatcher state afterwards, so retain no other
+        // abstract facts across that boundary.
+        invalidate_opaque_state(&mut env, &setup.state_var);
+        env.insert(setup.state_var.clone(), Value::Number(target));
+        let mut chunks = vec![format!("{} = {target_text};", setup.state_var)];
+        let mut state_path = Vec::new();
+        let mut seen_states = HashSet::new();
+        let mut register_reads_rewritten = 0;
+
+        for _ in 0..256 {
+            if !eval_with_env(setup.test, &env)?.truthy() {
+                return Some(ArithmeticBranchResult {
+                    chunks,
+                    state_path,
+                    termination: setup.loop_termination.to_string(),
+                    register_reads_rewritten,
+                });
+            }
+            let state_key = env.get(&setup.state_var)?.render()?;
+            if !seen_states.insert(state_key.clone()) {
+                return None;
+            }
+            state_path.push(state_key);
+
+            for selector_stmt in setup.selector_stmts {
+                let Statement::VariableDeclaration(_) = selector_stmt else {
+                    return None;
+                };
+                let (rendered, rewritten) = self.render_statement_with_env(selector_stmt, &env);
+                register_reads_rewritten += rewritten;
+                simulate_statement(
+                    selector_stmt,
+                    &setup.state_var,
+                    &mut env,
+                    &setup.register_arrays,
+                )?;
+                chunks.push(rendered);
+            }
+
+            let start = select_switch_case(setup.switch, &env)?;
+            let (outcome, rewritten) = self.simulate_arithmetic_case(
+                setup.switch,
+                start,
+                &setup.state_var,
+                &mut env,
+                &mut chunks,
+                &setup.register_arrays,
+            )?;
+            register_reads_rewritten += rewritten;
+            let ArithmeticCaseOutcome::Flow(flow) = outcome else {
+                return None;
+            };
+            if matches!(flow, StateFlow::Return | StateFlow::Throw) {
+                return Some(ArithmeticBranchResult {
+                    chunks,
+                    state_path,
+                    termination: if flow == StateFlow::Return {
+                        "return"
+                    } else {
+                        "throw"
+                    }
+                    .to_string(),
+                    register_reads_rewritten,
+                });
+            }
+            if flow == StateFlow::Break {
+                return None;
+            }
+
+            match env.get(&setup.state_var) {
+                Some(Value::Undefined) => {
+                    return Some(ArithmeticBranchResult {
+                        chunks,
+                        state_path,
+                        termination: "undefined".to_string(),
+                        register_reads_rewritten,
+                    });
+                }
+                Some(Value::Number(number)) if number.is_finite() && number.fract() == 0.0 => {}
+                _ => return None,
+            }
+        }
+        None
     }
 
     pub(super) fn arithmetic_state_replacement(
@@ -1476,11 +2155,22 @@ impl Collector<'_, '_> {
         let setup = self.arithmetic_state_setup(it)?;
         let mut env = HashMap::new();
         env.insert(setup.state_var.clone(), Value::Number(setup.initial_number));
-        let mut chunks = vec![setup.init_text];
+        let mut chunks = setup.init_text.iter().cloned().collect::<Vec<_>>();
         let mut seen_states = HashSet::new();
         let mut state_path = Vec::new();
+        let mut register_reads_rewritten = 0;
 
         for _ in 0..256 {
+            if !eval_with_env(setup.test, &env)?.truthy() {
+                return Some(arithmetic_state_result(
+                    it.span,
+                    &setup.state_var,
+                    state_path,
+                    &chunks,
+                    setup.loop_termination,
+                    register_reads_rewritten,
+                ));
+            }
             let state_key = env.get(&setup.state_var)?.render()?;
             if !seen_states.insert(state_key.clone()) {
                 return None;
@@ -1488,21 +2178,65 @@ impl Collector<'_, '_> {
             state_path.push(state_key);
 
             for selector_stmt in setup.selector_stmts {
-                let Statement::VariableDeclaration(decl) = selector_stmt else {
+                let Statement::VariableDeclaration(_decl) = selector_stmt else {
                     return None;
                 };
-                simulate_statement(selector_stmt, &setup.state_var, &mut env)?;
-                chunks.push(fragment(self.source, decl.span).to_string());
+                let (rendered, rewritten) = self.render_statement_with_env(selector_stmt, &env);
+                register_reads_rewritten += rewritten;
+                simulate_statement(
+                    selector_stmt,
+                    &setup.state_var,
+                    &mut env,
+                    &setup.register_arrays,
+                )?;
+                chunks.push(rendered);
             }
 
             let start = select_switch_case(setup.switch, &env)?;
-            let flow = self.simulate_arithmetic_case(
+            let (outcome, rewritten) = self.simulate_arithmetic_case(
                 setup.switch,
                 start,
                 &setup.state_var,
                 &mut env,
                 &mut chunks,
+                &setup.register_arrays,
             )?;
+            register_reads_rewritten += rewritten;
+            let flow = match outcome {
+                ArithmeticCaseOutcome::Flow(flow) => flow,
+                ArithmeticCaseOutcome::Conditional {
+                    test,
+                    consequent,
+                    alternate,
+                } => {
+                    let consequent_branch =
+                        self.finish_arithmetic_branch(&setup, &env, consequent)?;
+                    let alternate_branch =
+                        self.finish_arithmetic_branch(&setup, &env, alternate)?;
+                    register_reads_rewritten += consequent_branch.register_reads_rewritten
+                        + alternate_branch.register_reads_rewritten;
+                    let conditional = format!(
+                        "if ({test}) {} else {}",
+                        render_block(&consequent_branch.chunks),
+                        render_block(&alternate_branch.chunks)
+                    );
+                    chunks.push(conditional);
+                    let (text, mut proof) = arithmetic_state_result(
+                        it.span,
+                        &setup.state_var,
+                        state_path,
+                        &chunks,
+                        "conditional",
+                        register_reads_rewritten,
+                    );
+                    proof.branch_test = Some(test);
+                    proof.branch_paths =
+                        vec![consequent_branch.state_path, alternate_branch.state_path];
+                    proof.branch_terminations =
+                        vec![consequent_branch.termination, alternate_branch.termination];
+                    return Some((text, proof));
+                }
+            };
             if matches!(flow, StateFlow::Return | StateFlow::Throw) {
                 let termination = if flow == StateFlow::Return {
                     "return"
@@ -1515,6 +2249,7 @@ impl Collector<'_, '_> {
                     state_path,
                     &chunks,
                     termination,
+                    register_reads_rewritten,
                 ));
             }
             if flow == StateFlow::Break {
@@ -1529,6 +2264,7 @@ impl Collector<'_, '_> {
                         state_path,
                         &chunks,
                         "undefined",
+                        register_reads_rewritten,
                     ));
                 }
                 Some(Value::Number(number)) if number.is_finite() && number.fract() == 0.0 => {}

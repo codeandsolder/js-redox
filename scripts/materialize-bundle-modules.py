@@ -211,7 +211,10 @@ def main():
     modules = []
     module_tasks = []
     failures = []
-    tmp_root = ROOT / "work/test-tmp/bundle-module-materialization"
+    # Keep formatter scratch local to this output project. A shared repository-wide
+    # scratch directory made concurrent capture pipelines interfere with each other
+    # and inherited stale ownership from whichever user ran it first.
+    tmp_root = project / "analysis/.tmp/bundle-module-materialization"
     shutil.rmtree(tmp_root, ignore_errors=True)
     tmp_root.mkdir(parents=True, exist_ok=True)
 
@@ -469,6 +472,7 @@ def main():
     out = project / "analysis/bundles.json"
     out.write_text(json.dumps(index, indent=2) + "\n")
     write_module_readme(module_root, bundles, modules)
+    shutil.rmtree(tmp_root, ignore_errors=True)
     print(
         f"bundle modules: {len(bundles)} bundle payload(s), {len(modules)} modules, "
         f"{len(module_format_groups)} formatter invocation(s) / "

@@ -277,7 +277,11 @@ def instrumentation_kind(source: str) -> str | None:
         return "recorder-storage-dump"
     if "XMLSerializer().serializeToString(document.doctype)" in source:
         return "recorder-html-snapshot"
-    if "document.documentElement.scrollHeight" in source and (
+    # Recorder scroll probes are tiny evaluated helper functions. Without the
+    # size guard, ordinary page bundles containing scrollHeight/scrollY were
+    # falsely labeled instrumentation in the live corpus (including multi-MiB
+    # application bundles).
+    if len(source) <= 4096 and "document.documentElement.scrollHeight" in source and (
         "scrollY" in source or "scrollTo({ top:" in source or source.lstrip().startswith("() => Math.max(")
     ):
         return "recorder-scroll"

@@ -11,6 +11,7 @@ CASES = {
     "direct-switch": ROOT / "corpus/generated/js-vm-obfuscator/virtualized.js",
     "function-table": ROOT / "corpus/generated/js-virtualizer/vm.js",
     "generated-safe": ROOT / "corpus/generated/reversible-obfuscation/generated-child-safe.js",
+    "generated-packer": ROOT / "corpus/generated/reversible-obfuscation/packer-eval.js",
     "generated-obfuscated": ROOT / "corpus/generated/js-virtualizer/vm-obfuscated.js",
     "generated-obfuscated-affine-cff": (
         ROOT / "corpus/generated/js-virtualizer/vm-obfuscated-affine-cff.js"
@@ -167,6 +168,30 @@ def main():
             assert all((project / u["pseudocode_path"]).is_file() for u in devirt)
             graph = load(project, "analysis/source-graph.json")
             assert graph["summary"]["edge_kinds"].get("devirtualized_vm", 0) >= len(devirt)
+
+        elif name == "generated-packer":
+            assert len(analysis["dynamic_code_units"]) == 1
+            dynamic = analysis["dynamic_code_units"][0]
+            assert dynamic["kind"] == "Dean Edwards P.A.C.K.E.R."
+            generated = [
+                unit
+                for unit in analysis["code_units"]
+                if unit.get("origin") == "generated_dynamic_code"
+            ]
+            assert len(generated) == 1
+            child = generated[0]
+            assert child["analysis_origin"] == "safe_deobfuscation"
+            recovery = load(project, "analysis/generated-recovery.json")
+            assert recovery["summary"]["generated_units"] == 1
+            assert recovery["summary"]["safe_deobfuscation"] == 1
+            recovered = recovery["units"][0]
+            assert (project / recovered["readable_path"]).is_file()
+            readable = (project / recovered["readable_path"]).read_text()
+            assert "var answer = fortytwo;" in readable
+            assert "console.log(answer);" in readable
+            graph = load(project, "analysis/source-graph.json")
+            assert graph["summary"]["edge_kinds"].get("generated_code", 0) == 1
+            assert graph["summary"]["edge_kinds"].get("generated_safe_recovery", 0) == 1
 
         elif name == "generated-safe":
             assert analysis["dynamic_code_units"]
