@@ -1,6 +1,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use base64::Engine;
 use clap::Parser as ClapParser;
+use jsvm_lift::source_directive::source_directives;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -664,30 +665,19 @@ fn resolve_ref(base: &str, raw: &str) -> Option<String> {
 }
 
 fn source_refs(source: &str, base: &str) -> Vec<Reference> {
-    let mut out = Vec::new();
-    for (marker, kind) in [
-        ("sourceMappingURL=", "source_map"),
-        ("sourceURL=", "source_url"),
-    ] {
-        let mut from = 0usize;
-        while let Some(rel) = source[from..].find(marker) {
-            let start = from + rel + marker.len();
-            let tail = &source[start..];
-            let end = tail
-                .find(|c: char| c.is_whitespace() || matches!(c, '*' | '\'' | '"' | '<' | '>'))
-                .unwrap_or(tail.len());
-            let raw = tail[..end].trim().trim_end_matches(';');
-            if !raw.is_empty() && !raw.starts_with("data:") {
-                out.push(Reference {
-                    kind: kind.into(),
-                    raw: raw.into(),
-                    resolved_url: resolve_ref(base, raw),
-                });
+    source_directives(source)
+        .into_iter()
+        .filter_map(|directive| {
+            if directive.raw.starts_with("data:") {
+                return None;
             }
-            from = start + end.max(1);
-        }
-    }
-    out
+            Some(Reference {
+                kind: directive.kind,
+                resolved_url: resolve_ref(base, &directive.raw),
+                raw: directive.raw,
+            })
+        })
+        .collect()
 }
 
 fn write_resource(

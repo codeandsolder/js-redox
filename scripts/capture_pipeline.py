@@ -28,6 +28,7 @@ class Toolchain:
     switch_ir: Path = TOOL_ROOT / "switch-ir"
     table_ir: Path = TOOL_ROOT / "table-ir"
     js_refs: Path = TOOL_ROOT / "js-refs"
+    source_directives: Path = TOOL_ROOT / "source-directives"
     deobfuscator: Path = TOOL_ROOT / "deobfuscate-safe"
     string_recoverer: Path = ROOT / "scripts/recover-js-obfuscator-strings.py"
     bundle_inventory: Path = TOOL_ROOT / "bundle-unpack"
@@ -145,6 +146,8 @@ def _import_capture(
             capture,
             "--output",
             output,
+            "--source-directives",
+            tools.source_directives,
         ]
         if options.assets_dir:
             importer.extend(["--assets-dir", options.assets_dir])
@@ -221,6 +224,8 @@ def run_capture_pipeline(
             output,
             "--composer",
             tools.sourcemap_composer,
+            "--source-directives",
+            tools.source_directives,
         ]
     )
     run_checked(

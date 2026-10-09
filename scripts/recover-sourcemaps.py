@@ -13,9 +13,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote_to_bytes, urljoin, urlparse
 
-SOURCE_MAP_RE = re.compile(
-    r"(?:\/\/[#@]|\/\*[#@])\s*sourceMappingURL\s*=\s*([^\s*]+)"
-)
 MAX_CHAIN_DEPTH = 16
 
 
@@ -68,9 +65,55 @@ def parse_data_url(raw: str) -> bytes:
     return unquote_to_bytes(data)
 
 
-def source_mapping_url(text: str) -> str | None:
-    matches = list(SOURCE_MAP_RE.finditer(text))
-    return matches[-1].group(1).strip("'\"") if matches else None
+def source_mapping_urls(extractor: Path, paths: list[Path]) -> dict[str, str]:
+    if not paths:
+        return {}
+    cp = subprocess.run(
+        [str(extractor), *map(str, paths)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if cp.returncode:
+        raise RuntimeError(
+            f"source directive extraction failed ({cp.returncode}):\n{cp.stdout}{cp.stderr}"
+        )
+    rows = json.loads(cp.stdout)
+    result: dict[str, str] = {}
+    for row in rows:
+        source_maps = [
+            directive["raw"]
+            for directive in row.get("directives", [])
+            if directive.get("kind") == "source_map"
+        ]
+        if source_maps:
+            result[str(Path(row["input"]).resolve())] = source_maps[-1]
+    return result
+
+
+
+def source_mapping_url(extractor: Path, text: str) -> str | None:
+    if "sourceMappingURL" not in text:
+        return None
+    cp = subprocess.run(
+        [str(extractor), "--stdin"],
+        input=text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if cp.returncode:
+        raise RuntimeError(
+            f"source directive extraction failed ({cp.returncode}):\n{cp.stdout}{cp.stderr}"
+        )
+    rows = json.loads(cp.stdout)
+    directives = rows[0].get("directives", []) if rows else []
+    source_maps = [
+        directive["raw"]
+        for directive in directives
+        if directive.get("kind") == "source_map"
+    ]
+    return source_maps[-1] if source_maps else None
 
 
 def join_logical(base: str, reference: str) -> str:
@@ -226,6 +269,7 @@ def expand_map(
     by_url: dict[str, dict],
     project: Path,
     composer: Path | None,
+    source_directives: Path,
     work: Path,
     serial: itertools.count,
     stack: frozenset[str],
@@ -247,7 +291,7 @@ def expand_map(
         if code is None:
             continue
         code_text, code_origin, code_resource_id = code
-        raw_ref = source_mapping_url(code_text)
+        raw_ref = source_mapping_url(source_directives, code_text)
         if not raw_ref:
             continue
 
@@ -282,6 +326,7 @@ def expand_map(
             by_url=by_url,
             project=project,
             composer=composer,
+            source_directives=source_directives,
             work=work,
             serial=serial,
             stack=stack | {upstream.identity},
@@ -354,12 +399,20 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("project", type=Path)
     ap.add_argument("--composer", type=Path)
+    ap.add_argument(
+        "--source-directives",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / ".cargo-target-nodebug/debug/source-directives",
+    )
     args = ap.parse_args()
 
     project = args.project.resolve()
     composer = args.composer.resolve() if args.composer else None
+    source_directives_bin = args.source_directives.resolve()
     if composer is not None and not composer.is_file():
         raise SystemExit(f"source-map composer does not exist: {composer}")
+    if not source_directives_bin.is_file():
+        raise SystemExit(f"source-directives extractor does not exist: {source_directives_bin}")
     manifest = json.loads((project / "har-manifest.json").read_text())
     by_url = {resource["url"]: resource for resource in manifest["resources"]}
     results = []
@@ -367,21 +420,35 @@ def main() -> None:
     analysis.mkdir(parents=True, exist_ok=True)
     composed_root = analysis / "sourcemap-composed"
 
+    source_map_paths: dict[int, Path] = {}
+    candidate_paths: list[Path] = []
+    for resource in manifest["resources"]:
+        if resource.get("kind") != "javascript" or not resource.get("output_path"):
+            continue
+        js_path = project / resource["output_path"]
+        if not js_path.is_file():
+            continue
+        try:
+            js_text = js_path.read_text()
+        except UnicodeDecodeError:
+            continue
+        if "sourceMappingURL" not in js_text:
+            continue
+        resolved = js_path.resolve()
+        source_map_paths[resource["id"]] = resolved
+        candidate_paths.append(resolved)
+    source_map_refs = source_mapping_urls(
+        source_directives_bin, list(dict.fromkeys(candidate_paths))
+    )
+
     with tempfile.TemporaryDirectory(prefix="sourcemap-compose-", dir=analysis) as temp_dir:
         work = Path(temp_dir)
         serial = itertools.count()
         for resource in manifest["resources"]:
-            if resource.get("kind") != "javascript" or not resource.get("output_path"):
+            js_path = source_map_paths.get(resource["id"])
+            if js_path is None:
                 continue
-            js_path = project / resource["output_path"]
-            if not js_path.is_file():
-                continue
-            try:
-                js_text = js_path.read_text()
-            except UnicodeDecodeError:
-                continue
-
-            raw_ref = source_mapping_url(js_text)
+            raw_ref = source_map_refs.get(str(js_path))
             if not raw_ref:
                 continue
             loaded, problem = load_map(raw_ref, resource["url"], by_url, project)
@@ -406,6 +473,7 @@ def main() -> None:
                 by_url=by_url,
                 project=project,
                 composer=composer,
+                source_directives=source_directives_bin,
                 work=work,
                 serial=serial,
                 stack=frozenset({loaded.identity}),

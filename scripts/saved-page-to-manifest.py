@@ -6,6 +6,7 @@ import json
 import mimetypes
 import re
 import shutil
+import subprocess
 from pathlib import Path
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
@@ -15,9 +16,10 @@ from browser_script_types import (
     is_executable_script,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
 SAVED_ORIGIN = "https://saved-page.invalid/"
 SAVED_FROM_RE = re.compile(r"saved\s+from\s+url=\(\d+\)(.*?)\s*-->", re.IGNORECASE | re.DOTALL)
-SOURCE_REF_RE = re.compile(r"(?:\/\/[#@]|\/\*[#@])\s*(sourceMappingURL|sourceURL)\s*=\s*([^\s*]+)")
+CSS_SOURCE_REF_RE = re.compile(r"(?:\/\/[#@]|\/\*[#@])\s*(sourceMappingURL|sourceURL)\s*=\s*([^\s*]+)")
 CHARSET_RE = re.compile(r"(?:charset\s*=\s*[\"']?)([A-Za-z0-9._:-]+)", re.IGNORECASE)
 
 
@@ -234,11 +236,35 @@ def html_references(text: str, base: str) -> list[dict]:
     return refs
 
 
-def source_references(text: str, base: str) -> list[dict]:
+def css_source_references(text: str, base: str) -> list[dict]:
     refs = []
-    for kind, raw in SOURCE_REF_RE.findall(text):
+    for kind, raw in CSS_SOURCE_REF_RE.findall(text):
         raw = raw.strip("'\";")
         row = ref(base, "source_map" if kind == "sourceMappingURL" else "source_url", raw)
+        if row:
+            refs.append(row)
+    return refs
+
+
+def js_source_references(text: str, base: str, extractor: Path) -> list[dict]:
+    if "sourceMappingURL" not in text and "sourceURL" not in text:
+        return []
+    cp = subprocess.run(
+        [str(extractor), "--stdin"],
+        input=text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if cp.returncode:
+        raise RuntimeError(
+            f"source directive extraction failed ({cp.returncode}):\n{cp.stdout}{cp.stderr}"
+        )
+    rows = json.loads(cp.stdout)
+    directives = rows[0].get("directives", []) if rows else []
+    refs = []
+    for directive in directives:
+        row = ref(base, directive["kind"], directive["raw"])
         if row:
             refs.append(row)
     return refs
@@ -297,11 +323,17 @@ def main():
     ap.add_argument("html", type=Path)
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--assets-dir", type=Path)
+    ap.add_argument(
+        "--source-directives",
+        type=Path,
+        default=ROOT / ".cargo-target-nodebug/debug/source-directives",
+    )
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
     page = args.html.resolve()
     output = args.output.resolve()
+    source_directives_bin = args.source_directives.resolve()
     if not page.is_file():
         raise SystemExit(f"saved page HTML does not exist: {page}")
     if output.exists():
@@ -334,8 +366,6 @@ def main():
         base_url = canonical_url(capture_rel)
         refs = []
         text = read_text_lossless(src) if kind in {"javascript", "html", "css", "json", "text"} else None
-        if kind in {"javascript", "css"} and text is not None:
-            refs.extend(source_references(text, base_url))
         resources.append({
             "id": rid,
             "pageref": "saved-page",
@@ -393,7 +423,11 @@ def main():
             (item.get("kind"), item.get("raw"), item.get("resolved_url"))
             for item in resource.get("references", [])
         }
-        for item in source_references(text, resource["url"]):
+        if resource["kind"] == "javascript":
+            items = js_source_references(text, resource["url"], source_directives_bin)
+        else:
+            items = css_source_references(text, resource["url"])
+        for item in items:
             key = (item.get("kind"), item.get("raw"), item.get("resolved_url"))
             if key not in known:
                 resource["references"].append(item)
