@@ -210,3 +210,253 @@ customElements.define("not-module-inline-function", function () {
     module.exports = { value: "must-not-detect" };
   }, {}]
 }, {}, [52001]);
+
+
+const __webpack_modules__ = {
+  rspA(module, exports, require) {
+    exports.value = require("rspB").value;
+  },
+  rspB(module, exports) {
+    module.exports = { value: "rspack-style" };
+  }
+};
+void __webpack_modules__;
+
+(function () {
+  const __webpack_modules__ = {
+    mustNotDetect: 123
+  };
+  void __webpack_modules__;
+})();
+
+(function () {
+  const runtimeTable = {
+    runA(module, exports, require) {
+      exports.value = require("runB").value;
+    },
+    runB(module, exports) {
+      module.exports = { value: "runtime-table" };
+    }
+  };
+  const cache = {};
+  function runtimeRequire(id) {
+    if (cache[id]) return cache[id].exports;
+    const module = cache[id] = { exports: {} };
+    runtimeTable[id](module, module.exports, runtimeRequire);
+    return module.exports;
+  }
+  runtimeRequire.m = runtimeTable;
+  void runtimeRequire("runA");
+})();
+
+!function (modules) {
+  const cache = {};
+  function legacyRequire(id) {
+    if (cache[id]) return cache[id].exports;
+    const module = cache[id] = { exports: {} };
+    modules[id].call(module.exports, module, module.exports, legacyRequire);
+    return module.exports;
+  }
+  legacyRequire.m = modules;
+  void legacyRequire(0);
+}([
+  function (module, exports, require) {
+    exports.value = require(1).value;
+  },
+  function (module) {
+    module.exports = { value: "array-table" };
+  }
+]);
+
+(function (modules) {
+  function ordinaryLoader(id) {
+    return modules[id];
+  }
+  void ordinaryLoader(0);
+})([
+  function () {
+    return "must-not-detect-array";
+  }
+]);
+
+
+webpackJsonp([91], {
+  jsonpA: function (module, exports, require) {
+    exports.value = require("jsonpB").value;
+  },
+  jsonpB: function (module) {
+    module.exports = { value: "jsonp-object" };
+  }
+});
+
+webpackJsonp([92], [
+  ,
+  function (module, exports, require) {
+    exports.value = require(2).value;
+  },
+  function (module) {
+    module.exports = { value: "jsonp-sparse-array" };
+  }
+]);
+
+(function () {
+  function webpackJsonp(chunkIds, table) {
+    return [chunkIds, table];
+  }
+  webpackJsonp([93], {
+    jsonpShadow: function () {
+      return "must-not-detect";
+    }
+  });
+})();
+
+
+(function () {
+  const __webpack_modules__ = [
+    function (module, exports, require) {
+      exports.namedArray = require(1).namedArray;
+    },
+    function (module) {
+      module.exports = { namedArray: "named-array-table" };
+    }
+  ];
+  void __webpack_modules__;
+})();
+
+((modules) => {
+  const cache = {};
+  function arrowRequire(id) {
+    if (cache[id]) return cache[id].exports;
+    const module = cache[id] = { exports: {} };
+    modules[id].call(module.exports, module, module.exports, arrowRequire);
+    return module.exports;
+  }
+  arrowRequire.m = modules;
+  void arrowRequire(3);
+})([
+  ,
+  ,
+  ,
+  function (module, exports, require) {
+    exports.arrowValue = require(4).arrowValue;
+  },
+  function (module) {
+    module.exports = { arrowValue: "arrow-array-table" };
+  }
+]);
+
+((modules) => {
+  function ordinaryArrowLoader(id) {
+    return modules[id];
+  }
+  void ordinaryArrowLoader(7);
+})([
+  ,
+  ,
+  ,
+  ,
+  ,
+  ,
+  ,
+  function () {
+    return "must-not-detect-arrow-array";
+  }
+]);
+
+
+(window.webpackJsonp = window.webpackJsonp || []).push([[94], [
+  ,
+  ,
+  ,
+  ,
+  ,
+  function (module, exports, require) {
+    exports.pushArray = require(6).pushArray;
+  },
+  function (module) {
+    module.exports = { pushArray: "push-array-table" };
+  }
+]]);
+
+const ordinaryChunkSink = [];
+ordinaryChunkSink.push([[95], [
+  ,
+  ,
+  ,
+  ,
+  ,
+  ,
+  ,
+  ,
+  function () {
+    return "must-not-detect-generic-push-array";
+  }
+]]);
+
+
+const notwebpackJsonpQueue = [];
+notwebpackJsonpQueue.push([[96], [
+  function () {
+    return "must-not-detect-substring-push-array";
+  }
+]]);
+
+
+(window.wsc_webpackJsonp = window.wsc_webpackJsonp || []).push([[97], [
+  function (module) {
+    module.exports = { namespacedPush: "namespaced-webpack-queue" };
+  }
+]]);
+
+
+!function (modules) {
+  function objectBootstrapRequire(id) {
+    const module = { exports: {} };
+    modules[id](module, module.exports, objectBootstrapRequire);
+    return module.exports;
+  }
+  objectBootstrapRequire.m = modules;
+  void objectBootstrapRequire("objectBootstrapA");
+}({
+  objectBootstrapA: function (module, exports, require) {
+    exports.value = require("objectBootstrapB").value;
+  },
+  objectBootstrapB: function (module) {
+    module.exports = { value: "object-bootstrap" };
+  }
+});
+
+(window.webpackChunkConcat = window.webpackChunkConcat || []).push([[99], Array(3).concat([
+  function (module, exports, require) {
+    exports.concatValue = require(4).concatValue;
+  },
+  function (module) {
+    module.exports = { concatValue: "offset-concat-table" };
+  }
+])]);
+
+(window.webpackChunkConcat = window.webpackChunkConcat || []).push([[100], Array(window.dynamicWebpackOffset).concat([
+  function () {
+    return "must-not-detect-dynamic-concat-offset";
+  }
+])]);
+
+webpackJsonpFirebase([98], {
+  firebaseA: function (module, exports, require) {
+    exports.value = require("firebaseB").value;
+  },
+  firebaseB: function (module) {
+    module.exports = { value: "firebase-jsonp" };
+  }
+});
+
+(function () {
+  function webpackJsonpFirebase(chunkIds, table) {
+    return [chunkIds, table];
+  }
+  webpackJsonpFirebase([101], {
+    firebaseShadow: function () {
+      return "must-not-detect-shadowed-firebase";
+    }
+  });
+})();

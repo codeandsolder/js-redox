@@ -359,6 +359,177 @@ def main():
         "external-missing": "external-missing",
     }
     assert not any(row["module_id"] in {"52001", "52002"} for row in bundles["modules"])
+    rspack_alpha = next(row for row in bundles["modules"] if row["module_id"] == "rspA")
+    rspack_beta = next(row for row in bundles["modules"] if row["module_id"] == "rspB")
+    assert rspack_alpha["bundle_kind"] == "webpack_modules_binding"
+    assert rspack_alpha["dependencies"] == ["rspB"]
+    assert rspack_alpha["export_names"] == ["value"]
+    assert rspack_beta["commonjs_export"] is True
+    runtime_alpha = next(row for row in bundles["modules"] if row["module_id"] == "runA")
+    runtime_beta = next(row for row in bundles["modules"] if row["module_id"] == "runB")
+    assert runtime_alpha["bundle_kind"] == "webpack_runtime_module_table"
+    assert runtime_alpha["dependencies"] == ["runB"]
+    assert runtime_alpha["export_names"] == ["value"]
+    assert runtime_beta["commonjs_export"] is True
+    array_alpha = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "0" and row["bundle_kind"] == "webpack_array_bootstrap"
+    )
+    array_beta = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "1" and row["bundle_kind"] == "webpack_array_bootstrap"
+    )
+    assert array_alpha["dependencies"] == ["1"]
+    assert array_alpha["export_names"] == ["value"]
+    assert array_beta["commonjs_export"] is True
+    named_array_alpha = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "0" and row["bundle_kind"] == "webpack_modules_binding"
+    )
+    named_array_beta = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "1" and row["bundle_kind"] == "webpack_modules_binding"
+    )
+    assert named_array_alpha["dependencies"] == ["1"]
+    assert named_array_alpha["export_names"] == ["namedArray"]
+    assert named_array_beta["commonjs_export"] is True
+    arrow_array_alpha = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "3" and row["bundle_kind"] == "webpack_array_bootstrap"
+    )
+    arrow_array_beta = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "4" and row["bundle_kind"] == "webpack_array_bootstrap"
+    )
+    assert arrow_array_alpha["dependencies"] == ["4"]
+    assert arrow_array_alpha["export_names"] == ["arrowValue"]
+    assert arrow_array_beta["commonjs_export"] is True
+    assert not any(
+        row["module_id"] == "7" and row["bundle_kind"] == "webpack_array_bootstrap"
+        for row in bundles["modules"]
+    )
+    push_array_alpha = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "5"
+        and row["bundle_kind"] == "webpack_chunk_push"
+        and row["chunk_ids"] == ["94"]
+    )
+    push_array_beta = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "6"
+        and row["bundle_kind"] == "webpack_chunk_push"
+        and row["chunk_ids"] == ["94"]
+    )
+    assert push_array_alpha["dependencies"] == ["6"]
+    assert push_array_alpha["export_names"] == ["pushArray"]
+    assert push_array_beta["commonjs_export"] is True
+    assert not any(
+        row["module_id"] == "8"
+        and row["bundle_kind"] == "webpack_chunk_push"
+        and row["chunk_ids"] == ["95"]
+        for row in bundles["modules"]
+    )
+    assert not any(
+        row["module_id"] == "0"
+        and row["bundle_kind"] == "webpack_chunk_push"
+        and row["chunk_ids"] == ["96"]
+        for row in bundles["modules"]
+    )
+    namespaced_push = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "0"
+        and row["bundle_kind"] == "webpack_chunk_push"
+        and row["chunk_ids"] == ["97"]
+    )
+    assert namespaced_push["commonjs_export"] is True
+    jsonp_alpha = next(row for row in bundles["modules"] if row["module_id"] == "jsonpA")
+    jsonp_beta = next(row for row in bundles["modules"] if row["module_id"] == "jsonpB")
+    assert jsonp_alpha["bundle_kind"] == "webpack_jsonp_call"
+    assert jsonp_alpha["chunk_ids"] == ["91"]
+    assert jsonp_alpha["dependencies"] == ["jsonpB"]
+    assert jsonp_alpha["export_names"] == ["value"]
+    assert jsonp_beta["commonjs_export"] is True
+    sparse_alpha = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "1"
+        and row["bundle_kind"] == "webpack_jsonp_call"
+        and row["chunk_ids"] == ["92"]
+    )
+    sparse_beta = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "2"
+        and row["bundle_kind"] == "webpack_jsonp_call"
+        and row["chunk_ids"] == ["92"]
+    )
+    assert sparse_alpha["dependencies"] == ["2"]
+    assert sparse_alpha["export_names"] == ["value"]
+    assert sparse_beta["commonjs_export"] is True
+    assert not any(row["module_id"] == "jsonpShadow" for row in bundles["modules"])
+    object_bootstrap_alpha = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "objectBootstrapA"
+        and row["bundle_kind"] == "webpack_object_bootstrap"
+    )
+    object_bootstrap_beta = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "objectBootstrapB"
+        and row["bundle_kind"] == "webpack_object_bootstrap"
+    )
+    assert object_bootstrap_alpha["dependencies"] == ["objectBootstrapB"]
+    assert object_bootstrap_alpha["export_names"] == ["value"]
+    assert object_bootstrap_beta["commonjs_export"] is True
+    concat_alpha = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "3"
+        and row["bundle_kind"] == "webpack_chunk_push"
+        and row["chunk_ids"] == ["99"]
+    )
+    concat_beta = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "4"
+        and row["bundle_kind"] == "webpack_chunk_push"
+        and row["chunk_ids"] == ["99"]
+    )
+    assert concat_alpha["dependencies"] == ["4"]
+    assert concat_alpha["export_names"] == ["concatValue"]
+    assert concat_beta["commonjs_export"] is True
+    assert not any(
+        row["bundle_kind"] == "webpack_chunk_push" and row["chunk_ids"] == ["100"]
+        for row in bundles["modules"]
+    )
+    firebase_alpha = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "firebaseA"
+        and row["bundle_kind"] == "webpack_jsonp_call"
+        and row["chunk_ids"] == ["98"]
+    )
+    firebase_beta = next(
+        row
+        for row in bundles["modules"]
+        if row["module_id"] == "firebaseB"
+        and row["bundle_kind"] == "webpack_jsonp_call"
+        and row["chunk_ids"] == ["98"]
+    )
+    assert firebase_alpha["dependencies"] == ["firebaseB"]
+    assert firebase_alpha["export_names"] == ["value"]
+    assert firebase_beta["commonjs_export"] is True
+    assert not any(row["module_id"] == "firebaseShadow" for row in bundles["modules"])
     assert "/browserify-modules/" in browserify_alpha["source_path"]
     assert bundles["summary"]["browserify_modules"] >= 4
     browserify_source = (PROJECT / browserify_alpha["source_path"]).read_text()
