@@ -1,7 +1,13 @@
-use super::{Reference, ScriptTag};
+use super::materialize::Reference;
 use crate::source_directive::source_directives;
 use std::collections::HashMap;
 use url::Url;
+
+#[derive(Debug)]
+pub(super) struct ScriptTag {
+    pub(super) attrs: HashMap<String, String>,
+    pub(super) body: String,
+}
 
 const fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
     let mut quote = None;

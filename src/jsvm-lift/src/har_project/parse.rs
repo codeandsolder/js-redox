@@ -1,6 +1,101 @@
-use super::{Har, HarEntry, HarLog};
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 use std::{fs, path::Path};
+
+#[derive(Debug, Deserialize)]
+pub(super) struct Har {
+    pub(super) log: HarLog,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct HarLog {
+    #[serde(default)]
+    pub(super) version: String,
+    #[serde(default)]
+    pub(super) pages: Vec<HarPage>,
+    pub(super) entries: Vec<HarEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct HarPage {
+    #[serde(default)]
+    pub(super) id: String,
+    #[serde(default)]
+    pub(super) title: String,
+    #[serde(default)]
+    pub(super) started_date_time: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct HarEntry {
+    #[serde(default)]
+    pub(super) pageref: Option<String>,
+    #[serde(default)]
+    pub(super) started_date_time: String,
+    #[serde(default)]
+    pub(super) time: f64,
+    pub(super) request: HarRequest,
+    pub(super) response: HarResponse,
+    #[serde(default, rename = "_resourceType")]
+    pub(super) resource_type: Option<String>,
+    #[serde(default, rename = "_failure")]
+    pub(super) failure: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct HarRequest {
+    #[serde(default)]
+    pub(super) method: String,
+    #[serde(default)]
+    pub(super) url: String,
+    #[serde(default)]
+    pub(super) headers: Vec<NameValue>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct HarResponse {
+    #[serde(default)]
+    pub(super) status: i64,
+    #[serde(default)]
+    pub(super) status_text: String,
+    #[serde(default)]
+    pub(super) headers: Vec<NameValue>,
+    pub(super) content: HarContent,
+    #[serde(default, rename = "_jsRedoxBody")]
+    pub(super) js_redox_body: Option<JsRedoxBodyRef>,
+    #[serde(default, rename = "_jsRedoxBodyCapture")]
+    pub(super) js_redox_body_capture: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct JsRedoxBodyRef {
+    pub(super) path: String,
+    pub(super) sha256: String,
+    pub(super) size: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct HarContent {
+    #[serde(default)]
+    pub(super) size: i64,
+    #[serde(default)]
+    pub(super) mime_type: String,
+    #[serde(default)]
+    pub(super) text: Option<String>,
+    #[serde(default)]
+    pub(super) encoding: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct NameValue {
+    #[serde(default)]
+    pub(super) name: String,
+    #[serde(default)]
+    pub(super) value: String,
+}
 
 fn salvage_har(raw: &[u8]) -> Result<Har> {
     let text = std::str::from_utf8(raw).context("HAR is not valid UTF-8")?;
