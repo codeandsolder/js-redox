@@ -1,4 +1,4 @@
-use super::{i32_const, is_state_predicate, operator_family};
+use super::{i32_const, operator_family, transition::is_state_predicate};
 use std::collections::BTreeSet;
 use waffle::{entity::EntityRef, Block, FunctionBody, Operator, Value, ValueDef};
 
