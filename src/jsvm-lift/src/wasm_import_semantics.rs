@@ -865,10 +865,11 @@ mod tests {
             };
         "#;
         assert!(proven_wasm_import_data_view_set_u32_shapes(source).is_empty());
-        let proven =
+        assert_eq!(
             proven_wasm_import_data_view_set_u32_shape_at_offset(source, "wbg", "conditional", 5)
-                .expect("offset 5 must force the write");
-        assert_eq!(proven.offset_value, Some(5));
+                .map(|shape| shape.offset_value),
+            Some(Some(5))
+        );
         assert!(proven_wasm_import_data_view_set_u32_shape_at_offset(
             source,
             "wbg",
