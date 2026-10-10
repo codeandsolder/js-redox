@@ -45,6 +45,10 @@ jobs:
         uses: astral-sh/setup-uv@v10.2.0
         with:
           version: latest-known
+      - name: Persisted capture contracts
+        run: |
+          uv run --no-project python scripts/check-capture-project-contract.py
+          uv run --no-project python scripts/check-analysis-artifact-contract.py
       - name: Build analysis tools
         run: |
           cargo build --locked --workspace --bins
