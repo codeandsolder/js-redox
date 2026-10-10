@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from analysis_artifacts import BUNDLES, DEOBFUSCATION, GENERATED_RECOVERY, JSVM_INDEX, load_artifact, write_artifact
+
 from browser_script_types import is_executable_script
 from content_dedup import link_or_copy, sha256_path
 from capture_project import load_manifest
@@ -317,8 +319,7 @@ def main():
 
     project = args.project.resolve()
     manifest = load_manifest(project)
-    deob_path = project / "analysis/deobfuscation.json"
-    deob = json.loads(deob_path.read_text()) if deob_path.exists() else {"units": []}
+    deob = load_artifact(project, DEOBFUSCATION, optional=True) or {"units": []}
     deob_by_raw = {
         unit.get("raw_path"): unit
         for unit in deob.get("units", [])
@@ -328,9 +329,8 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     bundle_spans_by_parent = {}
-    bundles_path = project / "analysis/bundles.json"
-    if bundles_path.exists():
-        bundle_index = json.loads(bundles_path.read_text())
+    bundle_index = load_artifact(project, BUNDLES, optional=True)
+    if bundle_index is not None:
         for bundle in bundle_index.get("bundles", []):
             parent_path = bundle.get("parent_path")
             start = bundle.get("module_table_start")
@@ -644,7 +644,7 @@ def main():
         scan_id += 1
 
     generated_recovery_index = {
-        "schema": "generated-code-safe-recovery/v1",
+        "schema": GENERATED_RECOVERY.schema,
         "safe_static_only": True,
         "units": generated_recovery,
         "summary": {
@@ -667,12 +667,10 @@ def main():
             ),
         },
     }
-    (project / "analysis/generated-recovery.json").write_text(
-        json.dumps(generated_recovery_index, indent=2) + "\n"
-    )
+    write_artifact(project, GENERATED_RECOVERY, generated_recovery_index)
 
     index = {
-        "schema": "capture-jsvm-analysis/v1",
+        "schema": JSVM_INDEX.schema,
         "scanner": str(args.scanner),
         "formatter": str(args.formatter),
         "switch_ir": str(args.switch_ir),
@@ -680,7 +678,7 @@ def main():
         "deobfuscator": str(args.deobfuscator),
         "string_recoverer": str(args.string_recoverer),
         "recursive_generated_code": True,
-        "generated_recovery": "analysis/generated-recovery.json",
+        "generated_recovery": str(GENERATED_RECOVERY.relative_path),
         "max_generated_depth": args.max_generated_depth,
         "max_code_units": args.max_code_units,
         "scanner_invocations": scanner_invocations,
@@ -688,7 +686,7 @@ def main():
         "code_units": rows,
         "dynamic_code_units": dynamic_units,
     }
-    (outdir / "index.json").write_text(json.dumps(index, indent=2) + "\n")
+    write_artifact(project, JSVM_INDEX, index)
 
     signaled = [r for r in rows if r.get("vm_signal")]
     confirmed = [r for r in rows if r.get("confirmed_vm_signal")]

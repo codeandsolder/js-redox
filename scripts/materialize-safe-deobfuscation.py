@@ -7,6 +7,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from analysis_artifacts import DEOBFUSCATION, SOURCE_INDEX, STRING_RECOVERY, load_artifact, write_artifact
+
 from content_dedup import default_jobs, link_or_copy, sha256_path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,14 +80,14 @@ def main():
     jobs = max(1, args.jobs)
 
     project = args.project.resolve()
-    source_index = json.loads((project / "analysis/source-index.json").read_text())
+    source_index = load_artifact(project, SOURCE_INDEX)
     out_dir = project / "analysis/deobfuscation"
     string_dir = project / "analysis/string-recovery"
     out_dir.mkdir(parents=True, exist_ok=True)
     string_dir.mkdir(parents=True, exist_ok=True)
 
     project_key = hashlib.sha256(str(project).encode()).hexdigest()[:16]
-    tmp_dir = ROOT / "work/test-tmp/har-static-string-recovery" / project_key
+    tmp_dir = ROOT / "work/test-tmp/capture-static-string-recovery" / project_key
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     occurrences = []
@@ -417,7 +419,7 @@ def main():
     string_changed = [u for u in string_units if u.get("changed")]
     string_failed = [u for u in string_units if u.get("exit")]
     string_index = {
-        "schema": "har-static-string-recovery/v2",
+        "schema": STRING_RECOVERY.schema,
         "safe_static_only": True,
         "recoverer": str(args.string_recoverer),
         "units": string_units,
@@ -434,9 +436,7 @@ def main():
             "invocations": len(raw_groups),
         },
     }
-    (project / "analysis/string-recovery.json").write_text(
-        json.dumps(string_index, indent=2) + "\n"
-    )
+    write_artifact(project, STRING_RECOVERY, string_index)
 
     changed = [u for u in units if u.get("changed")]
     failed = [u for u in units if u.get("exit")]
@@ -446,13 +446,13 @@ def main():
             totals[kind] = totals.get(kind, 0) + count
 
     index = {
-        "schema": "har-safe-deobfuscation/v2",
+        "schema": DEOBFUSCATION.schema,
         "safe_static_only": True,
         "runtime_semantics_preserved_by_design": True,
         "presentation_formatted": False,
         "deobfuscator": str(args.deobfuscator),
         "formatter": str(args.formatter),
-        "string_recovery": "analysis/string-recovery.json",
+        "string_recovery": str(STRING_RECOVERY.relative_path),
         "units": units,
         "summary": {
             "javascript_units": len(units),
@@ -473,9 +473,7 @@ def main():
             "transforms": dict(sorted(totals.items())),
         },
     }
-    (project / "analysis/deobfuscation.json").write_text(
-        json.dumps(index, indent=2) + "\n"
-    )
+    write_artifact(project, DEOBFUSCATION, index)
     print(
         f"safe source recovery: {len(units)} JS occurrences / "
         f"{len(raw_groups)} unique raw / {len(pre_deob_groups)} unique pre-deob / "

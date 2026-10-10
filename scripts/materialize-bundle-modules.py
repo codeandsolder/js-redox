@@ -8,6 +8,8 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from analysis_artifacts import BUNDLES, DEOBFUSCATION, load_artifact, write_artifact
+
 from content_dedup import default_jobs, sha256_path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,10 +201,7 @@ def main():
     jobs = max(1, args.jobs)
 
     project = args.project.resolve()
-    deob_path = project / "analysis/deobfuscation.json"
-    if not deob_path.exists():
-        raise SystemExit("analysis/deobfuscation.json is required; run safe source recovery first")
-    deob = json.loads(deob_path.read_text())
+    deob = load_artifact(project, DEOBFUSCATION)
 
     module_root = project / "src/_modules"
     shutil.rmtree(module_root, ignore_errors=True)
@@ -417,7 +416,7 @@ def main():
                 record["materialization"] = "rendered_content_template"
 
     index = {
-        "schema": "har-bundle-modules/v5",
+        "schema": BUNDLES.schema,
         "safe_static_only": True,
         "inventory": str(args.inventory),
         "bundles": bundles,
@@ -469,8 +468,7 @@ def main():
             "failed_units": len(failures),
         },
     }
-    out = project / "analysis/bundles.json"
-    out.write_text(json.dumps(index, indent=2) + "\n")
+    write_artifact(project, BUNDLES, index)
     write_module_readme(module_root, bundles, modules)
     shutil.rmtree(tmp_root, ignore_errors=True)
     print(

@@ -8,14 +8,29 @@ feeds the same analysis pipeline without duplicating orchestration.
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from capture_project import MANIFEST_NAME, read_manifest
+from analysis_artifacts import (
+    BUNDLES,
+    DEOBFUSCATION,
+    GENERATED_RECOVERY,
+    JS_REFERENCES,
+    JSVM_INDEX,
+    RUNTIME_SCRIPTS,
+    SOURCE_GRAPH,
+    SOURCE_INDEX,
+    SOURCEMAPS,
+    WASM_HOST_EFFECTS,
+    WASM_INDEX,
+    artifact_path,
+    load_artifact,
+)
+
+from capture_project import MANIFEST_NAME, read_manifest, write_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL_ROOT = ROOT / ".cargo-target-nodebug/debug"
@@ -165,7 +180,7 @@ def _import_capture(
         source["kind"] = "recorder"
         source["input"] = str(capture)
         source["har_input"] = str(capture / "capture.har")
-        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+        write_manifest(manifest_path, manifest)
     return manifest_path
 
 
@@ -192,7 +207,7 @@ def run_capture_pipeline(
                 ROOT / "scripts/analyze-runtime-scripts.py",
                 capture,
                 "--output",
-                output / "analysis/runtime-scripts.json",
+                artifact_path(output, RUNTIME_SCRIPTS),
             ]
         )
 
@@ -314,9 +329,6 @@ def run_capture_pipeline(
     )
 
 
-def _read_json(path: Path) -> dict:
-    return json.loads(path.read_text())
-
 
 def load_project_summary(
     output: Path,
@@ -329,26 +341,26 @@ def load_project_summary(
 ) -> ProjectSummary:
     output = output.resolve()
     manifest = read_manifest(manifest_path or output / MANIFEST_NAME)
-    source_index = _read_json(output / "analysis/source-index.json")
-    maps = _read_json(output / "analysis/sourcemaps.json")
-    graph = _read_json(output / "analysis/source-graph.json")
-    jsrefs = _read_json(output / "analysis/js-references.json")
-    wasm = {"summary": {}}
-    wasm_path = output / "analysis/wasm/index.json"
-    if wasm_analysis and wasm_path.exists():
-        wasm = _read_json(wasm_path)
-
-    wasm_host_effects = {"summary": {}}
-    wasm_host_effects_path = output / "analysis/wasm-host-effects.json"
-    if wasm_analysis and safe_deobfuscation and wasm_host_effects_path.exists():
-        wasm_host_effects = _read_json(wasm_host_effects_path)
-
-    deob = _read_json(output / "analysis/deobfuscation.json") if safe_deobfuscation else None
-    bundles = {"summary": {}}
-    if safe_deobfuscation and bundle_unpack:
-        bundle_path = output / "analysis/bundles.json"
-        if bundle_path.exists():
-            bundles = _read_json(bundle_path)
+    source_index = load_artifact(output, SOURCE_INDEX)
+    maps = load_artifact(output, SOURCEMAPS)
+    graph = load_artifact(output, SOURCE_GRAPH)
+    jsrefs = load_artifact(output, JS_REFERENCES)
+    wasm = (
+        load_artifact(output, WASM_INDEX, optional=True) or {"summary": {}}
+        if wasm_analysis
+        else {"summary": {}}
+    )
+    wasm_host_effects = (
+        load_artifact(output, WASM_HOST_EFFECTS, optional=True) or {"summary": {}}
+        if wasm_analysis and safe_deobfuscation
+        else {"summary": {}}
+    )
+    deob = load_artifact(output, DEOBFUSCATION) if safe_deobfuscation else None
+    bundles = (
+        load_artifact(output, BUNDLES)
+        if safe_deobfuscation and bundle_unpack
+        else {"summary": {}}
+    )
 
     dynamic = 0
     devirtualized = 0
@@ -356,10 +368,8 @@ def load_project_summary(
     vm_candidates = 0
     generated_recovery = {"summary": {}}
     if vm_scan:
-        analysis = _read_json(output / "analysis/jsvm/index.json")
-        generated_path = output / "analysis/generated-recovery.json"
-        if generated_path.exists():
-            generated_recovery = _read_json(generated_path)
+        analysis = load_artifact(output, JSVM_INDEX)
+        generated_recovery = load_artifact(output, GENERATED_RECOVERY)
         dynamic = len(analysis.get("dynamic_code_units", []))
         devirtualized = len(analysis.get("devirtualized_units", []))
         units = analysis.get("code_units", [])
@@ -370,10 +380,7 @@ def load_project_summary(
         )
 
     generated = generated_recovery.get("summary", {})
-    runtime = {"summary": {}}
-    runtime_path = output / "analysis/runtime-scripts.json"
-    if runtime_path.exists():
-        runtime = _read_json(runtime_path)
+    runtime = load_artifact(output, RUNTIME_SCRIPTS, optional=True) or {"summary": {}}
     runtime_summary = runtime.get("summary", {})
     runtime_classes = runtime_summary.get("classifications", {})
     originals = sum(

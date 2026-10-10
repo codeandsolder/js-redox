@@ -6,6 +6,21 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import urljoin
 
+from analysis_artifacts import (
+    BUNDLES,
+    DEOBFUSCATION,
+    IMPORT_MAPS,
+    JS_REFERENCES,
+    JSVM_INDEX,
+    RUNTIME_SCRIPTS,
+    SOURCE_GRAPH,
+    SOURCE_INDEX,
+    SOURCEMAPS,
+    WASM_INDEX,
+    load_artifact,
+    write_artifact,
+)
+
 from capture_project import load_manifest
 
 
@@ -24,41 +39,19 @@ def main():
     project = args.project.resolve()
 
     manifest = load_manifest(project)
-    source_index_path = project / 'analysis/source-index.json'
-    sourcemaps_path = project / 'analysis/sourcemaps.json'
-    jsvm_path = project / 'analysis/jsvm/index.json'
-    jsrefs_path = project / 'analysis/js-references.json'
-    deobfuscation_path = project / 'analysis/deobfuscation.json'
-    bundles_path = project / 'analysis/bundles.json'
-    import_maps_path = project / 'analysis/import-maps.json'
-    wasm_path = project / 'analysis/wasm/index.json'
-    runtime_path = project / 'analysis/runtime-scripts.json'
-
-    source_index = json.loads(source_index_path.read_text()) if source_index_path.exists() else {'units': []}
-    sourcemaps = json.loads(sourcemaps_path.read_text()) if sourcemaps_path.exists() else {'source_maps': []}
-    jsvm = json.loads(jsvm_path.read_text()) if jsvm_path.exists() else {'code_units': [], 'dynamic_code_units': []}
-    jsrefs = json.loads(jsrefs_path.read_text()) if jsrefs_path.exists() else {'code_units': []}
-    deobfuscation = (
-        json.loads(deobfuscation_path.read_text())
-        if deobfuscation_path.exists()
-        else {'units': []}
-    )
-    bundles = (
-        json.loads(bundles_path.read_text())
-        if bundles_path.exists()
-        else {'bundles': [], 'modules': []}
-    )
-    wasm = json.loads(wasm_path.read_text()) if wasm_path.exists() else {'modules': []}
-    runtime = (
-        json.loads(runtime_path.read_text())
-        if runtime_path.exists()
-        else {'sources': [], 'alpine_families': [], 'gtm_families': []}
-    )
-    import_maps = (
-        json.loads(import_maps_path.read_text())
-        if import_maps_path.exists()
-        else {'maps': [], 'documents': {}, 'summary': {}}
-    )
+    source_index = load_artifact(project, SOURCE_INDEX, optional=True) or {'units': []}
+    sourcemaps = load_artifact(project, SOURCEMAPS, optional=True) or {'source_maps': []}
+    jsvm = load_artifact(project, JSVM_INDEX, optional=True) or {'code_units': [], 'dynamic_code_units': []}
+    jsrefs = load_artifact(project, JS_REFERENCES, optional=True) or {'code_units': []}
+    deobfuscation = load_artifact(project, DEOBFUSCATION, optional=True) or {'units': []}
+    bundles = load_artifact(project, BUNDLES, optional=True) or {'bundles': [], 'modules': []}
+    wasm = load_artifact(project, WASM_INDEX, optional=True) or {'modules': []}
+    runtime = load_artifact(project, RUNTIME_SCRIPTS, optional=True) or {
+        'sources': [], 'alpine_families': [], 'gtm_families': []
+    }
+    import_maps = load_artifact(project, IMPORT_MAPS, optional=True) or {
+        'maps': [], 'documents': {}, 'summary': {}
+    }
 
     source_by_resource = defaultdict(list)
     for unit in source_index.get('units', []):
@@ -897,7 +890,7 @@ def main():
     edge_counts = Counter(edge['kind'] for edge in edges)
     node_counts = Counter(node['type'] for node in nodes.values())
     graph = {
-        'schema': 'source-graph/v1',
+        'schema': SOURCE_GRAPH.schema,
         'project': str(project),
         'capture_salvaged': bool(manifest['source'].get('salvaged')),
         'nodes': sorted(nodes.values(), key=lambda n: n['id']),
@@ -910,8 +903,8 @@ def main():
             'external_urls': sum(n['type'] == 'external_url' for n in nodes.values()),
         },
     }
-    out = project / 'analysis/source-graph.json'
-    out.write_text(json.dumps(graph, indent=2) + '\n')
+    out = project / SOURCE_GRAPH.relative_path
+    write_artifact(project, SOURCE_GRAPH, graph)
     print(json.dumps(graph['summary'], sort_keys=True))
     print(f'wrote {out}')
 

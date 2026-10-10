@@ -8,6 +8,8 @@ import json
 import subprocess
 from pathlib import Path
 
+from analysis_artifacts import DEOBFUSCATION, WASM_HOST_EFFECTS, WASM_INDEX, load_artifact, write_artifact
+
 ROOT = Path(__file__).resolve().parents[1]
 TOOL_ROOT = ROOT / ".cargo-target-nodebug/debug"
 
@@ -65,8 +67,8 @@ def main() -> None:
     args = ap.parse_args()
 
     project = args.project.resolve()
-    wasm_index = load(project / "analysis/wasm/index.json")
-    deob = load(project / "analysis/deobfuscation.json")
+    wasm_index = load_artifact(project, WASM_INDEX)
+    deob = load_artifact(project, DEOBFUSCATION)
     deob_by_raw = {
         unit["raw_path"]: unit["output_path"]
         for unit in deob.get("units", [])
@@ -178,7 +180,7 @@ def main() -> None:
                 rows.append(row)
 
     out = {
-        "schema": "wasm-host-effect-correlation/v1",
+        "schema": WASM_HOST_EFFECTS.schema,
         "wasm_schema_required": "wasm-redox/deep-v5",
         "js_schema": "jsvm-wasm-import-semantics/v1",
         "safe_static_only": True,
@@ -196,8 +198,8 @@ def main() -> None:
             "skipped_modules": len(skipped_modules),
         },
     }
-    output = project / "analysis/wasm-host-effects.json"
-    output.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
+    output = project / WASM_HOST_EFFECTS.relative_path
+    write_artifact(project, WASM_HOST_EFFECTS, out)
     summary = out["summary"]
     print(
         "WASM host effects: "

@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 import argparse
-import json
 from collections import Counter
 from pathlib import Path
 
+from analysis_artifacts import (
+    BUNDLES,
+    DEOBFUSCATION,
+    GENERATED_RECOVERY,
+    IMPORT_MAPS,
+    JS_REFERENCES,
+    JSVM_INDEX,
+    RUNTIME_SCRIPTS,
+    SOURCE_GRAPH,
+    SOURCE_INDEX,
+    SOURCEMAPS,
+    load_artifact,
+)
+
 from capture_project import load_manifest
 
-
-def load(path: Path, default):
-    return json.loads(path.read_text()) if path.exists() else default
 
 
 def main():
@@ -20,25 +30,24 @@ def main():
     project = args.project.resolve()
 
     manifest = load_manifest(project)
-    source_index = load(project / "analysis/source-index.json", {"units": []})
-    sourcemaps = load(project / "analysis/sourcemaps.json", {"source_maps": []})
-    jsrefs = load(project / "analysis/js-references.json", {"code_units": [], "summary": {}})
-    import_maps = load(project / "analysis/import-maps.json", {"maps": [], "summary": {}})
-    deob = load(project / "analysis/deobfuscation.json", {"units": [], "summary": {}})
-    jsvm = load(
-        project / "analysis/jsvm/index.json",
-        {"code_units": [], "dynamic_code_units": [], "devirtualized_units": []},
-    )
-    graph = load(project / "analysis/source-graph.json", {"summary": {}})
-    bundles = load(project / "analysis/bundles.json", {"bundles": [], "modules": [], "summary": {}})
-    generated_recovery = load(
-        project / "analysis/generated-recovery.json",
-        {"units": [], "summary": {}},
-    )
-    runtime_scripts = load(
-        project / "analysis/runtime-scripts.json",
-        {"sources": [], "alpine_families": [], "gtm_families": [], "summary": {}},
-    )
+    source_index = load_artifact(project, SOURCE_INDEX, optional=True) or {"units": []}
+    sourcemaps = load_artifact(project, SOURCEMAPS, optional=True) or {"source_maps": []}
+    jsrefs = load_artifact(project, JS_REFERENCES, optional=True) or {"code_units": [], "summary": {}}
+    import_maps = load_artifact(project, IMPORT_MAPS, optional=True) or {"maps": [], "summary": {}}
+    deob = load_artifact(project, DEOBFUSCATION, optional=True) or {"units": [], "summary": {}}
+    jsvm = load_artifact(project, JSVM_INDEX, optional=True) or {
+        "code_units": [], "dynamic_code_units": [], "devirtualized_units": []
+    }
+    graph = load_artifact(project, SOURCE_GRAPH, optional=True) or {"summary": {}}
+    bundles = load_artifact(project, BUNDLES, optional=True) or {
+        "bundles": [], "modules": [], "summary": {}
+    }
+    generated_recovery = load_artifact(project, GENERATED_RECOVERY, optional=True) or {
+        "units": [], "summary": {}
+    }
+    runtime_scripts = load_artifact(project, RUNTIME_SCRIPTS, optional=True) or {
+        "sources": [], "alpine_families": [], "gtm_families": [], "summary": {}
+    }
 
     resources = manifest.get("resources", [])
     source_units = source_index.get("units", [])

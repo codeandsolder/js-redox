@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote_to_bytes, urljoin, urlparse
 
+from analysis_artifacts import SOURCEMAPS, write_artifact
+
 from capture_project import load_manifest
 
 MAX_CHAIN_DEPTH = 16
@@ -530,10 +532,10 @@ def main() -> None:
             )
 
     out = {
-        "schema": "har-sourcemap-recovery/v1",
+        "schema": SOURCEMAPS.schema,
         "source_maps": results,
     }
-    (analysis / "sourcemaps.json").write_text(json.dumps(out, indent=2) + "\n")
+    write_artifact(project, SOURCEMAPS, out)
 
     recovered = sum(
         item.get("status") == "recovered"
