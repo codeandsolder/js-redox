@@ -2,22 +2,119 @@ use super::html::{
     extract_script_tags, inline_script_extension, is_executable_script_type, is_json_script_type,
     resolve_ref, script_type, source_refs,
 };
+use super::parse::{Har, HarEntry, NameValue};
 use super::resource::{
-    decode_body, format_json_if_possible, headers, output_path_for, refine_resource_kind,
-    resource_kind, write_resource,
+    decode_body, format_json_if_possible, output_path_for, refine_resource_kind, resource_kind,
+    write_resource,
 };
-use super::{
-    CaptureSource, Har, HarEntry, HarProjectOptions, InlineScriptMeta, PageMeta, ProjectManifest,
-    Reference, ResourceMeta,
-};
+use super::{HarProjectOptions, HarProjectSummary};
 use crate::sha256_hex;
 use anyhow::{Context, Result};
+use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Write as _,
     fs,
     path::Path,
 };
+
+#[derive(Debug, Clone, Serialize)]
+struct PageMeta {
+    id: String,
+    title: String,
+    started_date_time: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HeaderMeta {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct Reference {
+    pub(super) kind: String,
+    pub(super) raw: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) resolved_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ResourceMeta {
+    id: usize,
+    pageref: Option<String>,
+    started_date_time: String,
+    time_ms: f64,
+    method: String,
+    url: String,
+    status: i64,
+    status_text: String,
+    mime_type: String,
+    resource_type: Option<String>,
+    declared_size: i64,
+    encoding: Option<String>,
+    body_present: bool,
+    body_complete: bool,
+    body_bytes: usize,
+    sha256: Option<String>,
+    transport_kind: String,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_failure: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_capture: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_path: Option<String>,
+    reused_body: bool,
+    request_headers: Vec<HeaderMeta>,
+    response_headers: Vec<HeaderMeta>,
+    references: Vec<Reference>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InlineScriptMeta {
+    parent_resource_id: usize,
+    ordinal: usize,
+    script_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    src: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_src: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_path: Option<String>,
+    body_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CaptureSource {
+    kind: &'static str,
+    input: String,
+    har_version: String,
+    salvaged: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectManifest {
+    schema: &'static str,
+    source: CaptureSource,
+    pages: Vec<PageMeta>,
+    resources: Vec<ResourceMeta>,
+    inline_scripts: Vec<InlineScriptMeta>,
+    counts: BTreeMap<String, usize>,
+}
+
+fn headers(src: &[NameValue]) -> Vec<HeaderMeta> {
+    src.iter()
+        .map(|header| HeaderMeta {
+            name: header.name.clone(),
+            value: header.value.clone(),
+        })
+        .collect()
+}
 
 fn page_metadata(har: &Har) -> Vec<PageMeta> {
     har.log
@@ -196,7 +293,7 @@ fn materialize_entry(
     })
 }
 
-pub(super) fn build_manifest(
+fn build_manifest(
     args: &HarProjectOptions,
     har: Har,
     salvaged: bool,
@@ -237,10 +334,7 @@ pub(super) fn build_manifest(
     })
 }
 
-pub(super) fn write_project_metadata(
-    args: &HarProjectOptions,
-    manifest: &ProjectManifest,
-) -> Result<()> {
+fn write_project_metadata(args: &HarProjectOptions, manifest: &ProjectManifest) -> Result<()> {
     fs::write(
         args.output.join("capture-manifest.json"),
         format!("{}\n", serde_json::to_string_pretty(manifest)?),
@@ -263,4 +357,19 @@ pub(super) fn write_project_metadata(
         ),
     )?;
     Ok(())
+}
+
+pub(super) fn materialize_project(
+    args: &HarProjectOptions,
+    har: Har,
+    salvaged: bool,
+    parse_error: Option<String>,
+) -> Result<HarProjectSummary> {
+    let manifest = build_manifest(args, har, salvaged, parse_error)?;
+    write_project_metadata(args, &manifest)?;
+    Ok(HarProjectSummary {
+        resources: manifest.resources.len(),
+        script_records: manifest.inline_scripts.len(),
+        counts: manifest.counts,
+    })
 }

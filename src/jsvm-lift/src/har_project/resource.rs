@@ -1,18 +1,9 @@
-use super::{HarContent, HeaderMeta, JsRedoxBodyRef, NameValue};
+use super::parse::{HarContent, JsRedoxBodyRef};
 use crate::sha256_hex;
 use anyhow::{ensure, Context, Result};
 use base64::Engine;
 use std::{collections::HashMap, fs, path::Path};
 use url::Url;
-
-pub(super) fn headers(src: &[NameValue]) -> Vec<HeaderMeta> {
-    src.iter()
-        .map(|h| HeaderMeta {
-            name: h.name.clone(),
-            value: h.value.clone(),
-        })
-        .collect()
-}
 
 fn short_hash(text: &str) -> String {
     sha256_hex(text.as_bytes())[..10].to_string()
