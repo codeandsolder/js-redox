@@ -926,6 +926,7 @@ struct SemanticCallNames {
     validated_view_new_imports: BTreeSet<Func>,
     validated_get_u32_imports: BTreeSet<Func>,
     validated_memory_get_u32_helpers: BTreeSet<Func>,
+    opaque_host_effect_helpers: BTreeMap<Func, Func>,
 }
 
 fn strip_wasm_bindgen_hash(name: &str) -> &str {
@@ -1013,6 +1014,18 @@ fn is_entry_parameter(body: &FunctionBody, value: Value) -> bool {
             if block == body.entry
                 && usize::try_from(index).is_ok_and(|index| index < body.n_params)
     )
+}
+
+fn entry_parameter_index(body: &FunctionBody, value: Value) -> Option<usize> {
+    match body.values[body.resolve_alias(value)] {
+        ValueDef::BlockParam(block, index, _)
+            if block == body.entry
+                && usize::try_from(index).is_ok_and(|index| index < body.n_params) =>
+        {
+            usize::try_from(index).ok()
+        }
+        _ => None,
+    }
 }
 
 fn table_get_slot(body: &FunctionBody, value: Value) -> Option<Value> {
@@ -1205,6 +1218,89 @@ fn helper_is_loose_get_u32(body: &FunctionBody, names: &SemanticCallNames) -> bo
     })
 }
 
+fn is_straight_line_void_body(body: &FunctionBody) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut block = body.entry;
+    loop {
+        if !seen.insert(block) {
+            return false;
+        }
+        match &body.blocks[block].terminator {
+            Terminator::Br { target } if target.args.is_empty() => block = target.block,
+            Terminator::Return { values } if values.is_empty() => {
+                return seen.len() == body.blocks.entries().count();
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn opaque_host_effect_target(
+    body: &FunctionBody,
+    imported_functions: &BTreeSet<Func>,
+) -> Option<Func> {
+    if body.n_params != 3 || !is_straight_line_void_body(body) {
+        return None;
+    }
+
+    if body.values.entries().any(|(_, value)| {
+        matches!(
+            value,
+            ValueDef::Operator(operator, _, _)
+                if !matches!(operator, Operator::Call { .. } | Operator::TableGet { .. })
+        )
+    }) {
+        return None;
+    }
+
+    let mut calls = body.values.entries().filter_map(|(_, value)| {
+        let ValueDef::Operator(Operator::Call { function_index }, args, _) = value else {
+            return None;
+        };
+        Some((*function_index, body.arg_pool[*args].to_vec()))
+    });
+    let (imported, args) = calls.next()?;
+    if calls.next().is_some() || !imported_functions.contains(&imported) {
+        return None;
+    }
+    let [receiver, base, offset] = args.as_slice() else {
+        return None;
+    };
+    if table_get_slot(body, *receiver).and_then(|slot| entry_parameter_index(body, slot)) != Some(0)
+        || entry_parameter_index(body, *base) != Some(1)
+        || entry_parameter_index(body, *offset) != Some(2)
+    {
+        return None;
+    }
+    Some(imported)
+}
+
+fn memory_grow_base_slot(
+    body: &FunctionBody,
+    base: Value,
+    names: &SemanticCallNames,
+) -> Option<Value> {
+    let base = body.resolve_alias(base);
+    let ValueDef::Operator(Operator::I32Shl, args, _) = &body.values[base] else {
+        return None;
+    };
+    let [grow_result, shift] = &body.arg_pool[*args] else {
+        return None;
+    };
+    if i32_const(body, *shift) != Some(16) {
+        return None;
+    }
+    let (grow_function, grow_args) = call_target(body, *grow_result, 8)?;
+    if !names.validated_memory_grow_imports.contains(&grow_function) {
+        return None;
+    }
+    let [receiver, _delta] = grow_args.as_slice() else {
+        return None;
+    };
+    let memory_slot = memory_slot_from_table_get(body, *receiver, names)?;
+    Some(unique_transparent_origin(body, memory_slot, 8))
+}
+
 fn classify_base_wasm_bindgen_helper(
     body: &FunctionBody,
     names: &SemanticCallNames,
@@ -1367,6 +1463,20 @@ fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> SemanticCal
         }
         if !changed {
             break;
+        }
+    }
+
+    // Record tiny wrappers that unconditionally forward
+    // (externref slot, base, offset) to one imported host function. The import
+    // remains opaque: this proves an effect boundary, not that the host function
+    // writes memory. Call-site analysis below separately proves the slot is the
+    // wasm Memory slot that produced the base through Memory.grow.
+    for callee in candidates.iter().copied() {
+        let Some(body) = module.funcs[callee].body() else {
+            continue;
+        };
+        if let Some(imported) = opaque_host_effect_target(body, &imported_functions) {
+            names.opaque_host_effect_helpers.insert(callee, imported);
         }
     }
 
@@ -2030,7 +2140,11 @@ fn render_return_expressions(
     body: &FunctionBody,
     bindings: &BTreeMap<Value, String>,
     call_names: &SemanticCallNames,
-) -> (Vec<String>, Vec<SemanticRuntimeBindingReport>) {
+) -> (
+    Vec<String>,
+    Vec<SemanticRuntimeBindingReport>,
+    BTreeMap<Value, String>,
+) {
     let mut expressions = Vec::new();
     let mut context = SemanticRenderContext {
         bindings,
@@ -2050,7 +2164,114 @@ fn render_return_expressions(
             }
         }
     }
-    (expressions, context.runtime_bindings)
+    (expressions, context.runtime_bindings, context.runtime_names)
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct OpaqueHostEffectMemoryReadReport {
+    /// WAFFLE basic block containing both operations. The host effect call is
+    /// earlier than the validated memory read in this same block.
+    pub block: usize,
+    pub host_effect_value: usize,
+    pub host_wrapper_function: usize,
+    pub host_import_function: usize,
+    /// Normalized imported host function reached through the proven wrapper.
+    /// The import remains semantically opaque; this does not claim a write.
+    pub host_import: String,
+    pub memory_read_value: usize,
+    pub memory_read_helper: usize,
+    pub base_value: usize,
+    pub offset: u32,
+    pub runtime_binding: Option<String>,
+}
+
+fn base_and_constant_offset(body: &FunctionBody, address: Value) -> Option<(Value, u32)> {
+    let address = body.resolve_alias(address);
+    let ValueDef::Operator(Operator::I32Or, args, _) = &body.values[address] else {
+        return None;
+    };
+    let [left, right] = &body.arg_pool[*args] else {
+        return None;
+    };
+    if let Some(offset) = i32_const(body, *left) {
+        return Some((unique_transparent_origin(body, *right, 8), offset));
+    }
+    i32_const(body, *right).map(|offset| (unique_transparent_origin(body, *left, 8), offset))
+}
+
+fn opaque_host_effect_memory_reads(
+    body: &FunctionBody,
+    names: &SemanticCallNames,
+    runtime_names: &BTreeMap<Value, String>,
+) -> Vec<OpaqueHostEffectMemoryReadReport> {
+    let mut reports = Vec::new();
+    for (block, block_def) in body.blocks.entries() {
+        let mut earlier_host_effects: BTreeMap<(Value, u32), (Value, Func, Func)> = BTreeMap::new();
+        for inst in &block_def.insts {
+            let value = body.resolve_alias(*inst);
+            let ValueDef::Operator(Operator::Call { function_index }, args, _) =
+                &body.values[value]
+            else {
+                continue;
+            };
+            let call_args = &body.arg_pool[*args];
+            if let Some(imported) = names
+                .opaque_host_effect_helpers
+                .get(function_index)
+                .copied()
+            {
+                if let [slot, base, offset] = call_args {
+                    let slot = unique_transparent_origin(body, *slot, 8);
+                    if memory_grow_base_slot(body, *base, names) == Some(slot) {
+                        if let Some(offset) = i32_const(body, *offset) {
+                            earlier_host_effects.insert(
+                                (unique_transparent_origin(body, *base, 8), offset),
+                                (value, *function_index, imported),
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+            if !names
+                .validated_memory_get_u32_helpers
+                .contains(function_index)
+            {
+                continue;
+            }
+            let [address] = call_args else {
+                continue;
+            };
+            let Some((base, offset)) = base_and_constant_offset(body, *address) else {
+                continue;
+            };
+            let Some((host_effect_value, host_wrapper, host_import)) =
+                earlier_host_effects.get(&(base, offset)).copied()
+            else {
+                continue;
+            };
+            let report = OpaqueHostEffectMemoryReadReport {
+                block: block.index(),
+                host_effect_value: host_effect_value.index(),
+                host_wrapper_function: host_wrapper.index(),
+                host_import_function: host_import.index(),
+                host_import: names
+                    .labels
+                    .get(&host_import)
+                    .cloned()
+                    .unwrap_or_else(|| format!("func{}", host_import.index())),
+                memory_read_value: value.index(),
+                memory_read_helper: function_index.index(),
+                base_value: base.index(),
+                offset,
+                runtime_binding: runtime_names.get(&value).cloned(),
+            };
+            if !reports.contains(&report) {
+                reports.push(report);
+            }
+        }
+    }
+    reports
 }
 
 fn machine_contains(machines: &[StateMachineReport], outer: usize, inner: usize) -> bool {
@@ -2202,6 +2423,7 @@ pub struct ExportSemanticAnalysis {
     pub state_machines: Vec<StateMachineReport>,
     pub terminal_bindings: Vec<SemanticBindingReport>,
     pub runtime_bindings: Vec<SemanticRuntimeBindingReport>,
+    pub opaque_host_effect_memory_reads: Vec<OpaqueHostEffectMemoryReadReport>,
     pub return_expressions: Vec<String>,
 }
 
@@ -2347,14 +2569,17 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
     let state_machine_roots = root_machine_indices(&machines);
     let state_machine_pipelines = compose_machine_pipelines(&machines);
     let (bindings, terminal_bindings) = terminal_bindings(body, &machines, &metadata);
-    let (return_expressions, runtime_bindings) =
+    let (return_expressions, runtime_bindings, runtime_names) =
         render_return_expressions(body, &bindings, &call_names);
+    let opaque_host_effect_memory_reads =
+        opaque_host_effect_memory_reads(body, &call_names, &runtime_names);
     Ok(ExportSemanticAnalysis {
         state_machine_roots,
         state_machine_pipelines,
         state_machines: machines,
         terminal_bindings,
         runtime_bindings,
+        opaque_host_effect_memory_reads,
         return_expressions,
     })
 }
@@ -2999,6 +3224,217 @@ mod tests {
         );
         Ok(())
     }
+    fn host_effect_memory_fixture(host_effect_body: &str, run_body: &str) -> Result<Vec<u8>> {
+        wat::parse_str(format!(
+            r#"(module
+                (import "wbg" "__wbindgen_memory" (func $memory (result externref)))
+                (import "wbg" "__wbg_grow_43d369088a370694"
+                    (func $grow (param externref i32) (result i32)))
+                (import "wbg" "__wbg_buffer_609cc3eee51ed158"
+                    (func $buffer (param externref) (result externref)))
+                (import "wbg" "__wbg_byteLength_ea52ac3de882b483"
+                    (func $byte_length (param externref) (result i32)))
+                (import "wbg" "__wbg_new_7e079fa25e135eb1"
+                    (func $view_new (param externref i32 i32) (result externref)))
+                (import "wbg" "__wbg_getUint32_9c3cc8fde7919ed4"
+                    (func $get_u32 (param externref i32) (result i32)))
+                (import "host" "opaque_signal"
+                    (func $opaque_signal (param externref i32 i32)))
+                (import "host" "alloc" (func $alloc (result i32)))
+                (table 16 externref)
+
+                (func $memory_slot (result i32)
+                    (local $slot i32)
+                    call $alloc
+                    local.tee $slot
+                    call $memory
+                    table.set 0
+                    local.get $slot)
+
+                (func $buffer_slot (param $memory_slot i32) (result i32)
+                    (local $buffer externref)
+                    (local $slot i32)
+                    local.get $memory_slot
+                    table.get 0
+                    call $buffer
+                    local.set $buffer
+                    call $alloc
+                    local.tee $slot
+                    local.get $buffer
+                    table.set 0
+                    local.get $slot)
+
+                (func $memory_get (param $offset i32) (result i32)
+                    (local $buffer_slot i32)
+                    (local $length i32)
+                    (local $view externref)
+                    (local $view_slot i32)
+                    call $memory_slot
+                    call $buffer_slot
+                    local.tee $buffer_slot
+                    table.get 0
+                    call $byte_length
+                    local.set $length
+                    local.get $buffer_slot
+                    table.get 0
+                    i32.const 0
+                    local.get $length
+                    call $view_new
+                    local.set $view
+                    call $alloc
+                    local.tee $view_slot
+                    local.get $view
+                    table.set 0
+                    local.get $view_slot
+                    table.get 0
+                    local.get $offset
+                    call $get_u32)
+
+                (func $host_effect (param $slot i32) (param $base i32) (param $offset i32)
+                    {host_effect_body})
+
+                (func (export "run") (result i32)
+                    (local $slot i32)
+                    (local $base i32)
+                    call $memory_slot
+                    local.tee $slot
+                    table.get 0
+                    i32.const 1
+                    call $grow
+                    i32.const 16
+                    i32.shl
+                    local.set $base
+                    {run_body}))"#
+        ))
+        .map_err(Into::into)
+    }
+
+    const STRAIGHT_HOST_EFFECT: &str = r#"
+        local.get $slot
+        table.get 0
+        local.get $base
+        local.get $offset
+        call $opaque_signal
+    "#;
+
+    #[test]
+    fn reports_same_block_opaque_host_effect_before_memory_read() -> Result<()> {
+        let bytes = host_effect_memory_fixture(
+            STRAIGHT_HOST_EFFECT,
+            r#"
+                local.get $slot
+                local.get $base
+                i32.const 3536
+                call $host_effect
+                local.get $base
+                i32.const 3536
+                i32.or
+                call $memory_get
+            "#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(analysis.opaque_host_effect_memory_reads.len(), 1);
+        let relation = &analysis.opaque_host_effect_memory_reads[0];
+        assert_eq!(relation.offset, 3536);
+        assert_eq!(relation.host_import, "host.opaque_signal");
+        assert!(relation
+            .runtime_binding
+            .as_deref()
+            .is_some_and(|name| name.starts_with("$runtime")));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_host_effect_memory_read_with_different_offset() -> Result<()> {
+        let bytes = host_effect_memory_fixture(
+            STRAIGHT_HOST_EFFECT,
+            r#"
+                local.get $slot
+                local.get $base
+                i32.const 3536
+                call $host_effect
+                local.get $base
+                i32.const 3540
+                i32.or
+                call $memory_get
+            "#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert!(analysis.opaque_host_effect_memory_reads.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_host_effect_with_different_memory_slot() -> Result<()> {
+        let bytes = host_effect_memory_fixture(
+            STRAIGHT_HOST_EFFECT,
+            r#"
+                i32.const 3
+                local.get $base
+                i32.const 3536
+                call $host_effect
+                local.get $base
+                i32.const 3536
+                i32.or
+                call $memory_get
+            "#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert!(analysis.opaque_host_effect_memory_reads.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_memory_read_before_host_effect() -> Result<()> {
+        let bytes = host_effect_memory_fixture(
+            STRAIGHT_HOST_EFFECT,
+            r#"
+                local.get $base
+                i32.const 3536
+                i32.or
+                call $memory_get
+                drop
+                local.get $slot
+                local.get $base
+                i32.const 3536
+                call $host_effect
+                i32.const 0
+            "#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert!(analysis.opaque_host_effect_memory_reads.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_conditional_opaque_host_effect_wrapper() -> Result<()> {
+        let bytes = host_effect_memory_fixture(
+            r#"
+                local.get $offset
+                if
+                    local.get $slot
+                    table.get 0
+                    local.get $base
+                    local.get $offset
+                    call $opaque_signal
+                end
+            "#,
+            r#"
+                local.get $slot
+                local.get $base
+                i32.const 3536
+                call $host_effect
+                local.get $base
+                i32.const 3536
+                i32.or
+                call $memory_get
+            "#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert!(analysis.opaque_host_effect_memory_reads.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn names_only_proven_module_memory_get_u32_bridge_strongly() -> Result<()> {
         let bytes = wat::parse_str(

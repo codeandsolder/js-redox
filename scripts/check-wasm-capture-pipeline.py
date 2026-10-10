@@ -73,7 +73,10 @@ def main():
     assert module["has_direct_resource"] is True
     assert module["has_inline_origin"] is True
     assert (PROJECT / module["report_path"]).is_file()
-    assert (PROJECT / module["deep_path"]).is_file()
+    deep_path = PROJECT / module["deep_path"]
+    assert deep_path.is_file()
+    deep = json.loads(deep_path.read_text())
+    assert deep["schema"] == "wasm-redox/deep-v5"
     run("uv", "run", "--no-project", "python", "scripts/build-source-graph.py", PROJECT)
     graph = json.loads((PROJECT / "analysis/source-graph.json").read_text())
     wasm_nodes = [node for node in graph["nodes"] if node["type"] == "wasm_module"]
