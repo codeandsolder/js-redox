@@ -63,6 +63,7 @@ struct StaticAliasInstallerCallReport {
     target_selector: u8,
     target_hint: Option<String>,
     alias_property: String,
+    forwarding_installer_proven: bool,
     semantics_proven: bool,
 }
 
@@ -132,6 +133,7 @@ fn main() -> Result<()> {
                     target_selector: call.target_selector,
                     target_hint,
                     alias_property: call.alias_property,
+                    forwarding_installer_proven: call.forwarding_installer_proven,
                     semantics_proven: call.semantics_proven,
                 }
             })

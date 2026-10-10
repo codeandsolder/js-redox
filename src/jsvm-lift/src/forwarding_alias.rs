@@ -1,3 +1,4 @@
+use crate::forwarding_semantics::structurally_proven_forwarding_installers;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, Expression, Function, ReturnStatement,
@@ -20,6 +21,10 @@ pub struct StaticAliasInstallerCall {
     pub source_property: String,
     pub target_selector: u8,
     pub alias_property: String,
+    /// The installer contains a structurally proven live getter/setter forwarding path.
+    /// This does not imply that this invocation successfully installs that forwarding.
+    pub forwarding_installer_proven: bool,
+    /// Reserved for call-specific proof that alias substitution is sound.
     pub semantics_proven: bool,
 }
 
@@ -292,6 +297,7 @@ impl<'a> Visit<'a> for ResolverCollector<'_> {
 struct CallCollector<'c> {
     scoping: &'c Scoping,
     resolvers: &'c HashMap<SymbolId, ResolverShape>,
+    proven_installers: &'c HashSet<SymbolId>,
     calls: Vec<StaticAliasInstallerCall>,
 }
 
@@ -313,6 +319,11 @@ impl<'a> Visit<'a> for CallCollector<'_> {
                 walk::walk_call_expression(self, it);
                 return;
             };
+            let forwarding_installer_proven = callee
+                .reference_id
+                .get()
+                .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                .is_some_and(|symbol| self.proven_installers.contains(&symbol));
             let Some(resolver) = self.resolver_for(&it.arguments[0]) else {
                 walk::walk_call_expression(self, it);
                 return;
@@ -346,6 +357,11 @@ impl<'a> Visit<'a> for CallCollector<'_> {
                 source_property: source_property.value.to_string(),
                 target_selector,
                 alias_property: alias_property.value.to_string(),
+                forwarding_installer_proven,
+                // A proven installer contains a live-forwarding installation path.
+                // This call may still early-return on pre-existing aliases or fail
+                // defineProperty under arbitrary host state, so substitution semantics
+                // are deliberately not claimed here.
                 semantics_proven: false,
             });
         }
@@ -368,6 +384,8 @@ pub fn static_alias_installer_calls(source: &str) -> Vec<StaticAliasInstallerCal
             continue;
         }
         let semantic = semantic_ret.semantic;
+        let proven_installers =
+            structurally_proven_forwarding_installers(&parsed.program, semantic.scoping());
         let mut resolver_collector = ResolverCollector {
             scoping: semantic.scoping(),
             resolvers: HashMap::new(),
@@ -376,6 +394,7 @@ pub fn static_alias_installer_calls(source: &str) -> Vec<StaticAliasInstallerCal
         let mut call_collector = CallCollector {
             scoping: semantic.scoping(),
             resolvers: &resolver_collector.resolvers,
+            proven_installers: &proven_installers,
             calls: Vec::new(),
         };
         call_collector.visit_program(&parsed.program);
