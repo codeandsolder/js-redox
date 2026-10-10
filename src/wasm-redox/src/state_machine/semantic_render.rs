@@ -1,0 +1,253 @@
+use super::{
+    helper_recognition::{memory_slot_from_table_get, SemanticCallNames},
+    ir::{i32_const, operator_family},
+    scalar::{is_inlineable_scalar, render_scalar_family, reverse_bits_source},
+    value_flow::{conditional_phi_inputs, incoming_block_param_edges},
+};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+use waffle::{entity::EntityRef, FunctionBody, Operator, Terminator, Value, ValueDef};
+
+#[derive(Debug, Serialize)]
+pub struct SemanticRuntimeBindingReport {
+    pub name: String,
+    pub expression: String,
+}
+
+fn is_runtime_boundary(op: &Operator) -> bool {
+    let family = operator_family(op);
+    matches!(op, Operator::Call { .. })
+        || family.starts_with("i32load")
+        || family.starts_with("i64load")
+        || family.starts_with("f32load")
+        || family.starts_with("f64load")
+        || family.starts_with("globalget")
+        || family.starts_with("global_get")
+}
+
+struct SemanticRenderContext<'a> {
+    bindings: &'a BTreeMap<Value, String>,
+    call_names: &'a SemanticCallNames,
+    runtime_names: BTreeMap<Value, String>,
+    runtime_bindings: Vec<SemanticRuntimeBindingReport>,
+}
+
+fn render_semantic_value(
+    body: &FunctionBody,
+    value: Value,
+    context: &mut SemanticRenderContext<'_>,
+    depth: usize,
+    visiting: &mut BTreeSet<Value>,
+) -> String {
+    let value = body.resolve_alias(value);
+    if let Some(binding) = context.bindings.get(&value) {
+        return binding.clone();
+    }
+    if let Some(binding) = context.runtime_names.get(&value) {
+        return binding.clone();
+    }
+    if let Some(constant) = i32_const(body, value) {
+        return format!("0x{constant:08x}");
+    }
+    if let Some(source) = reverse_bits_source(body, value) {
+        if source != value {
+            return format!(
+                "reverse_bits32({})",
+                render_semantic_value(body, source, context, depth.saturating_sub(1), visiting)
+            );
+        }
+    }
+    if depth == 0 || !visiting.insert(value) {
+        return format!("v{}", value.index());
+    }
+
+    let (rendered, runtime_boundary) = match &body.values[value] {
+        ValueDef::BlockParam(block, index, _) => {
+            let rendered = if *block == body.entry
+                && usize::try_from(*index).is_ok_and(|index| index < body.n_params)
+            {
+                format!("$arg{index}")
+            } else {
+                let incoming_edges = incoming_block_param_edges(body, *block, value);
+                let incoming_values = incoming_edges
+                    .iter()
+                    .map(|(_, incoming)| *incoming)
+                    .collect::<BTreeSet<_>>();
+                match incoming_values.len() {
+                    0 => format!("$block{}p{index}", block.index()),
+                    1 => {
+                        let incoming = incoming_values.into_iter().next().unwrap_or(value);
+                        render_semantic_value(
+                            body,
+                            incoming,
+                            context,
+                            depth.saturating_sub(1),
+                            visiting,
+                        )
+                    }
+                    _ => {
+                        if let Some((condition, if_true, if_false)) =
+                            conditional_phi_inputs(body, &incoming_edges)
+                        {
+                            let condition = render_semantic_value(
+                                body,
+                                condition,
+                                context,
+                                depth.saturating_sub(1),
+                                visiting,
+                            );
+                            let if_true = render_semantic_value(
+                                body,
+                                if_true,
+                                context,
+                                depth.saturating_sub(1),
+                                visiting,
+                            );
+                            let if_false = render_semantic_value(
+                                body,
+                                if_false,
+                                context,
+                                depth.saturating_sub(1),
+                                visiting,
+                            );
+                            format!("phi_if({condition}, {if_true}, {if_false})")
+                        } else {
+                            let incoming = incoming_values
+                                .into_iter()
+                                .map(|incoming| {
+                                    render_semantic_value(
+                                        body,
+                                        incoming,
+                                        context,
+                                        depth.saturating_sub(1),
+                                        visiting,
+                                    )
+                                })
+                                .collect::<BTreeSet<_>>();
+                            format!(
+                                "phi({})",
+                                incoming.into_iter().collect::<Vec<_>>().join(", ")
+                            )
+                        }
+                    }
+                }
+            };
+            (rendered, false)
+        }
+        ValueDef::Operator(op, arg_ref, _) => {
+            let raw_args = &body.arg_pool[*arg_ref];
+            {
+                let args = raw_args
+                    .iter()
+                    .map(|arg| {
+                        render_semantic_value(
+                            body,
+                            *arg,
+                            context,
+                            depth.saturating_sub(1),
+                            visiting,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let family = operator_family(op);
+                let rendered = if let Operator::Call { function_index } = op {
+                    if context.call_names.is_memory_grow_import(*function_index) {
+                        let [receiver, delta] = raw_args else {
+                            return format!("{op}({})", args.join(", "));
+                        };
+                        if let Some(slot) =
+                            memory_slot_from_table_get(body, *receiver, context.call_names)
+                        {
+                            let slot = render_semantic_value(
+                                body,
+                                slot,
+                                context,
+                                depth.saturating_sub(1),
+                                visiting,
+                            );
+                            let delta = render_semantic_value(
+                                body,
+                                *delta,
+                                context,
+                                depth.saturating_sub(1),
+                                visiting,
+                            );
+                            format!("wasm.memory_grow({delta}, externref_slot={slot})")
+                        } else {
+                            context.call_names.label(*function_index).map_or_else(
+                                || format!("{op}({})", args.join(", ")),
+                                |name| format!("{name}({})", args.join(", ")),
+                            )
+                        }
+                    } else {
+                        context.call_names.label(*function_index).map_or_else(
+                            || format!("{op}({})", args.join(", ")),
+                            |name| format!("{name}({})", args.join(", ")),
+                        )
+                    }
+                } else if is_inlineable_scalar(op) {
+                    render_scalar_family(&family, &args)
+                        .unwrap_or_else(|| format!("{family}({})", args.join(", ")))
+                } else {
+                    format!("{op}({})", args.join(", "))
+                };
+                (rendered, is_runtime_boundary(op))
+            }
+        }
+        ValueDef::PickOutput(source, index, _) => (
+            format!(
+                "pick{index}({})",
+                render_semantic_value(body, *source, context, depth.saturating_sub(1), visiting,)
+            ),
+            false,
+        ),
+        ValueDef::Alias(source) => (
+            render_semantic_value(body, *source, context, depth.saturating_sub(1), visiting),
+            false,
+        ),
+        ValueDef::Placeholder(_) | ValueDef::None => (format!("v{}", value.index()), false),
+    };
+    visiting.remove(&value);
+    if runtime_boundary {
+        let name = format!("$runtime{}", context.runtime_bindings.len());
+        context.runtime_names.insert(value, name.clone());
+        context.runtime_bindings.push(SemanticRuntimeBindingReport {
+            name: name.clone(),
+            expression: rendered,
+        });
+        name
+    } else {
+        rendered
+    }
+}
+
+pub(super) fn render_return_expressions(
+    body: &FunctionBody,
+    bindings: &BTreeMap<Value, String>,
+    call_names: &SemanticCallNames,
+) -> (
+    Vec<String>,
+    Vec<SemanticRuntimeBindingReport>,
+    BTreeMap<Value, String>,
+) {
+    let mut expressions = Vec::new();
+    let mut context = SemanticRenderContext {
+        bindings,
+        call_names,
+        runtime_names: BTreeMap::new(),
+        runtime_bindings: Vec::new(),
+    };
+    for (_, block) in body.blocks.entries() {
+        let Terminator::Return { values } = &block.terminator else {
+            continue;
+        };
+        for value in values {
+            let mut visiting = BTreeSet::new();
+            let expression = render_semantic_value(body, *value, &mut context, 48, &mut visiting);
+            if !expressions.contains(&expression) {
+                expressions.push(expression);
+            }
+        }
+    }
+    (expressions, context.runtime_bindings, context.runtime_names)
+}
