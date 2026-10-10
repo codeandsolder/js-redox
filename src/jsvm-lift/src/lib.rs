@@ -34,3 +34,4 @@ pub mod source_directive;
 pub mod semantic_ir;
 
 pub mod structural_signals;
+pub mod sus_scan;
