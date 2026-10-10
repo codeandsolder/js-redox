@@ -20,3 +20,5 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 pub mod forwarding_alias;
+
+pub mod forwarding_semantics;

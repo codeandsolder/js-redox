@@ -147,6 +147,11 @@ CASES = [
         ROOT / "corpus/generated/reversible-obfuscation/static-alias-installer-calls.js",
         ['install(getArray, "push", 1, "f2AA")', 'install(identity, "__residual", 0, "i2AA")'],
     ),
+    (
+        "static-alias-live-forwarding",
+        ROOT / "corpus/generated/reversible-obfuscation/static-alias-live-forwarding.js",
+        ['install(getArray, "push", 1, "f2AA")'],
+    ),
 ]
 
 
@@ -320,13 +325,26 @@ def main():
                 assert calls[0]["target_selector"] == 1, calls
                 assert calls[0]["target_hint"] == "Array.prototype", calls
                 assert calls[0]["alias_property"] == "f2AA", calls
+                assert calls[0]["forwarding_installer_proven"] is False, calls
                 assert calls[0]["semantics_proven"] is False, calls
                 assert calls[1]["resolver"] == "identity", calls
                 assert calls[1]["resolver_member"] is None, calls
                 assert calls[1]["target_hint"] is None, calls
                 assert meta["analysis_source_sha256"] == meta["output_sha256"], meta
+            if name == "static-alias-live-forwarding":
+                calls = meta["static_alias_installer_calls"]
+                assert len(calls) == 1, calls
+                call = calls[0]
+                assert call["installer"] == "install", call
+                assert call["resolver"] == "getArray", call
+                assert call["resolver_member"] == "Array", call
+                assert call["target_hint"] == "Array.prototype", call
+                assert call["source_property"] == "push", call
+                assert call["alias_property"] == "f2AA", call
+                assert call["forwarding_installer_proven"] is True, call
+                assert call["semantics_proven"] is False, call
             assert meta["safe_static_only"] is True
-            if name == "static-alias-installer-calls":
+            if name in {"static-alias-installer-calls", "static-alias-live-forwarding"}:
                 assert meta["changed"] is False, meta
             else:
                 assert meta["changed"] is True
