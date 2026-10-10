@@ -1,5 +1,7 @@
 pub mod har_project;
 
+pub mod bundle_unpack;
+
 pub mod effect_shape;
 
 pub mod numeric;
