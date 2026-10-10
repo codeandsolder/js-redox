@@ -4,26 +4,28 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     panic::{catch_unwind, AssertUnwindSafe},
 };
-use waffle::{
-    entity::EntityRef, Block, ExportKind, FrontendOptions, Func, FunctionBody, Module, Operator,
-    OptOptions, Value, ValueDef,
-};
+use waffle::{entity::EntityRef, ExportKind, FrontendOptions, Module, OptOptions};
 
 mod helper_recognition;
+mod host_effect;
 mod ir;
+mod nesting;
 mod reporting;
 mod scalar;
 mod semantic_render;
 mod transition;
 mod value_flow;
 
+use helper_recognition::build_semantic_call_names;
 #[cfg(test)]
 use helper_recognition::normalize_import_name;
-use helper_recognition::{build_semantic_call_names, memory_grow_base_slot, SemanticCallNames};
+use host_effect::opaque_host_effect_memory_reads;
+pub use host_effect::OpaqueHostEffectMemoryReadReport;
 use ir::i32_const;
+use nesting::annotate_nested_machines;
 use reporting::{
     annotate_composed_machine_flows, annotate_initial_entries, linearize_state_graph,
-    summarize_state_case, target_argument_vectors, terminal_bindings, MachineMeta,
+    summarize_state_case, terminal_bindings, MachineMeta,
 };
 pub use reporting::{
     compose_machine_pipelines, root_machine_indices, NestedMachineEntryReport,
@@ -37,217 +39,6 @@ use scalar::{fold_closed_i32_expression, render_scalar_family};
 use semantic_render::render_return_expressions;
 pub use semantic_render::SemanticRuntimeBindingReport;
 use transition::{state_cmp_count, transitions_for};
-use value_flow::unique_transparent_origin;
-
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct OpaqueHostEffectMemoryReadReport {
-    /// WAFFLE basic block containing both operations. The host effect call is
-    /// earlier than the validated memory read in this same block.
-    pub block: usize,
-    pub host_effect_value: usize,
-    pub host_wrapper_function: usize,
-    pub host_import_function: usize,
-    /// Normalized imported host function reached through the proven wrapper.
-    /// The import remains semantically opaque; this does not claim a write.
-    pub host_import: String,
-    pub memory_read_value: usize,
-    pub memory_read_helper: usize,
-    pub base_value: usize,
-    pub offset: u32,
-    pub runtime_binding: Option<String>,
-}
-
-fn base_and_constant_offset(body: &FunctionBody, address: Value) -> Option<(Value, u32)> {
-    let address = body.resolve_alias(address);
-    let ValueDef::Operator(Operator::I32Or, args, _) = &body.values[address] else {
-        return None;
-    };
-    let [left, right] = &body.arg_pool[*args] else {
-        return None;
-    };
-    if let Some(offset) = i32_const(body, *left) {
-        return Some((unique_transparent_origin(body, *right, 8), offset));
-    }
-    i32_const(body, *right).map(|offset| (unique_transparent_origin(body, *left, 8), offset))
-}
-
-fn opaque_host_effect_memory_reads(
-    body: &FunctionBody,
-    names: &SemanticCallNames,
-    runtime_names: &BTreeMap<Value, String>,
-) -> Vec<OpaqueHostEffectMemoryReadReport> {
-    let mut reports = Vec::new();
-    for (block, block_def) in body.blocks.entries() {
-        let mut earlier_host_effects: BTreeMap<(Value, u32), (Value, Func, Func)> = BTreeMap::new();
-        for inst in &block_def.insts {
-            let value = body.resolve_alias(*inst);
-            let ValueDef::Operator(Operator::Call { function_index }, args, _) =
-                &body.values[value]
-            else {
-                continue;
-            };
-            let call_args = &body.arg_pool[*args];
-            if let Some(imported) = names.opaque_host_effect_import(*function_index) {
-                if let [slot, base, offset] = call_args {
-                    let slot = unique_transparent_origin(body, *slot, 8);
-                    if memory_grow_base_slot(body, *base, names) == Some(slot) {
-                        if let Some(offset) = i32_const(body, *offset) {
-                            earlier_host_effects.insert(
-                                (unique_transparent_origin(body, *base, 8), offset),
-                                (value, *function_index, imported),
-                            );
-                        }
-                    }
-                }
-                continue;
-            }
-            if !names.is_memory_get_u32_helper(*function_index) {
-                continue;
-            }
-            let [address] = call_args else {
-                continue;
-            };
-            let Some((base, offset)) = base_and_constant_offset(body, *address) else {
-                continue;
-            };
-            let Some((host_effect_value, host_wrapper, host_import)) =
-                earlier_host_effects.get(&(base, offset)).copied()
-            else {
-                continue;
-            };
-            let report = OpaqueHostEffectMemoryReadReport {
-                block: block.index(),
-                host_effect_value: host_effect_value.index(),
-                host_wrapper_function: host_wrapper.index(),
-                host_import_function: host_import.index(),
-                host_import: names
-                    .label(host_import)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("func{}", host_import.index())),
-                memory_read_value: value.index(),
-                memory_read_helper: function_index.index(),
-                base_value: base.index(),
-                offset,
-                runtime_binding: runtime_names.get(&value).cloned(),
-            };
-            if !reports.contains(&report) {
-                reports.push(report);
-            }
-        }
-    }
-    reports
-}
-
-fn machine_contains(machines: &[StateMachineReport], outer: usize, inner: usize) -> bool {
-    let dispatcher = machines[inner].dispatcher_block;
-    machines[outer]
-        .cases
-        .iter()
-        .any(|case| case.blocks.contains(&dispatcher))
-}
-
-fn annotate_nested_machines(
-    body: &FunctionBody,
-    machines: &mut [StateMachineReport],
-    metadata: &[MachineMeta],
-) {
-    let contains = (0..machines.len())
-        .map(|outer| {
-            (0..machines.len())
-                .map(|inner| outer != inner && machine_contains(machines, outer, inner))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-
-    let raw_regions = machines
-        .iter()
-        .map(|machine| {
-            machine
-                .cases
-                .iter()
-                .flat_map(|case| case.blocks.iter().copied())
-                .map(Block::new)
-                .collect::<BTreeSet<_>>()
-        })
-        .collect::<Vec<_>>();
-    let dispatcher_blocks = machines
-        .iter()
-        .map(|machine| Block::new(machine.dispatcher_block))
-        .collect::<Vec<_>>();
-
-    for machine_index in 0..machines.len() {
-        let meta = metadata[machine_index];
-        let order = machines[machine_index]
-            .linearized
-            .clone()
-            .unwrap_or_else(|| machines[machine_index].graph.keys().copied().collect());
-
-        let mut cases = Vec::with_capacity(order.len());
-        for current in order {
-            let trace =
-                transitions_for(body, meta.dispatcher, meta.state, meta.param_index, current);
-            let nested = (0..machines.len())
-                .filter(|&inner| {
-                    inner != machine_index
-                        && trace
-                            .blocks
-                            .iter()
-                            .any(|block| block.index() == machines[inner].dispatcher_block)
-                })
-                .collect::<BTreeSet<_>>();
-            let direct_nested = nested
-                .iter()
-                .copied()
-                .filter(|&inner| {
-                    !nested
-                        .iter()
-                        .copied()
-                        .any(|other| other != inner && contains[other][inner])
-                })
-                .collect::<BTreeSet<_>>();
-            let excluded = direct_nested
-                .iter()
-                .flat_map(|&inner| raw_regions[inner].iter().copied())
-                .collect::<BTreeSet<_>>();
-            let mut nested_entries = Vec::new();
-            for &inner in &direct_nested {
-                for arguments in target_argument_vectors(
-                    body,
-                    &trace.blocks,
-                    dispatcher_blocks[inner],
-                    machines[inner].state_param_index,
-                    &machines[inner].initial,
-                    meta.dispatcher,
-                    meta.state,
-                ) {
-                    let entry = NestedMachineEntryReport {
-                        machine_index: inner,
-                        arguments,
-                        composed_arguments: Vec::new(),
-                    };
-                    if !nested_entries.contains(&entry) {
-                        nested_entries.push(entry);
-                    }
-                }
-            }
-
-            let mut case = summarize_state_case(
-                body,
-                meta.dispatcher,
-                meta.state,
-                meta.param_index,
-                current,
-                &trace,
-                &excluded,
-            );
-            case.nested_machines = nested;
-            case.direct_nested_machines = direct_nested;
-            case.nested_entries = nested_entries;
-            cases.push(case);
-        }
-        machines[machine_index].cases = cases;
-    }
-}
 
 #[derive(Debug, Serialize)]
 pub struct ExportSemanticAnalysis {
