@@ -19,6 +19,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
 
+from analysis_artifacts import RUNTIME_SCRIPTS, write_artifact_path
+
 ALPINE_PREFIX = "(async function anonymous(__self,scope\n) {\nwith (scope) { __self.result = "
 ALPINE_SUFFIX = " }; __self.finished = true; return __self.result;\n})"
 ALPINE_IIFE_RE = re.compile(r"^\(async\(\)=>\{ (?P<body>.*) \}\)\(\)$", re.DOTALL)
@@ -443,7 +445,7 @@ def analyze(capture: Path) -> dict:
     ]
 
     return {
-        "schema": "js-redox-runtime-scripts/v1",
+        "schema": RUNTIME_SCRIPTS.schema,
         "capture": str(capture),
         "summary": {
             "script_parsed_events": len(events),
@@ -476,7 +478,7 @@ def main() -> None:
     report = analyze(capture)
     output = args.output or capture / "runtime-analysis.json"
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    write_artifact_path(output, RUNTIME_SCRIPTS, report)
     summary = report["summary"]
     classes = ", ".join(f"{key}={value}" for key, value in summary["classifications"].items())
     print(

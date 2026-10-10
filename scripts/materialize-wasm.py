@@ -6,11 +6,12 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
-import json
 import re
 import subprocess
 from collections import defaultdict
 from pathlib import Path
+
+from analysis_artifacts import WASM_INDEX, write_artifact
 
 from capture_project import load_manifest
 
@@ -180,7 +181,7 @@ def main() -> None:
 
     analysis_root.mkdir(parents=True, exist_ok=True)
     index = {
-        "schema": "wasm-redox/capture-v1",
+        "schema": WASM_INDEX.schema,
         "modules": modules,
         "summary": {
             "modules": len(modules),
@@ -190,7 +191,7 @@ def main() -> None:
             "origins": sum(len(row["origins"]) for row in modules),
         },
     }
-    (analysis_root / "index.json").write_text(json.dumps(index, indent=2) + "\n")
+    write_artifact(project, WASM_INDEX, index)
     print(
         "WASM: "
         f"{index['summary']['modules']} unique module(s), "

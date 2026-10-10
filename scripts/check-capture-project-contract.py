@@ -5,7 +5,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from capture_project import CaptureManifestError, SCHEMA, read_manifest
+from capture_project import CaptureManifestError, SCHEMA, read_manifest, write_manifest
 
 
 def write(path: Path, value: object) -> None:
@@ -42,7 +42,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="js-redox-capture-contract-") as tmp:
         path = Path(tmp) / "capture-manifest.json"
         manifest = valid_manifest()
-        write(path, manifest)
+        write_manifest(path, manifest)
         assert read_manifest(path) == manifest
 
         wrong_schema = valid_manifest()

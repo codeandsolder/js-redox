@@ -257,7 +257,7 @@ def main():
     assert app_deob["readable_formatted"] is True
 
     sourcemaps = json.loads((PROJECT / "analysis/sourcemaps.json").read_text())
-    assert sourcemaps["schema"] == "har-sourcemap-recovery/v1"
+    assert sourcemaps["schema"] == "capture-sourcemap-recovery/v1"
     assert all(sm.get("raw_reference") != "fake-string.js.map" for sm in sourcemaps["source_maps"])
     assert all(sm.get("status") != "decode_error" for sm in sourcemaps["source_maps"])
     app_sourcemap = next(

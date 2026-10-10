@@ -4,6 +4,8 @@ import json
 import re
 from pathlib import Path
 
+from analysis_artifacts import JSVM_INDEX, artifact_path, load_artifact, write_artifact
+
 
 def safe_name(value):
     value = re.sub(r"[^A-Za-z0-9._-]+", "-", value or "anon").strip("-")
@@ -182,12 +184,12 @@ def main():
     ap.add_argument("project", type=Path)
     args = ap.parse_args()
     project = args.project.resolve()
-    index_path = project / "analysis/jsvm/index.json"
+    index_path = artifact_path(project, JSVM_INDEX)
     if not index_path.exists():
         print("no VM analysis index; 0 devirtualized units")
         return
 
-    index = json.loads(index_path.read_text())
+    index = load_artifact(project, JSVM_INDEX)
     all_units = []
     switch_count = 0
     table_count = 0
@@ -365,7 +367,7 @@ def main():
         row["devirtualized_units"] = units
 
     index["devirtualized_units"] = all_units
-    index_path.write_text(json.dumps(index, indent=2) + "\n")
+    write_artifact(project, JSVM_INDEX, index)
     print(
         f"materialized {len(all_units)} VM module(s): "
         f"{switch_count} direct-switch + {table_count} function-table; "

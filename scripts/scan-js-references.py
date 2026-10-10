@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
+from analysis_artifacts import IMPORT_MAPS, JS_REFERENCES, SOURCE_INDEX, load_artifact, write_artifact
+
 from browser_script_types import is_executable_script
 from content_dedup import default_jobs, sha256_path
 from capture_project import load_manifest
@@ -292,7 +294,7 @@ def load_import_maps(project: Path, manifest: dict):
         maps_by_document[document_id] = merged
 
     analysis = {
-        "schema": "browser-import-maps/v0",
+        "schema": IMPORT_MAPS.schema,
         "maps": records,
         "documents": {
             str(document_id): import_map
@@ -310,9 +312,7 @@ def load_import_maps(project: Path, manifest: dict):
             "semantics, but runtime resolved-module-set timing is not reconstructed."
         ),
     }
-    (project / "analysis/import-maps.json").write_text(
-        json.dumps(analysis, indent=2) + "\n"
-    )
+    write_artifact(project, IMPORT_MAPS, analysis)
     return maps_by_document, analysis
 
 
@@ -328,7 +328,7 @@ def main():
 
     project = args.project.resolve()
     manifest = load_manifest(project)
-    source_index = json.loads((project / "analysis/source-index.json").read_text())
+    source_index = load_artifact(project, SOURCE_INDEX)
     import_maps, import_map_analysis = load_import_maps(project, manifest)
 
     rows = []
@@ -623,9 +623,9 @@ def main():
                 ambiguous += 1
 
     out = {
-        "schema": "har-js-references/v1",
+        "schema": JS_REFERENCES.schema,
         "extractor": str(args.extractor),
-        "import_maps": "analysis/import-maps.json",
+        "import_maps": str(IMPORT_MAPS.relative_path),
         "code_units": rows,
         "summary": {
             "javascript_units": len(rows),
@@ -648,8 +648,7 @@ def main():
             ),
         },
     }
-    path = project / "analysis/js-references.json"
-    path.write_text(json.dumps(out, indent=2) + "\n")
+    write_artifact(project, JS_REFERENCES, out)
     dynamic_candidates = sum(len(set(matches)) for matches in dynamic_glob_matches.values())
     print(
         f"JavaScript references: {len(rows)} units, {total_refs} references, "

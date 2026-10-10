@@ -8,6 +8,8 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from analysis_artifacts import SOURCE_INDEX, write_artifact
+
 from browser_script_types import inline_script_kind
 from content_dedup import default_jobs, link_or_copy, sha256_path
 from capture_project import load_manifest
@@ -306,7 +308,7 @@ def main():
     captured_unique_js_inputs = len(js_groups)
     incomplete_units = sum(row["kind"] == "incomplete" for row in rows)
     source_index = {
-        "schema": "har-source-index/v2",
+        "schema": SOURCE_INDEX.schema,
         "units": rows,
         "summary": {
             "units": len(rows),
@@ -320,9 +322,7 @@ def main():
             "formatter_jobs": jobs,
         },
     }
-    (analysis / "source-index.json").write_text(
-        json.dumps(source_index, indent=2) + "\n"
-    )
+    write_artifact(project, SOURCE_INDEX, source_index)
 
     formatted = sum(r.get("transform") == "oxc_parse_codegen" for r in rows)
     fallbacks = sum(r.get("transform") == "utf8_raw_fallback" for r in rows)

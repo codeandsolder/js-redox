@@ -40,26 +40,37 @@ def _require(condition: bool, message: str) -> None:
         raise CaptureManifestError(message)
 
 
+def validate_manifest(raw: object, *, path: Path | None = None) -> CaptureManifest:
+    label = str(path) if path is not None else "capture manifest"
+    _require(isinstance(raw, dict), f"{label}: manifest root must be an object")
+    manifest = cast(dict[str, Any], raw)
+    _require(manifest.get("schema") == SCHEMA, f"{label}: expected schema {SCHEMA!r}")
+
+    source = manifest.get("source")
+    _require(isinstance(source, dict), f"{label}: source must be an object")
+    _require(isinstance(source.get("kind"), str) and bool(source["kind"]), f"{label}: source.kind must be a non-empty string")
+    _require(isinstance(source.get("input"), str) and bool(source["input"]), f"{label}: source.input must be a non-empty string")
+    _require(isinstance(source.get("salvaged"), bool), f"{label}: source.salvaged must be a bool")
+
+    for key in ("pages", "resources", "inline_scripts"):
+        _require(isinstance(manifest.get(key), list), f"{label}: {key} must be an array")
+    _require(isinstance(manifest.get("counts"), dict), f"{label}: counts must be an object")
+    return cast(CaptureManifest, manifest)
+
+
 def read_manifest(path: Path) -> CaptureManifest:
     try:
         raw = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as error:
         raise CaptureManifestError(f"failed to read capture manifest {path}: {error}") from error
+    return validate_manifest(raw, path=path)
 
-    _require(isinstance(raw, dict), f"{path}: manifest root must be an object")
-    _require(raw.get("schema") == SCHEMA, f"{path}: expected schema {SCHEMA!r}")
 
-    source = raw.get("source")
-    _require(isinstance(source, dict), f"{path}: source must be an object")
-    _require(isinstance(source.get("kind"), str) and bool(source["kind"]), f"{path}: source.kind must be a non-empty string")
-    _require(isinstance(source.get("input"), str) and bool(source["input"]), f"{path}: source.input must be a non-empty string")
-    _require(isinstance(source.get("salvaged"), bool), f"{path}: source.salvaged must be a bool")
-
-    for key in ("pages", "resources", "inline_scripts"):
-        _require(isinstance(raw.get(key), list), f"{path}: {key} must be an array")
-    _require(isinstance(raw.get("counts"), dict), f"{path}: counts must be an object")
-
-    return cast(CaptureManifest, raw)
+def write_manifest(path: Path, manifest: object) -> CaptureManifest:
+    validated = validate_manifest(manifest, path=path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(validated, indent=2, ensure_ascii=False) + "\n")
+    return validated
 
 
 def load_manifest(project: Path) -> CaptureManifest:
