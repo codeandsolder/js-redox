@@ -56,10 +56,12 @@ jobs:
             target/debug/switch-ir \
             target/debug/table-ir \
             target/debug/js-refs \
+            target/debug/source-directives \
             target/debug/deobfuscate-safe \
             target/debug/bundle-unpack \
             target/debug/sourcemap-compose \
             target/debug/wasm-redox \
+            target/debug/wasm-import-semantics \
             .cargo-target-nodebug/debug/
       - name: Safe deobfuscation runtime equivalence
         run: uv run --no-project python scripts/check-safe-deobfuscate.py
