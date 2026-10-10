@@ -48,6 +48,8 @@ def main():
     app = (
         BUNDLE_FIXTURE.read_text()
         + '\nnew Worker("./worker.js");\n'
+        + 'const fakeSourceMap = "/*# sourceMappingURL=fake-string.js.map */";\n'
+        + 'const fakeRuntimeMap = "/*# sourceMappingURL=data:application/json;base64," + globalThis.payload + " */";\n'
         + '//# sourceMappingURL=app.js.map\n'
     )
     (ASSETS / "app.js").write_text(app)
@@ -102,6 +104,12 @@ def main():
         for r in manifest["resources"]
         for ref in r.get("references", [])
     )
+    app_resource = next(r for r in manifest["resources"] if r["url"].endswith("/app.js"))
+    app_source_maps = [
+        ref for ref in app_resource.get("references", []) if ref.get("kind") == "source_map"
+    ]
+    assert [ref["raw"] for ref in app_source_maps] == ["app.js.map"]
+    assert all("fake-string.js.map" not in str(ref) for ref in app_resource.get("references", []))
     assert sum(bool(s.get("output_path")) for s in manifest["inline_scripts"]) == 2
     external_app = next(
         script
@@ -127,6 +135,8 @@ def main():
     assert speculation_unit["kind"] == "json"
 
     sourcemaps = json.loads((PROJECT / "analysis/sourcemaps.json").read_text())
+    assert all(sm.get("raw_reference") != "fake-string.js.map" for sm in sourcemaps["source_maps"])
+    assert all(sm.get("status") != "decode_error" for sm in sourcemaps["source_maps"])
     recovered = [
         rec
         for sm in sourcemaps["source_maps"]

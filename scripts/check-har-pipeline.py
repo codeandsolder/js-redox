@@ -91,6 +91,8 @@ def main():
         + 'const dynamicName = globalThis.dynamicName; void import(`./chunks/${dynamicName}.js`);\n'
         + generated_child + "\n"
         + generated_child + "\n"
+        + 'const fakeSourceMap = "/*# sourceMappingURL=fake-string.js.map */";\n'
+        + 'const fakeRuntimeMap = "/*# sourceMappingURL=data:application/json;base64," + globalThis.payload + " */";\n'
         + '//# sourceMappingURL=app.js.map\n'
     )
     html = (
@@ -221,6 +223,11 @@ def main():
     assert executable_inline["script_type"] == "80bb470769a376240e5e4e06-text/javascript"
     app_resource = next(r for r in manifest["resources"] if r["url"].endswith("/app.js"))
     assert app_resource["sha256"] == hashlib.sha256(app_js.encode()).hexdigest()
+    app_source_maps = [
+        ref for ref in app_resource.get("references", []) if ref.get("kind") == "source_map"
+    ]
+    assert [ref["raw"] for ref in app_source_maps] == ["app.js.map"]
+    assert all("fake-string.js.map" not in str(ref) for ref in app_resource.get("references", []))
 
     source_index = json.loads((PROJECT / "analysis/source-index.json").read_text())
     js_units = [u for u in source_index["units"] if u["kind"] == "javascript"]
@@ -251,6 +258,8 @@ def main():
 
     sourcemaps = json.loads((PROJECT / "analysis/sourcemaps.json").read_text())
     assert sourcemaps["schema"] == "har-sourcemap-recovery/v1"
+    assert all(sm.get("raw_reference") != "fake-string.js.map" for sm in sourcemaps["source_maps"])
+    assert all(sm.get("status") != "decode_error" for sm in sourcemaps["source_maps"])
     app_sourcemap = next(
         sm for sm in sourcemaps["source_maps"] if sm.get("resource_id") == app_resource["id"]
     )

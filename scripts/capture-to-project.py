@@ -25,6 +25,7 @@ def main() -> None:
     ap.add_argument("--switch-ir", type=Path, default=defaults.switch_ir)
     ap.add_argument("--table-ir", type=Path, default=defaults.table_ir)
     ap.add_argument("--js-refs", type=Path, default=defaults.js_refs)
+    ap.add_argument("--source-directives", type=Path, default=defaults.source_directives)
     ap.add_argument("--deobfuscator", type=Path, default=defaults.deobfuscator)
     ap.add_argument("--string-recoverer", type=Path, default=defaults.string_recoverer)
     ap.add_argument("--bundle-inventory", type=Path, default=defaults.bundle_inventory)
@@ -45,6 +46,7 @@ def main() -> None:
         switch_ir=args.switch_ir,
         table_ir=args.table_ir,
         js_refs=args.js_refs,
+        source_directives=args.source_directives,
         deobfuscator=args.deobfuscator,
         string_recoverer=args.string_recoverer,
         bundle_inventory=args.bundle_inventory,

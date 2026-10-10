@@ -71,7 +71,7 @@ mkdir -p "$canonical"
 # deleting its disposable scratch target. Prefer that durable mirror after Cargo
 # returns, while retaining the scratch path as a fallback for older wrappers.
 published=0
-for bin in jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack sourcemap-compose sus-scan wasm-redox wasm-import-semantics; do
+for bin in jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack sourcemap-compose sus-scan wasm-redox wasm-import-semantics source-directives; do
   source_bin=""
   if [[ -f "$mirror/$bin" ]]; then
     source_bin="$mirror/$bin"
