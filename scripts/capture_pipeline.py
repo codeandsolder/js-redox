@@ -33,6 +33,7 @@ class Toolchain:
     bundle_inventory: Path = TOOL_ROOT / "bundle-unpack"
     sourcemap_composer: Path = TOOL_ROOT / "sourcemap-compose"
     wasm_redox: Path = TOOL_ROOT / "wasm-redox"
+    wasm_import_semantics: Path = TOOL_ROOT / "wasm-import-semantics"
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,8 @@ class ProjectSummary:
     javascript_units: int
     wasm_modules: int
     wasm_origins: int
+    wasm_host_effect_pairs: int
+    wasm_proven_host_set_u32_shapes: int
     references: int
     import_map_resolutions: int
     unresolved_bare_specifiers: int
@@ -260,6 +263,17 @@ def run_capture_pipeline(
                 ]
             )
 
+    if options.wasm_analysis and options.safe_deobfuscation:
+        run_checked(
+            [
+                sys.executable,
+                ROOT / "scripts/correlate-wasm-host-effects.py",
+                output,
+                "--analyzer",
+                tools.wasm_import_semantics,
+            ]
+        )
+
     if options.vm_scan:
         run_checked(
             [
@@ -291,6 +305,7 @@ def run_capture_pipeline(
         safe_deobfuscation=options.safe_deobfuscation,
         bundle_unpack=options.bundle_unpack,
         vm_scan=options.vm_scan,
+        wasm_analysis=options.wasm_analysis,
     )
 
 
@@ -305,6 +320,7 @@ def load_project_summary(
     safe_deobfuscation: bool = True,
     bundle_unpack: bool = True,
     vm_scan: bool = True,
+    wasm_analysis: bool = True,
 ) -> ProjectSummary:
     output = output.resolve()
     manifest = _read_json(manifest_path or output / "har-manifest.json")
@@ -314,8 +330,13 @@ def load_project_summary(
     jsrefs = _read_json(output / "analysis/js-references.json")
     wasm = {"summary": {}}
     wasm_path = output / "analysis/wasm/index.json"
-    if wasm_path.exists():
+    if wasm_analysis and wasm_path.exists():
         wasm = _read_json(wasm_path)
+
+    wasm_host_effects = {"summary": {}}
+    wasm_host_effects_path = output / "analysis/wasm-host-effects.json"
+    if wasm_analysis and safe_deobfuscation and wasm_host_effects_path.exists():
+        wasm_host_effects = _read_json(wasm_host_effects_path)
 
     deob = _read_json(output / "analysis/deobfuscation.json") if safe_deobfuscation else None
     bundles = {"summary": {}}
@@ -365,6 +386,8 @@ def load_project_summary(
         javascript_units=sum(unit.get("kind") == "javascript" for unit in source_index["units"]),
         wasm_modules=wasm.get("summary", {}).get("modules", 0),
         wasm_origins=wasm.get("summary", {}).get("origins", 0),
+        wasm_host_effect_pairs=wasm_host_effects.get("summary", {}).get("pairs", 0),
+        wasm_proven_host_set_u32_shapes=wasm_host_effects.get("summary", {}).get("proven_js_set_u32_shapes", 0),
         references=jsrefs["summary"]["references"],
         import_map_resolutions=jsrefs["summary"].get("resolved_by_import_map", 0),
         unresolved_bare_specifiers=jsrefs["summary"].get("unresolved_bare_specifiers", 0),
@@ -403,6 +426,7 @@ def print_project_summary(summary: ProjectSummary) -> None:
         f"  captured resources: {summary.captured_resources}\n"
         f"  JavaScript units:   {summary.javascript_units}\n"
         f"  WebAssembly modules: {summary.wasm_modules} ({summary.wasm_origins} origin(s))\n"
+        f"  WASM host-effect DataView.setUint32 shapes: {summary.wasm_proven_host_set_u32_shapes}/{summary.wasm_host_effect_pairs} proven\n"
         f"  JS/module/worker references: {summary.references}\n"
         f"  import-map resolutions: {summary.import_map_resolutions} "
         f"(unresolved bare: {summary.unresolved_bare_specifiers})\n"
