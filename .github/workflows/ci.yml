@@ -9,13 +9,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_INCREMENTAL: "0"
+  RUSTC_WRAPPER: /usr/local/bin/sccache
+
 permissions:
   contents: read
 
 jobs:
   rust:
     name: Rust 1.99 quality gate
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-24.04]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -31,7 +35,7 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
   semantic:
     name: Semantic/runtime regressions
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-24.04]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
