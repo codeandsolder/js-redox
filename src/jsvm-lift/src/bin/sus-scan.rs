@@ -18,8 +18,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[path = "sus-scan/structures.rs"]
-mod structures;
+use jsvm_lift::structural_signals::{self as structures, apiish_name};
 
 #[derive(ClapParser, Debug)]
 #[command(
@@ -904,69 +903,6 @@ fn is_identifierish(value: &str) -> bool {
     };
     (first == '_' || first == '$' || first.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
-}
-
-fn apiish_name(value: &str) -> bool {
-    matches!(
-        value,
-        "apply"
-            | "call"
-            | "bind"
-            | "constructor"
-            | "prototype"
-            | "length"
-            | "push"
-            | "pop"
-            | "shift"
-            | "unshift"
-            | "slice"
-            | "splice"
-            | "split"
-            | "join"
-            | "concat"
-            | "replace"
-            | "charAt"
-            | "charCodeAt"
-            | "fromCharCode"
-            | "fromCodePoint"
-            | "indexOf"
-            | "substring"
-            | "substr"
-            | "map"
-            | "filter"
-            | "reduce"
-            | "forEach"
-            | "toString"
-            | "valueOf"
-            | "hasOwnProperty"
-            | "defineProperty"
-            | "getOwnPropertyDescriptor"
-            | "createElement"
-            | "appendChild"
-            | "addEventListener"
-            | "removeEventListener"
-            | "getAttribute"
-            | "setAttribute"
-            | "querySelector"
-            | "fetch"
-            | "XMLHttpRequest"
-            | "WebSocket"
-            | "postMessage"
-            | "localStorage"
-            | "sessionStorage"
-            | "navigator"
-            | "document"
-            | "window"
-            | "eval"
-            | "Function"
-            | "atob"
-            | "btoa"
-            | "setTimeout"
-            | "setInterval"
-            | "parseInt"
-            | "decodeURIComponent"
-            | "encodeURIComponent"
-    )
 }
 
 fn hot_api_name(value: &str) -> bool {

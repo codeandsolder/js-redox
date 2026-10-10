@@ -28,3 +28,7 @@ pub mod forwarding_semantics;
 pub mod wasm_import_semantics;
 
 pub mod source_directive;
+
+pub mod semantic_ir;
+
+pub mod structural_signals;
