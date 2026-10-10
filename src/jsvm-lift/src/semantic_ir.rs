@@ -1,4 +1,4 @@
-use jsvm_lift::effect_shape::{analyze_program, hash_shape_text, PropertyMode};
+use crate::effect_shape::{analyze_program, hash_shape_text, PropertyMode};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{Argument, AssignmentTarget, Expression, Statement};
 use oxc_span::{GetSpan, SourceType, Span};

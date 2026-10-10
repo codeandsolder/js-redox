@@ -69,9 +69,7 @@ struct PathIr {
     raw_ops: usize,
 }
 
-#[path = "../semantic_ir.rs"]
-mod semantic_ir;
-use semantic_ir::{classify_effect, IrOp};
+use jsvm_lift::semantic_ir::{classify_effect, IrOp};
 
 fn read_scan(path: &PathBuf) -> Result<HashMap<String, OpcodeProvenance>> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;

@@ -11,9 +11,7 @@ use std::{
     path::PathBuf,
 };
 
-#[path = "../semantic_ir.rs"]
-mod semantic_ir;
-use semantic_ir::{classify_effect, IrOp};
+use jsvm_lift::semantic_ir::{classify_effect, IrOp};
 
 #[derive(ClapParser, Debug)]
 #[command(about = "Infer function-table VM ABI roles and lift handler statements into semantic IR")]

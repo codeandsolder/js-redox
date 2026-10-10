@@ -1,5 +1,4 @@
-use super::capped_u32;
-use jsvm_lift::numeric::exact_i64;
+use crate::numeric::exact_i64;
 use oxc_ast::ast::{
     Argument, AssignmentExpression, BindingPattern, CallExpression, ConditionalExpression,
     Expression, Function, FunctionBody, ObjectExpression, ObjectPropertyKind, PropertyKind,
@@ -9,6 +8,14 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_span::Span;
 use oxc_syntax::scope::ScopeFlags;
 use std::collections::HashSet;
+
+fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn capped_u32(value: usize, cap: u32) -> u32 {
+    saturating_u32(value).min(cap)
+}
 
 #[derive(Debug)]
 pub struct StructuralSignal {
@@ -375,6 +382,69 @@ fn is_tiny_proxy_function(expr: &Expression<'_>) -> bool {
     }
 }
 
+pub fn apiish_name(value: &str) -> bool {
+    matches!(
+        value,
+        "apply"
+            | "call"
+            | "bind"
+            | "constructor"
+            | "prototype"
+            | "length"
+            | "push"
+            | "pop"
+            | "shift"
+            | "unshift"
+            | "slice"
+            | "splice"
+            | "split"
+            | "join"
+            | "concat"
+            | "replace"
+            | "charAt"
+            | "charCodeAt"
+            | "fromCharCode"
+            | "fromCodePoint"
+            | "indexOf"
+            | "substring"
+            | "substr"
+            | "map"
+            | "filter"
+            | "reduce"
+            | "forEach"
+            | "toString"
+            | "valueOf"
+            | "hasOwnProperty"
+            | "defineProperty"
+            | "getOwnPropertyDescriptor"
+            | "createElement"
+            | "appendChild"
+            | "addEventListener"
+            | "removeEventListener"
+            | "getAttribute"
+            | "setAttribute"
+            | "querySelector"
+            | "fetch"
+            | "XMLHttpRequest"
+            | "WebSocket"
+            | "postMessage"
+            | "localStorage"
+            | "sessionStorage"
+            | "navigator"
+            | "document"
+            | "window"
+            | "eval"
+            | "Function"
+            | "atob"
+            | "btoa"
+            | "setTimeout"
+            | "setInterval"
+            | "parseInt"
+            | "decodeURIComponent"
+            | "encodeURIComponent"
+    )
+}
+
 fn looks_generated_proxy_key(name: &str) -> bool {
     let len = name.len();
     (4..=8).contains(&len)
@@ -385,7 +455,7 @@ fn looks_generated_proxy_key(name: &str) -> bool {
             .bytes()
             .any(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
         && name.bytes().any(|byte| byte.is_ascii_lowercase())
-        && !super::apiish_name(name)
+        && !apiish_name(name)
 }
 
 fn detect_operator_proxy_table(object: &ObjectExpression<'_>) -> Option<StructuralSignal> {
