@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote_to_bytes, urljoin, urlparse
 
+from capture_project import load_manifest
+
 MAX_CHAIN_DEPTH = 16
 
 
@@ -413,7 +415,7 @@ def main() -> None:
         raise SystemExit(f"source-map composer does not exist: {composer}")
     if not source_directives_bin.is_file():
         raise SystemExit(f"source-directives extractor does not exist: {source_directives_bin}")
-    manifest = json.loads((project / "har-manifest.json").read_text())
+    manifest = load_manifest(project)
     by_url = {resource["url"]: resource for resource in manifest["resources"]}
     results = []
     analysis = project / "analysis"

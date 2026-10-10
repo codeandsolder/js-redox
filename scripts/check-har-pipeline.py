@@ -204,10 +204,10 @@ def main():
         TOOL_ROOT / "sourcemap-compose",
     )
 
-    manifest = json.loads((PROJECT / "har-manifest.json").read_text())
-    assert manifest["schema"] == "har-project/v0"
+    manifest = json.loads((PROJECT / "capture-manifest.json").read_text())
     assert len(manifest["resources"]) == 9
-    assert (PROJECT / "capture-manifest.json").is_file()
+    assert manifest["schema"] == "capture-project/v1"
+    assert manifest["source"]["kind"] == "har"
     speculation = next(
         script
         for script in manifest["inline_scripts"]
@@ -681,10 +681,10 @@ def main():
 
     run(HAR_PROJECT, TRUNCATED_HAR, "--output", TRUNCATED_PROJECT)
     truncated_manifest = json.loads(
-        (TRUNCATED_PROJECT / "har-manifest.json").read_text()
+        (TRUNCATED_PROJECT / "capture-manifest.json").read_text()
     )
-    assert truncated_manifest["salvaged"] is True
-    assert truncated_manifest["parse_error"]
+    assert truncated_manifest["source"]["salvaged"] is True
+    assert truncated_manifest["source"]["parse_error"]
     assert len(truncated_manifest["resources"]) == 7
 
     print(cp.stdout.rstrip())

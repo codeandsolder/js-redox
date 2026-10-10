@@ -6,6 +6,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import urljoin
 
+from capture_project import load_manifest
+
 
 def external_id(url: str) -> str:
     return 'external:' + hashlib.sha256(url.encode()).hexdigest()[:20]
@@ -21,7 +23,7 @@ def main():
     args = ap.parse_args()
     project = args.project.resolve()
 
-    manifest = json.loads((project / 'har-manifest.json').read_text())
+    manifest = load_manifest(project)
     source_index_path = project / 'analysis/source-index.json'
     sourcemaps_path = project / 'analysis/sourcemaps.json'
     jsvm_path = project / 'analysis/jsvm/index.json'
@@ -895,9 +897,9 @@ def main():
     edge_counts = Counter(edge['kind'] for edge in edges)
     node_counts = Counter(node['type'] for node in nodes.values())
     graph = {
-        'schema': 'har-source-graph/v0',
+        'schema': 'source-graph/v1',
         'project': str(project),
-        'capture_salvaged': bool(manifest.get('salvaged')),
+        'capture_salvaged': bool(manifest['source'].get('salvaged')),
         'nodes': sorted(nodes.values(), key=lambda n: n['id']),
         'edges': sorted(edges, key=lambda e: (e['from'], e['kind'], e['to'])),
         'summary': {

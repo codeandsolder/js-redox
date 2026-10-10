@@ -12,6 +12,8 @@ import subprocess
 from collections import defaultdict
 from pathlib import Path
 
+from capture_project import load_manifest
+
 BASE64_WASM = re.compile(rb"AGFzbQ[A-Za-z0-9+/]{8,}={0,2}")
 WASM_MAGIC = b"\x00asm"
 MAX_INLINE_BASE64 = 64 * 1024 * 1024
@@ -59,7 +61,7 @@ def main() -> None:
     args = ap.parse_args()
 
     project = args.project.resolve()
-    manifest = json.loads((project / "har-manifest.json").read_text())
+    manifest = load_manifest(project)
     analysis_root = project / "analysis/wasm"
     modules_root = analysis_root / "modules"
     inline_root = project / "src/_wasm/inline"

@@ -94,9 +94,9 @@ def main():
     )
 
     manifest = json.loads((PROJECT / "capture-manifest.json").read_text())
-    assert manifest["schema"] == "saved-page-project/v0"
-    assert manifest["source_kind"] == "saved_page_complete"
-    assert manifest["original_page_url"] == "https://example.invalid/demo"
+    assert manifest["schema"] == "capture-project/v1"
+    assert manifest["source"]["kind"] == "saved_page_complete"
+    assert manifest["source"]["original_page_url"] == "https://example.invalid/demo"
     assert len(manifest["resources"]) == 6
     assert any(r["kind"] == "javascript" for r in manifest["resources"])
     assert any(

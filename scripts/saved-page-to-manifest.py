@@ -8,6 +8,8 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+
+from capture_project import MANIFEST_NAME, SCHEMA
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
 from browser_script_types import (
@@ -485,15 +487,15 @@ def main():
     counts["inline_scripts"] = sum(bool(s.get("output_path")) for s in inline_scripts)
     original_url = infer_original_url(page_text)
     manifest = {
-        "schema": "saved-page-project/v0",
-        "source_kind": "saved_page_complete" if assets else "saved_page_html",
-        "source": str(page),
-        "source_har": None,
-        "original_page_url": original_url,
-        "assets_dir": str(assets) if assets else None,
-        "har_version": "",
-        "salvaged": False,
-        "parse_error": None,
+        "schema": SCHEMA,
+        "source": {
+            "kind": "saved_page_complete" if assets else "saved_page_html",
+            "input": str(page),
+            "salvaged": False,
+            "parse_error": None,
+            "original_page_url": original_url,
+            "assets_dir": str(assets) if assets else None,
+        },
         "pages": [{
             "id": "saved-page",
             "title": page.stem,
@@ -506,8 +508,7 @@ def main():
     }
 
     rendered = json.dumps(manifest, indent=2) + "\n"
-    (output / "har-manifest.json").write_text(rendered)
-    (output / "capture-manifest.json").write_text(rendered)
+    (output / MANIFEST_NAME).write_text(rendered)
     (output / ".vscode").mkdir(exist_ok=True)
     (output / ".vscode/settings.json").write_text(
         '{\n  "editor.maxTokenizationLineLength": 200000\n}\n'

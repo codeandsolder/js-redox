@@ -167,7 +167,7 @@ def main():
         "run",
         "--no-project",
         "python",
-        "scripts/materialize-har-source.py",
+        "scripts/materialize-capture-source.py",
         PROJECT,
         "--formatter",
         TOOL_ROOT / "js-format",
@@ -175,7 +175,7 @@ def main():
         "4",
     )
 
-    manifest = json.loads((PROJECT / "har-manifest.json").read_text())
+    manifest = json.loads((PROJECT / "capture-manifest.json").read_text())
     resources = {row["url"]: row for row in manifest["resources"]}
 
     xssi_row = resources["https://fixture.invalid/api/bootstrap.js"]
