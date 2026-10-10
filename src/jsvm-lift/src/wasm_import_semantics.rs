@@ -11,6 +11,17 @@ use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use std::collections::HashMap;
 
+mod import_object;
+use import_object::{assignment_import_object, collect_instantiation_sites};
+pub use import_object::{WasmImportObjectUsage, WasmInstantiationSite};
+
+/// Independent JavaScript-side proofs relevant to WebAssembly import correlation.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Default)]
+pub struct WasmImportSemanticsAnalysis {
+    pub shapes: Vec<WasmImportDataViewSetU32Shape>,
+    pub import_object_usages: Vec<WasmImportObjectUsage>,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct WasmImportDataViewSetU32Shape {
     pub import_module: Option<String>,
@@ -664,16 +675,18 @@ fn analyze_handler(
         .or_else(|| analyze_wrapped_write_function(function, scoping, global_aliases, offset_value))
 }
 
-struct HandlerCollector<'c, 'g, 'f> {
+struct HandlerCollector<'c, 'g, 'i, 'f> {
     scoping: &'c Scoping,
     global_aliases: &'g HashMap<SymbolId, String>,
+    instantiation_sites: &'i HashMap<SymbolId, Vec<WasmInstantiationSite>>,
     module_filter: Option<&'f str>,
     import_filter: Option<&'f str>,
     offset_value: Option<u32>,
     reports: Vec<WasmImportDataViewSetU32Shape>,
+    import_object_usages: Vec<WasmImportObjectUsage>,
 }
 
-impl<'a> Visit<'a> for HandlerCollector<'_, '_, '_> {
+impl<'a> Visit<'a> for HandlerCollector<'_, '_, '_, '_> {
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
         if assignment.operator.as_str() == "=" {
             if let (Some((import_name, import_module)), Expression::FunctionExpression(function)) = (
@@ -687,6 +700,32 @@ impl<'a> Visit<'a> for HandlerCollector<'_, '_, '_> {
                         .module_filter
                         .is_none_or(|wanted| import_module == Some(wanted))
                 {
+                    if let Some((symbol, import_object, module, name)) =
+                        assignment_import_object(self.scoping, &assignment.left)
+                    {
+                        if module == import_module.unwrap_or_default()
+                            && name == import_name
+                            && symbol_binding_is_stable(self.scoping, symbol)
+                        {
+                            if let Some(sites) = self.instantiation_sites.get(&symbol) {
+                                let later_sites = sites
+                                    .iter()
+                                    .filter(|site| site.start > assignment.span.end)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                if !later_sites.is_empty() {
+                                    self.import_object_usages.push(WasmImportObjectUsage {
+                                        import_module: module,
+                                        import_name: name,
+                                        assignment_start: assignment.span.start,
+                                        assignment_end: assignment.span.end,
+                                        import_object,
+                                        instantiation_sites: later_sites,
+                                    });
+                                }
+                            }
+                        }
+                    }
                     if let Some(global_object) = analyze_handler(
                         function,
                         self.scoping,
@@ -724,18 +763,21 @@ fn analyze_program(
     module_filter: Option<&str>,
     import_filter: Option<&str>,
     offset_value: Option<u32>,
-) -> Vec<WasmImportDataViewSetU32Shape> {
+) -> WasmImportSemanticsAnalysis {
     if has_dynamic_scope(program, scoping) {
-        return Vec::new();
+        return WasmImportSemanticsAnalysis::default();
     }
     let global_aliases = collect_global_aliases(program, scoping);
+    let instantiation_sites = collect_instantiation_sites(program, scoping);
     let mut collector = HandlerCollector {
         scoping,
         global_aliases: &global_aliases,
+        instantiation_sites: &instantiation_sites,
         module_filter,
         import_filter,
         offset_value,
         reports: Vec::new(),
+        import_object_usages: Vec::new(),
     };
     collector.visit_program(program);
     collector.reports.sort_by(|left, right| {
@@ -744,7 +786,17 @@ fn analyze_program(
             .then_with(|| left.import_name.cmp(&right.import_name))
     });
     collector.reports.dedup();
-    collector.reports
+    collector.import_object_usages.sort_by(|left, right| {
+        left.assignment_start
+            .cmp(&right.assignment_start)
+            .then_with(|| left.import_module.cmp(&right.import_module))
+            .then_with(|| left.import_name.cmp(&right.import_name))
+    });
+    collector.import_object_usages.dedup();
+    WasmImportSemanticsAnalysis {
+        shapes: collector.reports,
+        import_object_usages: collector.import_object_usages,
+    }
 }
 
 fn analyze_source(
@@ -752,7 +804,7 @@ fn analyze_source(
     module_filter: Option<&str>,
     import_filter: Option<&str>,
     offset_value: Option<u32>,
-) -> Vec<WasmImportDataViewSetU32Shape> {
+) -> WasmImportSemanticsAnalysis {
     for source_type in [SourceType::unambiguous(), SourceType::cjs()] {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, source_type);
@@ -773,14 +825,29 @@ fn analyze_source(
             offset_value,
         );
     }
-    Vec::new()
+    WasmImportSemanticsAnalysis::default()
+}
+
+#[must_use]
+pub fn proven_wasm_import_semantics(source: &str) -> WasmImportSemanticsAnalysis {
+    analyze_source(source, None, None, None)
+}
+
+#[must_use]
+pub fn proven_wasm_import_semantics_for(
+    source: &str,
+    import_module: &str,
+    import_name: &str,
+    offset: u32,
+) -> WasmImportSemanticsAnalysis {
+    analyze_source(source, Some(import_module), Some(import_name), Some(offset))
 }
 
 #[must_use]
 pub fn proven_wasm_import_data_view_set_u32_shapes(
     source: &str,
 ) -> Vec<WasmImportDataViewSetU32Shape> {
-    analyze_source(source, None, None, None)
+    proven_wasm_import_semantics(source).shapes
 }
 
 #[must_use]
@@ -790,7 +857,8 @@ pub fn proven_wasm_import_data_view_set_u32_shape_at_offset(
     import_name: &str,
     offset: u32,
 ) -> Option<WasmImportDataViewSetU32Shape> {
-    let mut reports = analyze_source(source, Some(import_module), Some(import_name), Some(offset));
+    let mut reports =
+        proven_wasm_import_semantics_for(source, import_module, import_name, offset).shapes;
     (reports.len() == 1).then(|| reports.remove(0))
 }
 
@@ -921,6 +989,92 @@ mod tests {
             };
         "#;
         assert!(proven_wasm_import_data_view_set_u32_shapes(with_scope).is_empty());
+    }
+
+    #[test]
+    fn proves_stable_import_object_at_webassembly_instantiation_sites() {
+        let source = r#"
+            var host = window;
+            var imports = { wbg: {} };
+            imports.wbg.target = function(memory, base, offset) {
+                var view = new host.DataView(memory.buffer), address = base + offset;
+                view.setUint32(address, 1, false);
+            };
+            WebAssembly.instantiate(bytes(), imports);
+            new WebAssembly.Instance(module(), imports);
+        "#;
+        let analysis = proven_wasm_import_semantics_for(source, "wbg", "target", 5);
+        assert_eq!(analysis.shapes.len(), 1);
+        assert_eq!(analysis.import_object_usages.len(), 1);
+        let usage = &analysis.import_object_usages[0];
+        assert_eq!(usage.import_object, "imports");
+        assert_eq!(usage.import_module, "wbg");
+        assert_eq!(usage.import_name, "target");
+        assert_eq!(usage.instantiation_sites.len(), 2);
+        assert_eq!(
+            usage
+                .instantiation_sites
+                .iter()
+                .map(|site| site.kind)
+                .collect::<Vec<_>>(),
+            vec!["WebAssembly.instantiate", "new WebAssembly.Instance"]
+        );
+        assert!(usage
+            .instantiation_sites
+            .iter()
+            .all(|site| site.unshadowed_webassembly_global_proven));
+        assert!(usage
+            .instantiation_sites
+            .iter()
+            .all(|site| site.standard_webassembly_builtin_semantics_required));
+    }
+
+    #[test]
+    fn requires_instantiation_site_after_import_assignment_in_source() {
+        let source = r#"
+            var host = window;
+            var imports = { wbg: {} };
+            WebAssembly.instantiate(bytes(), imports);
+            imports.wbg.target = function(memory, base, offset) {
+                var view = new host.DataView(memory.buffer), address = base + offset;
+                view.setUint32(address, 1, false);
+            };
+        "#;
+        let analysis = proven_wasm_import_semantics_for(source, "wbg", "target", 5);
+        assert_eq!(analysis.shapes.len(), 1);
+        assert!(analysis.import_object_usages.is_empty());
+    }
+
+    #[test]
+    fn rejects_shadowed_webassembly_and_reassigned_import_objects() {
+        let shadowed = r#"
+            var host = window;
+            var imports = { wbg: {} };
+            imports.wbg.target = function(memory, base, offset) {
+                var view = new host.DataView(memory.buffer), address = base + offset;
+                view.setUint32(address, 1, false);
+            };
+            function start(WebAssembly) {
+                WebAssembly.instantiate(bytes(), imports);
+            }
+        "#;
+        let analysis = proven_wasm_import_semantics_for(shadowed, "wbg", "target", 5);
+        assert_eq!(analysis.shapes.len(), 1);
+        assert!(analysis.import_object_usages.is_empty());
+
+        let reassigned = r#"
+            var host = window;
+            var imports = { wbg: {} };
+            imports.wbg.target = function(memory, base, offset) {
+                var view = new host.DataView(memory.buffer), address = base + offset;
+                view.setUint32(address, 1, false);
+            };
+            imports = replacement;
+            WebAssembly.instantiate(bytes(), imports);
+        "#;
+        let analysis = proven_wasm_import_semantics_for(reassigned, "wbg", "target", 5);
+        assert_eq!(analysis.shapes.len(), 1);
+        assert!(analysis.import_object_usages.is_empty());
     }
 
     #[test]

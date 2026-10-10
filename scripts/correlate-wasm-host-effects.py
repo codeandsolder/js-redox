@@ -24,7 +24,7 @@ def run_probe(
     import_module: str,
     import_name: str,
     offset: int,
-) -> dict | None:
+) -> dict:
     cp = subprocess.run(
         [
             str(analyzer),
@@ -48,12 +48,21 @@ def run_probe(
             f"{cp.stdout}{cp.stderr}"
         )
     document = json.loads(cp.stdout)
+    if document.get("schema") != "jsvm-wasm-import-semantics/v2":
+        raise RuntimeError(
+            f"unexpected JS WASM-import analyzer schema for {source}: "
+            f"{document.get('schema')!r}"
+        )
     writes = document.get("shapes", [])
+    usages = document.get("import_object_usages", [])
     if len(writes) > 1:
         raise RuntimeError(
             f"ambiguous JS WASM-import proof for {source}: {import_name}@{offset}"
         )
-    return writes[0] if writes else None
+    return {
+        "write": writes[0] if writes else None,
+        "import_object_usages": usages,
+    }
 
 
 def main() -> None:
@@ -75,7 +84,7 @@ def main() -> None:
         if unit.get("raw_path") and unit.get("output_path") and unit.get("exit") == 0
     }
 
-    cache: dict[tuple[str, str, str, int], dict | None] = {}
+    cache: dict[tuple[str, str, str, int], dict] = {}
     rows: list[dict] = []
     skipped_modules: list[dict] = []
     carrier_sources: set[str] = set()
@@ -125,6 +134,7 @@ def main() -> None:
                     raw_host_module = function_imports[host_import_function].get("module")
                 offset = pair.get("offset")
                 proofs = []
+                import_object_usage_proofs = []
                 if (
                     isinstance(raw_host_module, str)
                     and isinstance(raw_host_import, str)
@@ -144,9 +154,14 @@ def main() -> None:
                                 raw_host_import,
                                 offset,
                             )
-                        proof = cache[key]
+                        probe = cache[key]
+                        proof = probe["write"]
                         if proof is not None:
                             proofs.append({"source_path": relative, **proof})
+                        for usage in probe["import_object_usages"]:
+                            import_object_usage_proofs.append(
+                                {"source_path": relative, **usage}
+                            )
 
                 row = {
                     "module_sha256": module.get("sha256"),
@@ -157,7 +172,14 @@ def main() -> None:
                     "offset": offset,
                     "carrier_candidates": carrier_candidates,
                     "correlation_basis": "exact_import_module_and_name",
+                    "js_import_object_instantiation_site_proven": len(import_object_usage_proofs) == 1,
+                    "js_import_object_instantiation_site_proofs": import_object_usage_proofs,
                     "import_binding_identity_proven": False,
+                    "import_binding_identity_limitation": (
+                        "the exact stable JS import object is proven at an unshadowed "
+                        "WebAssembly instantiation site when reported, but the instantiated "
+                        "module bytes are not yet tied to this recovered WASM module"
+                    ),
                     "js_set_u32_shape_proven": len(proofs) == 1,
                     "js_set_u32_shape_proofs": proofs,
                     "wasm_relation": {
@@ -174,23 +196,38 @@ def main() -> None:
                         )
                     },
                 }
+                ambiguities = []
                 if len(proofs) > 1:
                     row["js_set_u32_shape_proven"] = False
-                    row["ambiguity"] = "multiple carrier sources prove the same import/offset"
+                    ambiguities.append("multiple carrier sources prove the same import write/offset")
+                if len(import_object_usage_proofs) > 1:
+                    row["js_import_object_instantiation_site_proven"] = False
+                    ambiguities.append(
+                        "multiple carrier sources prove import-object WebAssembly instantiation sites"
+                    )
+                if ambiguities:
+                    row["ambiguity"] = "; ".join(ambiguities)
                 rows.append(row)
 
     out = {
         "schema": WASM_HOST_EFFECTS.schema,
         "wasm_schema_required": "wasm-redox/deep-v5",
-        "js_schema": "jsvm-wasm-import-semantics/v1",
+        "js_schema": "jsvm-wasm-import-semantics/v2",
         "safe_static_only": True,
-        "correlation_contract": "exact WASM import module+name match; runtime import-object binding identity is not proven",
+        "correlation_contract": (
+            "exact WASM import module+name match; the same stable JS import object may be "
+            "proven as an argument at an unshadowed WebAssembly instantiation site, but "
+            "exact recovered-module byte identity at that site is not yet proven"
+        ),
         "memory_write_interpretation": "requires standard unmodified DataView builtin semantics",
         "rows": rows,
         "skipped_modules": skipped_modules,
         "summary": {
             "pairs": len(rows),
             "proven_js_set_u32_shapes": sum(row["js_set_u32_shape_proven"] for row in rows),
+            "proven_js_import_object_instantiation_sites": sum(
+                row["js_import_object_instantiation_site_proven"] for row in rows
+            ),
             "opaque_only": sum(not row["js_set_u32_shape_proven"] for row in rows),
             "modules": len({row["module_sha256"] for row in rows}),
             "carrier_sources": len(carrier_sources),
@@ -204,6 +241,7 @@ def main() -> None:
     print(
         "WASM host effects: "
         f"{summary['proven_js_set_u32_shapes']}/{summary['pairs']} pair(s) have proven JS DataView.setUint32 shapes; "
+        f"{summary['proven_js_import_object_instantiation_sites']}/{summary['pairs']} pair(s) have proven JS import-object WebAssembly instantiation sites; "
         f"{summary['opaque_only']} remain opaque; "
         f"{summary['carrier_sources']} carrier source(s)"
     )

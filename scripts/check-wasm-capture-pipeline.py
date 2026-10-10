@@ -78,6 +78,7 @@ def main():
         "    offset === 56708 || view.setUint32(address, 1, false);\n"
         "};\n"
         f'const embedded = "{WASM_B64}";\n'
+        "WebAssembly.instantiate(bytes, imports);\n"
     )
     fixture = {
         "log": {
@@ -184,12 +185,20 @@ def main():
         TOOL_ROOT / "wasm-import-semantics",
    )
     host_effects = json.loads((PROJECT / "analysis/wasm-host-effects.json").read_text())
+    assert host_effects["schema"] == "wasm-host-effect-correlation/v2", host_effects
     assert host_effects["summary"]["pairs"] == 2, host_effects
     assert host_effects["summary"]["proven_js_set_u32_shapes"] == 1, host_effects
+    assert host_effects["summary"]["proven_js_import_object_instantiation_sites"] == 2, host_effects
     by_offset = {row["offset"]: row for row in host_effects["rows"]}
     assert by_offset[3536]["js_set_u32_shape_proven"] is True, by_offset
     assert by_offset[56708]["js_set_u32_shape_proven"] is False, by_offset
     assert by_offset[3536]["js_set_u32_shape_proofs"][0]["method"] == "setUint32"
+    assert all(
+        row["js_import_object_instantiation_site_proven"] is True
+        and row["import_binding_identity_proven"] is False
+        and row["js_import_object_instantiation_site_proofs"][0]["import_object"] == "imports"
+        for row in by_offset.values()
+    ), by_offset
 
     run("uv", "run", "--no-project", "python", "scripts/build-source-graph.py", PROJECT)
     graph = json.loads((PROJECT / "analysis/source-graph.json").read_text())
@@ -200,7 +209,10 @@ def main():
         "wasm_resource",
         "wasm_inline_base64",
     }
-    print("wasm capture regression: dedup + provenance + 1/2 host DataView.setUint32-shape correlation OK")
+    print(
+        "wasm capture regression: dedup + provenance + 1/2 host DataView.setUint32 "
+        "shape + 2/2 import-object instantiation-site correlation OK"
+    )
 
 
 if __name__ == "__main__":

@@ -82,7 +82,7 @@ WASM_INDEX = ArtifactSpec(
 WASM_HOST_EFFECTS = ArtifactSpec(
     "WASM host-effect correlation",
     Path("analysis/wasm-host-effects.json"),
-    "wasm-host-effect-correlation/v1",
+    "wasm-host-effect-correlation/v2",
     array_fields=("rows", "skipped_modules"),
     object_fields=("summary",),
 )
