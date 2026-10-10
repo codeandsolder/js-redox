@@ -106,7 +106,7 @@ def main():
     HAR.write_text(json.dumps(fixture))
 
     run(TOOL_ROOT / "har-project", HAR, "--output", PROJECT)
-    manifest = json.loads((PROJECT / "har-manifest.json").read_text())
+    manifest = json.loads((PROJECT / "capture-manifest.json").read_text())
     wasm_resource = next(row for row in manifest["resources"] if row["kind"] == "wasm")
     assert wasm_resource["output_path"].endswith(".wasm")
     assert (PROJECT / wasm_resource["output_path"]).read_bytes() == WASM
@@ -116,7 +116,7 @@ def main():
         "run",
         "--no-project",
         "python",
-        "scripts/materialize-har-source.py",
+        "scripts/materialize-capture-source.py",
         PROJECT,
         "--formatter",
         TOOL_ROOT / "js-format",

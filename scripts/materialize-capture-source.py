@@ -10,6 +10,7 @@ from pathlib import Path
 
 from browser_script_types import inline_script_kind
 from content_dedup import default_jobs, link_or_copy, sha256_path
+from capture_project import load_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 CHARSET_RE = re.compile(r"charset\s*=\s*['\"]?([^;'\"\s]+)", re.IGNORECASE)
@@ -155,7 +156,7 @@ def main():
     jobs = max(1, args.jobs)
 
     project = args.project.resolve()
-    manifest = json.loads((project / "har-manifest.json").read_text())
+    manifest = load_manifest(project)
 
     units = []
     seen = set()

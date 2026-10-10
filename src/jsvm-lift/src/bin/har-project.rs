@@ -186,13 +186,19 @@ struct InlineScriptMeta {
 }
 
 #[derive(Debug, Serialize)]
-struct ProjectManifest {
-    schema: &'static str,
-    source_har: String,
+struct CaptureSource {
+    kind: &'static str,
+    input: String,
     har_version: String,
     salvaged: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     parse_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProjectManifest {
+    schema: &'static str,
+    source: CaptureSource,
     pages: Vec<PageMeta>,
     resources: Vec<ResourceMeta>,
     inline_scripts: Vec<InlineScriptMeta>,
@@ -1049,11 +1055,14 @@ fn build_manifest(
     counts.insert("resources_total".into(), resources.len());
     counts.insert("pages".into(), pages.len());
     Ok(ProjectManifest {
-        schema: "har-project/v0",
-        source_har: args.har.display().to_string(),
-        har_version: har.log.version,
-        salvaged,
-        parse_error,
+        schema: "capture-project/v1",
+        source: CaptureSource {
+            kind: "har",
+            input: args.har.display().to_string(),
+            har_version: har.log.version,
+            salvaged,
+            parse_error,
+        },
         pages,
         resources,
         inline_scripts,
@@ -1063,7 +1072,7 @@ fn build_manifest(
 
 fn write_project_metadata(args: &Args, manifest: &ProjectManifest) -> Result<()> {
     fs::write(
-        args.output.join("har-manifest.json"),
+        args.output.join("capture-manifest.json"),
         format!("{}\n", serde_json::to_string_pretty(manifest)?),
     )?;
     fs::create_dir_all(args.output.join(".vscode"))?;
@@ -1078,7 +1087,7 @@ fn write_project_metadata(args: &Args, manifest: &ProjectManifest) -> Result<()>
     fs::write(
         args.output.join("README.md"),
         format!(
-            "# HAR source project\n\nGenerated from {}.\n\nResponse bodies are preserved by URL under resources/. Inline script bodies are extracted beside their parent HTML. har-manifest.json keeps request/response provenance and discovered script/source-map references.\n\n## Counts\n\n{}",
+            "# Capture source project\n\nGenerated from {}.\n\nResponse bodies are preserved by URL under resources/. Inline script bodies are extracted beside their parent HTML. capture-manifest.json keeps capture provenance and discovered script/source-map references.\n\n## Counts\n\n{}",
             args.har.display(),
             summary
         ),

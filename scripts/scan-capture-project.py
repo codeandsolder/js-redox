@@ -10,6 +10,7 @@ from pathlib import Path
 
 from browser_script_types import is_executable_script
 from content_dedup import link_or_copy, sha256_path
+from capture_project import load_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STRING_RECOVERER = ROOT / "scripts/recover-js-obfuscator-strings.py"
@@ -315,7 +316,7 @@ def main():
     args = ap.parse_args()
 
     project = args.project.resolve()
-    manifest = json.loads((project / "har-manifest.json").read_text())
+    manifest = load_manifest(project)
     deob_path = project / "analysis/deobfuscation.json"
     deob = json.loads(deob_path.read_text()) if deob_path.exists() else {"units": []}
     deob_by_raw = {
@@ -671,7 +672,7 @@ def main():
     )
 
     index = {
-        "schema": "har-project-jsvm-analysis/v2",
+        "schema": "capture-jsvm-analysis/v1",
         "scanner": str(args.scanner),
         "formatter": str(args.formatter),
         "switch_ir": str(args.switch_ir),

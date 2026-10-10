@@ -4,6 +4,8 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from capture_project import load_manifest
+
 
 def load(path: Path, default):
     return json.loads(path.read_text()) if path.exists() else default
@@ -17,7 +19,7 @@ def main():
     args = ap.parse_args()
     project = args.project.resolve()
 
-    manifest = load(project / "har-manifest.json", {"resources": [], "inline_scripts": []})
+    manifest = load_manifest(project)
     source_index = load(project / "analysis/source-index.json", {"units": []})
     sourcemaps = load(project / "analysis/sourcemaps.json", {"source_maps": []})
     jsrefs = load(project / "analysis/js-references.json", {"code_units": [], "summary": {}})
@@ -92,10 +94,11 @@ def main():
     encoded_string_replacements = deob_summary.get("string_recovery_replacements", 0)
     encoded_string_units = deob_summary.get("string_recovery_changed_units", 0)
 
-    capture_state = "SALVAGED / truncated" if manifest.get("salvaged") else "complete"
-    source_capture = manifest.get("source_har") or manifest.get("source") or "browser capture"
-    source_kind = manifest.get("source_kind") or "har"
-    original_url = manifest.get("original_page_url")
+    source = manifest["source"]
+    capture_state = "SALVAGED / truncated" if source.get("salvaged") else "complete"
+    source_capture = source.get("input") or "browser capture"
+    source_kind = source["kind"]
+    original_url = source.get("original_page_url")
     bundle_summary = bundles.get("summary", {})
     generated_recovery_summary = generated_recovery.get("summary", {})
     runtime_summary = runtime_scripts.get("summary", {})
@@ -120,8 +123,7 @@ def main():
         "- [src/_sourcemap/](src/_sourcemap/) — direct source-map sources plus `final/` views after nested map chains are composed.",
         "- [src/_modules/](src/_modules/) — statically extracted Webpack/Next module wrappers and named AMD factories where module structure is explicit.",
         "- [resources/](resources/) — capture-faithful response bodies or saved-page files.",
-        "- [capture-manifest.json](capture-manifest.json) — normalized capture provenance and resource inventory.",
-        "- [har-manifest.json](har-manifest.json) — compatibility manifest consumed by the current analysis stages.",
+        "- [capture-manifest.json](capture-manifest.json) — canonical normalized capture provenance and resource inventory.",
         "- [analysis/import-maps.json](analysis/import-maps.json) — captured import-map definitions, normalized mappings and merge diagnostics.",
         "- [analysis/source-graph.json](analysis/source-graph.json) — machine-readable relationship/provenance graph.",
         *(["- [analysis/runtime-scripts.json](analysis/runtime-scripts.json) — Debugger runtime-script provenance, generated-expression recovery, and capture-instrumentation classification."] if runtime_summary else []),
@@ -241,8 +243,8 @@ def main():
             ]
         )
 
-    if manifest.get("salvaged"):
-        parse_error = manifest.get("parse_error")
+    if source.get("salvaged"):
+        parse_error = source.get("parse_error")
         lines.extend(
             [
                 "",

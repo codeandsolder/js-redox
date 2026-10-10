@@ -65,7 +65,7 @@ def stages(project: Path):
         "run",
         "--no-project",
         "python",
-        "scripts/materialize-har-source.py",
+        "scripts/materialize-capture-source.py",
         project,
         "--formatter",
         FORMATTER,

@@ -11,6 +11,7 @@ from urllib.parse import urljoin, urlsplit
 
 from browser_script_types import is_executable_script
 from content_dedup import default_jobs, sha256_path
+from capture_project import load_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EXTRACTOR = ROOT / ".cargo-target-nodebug/debug/js-refs"
@@ -326,7 +327,7 @@ def main():
     jobs = max(1, args.jobs)
 
     project = args.project.resolve()
-    manifest = json.loads((project / "har-manifest.json").read_text())
+    manifest = load_manifest(project)
     source_index = json.loads((project / "analysis/source-index.json").read_text())
     import_maps, import_map_analysis = load_import_maps(project, manifest)
 

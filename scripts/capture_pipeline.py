@@ -2,19 +2,20 @@
 """Shared orchestration for browser-capture source recovery.
 
 The CLI entry points intentionally stay thin. This module owns the stage order,
-tool locations, capture normalization, and final summary so HAR-only compatibility
-and the general HAR/saved-page front door cannot silently drift apart.
+tool locations, capture normalization, and final summary so every capture frontend
+feeds the same analysis pipeline without duplicating orchestration.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+
+from capture_project import MANIFEST_NAME, read_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL_ROOT = ROOT / ".cargo-target-nodebug/debug"
@@ -155,17 +156,16 @@ def _import_capture(
         importer.append("--overwrite")
     run_checked(importer)
 
-    manifest_path = output / "har-manifest.json"
+    manifest_path = output / MANIFEST_NAME
     if not manifest_path.is_file():
         raise SystemExit(f"capture importer did not create {manifest_path}")
     if kind == "recorder":
-        manifest = json.loads(manifest_path.read_text())
-        manifest["source_kind"] = "recorder"
-        manifest["recorder_bundle"] = str(capture)
+        manifest = read_manifest(manifest_path)
+        source = manifest["source"]
+        source["kind"] = "recorder"
+        source["input"] = str(capture)
+        source["har_input"] = str(capture / "capture.har")
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
-    capture_manifest = output / "capture-manifest.json"
-    if not capture_manifest.exists() or kind == "recorder":
-        shutil.copyfile(manifest_path, capture_manifest)
     return manifest_path
 
 
@@ -199,7 +199,7 @@ def run_capture_pipeline(
     run_checked(
         [
             sys.executable,
-            ROOT / "scripts/materialize-har-source.py",
+            ROOT / "scripts/materialize-capture-source.py",
             output,
             "--formatter",
             tools.formatter,
@@ -283,7 +283,7 @@ def run_capture_pipeline(
         run_checked(
             [
                 sys.executable,
-                ROOT / "scripts/scan-har-project.py",
+                ROOT / "scripts/scan-capture-project.py",
                 output,
                 "--scanner",
                 tools.scanner,
@@ -328,7 +328,7 @@ def load_project_summary(
     wasm_analysis: bool = True,
 ) -> ProjectSummary:
     output = output.resolve()
-    manifest = _read_json(manifest_path or output / "har-manifest.json")
+    manifest = read_manifest(manifest_path or output / MANIFEST_NAME)
     source_index = _read_json(output / "analysis/source-index.json")
     maps = _read_json(output / "analysis/sourcemaps.json")
     graph = _read_json(output / "analysis/source-graph.json")
@@ -385,8 +385,8 @@ def load_project_summary(
     )
     return ProjectSummary(
         output=output,
-        source_kind=manifest.get("source_kind") or "har",
-        capture_state="SALVAGED / truncated" if manifest.get("salvaged") else "complete",
+        source_kind=manifest["source"]["kind"],
+        capture_state="SALVAGED / truncated" if manifest["source"].get("salvaged") else "complete",
         captured_resources=len(manifest["resources"]),
         javascript_units=sum(unit.get("kind") == "javascript" for unit in source_index["units"]),
         wasm_modules=wasm.get("summary", {}).get("modules", 0),
