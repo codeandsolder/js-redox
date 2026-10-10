@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, VecDeque};
-use waffle::{entity::EntityRef, Block, FunctionBody, Terminator, Value};
+use waffle::{entity::EntityRef, Block, FunctionBody, Terminator, Value, ValueDef};
 
 pub(super) fn incoming_block_param_edges(
     body: &FunctionBody,
@@ -134,4 +134,22 @@ pub(super) fn conditional_phi_inputs(
     });
     candidates.dedup();
     (candidates.len() == 1).then(|| candidates[0])
+}
+
+pub(super) fn unique_transparent_origin(body: &FunctionBody, value: Value, depth: usize) -> Value {
+    if depth == 0 {
+        return body.resolve_alias(value);
+    }
+    let value = body.resolve_alias(value);
+    match &body.values[value] {
+        ValueDef::PickOutput(source, 0, _) => unique_transparent_origin(body, *source, depth - 1),
+        ValueDef::BlockParam(block, _, _) => {
+            let incoming = incoming_block_param_values(body, *block, value);
+            let [incoming] = incoming.as_slice() else {
+                return value;
+            };
+            unique_transparent_origin(body, *incoming, depth - 1)
+        }
+        _ => value,
+    }
 }

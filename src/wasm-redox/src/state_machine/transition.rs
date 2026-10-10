@@ -1,4 +1,4 @@
-use super::i32_const;
+use super::ir::i32_const;
 use std::collections::{BTreeSet, VecDeque};
 use waffle::{Block, BlockTarget, FunctionBody, Operator, Terminator, Value, ValueDef};
 
