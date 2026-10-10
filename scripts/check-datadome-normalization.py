@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / ".cargo-target-nodebug/debug/deobfuscate-safe"
 FIXTURE = ROOT / "corpus/generated/reversible-obfuscation/datadome-direct-table.js"
+SPARSE_FIXTURE = ROOT / "corpus/generated/reversible-obfuscation/sparse-direct-table.js"
 IDENTITY_FIXTURE = ROOT / "corpus/generated/reversible-obfuscation/reference-identity-table.js"
 TMP = ROOT / "work/test-tmp/datadome-normalization"
 
@@ -68,6 +69,27 @@ def main():
         assert transforms.get("pure_function_eval", 0) >= 5, transforms
         assert meta["safe_static_only"] is True
         print("PASS direct-table", transforms)
+
+    with tempfile.TemporaryDirectory(prefix="sparse-direct-table-", dir=TMP) as td:
+        td = Path(td)
+        out = td / "out.js"
+        report = td / "report.json"
+        before = run(["node", SPARSE_FIXTURE]).stdout
+        run([BIN, SPARSE_FIXTURE, out, "--report", report])
+        run(["node", "--check", out])
+        after = run(["node", out]).stdout
+        assert before == after == "a b parseInt 17 c 99 parseInt 99 3\n", (before, after)
+        text = out.read_text()
+        for folded in ("QSparse(0)", "QSparse(2)", "CSparse(0)", "CSparse(2)"):
+            assert folded not in text, folded
+        assert "QSparse(1)" in text, "dynamic standard-table element must remain dynamic"
+        assert "CSparse(1)" in text, "dynamic fixed-table element must remain dynamic"
+        assert "INested(0)" not in text, "proven two-statement nested decoder should fold"
+        assert "INested(1)" in text, "dynamic nested-table element must remain dynamic"
+        meta = json.loads(report.read_text())
+        transforms = meta["transforms"]
+        assert transforms.get("string_array_decode", 0) >= 5, transforms
+        print("PASS sparse-direct-table", transforms)
 
     with tempfile.TemporaryDirectory(prefix="identity-table-", dir=TMP) as td:
         td = Path(td)

@@ -14,7 +14,7 @@ struct Args {
     output: PathBuf,
     #[arg(long)]
     report: Option<PathBuf>,
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 16)]
     max_iterations: usize,
     /// Pretty-print the final analyst view. This is intentionally opt-in:
     /// Function#toString and related self-defending code can observe formatting.
