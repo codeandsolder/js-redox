@@ -166,7 +166,7 @@ def main():
     deep_path = PROJECT / module["deep_path"]
     assert deep_path.is_file()
     deep = json.loads(deep_path.read_text())
-    assert deep["schema"] == "wasm-redox/deep-v5"
+    assert deep["schema"] == "wasm-redox/deep-v6"
     pairs = [
         pair
         for export in deep["exports"]
@@ -179,17 +179,17 @@ def main():
         "run",
         "--no-project",
         "python",
-        "scripts/correlate-wasm-host-effects.py",
+        "scripts/correlate-wasm-js-boundary.py",
         PROJECT,
         "--analyzer",
         TOOL_ROOT / "wasm-import-semantics",
    )
-    host_effects = json.loads((PROJECT / "analysis/wasm-host-effects.json").read_text())
-    assert host_effects["schema"] == "wasm-host-effect-correlation/v2", host_effects
-    assert host_effects["summary"]["pairs"] == 2, host_effects
-    assert host_effects["summary"]["proven_js_set_u32_shapes"] == 1, host_effects
-    assert host_effects["summary"]["proven_js_import_object_instantiation_sites"] == 2, host_effects
-    by_offset = {row["offset"]: row for row in host_effects["rows"]}
+    boundary = json.loads((PROJECT / "analysis/wasm-js-boundary.json").read_text())
+    assert boundary["schema"] == "wasm-js-boundary-correlation/v1", boundary
+    assert boundary["summary"]["host_effect_pairs"] == 2, boundary
+    assert boundary["summary"]["proven_js_set_u32_shapes"] == 1, boundary
+    assert boundary["summary"]["proven_js_import_object_instantiation_sites"] == 2, boundary
+    by_offset = {row["offset"]: row for row in boundary["host_effect_rows"]}
     assert by_offset[3536]["js_set_u32_shape_proven"] is True, by_offset
     assert by_offset[56708]["js_set_u32_shape_proven"] is False, by_offset
     assert by_offset[3536]["js_set_u32_shape_proofs"][0]["method"] == "setUint32"

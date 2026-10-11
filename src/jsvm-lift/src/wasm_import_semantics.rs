@@ -11,7 +11,10 @@ use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use std::collections::HashMap;
 
+mod bulk_import;
 mod import_object;
+use bulk_import::analyze_import_handler;
+pub use bulk_import::{WasmImportHandlerSemantic, WasmImportHandlerShape};
 use import_object::{assignment_import_object, collect_instantiation_sites};
 pub use import_object::{WasmImportObjectUsage, WasmInstantiationSite};
 
@@ -19,6 +22,7 @@ pub use import_object::{WasmImportObjectUsage, WasmInstantiationSite};
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Default)]
 pub struct WasmImportSemanticsAnalysis {
     pub shapes: Vec<WasmImportDataViewSetU32Shape>,
+    pub handler_semantics: Vec<WasmImportHandlerShape>,
     pub import_object_usages: Vec<WasmImportObjectUsage>,
 }
 
@@ -683,6 +687,7 @@ struct HandlerCollector<'c, 'g, 'i, 'f> {
     import_filter: Option<&'f str>,
     offset_value: Option<u32>,
     reports: Vec<WasmImportDataViewSetU32Shape>,
+    handler_semantics: Vec<WasmImportHandlerShape>,
     import_object_usages: Vec<WasmImportObjectUsage>,
 }
 
@@ -725,6 +730,17 @@ impl<'a> Visit<'a> for HandlerCollector<'_, '_, '_, '_> {
                                 }
                             }
                         }
+                    }
+                    if let Some(semantic) =
+                        analyze_import_handler(function, self.scoping, self.global_aliases)
+                    {
+                        self.handler_semantics.push(WasmImportHandlerShape {
+                            import_module: import_module.map(str::to_string),
+                            import_name: import_name.to_string(),
+                            assignment_start: assignment.span.start,
+                            assignment_end: assignment.span.end,
+                            semantic,
+                        });
                     }
                     if let Some(global_object) = analyze_handler(
                         function,
@@ -777,6 +793,7 @@ fn analyze_program(
         import_filter,
         offset_value,
         reports: Vec::new(),
+        handler_semantics: Vec::new(),
         import_object_usages: Vec::new(),
     };
     collector.visit_program(program);
@@ -786,6 +803,12 @@ fn analyze_program(
             .then_with(|| left.import_name.cmp(&right.import_name))
     });
     collector.reports.dedup();
+    collector.handler_semantics.sort_by(|left, right| {
+        left.assignment_start
+            .cmp(&right.assignment_start)
+            .then_with(|| left.import_name.cmp(&right.import_name))
+    });
+    collector.handler_semantics.dedup();
     collector.import_object_usages.sort_by(|left, right| {
         left.assignment_start
             .cmp(&right.assignment_start)
@@ -795,6 +818,7 @@ fn analyze_program(
     collector.import_object_usages.dedup();
     WasmImportSemanticsAnalysis {
         shapes: collector.reports,
+        handler_semantics: collector.handler_semantics,
         import_object_usages: collector.import_object_usages,
     }
 }
@@ -1075,6 +1099,90 @@ mod tests {
         let analysis = proven_wasm_import_semantics_for(reassigned, "wbg", "target", 5);
         assert_eq!(analysis.shapes.len(), 1);
         assert!(analysis.import_object_usages.is_empty());
+    }
+
+    #[test]
+    fn proves_bulk_import_handler_semantics() {
+        let source = r#"
+            var host = window;
+            var imports = { wbg: {} };
+            imports.wbg.buffer = function(value) { return value.buffer };
+            imports.wbg.length = function(value) { return value.length };
+            imports.wbg.new_u32 = function(value) { return new host.Uint32Array(value) };
+            imports.wbg.set_u32 = function(receiver, source, offset) {
+                receiver.set(source, offset >>> 0)
+            };
+            WebAssembly.instantiate(bytes, imports);
+        "#;
+        let analysis = proven_wasm_import_semantics(source);
+        assert_eq!(analysis.handler_semantics.len(), 4);
+        let by_name = analysis
+            .handler_semantics
+            .iter()
+            .map(|shape| (shape.import_name.as_str(), &shape.semantic))
+            .collect::<HashMap<_, _>>();
+        assert!(matches!(
+            by_name["buffer"],
+            WasmImportHandlerSemantic::PropertyGetter {
+                receiver_param: 0,
+                property: "buffer",
+                standard_builtin_semantics_required: true,
+            }
+        ));
+        assert!(matches!(
+            by_name["length"],
+            WasmImportHandlerSemantic::PropertyGetter {
+                receiver_param: 0,
+                property: "length",
+                standard_builtin_semantics_required: true,
+            }
+        ));
+        assert!(matches!(
+            by_name["new_u32"],
+            WasmImportHandlerSemantic::Uint32ArrayConstructor {
+                source_param: 0,
+                element_width_bits: 32,
+                global_object,
+                standard_builtin_semantics_required: true,
+            } if global_object == "window"
+        ));
+        assert!(matches!(
+            by_name["set_u32"],
+            WasmImportHandlerSemantic::TypedArraySet {
+                receiver_param: 0,
+                source_param: 1,
+                offset_param: 2,
+                offset_to_u32_proven: true,
+                normal_return_set_call_proven: true,
+                standard_builtin_semantics_required: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_ambiguous_bulk_import_handler_semantics() {
+        let source = r#"
+            var host = window;
+            var imports = { wbg: {} };
+            imports.wbg.shadowed_ctor = function(value) {
+                function Uint32Array(value) { return value; }
+                return new Uint32Array(value);
+            };
+            imports.wbg.reassigned_param = function(value) {
+                value = replacement;
+                return value.buffer;
+            };
+            imports.wbg.raw_offset = function(receiver, source, offset) {
+                receiver.set(source, offset);
+            };
+            imports.wbg.extra_effect = function(receiver, source, offset) {
+                sideEffect();
+                receiver.set(source, offset >>> 0);
+            };
+        "#;
+        assert!(proven_wasm_import_semantics(source)
+            .handler_semantics
+            .is_empty());
     }
 
     #[test]
