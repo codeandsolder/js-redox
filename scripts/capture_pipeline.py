@@ -24,7 +24,7 @@ from analysis_artifacts import (
     SOURCE_GRAPH,
     SOURCE_INDEX,
     SOURCEMAPS,
-    WASM_HOST_EFFECTS,
+    WASM_JS_BOUNDARY,
     WASM_INDEX,
     artifact_path,
     load_artifact,
@@ -74,6 +74,8 @@ class ProjectSummary:
     wasm_modules: int
     wasm_origins: int
     wasm_host_effect_pairs: int
+    wasm_copied_input_candidates: int
+    wasm_proven_typed_array_copy_semantics: int
     wasm_proven_host_set_u32_shapes: int
     references: int
     import_map_resolutions: int
@@ -287,7 +289,7 @@ def run_capture_pipeline(
         run_checked(
             [
                 sys.executable,
-                ROOT / "scripts/correlate-wasm-host-effects.py",
+                ROOT / "scripts/correlate-wasm-js-boundary.py",
                 output,
                 "--analyzer",
                 tools.wasm_import_semantics,
@@ -350,8 +352,8 @@ def load_project_summary(
         if wasm_analysis
         else {"summary": {}}
     )
-    wasm_host_effects = (
-        load_artifact(output, WASM_HOST_EFFECTS, optional=True) or {"summary": {}}
+    wasm_js_boundary = (
+        load_artifact(output, WASM_JS_BOUNDARY, optional=True) or {"summary": {}}
         if wasm_analysis and safe_deobfuscation
         else {"summary": {}}
     )
@@ -398,8 +400,16 @@ def load_project_summary(
         javascript_units=sum(unit.get("kind") == "javascript" for unit in source_index["units"]),
         wasm_modules=wasm.get("summary", {}).get("modules", 0),
         wasm_origins=wasm.get("summary", {}).get("origins", 0),
-        wasm_host_effect_pairs=wasm_host_effects.get("summary", {}).get("pairs", 0),
-        wasm_proven_host_set_u32_shapes=wasm_host_effects.get("summary", {}).get("proven_js_set_u32_shapes", 0),
+        wasm_host_effect_pairs=wasm_js_boundary.get("summary", {}).get("host_effect_pairs", 0),
+        wasm_copied_input_candidates=wasm_js_boundary.get("summary", {}).get(
+            "copied_input_candidates", 0
+        ),
+        wasm_proven_typed_array_copy_semantics=wasm_js_boundary.get("summary", {}).get(
+            "proven_js_typed_array_copy_semantics", 0
+        ),
+        wasm_proven_host_set_u32_shapes=wasm_js_boundary.get("summary", {}).get(
+            "proven_js_set_u32_shapes", 0
+        ),
         references=jsrefs["summary"]["references"],
         import_map_resolutions=jsrefs["summary"].get("resolved_by_import_map", 0),
         unresolved_bare_specifiers=jsrefs["summary"].get("unresolved_bare_specifiers", 0),
@@ -439,6 +449,7 @@ def print_project_summary(summary: ProjectSummary) -> None:
         f"  JavaScript units:   {summary.javascript_units}\n"
         f"  WebAssembly modules: {summary.wasm_modules} ({summary.wasm_origins} origin(s))\n"
         f"  WASM host-effect DataView.setUint32 shapes: {summary.wasm_proven_host_set_u32_shapes}/{summary.wasm_host_effect_pairs} proven\n"
+        f"  WASM copied-input Uint32Array semantics: {summary.wasm_proven_typed_array_copy_semantics}/{summary.wasm_copied_input_candidates} proven\n"
         f"  JS/module/worker references: {summary.references}\n"
         f"  import-map resolutions: {summary.import_map_resolutions} "
         f"(unresolved bare: {summary.unresolved_bare_specifiers})\n"

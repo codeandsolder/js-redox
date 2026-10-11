@@ -22,6 +22,7 @@ struct Report {
     schema: &'static str,
     source: String,
     shapes: Vec<jsvm_lift::wasm_import_semantics::WasmImportDataViewSetU32Shape>,
+    handler_semantics: Vec<jsvm_lift::wasm_import_semantics::WasmImportHandlerShape>,
     import_object_usages: Vec<jsvm_lift::wasm_import_semantics::WasmImportObjectUsage>,
 }
 
@@ -48,9 +49,10 @@ fn main() -> Result<()> {
         _ => bail!("--import-module, --import-name and --offset must be supplied together"),
     };
     let report = Report {
-        schema: "jsvm-wasm-import-semantics/v2",
+        schema: "jsvm-wasm-import-semantics/v3",
         source: args.input.display().to_string(),
         shapes: analysis.shapes,
+        handler_semantics: analysis.handler_semantics,
         import_object_usages: analysis.import_object_usages,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);

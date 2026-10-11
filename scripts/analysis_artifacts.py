@@ -79,11 +79,11 @@ WASM_INDEX = ArtifactSpec(
     array_fields=("modules",),
     object_fields=("summary",),
 )
-WASM_HOST_EFFECTS = ArtifactSpec(
-    "WASM host-effect correlation",
-    Path("analysis/wasm-host-effects.json"),
-    "wasm-host-effect-correlation/v2",
-    array_fields=("rows", "skipped_modules"),
+WASM_JS_BOUNDARY = ArtifactSpec(
+    "WASM/JavaScript boundary correlation",
+    Path("analysis/wasm-js-boundary.json"),
+    "wasm-js-boundary-correlation/v1",
+    array_fields=("host_effect_rows", "copied_input_rows", "skipped_modules"),
     object_fields=("summary",),
 )
 GENERATED_RECOVERY = ArtifactSpec(
@@ -123,7 +123,7 @@ ALL_ARTIFACTS = (
     DEOBFUSCATION,
     BUNDLES,
     WASM_INDEX,
-    WASM_HOST_EFFECTS,
+    WASM_JS_BOUNDARY,
     GENERATED_RECOVERY,
     JSVM_INDEX,
     SOURCE_GRAPH,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Correlate proven WASM host-effect/read pairs with proven JS import writes."""
+"""Correlate proof-gated WebAssembly/JavaScript boundary semantics."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from analysis_artifacts import DEOBFUSCATION, WASM_HOST_EFFECTS, WASM_INDEX, load_artifact, write_artifact
+from analysis_artifacts import DEOBFUSCATION, WASM_INDEX, WASM_JS_BOUNDARY, load_artifact, write_artifact
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL_ROOT = ROOT / ".cargo-target-nodebug/debug"
@@ -48,12 +48,13 @@ def run_probe(
             f"{cp.stdout}{cp.stderr}"
         )
     document = json.loads(cp.stdout)
-    if document.get("schema") != "jsvm-wasm-import-semantics/v2":
+    if document.get("schema") != "jsvm-wasm-import-semantics/v3":
         raise RuntimeError(
             f"unexpected JS WASM-import analyzer schema for {source}: "
             f"{document.get('schema')!r}"
         )
     writes = document.get("shapes", [])
+    handler_semantics = document.get("handler_semantics", [])
     usages = document.get("import_object_usages", [])
     if len(writes) > 1:
         raise RuntimeError(
@@ -61,8 +62,42 @@ def run_probe(
         )
     return {
         "write": writes[0] if writes else None,
+        "handler_semantics": handler_semantics,
         "import_object_usages": usages,
     }
+
+
+def run_full_probe(analyzer: Path, source: Path) -> dict:
+    cp = subprocess.run(
+        [str(analyzer), str(source)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
+    if cp.returncode:
+        raise RuntimeError(
+            f"JS WASM-import analyzer failed ({cp.returncode}) for {source}:\n"
+            f"{cp.stdout}{cp.stderr}"
+        )
+    document = json.loads(cp.stdout)
+    if document.get("schema") != "jsvm-wasm-import-semantics/v3":
+        raise RuntimeError(
+            f"unexpected JS WASM-import analyzer schema for {source}: "
+            f"{document.get('schema')!r}"
+        )
+    return document
+
+
+def matching_handler(document: dict, import_module: str, import_name: str, kind: str) -> list[dict]:
+    return [
+        handler
+        for handler in document.get("handler_semantics", [])
+        if handler.get("import_module") == import_module
+        and handler.get("import_name") == import_name
+        and handler.get("kind") == kind
+    ]
 
 
 def main() -> None:
@@ -85,7 +120,9 @@ def main() -> None:
     }
 
     cache: dict[tuple[str, str, str, int], dict] = {}
-    rows: list[dict] = []
+    full_probe_cache: dict[str, dict] = {}
+    host_effect_rows: list[dict] = []
+    copied_input_rows: list[dict] = []
     skipped_modules: list[dict] = []
     carrier_sources: set[str] = set()
 
@@ -96,18 +133,18 @@ def main() -> None:
         report = load(project / module["report_path"])
         # module.report preserves WASM import-section order; filtering to function
         # imports therefore preserves the WebAssembly function-index prefix used
-        # by deep-v5 host_import_function.
+        # by deep-v6 host_import_function.
         function_imports = [
             imported
             for imported in report.get("imports", [])
             if imported.get("kind") == "function"
         ]
-        if deep.get("schema") != "wasm-redox/deep-v5":
+        if deep.get("schema") != "wasm-redox/deep-v6":
             skipped_modules.append(
                 {
                     "sha256": module.get("sha256"),
                     "schema": deep.get("schema"),
-                    "reason": "host-effect/read proof requires wasm-redox/deep-v5",
+                    "reason": "host-effect/read proof requires wasm-redox/deep-v6",
                 }
             )
             continue
@@ -207,43 +244,134 @@ def main() -> None:
                     )
                 if ambiguities:
                     row["ambiguity"] = "; ".join(ambiguities)
-                rows.append(row)
+                host_effect_rows.append(row)
+
+            for candidate in analysis.get("externref_bulk_copy_candidates", []):
+                set_index = candidate.get("set_import_function")
+                constructor_index = candidate.get("constructor_import_function")
+                set_import = (
+                    function_imports[set_index]
+                    if isinstance(set_index, int) and 0 <= set_index < len(function_imports)
+                    else None
+                )
+                constructor_import = (
+                    function_imports[constructor_index]
+                    if isinstance(constructor_index, int)
+                    and 0 <= constructor_index < len(function_imports)
+                    else None
+                )
+                set_module = set_import.get("module") if set_import else None
+                set_name = set_import.get("name") if set_import else None
+                constructor_module = constructor_import.get("module") if constructor_import else None
+                constructor_name = constructor_import.get("name") if constructor_import else None
+
+                proofs = []
+                if all(isinstance(value, str) for value in (
+                    set_module, set_name, constructor_module, constructor_name
+                )):
+                    for relative in carrier_candidates:
+                        source = project / relative
+                        if not source.is_file():
+                            continue
+                        carrier_sources.add(relative)
+                        if relative not in full_probe_cache:
+                            full_probe_cache[relative] = run_full_probe(args.analyzer, source)
+                        document = full_probe_cache[relative]
+                        set_matches = matching_handler(document, set_module, set_name, "typed_array_set")
+                        constructor_matches = [
+                            handler
+                            for handler in matching_handler(
+                                document, constructor_module, constructor_name, "uint32_array_constructor"
+                            )
+                            if handler.get("element_width_bits") == 32
+                        ]
+                        if len(set_matches) == 1 and len(constructor_matches) == 1:
+                            proofs.append({
+                                "source_path": relative,
+                                "set_handler": set_matches[0],
+                                "constructor_handler": constructor_matches[0],
+                            })
+
+                row = {
+                    "module_sha256": module.get("sha256"),
+                    "export": export.get("export"),
+                    "carrier_candidates": carrier_candidates,
+                    "correlation_basis": "exact_import_module_and_name",
+                    "raw_set_import_module": set_module,
+                    "raw_set_import": set_name,
+                    "raw_constructor_import_module": constructor_module,
+                    "raw_constructor_import": constructor_name,
+                    "wasm_structural_copy_candidate_proven": True,
+                    "wasm_candidate": candidate,
+                    "js_typed_array_copy_semantics_proven": len(proofs) == 1,
+                    "js_typed_array_copy_semantics_proofs": proofs,
+                    "module_memory_identity_proven": False,
+                    "module_memory_identity_limitation": (
+                        "the WASM structural candidate and matching JS Uint32Array constructor/set "
+                        "handlers are proven, but the constructor input ArrayBuffer is not yet tied "
+                        "to the memory export of this exact recovered module instance"
+                    ),
+                    "destination_load_interpretation_proven": False,
+                }
+                if len(proofs) > 1:
+                    row["js_typed_array_copy_semantics_proven"] = False
+                    row["ambiguity"] = (
+                        "multiple carrier sources prove the same constructor/set import semantics"
+                    )
+                copied_input_rows.append(row)
 
     out = {
-        "schema": WASM_HOST_EFFECTS.schema,
-        "wasm_schema_required": "wasm-redox/deep-v5",
-        "js_schema": "jsvm-wasm-import-semantics/v2",
+        "schema": WASM_JS_BOUNDARY.schema,
+        "wasm_schema_required": "wasm-redox/deep-v6",
+        "js_schema": "jsvm-wasm-import-semantics/v3",
         "safe_static_only": True,
         "correlation_contract": (
-            "exact WASM import module+name match; the same stable JS import object may be "
-            "proven as an argument at an unshadowed WebAssembly instantiation site, but "
-            "exact recovered-module byte identity at that site is not yet proven"
+            "cross-language claims require exact WASM import module+name matches. "
+            "Host-effect writes and typed-array input-copy candidates remain independent evidence "
+            "families; exact recovered-module instance/memory identity is a separate proof."
         ),
-        "memory_write_interpretation": "requires standard unmodified DataView builtin semantics",
-        "rows": rows,
+        "memory_write_interpretation": (
+            "DataView and typed-array interpretations require standard unmodified platform builtins"
+        ),
+        "host_effect_rows": host_effect_rows,
+        "copied_input_rows": copied_input_rows,
         "skipped_modules": skipped_modules,
         "summary": {
-            "pairs": len(rows),
-            "proven_js_set_u32_shapes": sum(row["js_set_u32_shape_proven"] for row in rows),
+            "host_effect_pairs": len(host_effect_rows),
+            "proven_js_set_u32_shapes": sum(row["js_set_u32_shape_proven"] for row in host_effect_rows),
             "proven_js_import_object_instantiation_sites": sum(
-                row["js_import_object_instantiation_site_proven"] for row in rows
+                row["js_import_object_instantiation_site_proven"] for row in host_effect_rows
             ),
-            "opaque_only": sum(not row["js_set_u32_shape_proven"] for row in rows),
-            "modules": len({row["module_sha256"] for row in rows}),
+            "opaque_host_effect_pairs": sum(
+                not row["js_set_u32_shape_proven"] for row in host_effect_rows
+            ),
+            "copied_input_candidates": len(copied_input_rows),
+            "proven_js_typed_array_copy_semantics": sum(
+                row["js_typed_array_copy_semantics_proven"] for row in copied_input_rows
+            ),
+            "proven_module_memory_identities": sum(
+                row["module_memory_identity_proven"] for row in copied_input_rows
+            ),
+            "modules": len({
+                row["module_sha256"] for row in [*host_effect_rows, *copied_input_rows]
+            }),
             "carrier_sources": len(carrier_sources),
-            "probe_invocations": len(cache),
+            "probe_invocations": len(cache) + len(full_probe_cache),
             "skipped_modules": len(skipped_modules),
         },
     }
-    output = project / WASM_HOST_EFFECTS.relative_path
-    write_artifact(project, WASM_HOST_EFFECTS, out)
+    output = project / WASM_JS_BOUNDARY.relative_path
+    write_artifact(project, WASM_JS_BOUNDARY, out)
     summary = out["summary"]
     print(
-        "WASM host effects: "
-        f"{summary['proven_js_set_u32_shapes']}/{summary['pairs']} pair(s) have proven JS DataView.setUint32 shapes; "
-        f"{summary['proven_js_import_object_instantiation_sites']}/{summary['pairs']} pair(s) have proven JS import-object WebAssembly instantiation sites; "
-        f"{summary['opaque_only']} remain opaque; "
-        f"{summary['carrier_sources']} carrier source(s)"
+        "WASM/JS boundary: "
+        f"{summary['proven_js_set_u32_shapes']}/{summary['host_effect_pairs']} host-effect pair(s) "
+        "have proven JS DataView.setUint32 shapes; "
+        f"{summary['proven_js_typed_array_copy_semantics']}/"
+        f"{summary['copied_input_candidates']} copied-input candidate(s) have proven "
+        "JS Uint32Array constructor/set semantics; "
+        f"{summary['proven_module_memory_identities']} copied-input candidate(s) have proven "
+        "exact module-memory identity"
     )
 
 

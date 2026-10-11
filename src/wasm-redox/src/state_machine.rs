@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 
 mod analysis;
+mod copied_input;
 mod helper_recognition;
 mod host_effect;
 mod ir;
@@ -15,6 +16,7 @@ mod transition;
 mod value_flow;
 
 pub use analysis::{analyze_export_semantics, ExportSemanticAnalysis};
+pub use copied_input::{ExternrefBulkCopyCandidateReport, StructuralInputCopyLoadReport};
 #[cfg(test)]
 use helper_recognition::normalize_import_name;
 pub use host_effect::OpaqueHostEffectMemoryReadReport;
@@ -30,6 +32,101 @@ pub use semantic_render::SemanticRuntimeBindingReport;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_structural_externref_bulk_copy_candidate() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (table 4 externref)
+                (memory 1)
+                (func (export "copy") (param $source externref) (param $base i32) (result i32)
+                    i32.const 0
+                    local.get $source
+                    table.set
+
+                    i32.const 1
+                    i32.const 0
+                    table.get
+                    call $ctor
+                    table.set
+
+                    i32.const 1
+                    table.get
+                    i32.const 0
+                    table.get
+                    local.get $base
+                    i32.const 2
+                    i32.shr_u
+                    call $set
+
+                    local.get $base
+                    i32.load
+                    local.get $base
+                    i32.load offset=4
+                    i32.add))"#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        assert_eq!(analysis.externref_bulk_copy_candidates.len(), 1);
+        let candidate = &analysis.externref_bulk_copy_candidates[0];
+        assert_eq!(candidate.set_import_function, 1);
+        assert_eq!(candidate.constructor_import_function, 0);
+        assert_eq!(candidate.source_entry_parameter, 0);
+        assert_eq!(candidate.destination_element_index_shift, 2);
+        assert_eq!(
+            candidate
+                .destination_loads
+                .iter()
+                .map(|load| load.byte_offset)
+                .collect::<Vec<_>>(),
+            vec![0, 4]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_bulk_copy_candidate_with_path_dependent_source_overwrite() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (table 4 externref)
+                (func (export "copy")
+                    (param $source externref)
+                    (param $other externref)
+                    (param $condition i32)
+                    (param $base i32)
+                    i32.const 0
+                    local.get $source
+                    table.set
+
+                    local.get $condition
+                    if
+                        i32.const 0
+                        local.get $other
+                        table.set
+                    end
+
+                    i32.const 1
+                    i32.const 0
+                    table.get
+                    call $ctor
+                    table.set
+
+                    i32.const 1
+                    table.get
+                    i32.const 0
+                    table.get
+                    local.get $base
+                    i32.const 2
+                    i32.shr_u
+                    call $set))"#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        assert!(analysis.externref_bulk_copy_candidates.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn recovers_xor_encoded_state_chain() -> Result<()> {

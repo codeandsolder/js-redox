@@ -1,4 +1,5 @@
 use super::{
+    copied_input::{externref_bulk_copy_candidates, ExternrefBulkCopyCandidateReport},
     helper_recognition::build_semantic_call_names,
     host_effect::{opaque_host_effect_memory_reads, OpaqueHostEffectMemoryReadReport},
     ir::i32_const,
@@ -26,6 +27,7 @@ pub struct ExportSemanticAnalysis {
     pub state_machines: Vec<StateMachineReport>,
     pub terminal_bindings: Vec<SemanticBindingReport>,
     pub runtime_bindings: Vec<SemanticRuntimeBindingReport>,
+    pub externref_bulk_copy_candidates: Vec<ExternrefBulkCopyCandidateReport>,
     pub opaque_host_effect_memory_reads: Vec<OpaqueHostEffectMemoryReadReport>,
     pub return_expressions: Vec<String>,
 }
@@ -61,6 +63,7 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
         .optimize(&OptOptions::default());
     let call_names = build_semantic_call_names(&mut module, func);
     let body = module.funcs[func].body().context("body")?;
+    let externref_bulk_copy_candidates = externref_bulk_copy_candidates(&module, body);
 
     let mut candidates = Vec::new();
     for (block, def) in body.blocks.entries() {
@@ -182,6 +185,7 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
         state_machines: machines,
         terminal_bindings,
         runtime_bindings,
+        externref_bulk_copy_candidates,
         opaque_host_effect_memory_reads,
         return_expressions,
     })
