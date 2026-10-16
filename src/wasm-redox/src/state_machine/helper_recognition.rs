@@ -14,6 +14,7 @@ pub(super) struct SemanticCallNames {
     validated_view_new_imports: BTreeSet<Func>,
     validated_get_u32_imports: BTreeSet<Func>,
     validated_memory_get_u32_helpers: BTreeSet<Func>,
+    memory_slot_imports: BTreeMap<Func, Func>,
     opaque_host_effect_helpers: BTreeMap<Func, Func>,
 }
 
@@ -28,6 +29,10 @@ impl SemanticCallNames {
 
     pub(super) fn is_memory_get_u32_helper(&self, function: Func) -> bool {
         self.validated_memory_get_u32_helpers.contains(&function)
+    }
+
+    pub(super) fn memory_slot_import(&self, function: Func) -> Option<Func> {
+        self.memory_slot_imports.get(&function).copied()
     }
 
     pub(super) fn opaque_host_effect_import(&self, function: Func) -> Option<Func> {
@@ -159,24 +164,35 @@ fn helper_returns_import_call(
     (label == import_name).then_some(args)
 }
 
-fn helper_is_memory_slot(body: &FunctionBody, names: &SemanticCallNames) -> bool {
+fn memory_slot_import(body: &FunctionBody, names: &SemanticCallNames) -> Option<Func> {
     if body.n_params != 0 {
-        return false;
+        return None;
     }
-    let Some(returned_slot) = unique_return_value(body) else {
-        return false;
-    };
-    let returned_slot = unique_transparent_origin(body, returned_slot, 8);
-    body.values.entries().any(|(_, value)| {
-        let ValueDef::Operator(Operator::TableSet { .. }, args, _) = value else {
-            return false;
-        };
-        let [slot, stored] = &body.arg_pool[*args] else {
-            return false;
-        };
-        unique_transparent_origin(body, *slot, 8) == returned_slot
-            && call_label(body, *stored, names).is_some_and(|(label, _)| label == "wbindgen.memory")
-    })
+    let returned_slot = unique_transparent_origin(body, unique_return_value(body)?, 8);
+    let imports = body
+        .values
+        .entries()
+        .filter_map(|(_, value)| {
+            let ValueDef::Operator(Operator::TableSet { .. }, args, _) = value else {
+                return None;
+            };
+            let [slot, stored] = &body.arg_pool[*args] else {
+                return None;
+            };
+            if unique_transparent_origin(body, *slot, 8) != returned_slot {
+                return None;
+            }
+            let (function, _) = call_target(body, *stored, 8)?;
+            (names.label(function) == Some("wbindgen.memory")).then_some(function)
+        })
+        .collect::<BTreeSet<_>>();
+    (imports.len() == 1)
+        .then(|| imports.into_iter().next())
+        .flatten()
+}
+
+fn helper_is_memory_slot(body: &FunctionBody, names: &SemanticCallNames) -> bool {
+    memory_slot_import(body, names).is_some()
 }
 
 pub(super) fn memory_slot_from_table_get(
@@ -551,6 +567,15 @@ pub(super) fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> 
         }
         if !changed {
             break;
+        }
+    }
+
+    for callee in candidates.iter().copied() {
+        let Some(body) = module.funcs[callee].body() else {
+            continue;
+        };
+        if let Some(imported) = memory_slot_import(body, &names) {
+            names.memory_slot_imports.insert(callee, imported);
         }
     }
 
