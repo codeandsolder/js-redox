@@ -48,7 +48,7 @@ def run_probe(
             f"{cp.stdout}{cp.stderr}"
         )
     document = json.loads(cp.stdout)
-    if document.get("schema") != "jsvm-wasm-import-semantics/v3":
+    if document.get("schema") != "jsvm-wasm-import-semantics/v4":
         raise RuntimeError(
             f"unexpected JS WASM-import analyzer schema for {source}: "
             f"{document.get('schema')!r}"
@@ -82,12 +82,63 @@ def run_full_probe(analyzer: Path, source: Path) -> dict:
             f"{cp.stdout}{cp.stderr}"
         )
     document = json.loads(cp.stdout)
-    if document.get("schema") != "jsvm-wasm-import-semantics/v3":
+    if document.get("schema") != "jsvm-wasm-import-semantics/v4":
         raise RuntimeError(
             f"unexpected JS WASM-import analyzer schema for {source}: "
             f"{document.get('schema')!r}"
         )
     return document
+
+
+def exact_module_usage_proofs(usages: list[dict], module_sha256: str | None) -> list[dict]:
+    if not isinstance(module_sha256, str):
+        return []
+    proofs = []
+    for usage in usages:
+        exact_sites = [
+            site
+            for site in usage.get("instantiation_sites", [])
+            if site.get("exact_import_object_identity_proven") is True
+            and site.get("exact_module_identity_proven") is True
+            and site.get("module_sha256") == module_sha256
+        ]
+        if exact_sites:
+            proofs.append({**usage, "instantiation_sites": exact_sites})
+    return proofs
+
+
+def common_exact_binding_proofs(
+    left_usages: list[dict], right_usages: list[dict], module_sha256: str | None
+) -> list[dict]:
+    left = exact_module_usage_proofs(left_usages, module_sha256)
+    right = exact_module_usage_proofs(right_usages, module_sha256)
+    proofs = []
+    for lhs in left:
+        for rhs in right:
+            if lhs.get("import_object") != rhs.get("import_object"):
+                continue
+            right_sites = {
+                (site.get("start"), site.get("end"), site.get("module_sha256"))
+                for site in rhs.get("instantiation_sites", [])
+            }
+            common_sites = [
+                site
+                for site in lhs.get("instantiation_sites", [])
+                if (site.get("start"), site.get("end"), site.get("module_sha256"))
+                in right_sites
+            ]
+            if common_sites:
+                proofs.append(
+                    {
+                        "import_object": lhs.get("import_object"),
+                        "left_import_module": lhs.get("import_module"),
+                        "left_import_name": lhs.get("import_name"),
+                        "right_import_module": rhs.get("import_module"),
+                        "right_import_name": rhs.get("import_name"),
+                        "instantiation_sites": common_sites,
+                    }
+                )
+    return proofs
 
 
 def matching_handler(document: dict, import_module: str, import_name: str, kind: str) -> list[dict]:
@@ -200,6 +251,9 @@ def main() -> None:
                                 {"source_path": relative, **usage}
                             )
 
+                exact_binding_proofs = exact_module_usage_proofs(
+                    import_object_usage_proofs, module.get("sha256")
+                )
                 row = {
                     "module_sha256": module.get("sha256"),
                     "export": export.get("export"),
@@ -211,11 +265,12 @@ def main() -> None:
                     "correlation_basis": "exact_import_module_and_name",
                     "js_import_object_instantiation_site_proven": len(import_object_usage_proofs) == 1,
                     "js_import_object_instantiation_site_proofs": import_object_usage_proofs,
-                    "import_binding_identity_proven": False,
+                    "import_binding_identity_proven": len(exact_binding_proofs) == 1,
+                    "import_binding_identity_proofs": exact_binding_proofs,
                     "import_binding_identity_limitation": (
-                        "the exact stable JS import object is proven at an unshadowed "
-                        "WebAssembly instantiation site when reported, but the instantiated "
-                        "module bytes are not yet tied to this recovered WASM module"
+                        None
+                        if len(exact_binding_proofs) == 1
+                        else "no unique carrier proof ties this exact recovered module SHA to the exact import object at one WebAssembly instantiation site"
                     ),
                     "js_set_u32_shape_proven": len(proofs) == 1,
                     "js_set_u32_shape_proofs": proofs,
@@ -241,6 +296,11 @@ def main() -> None:
                     row["js_import_object_instantiation_site_proven"] = False
                     ambiguities.append(
                         "multiple carrier sources prove import-object WebAssembly instantiation sites"
+                    )
+                if len(exact_binding_proofs) > 1:
+                    row["import_binding_identity_proven"] = False
+                    ambiguities.append(
+                        "multiple carrier sources prove exact module/import-object binding identity"
                     )
                 if ambiguities:
                     row["ambiguity"] = "; ".join(ambiguities)
@@ -286,12 +346,33 @@ def main() -> None:
                             if handler.get("element_width_bits") == 32
                         ]
                         if len(set_matches) == 1 and len(constructor_matches) == 1:
+                            set_usages = [
+                                usage
+                                for usage in document.get("import_object_usages", [])
+                                if usage.get("import_module") == set_module
+                                and usage.get("import_name") == set_name
+                            ]
+                            constructor_usages = [
+                                usage
+                                for usage in document.get("import_object_usages", [])
+                                if usage.get("import_module") == constructor_module
+                                and usage.get("import_name") == constructor_name
+                            ]
+                            binding_proofs = common_exact_binding_proofs(
+                                set_usages, constructor_usages, module.get("sha256")
+                            )
                             proofs.append({
                                 "source_path": relative,
                                 "set_handler": set_matches[0],
                                 "constructor_handler": constructor_matches[0],
+                                "import_binding_identity_proofs": binding_proofs,
                             })
 
+                copied_binding_proofs = [
+                    {"source_path": proof["source_path"], **binding}
+                    for proof in proofs
+                    for binding in proof.get("import_binding_identity_proofs", [])
+                ]
                 row = {
                     "module_sha256": module.get("sha256"),
                     "export": export.get("export"),
@@ -305,6 +386,8 @@ def main() -> None:
                     "wasm_candidate": candidate,
                     "js_typed_array_copy_semantics_proven": len(proofs) == 1,
                     "js_typed_array_copy_semantics_proofs": proofs,
+                    "import_binding_identity_proven": len(copied_binding_proofs) == 1,
+                    "import_binding_identity_proofs": copied_binding_proofs,
                     "module_memory_identity_proven": False,
                     "module_memory_identity_limitation": (
                         "the WASM structural candidate and matching JS Uint32Array constructor/set "
@@ -318,17 +401,23 @@ def main() -> None:
                     row["ambiguity"] = (
                         "multiple carrier sources prove the same constructor/set import semantics"
                     )
+                if len(copied_binding_proofs) > 1:
+                    row["import_binding_identity_proven"] = False
+                    row["ambiguity"] = (
+                        row.get("ambiguity", "") + "; multiple exact module/import-object binding proofs"
+                    ).strip("; ")
                 copied_input_rows.append(row)
 
     out = {
         "schema": WASM_JS_BOUNDARY.schema,
         "wasm_schema_required": "wasm-redox/deep-v6",
-        "js_schema": "jsvm-wasm-import-semantics/v3",
+        "js_schema": "jsvm-wasm-import-semantics/v4",
         "safe_static_only": True,
         "correlation_contract": (
             "cross-language claims require exact WASM import module+name matches. "
             "Host-effect writes and typed-array input-copy candidates remain independent evidence "
-            "families; exact recovered-module instance/memory identity is a separate proof."
+            "families; exact module/import-object binding identity is proven separately from "
+            "instance/exported-memory identity."
         ),
         "memory_write_interpretation": (
             "DataView and typed-array interpretations require standard unmodified platform builtins"
@@ -348,6 +437,12 @@ def main() -> None:
             "copied_input_candidates": len(copied_input_rows),
             "proven_js_typed_array_copy_semantics": sum(
                 row["js_typed_array_copy_semantics_proven"] for row in copied_input_rows
+            ),
+            "proven_host_import_binding_identities": sum(
+                row["import_binding_identity_proven"] for row in host_effect_rows
+            ),
+            "proven_copied_input_binding_identities": sum(
+                row["import_binding_identity_proven"] for row in copied_input_rows
             ),
             "proven_module_memory_identities": sum(
                 row["module_memory_identity_proven"] for row in copied_input_rows

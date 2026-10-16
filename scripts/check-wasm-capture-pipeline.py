@@ -77,8 +77,14 @@ def main():
         "    var view = new host.DataView(memory.buffer), address = base + offset;\n"
         "    offset === 56708 || view.setUint32(address, 1, false);\n"
         "};\n"
+        "function bA(A) {\n"
+        "    if (Uint8Array.fromBase64) return [Uint8Array.fromBase64(A).buffer, false];\n"
+        "    for (var Q = atob(A), g = new Uint8Array(Q.length), E = 0; E < Q.length; E++) g[E] = Q.charCodeAt(E);\n"
+        "    return [g.buffer, false];\n"
+        "}\n"
         f'const embedded = "{WASM_B64}";\n'
-        "WebAssembly.instantiate(bytes, imports);\n"
+        "var bytes = bA(embedded)[0];\n"
+        "host.WebAssembly.instantiate(bytes, imports);\n"
     )
     fixture = {
         "log": {
@@ -189,13 +195,15 @@ def main():
     assert boundary["summary"]["host_effect_pairs"] == 2, boundary
     assert boundary["summary"]["proven_js_set_u32_shapes"] == 1, boundary
     assert boundary["summary"]["proven_js_import_object_instantiation_sites"] == 2, boundary
+    assert boundary["summary"]["proven_host_import_binding_identities"] == 2, boundary
     by_offset = {row["offset"]: row for row in boundary["host_effect_rows"]}
     assert by_offset[3536]["js_set_u32_shape_proven"] is True, by_offset
     assert by_offset[56708]["js_set_u32_shape_proven"] is False, by_offset
     assert by_offset[3536]["js_set_u32_shape_proofs"][0]["method"] == "setUint32"
     assert all(
         row["js_import_object_instantiation_site_proven"] is True
-        and row["import_binding_identity_proven"] is False
+        and row["import_binding_identity_proven"] is True
+        and len(row["import_binding_identity_proofs"]) == 1
         and row["js_import_object_instantiation_site_proofs"][0]["import_object"] == "imports"
         for row in by_offset.values()
     ), by_offset
@@ -211,7 +219,7 @@ def main():
     }
     print(
         "wasm capture regression: dedup + provenance + 1/2 host DataView.setUint32 "
-        "shape + 2/2 import-object instantiation-site correlation OK"
+        "shape + 2/2 exact module/import-object binding correlation OK"
     )
 
 

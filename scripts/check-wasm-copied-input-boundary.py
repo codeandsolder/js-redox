@@ -84,8 +84,14 @@ def main() -> None:
         "imports.wbg.set = function(receiver, source, offset) {\n"
         "    receiver.set(source, offset >>> 0);\n"
         "};\n"
+        "function bA(A) {\n"
+        "    if (Uint8Array.fromBase64) return [Uint8Array.fromBase64(A).buffer, false];\n"
+        "    for (var Q = atob(A), g = new Uint8Array(Q.length), E = 0; E < Q.length; E++) g[E] = Q.charCodeAt(E);\n"
+        "    return [g.buffer, false];\n"
+        "}\n"
         f'const embedded = "{WASM_B64}";\n'
-        "WebAssembly.instantiate(bytes, imports);\n"
+        "var bytes = bA(embedded)[0];\n"
+        "host.WebAssembly.instantiate(bytes, imports);\n"
     )
     fixture = {
         "log": {
@@ -158,6 +164,7 @@ def main() -> None:
     assert boundary["summary"]["host_effect_pairs"] == 0, boundary
     assert boundary["summary"]["copied_input_candidates"] == 1, boundary
     assert boundary["summary"]["proven_js_typed_array_copy_semantics"] == 1, boundary
+    assert boundary["summary"]["proven_copied_input_binding_identities"] == 1, boundary
     assert boundary["summary"]["proven_module_memory_identities"] == 0, boundary
     [row] = boundary["copied_input_rows"]
     assert row["raw_constructor_import_module"] == "wbg", row
@@ -165,12 +172,14 @@ def main() -> None:
     assert row["raw_set_import_module"] == "wbg", row
     assert row["raw_set_import"] == "set", row
     assert row["js_typed_array_copy_semantics_proven"] is True, row
+    assert row["import_binding_identity_proven"] is True, row
+    assert len(row["import_binding_identity_proofs"]) == 1, row
     assert row["module_memory_identity_proven"] is False, row
     assert row["destination_load_interpretation_proven"] is False, row
 
     print(
         "WASM copied-input boundary regression: inline extraction + structural copy + "
-        "1/1 JS Uint32Array semantics + fail-closed module-memory identity OK"
+        "1/1 JS Uint32Array semantics + exact module/import binding + fail-closed module-memory identity OK"
     )
 
 
