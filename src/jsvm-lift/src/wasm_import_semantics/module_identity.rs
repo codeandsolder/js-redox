@@ -96,6 +96,48 @@ fn has_required_unresolved_globals(
     probe.valid && probe.seen.len() == probe.required.len()
 }
 
+struct ExactNamedSymbolReferences<'c, 'n> {
+    scoping: &'c Scoping,
+    name: &'n str,
+    symbol: SymbolId,
+    seen: bool,
+    valid: bool,
+}
+
+impl<'a> Visit<'a> for ExactNamedSymbolReferences<'_, '_> {
+    fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
+        if identifier.name.as_str() != self.name {
+            return;
+        }
+        let Some(reference_id) = identifier.reference_id.get() else {
+            self.valid = false;
+            return;
+        };
+        if self.scoping.get_reference(reference_id).symbol_id() != Some(self.symbol) {
+            self.valid = false;
+            return;
+        }
+        self.seen = true;
+    }
+}
+
+fn function_references_name_only_as_symbol(
+    function: &Function<'_>,
+    scoping: &Scoping,
+    name: &str,
+    symbol: SymbolId,
+) -> bool {
+    let mut probe = ExactNamedSymbolReferences {
+        scoping,
+        name,
+        symbol,
+        seen: false,
+        valid: true,
+    };
+    probe.visit_function(function, ScopeFlags::empty());
+    probe.seen && probe.valid
+}
+
 fn compact_statement(source: &str, statement: &Statement<'_>) -> Option<String> {
     let span = statement.span();
     source
@@ -195,7 +237,8 @@ fn classify_base64_array_buffer_pair(
     let Some(fallback_return) = compact_statement(source, fallback_return) else {
         return false;
     };
-    if fallback_return != format!("return[{bytes}.buffer,false];") {
+    let fallback = format!("return[{bytes}.buffer,false]");
+    if fallback_return != fallback && fallback_return != format!("{fallback};") {
         return false;
     }
 
@@ -232,7 +275,7 @@ fn classify_array_identity(
         let alias = scoping.symbol_name(*symbol);
         has_shape(&format!(
             "if({alias}.Array.isArray({parameter}))return{parameter}"
-        ))
+        )) && function_references_name_only_as_symbol(function, scoping, alias, *symbol)
     });
     let direct_identity = has_shape(&format!("if(Array.isArray({parameter}))return{parameter}"))
         && has_required_unresolved_globals(function, scoping, &["Array"]);

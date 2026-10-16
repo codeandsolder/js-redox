@@ -4,8 +4,8 @@ use super::{
     symbol_of, unparenthesized,
 };
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, BindingPattern, CallExpression, Expression, Function, Program,
-    Statement, VariableDeclaration,
+    Argument, AssignmentTarget, BindingPattern, BlockStatement, CallExpression, Expression,
+    Function, Program, Statement, SwitchCase,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
@@ -198,11 +198,63 @@ fn returned_symbol(expression: &Expression<'_>, scoping: &Scoping) -> Option<Sym
     }
 }
 
-fn fresh_returned_object(function: &Function<'_>, scoping: &Scoping) -> Option<SymbolId> {
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+struct RegionId {
+    start: u32,
+    end: u32,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct StatementPosition {
+    region: RegionId,
+    index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FreshReturnedObject {
+    object_symbol: SymbolId,
+    region: RegionId,
+    return_index: usize,
+}
+
+#[derive(Default)]
+struct FunctionReturnCounter {
+    function_depth: usize,
+    returns: usize,
+}
+
+impl<'a> Visit<'a> for FunctionReturnCounter {
+    fn visit_function(&mut self, function: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        self.function_depth += 1;
+        walk::walk_function(self, function, flags);
+        self.function_depth -= 1;
+    }
+
+    fn visit_return_statement(&mut self, statement: &oxc_ast::ast::ReturnStatement<'a>) {
+        if self.function_depth == 1 {
+            self.returns += 1;
+        }
+        walk::walk_return_statement(self, statement);
+    }
+}
+
+fn has_exactly_one_function_return(function: &Function<'_>) -> bool {
+    let mut counter = FunctionReturnCounter::default();
+    counter.visit_function(function, oxc_syntax::scope::ScopeFlags::empty());
+    counter.returns == 1
+}
+
+fn fresh_returned_object(
+    function: &Function<'_>,
+    scoping: &Scoping,
+) -> Option<FreshReturnedObject> {
+    if !has_exactly_one_function_return(function) {
+        return None;
+    }
     let body = function.body.as_ref()?;
     let mut fresh_objects = Vec::new();
     let mut returns = Vec::new();
-    for statement in &body.statements {
+    for (index, statement) in body.statements.iter().enumerate() {
         match statement {
             Statement::VariableDeclaration(declaration) => {
                 for declarator in &declaration.declarations {
@@ -218,23 +270,33 @@ fn fresh_returned_object(function: &Function<'_>, scoping: &Scoping) -> Option<S
                 }
             }
             Statement::ReturnStatement(statement) => {
-                returns.push(returned_symbol(statement.argument.as_ref()?, scoping)?);
+                returns.push((
+                    index,
+                    returned_symbol(statement.argument.as_ref()?, scoping)?,
+                ));
             }
             _ => {}
         }
     }
-    let [returned] = returns.as_slice() else {
+    let [(return_index, returned)] = returns.as_slice() else {
         return None;
     };
     fresh_objects
         .contains(returned)
-        .then_some(*returned)
-        .filter(|symbol| super::symbol_binding_is_stable(scoping, *symbol))
+        .then_some(FreshReturnedObject {
+            object_symbol: *returned,
+            region: RegionId {
+                start: function.span.start,
+                end: function.span.end,
+            },
+            return_index: *return_index,
+        })
+        .filter(|fresh| super::symbol_binding_is_stable(scoping, fresh.object_symbol))
 }
 
 struct ReturnedObjectFunctionCollector<'c> {
     scoping: &'c Scoping,
-    functions: HashMap<SymbolId, SymbolId>,
+    functions: HashMap<SymbolId, FreshReturnedObject>,
 }
 
 impl<'a> Visit<'a> for ReturnedObjectFunctionCollector<'_> {
@@ -242,8 +304,8 @@ impl<'a> Visit<'a> for ReturnedObjectFunctionCollector<'_> {
         if let Some(identifier) = &function.id {
             if let Some(function_symbol) = identifier.symbol_id.get() {
                 if super::symbol_binding_is_stable(self.scoping, function_symbol) {
-                    if let Some(object_symbol) = fresh_returned_object(function, self.scoping) {
-                        self.functions.insert(function_symbol, object_symbol);
+                    if let Some(object) = fresh_returned_object(function, self.scoping) {
+                        self.functions.insert(function_symbol, object);
                     }
                 }
             }
@@ -255,7 +317,7 @@ impl<'a> Visit<'a> for ReturnedObjectFunctionCollector<'_> {
 fn collect_returned_object_functions(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> HashMap<SymbolId, SymbolId> {
+) -> HashMap<SymbolId, FreshReturnedObject> {
     let mut collector = ReturnedObjectFunctionCollector {
         scoping,
         functions: HashMap::new(),
@@ -264,61 +326,309 @@ fn collect_returned_object_functions(
     collector.functions
 }
 
-struct ReturnedObjectAliasCollector<'c, 'f> {
+#[derive(Debug, Clone)]
+struct DirectAssignment {
+    span: (u32, u32),
+    symbol: SymbolId,
+    module: String,
+    name: String,
+    position: StatementPosition,
+    return_prefix: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReturnedObjectAlias {
+    result_symbol: SymbolId,
+    object_symbol: SymbolId,
+    position: StatementPosition,
+}
+
+#[derive(Default)]
+struct DirectExecutionFacts {
+    assignments: Vec<DirectAssignment>,
+    aliases: Vec<ReturnedObjectAlias>,
+    site_positions: HashMap<(u32, u32), Vec<StatementPosition>>,
+}
+
+type ImportMemberKey = (SymbolId, String, String);
+
+struct ImportMemberWriteCollector<'c> {
     scoping: &'c Scoping,
-    functions: &'f HashMap<SymbolId, SymbolId>,
-    aliases: HashMap<SymbolId, SymbolId>,
+    counts: HashMap<ImportMemberKey, usize>,
 }
 
-impl ReturnedObjectAliasCollector<'_, '_> {
-    fn returned_object(&self, expression: &Expression<'_>) -> Option<SymbolId> {
-        let Expression::CallExpression(call) = unparenthesized(expression) else {
-            return None;
-        };
-        if call.optional || call.arguments.iter().any(Argument::is_spread) {
-            return None;
+impl<'a> Visit<'a> for ImportMemberWriteCollector<'_> {
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if let Some((symbol, _, module, name)) =
+            assignment_import_object(self.scoping, &assignment.left)
+        {
+            *self.counts.entry((symbol, module, name)).or_default() += 1;
         }
-        self.functions
-            .get(&symbol_of(self.scoping, &call.callee)?)
-            .copied()
+        walk::walk_assignment_expression(self, assignment);
     }
 }
 
-impl<'a> Visit<'a> for ReturnedObjectAliasCollector<'_, '_> {
-    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
-        for declarator in &declaration.declarations {
-            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                continue;
-            };
-            let Some(result_symbol) = identifier.symbol_id.get() else {
-                continue;
-            };
-            let Some(initializer) = &declarator.init else {
-                continue;
-            };
-            let Some(object_symbol) = self.returned_object(initializer) else {
-                continue;
-            };
-            if super::symbol_binding_is_stable(self.scoping, result_symbol) {
-                self.aliases.insert(result_symbol, object_symbol);
-            }
-        }
-        walk::walk_variable_declaration(self, declaration);
-    }
-}
-
-fn collect_returned_object_aliases(
+fn collect_import_member_write_counts(
     program: &Program<'_>,
     scoping: &Scoping,
-    functions: &HashMap<SymbolId, SymbolId>,
-) -> HashMap<SymbolId, SymbolId> {
-    let mut collector = ReturnedObjectAliasCollector {
+) -> HashMap<ImportMemberKey, usize> {
+    let mut collector = ImportMemberWriteCollector {
         scoping,
-        functions,
-        aliases: HashMap::new(),
+        counts: HashMap::new(),
     };
     collector.visit_program(program);
-    collector.aliases
+    collector.counts
+}
+
+struct StatementSitePositionCollector<'f> {
+    position: StatementPosition,
+    site_positions: &'f mut HashMap<(u32, u32), Vec<StatementPosition>>,
+}
+
+impl<'a> Visit<'a> for StatementSitePositionCollector<'_> {
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {
+        // A nested function is a separate execution region; do not attribute its sites
+        // to the enclosing top-level statement.
+    }
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        // Arrow bodies are likewise separate execution regions. They are intentionally
+        // unsupported here until we model their invocation path explicitly.
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        self.site_positions
+            .entry((call.span.start, call.span.end))
+            .or_default()
+            .push(self.position);
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_new_expression(&mut self, expression: &oxc_ast::ast::NewExpression<'a>) {
+        self.site_positions
+            .entry((expression.span.start, expression.span.end))
+            .or_default()
+            .push(self.position);
+        walk::walk_new_expression(self, expression);
+    }
+}
+
+fn record_statement_site_positions(
+    statement: &Statement<'_>,
+    position: StatementPosition,
+    site_positions: &mut HashMap<(u32, u32), Vec<StatementPosition>>,
+) {
+    let mut collector = StatementSitePositionCollector {
+        position,
+        site_positions,
+    };
+    collector.visit_statement(statement);
+}
+
+fn record_direct_import_assignment(
+    assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    position: StatementPosition,
+    return_prefix: bool,
+    scoping: &Scoping,
+    facts: &mut DirectExecutionFacts,
+) {
+    let Some((symbol, _, module, name)) = assignment_import_object(scoping, &assignment.left)
+    else {
+        return;
+    };
+    if !super::symbol_binding_is_stable(scoping, symbol) {
+        return;
+    }
+    facts.assignments.push(DirectAssignment {
+        span: (assignment.span.start, assignment.span.end),
+        symbol,
+        module,
+        name,
+        position,
+        return_prefix,
+    });
+}
+
+fn record_return_sequence_assignments(
+    expression: &Expression<'_>,
+    position: StatementPosition,
+    scoping: &Scoping,
+    facts: &mut DirectExecutionFacts,
+) {
+    let Expression::SequenceExpression(sequence) = unparenthesized(expression) else {
+        return;
+    };
+    let Some((_, prefix)) = sequence.expressions.split_last() else {
+        return;
+    };
+    for expression in prefix {
+        if let Expression::AssignmentExpression(assignment) = unparenthesized(expression) {
+            record_direct_import_assignment(assignment, position, true, scoping, facts);
+        }
+    }
+}
+
+fn returned_object_for_call(
+    scoping: &Scoping,
+    functions: &HashMap<SymbolId, FreshReturnedObject>,
+    expression: &Expression<'_>,
+) -> Option<FreshReturnedObject> {
+    let Expression::CallExpression(call) = unparenthesized(expression) else {
+        return None;
+    };
+    if call.optional || call.arguments.iter().any(Argument::is_spread) {
+        return None;
+    }
+    functions.get(&symbol_of(scoping, &call.callee)?).copied()
+}
+
+fn record_region(
+    statements: &[Statement<'_>],
+    region: RegionId,
+    scoping: &Scoping,
+    functions: &HashMap<SymbolId, FreshReturnedObject>,
+    facts: &mut DirectExecutionFacts,
+) {
+    for (index, statement) in statements.iter().enumerate() {
+        let position = StatementPosition { region, index };
+        record_statement_site_positions(statement, position, &mut facts.site_positions);
+        match statement {
+            Statement::ExpressionStatement(statement) => {
+                let expression = unparenthesized(&statement.expression);
+                if let Expression::AssignmentExpression(assignment) = expression {
+                    record_direct_import_assignment(assignment, position, false, scoping, facts);
+                }
+            }
+            Statement::VariableDeclaration(declaration) => {
+                for declarator in &declaration.declarations {
+                    let Some(initializer) = &declarator.init else {
+                        continue;
+                    };
+                    let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                        continue;
+                    };
+                    let Some(result_symbol) = identifier.symbol_id.get() else {
+                        continue;
+                    };
+                    let Some(returned) = returned_object_for_call(scoping, functions, initializer)
+                    else {
+                        continue;
+                    };
+                    if super::symbol_binding_is_stable(scoping, result_symbol) {
+                        facts.aliases.push(ReturnedObjectAlias {
+                            result_symbol,
+                            object_symbol: returned.object_symbol,
+                            position,
+                        });
+                    }
+                }
+            }
+            Statement::ReturnStatement(statement) => {
+                if let Some(argument) = &statement.argument {
+                    record_return_sequence_assignments(argument, position, scoping, facts);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+struct FunctionRegionCollector<'c, 'f> {
+    scoping: &'c Scoping,
+    functions: &'f HashMap<SymbolId, FreshReturnedObject>,
+    facts: DirectExecutionFacts,
+}
+
+impl<'a> Visit<'a> for FunctionRegionCollector<'_, '_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        if let Some(body) = &function.body {
+            record_region(
+                &body.statements,
+                RegionId {
+                    start: function.span.start,
+                    end: function.span.end,
+                },
+                self.scoping,
+                self.functions,
+                &mut self.facts,
+            );
+        }
+        walk::walk_function(self, function, flags);
+    }
+
+    fn visit_block_statement(&mut self, block: &BlockStatement<'a>) {
+        record_region(
+            &block.body,
+            RegionId {
+                start: block.span.start,
+                end: block.span.end,
+            },
+            self.scoping,
+            self.functions,
+            &mut self.facts,
+        );
+        walk::walk_block_statement(self, block);
+    }
+
+    fn visit_switch_case(&mut self, case: &SwitchCase<'a>) {
+        record_region(
+            &case.consequent,
+            RegionId {
+                start: case.span.start,
+                end: case.span.end,
+            },
+            self.scoping,
+            self.functions,
+            &mut self.facts,
+        );
+        walk::walk_switch_case(self, case);
+    }
+}
+
+fn collect_direct_execution_facts(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    functions: &HashMap<SymbolId, FreshReturnedObject>,
+) -> DirectExecutionFacts {
+    let mut collector = FunctionRegionCollector {
+        scoping,
+        functions,
+        facts: DirectExecutionFacts::default(),
+    };
+    record_region(
+        &program.body,
+        RegionId {
+            start: program.span.start,
+            end: program.span.end,
+        },
+        scoping,
+        functions,
+        &mut collector.facts,
+    );
+    collector.visit_program(program);
+    collector.facts
+}
+
+fn later_in_same_region(left: StatementPosition, right: StatementPosition) -> bool {
+    left.region == right.region && left.index < right.index
+}
+
+fn site_is_later_in_region(
+    site_positions: &HashMap<(u32, u32), Vec<StatementPosition>>,
+    site: &WasmInstantiationSite,
+    earlier: StatementPosition,
+) -> bool {
+    site_positions
+        .get(&(site.start, site.end))
+        .is_some_and(|positions| {
+            positions
+                .iter()
+                .copied()
+                .any(|position| later_in_same_region(earlier, position))
+        })
 }
 
 pub(super) fn collect_instantiation_sites(
@@ -326,7 +636,7 @@ pub(super) fn collect_instantiation_sites(
     scoping: &Scoping,
     global_aliases: &HashMap<SymbolId, String>,
     exact_sites: &HashMap<(u32, u32), ExactModuleSite>,
-) -> HashMap<SymbolId, Vec<WasmInstantiationSite>> {
+) -> HashMap<(u32, u32), Vec<WasmInstantiationSite>> {
     let mut collector = InstantiationSiteCollector {
         scoping,
         global_aliases,
@@ -336,38 +646,74 @@ pub(super) fn collect_instantiation_sites(
     collector.visit_program(program);
 
     let returned_functions = collect_returned_object_functions(program, scoping);
-    let returned_aliases = collect_returned_object_aliases(program, scoping, &returned_functions);
-    let bridged = returned_aliases
-        .into_iter()
-        .filter_map(|(result_symbol, object_symbol)| {
-            collector
-                .sites
-                .get(&result_symbol)
-                .cloned()
-                .map(|mut sites| {
-                    for site in &mut sites {
-                        site.import_object_identity_kind = "returned_object_call";
-                    }
-                    (object_symbol, sites)
-                })
-        })
-        .collect::<Vec<_>>();
-    for (object_symbol, sites) in bridged {
-        collector
-            .sites
-            .entry(object_symbol)
-            .or_default()
-            .extend(sites);
-    }
+    let facts = collect_direct_execution_facts(program, scoping, &returned_functions);
+    let member_write_counts = collect_import_member_write_counts(program, scoping);
+    let factories_by_object = returned_functions
+        .values()
+        .copied()
+        .map(|factory| (factory.object_symbol, factory))
+        .collect::<HashMap<_, _>>();
 
-    for sites in collector.sites.values_mut() {
-        sites.sort_by(|left, right| {
+    let mut reachable = HashMap::<(u32, u32), Vec<WasmInstantiationSite>>::new();
+    for assignment in &facts.assignments {
+        if member_write_counts
+            .get(&(
+                assignment.symbol,
+                assignment.module.clone(),
+                assignment.name.clone(),
+            ))
+            .copied()
+            != Some(1)
+        {
+            continue;
+        }
+        let output = reachable.entry(assignment.span).or_default();
+
+        if let Some(sites) = collector.sites.get(&assignment.symbol) {
+            output.extend(
+                sites
+                    .iter()
+                    .filter(|site| {
+                        site_is_later_in_region(&facts.site_positions, site, assignment.position)
+                    })
+                    .cloned(),
+            );
+        }
+
+        if let Some(factory) = factories_by_object.get(&assignment.symbol) {
+            let assignment_runs_before_return = assignment.position.region == factory.region
+                && (assignment.position.index < factory.return_index
+                    || (assignment.position.index == factory.return_index
+                        && assignment.return_prefix));
+            if assignment_runs_before_return {
+                for alias in facts
+                    .aliases
+                    .iter()
+                    .filter(|alias| alias.object_symbol == assignment.symbol)
+                {
+                    let Some(sites) = collector.sites.get(&alias.result_symbol) else {
+                        continue;
+                    };
+                    output.extend(sites.iter().filter_map(|site| {
+                        if !site_is_later_in_region(&facts.site_positions, site, alias.position) {
+                            return None;
+                        }
+                        let mut site = site.clone();
+                        site.import_object_identity_kind = "returned_object_call";
+                        Some(site)
+                    }));
+                }
+            }
+        }
+
+        output.sort_by(|left, right| {
             left.start
                 .cmp(&right.start)
                 .then_with(|| left.end.cmp(&right.end))
                 .then_with(|| left.kind.cmp(right.kind))
         });
-        sites.dedup();
+        output.dedup();
     }
-    collector.sites
+    reachable.retain(|_, sites| !sites.is_empty());
+    reachable
 }

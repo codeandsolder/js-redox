@@ -684,7 +684,7 @@ fn analyze_handler(
 struct HandlerCollector<'c, 'g, 'i, 'f> {
     scoping: &'c Scoping,
     global_aliases: &'g HashMap<SymbolId, String>,
-    instantiation_sites: &'i HashMap<SymbolId, Vec<WasmInstantiationSite>>,
+    instantiation_sites: &'i HashMap<(u32, u32), Vec<WasmInstantiationSite>>,
     module_filter: Option<&'f str>,
     import_filter: Option<&'f str>,
     offset_value: Option<u32>,
@@ -714,22 +714,18 @@ impl<'a> Visit<'a> for HandlerCollector<'_, '_, '_, '_> {
                             && name == import_name
                             && symbol_binding_is_stable(self.scoping, symbol)
                         {
-                            if let Some(sites) = self.instantiation_sites.get(&symbol) {
-                                let later_sites = sites
-                                    .iter()
-                                    .filter(|site| site.start > assignment.span.end)
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                if !later_sites.is_empty() {
-                                    self.import_object_usages.push(WasmImportObjectUsage {
-                                        import_module: module,
-                                        import_name: name,
-                                        assignment_start: assignment.span.start,
-                                        assignment_end: assignment.span.end,
-                                        import_object,
-                                        instantiation_sites: later_sites,
-                                    });
-                                }
+                            if let Some(sites) = self
+                                .instantiation_sites
+                                .get(&(assignment.span.start, assignment.span.end))
+                            {
+                                self.import_object_usages.push(WasmImportObjectUsage {
+                                    import_module: module,
+                                    import_name: name,
+                                    assignment_start: assignment.span.start,
+                                    assignment_end: assignment.span.end,
+                                    import_object,
+                                    instantiation_sites: sites.clone(),
+                                });
                             }
                         }
                     }
@@ -1076,6 +1072,121 @@ mod tests {
     }
 
     #[test]
+    fn proves_return_sequence_factory_for_nested_later_instantiation() {
+        let source = r#"
+            function tQ() {
+                var imports = {};
+                imports.wbg = {};
+                return imports.wbg.target = function() {}, imports;
+            }
+            switch (mode) {
+                case 1:
+                    var imports = tQ();
+                    if (enabled) {
+                        new WebAssembly.Instance(bytes(), imports);
+                    }
+                    break;
+            }
+        "#;
+        let analysis = proven_wasm_import_semantics_for(source, "wbg", "target", 5);
+        let usage = analysis
+            .import_object_usages
+            .iter()
+            .find(|usage| usage.import_name == "target");
+        assert!(usage.is_some(), "expected target usage");
+        let Some(usage) = usage else {
+            return;
+        };
+        assert_eq!(usage.instantiation_sites.len(), 1);
+        let Some(site) = usage.instantiation_sites.first() else {
+            return;
+        };
+        assert_eq!(site.kind, "new WebAssembly.Instance");
+        assert_eq!(site.import_object_identity_kind, "returned_object_call");
+        assert!(site.exact_import_object_identity_proven);
+    }
+
+    #[test]
+    fn rejects_conditional_or_nested_import_object_assignment_reachability() {
+        let conditional = r#"
+            var imports = { wbg: {} };
+            if (enabled) {
+                imports.wbg.target = function() {};
+            }
+            WebAssembly.instantiate(bytes(), imports);
+        "#;
+        let analysis = proven_wasm_import_semantics_for(conditional, "wbg", "target", 5);
+        assert!(analysis.import_object_usages.is_empty());
+
+        let nested_installer = r#"
+            var imports = { wbg: {} };
+            function install() {
+                imports.wbg.target = function() {};
+            }
+            install();
+            WebAssembly.instantiate(bytes(), imports);
+        "#;
+        let analysis = proven_wasm_import_semantics_for(nested_installer, "wbg", "target", 5);
+        assert!(analysis.import_object_usages.is_empty());
+
+        let conditional_factory = r#"
+            function tQ() {
+                var imports = {};
+                imports.wbg = {};
+                if (enabled) {
+                    imports.wbg.target = function() {};
+                }
+                return imports;
+            }
+            var imports = tQ();
+            WebAssembly.instantiate(bytes(), imports);
+        "#;
+        let analysis = proven_wasm_import_semantics_for(conditional_factory, "wbg", "target", 5);
+        assert!(analysis.import_object_usages.is_empty());
+
+        let conditional_alias = r#"
+            function tQ() {
+                var imports = {};
+                imports.wbg = {};
+                imports.wbg.target = function() {};
+                return imports;
+            }
+            if (enabled) {
+                var imports = tQ();
+            }
+            WebAssembly.instantiate(bytes(), imports);
+        "#;
+        let analysis = proven_wasm_import_semantics_for(conditional_alias, "wbg", "target", 5);
+        assert!(analysis.import_object_usages.is_empty());
+
+        let early_return_factory = r#"
+            function tQ() {
+                var imports = {};
+                imports.wbg = {};
+                if (skipInstall) return imports;
+                imports.wbg.target = function() {};
+                return imports;
+            }
+            var imports = tQ();
+            WebAssembly.instantiate(bytes(), imports);
+        "#;
+        let analysis = proven_wasm_import_semantics_for(early_return_factory, "wbg", "target", 5);
+        assert!(analysis.import_object_usages.is_empty());
+    }
+
+    #[test]
+    fn rejects_overwritten_import_member_before_instantiation() {
+        let source = r#"
+            var imports = { wbg: {} };
+            imports.wbg.target = function() {};
+            imports.wbg.target = replacement;
+            WebAssembly.instantiate(bytes(), imports);
+        "#;
+        let analysis = proven_wasm_import_semantics_for(source, "wbg", "target", 5);
+        assert!(analysis.import_object_usages.is_empty());
+    }
+
+    #[test]
     fn rejects_shadowed_webassembly_and_reassigned_import_objects() {
         let shadowed = r#"
             var host = window;
@@ -1134,11 +1245,15 @@ mod tests {
         let usage = analysis
             .import_object_usages
             .iter()
-            .find(|usage| usage.import_name == "target")
-            .expect("target usage");
+            .find(|usage| usage.import_name == "target");
+        assert!(usage.is_some(), "expected target usage");
+        let Some(usage) = usage else {
+            return;
+        };
         assert_eq!(usage.import_object, "A");
-        let [site] = usage.instantiation_sites.as_slice() else {
-            panic!("expected one exact instantiation site");
+        assert_eq!(usage.instantiation_sites.len(), 1);
+        let Some(site) = usage.instantiation_sites.first() else {
+            return;
         };
         assert_eq!(site.kind, "WebAssembly.instantiate");
         assert_eq!(site.global_object, "window");
@@ -1152,6 +1267,51 @@ mod tests {
         );
         assert_eq!(site.module_identity_kind, Some("exact_bytes"));
         assert!(site.standard_module_decode_builtins_required);
+    }
+
+    #[test]
+    fn proves_same_module_across_forced_base64_fallback_rewrite() {
+        let source = r#"
+            var m = window;
+            function bA(A) {
+                var B = arguments.length > 1 && void 0 !== arguments[1] && arguments[1];
+                if (Uint8Array.fromBase64 && !B) return [Uint8Array.fromBase64(A).buffer, false];
+                for (var Q = atob(A), g = new Uint8Array(Q.length), E = 0; E < Q.length; E++)
+                    g[E] = Q.charCodeAt(E);
+                return [g.buffer, false]
+            }
+            function BQ(A, B) {
+                return function(A) { if (m.Array.isArray(A)) return A; }(A) || fallback(A, B);
+            }
+            function tQ() {
+                var A = {};
+                A.wbg = {};
+                A.wbg.target = function() {};
+                return A;
+            }
+            var N = "AGFzbQEAAAA=", e = BQ(bA(N), 2), G = e[0], r = tQ();
+            if (retry) G = BQ(bA(N, true), 1)[0];
+            m.WebAssembly.instantiate(G, r);
+        "#;
+        let analysis = proven_wasm_import_semantics(source);
+        let usage = analysis
+            .import_object_usages
+            .iter()
+            .find(|usage| usage.import_name == "target");
+        assert!(usage.is_some(), "expected target usage");
+        let Some(usage) = usage else {
+            return;
+        };
+        assert_eq!(usage.instantiation_sites.len(), 1);
+        let Some(site) = usage.instantiation_sites.first() else {
+            return;
+        };
+        assert!(site.exact_import_object_identity_proven);
+        assert!(site.exact_module_identity_proven);
+        assert_eq!(
+            site.module_sha256.as_deref(),
+            Some(crate::sha256_hex(b"\0asm\x01\0\0\0").as_str())
+        );
     }
 
     #[test]
@@ -1177,10 +1337,14 @@ mod tests {
         let usage = analysis
             .import_object_usages
             .iter()
-            .find(|usage| usage.import_name == "target")
-            .expect("target usage");
-        let [site] = usage.instantiation_sites.as_slice() else {
-            panic!("expected one instantiation site");
+            .find(|usage| usage.import_name == "target");
+        assert!(usage.is_some(), "expected target usage");
+        let Some(usage) = usage else {
+            return;
+        };
+        assert_eq!(usage.instantiation_sites.len(), 1);
+        let Some(site) = usage.instantiation_sites.first() else {
+            return;
         };
         assert!(site.exact_import_object_identity_proven);
         assert!(!site.exact_module_identity_proven);
@@ -1207,8 +1371,41 @@ mod tests {
         let usage = analysis
             .import_object_usages
             .iter()
-            .find(|usage| usage.import_name == "target")
-            .expect("target usage");
+            .find(|usage| usage.import_name == "target");
+        assert!(usage.is_some(), "expected target usage");
+        let Some(usage) = usage else {
+            return;
+        };
+        assert!(usage
+            .instantiation_sites
+            .iter()
+            .all(|site| !site.exact_module_identity_proven));
+
+        let shadowed_alias = r#"
+            var m = window;
+            function bA(A) {
+                if (Uint8Array.fromBase64) return [Uint8Array.fromBase64(A).buffer, false];
+                for (var Q = atob(A), g = new Uint8Array(Q.length), E = 0; E < Q.length; E++) {
+                    g[E] = Q.charCodeAt(E);
+                }
+                return [g.buffer, false];
+            }
+            function BQ(A, B, m) {
+                return function(A) { if (m.Array.isArray(A)) return A; }(A) || fallback(A, B);
+            }
+            function tQ() { var A = {}; A.wbg = {}; A.wbg.target = function() {}; return A; }
+            var N = "AGFzbQEAAAA=", e = BQ(bA(N), 2, fakeGlobal), G = e[0], r = tQ();
+            m.WebAssembly.instantiate(G, r);
+        "#;
+        let analysis = proven_wasm_import_semantics(shadowed_alias);
+        let usage = analysis
+            .import_object_usages
+            .iter()
+            .find(|usage| usage.import_name == "target");
+        assert!(usage.is_some(), "expected target usage");
+        let Some(usage) = usage else {
+            return;
+        };
         assert!(usage
             .instantiation_sites
             .iter()
