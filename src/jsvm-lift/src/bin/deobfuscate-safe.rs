@@ -8,7 +8,10 @@ use serde::Serialize;
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 #[derive(ClapParser, Debug)]
-#[command(version, about = "Conservative static JS deobfuscation; never executes sample code")]
+#[command(
+    version,
+    about = "Conservative static JS deobfuscation; never executes sample code"
+)]
 struct Args {
     input: PathBuf,
     output: PathBuf,
