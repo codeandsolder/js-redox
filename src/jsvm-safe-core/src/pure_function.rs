@@ -1,5 +1,5 @@
 use crate::value_eval::{eval_binary, js_to_int32, Value};
-use oxc_ast::ast::{BindingPattern, Expression, Statement};
+use oxc_ast::ast::{BindingPattern, Expression, Statement, VariableDeclarationKind};
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
 use oxc_span::Span;
@@ -36,6 +36,22 @@ enum PureExpr {
 }
 
 impl PureExpr {
+    fn is_effect_free(&self) -> bool {
+        match self {
+            Self::Value(_) | Self::Param(_) => true,
+            Self::AssignParam { .. } => false,
+            Self::Unary { argument, .. } => argument.is_effect_free(),
+            Self::Binary { left, right, .. } | Self::Logical { left, right, .. } => {
+                left.is_effect_free() && right.is_effect_free()
+            }
+            Self::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => test.is_effect_free() && consequent.is_effect_free() && alternate.is_effect_free(),
+        }
+    }
+
     fn eval(&self, params: &mut [Value]) -> Option<Value> {
         match self {
             Self::Value(value) => Some(value.clone()),
@@ -123,9 +139,16 @@ impl PureExpr {
     }
 }
 
-fn compile_pure_expr(expr: &Expression<'_>, params: &HashMap<String, usize>) -> Option<PureExpr> {
+fn compile_pure_expr(
+    expr: &Expression<'_>,
+    params: &HashMap<String, usize>,
+    locals: &HashMap<String, PureExpr>,
+) -> Option<PureExpr> {
     match expr {
-        Expression::Identifier(id) => params.get(id.name.as_str()).copied().map(PureExpr::Param),
+        Expression::Identifier(id) => locals
+            .get(id.name.as_str())
+            .cloned()
+            .or_else(|| params.get(id.name.as_str()).copied().map(PureExpr::Param)),
         Expression::StringLiteral(v) => Some(PureExpr::Value(Value::String(v.value.to_string()))),
         Expression::NumericLiteral(v) => Some(PureExpr::Value(Value::Number(v.value))),
         Expression::BooleanLiteral(v) => Some(PureExpr::Value(Value::Bool(v.value))),
@@ -135,14 +158,14 @@ fn compile_pure_expr(expr: &Expression<'_>, params: &HashMap<String, usize>) -> 
                 q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string(),
             ))
         }),
-        Expression::ParenthesizedExpression(v) => compile_pure_expr(&v.expression, params),
+        Expression::ParenthesizedExpression(v) => compile_pure_expr(&v.expression, params, locals),
         Expression::AssignmentExpression(v) if v.operator.as_str() == "=" => {
             let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(target) = &v.left else {
                 return None;
             };
             Some(PureExpr::AssignParam {
                 index: *params.get(target.name.as_str())?,
-                value: Box::new(compile_pure_expr(&v.right, params)?),
+                value: Box::new(compile_pure_expr(&v.right, params, locals)?),
             })
         }
         Expression::UnaryExpression(v)
@@ -153,7 +176,7 @@ fn compile_pure_expr(expr: &Expression<'_>, params: &HashMap<String, usize>) -> 
         {
             Some(PureExpr::Unary {
                 operator: v.operator.as_str().to_string(),
-                argument: Box::new(compile_pure_expr(&v.argument, params)?),
+                argument: Box::new(compile_pure_expr(&v.argument, params, locals)?),
             })
         }
         Expression::BinaryExpression(v)
@@ -182,19 +205,19 @@ fn compile_pure_expr(expr: &Expression<'_>, params: &HashMap<String, usize>) -> 
         {
             Some(PureExpr::Binary {
                 operator: v.operator.as_str().to_string(),
-                left: Box::new(compile_pure_expr(&v.left, params)?),
-                right: Box::new(compile_pure_expr(&v.right, params)?),
+                left: Box::new(compile_pure_expr(&v.left, params, locals)?),
+                right: Box::new(compile_pure_expr(&v.right, params, locals)?),
             })
         }
         Expression::LogicalExpression(v) => Some(PureExpr::Logical {
             operator: v.operator.as_str().to_string(),
-            left: Box::new(compile_pure_expr(&v.left, params)?),
-            right: Box::new(compile_pure_expr(&v.right, params)?),
+            left: Box::new(compile_pure_expr(&v.left, params, locals)?),
+            right: Box::new(compile_pure_expr(&v.right, params, locals)?),
         }),
         Expression::ConditionalExpression(v) => Some(PureExpr::Conditional {
-            test: Box::new(compile_pure_expr(&v.test, params)?),
-            consequent: Box::new(compile_pure_expr(&v.consequent, params)?),
-            alternate: Box::new(compile_pure_expr(&v.alternate, params)?),
+            test: Box::new(compile_pure_expr(&v.test, params, locals)?),
+            consequent: Box::new(compile_pure_expr(&v.consequent, params, locals)?),
+            alternate: Box::new(compile_pure_expr(&v.alternate, params, locals)?),
         }),
         _ => None,
     }
@@ -235,7 +258,7 @@ impl<'a> Visit<'a> for PureFunctionCollector<'_> {
                         self.scoping.get_resolved_reference_ids(symbol).iter().all(
                             |reference_id| !self.scoping.get_reference(*reference_id).is_write(),
                         );
-                    if immutable && body.statements.len() == 1 {
+                    if immutable {
                         let mut params = HashMap::new();
                         let mut valid_params = true;
                         for (index, parameter) in f.params.items.iter().enumerate() {
@@ -255,20 +278,78 @@ impl<'a> Visit<'a> for PureFunctionCollector<'_> {
                             }
                         }
                         if valid_params {
-                            if let Statement::ReturnStatement(ret) = &body.statements[0] {
-                                if let Some(argument) = &ret.argument {
-                                    if let Some(expression) = compile_pure_expr(argument, &params) {
-                                        self.functions.insert(
-                                            symbol,
-                                            PureFunction {
-                                                param_count: f.params.items.len(),
-                                                expression,
-                                                declaration_span: (f.r#type
-                                                    == oxc_ast::ast::FunctionType::FunctionDeclaration)
-                                                    .then_some(f.span),
-                                            },
-                                        );
+                            let mut locals = HashMap::new();
+                            let mut expression = None;
+                            let mut valid_body = !body.statements.is_empty();
+                            for (statement_index, statement) in body.statements.iter().enumerate() {
+                                match statement {
+                                    Statement::VariableDeclaration(declaration)
+                                        if declaration.kind == VariableDeclarationKind::Var
+                                            && statement_index + 1 < body.statements.len() =>
+                                    {
+                                        for declarator in &declaration.declarations {
+                                            let BindingPattern::BindingIdentifier(identifier) =
+                                                &declarator.id
+                                            else {
+                                                valid_body = false;
+                                                break;
+                                            };
+                                            if params.contains_key(identifier.name.as_str())
+                                                || locals.contains_key(identifier.name.as_str())
+                                            {
+                                                valid_body = false;
+                                                break;
+                                            }
+                                            let Some(initializer) = &declarator.init else {
+                                                valid_body = false;
+                                                break;
+                                            };
+                                            let Some(compiled) =
+                                                compile_pure_expr(initializer, &params, &locals)
+                                            else {
+                                                valid_body = false;
+                                                break;
+                                            };
+                                            if !compiled.is_effect_free() {
+                                                valid_body = false;
+                                                break;
+                                            }
+                                            locals.insert(identifier.name.to_string(), compiled);
+                                        }
+                                        if !valid_body {
+                                            break;
+                                        }
                                     }
+                                    Statement::ReturnStatement(ret)
+                                        if statement_index + 1 == body.statements.len() =>
+                                    {
+                                        let Some(argument) = &ret.argument else {
+                                            valid_body = false;
+                                            break;
+                                        };
+                                        expression = compile_pure_expr(argument, &params, &locals);
+                                        if expression.is_none() {
+                                            valid_body = false;
+                                        }
+                                    }
+                                    _ => {
+                                        valid_body = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if valid_body {
+                                if let Some(expression) = expression {
+                                    self.functions.insert(
+                                        symbol,
+                                        PureFunction {
+                                            param_count: f.params.items.len(),
+                                            expression,
+                                            declaration_span: (f.r#type
+                                                == oxc_ast::ast::FunctionType::FunctionDeclaration)
+                                                .then_some(f.span),
+                                        },
+                                    );
                                 }
                             }
                         }

@@ -1490,7 +1490,7 @@ fn parse_i64_literal(text: &str) -> Option<i64> {
     Some(if negative { -value } else { value })
 }
 
-fn js_parse_int(text: &str, radix: u32) -> Option<f64> {
+pub(super) fn js_parse_int(text: &str, radix: u32) -> Option<f64> {
     if !(2..=36).contains(&radix) {
         return None;
     }

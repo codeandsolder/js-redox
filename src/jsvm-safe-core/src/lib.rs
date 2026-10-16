@@ -12,7 +12,7 @@ use control_flow::{
     collect_dispatch_bindings, collect_reference_spans, detect_reference_identity_tables,
     reference_identity, ReferenceIdentityTable,
 };
-use decoder::{analyze_decoders, Decoder};
+use decoder::{analyze_decoders, js_parse_int, Decoder};
 pub use numeric::{exact_i64, exact_u32, exact_u64, exact_usize};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -399,6 +399,69 @@ fn collect_from_char_code_aliases(
     collector.candidates
 }
 
+fn direct_global_object_name<'a>(
+    scoping: &Scoping,
+    expression: &'a Expression<'a>,
+) -> Option<&'a str> {
+    let Expression::Identifier(identifier) = expression else {
+        return None;
+    };
+    if !matches!(identifier.name.as_str(), "window" | "globalThis" | "self") {
+        return None;
+    }
+    let reference = scoping.get_reference(identifier.reference_id.get()?);
+    reference
+        .symbol_id()
+        .is_none()
+        .then_some(identifier.name.as_str())
+}
+
+fn collect_global_object_aliases(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> HashSet<SymbolId> {
+    struct AliasCollector<'c> {
+        scoping: &'c Scoping,
+        aliases: HashSet<SymbolId>,
+    }
+    impl<'a> Visit<'a> for AliasCollector<'_> {
+        fn visit_variable_declaration(
+            &mut self,
+            declaration: &oxc_ast::ast::VariableDeclaration<'a>,
+        ) {
+            for declarator in &declaration.declarations {
+                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                    continue;
+                };
+                let Some(symbol) = identifier.symbol_id.get() else {
+                    continue;
+                };
+                let Some(initializer) = &declarator.init else {
+                    continue;
+                };
+                if direct_global_object_name(self.scoping, initializer).is_none() {
+                    continue;
+                }
+                let stable = self
+                    .scoping
+                    .get_resolved_reference_ids(symbol)
+                    .iter()
+                    .all(|reference_id| !self.scoping.get_reference(*reference_id).is_write());
+                if stable {
+                    self.aliases.insert(symbol);
+                }
+            }
+            walk::walk_variable_declaration(self, declaration);
+        }
+    }
+    let mut collector = AliasCollector {
+        scoping,
+        aliases: HashSet::new(),
+    };
+    collector.visit_program(program);
+    collector.aliases
+}
+
 #[derive(Clone, Copy)]
 enum CallRewriteTraversal {
     Stop,
@@ -415,6 +478,8 @@ struct Collector<'s, 'c> {
     proxies: &'c HashMap<SymbolId, ProxyObject>,
     pure_functions: &'c HashMap<SymbolId, PureFunction>,
     from_char_code_aliases: &'c HashMap<SymbolId, u32>,
+    global_object_aliases: &'c HashSet<SymbolId>,
+    standard_numeric_builtins: bool,
     reference_identity_tables: &'c HashMap<SymbolId, ReferenceIdentityTable>,
     selector_dispatchers: &'c HashMap<SymbolId, SelectorDispatcher>,
     dispatch_orders: &'c HashMap<SymbolId, Vec<String>>,
@@ -1073,6 +1138,7 @@ fn transform_once(
     counts: &mut Counts,
     arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
+    standard_numeric_builtins: bool,
 ) -> Option<String> {
     let allocator = Allocator::default();
     let program = parse_as(&allocator, source, source_type)?;
@@ -1096,6 +1162,7 @@ fn transform_once(
     let proxies = collect_proxy_objects(&program, scoping);
     let pure_functions = collect_pure_functions(&program, scoping);
     let from_char_code_aliases = collect_from_char_code_aliases(&program, scoping);
+    let global_object_aliases = collect_global_object_aliases(&program, scoping);
     let reference_identity_tables =
         detect_reference_identity_tables(source, scoping, &reference_spans);
     protected_spans.extend(
@@ -1124,6 +1191,8 @@ fn transform_once(
         proxies: &proxies,
         pure_functions: &pure_functions,
         from_char_code_aliases: &from_char_code_aliases,
+        global_object_aliases: &global_object_aliases,
+        standard_numeric_builtins,
         reference_identity_tables: &reference_identity_tables,
         selector_dispatchers: &selector_dispatchers,
         dispatch_orders: &dispatch_orders,
@@ -1155,8 +1224,11 @@ pub struct SafeTransformResult {
     pub arithmetic_state_proofs: Vec<ArithmeticStateProof>,
 }
 
-#[must_use]
-pub fn deobfuscate(source: &str, max_iterations: usize) -> Option<SafeTransformResult> {
+fn deobfuscate_with_mode(
+    source: &str,
+    max_iterations: usize,
+    standard_numeric_builtins: bool,
+) -> Option<SafeTransformResult> {
     // Select a source mode only after both parsing and semantic validation. Some
     // legacy browser scripts parse as modules but are invalid under module
     // strictness (for example duplicate top-level function declarations) while
@@ -1175,6 +1247,7 @@ pub fn deobfuscate(source: &str, max_iterations: usize) -> Option<SafeTransformR
             &mut counts,
             &mut arithmetic_state_proofs,
             iteration,
+            standard_numeric_builtins,
         )?;
         if next == current {
             break;
@@ -1189,4 +1262,88 @@ pub fn deobfuscate(source: &str, max_iterations: usize) -> Option<SafeTransformR
         transforms: counts.into_inner(),
         arithmetic_state_proofs,
     })
+}
+
+#[must_use]
+pub fn deobfuscate(source: &str, max_iterations: usize) -> Option<SafeTransformResult> {
+    deobfuscate_with_mode(source, max_iterations, false)
+}
+
+/// Proof-oriented variant that may evaluate standard numeric globals such as
+/// `Number`, `parseInt`, and `Math.floor` through a proven stable global-object
+/// alias. Callers must surface this assumption in any claim derived from the
+/// transformed source; ordinary source rewriting must use [`deobfuscate`].
+#[must_use]
+pub fn deobfuscate_with_standard_numeric_builtins(
+    source: &str,
+    max_iterations: usize,
+) -> Option<SafeTransformResult> {
+    deobfuscate_with_mode(source, max_iterations, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{deobfuscate, deobfuscate_with_standard_numeric_builtins};
+
+    #[test]
+    fn reference_state_standard_numeric_builtins_are_proof_only() {
+        let source = r#"
+            function identityIndex(A, B, Q, g, E, C, I, unused) {
+                return (B * C ^ Q * A ^ g * E) >>> 0 & I - 1;
+            }
+            function predicate(A, B) {
+                var Q = ~B;
+                return -5*(A&B)-1*(A&Q)+7*(A|B)+5*~(A|B)-6*~(A|Q)-5*~B;
+            }
+            var m = window;
+            var S = function(row) {
+                var init, column, table = [];
+                for (init = 0; init < 4; init++) table[init] = new Array(8);
+                for (column = 0; column < 8; column++)
+                    for (row = 0; row < 4; row++)
+                        table[row][column] = table[identityIndex(3, column, row, 7, 11, 5, 4)];
+                return table[1];
+            }();
+            var out = [];
+            for (var state = S[0][0], g = m.parseInt(-122.67); true;) {
+                var H = m.Number(-150);
+                switch (state) {
+                    case S[0][0]:
+                        predicate(231, 518) < -7*(g&~H)+1*(g|H)+7*~(g&H)-7*~(g|H)-8*~(g|~H) || false
+                            ? (out.push("bad"), state = S[0][2])
+                            : (out.push("good"), state = S[0][1]);
+                        continue;
+                    case S[0][1]:
+                        out.push("done");
+                        break;
+                    case S[0][2]:
+                        out.push("wrong");
+                        break;
+                }
+                break;
+            }
+        "#;
+
+        let normal = deobfuscate(source, 16);
+        assert!(normal.is_some(), "normal safe transform should succeed");
+        let Some(normal) = normal else {
+            return;
+        };
+        assert!(normal.source.contains("switch (state)"));
+
+        let proof = deobfuscate_with_standard_numeric_builtins(source, 16);
+        assert!(proof.is_some(), "proof transform should succeed");
+        let Some(proof) = proof else {
+            return;
+        };
+        assert!(!proof.source.contains("switch (state)"));
+        assert!(proof.source.contains("out.push(\"good\")"));
+        assert!(proof.source.contains("out.push(\"done\")"));
+        assert!(!proof.source.contains("out.push(\"bad\")"));
+        assert!(!proof.source.contains("out.push(\"wrong\")"));
+        assert!(proof
+            .transforms
+            .get("reference_state_unflatten")
+            .is_some_and(|count| *count >= 1));
+    }
 }

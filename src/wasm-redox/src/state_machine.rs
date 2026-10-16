@@ -86,6 +86,169 @@ mod tests {
     }
 
     #[test]
+    fn reports_memory_import_for_structural_bulk_copy_candidate() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "__wbindgen_memory" (func $memory (result externref)))
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (table 4 externref)
+                (memory (export "memory") 1)
+                (func $memory_slot (result i32)
+                    (local $slot i32)
+                    i32.const 2
+                    local.tee $slot
+                    call $memory
+                    table.set
+                    local.get $slot)
+                (func $buffer_slot (param $slot i32) (result i32)
+                    local.get $slot)
+                (func (export "copy") (param $source externref) (param $base i32) (result i32)
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    nop
+                    i32.const 0
+                    local.get $source
+                    table.set
+
+                    i32.const 1
+                    call $memory_slot
+                    call $buffer_slot
+                    table.get
+                    call $ctor
+                    table.set
+
+                    i32.const 1
+                    table.get
+                    i32.const 0
+                    table.get
+                    local.get $base
+                    i32.const 2
+                    i32.shr_u
+                    call $set
+
+                    local.get $base
+                    i32.load
+                    local.get $base
+                    i32.load offset=4
+                    i32.add))"#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        assert_eq!(analysis.externref_bulk_copy_candidates.len(), 1);
+        let candidate = &analysis.externref_bulk_copy_candidates[0];
+        assert_eq!(candidate.constructor_import_function, 1);
+        assert_eq!(candidate.set_import_function, 2);
+        assert_eq!(candidate.constructor_input_memory_import_function, Some(0));
+        assert_eq!(candidate.constructor_input_slot_provider_function, Some(4));
+        assert_eq!(
+            candidate.constructor_input_provider_argument_function,
+            Some(3)
+        );
+        assert_eq!(
+            candidate
+                .destination_loads
+                .iter()
+                .map(|load| load.memory)
+                .collect::<Vec<_>>(),
+            vec![0, 0]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn rejects_bulk_copy_candidate_with_path_dependent_source_overwrite() -> Result<()> {
         let bytes = wat::parse_str(
             r#"(module

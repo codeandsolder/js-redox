@@ -11,7 +11,8 @@ use crate::value_eval::{
     eval, eval_binary, js_to_int32, js_to_uint32, known_bool, same_value, Value,
 };
 use crate::{
-    array_element, direct_identifier_name, fragment, symbol_of, ArithmeticStateProof, Collector,
+    array_element, direct_identifier_name, fragment, js_parse_int, symbol_of, ArithmeticStateProof,
+    Collector,
 };
 use oxc_ast::ast::{BindingPattern, Expression, Statement, VariableDeclarationKind};
 use oxc_ast_visit::{walk, Visit};
@@ -123,7 +124,7 @@ pub fn collect_reference_spans(program: &oxc_ast::ast::Program<'_>) -> HashMap<R
     collector.spans
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReferenceIdentityTable {
     rows: u32,
     columns: u32,
@@ -370,6 +371,200 @@ fn parse_reference_identity_shape(
     })
 }
 
+struct SyncReferenceIdentityPatterns {
+    builder: regex::Regex,
+    helper: regex::Regex,
+}
+
+fn sync_reference_identity_patterns() -> Option<SyncReferenceIdentityPatterns> {
+    let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
+    let ws = r"\s*";
+    Some(SyncReferenceIdentityPatterns {
+        builder: regex::Regex::new(&format!(
+            r"(?P<target>{identifier}){ws}={ws}function{ws}\({ws}(?P<row_param>{identifier}){ws}\){ws}\{{{ws}var\s+[^;]*?(?P<table>{identifier}){ws}={ws}\[\]{ws};{ws}for{ws}\({ws}(?P<init_row>{identifier}){ws}={ws}0{ws};{ws}(?P<init_test>{identifier}){ws}<{ws}(?P<rows>\d+){ws};{ws}(?P<init_update>{identifier}){ws}\+\+{ws}\){ws}(?P<table_init>{identifier}){ws}\[{ws}(?P<init_index>{identifier}){ws}\]{ws}={ws}new{ws}Array{ws}\({ws}(?P<columns>\d+){ws}\){ws};{ws}for{ws}\({ws}(?P<column>{identifier}){ws}={ws}0{ws};{ws}(?P<column_test>{identifier}){ws}<{ws}(?P<columns2>\d+){ws};{ws}(?P<column_update>{identifier}){ws}\+\+{ws}\){ws}for{ws}\({ws}(?P<row>{identifier}){ws}={ws}0{ws};{ws}(?P<row_test>{identifier}){ws}<{ws}(?P<rows2>\d+){ws};{ws}(?P<row_update>{identifier}){ws}\+\+{ws}\){ws}(?P<table_fill>{identifier}){ws}\[{ws}(?P<row_index>{identifier}){ws}\]{ws}\[{ws}(?P<column_index>{identifier}){ws}\]{ws}={ws}(?P<table_lookup>{identifier}){ws}\[{ws}(?P<helper>{identifier}){ws}\({ws}(?P<row_multiplier>\d+){ws},{ws}(?P<column_arg>{identifier}){ws},{ws}(?P<row_arg>{identifier}){ws},{ws}(?P<salt_left>\d+){ws},{ws}(?P<salt_right>\d+){ws},{ws}(?P<column_multiplier>\d+){ws},{ws}(?P<mask>\d+){ws}\){ws}\]{ws};{ws}return{ws}(?P<table_return>{identifier}){ws}\[{ws}(?P<root>\d+){ws}\]{ws};?{ws}\}}{ws}\({ws}\)"
+        )).ok()?,
+        helper: regex::Regex::new(&format!(
+            r"function{ws}(?P<helper>{identifier}){ws}\({ws}(?P<p0>{identifier}){ws},{ws}(?P<p1>{identifier}){ws},{ws}(?P<p2>{identifier}){ws},{ws}(?P<p3>{identifier}){ws},{ws}(?P<p4>{identifier}){ws},{ws}(?P<p5>{identifier}){ws},{ws}(?P<p6>{identifier}){ws},{ws}(?P<p7>{identifier}){ws}\){ws}\{{{ws}return{ws}\({ws}(?P<t1a>{identifier}){ws}\*{ws}(?P<t1b>{identifier}){ws}\^{ws}(?P<t2a>{identifier}){ws}\*{ws}(?P<t2b>{identifier}){ws}\^{ws}(?P<t3a>{identifier}){ws}\*{ws}(?P<t3b>{identifier}){ws}\){ws}>>>{ws}0{ws}&{ws}(?P<mask_param>{identifier}){ws}-{ws}1{ws};?{ws}\}}"
+        )).ok()?,
+    })
+}
+
+fn reference_symbol_at_span(
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+    span: Span,
+) -> Option<SymbolId> {
+    reference_spans
+        .iter()
+        .find_map(|(reference_id, candidate)| {
+            (*candidate == span)
+                .then(|| scoping.get_reference(*reference_id).symbol_id())
+                .flatten()
+        })
+}
+
+fn helper_formula_matches(helper_caps: &regex::Captures<'_>) -> bool {
+    let Some(p0) = capture_str(helper_caps, "p0") else {
+        return false;
+    };
+    let Some(p1) = capture_str(helper_caps, "p1") else {
+        return false;
+    };
+    let Some(p2) = capture_str(helper_caps, "p2") else {
+        return false;
+    };
+    let Some(p3) = capture_str(helper_caps, "p3") else {
+        return false;
+    };
+    let Some(p4) = capture_str(helper_caps, "p4") else {
+        return false;
+    };
+    let Some(p5) = capture_str(helper_caps, "p5") else {
+        return false;
+    };
+    let Some(p6) = capture_str(helper_caps, "p6") else {
+        return false;
+    };
+    capture_str(helper_caps, "t1a") == Some(p1)
+        && capture_str(helper_caps, "t1b") == Some(p5)
+        && capture_str(helper_caps, "t2a") == Some(p2)
+        && capture_str(helper_caps, "t2b") == Some(p0)
+        && capture_str(helper_caps, "t3a") == Some(p3)
+        && capture_str(helper_caps, "t3b") == Some(p4)
+        && capture_str(helper_caps, "mask_param") == Some(p6)
+}
+
+fn parse_sync_reference_identity_shape(
+    source: &str,
+    patterns: &SyncReferenceIdentityPatterns,
+    builder_caps: &regex::Captures<'_>,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> Option<(SymbolId, ReferenceIdentityTable)> {
+    let builder_match = builder_caps.get(0)?;
+    let table_name = capture_str(builder_caps, "table")?;
+    let row_param = capture_str(builder_caps, "row_param")?;
+    let init_row = capture_str(builder_caps, "init_row")?;
+    let column = capture_str(builder_caps, "column")?;
+    let row = capture_str(builder_caps, "row")?;
+    if capture_str(builder_caps, "init_test")? != init_row
+        || capture_str(builder_caps, "init_update")? != init_row
+        || capture_str(builder_caps, "table_init")? != table_name
+        || capture_str(builder_caps, "init_index")? != init_row
+        || capture_str(builder_caps, "column_test")? != column
+        || capture_str(builder_caps, "column_update")? != column
+        || capture_str(builder_caps, "row_test")? != row
+        || capture_str(builder_caps, "row_update")? != row
+        || row != row_param
+        || capture_str(builder_caps, "table_fill")? != table_name
+        || capture_str(builder_caps, "row_index")? != row
+        || capture_str(builder_caps, "column_index")? != column
+        || capture_str(builder_caps, "table_lookup")? != table_name
+        || capture_str(builder_caps, "column_arg")? != column
+        || capture_str(builder_caps, "row_arg")? != row
+        || capture_str(builder_caps, "table_return")? != table_name
+    {
+        return None;
+    }
+    let rows = capture_u32(builder_caps, "rows")?;
+    let columns = capture_u32(builder_caps, "columns")?;
+    if rows < 2
+        || columns < 2
+        || !rows.is_power_of_two()
+        || capture_u32(builder_caps, "rows2")? != rows
+        || capture_u32(builder_caps, "columns2")? != columns
+        || capture_u32(builder_caps, "mask")? != rows
+    {
+        return None;
+    }
+    let root_row = capture_u32(builder_caps, "root")?;
+    if root_row >= rows {
+        return None;
+    }
+
+    let helper_name = capture_str(builder_caps, "helper")?;
+    let helper_caps = patterns.helper.captures_iter(source).find(|caps| {
+        capture_str(caps, "helper") == Some(helper_name) && helper_formula_matches(caps)
+    })?;
+    let helper_match = helper_caps.get(0)?;
+    let helper_decl_symbol = unique_symbol_named_near(
+        scoping,
+        helper_name,
+        u32::try_from(helper_match.start()).ok()?,
+        u32::try_from(helper_match.end()).ok()?,
+    )?;
+    let helper_capture = builder_caps.name("helper")?;
+    let helper_ref_span = Span::new(
+        u32::try_from(helper_capture.start()).ok()?,
+        u32::try_from(helper_capture.end()).ok()?,
+    );
+    if reference_symbol_at_span(scoping, reference_spans, helper_ref_span)
+        != Some(helper_decl_symbol)
+        || scoping
+            .get_resolved_reference_ids(helper_decl_symbol)
+            .iter()
+            .any(|reference_id| scoping.get_reference(*reference_id).is_write())
+    {
+        return None;
+    }
+
+    let start = u32::try_from(builder_match.start()).ok()?;
+    let end = u32::try_from(builder_match.end()).ok()?;
+    let target_name = capture_str(builder_caps, "target")?;
+    let target_symbol = unique_symbol_named_near(scoping, target_name, start, end)?;
+    let table_symbol = unique_symbol_named_near(scoping, table_name, start, end)?;
+    if scoping
+        .get_resolved_reference_ids(table_symbol)
+        .iter()
+        .any(|reference_id| {
+            reference_spans
+                .get(reference_id)
+                .is_none_or(|span| span.start < start || span.end > end)
+        })
+        || scoping
+            .get_resolved_reference_ids(target_symbol)
+            .iter()
+            .any(|reference_id| {
+                let reference = scoping.get_reference(*reference_id);
+                reference.is_write() || reference.flags().is_member_write_target()
+            })
+    {
+        return None;
+    }
+
+    let descriptor = ReferenceIdentityTable {
+        rows,
+        columns,
+        root_row,
+        column_multiplier: capture_u32(builder_caps, "column_multiplier")?,
+        row_multiplier: capture_u32(builder_caps, "row_multiplier")?,
+        salt_left: capture_u32(builder_caps, "salt_left")?,
+        salt_right: capture_u32(builder_caps, "salt_right")?,
+        construction_start: builder_match.start(),
+        construction_end: builder_match.end(),
+    };
+    let valid = (0..descriptor.rows)
+        .all(|row| (0..descriptor.columns).all(|column| descriptor.row_for(row, column).is_some()));
+    valid.then_some((target_symbol, descriptor))
+}
+
+fn detect_sync_reference_identity_tables(
+    source: &str,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> HashMap<SymbolId, ReferenceIdentityTable> {
+    let Some(patterns) = sync_reference_identity_patterns() else {
+        return HashMap::new();
+    };
+    patterns
+        .builder
+        .captures_iter(source)
+        .filter_map(|caps| {
+            parse_sync_reference_identity_shape(source, &patterns, &caps, scoping, reference_spans)
+        })
+        .collect()
+}
+
 fn prove_reference_identity_shape(
     shape: ReferenceIdentityShape,
     scoping: &Scoping,
@@ -423,15 +618,30 @@ pub fn detect_reference_identity_tables(
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> HashMap<SymbolId, ReferenceIdentityTable> {
-    let Some(patterns) = reference_identity_patterns() else {
-        return HashMap::new();
+    let mut tables = if let Some(patterns) = reference_identity_patterns() {
+        patterns
+            .row
+            .captures_iter(source)
+            .filter_map(|row_caps| parse_reference_identity_shape(source, &patterns, &row_caps))
+            .filter_map(|shape| prove_reference_identity_shape(shape, scoping, reference_spans))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
     };
-    patterns
-        .row
-        .captures_iter(source)
-        .filter_map(|row_caps| parse_reference_identity_shape(source, &patterns, &row_caps))
-        .filter_map(|shape| prove_reference_identity_shape(shape, scoping, reference_spans))
-        .collect()
+    for (symbol, descriptor) in
+        detect_sync_reference_identity_tables(source, scoping, reference_spans)
+    {
+        match tables.get(&symbol) {
+            Some(existing) if existing != &descriptor => {
+                tables.remove(&symbol);
+            }
+            Some(_) => {}
+            None => {
+                tables.insert(symbol, descriptor);
+            }
+        }
+    }
+    tables
 }
 
 pub fn reference_identity(
@@ -1440,6 +1650,7 @@ struct ReferenceStateSetup {
     table_symbol: SymbolId,
     current: u32,
     chunks: Vec<String>,
+    env: HashMap<String, Value>,
 }
 
 fn render_block(chunks: &[String]) -> String {
@@ -1483,6 +1694,177 @@ fn arithmetic_state_result(
 }
 
 impl Collector<'_, '_> {
+    fn stable_global_alias(&self, expression: &Expression<'_>) -> bool {
+        symbol_of(self.scoping, expression)
+            .is_some_and(|symbol| self.global_object_aliases.contains(&symbol))
+    }
+
+    fn reference_state_builtin_call(
+        &self,
+        call: &oxc_ast::ast::CallExpression<'_>,
+        env: &HashMap<String, Value>,
+    ) -> Option<Value> {
+        if call.optional || call.arguments.iter().any(oxc_ast::ast::Argument::is_spread) {
+            return None;
+        }
+        if let Some(symbol) = symbol_of(self.scoping, &call.callee) {
+            let function = self.pure_functions.get(&symbol)?;
+            let values = call
+                .arguments
+                .iter()
+                .map(|argument| self.reference_state_eval(argument.as_expression()?, env))
+                .collect::<Option<Vec<_>>>()?;
+            return function.evaluate(&values);
+        }
+        if !self.standard_numeric_builtins {
+            return None;
+        }
+        let Expression::StaticMemberExpression(member) = &call.callee else {
+            return None;
+        };
+        if member.optional {
+            return None;
+        }
+        let property = member.property.name.as_str();
+        if self.stable_global_alias(&member.object) {
+            return match property {
+                "Number" if call.arguments.len() == 1 => self
+                    .reference_state_eval(call.arguments[0].as_expression()?, env)?
+                    .number()
+                    .map(Value::Number),
+                "parseInt" if matches!(call.arguments.len(), 1 | 2) => {
+                    let value =
+                        self.reference_state_eval(call.arguments[0].as_expression()?, env)?;
+                    let radix = if call.arguments.len() == 2 {
+                        self.reference_state_eval(call.arguments[1].as_expression()?, env)?
+                            .number()
+                            .and_then(exact_u32)?
+                    } else {
+                        10
+                    };
+                    js_parse_int(&value.js_string()?, radix).map(Value::Number)
+                }
+                _ => None,
+            };
+        }
+        let Expression::StaticMemberExpression(namespace) = &member.object else {
+            return None;
+        };
+        if namespace.optional
+            || namespace.property.name.as_str() != "Math"
+            || !self.stable_global_alias(&namespace.object)
+            || call.arguments.len() != 1
+        {
+            return None;
+        }
+        let value = self
+            .reference_state_eval(call.arguments[0].as_expression()?, env)?
+            .number()?;
+        let result = match property {
+            "floor" => value.floor(),
+            "ceil" => value.ceil(),
+            "trunc" => value.trunc(),
+            _ => return None,
+        };
+        Some(Value::Number(result))
+    }
+
+    fn reference_state_eval(
+        &self,
+        expression: &Expression<'_>,
+        env: &HashMap<String, Value>,
+    ) -> Option<Value> {
+        if let Some((_symbol, identity)) =
+            reference_identity(expression, self.scoping, self.reference_identity_tables)
+        {
+            return Some(Value::Number(f64::from(identity)));
+        }
+        match expression {
+            Expression::Identifier(identifier) => env.get(identifier.name.as_str()).cloned(),
+            Expression::StringLiteral(value) => Some(Value::String(value.value.to_string())),
+            Expression::NumericLiteral(value) => Some(Value::Number(value.value)),
+            Expression::BooleanLiteral(value) => Some(Value::Bool(value.value)),
+            Expression::NullLiteral(_) => Some(Value::Null),
+            Expression::TemplateLiteral(value) if value.expressions.is_empty() => {
+                value.quasis.first().map(|quasi| {
+                    Value::String(
+                        quasi
+                            .value
+                            .cooked
+                            .as_ref()
+                            .unwrap_or(&quasi.value.raw)
+                            .to_string(),
+                    )
+                })
+            }
+            Expression::ParenthesizedExpression(value) => {
+                self.reference_state_eval(&value.expression, env)
+            }
+            Expression::UnaryExpression(unary) => {
+                if unary.operator.as_str() == "!" {
+                    return self
+                        .reference_state_eval(&unary.argument, env)
+                        .map(|value| Value::Bool(!value.truthy()));
+                }
+                if unary.operator.as_str() == "void" {
+                    self.reference_state_eval(&unary.argument, env)?;
+                    return Some(Value::Undefined);
+                }
+                let value = self.reference_state_eval(&unary.argument, env)?;
+                match unary.operator.as_str() {
+                    "+" => value.number().map(Value::Number),
+                    "-" => value.number().map(|number| Value::Number(-number)),
+                    "~" => value
+                        .number()
+                        .map(|number| Value::Number(f64::from(!js_to_int32(number)))),
+                    "typeof" => Some(Value::String(
+                        match value {
+                            Value::String(_) => "string",
+                            Value::Number(_) => "number",
+                            Value::Bool(_) => "boolean",
+                            Value::Null => "object",
+                            Value::Undefined => "undefined",
+                        }
+                        .to_string(),
+                    )),
+                    _ => None,
+                }
+            }
+            Expression::BinaryExpression(value) => eval_binary(
+                value.operator.as_str(),
+                self.reference_state_eval(&value.left, env)?,
+                self.reference_state_eval(&value.right, env)?,
+            ),
+            Expression::LogicalExpression(value) => {
+                let left = self.reference_state_eval(&value.left, env)?;
+                match value.operator.as_str() {
+                    "&&" if left.truthy() => self.reference_state_eval(&value.right, env),
+                    "&&" => Some(left),
+                    "||" if left.truthy() => Some(left),
+                    "||" => self.reference_state_eval(&value.right, env),
+                    "??" if matches!(left, Value::Null | Value::Undefined) => {
+                        self.reference_state_eval(&value.right, env)
+                    }
+                    "??" => Some(left),
+                    _ => None,
+                }
+            }
+            Expression::ConditionalExpression(value) => {
+                let test = self.reference_state_eval(&value.test, env)?.truthy();
+                self.reference_state_eval(
+                    if test {
+                        &value.consequent
+                    } else {
+                        &value.alternate
+                    },
+                    env,
+                )
+            }
+            Expression::CallExpression(call) => self.reference_state_builtin_call(call, env),
+            _ => None,
+        }
+    }
+
     fn reference_state_assignment(
         &self,
         expr: &Expression<'_>,
@@ -1506,11 +1888,113 @@ impl Collector<'_, '_> {
         (symbol == table_symbol).then_some(identity)
     }
 
+    fn clean_reference_state_expression(
+        &self,
+        expression: &Expression<'_>,
+        state_var: &str,
+        table_symbol: SymbolId,
+        env: &mut HashMap<String, Value>,
+    ) -> Option<(Vec<String>, Option<u32>)> {
+        if let Some(next) = self.reference_state_assignment(expression, state_var, table_symbol) {
+            return Some((Vec::new(), Some(next)));
+        }
+        match expression {
+            Expression::ParenthesizedExpression(parenthesized) => self
+                .clean_reference_state_expression(
+                    &parenthesized.expression,
+                    state_var,
+                    table_symbol,
+                    env,
+                ),
+            Expression::SequenceExpression(sequence) => {
+                let mut chunks = Vec::new();
+                let mut next_state = None;
+                for item in &sequence.expressions {
+                    let (mut item_chunks, next) =
+                        self.clean_reference_state_expression(item, state_var, table_symbol, env)?;
+                    chunks.append(&mut item_chunks);
+                    if let Some(next) = next {
+                        next_state = Some(next);
+                    }
+                }
+                Some((chunks, next_state))
+            }
+            Expression::ConditionalExpression(conditional)
+                if expression_mentions(expression, state_var) =>
+            {
+                let test = self.reference_state_eval(&conditional.test, env)?.truthy();
+                self.clean_reference_state_expression(
+                    if test {
+                        &conditional.consequent
+                    } else {
+                        &conditional.alternate
+                    },
+                    state_var,
+                    table_symbol,
+                    env,
+                )
+            }
+            Expression::AssignmentExpression(assignment) => {
+                if expression_mentions(expression, state_var) {
+                    return None;
+                }
+                if assignment.operator.as_str() == "=" {
+                    if let Some(name) = direct_assignment_name(&assignment.left) {
+                        if let Some(value) = self.reference_state_eval(&assignment.right, env) {
+                            env.insert(name.to_string(), value);
+                        } else {
+                            env.remove(name);
+                        }
+                    }
+                }
+                Some((
+                    vec![format!("{};", fragment(self.source, expression.span()))],
+                    None,
+                ))
+            }
+            _ => {
+                if expression_mentions(expression, state_var) {
+                    return None;
+                }
+                Some((
+                    vec![format!("{};", fragment(self.source, expression.span()))],
+                    None,
+                ))
+            }
+        }
+    }
+
+    fn update_reference_state_environment_from_declaration(
+        &self,
+        declaration: &oxc_ast::ast::VariableDeclaration<'_>,
+        env: &mut HashMap<String, Value>,
+    ) -> Option<()> {
+        if declaration.kind != VariableDeclarationKind::Var {
+            return None;
+        }
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                return None;
+            };
+            if let Some(initializer) = &declarator.init {
+                if let Some(value) = self.reference_state_eval(initializer, env) {
+                    env.insert(identifier.name.to_string(), value);
+                } else {
+                    env.remove(identifier.name.as_str());
+                }
+            } else {
+                env.insert(identifier.name.to_string(), Value::Undefined);
+            }
+        }
+        Some(())
+    }
+
     fn clean_reference_state_statement(
         &self,
         stmt: &Statement<'_>,
         state_var: &str,
         table_symbol: SymbolId,
+        env: &mut HashMap<String, Value>,
     ) -> Option<(String, Option<u32>, ReferenceCaseFlow)> {
         match stmt {
             Statement::BlockStatement(block) => {
@@ -1518,7 +2002,7 @@ impl Collector<'_, '_> {
                 let mut next_state = None;
                 for child in &block.body {
                     let (text, next, flow) =
-                        self.clean_reference_state_statement(child, state_var, table_symbol)?;
+                        self.clean_reference_state_statement(child, state_var, table_symbol, env)?;
                     if !text.trim().is_empty() {
                         chunks.push(text);
                     }
@@ -1526,49 +2010,45 @@ impl Collector<'_, '_> {
                         next_state = Some(next);
                     }
                     if flow != ReferenceCaseFlow::Normal {
-                        return Some((
-                            format!(
-                                "{{
-{}
-}}",
-                                chunks.join(
-                                    "
-"
-                                )
-                            ),
-                            next_state,
-                            flow,
-                        ));
+                        return Some((render_block(&chunks), next_state, flow));
                     }
                 }
-                Some((
-                    format!(
-                        "{{
-{}
-}}",
-                        chunks.join(
-                            "
-"
-                        )
-                    ),
-                    next_state,
-                    ReferenceCaseFlow::Normal,
-                ))
+                Some((render_block(&chunks), next_state, ReferenceCaseFlow::Normal))
             }
             Statement::ExpressionStatement(expression) => {
-                if let Some(next) =
-                    self.reference_state_assignment(&expression.expression, state_var, table_symbol)
-                {
-                    return Some((String::new(), Some(next), ReferenceCaseFlow::Normal));
-                }
-                if expression_mentions(&expression.expression, state_var) {
+                let (chunks, next) = self.clean_reference_state_expression(
+                    &expression.expression,
+                    state_var,
+                    table_symbol,
+                    env,
+                )?;
+                Some((chunks.join("\n"), next, ReferenceCaseFlow::Normal))
+            }
+            Statement::VariableDeclaration(declaration) => {
+                if statement_mentions(stmt, state_var) {
                     return None;
                 }
+                self.update_reference_state_environment_from_declaration(declaration, env)?;
                 Some((
                     fragment(self.source, stmt.span()).to_string(),
                     None,
                     ReferenceCaseFlow::Normal,
                 ))
+            }
+            Statement::IfStatement(branch) if statement_mentions(stmt, state_var) => {
+                let test = self.reference_state_eval(&branch.test, env)?.truthy();
+                if test {
+                    self.clean_reference_state_statement(
+                        &branch.consequent,
+                        state_var,
+                        table_symbol,
+                        env,
+                    )
+                } else if let Some(alternate) = &branch.alternate {
+                    self.clean_reference_state_statement(alternate, state_var, table_symbol, env)
+                } else {
+                    Some((String::new(), None, ReferenceCaseFlow::Normal))
+                }
             }
             Statement::ContinueStatement(continue_stmt) if continue_stmt.label.is_none() => {
                 Some((String::new(), None, ReferenceCaseFlow::Continue))
@@ -1666,18 +2146,36 @@ impl Collector<'_, '_> {
             .iter()
             .enumerate()
             .filter(|(index, _)| *index != state_index)
-            .map(|(_, declaration)| fragment(self.source, declaration.span))
             .collect::<Vec<_>>();
         let chunks = if other_declarations.is_empty() {
             Vec::new()
         } else {
-            vec![format!("var {};", other_declarations.join(","))]
+            vec![format!(
+                "var {};",
+                other_declarations
+                    .iter()
+                    .map(|(_, declaration)| fragment(self.source, declaration.span))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )]
         };
+        let mut env = HashMap::new();
+        for (_, declaration) in other_declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declaration.id else {
+                return None;
+            };
+            if let Some(initializer) = &declaration.init {
+                if let Some(value) = self.reference_state_eval(initializer, &env) {
+                    env.insert(identifier.name.to_string(), value);
+                }
+            }
+        }
         Some(ReferenceStateSetup {
             state_var,
             table_symbol,
             current,
             chunks,
+            env,
         })
     }
 
@@ -1686,22 +2184,34 @@ impl Collector<'_, '_> {
         it: &'a oxc_ast::ast::ForStatement<'a>,
         state_var: &str,
         table_symbol: SymbolId,
-    ) -> Option<(&'a oxc_ast::ast::SwitchStatement<'a>, HashMap<u32, usize>)> {
+    ) -> Option<(
+        &'a [Statement<'a>],
+        &'a oxc_ast::ast::SwitchStatement<'a>,
+        HashMap<u32, usize>,
+    )> {
         let Statement::BlockStatement(body) = &it.body else {
             return None;
         };
-        if body.body.len() != 2 {
+        if body.body.len() < 2 {
             return None;
         }
-        let Statement::SwitchStatement(switch) = &body.body[0] else {
+        let Statement::BreakStatement(outer_break) = body.body.last()? else {
             return None;
         };
-        let Statement::BreakStatement(outer_break) = &body.body[1] else {
+        if outer_break.label.is_some() {
+            return None;
+        }
+        let switch_index = body.body.len().checked_sub(2)?;
+        let Statement::SwitchStatement(switch) = &body.body[switch_index] else {
             return None;
         };
-        if outer_break.label.is_some()
-            || direct_identifier_name(&switch.discriminant) != Some(state_var)
-        {
+        if direct_identifier_name(&switch.discriminant) != Some(state_var) {
+            return None;
+        }
+        let prefix = &body.body[..switch_index];
+        if prefix.iter().any(|statement| {
+            statement_mentions(statement, state_var) || statement_has_loop_control(statement)
+        }) {
             return None;
         }
 
@@ -1712,15 +2222,17 @@ impl Collector<'_, '_> {
                 self.scoping,
                 self.reference_identity_tables,
             )?;
-            if symbol != table_symbol || cases.insert(identity, index).is_some() {
+            if symbol != table_symbol {
                 return None;
             }
+            cases.entry(identity).or_insert(index);
         }
-        Some((switch, cases))
+        Some((prefix, switch, cases))
     }
 
     fn simulate_reference_state(
         &self,
+        prefix: &[Statement<'_>],
         switch: &oxc_ast::ast::SwitchStatement<'_>,
         cases: &HashMap<u32, usize>,
         setup: ReferenceStateSetup,
@@ -1730,6 +2242,7 @@ impl Collector<'_, '_> {
             table_symbol,
             mut current,
             mut chunks,
+            mut env,
         } = setup;
         let mut seen = HashSet::new();
         for _ in 0..256 {
@@ -1740,12 +2253,31 @@ impl Collector<'_, '_> {
                 return Some(render_block(&chunks));
             };
 
+            for statement in prefix {
+                let (text, next, flow) = self.clean_reference_state_statement(
+                    statement,
+                    &state_var,
+                    table_symbol,
+                    &mut env,
+                )?;
+                if next.is_some() || flow != ReferenceCaseFlow::Normal {
+                    return None;
+                }
+                if !text.trim().is_empty() {
+                    chunks.push(text);
+                }
+            }
+
             let mut next_state = None;
             let mut flow = ReferenceCaseFlow::Normal;
             'cases: for case in switch.cases.iter().skip(start) {
                 for stmt in &case.consequent {
-                    let (text, next, stmt_flow) =
-                        self.clean_reference_state_statement(stmt, &state_var, table_symbol)?;
+                    let (text, next, stmt_flow) = self.clean_reference_state_statement(
+                        stmt,
+                        &state_var,
+                        table_symbol,
+                        &mut env,
+                    )?;
                     if !text.trim().is_empty() {
                         chunks.push(text);
                     }
@@ -1775,9 +2307,9 @@ impl Collector<'_, '_> {
         it: &oxc_ast::ast::ForStatement<'_>,
     ) -> Option<String> {
         let setup = self.reference_state_setup(it)?;
-        let (switch, cases) =
+        let (prefix, switch, cases) =
             self.reference_state_switch(it, &setup.state_var, setup.table_symbol)?;
-        self.simulate_reference_state(switch, &cases, setup)
+        self.simulate_reference_state(prefix, switch, &cases, setup)
     }
 
     fn external_arithmetic_state(

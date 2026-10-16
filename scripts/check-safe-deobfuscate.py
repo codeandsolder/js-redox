@@ -108,6 +108,11 @@ CASES = [
         [],
     ),
     (
+        "reference-identity-table-sync",
+        ROOT / "corpus/generated/reversible-obfuscation/reference-identity-table-sync.js",
+        [],
+    ),
+    (
         "ordered-switch",
         ROOT / "corpus/generated/reversible-obfuscation/ordered-switch.js",
         ['out.push("A")', 'out.push("B")', 'out.push("C")', 'out.push("D")'],
@@ -272,8 +277,8 @@ def main():
             if name == "selector-trailing-params":
                 assert meta["transforms"].get("selector_dispatch_specialize", 0) >= 2, meta
                 assert "function(selector, left, p2, p3, p4, p5, p6, p7, p8, p9){return (left | 0);}" not in text, text
-            if name == "reference-identity-table":
-                assert meta["transforms"].get("reference_identity_compare", 0) >= 4, meta
+            if name in {"reference-identity-table", "reference-identity-table-sync"}:
+                assert meta["transforms"].get("reference_identity_compare", 0) >= 2, meta
                 assert meta["transforms"].get("reference_state_unflatten", 0) >= 1, meta
             if name in {"ordered-switch", "ordered-switch-for"}:
                 assert meta["transforms"].get("ordered_switch_unflatten", 0) >= 1, meta

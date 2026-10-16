@@ -554,6 +554,60 @@ impl<'a> Visit<'a> for WriteCollector<'_, '_, '_, '_> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct OrderedWrite {
+    start: u32,
+    value: Option<StaticWasmValue>,
+}
+
+struct OrderedWriteCollector<'c, 'h, 'v, 'g> {
+    evaluator: Evaluator<'c, 'h, 'v, 'g>,
+    writes: HashMap<SymbolId, Vec<OrderedWrite>>,
+}
+
+impl OrderedWriteCollector<'_, '_, '_, '_> {
+    fn record(&mut self, symbol: SymbolId, start: u32, expression: &Expression<'_>) {
+        let value = self.evaluator.expression(expression);
+        self.writes
+            .entry(symbol)
+            .or_default()
+            .push(OrderedWrite { start, value });
+    }
+}
+
+impl<'a> Visit<'a> for OrderedWriteCollector<'_, '_, '_, '_> {
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            let Some(initializer) = declarator.init.as_ref() else {
+                continue;
+            };
+            if let Some(symbol) = identifier.symbol_id.get() {
+                self.record(symbol, declarator.span.start, initializer);
+            }
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment.operator.as_str() == "=" {
+            if let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left {
+                if let Some(symbol) = identifier.reference_id.get().and_then(|reference_id| {
+                    self.evaluator
+                        .scoping
+                        .get_reference(reference_id)
+                        .symbol_id()
+                }) {
+                    self.record(symbol, assignment.span.start, &assignment.right);
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+}
+
 fn collect_static_values(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -586,14 +640,43 @@ fn collect_static_values(
     values
 }
 
-struct SiteCollector<'c, 'h, 'v, 'g> {
+struct SiteCollector<'c, 'h, 'v, 'g, 'w> {
     evaluator: Evaluator<'c, 'h, 'v, 'g>,
+    ordered_writes: &'w HashMap<SymbolId, Vec<OrderedWrite>>,
     sites: HashMap<(u32, u32), ExactModuleSite>,
 }
 
-impl SiteCollector<'_, '_, '_, '_> {
-    fn exact_sha_from_argument(&self, argument: &Argument<'_>) -> Option<(String, &'static str)> {
-        match self.evaluator.expression(argument.as_expression()?)? {
+impl SiteCollector<'_, '_, '_, '_, '_> {
+    fn successful_value_before(
+        &self,
+        expression: &Expression<'_>,
+        site_start: u32,
+    ) -> Option<StaticWasmValue> {
+        if let Some(value) = self.evaluator.expression(expression) {
+            return Some(value);
+        }
+        let symbol = symbol_of(self.evaluator.scoping, expression)?;
+        let mut proven = None;
+        for write in self.ordered_writes.get(&symbol)? {
+            if write.start >= site_start {
+                continue;
+            }
+            let value = write.value.as_ref()?;
+            match &proven {
+                None => proven = Some(value.clone()),
+                Some(existing) if existing == value => {}
+                Some(_) => return None,
+            }
+        }
+        proven
+    }
+
+    fn exact_sha_from_argument(
+        &self,
+        argument: &Argument<'_>,
+        site_start: u32,
+    ) -> Option<(String, &'static str)> {
+        match self.successful_value_before(argument.as_expression()?, site_start)? {
             StaticWasmValue::Bytes(sha256) => Some((sha256, "exact_bytes")),
             StaticWasmValue::Module(sha256) => Some((sha256, "compiled_module")),
             _ => None,
@@ -612,7 +695,7 @@ impl SiteCollector<'_, '_, '_, '_> {
     }
 }
 
-impl<'a> Visit<'a> for SiteCollector<'_, '_, '_, '_> {
+impl<'a> Visit<'a> for SiteCollector<'_, '_, '_, '_, '_> {
     fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
         if !call.optional && !call.arguments.iter().any(Argument::is_spread) {
             if let Some((member, _)) = webassembly_member_name(
@@ -623,7 +706,7 @@ impl<'a> Visit<'a> for SiteCollector<'_, '_, '_, '_> {
                 if member == "instantiate" {
                     if let Some(argument) = call.arguments.first() {
                         if let Some((sha256, identity_kind)) =
-                            self.exact_sha_from_argument(argument)
+                            self.exact_sha_from_argument(argument, call.span.start)
                         {
                             self.insert(call.span, sha256, identity_kind);
                         }
@@ -642,7 +725,9 @@ impl<'a> Visit<'a> for SiteCollector<'_, '_, '_, '_> {
         ) {
             if member == "Instance" && !expression.arguments.iter().any(Argument::is_spread) {
                 if let Some(argument) = expression.arguments.first() {
-                    if let Some((sha256, identity_kind)) = self.exact_sha_from_argument(argument) {
+                    if let Some((sha256, identity_kind)) =
+                        self.exact_sha_from_argument(argument, expression.span.start)
+                    {
                         self.insert(expression.span, sha256, identity_kind);
                     }
                 }
@@ -666,8 +751,22 @@ pub(super) fn collect_exact_module_sites(
         values: &values,
         global_aliases,
     };
+    let mut ordered_write_collector = OrderedWriteCollector {
+        evaluator: Evaluator {
+            scoping,
+            helpers: &helpers,
+            values: &values,
+            global_aliases,
+        },
+        writes: HashMap::new(),
+    };
+    ordered_write_collector.visit_program(program);
+    for writes in ordered_write_collector.writes.values_mut() {
+        writes.sort_by_key(|write| write.start);
+    }
     let mut collector = SiteCollector {
         evaluator,
+        ordered_writes: &ordered_write_collector.writes,
         sites: HashMap::new(),
     };
     collector.visit_program(program);

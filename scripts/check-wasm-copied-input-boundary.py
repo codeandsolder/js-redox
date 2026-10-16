@@ -15,16 +15,15 @@ PROJECT = WORK / "project"
 # Deliberate nop padding keeps the exported core above wasm-redox deep-analysis
 # minimum body size; removing it would make this boundary fixture skip deep analysis.
 WASM = bytes.fromhex(
-    "0061736d0100000001120360016f016f60036f6f7f0060026f7f017f021602037762670463746f7200000377"
-    "6267037365740001030201020404016f0004050301000107080104636f707900020a93010190010001010101"
-    "0101010101010101010101010101010101010101010101010101010101010101010101010101010101010101"
-    "0101010101010101010101010101010101010101010101010101010101010101010101010101010101010101"
-    "0101010101010101410020002600410141002500100026004101250041002500200141027610012001280200"
-    "20012802046a0b0026046e616d65010c02000463746f72010373657402110102020006736f75726365010462"
-    "617365"
+    "0061736d01000000011f066000016f60016f016f60036f6f7f006000017f60017f017f60026f7f017f022e0303776267115f5f7762696e6467656e5f6d656d6f72790000037762670463746f7200010377626703736574000203"
+    "04030304050404016f00040503010001071102066d656d6f7279020004636f707900050aa501030e01017f410222001000260020000b040020000b8e010001010101010101010101010101010101010101010101010101010101"
+    "010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010141002000260041011003100425001001260041012500"
+    "4100250020014102761002200128020020012802046a0b0058046e616d65012e0500066d656d6f7279010463746f720203736574030b6d656d6f72795f736c6f74040b6275666665725f736c6f7402210303010004736c6f7404"
+    "010004736c6f7405020006736f75726365010462617365"
 )
-WASM_B64 = base64.b64encode(WASM).decode()
 
+
+WASM_B64 = base64.b64encode(WASM).decode()
 
 def run(*args):
     cp = subprocess.run(
@@ -79,19 +78,28 @@ def main() -> None:
     html = '<!doctype html><script src="https://fixture.invalid/carrier.js"></script>'
     js = (
         "var host = window;\n"
-        "var imports = {wbg: {}};\n"
-        "imports.wbg.ctor = function(value) { return new host.Uint32Array(value); };\n"
-        "imports.wbg.set = function(receiver, source, offset) {\n"
-        "    receiver.set(source, offset >>> 0);\n"
-        "};\n"
+        "var exportsBinding;\n"
+        "function init(instance) { exportsBinding = instance.exports; return exportsBinding; }\n"
+        "function tQ() {\n"
+        "    var imports = {wbg: {}};\n"
+        "    imports.wbg.__wbindgen_memory = function() { return exportsBinding.memory; };\n"
+        "    imports.wbg.ctor = function(value) { return new host.Uint32Array(value); };\n"
+        "    imports.wbg.set = function(receiver, source, offset) {\n"
+        "        receiver.set(source, offset >>> 0);\n"
+        "    };\n"
+        "    return imports;\n"
+        "}\n"
         "function bA(A) {\n"
         "    if (Uint8Array.fromBase64) return [Uint8Array.fromBase64(A).buffer, false];\n"
         "    for (var Q = atob(A), g = new Uint8Array(Q.length), E = 0; E < Q.length; E++) g[E] = Q.charCodeAt(E);\n"
         "    return [g.buffer, false];\n"
         "}\n"
         f'const embedded = "{WASM_B64}";\n'
-        "var bytes = bA(embedded)[0];\n"
-        "host.WebAssembly.instantiate(bytes, imports);\n"
+        "var bytes = bA(embedded)[0], imports = tQ();\n"
+        "var module = new host.WebAssembly.Module(bytes);\n"
+        "var instance = new host.WebAssembly.Instance(module, imports);\n"
+        "init(instance);\n"
+        "instance.exports.copy(input, 0);\n"
     )
     fixture = {
         "log": {
@@ -148,9 +156,10 @@ def main() -> None:
     candidates = copy_export["analysis"]["externref_bulk_copy_candidates"]
     assert len(candidates) == 1, candidates
     candidate = candidates[0]
-    assert candidate["set_import_function"] == 1, candidate
-    assert candidate["constructor_import_function"] == 0, candidate
+    assert candidate["set_import_function"] == 2, candidate
+    assert candidate["constructor_import_function"] == 1, candidate
     assert candidate["source_entry_parameter"] == 0, candidate
+    assert candidate["constructor_input_memory_import_function"] == 0, candidate
     assert candidate["destination_element_index_shift"] == 2, candidate
     assert [load["byte_offset"] for load in candidate["destination_loads"]] == [0, 4], candidate
 
@@ -165,21 +174,26 @@ def main() -> None:
     assert boundary["summary"]["copied_input_candidates"] == 1, boundary
     assert boundary["summary"]["proven_js_typed_array_copy_semantics"] == 1, boundary
     assert boundary["summary"]["proven_copied_input_binding_identities"] == 1, boundary
-    assert boundary["summary"]["proven_module_memory_identities"] == 0, boundary
+    assert boundary["summary"]["proven_module_memory_identities"] == 1, boundary
     [row] = boundary["copied_input_rows"]
     assert row["raw_constructor_import_module"] == "wbg", row
     assert row["raw_constructor_import"] == "ctor", row
+    assert row["raw_memory_import_module"] == "wbg", row
+    assert row["raw_memory_import"] == "__wbindgen_memory", row
     assert row["raw_set_import_module"] == "wbg", row
     assert row["raw_set_import"] == "set", row
     assert row["js_typed_array_copy_semantics_proven"] is True, row
     assert row["import_binding_identity_proven"] is True, row
     assert len(row["import_binding_identity_proofs"]) == 1, row
-    assert row["module_memory_identity_proven"] is False, row
+    assert row["module_memory_identity_proven"] is True, row
+    assert len(row["module_memory_identity_proofs"]) == 1, row
+    assert row["module_memory_identity_proofs"][0]["memory_export"]["name"] == "memory", row
+    assert row["module_memory_identity_proofs"][0]["memory_export"]["index"] == 0, row
     assert row["destination_load_interpretation_proven"] is False, row
 
     print(
         "WASM copied-input boundary regression: inline extraction + structural copy + "
-        "1/1 JS Uint32Array semantics + exact module/import binding + fail-closed module-memory identity OK"
+        "1/1 JS Uint32Array semantics + exact module/import binding + exact module-memory identity OK"
     )
 
 

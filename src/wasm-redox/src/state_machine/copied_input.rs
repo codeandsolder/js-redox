@@ -1,4 +1,6 @@
-use super::{ir::i32_const, value_flow::unique_transparent_origin};
+use super::{
+    helper_recognition::SemanticCallNames, ir::i32_const, value_flow::unique_transparent_origin,
+};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use waffle::{
@@ -42,6 +44,8 @@ pub struct ExternrefBulkCopyCandidateReport {
     /// Optional structural helper chain producing the constructor-input slot.
     pub constructor_input_slot_provider_function: Option<usize>,
     pub constructor_input_provider_argument_function: Option<usize>,
+    /// Imported function proven to provide the module Memory object to that helper chain.
+    pub constructor_input_memory_import_function: Option<usize>,
     /// Native WASM loads dominated by the set-like call and reusing the same destination-base SSA value.
     /// This does not prove the copied bytes remain unmodified before each load.
     pub destination_loads: Vec<StructuralInputCopyLoadReport>,
@@ -222,15 +226,26 @@ fn base_shifted_right_by_two(body: &FunctionBody, value: Value) -> Option<Value>
     (i32_const(body, *shift) == Some(2)).then(|| unique_transparent_origin(body, *base, 8))
 }
 
-fn provider_chain(body: &FunctionBody, input_slot: Value) -> (Option<usize>, Option<usize>) {
+fn provider_chain(
+    body: &FunctionBody,
+    input_slot: Value,
+    names: &SemanticCallNames,
+) -> (Option<usize>, Option<usize>, Option<usize>) {
     let Some((provider, args)) = direct_call(body, input_slot, 4) else {
-        return (None, None);
+        return (None, None, None);
     };
     let nested = match args.as_slice() {
-        [argument] => direct_call(body, *argument, 4).map(|(function, _)| function.index()),
+        [argument] => direct_call(body, *argument, 4).map(|(function, _)| function),
         _ => None,
     };
-    (Some(provider.index()), nested)
+    let memory_import = nested
+        .and_then(|function| names.memory_slot_import(function))
+        .map(|function| function.index());
+    (
+        Some(provider.index()),
+        nested.map(|function| function.index()),
+        memory_import,
+    )
 }
 
 fn destination_loads_dominated_by_set(
@@ -283,6 +298,7 @@ fn destination_loads_dominated_by_set(
 pub(super) fn externref_bulk_copy_candidates(
     module: &Module<'_>,
     body: &FunctionBody,
+    names: &SemanticCallNames,
 ) -> Vec<ExternrefBulkCopyCandidateReport> {
     let cfg = CFGInfo::new(body);
     let imported = module
@@ -345,7 +361,8 @@ pub(super) fn externref_bulk_copy_candidates(
             let Some(constructor_input_slot) = table_get_slot(body, *constructor_input) else {
                 continue;
             };
-            let (slot_provider, provider_argument) = provider_chain(body, constructor_input_slot);
+            let (slot_provider, provider_argument, memory_import) =
+                provider_chain(body, constructor_input_slot, names);
             reports.push(ExternrefBulkCopyCandidateReport {
                 block: block.index(),
                 set_instruction_index: position,
@@ -366,6 +383,7 @@ pub(super) fn externref_bulk_copy_candidates(
                 constructor_input_slot_value: constructor_input_slot.index(),
                 constructor_input_slot_provider_function: slot_provider,
                 constructor_input_provider_argument_function: provider_argument,
+                constructor_input_memory_import_function: memory_import,
                 destination_loads: destination_loads_dominated_by_set(
                     body,
                     &cfg,

@@ -63,7 +63,7 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
         .optimize(&OptOptions::default());
     let call_names = build_semantic_call_names(&mut module, func);
     let body = module.funcs[func].body().context("body")?;
-    let externref_bulk_copy_candidates = externref_bulk_copy_candidates(&module, body);
+    let externref_bulk_copy_candidates = externref_bulk_copy_candidates(&module, body, &call_names);
 
     let mut candidates = Vec::new();
     for (block, def) in body.blocks.entries() {

@@ -48,7 +48,7 @@ def run_probe(
             f"{cp.stdout}{cp.stderr}"
         )
     document = json.loads(cp.stdout)
-    if document.get("schema") != "jsvm-wasm-import-semantics/v4":
+    if document.get("schema") != "jsvm-wasm-import-semantics/v5":
         raise RuntimeError(
             f"unexpected JS WASM-import analyzer schema for {source}: "
             f"{document.get('schema')!r}"
@@ -82,7 +82,7 @@ def run_full_probe(analyzer: Path, source: Path) -> dict:
             f"{cp.stdout}{cp.stderr}"
         )
     document = json.loads(cp.stdout)
-    if document.get("schema") != "jsvm-wasm-import-semantics/v4":
+    if document.get("schema") != "jsvm-wasm-import-semantics/v5":
         raise RuntimeError(
             f"unexpected JS WASM-import analyzer schema for {source}: "
             f"{document.get('schema')!r}"
@@ -149,6 +149,62 @@ def matching_handler(document: dict, import_module: str, import_name: str, kind:
         and handler.get("import_name") == import_name
         and handler.get("kind") == kind
     ]
+
+
+def matching_module_memory_proofs(
+    document: dict,
+    import_module: str | None,
+    import_name: str | None,
+    module_sha256: str | None,
+    export_name: str | None,
+    binding_proofs: list[dict],
+    report: dict,
+    candidate: dict,
+) -> list[dict]:
+    if not all(isinstance(value, str) for value in (
+        import_module, import_name, module_sha256, export_name
+    )):
+        return []
+    load_memories = {
+        load.get("memory")
+        for load in candidate.get("destination_loads", [])
+        if isinstance(load.get("memory"), int)
+    }
+    if len(load_memories) != 1:
+        return []
+    [load_memory] = load_memories
+    binding_sites = {
+        (proof.get("import_object"), site.get("start"), site.get("end"), site.get("module_sha256"))
+        for proof in binding_proofs
+        for site in proof.get("instantiation_sites", [])
+    }
+    matches = []
+    for proof in document.get("module_memory_identity_proofs", []):
+        if proof.get("import_module") != import_module or proof.get("import_name") != import_name:
+            continue
+        site = proof.get("instantiation_site") or {}
+        site_key = (
+            proof.get("import_object"),
+            site.get("start"),
+            site.get("end"),
+            site.get("module_sha256"),
+        )
+        if site_key not in binding_sites or site.get("module_sha256") != module_sha256:
+            continue
+        if not any(call.get("export_name") == export_name for call in proof.get("export_calls", [])):
+            continue
+        memory_export_name = proof.get("memory_export_name")
+        memory_exports = [
+            exported
+            for exported in report.get("exports", [])
+            if exported.get("kind") == "memory"
+            and exported.get("name") == memory_export_name
+            and exported.get("index") == load_memory
+        ]
+        if len(memory_exports) != 1:
+            continue
+        matches.append({**proof, "memory_export": memory_exports[0]})
+    return matches
 
 
 def main() -> None:
@@ -324,6 +380,14 @@ def main() -> None:
                 set_name = set_import.get("name") if set_import else None
                 constructor_module = constructor_import.get("module") if constructor_import else None
                 constructor_name = constructor_import.get("name") if constructor_import else None
+                memory_index = candidate.get("constructor_input_memory_import_function")
+                memory_import = (
+                    function_imports[memory_index]
+                    if isinstance(memory_index, int) and 0 <= memory_index < len(function_imports)
+                    else None
+                )
+                memory_module = memory_import.get("module") if memory_import else None
+                memory_name = memory_import.get("name") if memory_import else None
 
                 proofs = []
                 if all(isinstance(value, str) for value in (
@@ -361,11 +425,22 @@ def main() -> None:
                             binding_proofs = common_exact_binding_proofs(
                                 set_usages, constructor_usages, module.get("sha256")
                             )
+                            memory_proofs = matching_module_memory_proofs(
+                                document,
+                                memory_module,
+                                memory_name,
+                                module.get("sha256"),
+                                export.get("export"),
+                                binding_proofs,
+                                report,
+                                candidate,
+                            )
                             proofs.append({
                                 "source_path": relative,
                                 "set_handler": set_matches[0],
                                 "constructor_handler": constructor_matches[0],
                                 "import_binding_identity_proofs": binding_proofs,
+                                "module_memory_identity_proofs": memory_proofs,
                             })
 
                 copied_binding_proofs = [
@@ -373,6 +448,18 @@ def main() -> None:
                     for proof in proofs
                     for binding in proof.get("import_binding_identity_proofs", [])
                 ]
+                module_memory_proofs = [
+                    {"source_path": proof["source_path"], **memory}
+                    for proof in proofs
+                    for memory in proof.get("module_memory_identity_proofs", [])
+                ]
+                module_memory_sources = {proof["source_path"] for proof in module_memory_proofs}
+                module_memory_proven = (
+                    bool(module_memory_proofs)
+                    and len(module_memory_sources) == 1
+                    and len(proofs) == 1
+                    and len(copied_binding_proofs) == 1
+                )
                 row = {
                     "module_sha256": module.get("sha256"),
                     "export": export.get("export"),
@@ -382,19 +469,27 @@ def main() -> None:
                     "raw_set_import": set_name,
                     "raw_constructor_import_module": constructor_module,
                     "raw_constructor_import": constructor_name,
+                    "raw_memory_import_module": memory_module,
+                    "raw_memory_import": memory_name,
                     "wasm_structural_copy_candidate_proven": True,
                     "wasm_candidate": candidate,
                     "js_typed_array_copy_semantics_proven": len(proofs) == 1,
                     "js_typed_array_copy_semantics_proofs": proofs,
                     "import_binding_identity_proven": len(copied_binding_proofs) == 1,
                     "import_binding_identity_proofs": copied_binding_proofs,
-                    "module_memory_identity_proven": False,
+                    "module_memory_identity_proven": module_memory_proven,
+                    "module_memory_identity_proofs": module_memory_proofs,
                     "module_memory_identity_limitation": (
-                        "the WASM structural candidate and matching JS Uint32Array constructor/set "
-                        "handlers are proven, but the constructor input ArrayBuffer is not yet tied "
-                        "to the memory export of this exact recovered module instance"
+                        None
+                        if module_memory_proven
+                        else "no unique carrier source proves that the constructor input comes from the exported memory of the exact module instance executing this copied-input export"
                     ),
                     "destination_load_interpretation_proven": False,
+                    "destination_load_interpretation_limitation": (
+                        "exact module-memory identity is proven, but the structural copy candidate does not yet prove that copied bytes remain unmodified before each dominated native load"
+                        if module_memory_proven
+                        else "module-memory identity is not proven"
+                    ),
                 }
                 if len(proofs) > 1:
                     row["js_typed_array_copy_semantics_proven"] = False
@@ -406,12 +501,20 @@ def main() -> None:
                     row["ambiguity"] = (
                         row.get("ambiguity", "") + "; multiple exact module/import-object binding proofs"
                     ).strip("; ")
+                if len(module_memory_sources) > 1:
+                    row["module_memory_identity_proven"] = False
+                    row["module_memory_identity_limitation"] = (
+                        "multiple carrier sources prove module-memory identity"
+                    )
+                    row["ambiguity"] = (
+                        row.get("ambiguity", "") + "; multiple module-memory carrier proofs"
+                    ).strip("; ")
                 copied_input_rows.append(row)
 
     out = {
         "schema": WASM_JS_BOUNDARY.schema,
         "wasm_schema_required": "wasm-redox/deep-v6",
-        "js_schema": "jsvm-wasm-import-semantics/v4",
+        "js_schema": "jsvm-wasm-import-semantics/v5",
         "safe_static_only": True,
         "correlation_contract": (
             "cross-language claims require exact WASM import module+name matches. "
