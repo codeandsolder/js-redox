@@ -15,6 +15,7 @@ pub(super) struct SemanticCallNames {
     validated_get_u32_imports: BTreeSet<Func>,
     validated_memory_get_u32_helpers: BTreeSet<Func>,
     memory_slot_imports: BTreeMap<Func, Func>,
+    externref_length_imports: BTreeMap<Func, Func>,
     opaque_host_effect_helpers: BTreeMap<Func, Func>,
 }
 
@@ -33,6 +34,10 @@ impl SemanticCallNames {
 
     pub(super) fn memory_slot_import(&self, function: Func) -> Option<Func> {
         self.memory_slot_imports.get(&function).copied()
+    }
+
+    pub(super) fn externref_length_import(&self, function: Func) -> Option<Func> {
+        self.externref_length_imports.get(&function).copied()
     }
 
     pub(super) fn opaque_host_effect_import(&self, function: Func) -> Option<Func> {
@@ -162,6 +167,17 @@ fn helper_returns_import_call(
     let returned = unique_return_value(body)?;
     let (label, args) = call_label(body, returned, names)?;
     (label == import_name).then_some(args)
+}
+
+fn externref_length_import(body: &FunctionBody, names: &SemanticCallNames) -> Option<Func> {
+    if body.n_params != 1 {
+        return None;
+    }
+    let returned = unique_return_value(body)?;
+    let (function, args) = call_target(body, returned, 8)?;
+    (names.label(function) == Some("wbg.length")
+        && matches!(args.as_slice(), [receiver] if is_table_get_of_entry_parameter(body, *receiver)))
+    .then_some(function)
 }
 
 fn memory_slot_import(body: &FunctionBody, names: &SemanticCallNames) -> Option<Func> {
@@ -409,9 +425,7 @@ fn classify_base_wasm_bindgen_helper(
     body: &FunctionBody,
     names: &SemanticCallNames,
 ) -> Option<&'static str> {
-    if helper_returns_import_call(body, names, "wbg.length").is_some_and(
-        |args| matches!(args.as_slice(), [value] if is_table_get_of_entry_parameter(body, *value)),
-    ) {
+    if externref_length_import(body, names).is_some() {
         Some("wbindgen.externref_length")
     } else if helper_is_memory_slot(body, names) {
         Some("wbindgen.memory_slot")
@@ -576,6 +590,9 @@ pub(super) fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> 
         };
         if let Some(imported) = memory_slot_import(body, &names) {
             names.memory_slot_imports.insert(callee, imported);
+        }
+        if let Some(imported) = externref_length_import(body, &names) {
+            names.externref_length_imports.insert(callee, imported);
         }
     }
 

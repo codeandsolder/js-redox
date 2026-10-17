@@ -56,7 +56,10 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
             _ => None,
         })
         .context("export")?;
-    module.expand_func(func)?;
+    // Copied-input byte-integrity proofs summarize side effects through the
+    // reachable internal call graph. Expand lazy defined bodies up front so an
+    // unparsed internal helper is never mistaken for an opaque host import.
+    module.expand_all_funcs()?;
     module.funcs[func]
         .body_mut()
         .context("body")?

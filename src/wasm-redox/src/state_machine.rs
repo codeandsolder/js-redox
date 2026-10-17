@@ -74,6 +74,7 @@ mod tests {
         assert_eq!(candidate.constructor_import_function, 0);
         assert_eq!(candidate.source_entry_parameter, 0);
         assert_eq!(candidate.destination_element_index_shift, 2);
+        assert_eq!(candidate.destination_base_guaranteed_trailing_zero_bits, 0);
         assert_eq!(
             candidate
                 .destination_loads
@@ -82,6 +83,195 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 4]
         );
+        assert!(candidate
+            .destination_loads
+            .iter()
+            .all(|load| load.copied_bytes_unmodified_since_set));
+        Ok(())
+    }
+
+    #[test]
+    fn copied_input_destination_alignment_proves_masked_base() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (table 4 externref)
+                (memory 1)
+                (func (export "copy") (param $source externref) (param $base i32) (result i32)
+                    (local $aligned i32)
+                    local.get $base i32.const -4 i32.and local.set $aligned
+                    i32.const 0 local.get $source table.set
+                    i32.const 1 i32.const 0 table.get call $ctor table.set
+                    i32.const 1 table.get
+                    i32.const 0 table.get
+                    local.get $aligned i32.const 2 i32.shr_u
+                    call $set
+                    local.get $aligned i32.load))"#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input candidate"));
+        };
+        assert!(candidate.destination_base_guaranteed_trailing_zero_bits >= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn copied_input_destination_alignment_fails_closed_on_degrading_loop() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (table 4 externref)
+                (memory 1)
+                (func (export "copy")
+                    (param $source externref) (param $base i32) (param $count i32) (result i32)
+                    (local $aligned i32)
+                    local.get $base i32.const -4 i32.and local.set $aligned
+                    block $exit
+                        loop $again
+                            local.get $count i32.eqz br_if $exit
+                            local.get $aligned i32.const 1 i32.shr_u local.set $aligned
+                            local.get $count i32.const 1 i32.sub local.set $count
+                            br $again
+                        end
+                    end
+                    i32.const 0 local.get $source table.set
+                    i32.const 1 i32.const 0 table.get call $ctor table.set
+                    i32.const 1 table.get
+                    i32.const 0 table.get
+                    local.get $aligned i32.const 2 i32.shr_u
+                    call $set
+                    local.get $aligned i32.load))"#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input candidate"));
+        };
+        assert_eq!(candidate.destination_base_guaranteed_trailing_zero_bits, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn copied_input_load_integrity_rejects_intervening_same_memory_write() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (table 4 externref)
+                (memory 1)
+                (func (export "copy") (param $source externref) (param $base i32) (result i32)
+                    i32.const 0 local.get $source table.set
+                    i32.const 1 i32.const 0 table.get call $ctor table.set
+                    i32.const 1 table.get
+                    i32.const 0 table.get
+                    local.get $base i32.const 2 i32.shr_u
+                    call $set
+                    local.get $base i32.const 99 i32.store
+                    local.get $base i32.load))"#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input candidate"));
+        };
+        let [load] = candidate.destination_loads.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input load"));
+        };
+        assert!(!load.copied_bytes_unmodified_since_set);
+        Ok(())
+    }
+
+    #[test]
+    fn copied_input_load_integrity_rejects_path_dependent_memory_write() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (table 4 externref)
+                (memory 1)
+                (func (export "copy")
+                    (param $source externref) (param $base i32) (param $condition i32) (result i32)
+                    i32.const 0 local.get $source table.set
+                    i32.const 1 i32.const 0 table.get call $ctor table.set
+                    i32.const 1 table.get
+                    i32.const 0 table.get
+                    local.get $base i32.const 2 i32.shr_u
+                    call $set
+                    local.get $condition
+                    if
+                        local.get $base i32.const 99 i32.store
+                    end
+                    local.get $base i32.load))"#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input candidate"));
+        };
+        let [load] = candidate.destination_loads.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input load"));
+        };
+        assert!(!load.copied_bytes_unmodified_since_set);
+        Ok(())
+    }
+
+    #[test]
+    fn copied_input_load_integrity_ignores_alternate_memory_writes() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (table 4 externref)
+                (memory $copied 1)
+                (memory $other 1)
+                (func (export "copy") (param $source externref) (param $base i32) (result i32)
+                    i32.const 0 local.get $source table.set
+                    i32.const 1 i32.const 0 table.get call $ctor table.set
+                    i32.const 1 table.get
+                    i32.const 0 table.get
+                    local.get $base i32.const 2 i32.shr_u
+                    call $set
+                    local.get $base i32.const 99 i32.store $other
+                    local.get $base i32.load $copied))"#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input candidate"));
+        };
+        let [load] = candidate.destination_loads.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input load"));
+        };
+        assert!(load.copied_bytes_unmodified_since_set);
+        Ok(())
+    }
+
+    #[test]
+    fn copied_input_load_integrity_treats_calls_as_memory_barriers() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (import "wbg" "opaque" (func $opaque))
+                (table 4 externref)
+                (memory 1)
+                (func (export "copy") (param $source externref) (param $base i32) (result i32)
+                    i32.const 0 local.get $source table.set
+                    i32.const 1 i32.const 0 table.get call $ctor table.set
+                    i32.const 1 table.get
+                    i32.const 0 table.get
+                    local.get $base i32.const 2 i32.shr_u
+                    call $set
+                    call $opaque
+                    local.get $base i32.load))"#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input candidate"));
+        };
+        let [load] = candidate.destination_loads.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input load"));
+        };
+        assert!(!load.copied_bytes_unmodified_since_set);
         Ok(())
     }
 
