@@ -1,12 +1,12 @@
 use super::import_object::WasmInstantiationSite;
 use super::{
-    assignment_import_object, parameter_symbols, symbol_binding_is_stable, symbol_of,
-    unparenthesized,
+    assignment_import_object, global_constructor, parameter_symbols, symbol_binding_is_stable,
+    symbol_of, unparenthesized,
 };
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, BindingPattern, BlockStatement, CallExpression, Expression,
-    Function, Program, Statement,
+    Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, BlockStatement,
+    CallExpression, Expression, Function, Program, Statement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, SemanticBuilder};
@@ -22,6 +22,9 @@ pub struct WasmInstanceExportCall {
     pub call_start: u32,
     pub call_end: u32,
     pub argument_count: usize,
+    /// Per argument, the exact element count when the value is proven to be a
+    /// stable `Uint32Array` constructed from a fixed array literal.
+    pub static_uint32_array_argument_lengths: Vec<Option<usize>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -488,12 +491,95 @@ struct RegionExportCall {
     call: WasmInstanceExportCall,
 }
 
-struct ExportCallCollector<'c> {
+fn fixed_array_literal_length(expression: &Expression<'_>) -> Option<usize> {
+    let Expression::ArrayExpression(array) = unparenthesized(expression) else {
+        return None;
+    };
+    (!array
+        .elements
+        .iter()
+        .any(|element| matches!(element, ArrayExpressionElement::SpreadElement(_))))
+    .then_some(array.elements.len())
+}
+
+fn direct_uint32_array_length(
+    scoping: &Scoping,
+    global_aliases: &HashMap<SymbolId, String>,
+    expression: &Expression<'_>,
+) -> Option<usize> {
+    let Expression::NewExpression(new_expression) = unparenthesized(expression) else {
+        return None;
+    };
+    global_constructor(
+        scoping,
+        global_aliases,
+        &new_expression.callee,
+        "Uint32Array",
+    )?;
+    let [argument] = new_expression.arguments.as_slice() else {
+        return None;
+    };
+    fixed_array_literal_length(argument.as_expression()?)
+}
+
+struct StableUint32ArrayLengthCollector<'c, 'g> {
     scoping: &'c Scoping,
+    global_aliases: &'g HashMap<SymbolId, String>,
+    lengths: HashMap<SymbolId, usize>,
+}
+
+impl<'a> Visit<'a> for StableUint32ArrayLengthCollector<'_, '_> {
+    fn visit_variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+            if !symbol_binding_is_stable(self.scoping, symbol) {
+                continue;
+            }
+            let Some(initializer) = declarator.init.as_ref() else {
+                continue;
+            };
+            if let Some(length) =
+                direct_uint32_array_length(self.scoping, self.global_aliases, initializer)
+            {
+                self.lengths.insert(symbol, length);
+            }
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
+fn static_uint32_array_length(
+    scoping: &Scoping,
+    global_aliases: &HashMap<SymbolId, String>,
+    known_lengths: &HashMap<SymbolId, usize>,
+    expression: &Expression<'_>,
+) -> Option<usize> {
+    direct_uint32_array_length(scoping, global_aliases, expression).or_else(|| {
+        let symbol = symbol_of(scoping, expression)?;
+        // A stable binding fixes object identity, but its ArrayBuffer could still
+        // be detached if the object escaped before this call. Restrict the
+        // length proof to a fresh local whose only resolved use is this export
+        // argument; later/earlier aliases then fail closed rather than assuming
+        // an undetached buffer.
+        (scoping.get_resolved_reference_ids(symbol).len() == 1)
+            .then(|| known_lengths.get(&symbol).copied())
+            .flatten()
+    })
+}
+
+struct ExportCallCollector<'c, 'g, 'l> {
+    scoping: &'c Scoping,
+    global_aliases: &'g HashMap<SymbolId, String>,
+    uint32_array_lengths: &'l HashMap<SymbolId, usize>,
     calls: Vec<(InstanceKey, WasmInstanceExportCall)>,
 }
 
-impl<'a> Visit<'a> for ExportCallCollector<'_> {
+impl<'a> Visit<'a> for ExportCallCollector<'_, '_, '_> {
     fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
 
     fn visit_arrow_function_expression(
@@ -516,6 +602,20 @@ impl<'a> Visit<'a> for ExportCallCollector<'_> {
                                 call_start: call.span.start,
                                 call_end: call.span.end,
                                 argument_count: call.arguments.len(),
+                                static_uint32_array_argument_lengths: call
+                                    .arguments
+                                    .iter()
+                                    .map(|argument| {
+                                        argument.as_expression().and_then(|expression| {
+                                            static_uint32_array_length(
+                                                self.scoping,
+                                                self.global_aliases,
+                                                self.uint32_array_lengths,
+                                                expression,
+                                            )
+                                        })
+                                    })
+                                    .collect(),
                             },
                         ));
                     }
@@ -575,6 +675,8 @@ struct RegionFacts {
 fn analyze_region(
     statements: &[Statement<'_>],
     scoping: &Scoping,
+    global_aliases: &HashMap<SymbolId, String>,
+    uint32_array_lengths: &HashMap<SymbolId, usize>,
     helper: SymbolId,
     parameter: usize,
 ) -> RegionFacts {
@@ -597,6 +699,8 @@ fn analyze_region(
         }
         let mut exports = ExportCallCollector {
             scoping,
+            global_aliases,
+            uint32_array_lengths,
             calls: Vec::new(),
         };
         exports.visit_statement(statement);
@@ -614,23 +718,32 @@ fn analyze_region(
     facts
 }
 
-struct RegionCollector<'c> {
+struct RegionCollector<'c, 'g, 'l> {
     scoping: &'c Scoping,
+    global_aliases: &'g HashMap<SymbolId, String>,
+    uint32_array_lengths: &'l HashMap<SymbolId, usize>,
     helper: SymbolId,
     parameter: usize,
     regions: Vec<RegionFacts>,
 }
 
-impl RegionCollector<'_> {
+impl RegionCollector<'_, '_, '_> {
     fn record(&mut self, statements: &[Statement<'_>]) {
-        let facts = analyze_region(statements, self.scoping, self.helper, self.parameter);
+        let facts = analyze_region(
+            statements,
+            self.scoping,
+            self.global_aliases,
+            self.uint32_array_lengths,
+            self.helper,
+            self.parameter,
+        );
         if !facts.initializers.is_empty() || !facts.exports.is_empty() {
             self.regions.push(facts);
         }
     }
 }
 
-impl<'a> Visit<'a> for RegionCollector<'_> {
+impl<'a> Visit<'a> for RegionCollector<'_, '_, '_> {
     fn visit_program(&mut self, program: &Program<'a>) {
         self.record(&program.body);
         walk::walk_program(self, program);
@@ -1036,6 +1149,7 @@ pub(super) fn collect_module_memory_identity_proofs(
     source: &str,
     program: &Program<'_>,
     scoping: &Scoping,
+    global_aliases: &HashMap<SymbolId, String>,
     instantiation_sites: &HashMap<(u32, u32), Vec<WasmInstantiationSite>>,
 ) -> Vec<WasmModuleMemoryIdentityProof> {
     let mut function_collector = FunctionCollector {
@@ -1069,6 +1183,13 @@ pub(super) fn collect_module_memory_identity_proofs(
         paths: Vec::new(),
     };
     promise_collector.visit_program(program);
+
+    let mut length_collector = StableUint32ArrayLengthCollector {
+        scoping,
+        global_aliases,
+        lengths: HashMap::new(),
+    };
+    length_collector.visit_program(program);
 
     let mut proofs = Vec::new();
     for getter in getter_collector.candidates {
@@ -1127,6 +1248,8 @@ pub(super) fn collect_module_memory_identity_proofs(
 
         let mut regions = RegionCollector {
             scoping,
+            global_aliases,
+            uint32_array_lengths: &length_collector.lengths,
             helper: write.helper,
             parameter: write.parameter,
             regions: Vec::new(),

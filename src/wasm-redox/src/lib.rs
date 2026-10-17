@@ -334,7 +334,7 @@ pub fn deep_analyze(bytes: &[u8], report: &ModuleReport) -> DeepModuleReport {
         }
     }
     DeepModuleReport {
-        schema: "wasm-redox/deep-v6",
+        schema: "wasm-redox/deep-v7",
         exports,
     }
 }
@@ -365,7 +365,7 @@ mod tests {
             )"#,
         )?;
         let report = analyze(&bytes)?;
-        assert_eq!(deep_analyze(&bytes, &report).schema, "wasm-redox/deep-v6");
+        assert_eq!(deep_analyze(&bytes, &report).schema, "wasm-redox/deep-v7");
         assert_eq!(report.sections.imported_functions, 1);
         assert_eq!(report.sections.defined_functions, 1);
         assert_eq!(report.functions.len(), 1);
