@@ -48,7 +48,7 @@ def run_probe(
             f"{cp.stdout}{cp.stderr}"
         )
     document = json.loads(cp.stdout)
-    if document.get("schema") != "jsvm-wasm-import-semantics/v5":
+    if document.get("schema") != "jsvm-wasm-import-semantics/v6":
         raise RuntimeError(
             f"unexpected JS WASM-import analyzer schema for {source}: "
             f"{document.get('schema')!r}"
@@ -82,7 +82,7 @@ def run_full_probe(analyzer: Path, source: Path) -> dict:
             f"{cp.stdout}{cp.stderr}"
         )
     document = json.loads(cp.stdout)
-    if document.get("schema") != "jsvm-wasm-import-semantics/v5":
+    if document.get("schema") != "jsvm-wasm-import-semantics/v6":
         raise RuntimeError(
             f"unexpected JS WASM-import analyzer schema for {source}: "
             f"{document.get('schema')!r}"
@@ -149,6 +149,156 @@ def matching_handler(document: dict, import_module: str, import_name: str, kind:
         and handler.get("import_name") == import_name
         and handler.get("kind") == kind
     ]
+
+
+def exact_usage_matches_binding(usage: dict, binding_proofs: list[dict]) -> bool:
+    usage_sites = {
+        (site.get("start"), site.get("end"), site.get("module_sha256"))
+        for site in usage.get("instantiation_sites", [])
+    }
+    return any(
+        usage.get("import_object") == binding.get("import_object")
+        and any(
+            (site.get("start"), site.get("end"), site.get("module_sha256")) in usage_sites
+            for site in binding.get("instantiation_sites", [])
+        )
+        for binding in binding_proofs
+    )
+
+
+def source_length_barrier_proofs(
+    document: dict,
+    function_imports: list[dict],
+    candidate: dict,
+    module_sha256: str | None,
+    binding_proofs: list[dict],
+) -> list[dict]:
+    barrier_indices = sorted({
+        index
+        for load in candidate.get("destination_loads", [])
+        for index in load.get("source_length_import_barriers", [])
+        if isinstance(index, int) and not isinstance(index, bool)
+    })
+    proofs = []
+    for index in barrier_indices:
+        if not (0 <= index < len(function_imports)):
+            return []
+        imported = function_imports[index]
+        import_module = imported.get("module")
+        import_name = imported.get("name")
+        if not isinstance(import_module, str) or not isinstance(import_name, str):
+            return []
+        handlers = [
+            handler
+            for handler in matching_handler(
+                document, import_module, import_name, "property_getter"
+            )
+            if handler.get("property") == "length"
+            and handler.get("standard_builtin_semantics_required") is True
+        ]
+        if len(handlers) != 1:
+            return []
+        handler = handlers[0]
+        usages = [
+            usage
+            for usage in document.get("import_object_usages", [])
+            if usage.get("import_module") == import_module
+            and usage.get("import_name") == import_name
+            and usage.get("assignment_start") == handler.get("assignment_start")
+            and usage.get("assignment_end") == handler.get("assignment_end")
+        ]
+        exact = exact_module_usage_proofs(usages, module_sha256)
+        exact = [usage for usage in exact if exact_usage_matches_binding(usage, binding_proofs)]
+        if len(exact) != 1:
+            return []
+        proofs.append({
+            "function_import": index,
+            "import_module": import_module,
+            "import_name": import_name,
+            "handler": handler,
+            "binding": exact[0],
+        })
+    return proofs
+
+
+def fixed_uint32_source_length_lower_bound(
+    memory_proofs: list[dict], export_name: str | None, source_parameter: object
+) -> int | None:
+    if (
+        not isinstance(export_name, str)
+        or not isinstance(source_parameter, int)
+        or isinstance(source_parameter, bool)
+    ):
+        return None
+    lengths: list[int] = []
+    for proof in memory_proofs:
+        matching_calls = [
+            call for call in proof.get("export_calls", [])
+            if call.get("export_name") == export_name
+        ]
+        if not matching_calls:
+            return None
+        for call in matching_calls:
+            argument_lengths = call.get("static_uint32_array_argument_lengths")
+            if not isinstance(argument_lengths, list) or source_parameter >= len(argument_lengths):
+                return None
+            length = argument_lengths[source_parameter]
+            if not isinstance(length, int) or isinstance(length, bool) or length < 0:
+                return None
+            lengths.append(length)
+    return min(lengths) if lengths else None
+
+
+def interpreted_destination_loads(
+    candidate: dict,
+    module_memory_proofs: list[dict],
+    export_name: str | None,
+    byte_integrity_proven: bool,
+) -> tuple[list[dict], int | None]:
+    loads = candidate.get("destination_loads", [])
+    source_parameter = candidate.get("source_entry_parameter")
+    source_length = fixed_uint32_source_length_lower_bound(
+        module_memory_proofs, export_name, source_parameter
+    )
+    element_shift = candidate.get("destination_element_index_shift")
+    base_zero_bits = candidate.get("destination_base_guaranteed_trailing_zero_bits")
+    if (
+        not loads
+        or source_length is None
+        or not byte_integrity_proven
+        or element_shift != 2
+        or not isinstance(base_zero_bits, int)
+        or isinstance(base_zero_bits, bool)
+        or base_zero_bits < element_shift
+    ):
+        return [], source_length
+    interpreted = []
+    for load in loads:
+        offset = load.get("byte_offset")
+        if (
+            not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+            or offset % 4 != 0
+        ):
+            return [], source_length
+        source_index = offset // 4
+        if source_index >= source_length:
+            return [], source_length
+        interpreted.append(
+            {
+                "load_value": load.get("value"),
+                "load_block": load.get("block"),
+                "load_instruction_index": load.get("instruction_index"),
+                "memory": load.get("memory"),
+                "byte_offset": offset,
+                "source_parameter": source_parameter,
+                "source_element_index": source_index,
+                "source_conversion": "ToUint32",
+                "little_endian_typed_array_storage_required": True,
+            }
+        )
+    return interpreted, source_length
 
 
 def matching_module_memory_proofs(
@@ -240,18 +390,18 @@ def main() -> None:
         report = load(project / module["report_path"])
         # module.report preserves WASM import-section order; filtering to function
         # imports therefore preserves the WebAssembly function-index prefix used
-        # by deep-v6 host_import_function.
+        # by deep-v7 host_import_function.
         function_imports = [
             imported
             for imported in report.get("imports", [])
             if imported.get("kind") == "function"
         ]
-        if deep.get("schema") != "wasm-redox/deep-v6":
+        if deep.get("schema") != "wasm-redox/deep-v7":
             skipped_modules.append(
                 {
                     "sha256": module.get("sha256"),
                     "schema": deep.get("schema"),
-                    "reason": "host-effect/read proof requires wasm-redox/deep-v6",
+                    "reason": "host-effect/read proof requires wasm-redox/deep-v7",
                 }
             )
             continue
@@ -435,12 +585,20 @@ def main() -> None:
                                 report,
                                 candidate,
                             )
+                            length_barrier_proofs = source_length_barrier_proofs(
+                                document,
+                                function_imports,
+                                candidate,
+                                module.get("sha256"),
+                                binding_proofs,
+                            )
                             proofs.append({
                                 "source_path": relative,
                                 "set_handler": set_matches[0],
                                 "constructor_handler": constructor_matches[0],
                                 "import_binding_identity_proofs": binding_proofs,
                                 "module_memory_identity_proofs": memory_proofs,
+                                "source_length_barrier_proofs": length_barrier_proofs,
                             })
 
                 copied_binding_proofs = [
@@ -459,6 +617,57 @@ def main() -> None:
                     and len(module_memory_sources) == 1
                     and len(proofs) == 1
                     and len(copied_binding_proofs) == 1
+                )
+                destination_loads = candidate.get("destination_loads", [])
+                source_length_lower_bound = fixed_uint32_source_length_lower_bound(
+                    module_memory_proofs if module_memory_proven else [],
+                    export.get("export"),
+                    candidate.get("source_entry_parameter"),
+                )
+                required_length_barriers = {
+                    index
+                    for load in destination_loads
+                    for index in load.get("source_length_import_barriers", [])
+                    if isinstance(index, int) and not isinstance(index, bool)
+                }
+                length_barrier_proofs = [
+                    {"source_path": proof["source_path"], **barrier}
+                    for proof in proofs
+                    for barrier in proof.get("source_length_barrier_proofs", [])
+                ]
+                proven_length_barriers = {
+                    proof.get("function_import") for proof in length_barrier_proofs
+                }
+                destination_byte_integrity_proven = (
+                    bool(destination_loads)
+                    and source_length_lower_bound is not None
+                    and all(
+                        load.get("unresolved_intervening_memory_mutation") is False
+                        and not load.get("other_import_call_barriers", [])
+                        for load in destination_loads
+                    )
+                    and proven_length_barriers == required_length_barriers
+                    and (not required_length_barriers or len(proofs) == 1)
+                )
+                element_shift = candidate.get("destination_element_index_shift")
+                base_zero_bits = candidate.get("destination_base_guaranteed_trailing_zero_bits")
+                destination_base_alignment_proven = (
+                    element_shift == 2
+                    and isinstance(base_zero_bits, int)
+                    and not isinstance(base_zero_bits, bool)
+                    and base_zero_bits >= element_shift
+                )
+                destination_load_interpretations, _ = interpreted_destination_loads(
+                    candidate,
+                    module_memory_proofs if module_memory_proven else [],
+                    export.get("export"),
+                    destination_byte_integrity_proven,
+                )
+                destination_load_interpretation_proven = (
+                    module_memory_proven
+                    and destination_byte_integrity_proven
+                    and len(destination_load_interpretations) == len(destination_loads)
+                    and bool(destination_load_interpretations)
                 )
                 row = {
                     "module_sha256": module.get("sha256"),
@@ -484,11 +693,31 @@ def main() -> None:
                         if module_memory_proven
                         else "no unique carrier source proves that the constructor input comes from the exported memory of the exact module instance executing this copied-input export"
                     ),
-                    "destination_load_interpretation_proven": False,
+                    "destination_byte_integrity_proven": destination_byte_integrity_proven,
+                    "source_length_barrier_proofs": length_barrier_proofs,
+                    "destination_base_alignment_proven": destination_base_alignment_proven,
+                    "destination_load_interpretation_proven": destination_load_interpretation_proven,
+                    "destination_load_interpretations": destination_load_interpretations,
+                    "source_uint32_array_length_lower_bound": source_length_lower_bound,
                     "destination_load_interpretation_limitation": (
-                        "exact module-memory identity is proven, but the structural copy candidate does not yet prove that copied bytes remain unmodified before each dominated native load"
-                        if module_memory_proven
-                        else "module-memory identity is not proven"
+                        None
+                        if destination_load_interpretation_proven
+                        else (
+                            "module-memory identity is not proven"
+                            if not module_memory_proven
+                            else (
+                                "a potentially memory-mutating path exists between the proven Uint32Array.set and at least one destination load"
+                                if not destination_byte_integrity_proven
+                                else (
+                                    "the destination base is not proven aligned to the Uint32Array element width"
+                                    if not destination_base_alignment_proven
+                                    else "the exact carrier export-call argument is not proven to be a fixed-length Uint32Array covering every destination load"
+                                )
+                            )
+                        )
+                    ),
+                    "destination_load_interpretation_contract": (
+                        "each proven i32.load reads the unchanged Uint32Array.set destination word corresponding to ToUint32(source[index]); numeric equality requires little-endian typed-array storage"
                     ),
                 }
                 if len(proofs) > 1:
@@ -513,17 +742,20 @@ def main() -> None:
 
     out = {
         "schema": WASM_JS_BOUNDARY.schema,
-        "wasm_schema_required": "wasm-redox/deep-v6",
-        "js_schema": "jsvm-wasm-import-semantics/v5",
+        "wasm_schema_required": "wasm-redox/deep-v7",
+        "js_schema": "jsvm-wasm-import-semantics/v6",
         "safe_static_only": True,
         "correlation_contract": (
             "cross-language claims require exact WASM import module+name matches. "
             "Host-effect writes and typed-array input-copy candidates remain independent evidence "
-            "families; exact module/import-object binding identity is proven separately from "
-            "instance/exported-memory identity."
+            "families; source-word interpretation additionally requires exact instance/exported-memory "
+            "identity, path-complete destination-byte integrity, destination-base element alignment, "
+            "and fixed Uint32Array source coverage."
         ),
         "memory_write_interpretation": (
-            "DataView and typed-array interpretations require standard unmodified platform builtins"
+            "DataView and typed-array interpretations require standard unmodified platform builtins; "
+            "numeric equality between Uint32Array elements and WASM i32 loads additionally requires "
+            "little-endian typed-array storage"
         ),
         "host_effect_rows": host_effect_rows,
         "copied_input_rows": copied_input_rows,
@@ -550,6 +782,12 @@ def main() -> None:
             "proven_module_memory_identities": sum(
                 row["module_memory_identity_proven"] for row in copied_input_rows
             ),
+            "proven_destination_byte_integrities": sum(
+                row["destination_byte_integrity_proven"] for row in copied_input_rows
+            ),
+            "proven_destination_load_interpretations": sum(
+                row["destination_load_interpretation_proven"] for row in copied_input_rows
+            ),
             "modules": len({
                 row["module_sha256"] for row in [*host_effect_rows, *copied_input_rows]
             }),
@@ -569,7 +807,9 @@ def main() -> None:
         f"{summary['copied_input_candidates']} copied-input candidate(s) have proven "
         "JS Uint32Array constructor/set semantics; "
         f"{summary['proven_module_memory_identities']} copied-input candidate(s) have proven "
-        "exact module-memory identity"
+        "exact module-memory identity; "
+        f"{summary['proven_destination_load_interpretations']} copied-input candidate(s) have proven "
+        "source-word load interpretation"
     )
 
 

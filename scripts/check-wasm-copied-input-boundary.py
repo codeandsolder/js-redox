@@ -15,11 +15,11 @@ PROJECT = WORK / "project"
 # Deliberate nop padding keeps the exported core above wasm-redox deep-analysis
 # minimum body size; removing it would make this boundary fixture skip deep analysis.
 WASM = bytes.fromhex(
-    "0061736d01000000011f066000016f60016f016f60036f6f7f006000017f60017f017f60026f7f017f022e0303776267115f5f7762696e6467656e5f6d656d6f72790000037762670463746f7200010377626703736574000203"
-    "04030304050404016f00040503010001071102066d656d6f7279020004636f707900050aa501030e01017f410222001000260020000b040020000b8e010001010101010101010101010101010101010101010101010101010101"
-    "010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010141002000260041011003100425001001260041012500"
-    "4100250020014102761002200128020020012802046a0b0058046e616d65012e0500066d656d6f7279010463746f720203736574030b6d656d6f72795f736c6f74040b6275666665725f736c6f7402210303010004736c6f7404"
-    "010004736c6f7405020006736f75726365010462617365"
+    "0061736d01000000011f066000016f60016f016f60036f6f7f006000017f60017f017f60026f7f017f022e0303776267115f5f7762696e6467656e5f6d656d6f72790000037762670463746f72000103"
+    "7762670373657400020304030304050404016f00040503010001071102066d656d6f7279020004636f707900050aad01030e01017f410222001000260020000b040020000b960101017f010101010101"
+    "0101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101"
+    "0101010101010101012001417c712102410020002600410110031004250010012600410125004100250020024102761002200228020020022802046a0b0061046e616d65012e0500066d656d6f727901"
+    "0463746f720203736574030b6d656d6f72795f736c6f74040b6275666665725f736c6f74022a0303010004736c6f7404010004736c6f7405030006736f757263650104626173650207616c69676e6564"
 )
 
 
@@ -99,6 +99,7 @@ def main() -> None:
         "var module = new host.WebAssembly.Module(bytes);\n"
         "var instance = new host.WebAssembly.Instance(module, imports);\n"
         "init(instance);\n"
+        "var input = new host.Uint32Array([11, 22]);\n"
         "instance.exports.copy(input, 0);\n"
     )
     fixture = {
@@ -151,7 +152,7 @@ def main() -> None:
     }, index
     module = index["modules"][0]
     deep = json.loads((PROJECT / module["deep_path"]).read_text())
-    assert deep["schema"] == "wasm-redox/deep-v6", deep
+    assert deep["schema"] == "wasm-redox/deep-v7", deep
     copy_export = next(row for row in deep["exports"] if row.get("export") == "copy")
     candidates = copy_export["analysis"]["externref_bulk_copy_candidates"]
     assert len(candidates) == 1, candidates
@@ -162,6 +163,7 @@ def main() -> None:
     assert candidate["constructor_input_memory_import_function"] == 0, candidate
     assert candidate["destination_element_index_shift"] == 2, candidate
     assert [load["byte_offset"] for load in candidate["destination_loads"]] == [0, 4], candidate
+    assert all(load["copied_bytes_unmodified_since_set"] for load in candidate["destination_loads"]), candidate
 
     run(
         "uv", "run", "--no-project", "python",
@@ -189,11 +191,17 @@ def main() -> None:
     assert len(row["module_memory_identity_proofs"]) == 1, row
     assert row["module_memory_identity_proofs"][0]["memory_export"]["name"] == "memory", row
     assert row["module_memory_identity_proofs"][0]["memory_export"]["index"] == 0, row
-    assert row["destination_load_interpretation_proven"] is False, row
+    assert row["destination_byte_integrity_proven"] is True, row
+    assert row["destination_load_interpretation_proven"] is True, row
+    assert row["source_uint32_array_length_lower_bound"] == 2, row
+    assert [
+        proof["source_element_index"] for proof in row["destination_load_interpretations"]
+    ] == [0, 1], row
 
     print(
         "WASM copied-input boundary regression: inline extraction + structural copy + "
-        "1/1 JS Uint32Array semantics + exact module/import binding + exact module-memory identity OK"
+        "1/1 JS Uint32Array semantics + exact module/import binding + exact module-memory identity + "
+        "unchanged destination/source-word interpretation OK"
     )
 
 
