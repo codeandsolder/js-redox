@@ -792,7 +792,13 @@ fn analyze_program(
         collect_instantiation_sites(program, scoping, &global_aliases, &exact_module_sites);
     let module_memory_identity_proofs =
         if module_filter.is_none() && import_filter.is_none() && offset_value.is_none() {
-            collect_module_memory_identity_proofs(source, program, scoping, &instantiation_sites)
+            collect_module_memory_identity_proofs(
+                source,
+                program,
+                scoping,
+                &global_aliases,
+                &instantiation_sites,
+            )
         } else {
             Vec::new()
         };
@@ -1533,10 +1539,12 @@ mod tests {
             compiled = new m.WebAssembly.Module(G);
             var instance = new m.WebAssembly.Instance(compiled, imports);
             init(instance);
+            var input = new m.Uint32Array([a, b, c, d]);
             instance.exports.copy(input);
             m.WebAssembly.instantiate(G, imports).then(function(result) {
                 init(result.instance);
-                result.instance.exports.copy(input);
+                var asyncInput = new m.Uint32Array([a, b, c, d]);
+                result.instance.exports.copy(asyncInput);
             });
         "#;
         let analysis = proven_wasm_import_semantics(source);
@@ -1547,10 +1555,10 @@ mod tests {
                 && proof.memory_export_name == "memory"
                 && proof.instantiation_site.exact_module_identity_proven
                 && proof.instantiation_site.exact_import_object_identity_proven
-                && proof
-                    .export_calls
-                    .iter()
-                    .any(|call| call.export_name == "copy")
+                && proof.export_calls.iter().any(|call| {
+                    call.export_name == "copy"
+                        && call.static_uint32_array_argument_lengths == [Some(4)]
+                })
         }));
         assert!(analysis
             .module_memory_identity_proofs
@@ -1560,6 +1568,69 @@ mod tests {
             .module_memory_identity_proofs
             .iter()
             .any(|proof| proof.instance_identity_kind == "instantiate_promise_result"));
+    }
+
+    #[test]
+    fn module_memory_identity_reports_uint32_source_length_only_when_static() {
+        let source = r#"
+            var m = window;
+            function bA(A) {
+                if (Uint8Array.fromBase64) return [Uint8Array.fromBase64(A).buffer, false];
+                for (var Q = atob(A), g = new Uint8Array(Q.length), E = 0; E < Q.length; E++) g[E] = Q.charCodeAt(E);
+                return [g.buffer, false];
+            }
+            var exports_binding;
+            function init(instance) { exports_binding = instance.exports; return exports_binding; }
+            function tQ() {
+                var imports = {}; imports.wbg = {};
+                imports.wbg.__wbindgen_memory = function() { return exports_binding.memory; };
+                return imports;
+            }
+            var N = "AGFzbQEAAAA=", G = bA(N)[0], imports = tQ();
+            var instance = new m.WebAssembly.Instance(new m.WebAssembly.Module(G), imports);
+            init(instance);
+            var fixed = new m.Uint32Array([a, b, c, d]);
+            var dynamic = new m.Uint32Array(values);
+            var escaped = new m.Uint32Array([a, b, c, d]);
+            var leakedBuffer = escaped.buffer;
+            instance.exports.fixed(fixed);
+            instance.exports.dynamic(dynamic);
+            instance.exports.escaped(escaped);
+        "#;
+        let analysis = proven_wasm_import_semantics(source);
+        assert_eq!(analysis.module_memory_identity_proofs.len(), 1);
+        let Some(proof) = analysis.module_memory_identity_proofs.first() else {
+            return;
+        };
+        let fixed = proof
+            .export_calls
+            .iter()
+            .find(|call| call.export_name == "fixed");
+        assert!(fixed.is_some());
+        let Some(fixed) = fixed else {
+            return;
+        };
+        assert_eq!(fixed.static_uint32_array_argument_lengths, [Some(4)]);
+
+        let dynamic = proof
+            .export_calls
+            .iter()
+            .find(|call| call.export_name == "dynamic");
+        assert!(dynamic.is_some());
+        let Some(dynamic) = dynamic else {
+            return;
+        };
+        assert_eq!(dynamic.static_uint32_array_argument_lengths, [None]);
+
+        let escaped = proof
+            .export_calls
+            .iter()
+            .find(|call| call.export_name == "escaped");
+        assert!(escaped.is_some());
+        let Some(escaped) = escaped else {
+            return;
+        };
+        assert_eq!(escaped.static_uint32_array_argument_lengths, [None]);
     }
 
     #[test]
