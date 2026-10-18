@@ -172,7 +172,7 @@ def main():
     deep_path = PROJECT / module["deep_path"]
     assert deep_path.is_file()
     deep = json.loads(deep_path.read_text())
-    assert deep["schema"] == "wasm-redox/deep-v7"
+    assert deep["schema"] == "wasm-redox/deep-v8"
     pairs = [
         pair
         for export in deep["exports"]

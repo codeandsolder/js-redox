@@ -28,6 +28,11 @@ use module_identity::collect_exact_module_sites;
 pub struct WasmImportSemanticsAnalysis {
     pub shapes: Vec<WasmImportDataViewSetU32Shape>,
     pub handler_semantics: Vec<WasmImportHandlerShape>,
+    /// Handler semantics proven only after the proof-only standard numeric builtin
+    /// control-flow normalizer. Spans belong to the normalized source and are not
+    /// valid captured-source identity keys; correlate these by unique module/name
+    /// plus an exact original import-object usage.
+    pub proof_normalized_handler_semantics: Vec<WasmImportHandlerShape>,
     pub import_object_usages: Vec<WasmImportObjectUsage>,
     pub module_memory_identity_proofs: Vec<WasmModuleMemoryIdentityProof>,
 }
@@ -836,9 +841,105 @@ fn analyze_program(
     WasmImportSemanticsAnalysis {
         shapes: collector.reports,
         handler_semantics: collector.handler_semantics,
+        proof_normalized_handler_semantics: Vec::new(),
         import_object_usages: collector.import_object_usages,
         module_memory_identity_proofs,
     }
+}
+
+fn collect_proof_normalized_handler_semantics(source: &str) -> Vec<WasmImportHandlerShape> {
+    let Some(normalized) = jsvm_safe_core::deobfuscate_with_standard_numeric_builtins(source, 16)
+    else {
+        return Vec::new();
+    };
+    for source_type in [SourceType::unambiguous(), SourceType::cjs()] {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, &normalized.source, source_type);
+        if !parsed.is_clean() {
+            continue;
+        }
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        if !semantic.diagnostics.is_empty() {
+            continue;
+        }
+        let scoping = semantic.semantic.scoping();
+        if has_dynamic_scope(&parsed.program, scoping) {
+            return Vec::new();
+        }
+        let global_aliases = collect_global_aliases(&parsed.program, scoping);
+        struct Collector<'c, 'g> {
+            scoping: &'c Scoping,
+            global_aliases: &'g HashMap<SymbolId, String>,
+            shapes: Vec<WasmImportHandlerShape>,
+            assignment_counts: HashMap<(Option<String>, String), usize>,
+        }
+        impl<'a> Visit<'a> for Collector<'_, '_> {
+            fn visit_assignment_expression(
+                &mut self,
+                assignment: &oxc_ast::ast::AssignmentExpression<'a>,
+            ) {
+                if assignment.operator.as_str() == "=" {
+                    if let (
+                        Some((import_name, import_module)),
+                        Expression::FunctionExpression(function),
+                    ) = (
+                        assignment_property(&assignment.left),
+                        unparenthesized(&assignment.right),
+                    ) {
+                        *self
+                            .assignment_counts
+                            .entry((import_module.map(str::to_string), import_name.to_string()))
+                            .or_default() += 1;
+                        if let Some(semantic) =
+                            analyze_import_handler(function, self.scoping, self.global_aliases)
+                        {
+                            if matches!(
+                                semantic,
+                                WasmImportHandlerSemantic::TableInitializerOnly { .. }
+                            ) {
+                                self.shapes.push(WasmImportHandlerShape {
+                                    import_module: import_module.map(str::to_string),
+                                    import_name: import_name.to_string(),
+                                    assignment_start: assignment.span.start,
+                                    assignment_end: assignment.span.end,
+                                    semantic,
+                                });
+                            }
+                        }
+                    }
+                }
+                walk::walk_assignment_expression(self, assignment);
+            }
+        }
+        let mut collector = Collector {
+            scoping,
+            global_aliases: &global_aliases,
+            shapes: Vec::new(),
+            assignment_counts: HashMap::new(),
+        };
+        collector.visit_program(&parsed.program);
+        collector.shapes.retain(|shape| {
+            collector
+                .assignment_counts
+                .iter()
+                .any(|((module, name), count)| {
+                    module.as_deref() == shape.import_module.as_deref()
+                        && name == &shape.import_name
+                        && *count == 1
+                })
+        });
+        collector.shapes.sort_by(|left, right| {
+            left.import_module
+                .cmp(&right.import_module)
+                .then_with(|| left.import_name.cmp(&right.import_name))
+                .then_with(|| left.assignment_start.cmp(&right.assignment_start))
+        });
+        collector.shapes.dedup();
+        return collector.shapes;
+    }
+    Vec::new()
 }
 
 fn analyze_source(
@@ -859,7 +960,7 @@ fn analyze_source(
         if !semantic.diagnostics.is_empty() {
             continue;
         }
-        return analyze_program(
+        let mut analysis = analyze_program(
             source,
             &parsed.program,
             semantic.semantic.scoping(),
@@ -867,6 +968,11 @@ fn analyze_source(
             import_filter,
             offset_value,
         );
+        if module_filter.is_none() && import_filter.is_none() && offset_value.is_none() {
+            analysis.proof_normalized_handler_semantics =
+                collect_proof_normalized_handler_semantics(source);
+        }
+        return analysis;
     }
     WasmImportSemanticsAnalysis::default()
 }
@@ -1728,6 +1834,111 @@ mod tests {
         "#;
         assert!(proven_wasm_import_semantics(escaped_instance)
             .module_memory_identity_proofs
+            .is_empty());
+    }
+
+    #[test]
+    fn proof_normalized_table_initializer_is_strict_and_shadow_safe() {
+        let good = r#"
+            var host = window;
+            var exports_binding;
+            var imports = { wbg: {} };
+            imports.wbg.__wbindgen_init_externref_table = function() {
+                var table, base;
+                table = exports_binding.__wbindgen_export_0;
+                base = table.grow(4);
+                table.set(0, void 0);
+                table.set(base + 0, void 0);
+                table.set(base + 1, null);
+                table.set(base + 2, true);
+                table.set(base + 3, false);
+            };
+        "#;
+        let analysis = proven_wasm_import_semantics(good);
+        assert_eq!(analysis.proof_normalized_handler_semantics.len(), 1);
+        assert!(matches!(
+            &analysis.proof_normalized_handler_semantics[0].semantic,
+            WasmImportHandlerSemantic::TableInitializerOnly {
+                exports_binding,
+                table_export: "__wbindgen_export_0",
+                standard_builtin_semantics_required: true,
+                standard_webassembly_builtin_semantics_required: true,
+            } if exports_binding == "exports_binding"
+        ));
+
+        let shadowed = r#"
+            var exports_binding;
+            var imports = { wbg: {} };
+            imports.wbg.__wbindgen_init_externref_table = function() {
+                var exports_binding = attacker;
+                var table, base;
+                table = exports_binding.__wbindgen_export_0;
+                base = table.grow(4);
+                table.set(base, void 0);
+            };
+        "#;
+        assert!(proven_wasm_import_semantics(shadowed)
+            .proof_normalized_handler_semantics
+            .is_empty());
+
+        let side_effect = r#"
+            var exports_binding;
+            var imports = { wbg: {} };
+            imports.wbg.__wbindgen_init_externref_table = function() {
+                var table, base;
+                table = exports_binding.__wbindgen_export_0;
+                sideEffect();
+                base = table.grow(4);
+                table.set(base, void 0);
+            };
+        "#;
+        assert!(proven_wasm_import_semantics(side_effect)
+            .proof_normalized_handler_semantics
+            .is_empty());
+
+        let hidden_getter = r#"
+            var exports_binding;
+            var attacker;
+            var imports = { wbg: {} };
+            imports.wbg.__wbindgen_init_externref_table = function() {
+                var table, base;
+                table = exports_binding.__wbindgen_export_0;
+                base = table.grow(attacker.value);
+                table.set(base, void 0);
+            };
+        "#;
+        assert!(proven_wasm_import_semantics(hidden_getter)
+            .proof_normalized_handler_semantics
+            .is_empty());
+
+        let outer_write = r#"
+            var exports_binding, escaped;
+            var imports = { wbg: {} };
+            imports.wbg.__wbindgen_init_externref_table = function() {
+                var table, base;
+                table = exports_binding.__wbindgen_export_0;
+                escaped = 1;
+                base = table.grow(4);
+                table.set(base, void 0);
+            };
+        "#;
+        assert!(proven_wasm_import_semantics(outer_write)
+            .proof_normalized_handler_semantics
+            .is_empty());
+
+        let duplicate = r#"
+            var exports_binding;
+            var imports = { wbg: {} };
+            imports.wbg.__wbindgen_init_externref_table = function() {
+                var table, base;
+                table = exports_binding.__wbindgen_export_0;
+                base = table.grow(4);
+                table.set(base, void 0);
+            };
+            imports.wbg.__wbindgen_init_externref_table = function() {};
+        "#;
+        assert!(proven_wasm_import_semantics(duplicate)
+            .proof_normalized_handler_semantics
             .is_empty());
     }
 

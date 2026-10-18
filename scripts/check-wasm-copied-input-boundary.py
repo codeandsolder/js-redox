@@ -11,6 +11,8 @@ TOOL_ROOT = Path(os.environ.get("JSVM_TOOL_ROOT", ROOT / ".cargo-target-nodebug/
 WORK = ROOT / "work/wasm-copied-input-boundary-regression"
 HAR = WORK / "fixture.har"
 PROJECT = WORK / "project"
+FRESH_HAR = WORK / "fresh-fixture.har"
+FRESH_PROJECT = WORK / "fresh-project"
 
 # Deliberate nop padding keeps the exported core above wasm-redox deep-analysis
 # minimum body size; removing it would make this boundary fixture skip deep analysis.
@@ -24,6 +26,11 @@ WASM = bytes.fromhex(
 
 
 WASM_B64 = base64.b64encode(WASM).decode()
+
+FRESH_WASM = bytes.fromhex(
+    "0061736d0100000001270860016f017f6000016f60016f016f60036f6f7f006000006000017f60017f017f60026f7f017f02610503776267066c656e677468000003776267115f5f7762696e6467656e5f6d656d6f72790001037762670463746f72000203776267037365740003037762671f5f5f7762696e6467656e5f696e69745f65787465726e7265665f7461626c65000403060505060606070404016f00080503010001073a04135f5f7762696e6467656e5f6578706f72745f300100066d656d6f72790200105f5f7762696e6467656e5f7374617274000404636f707900090ace01050e01017f410222001001260020000b040020000b08002000250010000b0a00410028020020006a0ba30101017f0101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101014100200026004101100510062500100226002001047f4104054100100741027410080b2102410125004100250020024102761003200228020020022802046a0b0b0a010041000b0408000000009701046e616d6501530900066c656e67746801066d656d6f7279020463746f72030373657404057374617274050b6d656d6f72795f736c6f74060b6275666665725f736c6f74070d6c656e6774685f68656c7065720805616c6c6f63023b0505010004736c6f7406010004736c6f7407010004736c6f7408010005627974657309030006736f7572636501077573655f616c74020462617365"
+)
+FRESH_WASM_B64 = base64.b64encode(FRESH_WASM).decode()
 
 def run(*args):
     cp = subprocess.run(
@@ -72,10 +79,60 @@ def entry(url: str, mime: str, text: str):
     }
 
 
+def write_fixture(path: Path, title: str, js: str) -> None:
+    html = '<!doctype html><script src="https://fixture.invalid/carrier.js"></script>'
+    fixture = {
+        "log": {
+            "version": "1.2",
+            "creator": {"name": title, "version": "1"},
+            "pages": [
+                {
+                    "startedDateTime": "2026-10-11T00:00:00.000Z",
+                    "id": "page_1",
+                    "title": title,
+                    "pageTimings": {},
+                }
+            ],
+            "entries": [
+                entry("https://fixture.invalid/index.html", "text/html", html),
+                entry("https://fixture.invalid/carrier.js", "application/javascript", js),
+            ],
+        }
+    }
+    path.write_text(json.dumps(fixture))
+
+
+def materialize_and_correlate(har: Path, project: Path) -> None:
+    run(TOOL_ROOT / "har-project", har, "--output", project)
+    run(
+        "uv", "run", "--no-project", "python",
+        "scripts/materialize-capture-source.py", project,
+        "--formatter", TOOL_ROOT / "js-format",
+    )
+    run(
+        "uv", "run", "--no-project", "python",
+        "scripts/materialize-safe-deobfuscation.py", project,
+        "--deobfuscator", TOOL_ROOT / "deobfuscate-safe",
+        "--string-recoverer", ROOT / "scripts/recover-js-obfuscator-strings.py",
+        "--formatter", TOOL_ROOT / "js-format",
+        "--jobs", 1,
+    )
+    run(
+        "uv", "run", "--no-project", "python",
+        "scripts/materialize-wasm.py", project,
+        "--wasm-redox", TOOL_ROOT / "wasm-redox",
+    )
+    run(
+        "uv", "run", "--no-project", "python",
+        "scripts/correlate-wasm-js-boundary.py", project,
+        "--analyzer", TOOL_ROOT / "wasm-import-semantics",
+        "--fresh-evaluator", TOOL_ROOT / "fresh-eval",
+    )
+
+
 def main() -> None:
     shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(parents=True)
-    html = '<!doctype html><script src="https://fixture.invalid/carrier.js"></script>'
     js = (
         "var host = window;\n"
         "var exportsBinding;\n"
@@ -102,45 +159,10 @@ def main() -> None:
         "var input = new host.Uint32Array([11, 22]);\n"
         "instance.exports.copy(input, 0);\n"
     )
-    fixture = {
-        "log": {
-            "version": "1.2",
-            "creator": {"name": "copied-input boundary regression", "version": "1"},
-            "pages": [
-                {
-                    "startedDateTime": "2026-10-11T00:00:00.000Z",
-                    "id": "page_1",
-                    "title": "copied-input fixture",
-                    "pageTimings": {},
-                }
-            ],
-            "entries": [
-                entry("https://fixture.invalid/index.html", "text/html", html),
-                entry("https://fixture.invalid/carrier.js", "application/javascript", js),
-            ],
-        }
-    }
-    HAR.write_text(json.dumps(fixture))
+    write_fixture(HAR, "copied-input boundary regression", js)
 
-    run(TOOL_ROOT / "har-project", HAR, "--output", PROJECT)
-    run(
-        "uv", "run", "--no-project", "python",
-        "scripts/materialize-capture-source.py", PROJECT,
-        "--formatter", TOOL_ROOT / "js-format",
-    )
-    run(
-        "uv", "run", "--no-project", "python",
-        "scripts/materialize-safe-deobfuscation.py", PROJECT,
-        "--deobfuscator", TOOL_ROOT / "deobfuscate-safe",
-        "--string-recoverer", ROOT / "scripts/recover-js-obfuscator-strings.py",
-        "--formatter", TOOL_ROOT / "js-format",
-        "--jobs", 1,
-    )
-    run(
-        "uv", "run", "--no-project", "python",
-        "scripts/materialize-wasm.py", PROJECT,
-        "--wasm-redox", TOOL_ROOT / "wasm-redox",
-    )
+
+    materialize_and_correlate(HAR, PROJECT)
 
     index = json.loads((PROJECT / "analysis/wasm/index.json").read_text())
     assert index["summary"] == {
@@ -152,7 +174,7 @@ def main() -> None:
     }, index
     module = index["modules"][0]
     deep = json.loads((PROJECT / module["deep_path"]).read_text())
-    assert deep["schema"] == "wasm-redox/deep-v7", deep
+    assert deep["schema"] == "wasm-redox/deep-v8", deep
     copy_export = next(row for row in deep["exports"] if row.get("export") == "copy")
     candidates = copy_export["analysis"]["externref_bulk_copy_candidates"]
     assert len(candidates) == 1, candidates
@@ -165,11 +187,6 @@ def main() -> None:
     assert [load["byte_offset"] for load in candidate["destination_loads"]] == [0, 4], candidate
     assert all(load["copied_bytes_unmodified_since_set"] for load in candidate["destination_loads"]), candidate
 
-    run(
-        "uv", "run", "--no-project", "python",
-        "scripts/correlate-wasm-js-boundary.py", PROJECT,
-        "--analyzer", TOOL_ROOT / "wasm-import-semantics",
-    )
     boundary = json.loads((PROJECT / "analysis/wasm-js-boundary.json").read_text())
     assert boundary["schema"] == "wasm-js-boundary-correlation/v1", boundary
     assert boundary["summary"]["host_effect_pairs"] == 0, boundary
@@ -177,6 +194,8 @@ def main() -> None:
     assert boundary["summary"]["proven_js_typed_array_copy_semantics"] == 1, boundary
     assert boundary["summary"]["proven_copied_input_binding_identities"] == 1, boundary
     assert boundary["summary"]["proven_module_memory_identities"] == 1, boundary
+    assert boundary["summary"]["proven_destination_base_alignments"] == 1, boundary
+    assert boundary["bounded_wasm_ir_interpretation"] is True, boundary
     [row] = boundary["copied_input_rows"]
     assert row["raw_constructor_import_module"] == "wbg", row
     assert row["raw_constructor_import"] == "ctor", row
@@ -192,16 +211,97 @@ def main() -> None:
     assert row["module_memory_identity_proofs"][0]["memory_export"]["name"] == "memory", row
     assert row["module_memory_identity_proofs"][0]["memory_export"]["index"] == 0, row
     assert row["destination_byte_integrity_proven"] is True, row
+    assert row["destination_base_alignment_proven"] is True, row
+    assert row["destination_base_alignment_basis"] == "static_ssa", row
     assert row["destination_load_interpretation_proven"] is True, row
     assert row["source_uint32_array_length_lower_bound"] == 2, row
     assert [
         proof["source_element_index"] for proof in row["destination_load_interpretations"]
     ] == [0, 1], row
 
+    fresh_js = (
+        "var host = window;\n"
+        "var exportsBinding;\n"
+        "function init(instance) {\n"
+        "    exportsBinding = instance.exports;\n"
+        "    exportsBinding.__wbindgen_start();\n"
+        "    return exportsBinding;\n"
+        "}\n"
+        "function tQ() {\n"
+        "    var imports = {wbg: {}};\n"
+        "    imports.wbg.length = function(value) { return value.length; };\n"
+        "    imports.wbg.__wbindgen_memory = function() { return exportsBinding.memory; };\n"
+        "    imports.wbg.ctor = function(value) { return new host.Uint32Array(value); };\n"
+        "    imports.wbg.set = function(receiver, source, offset) { receiver.set(source, offset >>> 0); };\n"
+        "    imports.wbg.__wbindgen_init_externref_table = function() {\n"
+        "        var table, base;\n"
+        "        table = exportsBinding.__wbindgen_export_0;\n"
+        "        base = table.grow(4);\n"
+        "        table.set(0, void 0);\n"
+        "        table.set(base + 0, void 0);\n"
+        "        table.set(base + 1, null);\n"
+        "        table.set(base + 2, true);\n"
+        "        table.set(base + 3, false);\n"
+        "    };\n"
+        "    return imports;\n"
+        "}\n"
+        "function bA(A) {\n"
+        "    if (Uint8Array.fromBase64) return [Uint8Array.fromBase64(A).buffer, false];\n"
+        "    for (var Q = atob(A), g = new Uint8Array(Q.length), E = 0; E < Q.length; E++) g[E] = Q.charCodeAt(E);\n"
+        "    return [g.buffer, false];\n"
+        "}\n"
+        f'const embedded = "{FRESH_WASM_B64}";\n'
+        "var bytes = bA(embedded)[0], imports = tQ();\n"
+        "var module = new host.WebAssembly.Module(bytes);\n"
+        "var instance = new host.WebAssembly.Instance(module, imports);\n"
+        "init(instance);\n"
+        "var input = new host.Uint32Array([11, 22]);\n"
+        "instance.exports.copy(input, 0);\n"
+    )
+    write_fixture(FRESH_HAR, "fresh copied-input alignment regression", fresh_js)
+    materialize_and_correlate(FRESH_HAR, FRESH_PROJECT)
+
+    fresh_index = json.loads((FRESH_PROJECT / "analysis/wasm/index.json").read_text())
+    assert fresh_index["summary"]["modules"] == 1, fresh_index
+    fresh_module = fresh_index["modules"][0]
+    fresh_deep = json.loads((FRESH_PROJECT / fresh_module["deep_path"]).read_text())
+    assert fresh_deep["schema"] == "wasm-redox/deep-v8", fresh_deep
+    fresh_copy = next(row for row in fresh_deep["exports"] if row.get("export") == "copy")
+    [fresh_candidate] = fresh_copy["analysis"]["externref_bulk_copy_candidates"]
+    assert fresh_candidate["destination_base_guaranteed_trailing_zero_bits"] == 0, fresh_candidate
+    assert fresh_candidate["fresh_destination_base_recipe"] == {
+        "function": 8,
+        "source_length_helper_function": 7,
+        "source_length_import_function": 0,
+        "source_length_byte_shift": 2,
+        "alternate_constant_bases": [4],
+    }, fresh_candidate
+
+    fresh_boundary = json.loads(
+        (FRESH_PROJECT / "analysis/wasm-js-boundary.json").read_text()
+    )
+    [fresh_row] = fresh_boundary["copied_input_rows"]
+    assert fresh_row["module_memory_identity_proven"] is True, fresh_row
+    assert fresh_row["destination_byte_integrity_proven"] is True, fresh_row
+    assert fresh_row["static_destination_base_alignment_proven"] is False, fresh_row
+    assert fresh_row["destination_base_alignment_proven"] is True, fresh_row
+    assert fresh_row["destination_base_alignment_basis"] == "fresh_exact_evaluation", fresh_row
+    fresh_proof = fresh_row["fresh_destination_base_alignment_proof"]
+    assert fresh_proof["source_uint32_array_length"] == 2, fresh_proof
+    assert fresh_proof["allocator_byte_count"] == 8, fresh_proof
+    assert fresh_proof["evaluated_destination_base"] == 16, fresh_proof
+    assert fresh_proof["evaluated_destination_base_trailing_zero_bits"] == 4, fresh_proof
+    assert fresh_proof["fresh_evaluation"]["outcome"] == "returned", fresh_proof
+    assert fresh_proof["start_handler"]["kind"] == "table_initializer_only", fresh_proof
+    assert fresh_row["destination_load_interpretation_proven"] is True, fresh_row
+    assert [
+        proof["source_element_index"] for proof in fresh_row["destination_load_interpretations"]
+    ] == [0, 1], fresh_row
+
     print(
         "WASM copied-input boundary regression: inline extraction + structural copy + "
         "1/1 JS Uint32Array semantics + exact module/import binding + exact module-memory identity + "
-        "unchanged destination/source-word interpretation OK"
+        "static + fresh-evaluated destination/source-word interpretation OK"
     )
 
 

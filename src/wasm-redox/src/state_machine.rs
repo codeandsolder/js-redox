@@ -153,6 +153,183 @@ mod tests {
         Ok(())
     }
 
+    fn copied_input_recipe_fixture(alternate: u32, length_slot: u32) -> Result<Vec<u8>> {
+        wat::parse_str(format!(
+            r#"(module
+                (import "wbg" "__wbg_length_0123456789abcdef"
+                    (func $length (param externref) (result i32)))
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (table 8 externref)
+                (memory 1)
+                (func $length_helper (param $slot i32) (result i32)
+                    local.get $slot
+                    table.get
+                    call $length)
+                (func $alloc (param $bytes i32) (result i32)
+                    local.get $bytes
+                    i32.const 1024
+                    i32.add)
+                (func (export "copy") (param $source externref) (param $use_alt i32) (result i32)
+                    (local $base i32)
+                    i32.const 0
+                    local.get $source
+                    table.set
+                    i32.const 1
+                    i32.const 2
+                    table.get
+                    call $ctor
+                    table.set
+                    local.get $use_alt
+                    if (result i32)
+                        i32.const {alternate}
+                    else
+                        i32.const {length_slot}
+                        call $length_helper
+                        i32.const 2
+                        i32.shl
+                        call $alloc
+                    end
+                    local.set $base
+                    i32.const 1
+                    table.get
+                    i32.const 0
+                    table.get
+                    local.get $base
+                    i32.const 2
+                    i32.shr_u
+                    call $set
+                    local.get $base
+                    i32.load))"#,
+        ))
+        .context("parse copied-input recipe fixture")
+    }
+
+    fn copied_input_fresh_alignment_boundary_fixture() -> Result<Vec<u8>> {
+        wat::parse_str(
+            r#"(module
+                (import "wbg" "length" (func $length (param externref) (result i32)))
+                (import "wbg" "__wbindgen_memory" (func $memory (result externref)))
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (import "wbg" "__wbindgen_init_externref_table" (func $start))
+                (table (export "__wbindgen_export_0") 8 externref)
+                (memory (export "memory") 1)
+                (data (i32.const 0) "\08\00\00\00")
+
+                (func $memory_slot (result i32)
+                    (local $slot i32)
+                    i32.const 2
+                    local.tee $slot
+                    call $memory
+                    table.set
+                    local.get $slot)
+                (func $buffer_slot (param $slot i32) (result i32)
+                    local.get $slot)
+                (func $length_helper (param $slot i32) (result i32)
+                    local.get $slot
+                    table.get
+                    call $length)
+                (func $alloc (param $bytes i32) (result i32)
+                    i32.const 0
+                    i32.load
+                    local.get $bytes
+                    i32.add)
+                (export "__wbindgen_start" (func $start))
+                (func (export "copy") (param $source externref) (param $use_alt i32) (result i32)
+                    (local $base i32)
+                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
+                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
+                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
+                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
+                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
+                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
+                    i32.const 0
+                    local.get $source
+                    table.set
+                    i32.const 1
+                    call $memory_slot
+                    call $buffer_slot
+                    table.get
+                    call $ctor
+                    table.set
+                    local.get $use_alt
+                    if (result i32)
+                        i32.const 4
+                    else
+                        i32.const 0
+                        call $length_helper
+                        i32.const 2
+                        i32.shl
+                        call $alloc
+                    end
+                    local.set $base
+                    i32.const 1
+                    table.get
+                    i32.const 0
+                    table.get
+                    local.get $base
+                    i32.const 2
+                    i32.shr_u
+                    call $set
+                    local.get $base
+                    i32.load
+                    local.get $base
+                    i32.load offset=4
+                    i32.add))"#,
+        )
+        .context("parse copied-input fresh-alignment boundary fixture")
+    }
+
+    #[test]
+    fn copied_input_fresh_alignment_boundary_requires_exact_evaluation() -> Result<()> {
+        let bytes = copied_input_fresh_alignment_boundary_fixture()?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input candidate"));
+        };
+        assert_eq!(candidate.destination_base_guaranteed_trailing_zero_bits, 0);
+        let Some(recipe) = &candidate.fresh_destination_base_recipe else {
+            return Err(anyhow::anyhow!("expected fresh destination-base recipe"));
+        };
+        assert_eq!(recipe.source_length_byte_shift, 2);
+        assert_eq!(recipe.alternate_constant_bases, vec![4]);
+        assert_eq!(recipe.source_length_import_function, 0);
+        assert_eq!(recipe.function, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn copied_input_reports_fresh_destination_recipe() -> Result<()> {
+        let bytes = copied_input_recipe_fixture(4, 0)?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input candidate"));
+        };
+        let Some(recipe) = &candidate.fresh_destination_base_recipe else {
+            return Err(anyhow::anyhow!("expected fresh destination-base recipe"));
+        };
+        assert_eq!(recipe.source_length_byte_shift, 2);
+        assert_eq!(recipe.alternate_constant_bases, vec![4]);
+        assert_eq!(recipe.source_length_import_function, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn copied_input_recipe_rejects_unaligned_alternate_or_wrong_source_slot() -> Result<()> {
+        for bytes in [
+            copied_input_recipe_fixture(2, 0)?,
+            copied_input_recipe_fixture(4, 3)?,
+        ] {
+            let analysis = analyze_export_semantics(&bytes, "copy")?;
+            let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
+                return Err(anyhow::anyhow!("expected one copied-input candidate"));
+            };
+            assert!(candidate.fresh_destination_base_recipe.is_none());
+        }
+        Ok(())
+    }
+
     #[test]
     fn copied_input_load_integrity_rejects_intervening_same_memory_write() -> Result<()> {
         let bytes = wat::parse_str(

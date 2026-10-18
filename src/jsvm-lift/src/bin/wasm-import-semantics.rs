@@ -23,6 +23,8 @@ struct Report {
     source: String,
     shapes: Vec<jsvm_lift::wasm_import_semantics::WasmImportDataViewSetU32Shape>,
     handler_semantics: Vec<jsvm_lift::wasm_import_semantics::WasmImportHandlerShape>,
+    proof_normalized_handler_semantics:
+        Vec<jsvm_lift::wasm_import_semantics::WasmImportHandlerShape>,
     import_object_usages: Vec<jsvm_lift::wasm_import_semantics::WasmImportObjectUsage>,
     module_memory_identity_proofs:
         Vec<jsvm_lift::wasm_import_semantics::WasmModuleMemoryIdentityProof>,
@@ -51,10 +53,11 @@ fn main() -> Result<()> {
         _ => bail!("--import-module, --import-name and --offset must be supplied together"),
     };
     let report = Report {
-        schema: "jsvm-wasm-import-semantics/v6",
+        schema: "jsvm-wasm-import-semantics/v7",
         source: args.input.display().to_string(),
         shapes: analysis.shapes,
         handler_semantics: analysis.handler_semantics,
+        proof_normalized_handler_semantics: analysis.proof_normalized_handler_semantics,
         import_object_usages: analysis.import_object_usages,
         module_memory_identity_proofs: analysis.module_memory_identity_proofs,
     };

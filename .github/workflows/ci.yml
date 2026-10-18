@@ -65,6 +65,7 @@ jobs:
             target/debug/bundle-unpack \
             target/debug/sourcemap-compose \
             target/debug/wasm-redox \
+            target/debug/fresh-eval \
             target/debug/wasm-import-semantics \
             .cargo-target-nodebug/debug/
       - name: Safe deobfuscation runtime equivalence
