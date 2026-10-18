@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -48,7 +49,7 @@ def run_probe(
             f"{cp.stdout}{cp.stderr}"
         )
     document = json.loads(cp.stdout)
-    if document.get("schema") != "jsvm-wasm-import-semantics/v6":
+    if document.get("schema") != "jsvm-wasm-import-semantics/v7":
         raise RuntimeError(
             f"unexpected JS WASM-import analyzer schema for {source}: "
             f"{document.get('schema')!r}"
@@ -82,10 +83,43 @@ def run_full_probe(analyzer: Path, source: Path) -> dict:
             f"{cp.stdout}{cp.stderr}"
         )
     document = json.loads(cp.stdout)
-    if document.get("schema") != "jsvm-wasm-import-semantics/v6":
+    if document.get("schema") != "jsvm-wasm-import-semantics/v7":
         raise RuntimeError(
             f"unexpected JS WASM-import analyzer schema for {source}: "
             f"{document.get('schema')!r}"
+        )
+    return document
+
+
+def run_fresh_eval(
+    evaluator: Path,
+    binary: Path,
+    function_index: int,
+    i32_args: list[int],
+) -> dict:
+    cp = subprocess.run(
+        [
+            str(evaluator),
+            str(binary),
+            "--function-index",
+            str(function_index),
+            *sum((["--i32-arg", str(value)] for value in i32_args), []),
+        ],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
+    if cp.returncode:
+        raise RuntimeError(
+            f"fresh WASM evaluator failed ({cp.returncode}) for {binary}:\n"
+            f"{cp.stdout}{cp.stderr}"
+        )
+    document = json.loads(cp.stdout)
+    if document.get("schema") != "wasm-redox/fresh-i32-call-v1":
+        raise RuntimeError(
+            f"unexpected fresh evaluator schema for {binary}: {document.get('schema')!r}"
         )
     return document
 
@@ -221,9 +255,9 @@ def source_length_barrier_proofs(
     return proofs
 
 
-def fixed_uint32_source_length_lower_bound(
+def fixed_uint32_source_lengths(
     memory_proofs: list[dict], export_name: str | None, source_parameter: object
-) -> int | None:
+) -> list[int] | None:
     if (
         not isinstance(export_name, str)
         or not isinstance(source_parameter, int)
@@ -246,14 +280,31 @@ def fixed_uint32_source_length_lower_bound(
             if not isinstance(length, int) or isinstance(length, bool) or length < 0:
                 return None
             lengths.append(length)
+    return lengths or None
+
+
+def fixed_uint32_source_length_lower_bound(
+    memory_proofs: list[dict], export_name: str | None, source_parameter: object
+) -> int | None:
+    lengths = fixed_uint32_source_lengths(memory_proofs, export_name, source_parameter)
     return min(lengths) if lengths else None
 
+
+def fixed_uint32_source_length_exact(
+    memory_proofs: list[dict], export_name: str | None, source_parameter: object
+) -> int | None:
+    lengths = fixed_uint32_source_lengths(memory_proofs, export_name, source_parameter)
+    if not lengths:
+        return None
+    unique = set(lengths)
+    return next(iter(unique)) if len(unique) == 1 else None
 
 def interpreted_destination_loads(
     candidate: dict,
     module_memory_proofs: list[dict],
     export_name: str | None,
     byte_integrity_proven: bool,
+    base_alignment_proven: bool,
 ) -> tuple[list[dict], int | None]:
     loads = candidate.get("destination_loads", [])
     source_parameter = candidate.get("source_entry_parameter")
@@ -261,15 +312,12 @@ def interpreted_destination_loads(
         module_memory_proofs, export_name, source_parameter
     )
     element_shift = candidate.get("destination_element_index_shift")
-    base_zero_bits = candidate.get("destination_base_guaranteed_trailing_zero_bits")
     if (
         not loads
         or source_length is None
         or not byte_integrity_proven
+        or not base_alignment_proven
         or element_shift != 2
-        or not isinstance(base_zero_bits, int)
-        or isinstance(base_zero_bits, bool)
-        or base_zero_bits < element_shift
     ):
         return [], source_length
     interpreted = []
@@ -357,6 +405,199 @@ def matching_module_memory_proofs(
     return matches
 
 
+def fresh_destination_alignment_proof(
+    evaluator: Path,
+    project: Path,
+    module: dict,
+    report: dict,
+    function_imports: list[dict],
+    document: dict,
+    candidate: dict,
+    module_memory_proofs: list[dict],
+    binding_proofs: list[dict],
+    export_name: str | None,
+) -> dict | None:
+    recipe = candidate.get("fresh_destination_base_recipe")
+    if not isinstance(recipe, dict) or not isinstance(export_name, str):
+        return None
+    function = recipe.get("function")
+    length_import_index = recipe.get("source_length_import_function")
+    length_shift = recipe.get("source_length_byte_shift")
+    element_shift = candidate.get("destination_element_index_shift")
+    alternate_bases = recipe.get("alternate_constant_bases")
+    if (
+        not isinstance(function, int)
+        or isinstance(function, bool)
+        or not isinstance(length_import_index, int)
+        or isinstance(length_import_index, bool)
+        or not isinstance(length_shift, int)
+        or isinstance(length_shift, bool)
+        or length_shift != element_shift
+        or length_shift != 2
+        or not isinstance(alternate_bases, list)
+        or any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or value > 0xFFFFFFFF
+            or value % 4 != 0
+            for value in alternate_bases
+        )
+    ):
+        return None
+    if not (0 <= length_import_index < len(function_imports)):
+        return None
+
+    source_parameter = candidate.get("source_entry_parameter")
+    exact_source_length = fixed_uint32_source_length_exact(
+        module_memory_proofs, export_name, source_parameter
+    )
+    if exact_source_length is None or exact_source_length > (0xFFFFFFFF >> length_shift):
+        return None
+
+    # The exact instance initializer must invoke only __wbindgen_start through
+    # its exports binding, and the copied-input export must be the first later
+    # application export call on every proven carrier path.
+    exports_bindings = set()
+    for proof in module_memory_proofs:
+        if (
+            proof.get("initializer_only_wasm_export_call") != "__wbindgen_start"
+            or proof.get("initializer_non_start_effects_memory_disjoint") is not True
+        ):
+            return None
+        exports_binding = proof.get("exports_binding")
+        if not isinstance(exports_binding, str):
+            return None
+        exports_bindings.add(exports_binding)
+        calls = proof.get("export_calls")
+        if not isinstance(calls, list) or not calls or calls[0].get("export_name") != export_name:
+            return None
+        argument_lengths = calls[0].get("static_uint32_array_argument_lengths")
+        if (
+            not isinstance(source_parameter, int)
+            or isinstance(source_parameter, bool)
+            or not isinstance(argument_lengths, list)
+            or source_parameter >= len(argument_lengths)
+            or argument_lengths[source_parameter] != exact_source_length
+        ):
+            return None
+    if len(exports_bindings) != 1:
+        return None
+    [exports_binding] = exports_bindings
+
+    start_exports = [
+        exported
+        for exported in report.get("exports", [])
+        if exported.get("name") == "__wbindgen_start"
+        and exported.get("kind") == "function"
+        and isinstance(exported.get("index"), int)
+        and not isinstance(exported.get("index"), bool)
+    ]
+    if len(start_exports) != 1:
+        return None
+    start_function = start_exports[0]["index"]
+    if not (0 <= start_function < len(function_imports)):
+        return None
+    start_import = function_imports[start_function]
+    start_module = start_import.get("module")
+    start_name = start_import.get("name")
+    if not isinstance(start_module, str) or not isinstance(start_name, str):
+        return None
+
+    table_exports = [
+        exported
+        for exported in report.get("exports", [])
+        if exported.get("kind") == "table"
+        and exported.get("name") == "__wbindgen_export_0"
+    ]
+    if len(table_exports) != 1:
+        return None
+
+    normalized_handlers = [
+        handler
+        for handler in document.get("proof_normalized_handler_semantics", [])
+        if handler.get("import_module") == start_module
+        and handler.get("import_name") == start_name
+        and handler.get("kind") == "table_initializer_only"
+        and handler.get("exports_binding") == exports_binding
+        and handler.get("table_export") == "__wbindgen_export_0"
+        and handler.get("standard_builtin_semantics_required") is True
+        and handler.get("standard_webassembly_builtin_semantics_required") is True
+    ]
+    if len(normalized_handlers) != 1:
+        return None
+
+    start_usages = [
+        usage
+        for usage in document.get("import_object_usages", [])
+        if usage.get("import_module") == start_module
+        and usage.get("import_name") == start_name
+    ]
+    exact_start_usages = exact_module_usage_proofs(start_usages, module.get("sha256"))
+    exact_start_usages = [
+        usage
+        for usage in exact_start_usages
+        if exact_usage_matches_binding(usage, binding_proofs)
+    ]
+    if len(exact_start_usages) != 1:
+        return None
+
+    # The length helper in the WASM recipe must refer to a real function import.
+    length_import = function_imports[length_import_index]
+    if (
+        not isinstance(length_import.get("module"), str)
+        or not isinstance(length_import.get("name"), str)
+    ):
+        return None
+
+    binary_path = module.get("binary_path")
+    module_sha256 = module.get("sha256")
+    if not isinstance(binary_path, str) or not isinstance(module_sha256, str):
+        return None
+    binary = project / binary_path
+    if not binary.is_file():
+        return None
+    binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+    if binary_sha256 != module_sha256:
+        return None
+
+    byte_count = exact_source_length << length_shift
+    evaluation = run_fresh_eval(evaluator, binary, function, [byte_count])
+    result = evaluation.get("i32_result")
+    if (
+        evaluation.get("outcome") != "returned"
+        or not isinstance(result, int)
+        or isinstance(result, bool)
+        or result < 0
+        or result > 0xFFFFFFFF
+        or result % 4 != 0
+    ):
+        return None
+
+    return {
+        "fresh_instance_state_required": True,
+        "module_sha256": module_sha256,
+        "binary_path": binary_path,
+        "binary_sha256_verified": True,
+        "source_uint32_array_length": exact_source_length,
+        "allocator_byte_count": byte_count,
+        "recipe": recipe,
+        "start_export": start_exports[0],
+        "start_import": start_import,
+        "start_import_object_usage": exact_start_usages[0],
+        "start_handler": normalized_handlers[0],
+        "table_export": table_exports[0],
+        "exports_binding": exports_binding,
+        "standard_js_numeric_builtin_semantics_required": True,
+        "standard_webassembly_builtin_semantics_required": True,
+        "fresh_evaluation": evaluation,
+        "evaluated_destination_base": result,
+        "evaluated_destination_base_trailing_zero_bits": (
+            32 if result == 0 else (result & -result).bit_length() - 1
+        ),
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("project", type=Path)
@@ -364,6 +605,11 @@ def main() -> None:
         "--analyzer",
         type=Path,
         default=TOOL_ROOT / "wasm-import-semantics",
+    )
+    ap.add_argument(
+        "--fresh-evaluator",
+        type=Path,
+        default=TOOL_ROOT / "fresh-eval",
     )
     args = ap.parse_args()
 
@@ -390,18 +636,18 @@ def main() -> None:
         report = load(project / module["report_path"])
         # module.report preserves WASM import-section order; filtering to function
         # imports therefore preserves the WebAssembly function-index prefix used
-        # by deep-v7 host_import_function.
+        # by deep-v8 host_import_function.
         function_imports = [
             imported
             for imported in report.get("imports", [])
             if imported.get("kind") == "function"
         ]
-        if deep.get("schema") != "wasm-redox/deep-v7":
+        if deep.get("schema") != "wasm-redox/deep-v8":
             skipped_modules.append(
                 {
                     "sha256": module.get("sha256"),
                     "schema": deep.get("schema"),
-                    "reason": "host-effect/read proof requires wasm-redox/deep-v7",
+                    "reason": "host-effect/read proof requires wasm-redox/deep-v8",
                 }
             )
             continue
@@ -651,17 +897,39 @@ def main() -> None:
                 )
                 element_shift = candidate.get("destination_element_index_shift")
                 base_zero_bits = candidate.get("destination_base_guaranteed_trailing_zero_bits")
-                destination_base_alignment_proven = (
+                static_destination_base_alignment_proven = (
                     element_shift == 2
                     and isinstance(base_zero_bits, int)
                     and not isinstance(base_zero_bits, bool)
                     and base_zero_bits >= element_shift
+                )
+                fresh_alignment_proof = None
+                if module_memory_proven and len(module_memory_sources) == 1:
+                    source_path = next(iter(module_memory_sources))
+                    document = full_probe_cache.get(source_path)
+                    if document is not None:
+                        fresh_alignment_proof = fresh_destination_alignment_proof(
+                            args.fresh_evaluator,
+                            project,
+                            module,
+                            report,
+                            function_imports,
+                            document,
+                            candidate,
+                            module_memory_proofs,
+                            copied_binding_proofs,
+                            export.get("export"),
+                        )
+                destination_base_alignment_proven = (
+                    static_destination_base_alignment_proven
+                    or fresh_alignment_proof is not None
                 )
                 destination_load_interpretations, _ = interpreted_destination_loads(
                     candidate,
                     module_memory_proofs if module_memory_proven else [],
                     export.get("export"),
                     destination_byte_integrity_proven,
+                    destination_base_alignment_proven,
                 )
                 destination_load_interpretation_proven = (
                     module_memory_proven
@@ -695,7 +963,14 @@ def main() -> None:
                     ),
                     "destination_byte_integrity_proven": destination_byte_integrity_proven,
                     "source_length_barrier_proofs": length_barrier_proofs,
+                    "static_destination_base_alignment_proven": static_destination_base_alignment_proven,
+                    "fresh_destination_base_alignment_proof": fresh_alignment_proof,
                     "destination_base_alignment_proven": destination_base_alignment_proven,
+                    "destination_base_alignment_basis": (
+                        "static_ssa"
+                        if static_destination_base_alignment_proven
+                        else ("fresh_exact_evaluation" if fresh_alignment_proof is not None else None)
+                    ),
                     "destination_load_interpretation_proven": destination_load_interpretation_proven,
                     "destination_load_interpretations": destination_load_interpretations,
                     "source_uint32_array_length_lower_bound": source_length_lower_bound,
@@ -742,15 +1017,18 @@ def main() -> None:
 
     out = {
         "schema": WASM_JS_BOUNDARY.schema,
-        "wasm_schema_required": "wasm-redox/deep-v7",
-        "js_schema": "jsvm-wasm-import-semantics/v6",
+        "wasm_schema_required": "wasm-redox/deep-v8",
+        "js_schema": "jsvm-wasm-import-semantics/v7",
         "safe_static_only": True,
+        "bounded_wasm_ir_interpretation": True,
         "correlation_contract": (
             "cross-language claims require exact WASM import module+name matches. "
             "Host-effect writes and typed-array input-copy candidates remain independent evidence "
             "families; source-word interpretation additionally requires exact instance/exported-memory "
             "identity, path-complete destination-byte integrity, destination-base element alignment, "
-            "and fixed Uint32Array source coverage."
+            "and fixed Uint32Array source coverage. Fresh-state alignment may use bounded Waffle-IR "
+            "interpretation only after rejecting module start functions, imported state, imported or "
+            "indirect calls, recursion, and all table operations in the evaluated call graph."
         ),
         "memory_write_interpretation": (
             "DataView and typed-array interpretations require standard unmodified platform builtins; "
@@ -784,6 +1062,9 @@ def main() -> None:
             ),
             "proven_destination_byte_integrities": sum(
                 row["destination_byte_integrity_proven"] for row in copied_input_rows
+            ),
+            "proven_destination_base_alignments": sum(
+                row["destination_base_alignment_proven"] for row in copied_input_rows
             ),
             "proven_destination_load_interpretations": sum(
                 row["destination_load_interpretation_proven"] for row in copied_input_rows
