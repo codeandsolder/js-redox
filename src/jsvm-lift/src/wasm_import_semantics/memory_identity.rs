@@ -1,7 +1,8 @@
+use super::bulk_import::proof_primitive_expression;
 use super::import_object::WasmInstantiationSite;
 use super::{
-    assignment_import_object, global_constructor, parameter_symbols, symbol_binding_is_stable,
-    symbol_of, unparenthesized,
+    assignment_import_object, collect_global_aliases, global_constructor, parameter_symbols,
+    symbol_binding_is_stable, symbol_of, unparenthesized,
 };
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -42,6 +43,12 @@ pub struct WasmModuleMemoryIdentityProof {
     pub initializer_parameter: usize,
     pub initializer_call_starts: Vec<u32>,
     pub initializer_exports_write_dominates_normal_exit: bool,
+    /// Present only when proof-only normalization shows that the initializer's
+    /// sole call through the exact exports binding is this zero-argument export.
+    pub initializer_only_wasm_export_call: Option<String>,
+    /// Proof-only normalized initializer has no non-start effects capable of
+    /// mutating or observing linear memory through user-defined accessors.
+    pub initializer_non_start_effects_memory_disjoint: bool,
     pub standard_js_numeric_builtin_semantics_required: bool,
     pub instantiation_site: WasmInstantiationSite,
     pub export_calls: Vec<WasmInstanceExportCall>,
@@ -1004,16 +1011,20 @@ impl<'a> Visit<'a> for NormalizedWriteCollector<'_> {
     }
 }
 
-fn normalized_helper_write_dominates_normal_exit(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NormalizedInitializerProof {
+    write_dominates_normal_exit: bool,
+    only_start_export_call: bool,
+    non_start_effects_memory_disjoint: bool,
+}
+
+fn normalized_initializer_proof(
     source: &str,
     helper_name: &str,
     exports_binding: &str,
     parameter: usize,
-) -> bool {
-    let Some(normalized) = jsvm_safe_core::deobfuscate_with_standard_numeric_builtins(source, 16)
-    else {
-        return false;
-    };
+) -> Option<NormalizedInitializerProof> {
+    let normalized = jsvm_safe_core::deobfuscate_with_standard_numeric_builtins(source, 16)?;
     for source_type in [SourceType::unambiguous(), SourceType::cjs()] {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, &normalized.source, source_type);
@@ -1027,13 +1038,15 @@ fn normalized_helper_write_dominates_normal_exit(
             continue;
         }
         let scoping = semantic.semantic.scoping();
+        let global_aliases = collect_global_aliases(&parsed.program, scoping);
         let mut proven = Vec::new();
         struct HelperFinder<'c, 's> {
             scoping: &'c Scoping,
             helper_name: &'s str,
             exports_binding: &'s str,
             parameter: usize,
-            proven: &'s mut Vec<bool>,
+            global_aliases: &'s HashMap<SymbolId, String>,
+            proven: &'s mut Vec<NormalizedInitializerProof>,
         }
         impl<'a> Visit<'a> for HelperFinder<'_, '_> {
             fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
@@ -1043,15 +1056,27 @@ fn normalized_helper_write_dominates_normal_exit(
                     .is_some_and(|identifier| identifier.name.as_str() == self.helper_name)
                 {
                     let Some(params) = parameter_symbols(function) else {
-                        self.proven.push(false);
+                        self.proven.push(NormalizedInitializerProof {
+                            write_dominates_normal_exit: false,
+                            only_start_export_call: false,
+                            non_start_effects_memory_disjoint: false,
+                        });
                         return;
                     };
                     let Some(parameter_symbol) = params.get(self.parameter).copied() else {
-                        self.proven.push(false);
+                        self.proven.push(NormalizedInitializerProof {
+                            write_dominates_normal_exit: false,
+                            only_start_export_call: false,
+                            non_start_effects_memory_disjoint: false,
+                        });
                         return;
                     };
                     let Some(body) = &function.body else {
-                        self.proven.push(false);
+                        self.proven.push(NormalizedInitializerProof {
+                            write_dominates_normal_exit: false,
+                            only_start_export_call: false,
+                            non_start_effects_memory_disjoint: false,
+                        });
                         return;
                     };
                     let mut writes = NormalizedWriteCollector {
@@ -1064,7 +1089,11 @@ fn normalized_helper_write_dominates_normal_exit(
                         writes.visit_statement(statement);
                     }
                     let [candidate] = writes.candidates.as_slice() else {
-                        self.proven.push(false);
+                        self.proven.push(NormalizedInitializerProof {
+                            write_dominates_normal_exit: false,
+                            only_start_export_call: false,
+                            non_start_effects_memory_disjoint: false,
+                        });
                         return;
                     };
                     let (target_symbol, write_span) = *candidate;
@@ -1077,15 +1106,195 @@ fn normalized_helper_write_dominates_normal_exit(
                         })
                         .count();
                     let Some(flow) = statements_flow(&body.statements, false, write_span) else {
-                        self.proven.push(false);
+                        self.proven.push(NormalizedInitializerProof {
+                            write_dominates_normal_exit: false,
+                            only_start_export_call: false,
+                            non_start_effects_memory_disjoint: false,
+                        });
                         return;
                     };
-                    self.proven.push(
-                        write_count == 1
-                            && !flow.bad_return
-                            && !flow.normal_unassigned
-                            && (flow.good_return || flow.normal_assigned),
-                    );
+                    let write_dominates_normal_exit = write_count == 1
+                        && !flow.bad_return
+                        && !flow.normal_unassigned
+                        && (flow.good_return || flow.normal_assigned);
+
+                    struct InitializerVerifier<'c, 'g> {
+                        scoping: &'c Scoping,
+                        global_aliases: &'g HashMap<SymbolId, String>,
+                        parameter_symbol: SymbolId,
+                        target_symbol: SymbolId,
+                        primitive_symbols: HashSet<SymbolId>,
+                        exports_assigned: bool,
+                        start_calls: usize,
+                    }
+                    impl InitializerVerifier<'_, '_> {
+                        fn verify_statements(&mut self, statements: &[Statement<'_>]) -> bool {
+                            statements
+                                .iter()
+                                .all(|statement| self.verify_statement(statement))
+                        }
+
+                        fn verify_statement(&mut self, statement: &Statement<'_>) -> bool {
+                            match statement {
+                                Statement::BlockStatement(block) => {
+                                    self.verify_statements(&block.body)
+                                }
+                                Statement::EmptyStatement(_) => true,
+                                Statement::VariableDeclaration(declaration) => {
+                                    for declarator in &declaration.declarations {
+                                        let BindingPattern::BindingIdentifier(identifier) =
+                                            &declarator.id
+                                        else {
+                                            return false;
+                                        };
+                                        let Some(symbol) = identifier.symbol_id.get() else {
+                                            return false;
+                                        };
+                                        if let Some(initializer) = &declarator.init {
+                                            if !proof_primitive_expression(
+                                                initializer,
+                                                self.scoping,
+                                                self.global_aliases,
+                                                &self.primitive_symbols,
+                                            ) {
+                                                return false;
+                                            }
+                                            self.primitive_symbols.insert(symbol);
+                                        }
+                                    }
+                                    true
+                                }
+                                Statement::ExpressionStatement(statement) => {
+                                    let expression = unparenthesized(&statement.expression);
+                                    if let Expression::AssignmentExpression(assignment) = expression
+                                    {
+                                        if assignment.operator.as_str() != "=" {
+                                            return false;
+                                        }
+                                        let AssignmentTarget::AssignmentTargetIdentifier(left) =
+                                            &assignment.left
+                                        else {
+                                            return false;
+                                        };
+                                        let Some(target) =
+                                            left.reference_id.get().and_then(|reference_id| {
+                                                self.scoping.get_reference(reference_id).symbol_id()
+                                            })
+                                        else {
+                                            return false;
+                                        };
+                                        if target == self.target_symbol {
+                                            if self.exports_assigned {
+                                                return false;
+                                            }
+                                            let property = match unparenthesized(&assignment.right)
+                                            {
+                                                Expression::StaticMemberExpression(member)
+                                                    if !member.optional
+                                                        && symbol_of(
+                                                            self.scoping,
+                                                            &member.object,
+                                                        ) == Some(self.parameter_symbol) =>
+                                                {
+                                                    Some(member.property.name.as_str())
+                                                }
+                                                Expression::ComputedMemberExpression(member)
+                                                    if !member.optional
+                                                        && symbol_of(
+                                                            self.scoping,
+                                                            &member.object,
+                                                        ) == Some(self.parameter_symbol) =>
+                                                {
+                                                    match unparenthesized(&member.expression) {
+                                                        Expression::StringLiteral(property) => {
+                                                            Some(property.value.as_str())
+                                                        }
+                                                        _ => None,
+                                                    }
+                                                }
+                                                _ => None,
+                                            };
+                                            if property != Some("exports") {
+                                                return false;
+                                            }
+                                            self.exports_assigned = true;
+                                            return true;
+                                        }
+                                        if !proof_primitive_expression(
+                                            &assignment.right,
+                                            self.scoping,
+                                            self.global_aliases,
+                                            &self.primitive_symbols,
+                                        ) {
+                                            return false;
+                                        }
+                                        self.primitive_symbols.insert(target);
+                                        true
+                                    } else if let Expression::CallExpression(call) = expression {
+                                        if !self.exports_assigned
+                                            || call.optional
+                                            || !call.arguments.is_empty()
+                                        {
+                                            return false;
+                                        }
+                                        let export = match unparenthesized(&call.callee) {
+                                            Expression::StaticMemberExpression(member)
+                                                if !member.optional
+                                                    && symbol_of(self.scoping, &member.object)
+                                                        == Some(self.target_symbol) =>
+                                            {
+                                                Some(member.property.name.as_str())
+                                            }
+                                            Expression::ComputedMemberExpression(member)
+                                                if !member.optional
+                                                    && symbol_of(self.scoping, &member.object)
+                                                        == Some(self.target_symbol) =>
+                                            {
+                                                match unparenthesized(&member.expression) {
+                                                    Expression::StringLiteral(property) => {
+                                                        Some(property.value.as_str())
+                                                    }
+                                                    _ => None,
+                                                }
+                                            }
+                                            _ => None,
+                                        };
+                                        if export != Some("__wbindgen_start") {
+                                            return false;
+                                        }
+                                        self.start_calls += 1;
+                                        self.start_calls == 1
+                                    } else {
+                                        false
+                                    }
+                                }
+                                Statement::ReturnStatement(statement) => {
+                                    statement.argument.as_ref().is_none_or(|argument| {
+                                        symbol_of(self.scoping, argument)
+                                            == Some(self.target_symbol)
+                                    })
+                                }
+                                _ => false,
+                            }
+                        }
+                    }
+                    let mut verifier = InitializerVerifier {
+                        scoping: self.scoping,
+                        global_aliases: self.global_aliases,
+                        parameter_symbol,
+                        target_symbol,
+                        primitive_symbols: HashSet::new(),
+                        exports_assigned: false,
+                        start_calls: 0,
+                    };
+                    let non_start_effects_memory_disjoint =
+                        verifier.verify_statements(&body.statements) && verifier.exports_assigned;
+                    self.proven.push(NormalizedInitializerProof {
+                        write_dominates_normal_exit,
+                        only_start_export_call: non_start_effects_memory_disjoint
+                            && verifier.start_calls == 1,
+                        non_start_effects_memory_disjoint,
+                    });
                     return;
                 }
                 walk::walk_function(self, function, flags);
@@ -1096,14 +1305,15 @@ fn normalized_helper_write_dominates_normal_exit(
             helper_name,
             exports_binding,
             parameter,
+            global_aliases: &global_aliases,
             proven: &mut proven,
         };
         finder.visit_program(&parsed.program);
-        if proven.as_slice() == [true] {
-            return true;
+        if let [proof] = proven.as_slice() {
+            return Some(*proof);
         }
     }
-    false
+    None
 }
 
 fn unique_exact_instance_paths(
@@ -1193,6 +1403,14 @@ pub(super) fn collect_module_memory_identity_proofs(
 
     let mut proofs = Vec::new();
     for getter in getter_collector.candidates {
+        if scoping
+            .symbol_ids()
+            .filter(|symbol| scoping.symbol_name(*symbol) == getter.exports_binding)
+            .count()
+            != 1
+        {
+            continue;
+        }
         let Some(write) =
             exact_write_relation(scoping, &write_collector.writes, getter.exports_symbol)
         else {
@@ -1201,12 +1419,15 @@ pub(super) fn collect_module_memory_identity_proofs(
         let Some(function) = function_collector.functions.get(&write.helper) else {
             continue;
         };
-        if !normalized_helper_write_dominates_normal_exit(
+        let Some(initializer_proof) = normalized_initializer_proof(
             source,
             &function.name,
             &getter.exports_binding,
             write.parameter,
-        ) {
+        ) else {
+            continue;
+        };
+        if !initializer_proof.write_dominates_normal_exit {
             continue;
         }
         let exact_instances = unique_exact_instance_paths(
@@ -1324,6 +1545,11 @@ pub(super) fn collect_module_memory_identity_proofs(
                     initializer_parameter: write.parameter,
                     initializer_call_starts: vec![initializer.call.start],
                     initializer_exports_write_dominates_normal_exit: true,
+                    initializer_only_wasm_export_call: initializer_proof
+                        .only_start_export_call
+                        .then(|| "__wbindgen_start".to_string()),
+                    initializer_non_start_effects_memory_disjoint: initializer_proof
+                        .non_start_effects_memory_disjoint,
                     standard_js_numeric_builtin_semantics_required: true,
                     instantiation_site: site.clone(),
                     export_calls,
