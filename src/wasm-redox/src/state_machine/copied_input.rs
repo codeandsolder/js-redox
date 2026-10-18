@@ -36,6 +36,20 @@ pub struct StructuralInputCopyLoadReport {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FreshDestinationBaseRecipeReport {
+    /// Internal single-i32 producer whose result can become the destination base.
+    pub function: usize,
+    /// Structural wasm-bindgen source-length helper feeding the byte-count expression.
+    pub source_length_helper_function: usize,
+    /// Imported property getter called by that helper.
+    pub source_length_import_function: usize,
+    /// Exact left shift converting source element count to producer byte count.
+    pub source_length_byte_shift: u32,
+    /// Other destination-base origins, all proven constants aligned to the element width.
+    pub alternate_constant_bases: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ExternrefBulkCopyCandidateReport {
     /// Basic block and instruction position containing the set-like imported call.
     pub block: usize,
@@ -62,6 +76,9 @@ pub struct ExternrefBulkCopyCandidateReport {
     /// destination base. A value >= `destination_element_index_shift` proves
     /// that the JS typed-array element offset and WASM byte base coincide.
     pub destination_base_guaranteed_trailing_zero_bits: u32,
+    /// Optional exact recipe for evaluating the non-constant destination-base producer
+    /// on fresh module state once the JS-side source length is known.
+    pub fresh_destination_base_recipe: Option<FreshDestinationBaseRecipeReport>,
     /// Table slot from which the constructor input is loaded.
     pub constructor_input_slot_value: usize,
     /// Optional structural helper chain producing the constructor-input slot.
@@ -247,6 +264,111 @@ fn base_shifted_right_by_two(body: &FunctionBody, value: Value) -> Option<Value>
         return None;
     };
     (i32_const(body, *shift) == Some(2)).then(|| unique_transparent_origin(body, *base, 8))
+}
+
+fn collect_origin_values(
+    body: &FunctionBody,
+    value: Value,
+    depth: usize,
+    visiting: &mut BTreeSet<Value>,
+    origins: &mut BTreeSet<Value>,
+) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    let value = body.resolve_alias(value);
+    if !visiting.insert(value) {
+        return false;
+    }
+    let complete = match &body.values[value] {
+        ValueDef::Alias(alias) | ValueDef::PickOutput(alias, 0, _) => {
+            collect_origin_values(body, *alias, depth - 1, visiting, origins)
+        }
+        ValueDef::BlockParam(block, _, _) if *block != body.entry => {
+            let incoming = incoming_block_param_values(body, *block, value);
+            !incoming.is_empty()
+                && incoming.into_iter().all(|incoming| {
+                    collect_origin_values(body, incoming, depth - 1, visiting, origins)
+                })
+        }
+        _ => {
+            origins.insert(value);
+            true
+        }
+    };
+    visiting.remove(&value);
+    complete
+}
+
+fn fresh_destination_base_recipe(
+    module: &Module<'_>,
+    body: &FunctionBody,
+    destination_base: Value,
+    source_slot: Value,
+    names: &SemanticCallNames,
+) -> Option<FreshDestinationBaseRecipeReport> {
+    let mut origins = BTreeSet::new();
+    if !collect_origin_values(
+        body,
+        destination_base,
+        16,
+        &mut BTreeSet::new(),
+        &mut origins,
+    ) {
+        return None;
+    }
+
+    let mut recipe: Option<(Func, Func, Func, u32)> = None;
+    let mut alternate_constant_bases = Vec::new();
+    for origin in origins {
+        if let Some(value) = i32_const(body, origin) {
+            if value.trailing_zeros() < 2 {
+                return None;
+            }
+            alternate_constant_bases.push(value);
+            continue;
+        }
+
+        let (function, args) = direct_call(body, origin, 4)?;
+        module.funcs[function].body()?;
+        let [byte_count] = args.as_slice() else {
+            return None;
+        };
+        let byte_count = body.resolve_alias(*byte_count);
+        let ValueDef::Operator(Operator::I32Shl, shift_args, _) = &body.values[byte_count] else {
+            return None;
+        };
+        let [source_length, shift] = &body.arg_pool[*shift_args] else {
+            return None;
+        };
+        let shift = i32_const(body, *shift)?;
+        if shift >= 32 {
+            return None;
+        }
+        let (length_helper, length_args) = direct_call(body, *source_length, 4)?;
+        let [length_source_slot] = length_args.as_slice() else {
+            return None;
+        };
+        if !same_table_slot(body, *length_source_slot, source_slot) {
+            return None;
+        }
+        let length_import = names.externref_length_import(length_helper)?;
+        let candidate = (function, length_helper, length_import, shift);
+        if recipe.is_some_and(|existing| existing != candidate) {
+            return None;
+        }
+        recipe = Some(candidate);
+    }
+    let (function, length_helper, length_import, shift) = recipe?;
+    alternate_constant_bases.sort_unstable();
+    alternate_constant_bases.dedup();
+    Some(FreshDestinationBaseRecipeReport {
+        function: function.index(),
+        source_length_helper_function: length_helper.index(),
+        source_length_import_function: length_import.index(),
+        source_length_byte_shift: shift,
+        alternate_constant_bases,
+    })
 }
 
 fn provider_chain(
@@ -912,6 +1034,13 @@ pub(super) fn externref_bulk_copy_candidates(
                     module,
                     body,
                     destination_base,
+                ),
+                fresh_destination_base_recipe: fresh_destination_base_recipe(
+                    module,
+                    body,
+                    destination_base,
+                    source_slot,
+                    names,
                 ),
                 constructor_input_slot_value: constructor_input_slot.index(),
                 constructor_input_slot_provider_function: slot_provider,
