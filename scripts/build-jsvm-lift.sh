@@ -40,7 +40,7 @@ if [[ "$profile" == "release" ]]; then
   composer_args+=(--release)
 fi
 "$cargo_bin" build -j "$jobs" -p sourcemap-compose "${composer_args[@]}"
-"$cargo_bin" build -j "$jobs" -p wasm-redox "${composer_args[@]}"
+"$cargo_bin" build -j "$jobs" -p wasm-redox --bin wasm-redox --bin fresh-eval "${composer_args[@]}"
 
 # Site-wrapper target is a disposable compile cache; durable executables are published below.
 shim_target_root="/var/cache/sentinelx/cargo-target"
@@ -70,18 +70,26 @@ mkdir -p "$canonical"
 # SentinelX Cargo mirrors final link artifacts to the workspace target/ before
 # deleting its disposable scratch target. Prefer that durable mirror after Cargo
 # returns, while retaining the scratch path as a fallback for older wrappers.
+bins=(
+  jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir
+  switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack
+  sourcemap-compose sus-scan wasm-redox fresh-eval wasm-import-semantics
+  source-directives
+)
 published=0
-for bin in jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack sourcemap-compose sus-scan wasm-redox fresh-eval wasm-import-semantics source-directives; do
+for bin in "${bins[@]}"; do
   source_bin=""
   if [[ -f "$mirror/$bin" ]]; then
     source_bin="$mirror/$bin"
   elif [[ -f "$actual/$bin" ]]; then
     source_bin="$actual/$bin"
   fi
-  if [[ -n "$source_bin" ]]; then
-    install -m 0755 "$source_bin" "$canonical/$bin"
-    published=$((published + 1))
+  if [[ -z "$source_bin" ]]; then
+    echo "missing built executable: $bin" >&2
+    exit 2
   fi
+  install -m 0755 "$source_bin" "$canonical/$bin"
+  published=$((published + 1))
 done
 
 echo "artifact mirror: $mirror"
