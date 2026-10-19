@@ -1,11 +1,15 @@
 use anyhow::{Context, Result};
-use clap::Parser as ClapParser;
+use clap::{Parser as ClapParser, ValueEnum};
 use oxc_allocator::Allocator;
 use oxc_codegen::Codegen;
 use oxc_span::SourceType;
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(ClapParser, Debug)]
 #[command(
@@ -19,10 +23,20 @@ struct Args {
     report: Option<PathBuf>,
     #[arg(long, default_value_t = 16)]
     max_iterations: usize,
+    /// Override JavaScript source mode instead of inferring it from the input suffix.
+    #[arg(long, value_enum)]
+    source_mode: Option<SourceModeArg>,
     /// Pretty-print the final analyst view. This is intentionally opt-in:
     /// Function#toString and related self-defending code can observe formatting.
     #[arg(long)]
     format_output: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SourceModeArg {
+    Auto,
+    Module,
+    Commonjs,
 }
 
 fn canonicalize(source: &str) -> Option<String> {
@@ -39,6 +53,26 @@ fn canonicalize(source: &str) -> Option<String> {
 
 fn sha256(bytes: &[u8]) -> String {
     jsvm_lift::sha256_hex(bytes)
+}
+
+fn source_mode(
+    path: &Path,
+    requested: Option<SourceModeArg>,
+) -> (jsvm_safe_core::SafeSourceMode, &'static str) {
+    match requested {
+        Some(SourceModeArg::Auto) => (jsvm_safe_core::SafeSourceMode::Auto, "auto"),
+        Some(SourceModeArg::Module) => (jsvm_safe_core::SafeSourceMode::Module, "module"),
+        Some(SourceModeArg::Commonjs) => (jsvm_safe_core::SafeSourceMode::CommonJs, "commonjs"),
+        None => match path.extension().and_then(|extension| extension.to_str()) {
+            Some(extension) if extension.eq_ignore_ascii_case("mjs") => {
+                (jsvm_safe_core::SafeSourceMode::Module, "module")
+            }
+            Some(extension) if extension.eq_ignore_ascii_case("cjs") => {
+                (jsvm_safe_core::SafeSourceMode::CommonJs, "commonjs")
+            }
+            _ => (jsvm_safe_core::SafeSourceMode::Auto, "auto"),
+        },
+    }
 }
 
 #[derive(Serialize)]
@@ -73,6 +107,7 @@ struct StaticAliasInstallerCallReport {
 #[derive(Serialize)]
 struct Report {
     schema: &'static str,
+    source_mode: &'static str,
     input: String,
     input_sha256: String,
     output_sha256: String,
@@ -94,9 +129,12 @@ fn main() -> Result<()> {
 
     // Feed the exact source bytes to the proof-oriented engine. Canonicalizing
     // first is observably unsafe for Function#toString/self-defending code.
-    let result = jsvm_safe_core::deobfuscate(&original, args.max_iterations).ok_or_else(|| {
-        anyhow::anyhow!("source failed parse or semantic validation during safe deobfuscation")
-    })?;
+    let (source_mode, source_mode_label) = source_mode(&args.input, args.source_mode);
+    let result =
+        jsvm_safe_core::deobfuscate_with_source_mode(&original, args.max_iterations, source_mode)
+            .ok_or_else(|| {
+            anyhow::anyhow!("source failed parse or semantic validation during safe deobfuscation")
+        })?;
 
     let arithmetic_state_proofs = result
         .arithmetic_state_proofs
@@ -162,6 +200,7 @@ fn main() -> Result<()> {
 
     let report = Report {
         schema: "js-safe-deobfuscate/v1",
+        source_mode: source_mode_label,
         input: args.input.display().to_string(),
         input_sha256: sha256(original.as_bytes()),
         output_sha256: sha256(source.as_bytes()),
