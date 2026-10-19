@@ -8,14 +8,17 @@ Provenance-preserving static recovery for hostile browser JavaScript and embedde
 - `corpus/taobao/` — extracted real-world Fireye / ET samples.
 - `corpus/generated/` — source ↔ virtualized ground-truth pairs.
 - `corpus/manifest.json` — asserted positive/negative regression corpus.
-- `src/jsvm-lift/` — Rust/Oxc detector and lifter prototype.
-- `scripts/` — build, benchmark, width-consensus and bytecode inspection helpers.
+- `src/jsvm-safe-core/` — proof-gated semantics-preserving JavaScript rewrites.
+- `src/jsvm-lift/` — capture/project analysis, structural scanning, VM recovery and bundle/module tooling.
+- `src/sourcemap-compose/` — isolated source-map chain composition.
+- `src/wasm-redox/` — WASM validation/readability, deep CFG/state-machine recovery and JavaScript/WASM boundary proofs.
+- `scripts/` — capture pipeline, proof correlation, build, benchmark and regression helpers.
 - `third_party/` — pinned reference implementations / corpus generators.
 - `work/` — disposable derived analysis output.
 
 ## Build
 
-The Rust code is one Cargo workspace (`jsvm-safe-core` + `jsvm-lift`) with a single root `Cargo.lock` and shared dependency-version pins. Whole-workspace correctness gates are therefore ordinary Cargo commands:
+The Rust side is one Cargo workspace with four crates: `jsvm-safe-core`, `jsvm-lift`, `sourcemap-compose`, and `wasm-redox`. It uses a single root `Cargo.lock`, shared dependency-version pins, and `rust-version = "1.99"`. Whole-workspace correctness gates are therefore ordinary Cargo commands:
 
 ```sh
 cargo fmt --all -- --check
@@ -31,7 +34,7 @@ For normal executable builds, use the project helper rather than raw `cargo`:
 scripts/build-jsvm-lift.sh
 ```
 
-It pins rustc 1.99.0, preserves the distributed sccache wrapper, derives build parallelism from live farm capacity, and publishes durable executables under `.cargo-target-nodebug/`. The helper asks Cargo for the workspace target directory rather than assuming a member-local `target/` layout.
+It uses the machine-pinned Rust 1.99 toolchain, requires the distributed sccache build path, derives build parallelism from live farm capacity, and publishes durable executables under `.cargo-target-nodebug/`. The helper builds the scanner/tooling plus `sourcemap-compose`, `wasm-redox`, and the `fresh-eval` proof helper, and asks Cargo for the workspace target directory rather than assuming a member-local `target/` layout.
 
 ## Regression
 
@@ -78,6 +81,8 @@ VM/CFF detection + switch/table semantic IR
   ↓
 role-normalized devirtualization where the dispatcher linkage is proven
   ↓
+exact WASM extraction/dedup + readable/deep analysis + JavaScript/WASM boundary correlation
+  ↓
 readable recovered modules + analysis/provenance graph
 ```
 
@@ -121,6 +126,14 @@ Safe deobfuscation resolves ambiguous JavaScript as browser Script vs ES Module 
 The string-recovery CLI likewise reads and writes explicit UTF-8 bytes rather than newline-normalizing text I/O, so unchanged CRLF captures remain byte-identical and hash/provenance validation stays exact.
 
 `scan-capture-project.py` prefers a proven safe-deobfuscated view for captured units while retaining the captured file as provenance. Static `Function(...)` payloads become bounded recursive code units: each exact recovered child is passed through the same safe string-recovery + deob stack, hash/provenance validated, and scanned from the furthest proven-safe result. Static string recovery includes the existing Base64/RC4 families plus a strict rotated-Base91 scaffold. The expensive Base91 array/scope proof is entered only when the source contains the necessary quoted 91-character / 91-unique-symbol alphabet; ordinary large application bundles therefore skip it in a linear preflight. Base91 recovery proves the rotation and decoder arithmetic, tracks lexical scope (including constructor, quoted/computed method and block-arrow scopes), tolerates uniquely provable affine/CFF hiding of its constants, and can solve control-flow-flattened constant lookups only when their exact Base91 semantic positions uniquely determine the hidden table state; it rewrites only ASCII-safe decoded strings. Proven read-only literal `const` tables may then expose numeric string fragments while dynamic reads are preserved; mutation, aliasing or escaping rejects the table. Recovery is iterated to a bounded fixed point so a first pass can expose a method name such as `run` and a later pass can safely discover a decoder local to that method. This is enough to recover independently randomized js-confuser/js-virtualizer outputs while the later semantic deobfuscator still correctly refuses sloppy-mode `with` regions. Supported direct-switch VMs are lifted with `switch-ir`; linked function-table VMs use `table-ir`. Large unlinked handler tables remain explicit VM candidates only when they are handler-dense (at least 75% function entries) and also have runtime-indexed calls from a loop; exact spans already proven to be Webpack module tables are excluded from candidate scoring. Base VM scanning is exact-content cached when no generated-code dumps are present, while generated-code-bearing units keep independent dump provenance. Generated child recovery is separately exact-content cached by raw child SHA: duplicate children still receive distinct occurrence paths/recovery rows/graph edges, but string recovery, safe deobfuscation and readable formatting execute once per exact body. Python recovery helpers are invoked directly with the active interpreter; timeouts are recorded as failed optional stages (exit 124) and fall back to exact bytes instead of aborting the whole project or leaving a wrapper-spawned orphan process. Unconfirmed numeric direct-switch maps remain visible in scanner JSON, but weak VM-candidate promotion now requires evidence score >=3 rather than treating every numeric switch as suspicious; this excludes codec enum/bitstream tables such as H.264 aspect-ratio parsing without changing confirmed VM thresholds.
+
+## WebAssembly recovery
+
+WASM is treated as another exact binary source, not as an opaque attachment. Captured and statically recoverable inline modules are content-addressed while preserving every origin; readable WAT and deeper analysis are derived artifacts. The current machine contracts are `wasm-redox/deep-v9`, `jsvm-wasm-import-semantics/v8`, and `wasm-js-boundary-correlation/v1`.
+
+The JavaScript/WASM boundary is fail-closed. The correlation layer can prove exact recovered module bytes, exact import-object binding, instance/export/module-memory identity, selected typed-array copy semantics, destination alignment, and whether intervening linear-memory effects can touch the copied interval. Concrete input-word interpretation is emitted only when both byte integrity and alignment are independently proven; ambiguous host effects or unconstrained memory writes remain barriers.
+
+`fresh-eval` is a bounded proof helper for closed internal `i32` computations. It can execute a sequence of internal calls in one fresh interpreter state, feed earlier proven results into later calls, and report the relevant memory accesses. Imported calls, unsupported mutable host state, ambiguous control flow, and exhausted fuel fail closed. Public synthetic fixtures exercise the complete proof boundary; private real-world corpus material is validation data rather than hard-coded names, addresses, or exceptions.
 
 ## Useful inspection commands
 
