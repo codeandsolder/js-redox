@@ -47,4 +47,4 @@ rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox
 url = "2"
 wasmparser = "0.261.0"
 wasmprinter = "0.261.0"
-waffle = { git = "https://github.com/codeandsolder/waffle.git", rev = "10e4b99e354074bacf83500c7664efd14c102d25" }
+waffle = { git = "https://github.com/codeandsolder/waffle.git", rev = "528b09ab97a67cda251fea2772040d29f7148851" }

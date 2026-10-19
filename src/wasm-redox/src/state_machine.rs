@@ -360,6 +360,46 @@ mod tests {
     }
 
     #[test]
+    fn copied_input_load_integrity_resets_at_repeated_copy_site() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (table 4 externref)
+                (memory 1)
+                (func (export "copy")
+                    (param $source externref) (param $base i32) (param $repeat i32) (result i32)
+                    (local $result i32)
+                    (loop $again
+                        i32.const 0 local.get $source table.set
+                        i32.const 1 i32.const 0 table.get call $ctor table.set
+                        i32.const 1 table.get
+                        i32.const 0 table.get
+                        local.get $base i32.const 2 i32.shr_u
+                        call $set
+                        local.get $repeat
+                        if
+                            local.get $base i32.const 99 i32.store
+                            i32.const 0 local.set $repeat
+                            br $again
+                        end
+                        local.get $base i32.load
+                        local.set $result)
+                    local.get $result))"#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input candidate"));
+        };
+        let [load] = candidate.destination_loads.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input load"));
+        };
+        assert!(!load.unresolved_intervening_memory_mutation);
+        assert!(load.copied_bytes_unmodified_since_set);
+        Ok(())
+    }
+
+    #[test]
     fn copied_input_load_integrity_rejects_path_dependent_memory_write() -> Result<()> {
         let bytes = wat::parse_str(
             r#"(module

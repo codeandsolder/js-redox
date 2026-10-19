@@ -49,7 +49,7 @@ def run_probe(
             f"{cp.stdout}{cp.stderr}"
         )
     document = json.loads(cp.stdout)
-    if document.get("schema") != "jsvm-wasm-import-semantics/v7":
+    if document.get("schema") != "jsvm-wasm-import-semantics/v8":
         raise RuntimeError(
             f"unexpected JS WASM-import analyzer schema for {source}: "
             f"{document.get('schema')!r}"
@@ -83,7 +83,7 @@ def run_full_probe(analyzer: Path, source: Path) -> dict:
             f"{cp.stdout}{cp.stderr}"
         )
     document = json.loads(cp.stdout)
-    if document.get("schema") != "jsvm-wasm-import-semantics/v7":
+    if document.get("schema") != "jsvm-wasm-import-semantics/v8":
         raise RuntimeError(
             f"unexpected JS WASM-import analyzer schema for {source}: "
             f"{document.get('schema')!r}"
@@ -122,6 +122,78 @@ def run_fresh_eval(
             f"unexpected fresh evaluator schema for {binary}: {document.get('schema')!r}"
         )
     return document
+
+
+def run_fresh_sequence(
+    evaluator: Path,
+    binary: Path,
+    initial_table_grows: list[tuple[int, int]],
+    calls: list[tuple[int, list[int | str]]],
+) -> dict:
+    if not calls:
+        raise ValueError("fresh sequence requires at least one call")
+    first_function, first_args = calls[0]
+    if any(isinstance(value, str) for value in first_args):
+        raise ValueError("first fresh-sequence call must use literal i32 arguments")
+    command = [
+        str(evaluator),
+        str(binary),
+        "--function-index",
+        str(first_function),
+    ]
+    for value in first_args:
+        command.extend(["--i32-arg", str(value)])
+    for table_index, delta in initial_table_grows:
+        command.extend(["--initial-table-grow", f"{table_index}:{delta}"])
+    for function, arguments in calls[1:]:
+        rendered = ",".join(str(value) for value in arguments)
+        command.extend(["--then-call", f"{function}:{rendered}"])
+    cp = subprocess.run(
+        command,
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
+    if cp.returncode:
+        raise RuntimeError(
+            f"fresh WASM sequence evaluator failed ({cp.returncode}) for {binary}:\n"
+            f"{cp.stdout}{cp.stderr}"
+        )
+    document = json.loads(cp.stdout)
+    if document.get("schema") != "wasm-redox/fresh-i32-sequence-v2":
+        raise RuntimeError(
+            f"unexpected fresh sequence evaluator schema for {binary}: "
+            f"{document.get('schema')!r}"
+        )
+    return document
+
+
+def access_is_disjoint_from_range(
+    access: dict,
+    target_memory: int,
+    range_start: int,
+    range_end: int,
+) -> bool:
+    memory = access.get("memory")
+    addr = access.get("addr")
+    length = access.get("len")
+    if (
+        not isinstance(memory, int)
+        or isinstance(memory, bool)
+        or not isinstance(addr, int)
+        or isinstance(addr, bool)
+        or not isinstance(length, int)
+        or isinstance(length, bool)
+        or addr < 0
+        or length < 0
+    ):
+        return False
+    if memory != target_memory:
+        return True
+    access_end = addr + length
+    return access_end <= range_start or range_end <= addr
 
 
 def exact_module_usage_proofs(usages: list[dict], module_sha256: str | None) -> list[dict]:
@@ -598,6 +670,205 @@ def fresh_destination_alignment_proof(
     }
 
 
+def fresh_cleanup_disjointness_proof(
+    evaluator: Path,
+    project: Path,
+    module: dict,
+    function_imports: list[dict],
+    document: dict,
+    candidate: dict,
+    module_memory_proofs: list[dict],
+    binding_proofs: list[dict],
+    fresh_alignment_proof: dict | None,
+) -> dict | None:
+    recipe = candidate.get("fresh_cleanup_disjointness_recipe")
+    if not isinstance(recipe, dict) or not isinstance(fresh_alignment_proof, dict):
+        return None
+    slot_allocator = recipe.get("slot_allocator_function")
+    cleanup_function = recipe.get("cleanup_function")
+    bypassed_imports = recipe.get("bypassed_setup_import_functions")
+    if (
+        not isinstance(slot_allocator, int)
+        or isinstance(slot_allocator, bool)
+        or not isinstance(cleanup_function, int)
+        or isinstance(cleanup_function, bool)
+        or recipe.get("pre_copy_cleanup") != "buffer"
+        or recipe.get("post_copy_cleanups") != ["receiver", "memory"]
+        or not isinstance(bypassed_imports, list)
+        or any(not isinstance(index, int) or isinstance(index, bool) for index in bypassed_imports)
+    ):
+        return None
+
+    memory_import_index = candidate.get("constructor_input_memory_import_function")
+    if not isinstance(memory_import_index, int) or isinstance(memory_import_index, bool):
+        return None
+    if memory_import_index not in bypassed_imports or len(set(bypassed_imports)) != 2:
+        return None
+    if not module_memory_proofs:
+        return None
+
+    # The second bypassed wrapper import must be the exact `.buffer` getter on
+    # the same proven import object. The memory import itself is covered by the
+    # stronger module-memory identity proof above (a zero-arg `exports.memory`
+    # single-return handler).
+    buffer_import_indices = [index for index in bypassed_imports if index != memory_import_index]
+    if len(buffer_import_indices) != 1:
+        return None
+    buffer_index = buffer_import_indices[0]
+    if not (0 <= buffer_index < len(function_imports)):
+        return None
+    buffer_import = function_imports[buffer_index]
+    buffer_module = buffer_import.get("module")
+    buffer_name = buffer_import.get("name")
+    if not isinstance(buffer_module, str) or not isinstance(buffer_name, str):
+        return None
+    binding_import_objects = {
+        proof.get("import_object")
+        for proof in binding_proofs
+        if isinstance(proof.get("import_object"), str)
+    }
+    if len(binding_import_objects) != 1:
+        return None
+    [binding_import_object] = binding_import_objects
+    buffer_handlers = [
+        handler
+        for handler in matching_handler(document, buffer_module, buffer_name, "property_getter")
+        if handler.get("property") == "buffer"
+        and handler.get("standard_builtin_semantics_required") is True
+        and handler.get("import_object") == binding_import_object
+    ]
+    if len(buffer_handlers) != 1:
+        return None
+
+    binary_path = fresh_alignment_proof.get("binary_path")
+    module_sha256 = fresh_alignment_proof.get("module_sha256")
+    destination_base = fresh_alignment_proof.get("evaluated_destination_base")
+    byte_count = fresh_alignment_proof.get("allocator_byte_count")
+    start_handler = fresh_alignment_proof.get("start_handler")
+    table_export = fresh_alignment_proof.get("table_export")
+    if (
+        not isinstance(binary_path, str)
+        or not isinstance(module_sha256, str)
+        or not isinstance(destination_base, int)
+        or isinstance(destination_base, bool)
+        or not isinstance(byte_count, int)
+        or isinstance(byte_count, bool)
+        or byte_count <= 0
+        or not isinstance(start_handler, dict)
+        or not isinstance(table_export, dict)
+    ):
+        return None
+    binary = project / binary_path
+    if not binary.is_file() or hashlib.sha256(binary.read_bytes()).hexdigest() != module_sha256:
+        return None
+    table_index = table_export.get("index")
+    grow_deltas = start_handler.get("exact_grow_deltas")
+    if (
+        not isinstance(table_index, int)
+        or isinstance(table_index, bool)
+        or not isinstance(grow_deltas, list)
+        or not grow_deltas
+        or any(not isinstance(delta, int) or isinstance(delta, bool) or delta < 0 for delta in grow_deltas)
+    ):
+        return None
+
+    destination_function = (candidate.get("fresh_destination_base_recipe") or {}).get("function")
+    if not isinstance(destination_function, int) or isinstance(destination_function, bool):
+        return None
+
+    # Exact fresh-state sequence for this structural recipe:
+    #   destination malloc -> memory slot -> buffer slot -> receiver slot
+    #   -> pre-copy buffer cleanup -> [JS set] -> receiver cleanup -> memory cleanup.
+    # Step-result references are resolved by the evaluator while preserving its
+    # exact memory/table/global state across calls.
+    calls = [
+        (destination_function, [byte_count]),
+        (slot_allocator, []),
+        (slot_allocator, []),
+        (slot_allocator, []),
+        (cleanup_function, ["@2"]),
+        (cleanup_function, ["@3"]),
+        (cleanup_function, ["@1"]),
+    ]
+    evaluation = run_fresh_sequence(
+        evaluator,
+        binary,
+        [(table_index, delta) for delta in grow_deltas],
+        calls,
+    )
+    if evaluation.get("outcome") != "returned":
+        return None
+    steps = evaluation.get("steps")
+    if not isinstance(steps, list) or len(steps) != len(calls):
+        return None
+    if steps[0].get("i32_result") != destination_base:
+        return None
+    slot_results = [steps[index].get("i32_result") for index in (1, 2, 3)]
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in slot_results):
+        return None
+    if len(set(slot_results)) != 3:
+        return None
+
+    target_memories = {
+        load.get("memory")
+        for load in candidate.get("destination_loads", [])
+        if isinstance(load.get("memory"), int) and not isinstance(load.get("memory"), bool)
+    }
+    if len(target_memories) != 1:
+        return None
+    target_memory = next(iter(target_memories))
+    range_end = destination_base + byte_count
+    if range_end > 0x1_0000_0000:
+        return None
+
+    # Steps 5 and 6 execute after the proven JS copy. Reads are checked as well
+    # as writes: otherwise copied payload values could silently choose a
+    # different cleanup path than the zero-initialized evaluator state.
+    post_copy_accesses = [
+        access
+        for step in steps[5:]
+        for access in step.get("memory_accesses", [])
+    ]
+    if not all(
+        access_is_disjoint_from_range(access, target_memory, destination_base, range_end)
+        for access in post_copy_accesses
+    ):
+        return None
+
+    required_internal_barriers = {
+        barrier
+        for load in candidate.get("destination_loads", [])
+        for barrier in load.get("internal_memory_mutation_call_barriers", [])
+        if isinstance(barrier, int) and not isinstance(barrier, bool)
+    }
+    if required_internal_barriers != {cleanup_function}:
+        return None
+
+    return {
+        "fresh_instance_state_required": True,
+        "module_sha256": module_sha256,
+        "recipe": recipe,
+        "bypassed_setup_import_proofs": {
+            "memory_import_function": memory_import_index,
+            "module_memory_identity_proofs": module_memory_proofs,
+            "buffer_import_function": buffer_index,
+            "buffer_handler": buffer_handlers[0],
+            "exact_import_object": binding_import_object,
+        },
+        "initial_table_grows": [
+            {"table_index": table_index, "delta": delta} for delta in grow_deltas
+        ],
+        "protected_memory": target_memory,
+        "protected_range_start": destination_base,
+        "protected_range_end": range_end,
+        "copy_boundary_after_step": 4,
+        "post_copy_steps": [5, 6],
+        "fresh_sequence_evaluation": evaluation,
+        "post_copy_memory_accesses": post_copy_accesses,
+        "post_copy_accesses_disjoint_from_copied_range": True,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("project", type=Path)
@@ -642,12 +913,12 @@ def main() -> None:
             for imported in report.get("imports", [])
             if imported.get("kind") == "function"
         ]
-        if deep.get("schema") != "wasm-redox/deep-v8":
+        if deep.get("schema") != "wasm-redox/deep-v9":
             skipped_modules.append(
                 {
                     "sha256": module.get("sha256"),
                     "schema": deep.get("schema"),
-                    "reason": "host-effect/read proof requires wasm-redox/deep-v8",
+                    "reason": "host-effect/read proof requires wasm-redox/deep-v9",
                 }
             )
             continue
@@ -884,7 +1155,13 @@ def main() -> None:
                 proven_length_barriers = {
                     proof.get("function_import") for proof in length_barrier_proofs
                 }
-                destination_byte_integrity_proven = (
+                required_internal_barriers = {
+                    index
+                    for load in destination_loads
+                    for index in load.get("internal_memory_mutation_call_barriers", [])
+                    if isinstance(index, int) and not isinstance(index, bool)
+                }
+                base_destination_byte_integrity_proven = (
                     bool(destination_loads)
                     and source_length_lower_bound is not None
                     and all(
@@ -904,17 +1181,18 @@ def main() -> None:
                     and base_zero_bits >= element_shift
                 )
                 fresh_alignment_proof = None
+                fresh_proof_document = None
                 if module_memory_proven and len(module_memory_sources) == 1:
                     source_path = next(iter(module_memory_sources))
-                    document = full_probe_cache.get(source_path)
-                    if document is not None:
+                    fresh_proof_document = full_probe_cache.get(source_path)
+                    if fresh_proof_document is not None:
                         fresh_alignment_proof = fresh_destination_alignment_proof(
                             args.fresh_evaluator,
                             project,
                             module,
                             report,
                             function_imports,
-                            document,
+                            fresh_proof_document,
                             candidate,
                             module_memory_proofs,
                             copied_binding_proofs,
@@ -923,6 +1201,28 @@ def main() -> None:
                 destination_base_alignment_proven = (
                     static_destination_base_alignment_proven
                     or fresh_alignment_proof is not None
+                )
+                fresh_cleanup_proof = None
+                if (
+                    base_destination_byte_integrity_proven
+                    and required_internal_barriers
+                    and fresh_alignment_proof is not None
+                    and fresh_proof_document is not None
+                ):
+                    fresh_cleanup_proof = fresh_cleanup_disjointness_proof(
+                        args.fresh_evaluator,
+                        project,
+                        module,
+                        function_imports,
+                        fresh_proof_document,
+                        candidate,
+                        module_memory_proofs,
+                        copied_binding_proofs,
+                        fresh_alignment_proof,
+                    )
+                destination_byte_integrity_proven = (
+                    base_destination_byte_integrity_proven
+                    and (not required_internal_barriers or fresh_cleanup_proof is not None)
                 )
                 destination_load_interpretations, _ = interpreted_destination_loads(
                     candidate,
@@ -962,6 +1262,8 @@ def main() -> None:
                         else "no unique carrier source proves that the constructor input comes from the exported memory of the exact module instance executing this copied-input export"
                     ),
                     "destination_byte_integrity_proven": destination_byte_integrity_proven,
+                    "required_internal_memory_mutation_call_barriers": sorted(required_internal_barriers),
+                    "fresh_cleanup_disjointness_proof": fresh_cleanup_proof,
                     "source_length_barrier_proofs": length_barrier_proofs,
                     "static_destination_base_alignment_proven": static_destination_base_alignment_proven,
                     "fresh_destination_base_alignment_proof": fresh_alignment_proof,
@@ -1017,8 +1319,8 @@ def main() -> None:
 
     out = {
         "schema": WASM_JS_BOUNDARY.schema,
-        "wasm_schema_required": "wasm-redox/deep-v8",
-        "js_schema": "jsvm-wasm-import-semantics/v7",
+        "wasm_schema_required": "wasm-redox/deep-v9",
+        "js_schema": "jsvm-wasm-import-semantics/v8",
         "safe_static_only": True,
         "bounded_wasm_ir_interpretation": True,
         "correlation_contract": (

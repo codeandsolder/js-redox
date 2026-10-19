@@ -741,9 +741,19 @@ impl<'a> Visit<'a> for HandlerCollector<'_, '_, '_, '_> {
                     if let Some(semantic) =
                         analyze_import_handler(function, self.scoping, self.global_aliases)
                     {
+                        let import_object =
+                            assignment_import_object(self.scoping, &assignment.left).and_then(
+                                |(symbol, import_object, module, name)| {
+                                    (module == import_module.unwrap_or_default()
+                                        && name == import_name
+                                        && symbol_binding_is_stable(self.scoping, symbol))
+                                    .then_some(import_object)
+                                },
+                            );
                         self.handler_semantics.push(WasmImportHandlerShape {
                             import_module: import_module.map(str::to_string),
                             import_name: import_name.to_string(),
+                            import_object,
                             assignment_start: assignment.span.start,
                             assignment_end: assignment.span.end,
                             semantic,
@@ -899,9 +909,18 @@ fn collect_proof_normalized_handler_semantics(source: &str) -> Vec<WasmImportHan
                                 semantic,
                                 WasmImportHandlerSemantic::TableInitializerOnly { .. }
                             ) {
+                                let import_object =
+                                    assignment_import_object(self.scoping, &assignment.left)
+                                        .and_then(|(symbol, import_object, module, name)| {
+                                            (module == import_module.unwrap_or_default()
+                                                && name == import_name
+                                                && symbol_binding_is_stable(self.scoping, symbol))
+                                            .then_some(import_object)
+                                        });
                                 self.shapes.push(WasmImportHandlerShape {
                                     import_module: import_module.map(str::to_string),
                                     import_name: import_name.to_string(),
+                                    import_object,
                                     assignment_start: assignment.span.start,
                                     assignment_end: assignment.span.end,
                                     semantic,
@@ -1550,6 +1569,10 @@ mod tests {
         "#;
         let analysis = proven_wasm_import_semantics(source);
         assert_eq!(analysis.handler_semantics.len(), 4);
+        assert!(analysis
+            .handler_semantics
+            .iter()
+            .all(|shape| shape.import_object.as_deref() == Some("imports")));
         let by_name = analysis
             .handler_semantics
             .iter()
@@ -1856,14 +1879,21 @@ mod tests {
         "#;
         let analysis = proven_wasm_import_semantics(good);
         assert_eq!(analysis.proof_normalized_handler_semantics.len(), 1);
+        assert_eq!(
+            analysis.proof_normalized_handler_semantics[0]
+                .import_object
+                .as_deref(),
+            Some("imports")
+        );
         assert!(matches!(
             &analysis.proof_normalized_handler_semantics[0].semantic,
             WasmImportHandlerSemantic::TableInitializerOnly {
                 exports_binding,
                 table_export: "__wbindgen_export_0",
+                exact_grow_deltas,
                 standard_builtin_semantics_required: true,
                 standard_webassembly_builtin_semantics_required: true,
-            } if exports_binding == "exports_binding"
+            } if exports_binding == "exports_binding" && exact_grow_deltas == &[4]
         ));
 
         let shadowed = r#"

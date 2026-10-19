@@ -174,7 +174,7 @@ def main() -> None:
     }, index
     module = index["modules"][0]
     deep = json.loads((PROJECT / module["deep_path"]).read_text())
-    assert deep["schema"] == "wasm-redox/deep-v8", deep
+    assert deep["schema"] == "wasm-redox/deep-v9", deep
     copy_export = next(row for row in deep["exports"] if row.get("export") == "copy")
     candidates = copy_export["analysis"]["externref_bulk_copy_candidates"]
     assert len(candidates) == 1, candidates
@@ -265,7 +265,7 @@ def main() -> None:
     assert fresh_index["summary"]["modules"] == 1, fresh_index
     fresh_module = fresh_index["modules"][0]
     fresh_deep = json.loads((FRESH_PROJECT / fresh_module["deep_path"]).read_text())
-    assert fresh_deep["schema"] == "wasm-redox/deep-v8", fresh_deep
+    assert fresh_deep["schema"] == "wasm-redox/deep-v9", fresh_deep
     fresh_copy = next(row for row in fresh_deep["exports"] if row.get("export") == "copy")
     [fresh_candidate] = fresh_copy["analysis"]["externref_bulk_copy_candidates"]
     assert fresh_candidate["destination_base_guaranteed_trailing_zero_bits"] == 0, fresh_candidate

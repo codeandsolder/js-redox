@@ -3,6 +3,7 @@ use super::{
     parameter_symbols, static_member_of_symbol, symbol_binding_is_stable, symbol_of,
     unparenthesized,
 };
+use crate::numeric::exact_u64;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, CallExpression, Expression, Function, Statement,
     VariableDeclaration,
@@ -42,6 +43,7 @@ pub enum WasmImportHandlerSemantic {
     TableInitializerOnly {
         exports_binding: String,
         table_export: &'static str,
+        exact_grow_deltas: Vec<u32>,
         standard_builtin_semantics_required: bool,
         standard_webassembly_builtin_semantics_required: bool,
     },
@@ -51,6 +53,10 @@ pub enum WasmImportHandlerSemantic {
 pub struct WasmImportHandlerShape {
     pub import_module: Option<String>,
     pub import_name: String,
+    /// Stable import-object binding owning this handler assignment, when the
+    /// assignment itself proves one. Cross-stage correlation can use this to
+    /// tie handler semantics to an exact instantiated import object.
+    pub import_object: Option<String>,
     pub assignment_start: u32,
     pub assignment_end: u32,
     #[serde(flatten)]
@@ -413,6 +419,7 @@ fn table_initializer_only(
         primitive_locals: HashSet<SymbolId>,
         receiver_assigned: bool,
         saw_table_operation: bool,
+        exact_grow_deltas: Vec<u32>,
     }
     impl Verifier<'_, '_, '_> {
         fn verify_statements(&mut self, statements: &[Statement<'_>]) -> bool {
@@ -507,6 +514,16 @@ fn table_initializer_only(
                             ) {
                                 return false;
                             }
+                            let Expression::NumericLiteral(delta) = unparenthesized(argument)
+                            else {
+                                return false;
+                            };
+                            let Some(delta) =
+                                exact_u64(delta.value).and_then(|value| u32::try_from(value).ok())
+                            else {
+                                return false;
+                            };
+                            self.exact_grow_deltas.push(delta);
                             self.primitive_locals.insert(target);
                             self.saw_table_operation = true;
                             return true;
@@ -573,6 +590,7 @@ fn table_initializer_only(
         primitive_locals: HashSet::new(),
         receiver_assigned: false,
         saw_table_operation: false,
+        exact_grow_deltas: Vec::new(),
     };
     if !verifier.verify_statements(&body.statements)
         || !verifier.receiver_assigned
@@ -594,6 +612,7 @@ fn table_initializer_only(
     Some(WasmImportHandlerSemantic::TableInitializerOnly {
         exports_binding: exports_name.to_string(),
         table_export: "__wbindgen_export_0",
+        exact_grow_deltas: verifier.exact_grow_deltas,
         standard_builtin_semantics_required: true,
         standard_webassembly_builtin_semantics_required: true,
     })
