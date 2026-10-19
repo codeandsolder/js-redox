@@ -1109,12 +1109,25 @@ fn contains_with_statement(program: &oxc_ast::ast::Program<'_>) -> bool {
     detector.found
 }
 
-fn semantically_valid_source_type(source: &str) -> Option<SourceType> {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SafeSourceMode {
+    Auto,
+    Module,
+    CommonJs,
+}
+
+fn semantically_valid_source_type(source: &str, mode: SafeSourceMode) -> Option<SourceType> {
     // Browser-captured `.js` is normally either a classic Script or an ES
     // Module. Let Oxc resolve that from syntax first, then pin the resolved
-    // Program source type for every rewrite iteration. CommonJS is only a
-    // fallback for genuinely CJS-only syntax such as top-level `return`.
-    for source_type in [SourceType::unambiguous(), SourceType::cjs()] {
+    // Program source type for every rewrite iteration. Explicit `.mjs`/`.cjs`
+    // callers instead require the host-selected mode; falling back would change
+    // the semantics of marker-free modules or CommonJS-only syntax.
+    let candidates = match mode {
+        SafeSourceMode::Auto => [Some(SourceType::unambiguous()), Some(SourceType::cjs())],
+        SafeSourceMode::Module => [Some(SourceType::mjs()), None],
+        SafeSourceMode::CommonJs => [Some(SourceType::cjs()), None],
+    };
+    for source_type in candidates.into_iter().flatten() {
         let allocator = Allocator::default();
         let Some(program) = parse_as(&allocator, source, source_type) else {
             continue;
@@ -1228,12 +1241,13 @@ fn deobfuscate_with_mode(
     source: &str,
     max_iterations: usize,
     standard_numeric_builtins: bool,
+    source_mode: SafeSourceMode,
 ) -> Option<SafeTransformResult> {
     // Select a source mode only after both parsing and semantic validation. Some
     // legacy browser scripts parse as modules but are invalid under module
     // strictness (for example duplicate top-level function declarations) while
     // remaining valid classic scripts/CommonJS. Preserve that distinction.
-    let source_type = semantically_valid_source_type(source)?;
+    let source_type = semantically_valid_source_type(source, source_mode)?;
 
     let mut current = source.to_string();
     let mut counts = Counts::default();
@@ -1266,7 +1280,18 @@ fn deobfuscate_with_mode(
 
 #[must_use]
 pub fn deobfuscate(source: &str, max_iterations: usize) -> Option<SafeTransformResult> {
-    deobfuscate_with_mode(source, max_iterations, false)
+    deobfuscate_with_mode(source, max_iterations, false, SafeSourceMode::Auto)
+}
+
+/// Proof-oriented deobfuscation with an explicit host-language source mode.
+/// Use this when filename semantics make module/CommonJS mode authoritative.
+#[must_use]
+pub fn deobfuscate_with_source_mode(
+    source: &str,
+    max_iterations: usize,
+    source_mode: SafeSourceMode,
+) -> Option<SafeTransformResult> {
+    deobfuscate_with_mode(source, max_iterations, false, source_mode)
 }
 
 /// Proof-oriented variant that may evaluate standard numeric globals such as
@@ -1278,12 +1303,24 @@ pub fn deobfuscate_with_standard_numeric_builtins(
     source: &str,
     max_iterations: usize,
 ) -> Option<SafeTransformResult> {
-    deobfuscate_with_mode(source, max_iterations, true)
+    deobfuscate_with_mode(source, max_iterations, true, SafeSourceMode::Auto)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{deobfuscate, deobfuscate_with_standard_numeric_builtins};
+    use super::{
+        deobfuscate, deobfuscate_with_source_mode, deobfuscate_with_standard_numeric_builtins,
+        SafeSourceMode,
+    };
+
+    #[test]
+    fn explicit_source_mode_does_not_fall_back_across_module_commonjs_boundary() {
+        let commonjs_only = "return 1;";
+        assert!(
+            deobfuscate_with_source_mode(commonjs_only, 1, SafeSourceMode::CommonJs,).is_some()
+        );
+        assert!(deobfuscate_with_source_mode(commonjs_only, 1, SafeSourceMode::Module,).is_none());
+    }
 
     #[test]
     fn reference_state_standard_numeric_builtins_are_proof_only() {

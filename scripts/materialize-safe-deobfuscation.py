@@ -26,6 +26,19 @@ def derived_path(raw_path: str, root: str) -> Path:
     return Path("src", root, *parts)
 
 
+def logical_source_mode(path: str) -> str:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".mjs":
+        return "module"
+    if suffix == ".cjs":
+        return "commonjs"
+    return "auto"
+
+
+def source_suffix(mode: str) -> str:
+    return {"module": ".mjs", "commonjs": ".cjs", "auto": ".js"}[mode]
+
+
 def run(argv, timeout):
     argv = [str(x) for x in argv]
     try:
@@ -102,21 +115,26 @@ def main():
         if not source.is_file():
             continue
         raw_sha = sha256_path(source)
+        source_mode = logical_source_mode(unit["source_path"])
+        raw_group_key = (raw_sha, source_mode)
         occurrence = {
             "ordinal": ordinal,
             "unit": unit,
             "raw_path": raw_path,
             "source": source,
             "raw_sha": raw_sha,
+            "source_mode": source_mode,
+            "raw_group_key": raw_group_key,
         }
         occurrences.append(occurrence)
-        raw_groups.setdefault(raw_sha, []).append(occurrence)
+        raw_groups.setdefault(raw_group_key, []).append(occurrence)
 
-    def recover_strings(raw_sha, group):
+    def recover_strings(raw_group_key, group):
+        raw_sha, source_mode = raw_group_key
         canonical = group[0]
-        cache = tmp_dir / "string" / raw_sha
+        cache = tmp_dir / "string" / source_mode / raw_sha
         cache.mkdir(parents=True, exist_ok=True)
-        recovered = cache / "recovered.js"
+        recovered = cache / f"recovered{source_suffix(source_mode)}"
         report = cache / "report.json"
         cp = run(
             [
@@ -131,6 +149,8 @@ def main():
         )
         result = {
             "raw_sha": raw_sha,
+            "source_mode": source_mode,
+            "raw_group_key": raw_group_key,
             "canonical_ordinal": canonical["ordinal"],
             "canonical_raw_path": canonical["raw_path"],
             "report": report,
@@ -175,22 +195,24 @@ def main():
     string_results = {}
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = {
-            pool.submit(recover_strings, digest, group): digest
-            for digest, group in raw_groups.items()
+            pool.submit(recover_strings, group_key, group): group_key
+            for group_key, group in raw_groups.items()
         }
         for future in as_completed(futures):
             result = future.result()
-            string_results[result["raw_sha"]] = result
+            string_results[result["raw_group_key"]] = result
 
     pre_deob_groups = {}
-    for raw_sha, result in string_results.items():
-        pre_deob_groups.setdefault(result["selected_sha"], []).append(raw_sha)
+    for raw_group_key, result in string_results.items():
+        pre_deob_key = (result["selected_sha"], result["source_mode"])
+        pre_deob_groups.setdefault(pre_deob_key, []).append(raw_group_key)
 
-    def safe_deob(selected_sha, raw_shas):
-        representative = string_results[raw_shas[0]]
-        cache = tmp_dir / "deob" / selected_sha
+    def safe_deob(pre_deob_key, raw_group_keys):
+        selected_sha, source_mode = pre_deob_key
+        representative = string_results[raw_group_keys[0]]
+        cache = tmp_dir / "deob" / source_mode / selected_sha
         cache.mkdir(parents=True, exist_ok=True)
-        output = cache / "safe.js"
+        output = cache / f"safe{source_suffix(source_mode)}"
         report = cache / "report.json"
         cp = run(
             [
@@ -199,13 +221,17 @@ def main():
                 output,
                 "--report",
                 report,
+                "--source-mode",
+                source_mode,
             ],
             timeout=180,
         )
         result = {
             "selected_sha": selected_sha,
-            "raw_shas": list(raw_shas),
-            "canonical_raw_sha": raw_shas[0],
+            "source_mode": source_mode,
+            "pre_deob_key": pre_deob_key,
+            "raw_group_keys": list(raw_group_keys),
+            "canonical_raw_group_key": raw_group_keys[0],
             "report": report,
             "output": output,
             "exit": cp.returncode,
@@ -237,6 +263,12 @@ def main():
             raise RuntimeError(
                 f"safe deobfuscation input hash mismatch for {representative['selected']}"
             )
+        if meta.get("source_mode") != source_mode:
+            raise RuntimeError(
+                "safe deobfuscation source mode mismatch for "
+                f"{representative['selected']}: expected {source_mode}, "
+                f"observed {meta.get('source_mode')!r}"
+            )
         if meta.get("output_sha256") != output_sha:
             raise RuntimeError(
                 f"safe deobfuscation output hash mismatch for {representative['selected']}"
@@ -263,23 +295,23 @@ def main():
     deob_results = {}
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = {
-            pool.submit(safe_deob, digest, raw_shas): digest
-            for digest, raw_shas in pre_deob_groups.items()
+            pool.submit(safe_deob, pre_deob_key, raw_group_keys): pre_deob_key
+            for pre_deob_key, raw_group_keys in pre_deob_groups.items()
         }
         for future in as_completed(futures):
             result = future.result()
-            deob_results[result["selected_sha"]] = result
+            deob_results[result["pre_deob_key"]] = result
 
     output_groups = {}
     for result in deob_results.values():
         if result["exit"] == 0 and result["output_sha"]:
-            output_groups.setdefault(result["output_sha"], []).append(
-                result["selected_sha"]
-            )
+            output_key = (result["output_sha"], result["source_mode"])
+            output_groups.setdefault(output_key, []).append(result["pre_deob_key"])
 
-    def format_output(output_sha, selected_shas):
-        representative = deob_results[selected_shas[0]]
-        cache = tmp_dir / "readable" / output_sha
+    def format_output(output_key, pre_deob_keys):
+        output_sha, source_mode = output_key
+        representative = deob_results[pre_deob_keys[0]]
+        cache = tmp_dir / "readable" / source_mode / output_sha
         cache.mkdir(parents=True, exist_ok=True)
         readable = cache / "readable.js"
         cp = run([args.formatter, representative["output"], readable], timeout=120)
@@ -287,7 +319,9 @@ def main():
             readable.write_bytes(representative["output"].read_bytes())
         return {
             "output_sha": output_sha,
-            "selected_shas": list(selected_shas),
+            "source_mode": source_mode,
+            "output_key": output_key,
+            "pre_deob_keys": list(pre_deob_keys),
             "readable": readable,
             "formatted": cp.returncode == 0,
             "readable_sha": sha256_path(readable),
@@ -297,12 +331,12 @@ def main():
     readable_results = {}
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = {
-            pool.submit(format_output, digest, selected_shas): digest
-            for digest, selected_shas in output_groups.items()
+            pool.submit(format_output, output_key, pre_deob_keys): output_key
+            for output_key, pre_deob_keys in output_groups.items()
         }
         for future in as_completed(futures):
             result = future.result()
-            readable_results[result["output_sha"]] = result
+            readable_results[result["output_key"]] = result
 
     units = []
     string_units = []
@@ -311,9 +345,12 @@ def main():
         unit = occurrence["unit"]
         raw_path = occurrence["raw_path"]
         raw_sha = occurrence["raw_sha"]
-        raw_group = raw_groups[raw_sha]
-        string_result = string_results[raw_sha]
-        deob_result = deob_results[string_result["selected_sha"]]
+        source_mode = occurrence["source_mode"]
+        raw_group_key = occurrence["raw_group_key"]
+        raw_group = raw_groups[raw_group_key]
+        string_result = string_results[raw_group_key]
+        pre_deob_key = (string_result["selected_sha"], source_mode)
+        deob_result = deob_results[pre_deob_key]
 
         report_rel = Path("analysis/deobfuscation") / f"{ordinal:04}.json"
         report = project / report_rel
@@ -332,6 +369,7 @@ def main():
             "readable_baseline_path": unit.get("source_path"),
             "report_path": str(string_report_rel),
             "input_sha256": raw_sha,
+            "source_mode": source_mode,
             "output_sha256": string_result["selected_sha"],
             "exit": string_result["exit"],
             "changed": string_result["changed"],
@@ -368,6 +406,7 @@ def main():
             "string_recovery_changed": string_result["changed"],
             "string_recovery_replacements": string_result["replacements"],
             "input_sha256": raw_sha,
+            "source_mode": source_mode,
             "pre_deob_sha256": string_result["selected_sha"],
             "exit": deob_result["exit"],
             "content_group_size": len(raw_group),
@@ -378,7 +417,7 @@ def main():
                 else None
             ),
             "pre_deob_group_size": sum(
-                len(raw_groups[member]) for member in deob_result["raw_shas"]
+                len(raw_groups[member]) for member in deob_result["raw_group_keys"]
             ),
         }
         if deob_result["exit"]:
@@ -406,7 +445,7 @@ def main():
             }
         )
         row["output_materialization"] = link_or_copy(deob_result["output"], dest)
-        readable_result = readable_results[deob_result["output_sha"]]
+        readable_result = readable_results[(deob_result["output_sha"], source_mode)]
         row["readable_materialization"] = link_or_copy(
             readable_result["readable"], readable_dest
         )
@@ -421,6 +460,7 @@ def main():
     string_index = {
         "schema": STRING_RECOVERY.schema,
         "safe_static_only": True,
+        "mode_sensitive_deduplication": True,
         "recoverer": str(args.string_recoverer),
         "units": string_units,
         "summary": {
@@ -448,6 +488,7 @@ def main():
     index = {
         "schema": DEOBFUSCATION.schema,
         "safe_static_only": True,
+        "mode_sensitive_deduplication": True,
         "runtime_semantics_preserved_by_design": True,
         "presentation_formatted": False,
         "deobfuscator": str(args.deobfuscator),

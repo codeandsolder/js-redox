@@ -70,6 +70,8 @@ jobs:
             .cargo-target-nodebug/debug/
       - name: Safe deobfuscation runtime equivalence
         run: uv run --no-project python scripts/check-safe-deobfuscate.py
+      - name: Deobfuscation source-mode pipeline
+        run: uv run --no-project python scripts/check-deobfuscation-source-mode-pipeline.py
       - name: Static string recovery
         run: uv run --no-project python scripts/check-static-string-recovery.py
       - name: VM capture pipeline
