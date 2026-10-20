@@ -31,6 +31,7 @@ pub use semantic_render::SemanticRuntimeBindingReport;
 
 #[cfg(test)]
 mod tests {
+    use super::copied_input::FreshCleanupSlotRole;
     use super::*;
 
     #[test]
@@ -651,6 +652,116 @@ mod tests {
                 .map(|load| load.memory)
                 .collect::<Vec<_>>(),
             vec![0, 0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reports_fresh_cleanup_disjointness_recipe() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "wbg" "__wbindgen_memory" (func $memory (result externref)))
+                (import "wbg" "__wbg_buffer_fixture" (func $buffer (param externref) (result externref)))
+                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
+                (import "wbg" "set" (func $set (param externref externref i32)))
+                (table 16 externref)
+                (memory 1)
+                (global $next_slot (mut i32) (i32.const 4))
+                (func $slot_alloc (result i32)
+                    (local $slot i32)
+                    global.get $next_slot
+                    local.tee $slot
+                    i32.const 1
+                    i32.add
+                    global.set $next_slot
+                    local.get $slot)
+                (func $memory_slot (result i32)
+                    (local $slot i32)
+                    call $slot_alloc
+                    local.tee $slot
+                    call $memory
+                    table.set
+                    local.get $slot)
+                (func $buffer_slot (param $memory_slot i32) (result i32)
+                    (local $value externref)
+                    (local $slot i32)
+                    local.get $memory_slot
+                    table.get
+                    call $buffer
+                    local.set $value
+                    call $slot_alloc
+                    local.tee $slot
+                    local.get $value
+                    table.set
+                    local.get $slot)
+                (func $cleanup (param $slot i32)
+                    local.get $slot
+                    i32.const 2
+                    i32.shl
+                    i32.const 4096
+                    i32.add
+                    i32.const 0
+                    i32.store)
+                (func (export "copy") (param $source externref) (param $base i32) (result i32)
+                    (local $memory_slot i32)
+                    (local $buffer_slot i32)
+                    (local $receiver_slot i32)
+                    (local $receiver externref)
+                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
+                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
+                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
+                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
+                    i32.const 0
+                    local.get $source
+                    table.set
+                    call $memory_slot
+                    local.tee $memory_slot
+                    call $buffer_slot
+                    local.tee $buffer_slot
+                    table.get
+                    call $ctor
+                    local.set $receiver
+                    call $slot_alloc
+                    local.tee $receiver_slot
+                    local.get $receiver
+                    table.set
+                    local.get $buffer_slot
+                    call $cleanup
+                    local.get $receiver_slot
+                    table.get
+                    i32.const 0
+                    table.get
+                    local.get $base
+                    i32.const 2
+                    i32.shr_u
+                    call $set
+                    local.get $receiver_slot
+                    call $cleanup
+                    local.get $memory_slot
+                    call $cleanup
+                    local.get $base
+                    i32.load))"#,
+        )?;
+        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
+            return Err(anyhow::anyhow!("expected one copied-input candidate"));
+        };
+        let Some(recipe) = &candidate.fresh_cleanup_disjointness_recipe else {
+            return Err(anyhow::anyhow!(
+                "expected fresh cleanup disjointness recipe"
+            ));
+        };
+        assert_eq!(recipe.slot_allocator_function, 4);
+        assert_eq!(recipe.cleanup_function, 7);
+        assert_eq!(recipe.bypassed_setup_import_functions, vec![0, 1]);
+        assert_eq!(recipe.pre_copy_cleanup, FreshCleanupSlotRole::Buffer);
+        assert_eq!(
+            recipe.post_copy_cleanups,
+            vec![FreshCleanupSlotRole::Receiver, FreshCleanupSlotRole::Memory]
+        );
+        assert_eq!(
+            candidate.destination_loads[0].internal_memory_mutation_call_barriers,
+            vec![7]
         );
         Ok(())
     }
