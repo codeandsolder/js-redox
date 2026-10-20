@@ -257,7 +257,7 @@ def main() -> None:
     }, index
     module = index["modules"][0]
     deep = json.loads((PROJECT / module["deep_path"]).read_text())
-    assert deep["schema"] == "wasm-redox/deep-v9", deep
+    assert deep["schema"] == "wasm-redox/deep-v10", deep
     copy_export = next(row for row in deep["exports"] if row.get("export") == "copy")
     candidates = copy_export["analysis"]["externref_bulk_copy_candidates"]
     assert len(candidates) == 1, candidates
@@ -271,7 +271,7 @@ def main() -> None:
     assert all(load["copied_bytes_unmodified_since_set"] for load in candidate["destination_loads"]), candidate
 
     boundary = json.loads((PROJECT / "analysis/wasm-js-boundary.json").read_text())
-    assert boundary["schema"] == "wasm-js-boundary-correlation/v1", boundary
+    assert boundary["schema"] == "wasm-js-boundary-correlation/v2", boundary
     assert boundary["summary"]["host_effect_pairs"] == 0, boundary
     assert boundary["summary"]["copied_input_candidates"] == 1, boundary
     assert boundary["summary"]["proven_js_typed_array_copy_semantics"] == 1, boundary
@@ -301,6 +301,17 @@ def main() -> None:
     assert [
         proof["source_element_index"] for proof in row["destination_load_interpretations"]
     ] == [0, 1], row
+    assert row["source_word_semantic_overlay_proven"] is True, row
+    assert [binding["load_value"] for binding in row["source_word_runtime_bindings"]] == [
+        proof["load_value"] for proof in row["destination_load_interpretations"]
+    ], row
+    assert [binding["semantic_expression"] for binding in row["source_word_runtime_bindings"]] == [
+        "source_u32(arg0, 0)", "source_u32(arg0, 1)"
+    ], row
+    assert all(
+        "source_u32(arg0," in expression
+        for expression in row["source_word_return_expressions"]
+    ), row
 
     fresh_js = (
         "var host = window;\n"
@@ -348,7 +359,7 @@ def main() -> None:
     assert fresh_index["summary"]["modules"] == 1, fresh_index
     fresh_module = fresh_index["modules"][0]
     fresh_deep = json.loads((FRESH_PROJECT / fresh_module["deep_path"]).read_text())
-    assert fresh_deep["schema"] == "wasm-redox/deep-v9", fresh_deep
+    assert fresh_deep["schema"] == "wasm-redox/deep-v10", fresh_deep
     fresh_copy = next(row for row in fresh_deep["exports"] if row.get("export") == "copy")
     [fresh_candidate] = fresh_copy["analysis"]["externref_bulk_copy_candidates"]
     assert fresh_candidate["destination_base_guaranteed_trailing_zero_bits"] == 0, fresh_candidate
@@ -380,6 +391,7 @@ def main() -> None:
     assert [
         proof["source_element_index"] for proof in fresh_row["destination_load_interpretations"]
     ] == [0, 1], fresh_row
+    assert fresh_row["source_word_semantic_overlay_proven"] is True, fresh_row
 
     cleanup_cases = [
         (CLEANUP_WASM_B64, CLEANUP_HAR, CLEANUP_PROJECT, True),
@@ -425,10 +437,12 @@ def main() -> None:
                 proof["source_element_index"]
                 for proof in cleanup_row["destination_load_interpretations"]
             ] == [0, 1], cleanup_row
+            assert cleanup_row["source_word_semantic_overlay_proven"] is True, cleanup_row
         else:
             assert cleanup_proof is None, cleanup_row
             assert cleanup_row["destination_byte_integrity_proven"] is False, cleanup_row
             assert cleanup_row["destination_load_interpretation_proven"] is False, cleanup_row
+            assert cleanup_row["source_word_semantic_overlay_proven"] is False, cleanup_row
 
     print(
         "WASM copied-input boundary regression: inline extraction + structural copy + "

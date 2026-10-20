@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -419,6 +420,74 @@ def interpreted_destination_loads(
             }
         )
     return interpreted, source_length
+
+
+RUNTIME_BINDING_TOKEN = re.compile(r"\$runtime\d+\b")
+
+
+def source_word_semantic_overlay(
+    analysis: dict, destination_load_interpretations: list[dict]
+) -> tuple[list[dict], list[str]]:
+    runtime_by_value: dict[int, dict] = {}
+    for binding in analysis.get("runtime_bindings", []):
+        value = binding.get("value")
+        name = binding.get("name")
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not isinstance(name, str)
+        ):
+            continue
+        if value in runtime_by_value:
+            return [], []
+        runtime_by_value[value] = binding
+
+    overlays: list[dict] = []
+    replacements: dict[str, str] = {}
+    for interpretation in destination_load_interpretations:
+        value = interpretation.get("load_value")
+        source_parameter = interpretation.get("source_parameter")
+        source_index = interpretation.get("source_element_index")
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not isinstance(source_parameter, int)
+            or isinstance(source_parameter, bool)
+            or not isinstance(source_index, int)
+            or isinstance(source_index, bool)
+        ):
+            return [], []
+        binding = runtime_by_value.get(value)
+        if binding is None:
+            return [], []
+        semantic_expression = f"source_u32(arg{source_parameter}, {source_index})"
+        overlays.append(
+            {
+                "load_value": value,
+                "runtime_binding": binding["name"],
+                "runtime_expression": binding.get("expression"),
+                "source_parameter": source_parameter,
+                "source_element_index": source_index,
+                "source_conversion": interpretation.get("source_conversion"),
+                "semantic_expression": semantic_expression,
+            }
+        )
+        replacements[binding["name"]] = semantic_expression
+
+    if not overlays:
+        return [], []
+    return_expressions = analysis.get("return_expressions", [])
+    if not isinstance(return_expressions, list) or not all(
+        isinstance(expression, str) for expression in return_expressions
+    ):
+        return [], []
+    rewritten = [
+        RUNTIME_BINDING_TOKEN.sub(
+            lambda match: replacements.get(match.group(0), match.group(0)), expression
+        )
+        for expression in return_expressions
+    ]
+    return overlays, rewritten
 
 
 def matching_module_memory_proofs(
@@ -907,18 +976,18 @@ def main() -> None:
         report = load(project / module["report_path"])
         # module.report preserves WASM import-section order; filtering to function
         # imports therefore preserves the WebAssembly function-index prefix used
-        # by deep-v8 host_import_function.
+        # by deep-v10 host_import_function.
         function_imports = [
             imported
             for imported in report.get("imports", [])
             if imported.get("kind") == "function"
         ]
-        if deep.get("schema") != "wasm-redox/deep-v9":
+        if deep.get("schema") != "wasm-redox/deep-v10":
             skipped_modules.append(
                 {
                     "sha256": module.get("sha256"),
                     "schema": deep.get("schema"),
-                    "reason": "host-effect/read proof requires wasm-redox/deep-v9",
+                    "reason": "host-effect/read proof requires wasm-redox/deep-v10",
                 }
             )
             continue
@@ -1237,6 +1306,17 @@ def main() -> None:
                     and len(destination_load_interpretations) == len(destination_loads)
                     and bool(destination_load_interpretations)
                 )
+                source_word_runtime_bindings, source_word_return_expressions = (
+                    source_word_semantic_overlay(analysis, destination_load_interpretations)
+                    if destination_load_interpretation_proven
+                    else ([], [])
+                )
+                source_word_semantic_overlay_proven = (
+                    destination_load_interpretation_proven
+                    and len(source_word_runtime_bindings)
+                    == len(destination_load_interpretations)
+                    and bool(source_word_runtime_bindings)
+                )
                 row = {
                     "module_sha256": module.get("sha256"),
                     "export": export.get("export"),
@@ -1275,6 +1355,22 @@ def main() -> None:
                     ),
                     "destination_load_interpretation_proven": destination_load_interpretation_proven,
                     "destination_load_interpretations": destination_load_interpretations,
+                    "source_word_semantic_overlay_proven": source_word_semantic_overlay_proven,
+                    "source_word_runtime_bindings": source_word_runtime_bindings,
+                    "source_word_return_expressions": (
+                        source_word_return_expressions
+                        if source_word_semantic_overlay_proven
+                        else []
+                    ),
+                    "source_word_semantic_overlay_limitation": (
+                        None
+                        if source_word_semantic_overlay_proven
+                        else (
+                            "destination-load interpretation is not proven"
+                            if not destination_load_interpretation_proven
+                            else "the deep runtime-binding report does not preserve a unique binding for every interpreted load SSA value"
+                        )
+                    ),
                     "source_uint32_array_length_lower_bound": source_length_lower_bound,
                     "destination_load_interpretation_limitation": (
                         None
@@ -1319,10 +1415,11 @@ def main() -> None:
 
     out = {
         "schema": WASM_JS_BOUNDARY.schema,
-        "wasm_schema_required": "wasm-redox/deep-v9",
+        "wasm_schema_required": "wasm-redox/deep-v10",
         "js_schema": "jsvm-wasm-import-semantics/v8",
         "safe_static_only": True,
         "bounded_wasm_ir_interpretation": True,
+        "source_word_semantic_overlay_contract": "deep runtime bindings preserve originating SSA value IDs; post-correlation source-word facts join by exact value identity and may replace only the matching generated $runtimeN token in derived return expressions",
         "correlation_contract": (
             "cross-language claims require exact WASM import module+name matches. "
             "Host-effect writes and typed-array input-copy candidates remain independent evidence "
@@ -1370,6 +1467,9 @@ def main() -> None:
             ),
             "proven_destination_load_interpretations": sum(
                 row["destination_load_interpretation_proven"] for row in copied_input_rows
+            ),
+            "proven_source_word_semantic_overlays": sum(
+                row["source_word_semantic_overlay_proven"] for row in copied_input_rows
             ),
             "modules": len({
                 row["module_sha256"] for row in [*host_effect_rows, *copied_input_rows]

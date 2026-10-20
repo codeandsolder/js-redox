@@ -10,6 +10,7 @@ use waffle::{entity::EntityRef, FunctionBody, Operator, Terminator, Value, Value
 
 #[derive(Debug, Serialize)]
 pub struct SemanticRuntimeBindingReport {
+    pub value: usize,
     pub name: String,
     pub expression: String,
 }
@@ -212,6 +213,7 @@ fn render_semantic_value(
         let name = format!("$runtime{}", context.runtime_bindings.len());
         context.runtime_names.insert(value, name.clone());
         context.runtime_bindings.push(SemanticRuntimeBindingReport {
+            value: value.index(),
             name: name.clone(),
             expression: rendered,
         });
