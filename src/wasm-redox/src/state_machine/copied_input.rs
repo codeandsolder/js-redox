@@ -889,6 +889,15 @@ struct CopySite {
 }
 
 #[derive(Clone, Copy)]
+struct FreshCleanupContext {
+    receiver_store: TableStoreSite,
+    receiver_slot: Value,
+    constructor_input_slot: Value,
+    slot_provider: Option<usize>,
+    provider_argument: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
 struct LoadSite {
     block: Block,
     position: usize,
@@ -1074,23 +1083,19 @@ fn fresh_cleanup_disjointness_recipe(
     module: &Module<'_>,
     body: &FunctionBody,
     copy: CopySite,
-    receiver_store: TableStoreSite,
-    receiver_slot: Value,
-    constructor_input_slot: Value,
-    slot_provider: Option<usize>,
-    provider_argument: Option<usize>,
+    context: FreshCleanupContext,
     destination_loads: &[StructuralInputCopyLoadReport],
 ) -> Option<FreshCleanupDisjointnessRecipeReport> {
-    let slot_provider = Func::new(slot_provider?);
-    let provider_argument = Func::new(provider_argument?);
+    let slot_provider = Func::new(context.slot_provider?);
+    let provider_argument = Func::new(context.provider_argument?);
 
-    let (_, provider_args) = direct_call(body, constructor_input_slot, 8)?;
+    let (_, provider_args) = direct_call(body, context.constructor_input_slot, 8)?;
     let [memory_slot] = provider_args.as_slice() else {
         return None;
     };
     let memory_slot = unique_transparent_origin(body, *memory_slot, 8);
-    let buffer_slot = unique_transparent_origin(body, constructor_input_slot, 8);
-    let receiver_slot = unique_transparent_origin(body, receiver_slot, 8);
+    let buffer_slot = unique_transparent_origin(body, context.constructor_input_slot, 8);
+    let receiver_slot = unique_transparent_origin(body, context.receiver_slot, 8);
 
     let receiver_allocator = unique_carried_direct_callee(body, receiver_slot)?;
     let buffer_allocator = unique_return_direct_callee(module, slot_provider)?;
@@ -1124,8 +1129,8 @@ fn fresh_cleanup_disjointness_recipe(
         position: copy.position + 1,
     };
     let after_receiver_store = ProgramPoint {
-        block: receiver_store.block,
-        position: receiver_store.position + 1,
+        block: context.receiver_store.block,
+        position: context.receiver_store.position + 1,
     };
 
     let mut pre_roles = Vec::new();
@@ -1355,11 +1360,13 @@ pub(super) fn externref_bulk_copy_candidates(
                 module,
                 body,
                 copy,
-                receiver_store,
-                receiver_slot,
-                constructor_input_slot,
-                slot_provider,
-                provider_argument,
+                FreshCleanupContext {
+                    receiver_store,
+                    receiver_slot,
+                    constructor_input_slot,
+                    slot_provider,
+                    provider_argument,
+                },
                 &destination_loads,
             );
             reports.push(ExternrefBulkCopyCandidateReport {
