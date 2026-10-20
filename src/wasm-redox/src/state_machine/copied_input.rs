@@ -27,8 +27,16 @@ pub struct StructuralInputCopyLoadReport {
     /// Other imported calls reachable before this load. These remain opaque
     /// memory barriers and prevent byte-integrity claims.
     pub other_import_call_barriers: Vec<usize>,
-    /// True when a same-memory write, indirect call, recursive unknown, or other
-    /// unresolved side effect can occur before this static load execution.
+    /// Defined internal calls whose transitive body is not statically proven
+    /// memory-pure on every path. Cross-language correlation may discharge
+    /// these only by replaying the exact helper call in the exact fresh state
+    /// and proving its concrete memory accesses are disjoint from the copied
+    /// byte range.
+    pub internal_memory_mutation_call_barriers: Vec<usize>,
+    /// True when a same-memory write occurs directly in the export path, or an
+    /// indirect/recursive/otherwise unresolved effect can occur before this
+    /// static load execution. Unlike `internal_memory_mutation_call_barriers`,
+    /// this is not dynamically dischargeable.
     pub unresolved_intervening_memory_mutation: bool,
     /// Standalone WASM-only integrity proof. Cross-language correlation may be
     /// stronger by discharging `source_length_import_barriers` semantically.
@@ -47,6 +55,27 @@ pub struct FreshDestinationBaseRecipeReport {
     pub source_length_byte_shift: u32,
     /// Other destination-base origins, all proven constants aligned to the element width.
     pub alternate_constant_bases: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshCleanupSlotRole {
+    Memory,
+    Buffer,
+    Receiver,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FreshCleanupDisjointnessRecipeReport {
+    pub slot_allocator_function: usize,
+    pub cleanup_function: usize,
+    /// Host imports called by the memory/buffer slot-provider wrappers that are
+    /// bypassed by the exact fresh-state replay. Cross-language correlation must
+    /// prove these imports are memory-disjoint before replaying the allocator
+    /// calls directly.
+    pub bypassed_setup_import_functions: Vec<usize>,
+    pub pre_copy_cleanup: FreshCleanupSlotRole,
+    pub post_copy_cleanups: Vec<FreshCleanupSlotRole>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -86,6 +115,9 @@ pub struct ExternrefBulkCopyCandidateReport {
     pub constructor_input_provider_argument_function: Option<usize>,
     /// Imported function proven to provide the module Memory object to that helper chain.
     pub constructor_input_memory_import_function: Option<usize>,
+    /// Optional exact fresh-state recipe for replaying wasm-bindgen temporary-slot
+    /// allocation and cleanup around the JS copy.
+    pub fresh_cleanup_disjointness_recipe: Option<FreshCleanupDisjointnessRecipeReport>,
     /// Native WASM loads dominated by the set-like call and reusing the same destination-base SSA value.
     /// This does not prove the copied bytes remain unmodified before each load.
     pub destination_loads: Vec<StructuralInputCopyLoadReport>,
@@ -135,6 +167,63 @@ fn same_origin(body: &FunctionBody, left: Value, right: Value) -> bool {
 fn same_table_slot(body: &FunctionBody, left: Value, right: Value) -> bool {
     same_origin(body, left, right)
         || matches!((i32_const(body, left), i32_const(body, right)), (Some(a), Some(b)) if a == b)
+}
+
+fn carried_origin_leaves(body: &FunctionBody, value: Value, depth: usize) -> BTreeSet<Value> {
+    fn visit(
+        body: &FunctionBody,
+        value: Value,
+        depth: usize,
+        seen: &mut BTreeSet<Value>,
+        leaves: &mut BTreeSet<Value>,
+    ) {
+        if depth == 0 {
+            leaves.insert(body.resolve_alias(value));
+            return;
+        }
+        let value = body.resolve_alias(value);
+        if !seen.insert(value) {
+            return;
+        }
+        match &body.values[value] {
+            ValueDef::PickOutput(source, 0, _) => visit(body, *source, depth - 1, seen, leaves),
+            ValueDef::BlockParam(block, _, _) => {
+                let incoming = incoming_block_param_values(body, *block, value);
+                if incoming.is_empty() {
+                    leaves.insert(value);
+                } else {
+                    for incoming in incoming {
+                        visit(body, incoming, depth - 1, seen, leaves);
+                    }
+                }
+            }
+            _ => {
+                leaves.insert(value);
+            }
+        }
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut leaves = BTreeSet::new();
+    visit(body, value, depth, &mut seen, &mut leaves);
+    leaves
+}
+
+fn same_carried_origin(body: &FunctionBody, left: Value, right: Value) -> bool {
+    let left = carried_origin_leaves(body, left, 32);
+    let right = carried_origin_leaves(body, right, 32);
+    !left.is_empty() && left == right
+}
+
+fn unique_carried_direct_callee(body: &FunctionBody, value: Value) -> Option<Func> {
+    let leaves = carried_origin_leaves(body, value, 32);
+    let mut callees = BTreeSet::new();
+    for leaf in leaves {
+        callees.insert(direct_call(body, leaf, 8)?.0);
+    }
+    (callees.len() == 1)
+        .then(|| callees.into_iter().next())
+        .flatten()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -639,6 +728,7 @@ struct MemoryBarrierSummary {
     unresolved: bool,
     source_length_imports: BTreeSet<usize>,
     other_imports: BTreeSet<usize>,
+    internal_calls: BTreeSet<usize>,
 }
 
 impl MemoryBarrierSummary {
@@ -646,18 +736,25 @@ impl MemoryBarrierSummary {
         let old_unresolved = self.unresolved;
         let old_source_len = self.source_length_imports.len();
         let old_other_len = self.other_imports.len();
+        let old_internal_len = self.internal_calls.len();
         self.unresolved |= other.unresolved;
         self.source_length_imports
             .extend(other.source_length_imports.iter().copied());
         self.other_imports
             .extend(other.other_imports.iter().copied());
+        self.internal_calls
+            .extend(other.internal_calls.iter().copied());
         self.unresolved != old_unresolved
             || self.source_length_imports.len() != old_source_len
             || self.other_imports.len() != old_other_len
+            || self.internal_calls.len() != old_internal_len
     }
 
     fn is_empty(&self) -> bool {
-        !self.unresolved && self.source_length_imports.is_empty() && self.other_imports.is_empty()
+        !self.unresolved
+            && self.source_length_imports.is_empty()
+            && self.other_imports.is_empty()
+            && self.internal_calls.is_empty()
     }
 }
 
@@ -755,7 +852,15 @@ impl MemoryBarrierAnalyzer<'_, '_, '_> {
                         };
                     }
                 }
-                self.function(*function_index)
+                let summary = self.function(*function_index);
+                if self.module.funcs[*function_index].body().is_some() && !summary.is_empty() {
+                    MemoryBarrierSummary {
+                        internal_calls: BTreeSet::from([function_index.index()]),
+                        ..MemoryBarrierSummary::default()
+                    }
+                } else {
+                    summary
+                }
             }
             ValueDef::Operator(Operator::CallIndirect { .. }, _, _) => MemoryBarrierSummary {
                 unresolved: true,
@@ -781,6 +886,15 @@ struct CopySite {
     position: usize,
     destination_base: Value,
     source_slot: Value,
+}
+
+#[derive(Clone, Copy)]
+struct FreshCleanupContext {
+    receiver_store: TableStoreSite,
+    receiver_slot: Value,
+    constructor_input_slot: Value,
+    slot_provider: Option<usize>,
+    provider_argument: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -828,6 +942,17 @@ fn barriers_before_load(
             continue;
         };
         let block_definition = &body.blocks[block];
+
+        // A cycle may revisit this exact proven JS copy site before reaching
+        // the same static load again. The copy overwrites the destination
+        // bytes, so barriers accumulated before that later copy cannot affect
+        // the subsequent load. The initial post-copy state was seeded above
+        // with the same empty summary and has already explored every raw-CFG
+        // continuation from this point.
+        if block == copy.block && position == copy.position {
+            continue;
+        }
+
         if block == load.block && position == load.position {
             reached_load = true;
             load_summary.merge(&state);
@@ -864,6 +989,211 @@ fn barriers_before_load(
         });
     }
     reached_load.then_some(load_summary)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ProgramPoint {
+    block: Block,
+    position: usize,
+}
+
+fn point_reachable_without_crossing(
+    body: &FunctionBody,
+    start: ProgramPoint,
+    target: ProgramPoint,
+    forbidden: Option<ProgramPoint>,
+) -> bool {
+    let mut queue = VecDeque::from([start]);
+    let mut seen = BTreeSet::new();
+    while let Some(point) = queue.pop_front() {
+        if point == target {
+            return true;
+        }
+        if forbidden == Some(point) || !seen.insert((point.block.index(), point.position)) {
+            continue;
+        }
+        let block = &body.blocks[point.block];
+        if point.position < block.insts.len() {
+            queue.push_back(ProgramPoint {
+                block: point.block,
+                position: point.position + 1,
+            });
+            continue;
+        }
+        block.terminator.visit_targets(|next| {
+            queue.push_back(ProgramPoint {
+                block: next.block,
+                position: 0,
+            });
+        });
+    }
+    false
+}
+
+fn unique_return_direct_callee(module: &Module<'_>, function: Func) -> Option<Func> {
+    let body = module.funcs[function].body()?;
+    let mut callees = BTreeSet::new();
+    let mut saw_return = false;
+    for (_, block) in body.blocks.entries() {
+        let waffle::Terminator::Return { values } = &block.terminator else {
+            continue;
+        };
+        let [value] = values.as_slice() else {
+            return None;
+        };
+        saw_return = true;
+        let leaves = carried_origin_leaves(body, *value, 32);
+        if leaves.is_empty() {
+            return None;
+        }
+        for leaf in leaves {
+            callees.insert(direct_call(body, leaf, 8)?.0);
+        }
+    }
+    (saw_return && callees.len() == 1)
+        .then(|| callees.into_iter().next())
+        .flatten()
+}
+
+fn provider_wrapper_imports_around_allocator(
+    module: &Module<'_>,
+    function: Func,
+    allocator: Func,
+) -> Option<BTreeSet<usize>> {
+    let body = module.funcs[function].body()?;
+    let mut imports = BTreeSet::new();
+    for (_, value) in body.values.entries() {
+        let ValueDef::Operator(operator, _, _) = value else {
+            continue;
+        };
+        match operator {
+            Operator::Call { function_index } if *function_index == allocator => {}
+            Operator::Call { function_index } if module.funcs[*function_index].body().is_none() => {
+                imports.insert(function_index.index());
+            }
+            Operator::Call { .. } | Operator::CallIndirect { .. } => return None,
+            _ if operator_direct_memory_mutation(operator, 0) => return None,
+            _ => {}
+        }
+    }
+    Some(imports)
+}
+
+fn fresh_cleanup_disjointness_recipe(
+    module: &Module<'_>,
+    body: &FunctionBody,
+    copy: CopySite,
+    context: FreshCleanupContext,
+    destination_loads: &[StructuralInputCopyLoadReport],
+) -> Option<FreshCleanupDisjointnessRecipeReport> {
+    let slot_provider = Func::new(context.slot_provider?);
+    let provider_argument = Func::new(context.provider_argument?);
+
+    let (_, provider_args) = direct_call(body, context.constructor_input_slot, 8)?;
+    let [memory_slot] = provider_args.as_slice() else {
+        return None;
+    };
+    let memory_slot = unique_transparent_origin(body, *memory_slot, 8);
+    let buffer_slot = unique_transparent_origin(body, context.constructor_input_slot, 8);
+    let receiver_slot = unique_transparent_origin(body, context.receiver_slot, 8);
+
+    let receiver_allocator = unique_carried_direct_callee(body, receiver_slot)?;
+    let buffer_allocator = unique_return_direct_callee(module, slot_provider)?;
+    let memory_allocator = unique_return_direct_callee(module, provider_argument)?;
+    if receiver_allocator != buffer_allocator || receiver_allocator != memory_allocator {
+        return None;
+    }
+    let mut bypassed_setup_import_functions =
+        provider_wrapper_imports_around_allocator(module, slot_provider, receiver_allocator)?;
+    bypassed_setup_import_functions.extend(provider_wrapper_imports_around_allocator(
+        module,
+        provider_argument,
+        receiver_allocator,
+    )?);
+
+    let cleanup_functions = destination_loads
+        .iter()
+        .flat_map(|load| load.internal_memory_mutation_call_barriers.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if cleanup_functions.len() != 1 {
+        return None;
+    }
+    let cleanup_function = Func::new(*cleanup_functions.iter().next()?);
+
+    let copy_point = ProgramPoint {
+        block: copy.block,
+        position: copy.position,
+    };
+    let after_copy = ProgramPoint {
+        block: copy.block,
+        position: copy.position + 1,
+    };
+    let after_receiver_store = ProgramPoint {
+        block: context.receiver_store.block,
+        position: context.receiver_store.position + 1,
+    };
+
+    let mut pre_roles = Vec::new();
+    let mut post_roles = Vec::new();
+    for (block, definition) in body.blocks.entries() {
+        for (position, instruction) in definition.insts.iter().copied().enumerate() {
+            let value = body.resolve_alias(instruction);
+            let ValueDef::Operator(Operator::Call { function_index }, args, _) =
+                &body.values[value]
+            else {
+                continue;
+            };
+            if *function_index != cleanup_function {
+                continue;
+            }
+            let [argument] = &body.arg_pool[*args] else {
+                return None;
+            };
+            let argument = unique_transparent_origin(body, *argument, 8);
+            let role = if same_carried_origin(body, argument, memory_slot) {
+                FreshCleanupSlotRole::Memory
+            } else if same_carried_origin(body, argument, buffer_slot) {
+                FreshCleanupSlotRole::Buffer
+            } else if same_carried_origin(body, argument, receiver_slot) {
+                FreshCleanupSlotRole::Receiver
+            } else {
+                continue;
+            };
+            let call = ProgramPoint { block, position };
+            let after_call = ProgramPoint {
+                block,
+                position: position + 1,
+            };
+            let is_pre = point_reachable_without_crossing(
+                body,
+                after_receiver_store,
+                call,
+                Some(copy_point),
+            ) && point_reachable_without_crossing(body, after_call, copy_point, None);
+            let is_post =
+                point_reachable_without_crossing(body, after_copy, call, Some(copy_point));
+            match (is_pre, is_post) {
+                (true, false) => pre_roles.push(role),
+                (false, true) => post_roles.push(role),
+                _ => return None,
+            }
+        }
+    }
+    pre_roles.sort();
+    post_roles.sort();
+    if pre_roles != [FreshCleanupSlotRole::Buffer]
+        || post_roles != [FreshCleanupSlotRole::Memory, FreshCleanupSlotRole::Receiver]
+    {
+        return None;
+    }
+
+    Some(FreshCleanupDisjointnessRecipeReport {
+        slot_allocator_function: receiver_allocator.index(),
+        cleanup_function: cleanup_function.index(),
+        bypassed_setup_import_functions: bypassed_setup_import_functions.into_iter().collect(),
+        pre_copy_cleanup: FreshCleanupSlotRole::Buffer,
+        post_copy_cleanups: vec![FreshCleanupSlotRole::Receiver, FreshCleanupSlotRole::Memory],
+    })
 }
 
 fn destination_loads_dominated_by_set(
@@ -930,6 +1260,11 @@ fn destination_loads_dominated_by_set(
                     .copied()
                     .collect(),
                 other_import_call_barriers: barriers.other_imports.iter().copied().collect(),
+                internal_memory_mutation_call_barriers: barriers
+                    .internal_calls
+                    .iter()
+                    .copied()
+                    .collect(),
                 unresolved_intervening_memory_mutation: barriers.unresolved,
                 copied_bytes_unmodified_since_set: barriers.is_empty(),
             });
@@ -1013,6 +1348,27 @@ pub(super) fn externref_bulk_copy_candidates(
             };
             let (slot_provider, provider_argument, memory_import) =
                 provider_chain(body, constructor_input_slot, names);
+            let copy = CopySite {
+                block,
+                position,
+                destination_base,
+                source_slot,
+            };
+            let destination_loads =
+                destination_loads_dominated_by_set(module, names, body, &cfg, copy);
+            let fresh_cleanup_disjointness_recipe = fresh_cleanup_disjointness_recipe(
+                module,
+                body,
+                copy,
+                FreshCleanupContext {
+                    receiver_store,
+                    receiver_slot,
+                    constructor_input_slot,
+                    slot_provider,
+                    provider_argument,
+                },
+                &destination_loads,
+            );
             reports.push(ExternrefBulkCopyCandidateReport {
                 block: block.index(),
                 set_instruction_index: position,
@@ -1046,18 +1402,8 @@ pub(super) fn externref_bulk_copy_candidates(
                 constructor_input_slot_provider_function: slot_provider,
                 constructor_input_provider_argument_function: provider_argument,
                 constructor_input_memory_import_function: memory_import,
-                destination_loads: destination_loads_dominated_by_set(
-                    module,
-                    names,
-                    body,
-                    &cfg,
-                    CopySite {
-                        block,
-                        position,
-                        destination_base,
-                        source_slot,
-                    },
-                ),
+                fresh_cleanup_disjointness_recipe,
+                destination_loads,
             });
         }
     }
