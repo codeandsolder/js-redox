@@ -253,6 +253,11 @@ def check_transitive_runtime_dependency_overlay() -> None:
             }
         ],
     }
+    for binding in analysis["runtime_bindings"]:
+        binding["normalized_semantic_ir"] = json.loads(json.dumps(binding["semantic_ir"]))
+    for report in analysis["returns"]:
+        report["normalized_semantic_ir"] = json.loads(json.dumps(report["semantic_ir"]))
+
     interpretations = [
         {
             "load_value": 10,
@@ -300,6 +305,18 @@ def check_transitive_runtime_dependency_overlay() -> None:
     assert bad_graph is False, (bad_bindings, bad_returns)
     assert bad_bindings == [] and bad_returns == [], (bad_bindings, bad_returns)
 
+    normalization_mismatch = json.loads(json.dumps(analysis))
+    normalization_mismatch["returns"][0]["normalized_semantic_ir"] = {
+        "kind": "runtime",
+        "value": 10,
+        "name": "$runtime0",
+    }
+    norm_bindings, norm_returns, norm_graph = overlay(
+        normalization_mismatch, interpretations
+    )
+    assert norm_graph is False, (norm_bindings, norm_returns)
+    assert norm_bindings == [] and norm_returns == [], (norm_bindings, norm_returns)
+
     cyclic = json.loads(json.dumps(analysis))
     cyclic["runtime_bindings"][0]["runtime_dependencies"] = [20]
     cyclic["runtime_bindings"][0]["semantic_ir"] = {
@@ -307,12 +324,18 @@ def check_transitive_runtime_dependency_overlay() -> None:
         "value": 20,
         "name": "$runtime1",
     }
+    cyclic["runtime_bindings"][0]["normalized_semantic_ir"] = json.loads(
+        json.dumps(cyclic["runtime_bindings"][0]["semantic_ir"])
+    )
     cyclic["runtime_bindings"][1]["runtime_dependencies"] = [10]
     cyclic["runtime_bindings"][1]["semantic_ir"] = {
         "kind": "runtime",
         "value": 10,
         "name": "$runtime0",
     }
+    cyclic["runtime_bindings"][1]["normalized_semantic_ir"] = json.loads(
+        json.dumps(cyclic["runtime_bindings"][1]["semantic_ir"])
+    )
     cycle_bindings, cycle_returns, cycle_graph = overlay(cyclic, interpretations)
     assert cycle_graph is False, (cycle_bindings, cycle_returns)
     assert cycle_bindings == [] and cycle_returns == [], (cycle_bindings, cycle_returns)
@@ -375,7 +398,7 @@ def main() -> None:
     }, index
     module = index["modules"][0]
     deep = json.loads((PROJECT / module["deep_path"]).read_text())
-    assert deep["schema"] == "wasm-redox/deep-v12", deep
+    assert deep["schema"] == "wasm-redox/deep-v13", deep
     copy_export = next(row for row in deep["exports"] if row.get("export") == "copy")
     candidates = copy_export["analysis"]["externref_bulk_copy_candidates"]
     assert len(candidates) == 1, candidates
@@ -389,7 +412,7 @@ def main() -> None:
     assert all(load["copied_bytes_unmodified_since_set"] for load in candidate["destination_loads"]), candidate
 
     boundary = json.loads((PROJECT / "analysis/wasm-js-boundary.json").read_text())
-    assert boundary["schema"] == "wasm-js-boundary-correlation/v4", boundary
+    assert boundary["schema"] == "wasm-js-boundary-correlation/v5", boundary
     assert boundary["summary"]["host_effect_pairs"] == 0, boundary
     assert boundary["summary"]["copied_input_candidates"] == 1, boundary
     assert boundary["summary"]["proven_js_typed_array_copy_semantics"] == 1, boundary
@@ -440,6 +463,9 @@ def main() -> None:
     assert "source_u32(arg0, 0)" in source_word_return["source_word_expression"], source_word_return
     assert "source_u32(arg0, 1)" in source_word_return["source_word_expression"], source_word_return
     assert sorted(source_word_ir_indices(source_word_return["source_word_semantic_ir"])) == [0, 1], source_word_return
+    assert sorted(
+        source_word_ir_indices(source_word_return["normalized_source_word_semantic_ir"])
+    ) == [0, 1], source_word_return
 
     fresh_js = (
         "var host = window;\n"
@@ -487,7 +513,7 @@ def main() -> None:
     assert fresh_index["summary"]["modules"] == 1, fresh_index
     fresh_module = fresh_index["modules"][0]
     fresh_deep = json.loads((FRESH_PROJECT / fresh_module["deep_path"]).read_text())
-    assert fresh_deep["schema"] == "wasm-redox/deep-v12", fresh_deep
+    assert fresh_deep["schema"] == "wasm-redox/deep-v13", fresh_deep
     fresh_copy = next(row for row in fresh_deep["exports"] if row.get("export") == "copy")
     [fresh_candidate] = fresh_copy["analysis"]["externref_bulk_copy_candidates"]
     assert fresh_candidate["destination_base_guaranteed_trailing_zero_bits"] == 0, fresh_candidate

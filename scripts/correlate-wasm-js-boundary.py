@@ -487,6 +487,42 @@ def semantic_ir_runtime_values(
     return None
 
 
+def semantic_ir_ssa_shape(expression: object) -> tuple[set[int], set[int]] | None:
+    definitions: set[int] = set()
+    references: set[int] = set()
+
+    def visit(node: object) -> bool:
+        if not isinstance(node, dict):
+            return False
+        kind = node.get("kind")
+        if kind == "ssa_value":
+            value = node.get("value")
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                return False
+            references.add(value)
+            return True
+        if kind == "operation":
+            value = node.get("value")
+            arguments = node.get("arguments")
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                or value in definitions
+                or not isinstance(arguments, list)
+            ):
+                return False
+            definitions.add(value)
+            return all(visit(argument) for argument in arguments)
+        if kind in {"i32_const", "argument", "runtime", "symbol", "opaque"}:
+            return True
+        return False
+
+    if not visit(expression) or not references.issubset(definitions):
+        return None
+    return definitions, references
+
+
 def semantic_runtime_graph(
     analysis: dict,
 ) -> tuple[dict[int, dict], dict[int, tuple[int, ...]], list[dict]] | None:
@@ -504,6 +540,7 @@ def semantic_runtime_graph(
         name = binding.get("name")
         expression = binding.get("expression")
         semantic_ir = binding.get("semantic_ir")
+        normalized_semantic_ir = binding.get("normalized_semantic_ir")
         dependencies = binding.get("runtime_dependencies")
         if (
             not isinstance(value, int)
@@ -511,6 +548,7 @@ def semantic_runtime_graph(
             or not isinstance(name, str)
             or not isinstance(expression, str)
             or not isinstance(semantic_ir, dict)
+            or not isinstance(normalized_semantic_ir, dict)
             or not isinstance(dependencies, list)
             or any(
                 not isinstance(dependency, int) or isinstance(dependency, bool)
@@ -531,15 +569,21 @@ def semantic_runtime_graph(
     ):
         return None
 
-    # Every structured runtime expression must contain exactly the runtime
-    # references claimed by its direct dependency list. This makes the graph
-    # and the IR independent cross-checks rather than two drifting views.
+    # Raw and normalized IR independently cross-check the explicit runtime
+    # graph. Normalization may fold constants/neutral identities, but it may not
+    # add or erase runtime provenance, duplicate definitions, or leave SSA refs
+    # dangling.
     for value, binding in runtime_by_value.items():
-        semantic_dependencies = semantic_ir_runtime_values(
-            binding["semantic_ir"], runtime_by_value
-        )
-        if semantic_dependencies is None or semantic_dependencies != set(graph[value]):
-            return None
+        for field in ("semantic_ir", "normalized_semantic_ir"):
+            semantic_dependencies = semantic_ir_runtime_values(
+                binding[field], runtime_by_value
+            )
+            if (
+                semantic_dependencies is None
+                or semantic_dependencies != set(graph[value])
+                or semantic_ir_ssa_shape(binding[field]) is None
+            ):
+                return None
 
     normalized_returns = []
     for report in returns:
@@ -548,12 +592,14 @@ def semantic_runtime_graph(
         value = report.get("value")
         expression = report.get("expression")
         semantic_ir = report.get("semantic_ir")
+        normalized_semantic_ir = report.get("normalized_semantic_ir")
         dependencies = report.get("runtime_dependencies")
         if (
             not isinstance(value, int)
             or isinstance(value, bool)
             or not isinstance(expression, str)
             or not isinstance(semantic_ir, dict)
+            or not isinstance(normalized_semantic_ir, dict)
             or not isinstance(dependencies, list)
             or any(
                 not isinstance(dependency, int) or isinstance(dependency, bool)
@@ -563,9 +609,14 @@ def semantic_runtime_graph(
             or any(dependency not in runtime_values for dependency in dependencies)
         ):
             return None
-        semantic_dependencies = semantic_ir_runtime_values(semantic_ir, runtime_by_value)
-        if semantic_dependencies is None or semantic_dependencies != set(dependencies):
-            return None
+        for candidate_ir in (semantic_ir, normalized_semantic_ir):
+            semantic_dependencies = semantic_ir_runtime_values(candidate_ir, runtime_by_value)
+            if (
+                semantic_dependencies is None
+                or semantic_dependencies != set(dependencies)
+                or semantic_ir_ssa_shape(candidate_ir) is None
+            ):
+                return None
         normalized_returns.append(report)
 
     # Cycles should not exist in the rendered SSA dependency DAG. If one
@@ -732,6 +783,7 @@ def source_word_semantic_overlay(
             "runtime_binding": binding["name"],
             "runtime_expression": binding.get("expression"),
             "runtime_semantic_ir": binding.get("semantic_ir"),
+            "normalized_runtime_semantic_ir": binding.get("normalized_semantic_ir"),
             "runtime_dependencies": binding.get("runtime_dependencies"),
             "source_parameter": source_parameter,
             "source_element_index": source_index,
@@ -767,14 +819,19 @@ def source_word_semantic_overlay(
         annotated_ir = source_word_semantic_ir(
             report["semantic_ir"], runtime_by_value, graph, source_by_value
         )
-        if annotated_ir is None:
+        normalized_annotated_ir = source_word_semantic_ir(
+            report["normalized_semantic_ir"], runtime_by_value, graph, source_by_value
+        )
+        if annotated_ir is None or normalized_annotated_ir is None:
             return overlays, [], False
         return_semantics.append(
             {
                 "return_value": report["value"],
                 "expression": expression,
                 "semantic_ir": report["semantic_ir"],
+                "normalized_semantic_ir": report["normalized_semantic_ir"],
                 "source_word_semantic_ir": annotated_ir,
+                "normalized_source_word_semantic_ir": normalized_annotated_ir,
                 "runtime_dependencies": direct_dependencies,
                 "transitive_runtime_dependencies": transitive_dependencies,
                 "source_word_dependencies": source_dependencies,
@@ -1275,18 +1332,18 @@ def main() -> None:
         report = load(project / module["report_path"])
         # module.report preserves WASM import-section order; filtering to function
         # imports therefore preserves the WebAssembly function-index prefix used
-        # by deep-v12 host_import_function.
+        # by deep-v13 host_import_function.
         function_imports = [
             imported
             for imported in report.get("imports", [])
             if imported.get("kind") == "function"
         ]
-        if deep.get("schema") != "wasm-redox/deep-v12":
+        if deep.get("schema") != "wasm-redox/deep-v13":
             skipped_modules.append(
                 {
                     "sha256": module.get("sha256"),
                     "schema": deep.get("schema"),
-                    "reason": "host-effect/read proof requires wasm-redox/deep-v12",
+                    "reason": "host-effect/read proof requires wasm-redox/deep-v13",
                 }
             )
             continue
@@ -1730,11 +1787,11 @@ def main() -> None:
 
     out = {
         "schema": WASM_JS_BOUNDARY.schema,
-        "wasm_schema_required": "wasm-redox/deep-v12",
+        "wasm_schema_required": "wasm-redox/deep-v13",
         "js_schema": "jsvm-wasm-import-semantics/v8",
         "safe_static_only": True,
         "bounded_wasm_ir_interpretation": True,
-        "source_word_semantic_overlay_contract": "deep runtime bindings and semantic returns preserve structured semantic IR plus exact SSA runtime-dependency edges; the boundary validates that each IR runtime leaf set exactly matches its declared direct dependencies. Proven copied loads become source_word leaves in the boundary semantic IR; unmatched runtime leaves retain exact identity plus transitive source-word provenance. Generated $runtimeN replacement is presentation only.",
+        "source_word_semantic_overlay_contract": "deep runtime bindings and semantic returns preserve raw plus normalized structured semantic IR and exact SSA runtime-dependency edges. Boundary validation requires both IR forms to have the same exact runtime leaf set as the declared direct dependencies and to contain no duplicate definitions or dangling SSA references. Proven copied loads become source_word leaves in both boundary IR forms; unmatched runtime leaves retain exact identity plus transitive source-word provenance. Generated $runtimeN replacement is presentation only.",
         "correlation_contract": (
             "cross-language claims require exact WASM import module+name matches. "
             "Host-effect writes and typed-array input-copy candidates remain independent evidence "
