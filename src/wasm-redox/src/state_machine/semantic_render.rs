@@ -8,11 +8,40 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use waffle::{entity::EntityRef, FunctionBody, Operator, Terminator, Value, ValueDef};
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticExpression {
+    I32Const {
+        value: u32,
+    },
+    Argument {
+        index: usize,
+    },
+    Runtime {
+        value: usize,
+        name: String,
+    },
+    Symbol {
+        name: String,
+    },
+    SsaValue {
+        value: usize,
+    },
+    Opaque {
+        expression: String,
+    },
+    Operation {
+        operator: String,
+        arguments: Vec<SemanticExpression>,
+    },
+}
+
 #[derive(Debug, Serialize)]
 pub struct SemanticRuntimeBindingReport {
     pub value: usize,
     pub name: String,
     pub expression: String,
+    pub semantic_ir: SemanticExpression,
     pub runtime_dependencies: Vec<usize>,
 }
 
@@ -20,6 +49,7 @@ pub struct SemanticRuntimeBindingReport {
 pub struct SemanticReturnReport {
     pub value: usize,
     pub expression: String,
+    pub semantic_ir: SemanticExpression,
     pub runtime_dependencies: Vec<usize>,
 }
 
@@ -39,6 +69,215 @@ struct SemanticRenderContext<'a> {
     call_names: &'a SemanticCallNames,
     runtime_names: BTreeMap<Value, String>,
     runtime_bindings: Vec<SemanticRuntimeBindingReport>,
+}
+
+fn semantic_binding_leaf(binding: &str) -> SemanticExpression {
+    if let Some(hex) = binding.strip_prefix("0x") {
+        if hex.len() == 8 {
+            if let Ok(value) = u32::from_str_radix(hex, 16) {
+                return SemanticExpression::I32Const { value };
+            }
+        }
+    }
+    if let Some(index) = binding
+        .strip_prefix("$arg")
+        .and_then(|index| index.parse::<usize>().ok())
+    {
+        return SemanticExpression::Argument { index };
+    }
+    if binding.starts_with('$') {
+        return SemanticExpression::Symbol {
+            name: binding.to_owned(),
+        };
+    }
+    SemanticExpression::Opaque {
+        expression: binding.to_owned(),
+    }
+}
+
+fn build_semantic_expression(
+    body: &FunctionBody,
+    value: Value,
+    bindings: &BTreeMap<Value, String>,
+    call_names: &SemanticCallNames,
+    runtime_names: &BTreeMap<Value, String>,
+    expanded_runtime: Option<Value>,
+    depth: usize,
+    visiting: &mut BTreeSet<Value>,
+) -> SemanticExpression {
+    let value = body.resolve_alias(value);
+    if let Some(binding) = bindings.get(&value) {
+        return semantic_binding_leaf(binding);
+    }
+    if Some(value) != expanded_runtime {
+        if let Some(name) = runtime_names.get(&value) {
+            return SemanticExpression::Runtime {
+                value: value.index(),
+                name: name.clone(),
+            };
+        }
+    }
+    if let Some(value) = i32_const(body, value) {
+        return SemanticExpression::I32Const { value };
+    }
+    if let Some(source) = reverse_bits_source(body, value) {
+        if source != value {
+            return SemanticExpression::Operation {
+                operator: "reverse_bits32".to_owned(),
+                arguments: vec![build_semantic_expression(
+                    body,
+                    source,
+                    bindings,
+                    call_names,
+                    runtime_names,
+                    expanded_runtime,
+                    depth.saturating_sub(1),
+                    visiting,
+                )],
+            };
+        }
+    }
+    if depth == 0 || !visiting.insert(value) {
+        return SemanticExpression::SsaValue {
+            value: value.index(),
+        };
+    }
+
+    let expression = match &body.values[value] {
+        ValueDef::BlockParam(block, index, _) => {
+            if *block == body.entry
+                && usize::try_from(*index).is_ok_and(|index| index < body.n_params)
+            {
+                SemanticExpression::Argument {
+                    index: usize::try_from(*index).unwrap_or_default(),
+                }
+            } else {
+                let incoming_edges = incoming_block_param_edges(body, *block, value);
+                let incoming_values = incoming_edges
+                    .iter()
+                    .map(|(_, incoming)| *incoming)
+                    .collect::<BTreeSet<_>>();
+                match incoming_values.len() {
+                    0 => SemanticExpression::Symbol {
+                        name: format!("$block{}p{index}", block.index()),
+                    },
+                    1 => {
+                        let incoming = incoming_values.into_iter().next().unwrap_or(value);
+                        build_semantic_expression(
+                            body,
+                            incoming,
+                            bindings,
+                            call_names,
+                            runtime_names,
+                            expanded_runtime,
+                            depth.saturating_sub(1),
+                            visiting,
+                        )
+                    }
+                    _ => {
+                        if let Some((condition, if_true, if_false)) =
+                            conditional_phi_inputs(body, &incoming_edges)
+                        {
+                            SemanticExpression::Operation {
+                                operator: "phi_if".to_owned(),
+                                arguments: [condition, if_true, if_false]
+                                    .into_iter()
+                                    .map(|input| {
+                                        build_semantic_expression(
+                                            body,
+                                            input,
+                                            bindings,
+                                            call_names,
+                                            runtime_names,
+                                            expanded_runtime,
+                                            depth.saturating_sub(1),
+                                            visiting,
+                                        )
+                                    })
+                                    .collect(),
+                            }
+                        } else {
+                            SemanticExpression::Operation {
+                                operator: "phi".to_owned(),
+                                arguments: incoming_values
+                                    .into_iter()
+                                    .map(|incoming| {
+                                        build_semantic_expression(
+                                            body,
+                                            incoming,
+                                            bindings,
+                                            call_names,
+                                            runtime_names,
+                                            expanded_runtime,
+                                            depth.saturating_sub(1),
+                                            visiting,
+                                        )
+                                    })
+                                    .collect(),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ValueDef::Operator(op, arg_ref, _) => {
+            let raw_args = &body.arg_pool[*arg_ref];
+            SemanticExpression::Operation {
+                operator: if let Operator::Call { function_index } = op {
+                    call_names
+                        .label(*function_index)
+                        .map_or_else(|| op.to_string(), str::to_owned)
+                } else if is_inlineable_scalar(op) {
+                    operator_family(op)
+                } else {
+                    op.to_string()
+                },
+                arguments: raw_args
+                    .iter()
+                    .map(|argument| {
+                        build_semantic_expression(
+                            body,
+                            *argument,
+                            bindings,
+                            call_names,
+                            runtime_names,
+                            expanded_runtime,
+                            depth.saturating_sub(1),
+                            visiting,
+                        )
+                    })
+                    .collect(),
+            }
+        }
+        ValueDef::PickOutput(source, index, _) => SemanticExpression::Operation {
+            operator: format!("pick{index}"),
+            arguments: vec![build_semantic_expression(
+                body,
+                *source,
+                bindings,
+                call_names,
+                runtime_names,
+                expanded_runtime,
+                depth.saturating_sub(1),
+                visiting,
+            )],
+        },
+        ValueDef::Alias(source) => build_semantic_expression(
+            body,
+            *source,
+            bindings,
+            call_names,
+            runtime_names,
+            expanded_runtime,
+            depth.saturating_sub(1),
+            visiting,
+        ),
+        ValueDef::Placeholder(_) | ValueDef::None => SemanticExpression::SsaValue {
+            value: value.index(),
+        },
+    };
+    visiting.remove(&value);
+    expression
 }
 
 fn render_semantic_value(
@@ -223,10 +462,22 @@ fn render_semantic_value(
                 visiting.remove(&value);
                 let name = format!("$runtime{}", context.runtime_bindings.len());
                 context.runtime_names.insert(value, name.clone());
+                let mut semantic_visiting = BTreeSet::new();
+                let semantic_ir = build_semantic_expression(
+                    body,
+                    value,
+                    context.bindings,
+                    context.call_names,
+                    &context.runtime_names,
+                    Some(value),
+                    48,
+                    &mut semantic_visiting,
+                );
                 context.runtime_bindings.push(SemanticRuntimeBindingReport {
                     value: value.index(),
                     name: name.clone(),
                     expression: rendered,
+                    semantic_ir,
                     runtime_dependencies: operator_runtime_dependencies
                         .iter()
                         .map(|value| value.index())
@@ -295,9 +546,21 @@ pub(super) fn render_return_semantics(
                 &mut visiting,
                 &mut runtime_dependencies,
             );
+            let mut semantic_visiting = BTreeSet::new();
+            let semantic_ir = build_semantic_expression(
+                body,
+                resolved,
+                context.bindings,
+                context.call_names,
+                &context.runtime_names,
+                None,
+                48,
+                &mut semantic_visiting,
+            );
             let report = SemanticReturnReport {
                 value: resolved.index(),
                 expression,
+                semantic_ir,
                 runtime_dependencies: runtime_dependencies
                     .iter()
                     .map(|value| value.index())
