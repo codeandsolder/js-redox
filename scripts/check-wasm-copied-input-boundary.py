@@ -279,6 +279,7 @@ def check_transitive_runtime_dependency_overlay() -> None:
     # Presentation rewriting cannot see through runtime1. The structured DAG and
     # source-aware IR can: runtime1 remains a runtime leaf but carries the exact
     # copied source word reachable through runtime1 -> runtime0.
+    assert semantic_return["raw_source_word_expression"] == "$runtime1", semantic_return
     assert semantic_return["source_word_expression"] == "$runtime1", semantic_return
     assert semantic_return["source_word_semantic_ir"] == {
         "kind": "runtime",
@@ -398,7 +399,7 @@ def main() -> None:
     }, index
     module = index["modules"][0]
     deep = json.loads((PROJECT / module["deep_path"]).read_text())
-    assert deep["schema"] == "wasm-redox/deep-v13", deep
+    assert deep["schema"] == "wasm-redox/deep-v14", deep
     copy_export = next(row for row in deep["exports"] if row.get("export") == "copy")
     candidates = copy_export["analysis"]["externref_bulk_copy_candidates"]
     assert len(candidates) == 1, candidates
@@ -412,7 +413,7 @@ def main() -> None:
     assert all(load["copied_bytes_unmodified_since_set"] for load in candidate["destination_loads"]), candidate
 
     boundary = json.loads((PROJECT / "analysis/wasm-js-boundary.json").read_text())
-    assert boundary["schema"] == "wasm-js-boundary-correlation/v5", boundary
+    assert boundary["schema"] == "wasm-js-boundary-correlation/v6", boundary
     assert boundary["summary"]["host_effect_pairs"] == 0, boundary
     assert boundary["summary"]["copied_input_candidates"] == 1, boundary
     assert boundary["summary"]["proven_js_typed_array_copy_semantics"] == 1, boundary
@@ -462,6 +463,8 @@ def main() -> None:
     ), source_word_return
     assert "source_u32(arg0, 0)" in source_word_return["source_word_expression"], source_word_return
     assert "source_u32(arg0, 1)" in source_word_return["source_word_expression"], source_word_return
+    assert "source_u32(arg0, 0)" in source_word_return["raw_source_word_expression"], source_word_return
+    assert "source_u32(arg0, 1)" in source_word_return["raw_source_word_expression"], source_word_return
     assert sorted(source_word_ir_indices(source_word_return["source_word_semantic_ir"])) == [0, 1], source_word_return
     assert sorted(
         source_word_ir_indices(source_word_return["normalized_source_word_semantic_ir"])
@@ -513,7 +516,7 @@ def main() -> None:
     assert fresh_index["summary"]["modules"] == 1, fresh_index
     fresh_module = fresh_index["modules"][0]
     fresh_deep = json.loads((FRESH_PROJECT / fresh_module["deep_path"]).read_text())
-    assert fresh_deep["schema"] == "wasm-redox/deep-v13", fresh_deep
+    assert fresh_deep["schema"] == "wasm-redox/deep-v14", fresh_deep
     fresh_copy = next(row for row in fresh_deep["exports"] if row.get("export") == "copy")
     [fresh_candidate] = fresh_copy["analysis"]["externref_bulk_copy_candidates"]
     assert fresh_candidate["destination_base_guaranteed_trailing_zero_bits"] == 0, fresh_candidate

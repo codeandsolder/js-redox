@@ -1381,6 +1381,53 @@ mod tests {
     }
 
     #[test]
+    fn runtime_dag_does_not_backlink_to_later_loop_boundary() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "host" "read" (func $read (param i32) (result i32)))
+                (func (export "run") (param $limit i32) (result i32)
+                    (local $x i32)
+                    (local $y i32)
+                    (local $i i32)
+                    i32.const 1
+                    local.set $y
+                    loop $loop
+                        local.get $y
+                        call $read
+                        local.set $x
+                        local.get $x
+                        call $read
+                        local.set $y
+                        local.get $i
+                        i32.const 1
+                        i32.add
+                        local.tee $i
+                        local.get $limit
+                        i32.lt_u
+                        br_if $loop
+                    end
+                    local.get $x))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(analysis.runtime_bindings.len(), 2);
+        let first = &analysis.runtime_bindings[0];
+        let second = &analysis.runtime_bindings[1];
+        assert!(first.runtime_dependencies.is_empty(), "{first:#?}");
+        assert_eq!(second.runtime_dependencies, [first.value]);
+        assert_eq!(
+            semantic_runtime_values(&first.semantic_ir),
+            first.runtime_dependencies.iter().copied().collect()
+        );
+        assert_eq!(
+            semantic_runtime_values(&second.semantic_ir),
+            second.runtime_dependencies.iter().copied().collect()
+        );
+        assert!(!first.expression.contains(&second.name));
+        Ok(())
+    }
+
+    #[test]
     fn follows_surviving_block_params_after_redundant_param_removal() -> Result<()> {
         let bytes = wat::parse_str(
             r#"(module
