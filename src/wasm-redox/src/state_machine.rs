@@ -11,6 +11,7 @@ mod ir;
 mod nesting;
 mod reporting;
 mod scalar;
+mod semantic_normalize;
 mod semantic_render;
 mod transition;
 mod value_flow;
@@ -26,7 +27,10 @@ pub use reporting::{
     StateMachinePipelineStageReport, StateMachineReport, StateTransitionReport,
 };
 #[cfg(test)]
-use scalar::{fold_closed_i32_expression, render_scalar_family, try_eval_i32_expression};
+use scalar::{
+    eval_i32_scalar_family, fold_closed_i32_expression, render_scalar_family,
+    try_eval_i32_expression,
+};
 pub use semantic_render::{SemanticExpression, SemanticReturnReport, SemanticRuntimeBindingReport};
 
 #[cfg(test)]
@@ -906,6 +910,11 @@ mod tests {
             "0x0000001f"
         );
         assert_eq!(try_eval_i32_expression("$p1"), None);
+        assert_eq!(try_eval_i32_expression("is_zero(0x00000000)"), Some(1));
+        assert_eq!(
+            eval_i32_scalar_family("i32shrs", &[0x8000_0000, 1]),
+            Some(0xc000_0000)
+        );
         assert_eq!(
             render_scalar_family("i32mul", &["$x".into(), "0x00000000".into()]),
             Some("0x00000000".into())

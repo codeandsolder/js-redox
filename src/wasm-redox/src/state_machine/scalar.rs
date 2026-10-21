@@ -33,6 +33,36 @@ pub(super) fn is_inlineable_scalar(op: &Operator) -> bool {
     )
 }
 
+pub(super) fn eval_i32_scalar_family(family: &str, args: &[u32]) -> Option<u32> {
+    match (family, args) {
+        ("i32eqz", [value]) => Some(u32::from(*value == 0)),
+        ("i32add", [left, right]) => Some(left.wrapping_add(*right)),
+        ("i32sub", [left, right]) => Some(left.wrapping_sub(*right)),
+        ("i32mul", [left, right]) => Some(left.wrapping_mul(*right)),
+        ("i32and", [left, right]) => Some(*left & *right),
+        ("i32or", [left, right]) => Some(*left | *right),
+        ("i32xor", [left, right]) => Some(*left ^ *right),
+        ("i32shl", [value, amount]) => Some(value.wrapping_shl(*amount & 31)),
+        ("i32shrs", [value, amount]) => {
+            Some((value.cast_signed() >> (*amount & 31)).cast_unsigned())
+        }
+        ("i32shru", [value, amount]) => Some(value.wrapping_shr(*amount & 31)),
+        ("i32rotl", [value, amount]) => Some(value.rotate_left(*amount & 31)),
+        ("i32rotr", [value, amount]) => Some(value.rotate_right(*amount & 31)),
+        ("i32eq", [left, right]) => Some(u32::from(left == right)),
+        ("i32ne", [left, right]) => Some(u32::from(left != right)),
+        ("i32ltu", [left, right]) => Some(u32::from(left < right)),
+        ("i32leu", [left, right]) => Some(u32::from(left <= right)),
+        ("i32gtu", [left, right]) => Some(u32::from(left > right)),
+        ("i32geu", [left, right]) => Some(u32::from(left >= right)),
+        ("i32lts", [left, right]) => Some(u32::from(left.cast_signed() < right.cast_signed())),
+        ("i32les", [left, right]) => Some(u32::from(left.cast_signed() <= right.cast_signed())),
+        ("i32gts", [left, right]) => Some(u32::from(left.cast_signed() > right.cast_signed())),
+        ("i32ges", [left, right]) => Some(u32::from(left.cast_signed() >= right.cast_signed())),
+        _ => None,
+    }
+}
+
 pub(super) fn render_scalar_family(family: &str, args: &[String]) -> Option<String> {
     const ZERO: &str = "0x00000000";
     const ONE: &str = "0x00000001";
@@ -271,58 +301,35 @@ fn split_top_level_arguments(expression: &str) -> Vec<&str> {
 }
 
 fn eval_i32_function(name: &str, arguments: &[&str]) -> Option<u32> {
-    match (name, arguments) {
-        ("reverse_bits32", [value]) => Some(try_eval_i32_expression(value)?.reverse_bits()),
-        ("wrapping_add", [left, right]) => {
-            Some(try_eval_i32_expression(left)?.wrapping_add(try_eval_i32_expression(right)?))
-        }
-        ("wrapping_sub", [left, right]) => {
-            Some(try_eval_i32_expression(left)?.wrapping_sub(try_eval_i32_expression(right)?))
-        }
-        ("wrapping_mul", [left, right]) => {
-            Some(try_eval_i32_expression(left)?.wrapping_mul(try_eval_i32_expression(right)?))
-        }
-        ("rotl", [value, amount]) => {
-            Some(try_eval_i32_expression(value)?.rotate_left(try_eval_i32_expression(amount)? & 31))
-        }
-        ("rotr", [value, amount]) => Some(
-            try_eval_i32_expression(value)?.rotate_right(try_eval_i32_expression(amount)? & 31),
-        ),
-        ("ashr", [value, amount]) => Some(
-            (try_eval_i32_expression(value)?.cast_signed()
-                >> (try_eval_i32_expression(amount)? & 31))
-                .cast_unsigned(),
-        ),
-        ("ult", [left, right]) => Some(u32::from(
-            try_eval_i32_expression(left)? < try_eval_i32_expression(right)?,
-        )),
-        ("ule", [left, right]) => Some(u32::from(
-            try_eval_i32_expression(left)? <= try_eval_i32_expression(right)?,
-        )),
-        ("ugt", [left, right]) => Some(u32::from(
-            try_eval_i32_expression(left)? > try_eval_i32_expression(right)?,
-        )),
-        ("uge", [left, right]) => Some(u32::from(
-            try_eval_i32_expression(left)? >= try_eval_i32_expression(right)?,
-        )),
-        ("slt", [left, right]) => Some(u32::from(
-            try_eval_i32_expression(left)?.cast_signed()
-                < try_eval_i32_expression(right)?.cast_signed(),
-        )),
-        ("sle", [left, right]) => Some(u32::from(
-            try_eval_i32_expression(left)?.cast_signed()
-                <= try_eval_i32_expression(right)?.cast_signed(),
-        )),
-        ("sgt", [left, right]) => Some(u32::from(
-            try_eval_i32_expression(left)?.cast_signed()
-                > try_eval_i32_expression(right)?.cast_signed(),
-        )),
-        ("sge", [left, right]) => Some(u32::from(
-            try_eval_i32_expression(left)?.cast_signed()
-                >= try_eval_i32_expression(right)?.cast_signed(),
-        )),
-        _ => None,
+    let values = arguments
+        .iter()
+        .map(|argument| try_eval_i32_expression(argument))
+        .collect::<Option<Vec<_>>>()?;
+    if name == "reverse_bits32" {
+        let [value] = values.as_slice() else {
+            return None;
+        };
+        return Some(value.reverse_bits());
     }
+    let family = match name {
+        "is_zero" => "i32eqz",
+        "wrapping_add" => "i32add",
+        "wrapping_sub" => "i32sub",
+        "wrapping_mul" => "i32mul",
+        "rotl" => "i32rotl",
+        "rotr" => "i32rotr",
+        "ashr" => "i32shrs",
+        "ult" => "i32ltu",
+        "ule" => "i32leu",
+        "ugt" => "i32gtu",
+        "uge" => "i32geu",
+        "slt" => "i32lts",
+        "sle" => "i32les",
+        "sgt" => "i32gts",
+        "sge" => "i32ges",
+        _ => return None,
+    };
+    eval_i32_scalar_family(family, &values)
 }
 
 pub(super) fn try_eval_i32_expression(expression: &str) -> Option<u32> {
@@ -352,18 +359,21 @@ pub(super) fn try_eval_i32_expression(expression: &str) -> Option<u32> {
 
     for operator in ["==", "!=", "|", "^", "&", "<<", ">>"] {
         if let Some((left, right)) = split_top_level_binary(expression, operator) {
-            let left = try_eval_i32_expression(left)?;
-            let right = try_eval_i32_expression(right)?;
-            return Some(match operator {
-                "==" => u32::from(left == right),
-                "!=" => u32::from(left != right),
-                "|" => left | right,
-                "^" => left ^ right,
-                "&" => left & right,
-                "<<" => left.wrapping_shl(right & 31),
-                ">>" => left.wrapping_shr(right & 31),
+            let args = [
+                try_eval_i32_expression(left)?,
+                try_eval_i32_expression(right)?,
+            ];
+            let family = match operator {
+                "==" => "i32eq",
+                "!=" => "i32ne",
+                "|" => "i32or",
+                "^" => "i32xor",
+                "&" => "i32and",
+                "<<" => "i32shl",
+                ">>" => "i32shru",
                 _ => return None,
-            });
+            };
+            return eval_i32_scalar_family(family, &args);
         }
     }
     None

@@ -2,6 +2,7 @@ use super::{
     helper_recognition::{memory_slot_from_table_get, SemanticCallNames},
     ir::{i32_const, operator_family},
     scalar::{is_inlineable_scalar, render_scalar_family, reverse_bits_source},
+    semantic_normalize::normalize_semantic_expression,
     value_flow::{conditional_phi_inputs, incoming_block_param_edges},
 };
 use serde::Serialize;
@@ -43,6 +44,7 @@ pub struct SemanticRuntimeBindingReport {
     pub name: String,
     pub expression: String,
     pub semantic_ir: SemanticExpression,
+    pub normalized_semantic_ir: SemanticExpression,
     pub runtime_dependencies: Vec<usize>,
 }
 
@@ -51,6 +53,7 @@ pub struct SemanticReturnReport {
     pub value: usize,
     pub expression: String,
     pub semantic_ir: SemanticExpression,
+    pub normalized_semantic_ir: SemanticExpression,
     pub runtime_dependencies: Vec<usize>,
 }
 
@@ -476,11 +479,13 @@ fn render_semantic_value(
                     expanded: BTreeSet::new(),
                 };
                 let semantic_ir = build_semantic_expression(body, value, 48, &mut semantic_context);
+                let normalized_semantic_ir = normalize_semantic_expression(&semantic_ir);
                 context.runtime_bindings.push(SemanticRuntimeBindingReport {
                     value: value.index(),
                     name: name.clone(),
                     expression: rendered,
                     semantic_ir,
+                    normalized_semantic_ir,
                     runtime_dependencies: operator_runtime_dependencies
                         .iter()
                         .map(|value| value.index())
@@ -558,10 +563,12 @@ pub(super) fn render_return_semantics(
                 expanded: BTreeSet::new(),
             };
             let semantic_ir = build_semantic_expression(body, resolved, 48, &mut semantic_context);
+            let normalized_semantic_ir = normalize_semantic_expression(&semantic_ir);
             let report = SemanticReturnReport {
                 value: resolved.index(),
                 expression,
                 semantic_ir,
+                normalized_semantic_ir,
                 runtime_dependencies: runtime_dependencies
                     .iter()
                     .map(|value| value.index())
