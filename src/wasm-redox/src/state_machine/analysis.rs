@@ -9,7 +9,9 @@ use super::{
         linearize_state_graph, root_machine_indices, summarize_state_case, terminal_bindings,
         MachineMeta, SemanticBindingReport, StateMachinePipelineReport, StateMachineReport,
     },
-    semantic_render::{render_return_expressions, SemanticRuntimeBindingReport},
+    semantic_render::{
+        render_return_semantics, SemanticReturnReport, SemanticRuntimeBindingReport,
+    },
     transition::{state_cmp_count, transitions_for},
 };
 use anyhow::{anyhow, Context, Result};
@@ -29,7 +31,7 @@ pub struct ExportSemanticAnalysis {
     pub runtime_bindings: Vec<SemanticRuntimeBindingReport>,
     pub externref_bulk_copy_candidates: Vec<ExternrefBulkCopyCandidateReport>,
     pub opaque_host_effect_memory_reads: Vec<OpaqueHostEffectMemoryReadReport>,
-    pub return_expressions: Vec<String>,
+    pub returns: Vec<SemanticReturnReport>,
 }
 
 pub fn analyze_export_semantics(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalysis> {
@@ -178,8 +180,8 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
     let state_machine_roots = root_machine_indices(&machines);
     let state_machine_pipelines = compose_machine_pipelines(&machines);
     let (bindings, terminal_bindings) = terminal_bindings(body, &machines, &metadata);
-    let (return_expressions, runtime_bindings, runtime_names) =
-        render_return_expressions(body, &bindings, &call_names);
+    let (returns, runtime_bindings, runtime_names) =
+        render_return_semantics(body, &bindings, &call_names);
     let opaque_host_effect_memory_reads =
         opaque_host_effect_memory_reads(body, &call_names, &runtime_names);
     Ok(ExportSemanticAnalysis {
@@ -190,6 +192,6 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
         runtime_bindings,
         externref_bulk_copy_candidates,
         opaque_host_effect_memory_reads,
-        return_expressions,
+        returns,
     })
 }

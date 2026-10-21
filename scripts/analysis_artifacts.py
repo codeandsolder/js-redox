@@ -82,7 +82,7 @@ WASM_INDEX = ArtifactSpec(
 WASM_JS_BOUNDARY = ArtifactSpec(
     "WASM/JavaScript boundary correlation",
     Path("analysis/wasm-js-boundary.json"),
-    "wasm-js-boundary-correlation/v2",
+    "wasm-js-boundary-correlation/v3",
     array_fields=("host_effect_rows", "copied_input_rows", "skipped_modules"),
     object_fields=("summary",),
 )
