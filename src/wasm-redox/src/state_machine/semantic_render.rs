@@ -72,6 +72,7 @@ fn is_runtime_boundary(op: &Operator) -> bool {
 struct RuntimeDiscovery {
     names: BTreeMap<Value, String>,
     ordered: Vec<Value>,
+    dependencies: BTreeMap<Value, BTreeSet<Value>>,
 }
 
 struct SemanticExpressionContext<'a> {
@@ -352,24 +353,24 @@ fn render_semantic_expression(expression: &SemanticExpression) -> String {
     }
 }
 
-fn discover_runtime_boundaries(
+fn discover_runtime_roots(
     body: &FunctionBody,
     value: Value,
     bindings: &BTreeMap<Value, String>,
     discovery: &mut RuntimeDiscovery,
     depth: usize,
     visiting: &mut BTreeSet<Value>,
-) {
+) -> BTreeSet<Value> {
     let value = body.resolve_alias(value);
-    if bindings.contains_key(&value)
-        || i32_const(body, value).is_some()
-        || discovery.names.contains_key(&value)
-    {
-        return;
+    if bindings.contains_key(&value) || i32_const(body, value).is_some() {
+        return BTreeSet::new();
+    }
+    if discovery.names.contains_key(&value) {
+        return [value].into_iter().collect();
     }
     if let Some(source) = reverse_bits_source(body, value) {
         if source != value {
-            discover_runtime_boundaries(
+            return discover_runtime_roots(
                 body,
                 source,
                 bindings,
@@ -377,69 +378,89 @@ fn discover_runtime_boundaries(
                 depth.saturating_sub(1),
                 visiting,
             );
-            return;
         }
     }
     if depth == 0 || !visiting.insert(value) {
-        return;
+        return BTreeSet::new();
     }
 
-    match &body.values[value] {
+    let roots = match &body.values[value] {
         ValueDef::BlockParam(block, index, _) => {
-            if !(*block == body.entry
-                && usize::try_from(*index).is_ok_and(|index| index < body.n_params))
+            if *block == body.entry
+                && usize::try_from(*index).is_ok_and(|index| index < body.n_params)
             {
+                BTreeSet::new()
+            } else {
                 let incoming_edges = incoming_block_param_edges(body, *block, value);
                 let incoming_values = incoming_edges
                     .iter()
                     .map(|(_, incoming)| *incoming)
                     .collect::<BTreeSet<_>>();
-                let ordered = conditional_phi_inputs(body, &incoming_edges).map_or_else(
-                    || incoming_values.into_iter().collect::<Vec<_>>(),
-                    |(condition, if_true, if_false)| vec![condition, if_true, if_false],
-                );
-                for incoming in ordered {
-                    discover_runtime_boundaries(
+                match incoming_values.len() {
+                    0 => BTreeSet::new(),
+                    1 => discover_runtime_roots(
                         body,
-                        incoming,
+                        incoming_values.into_iter().next().unwrap_or(value),
                         bindings,
                         discovery,
                         depth.saturating_sub(1),
                         visiting,
-                    );
+                    ),
+                    _ => {
+                        let ordered = conditional_phi_inputs(body, &incoming_edges).map_or_else(
+                            || incoming_values.into_iter().collect::<Vec<_>>(),
+                            |(condition, if_true, if_false)| vec![condition, if_true, if_false],
+                        );
+                        let mut roots = BTreeSet::new();
+                        for incoming in ordered {
+                            roots.extend(discover_runtime_roots(
+                                body,
+                                incoming,
+                                bindings,
+                                discovery,
+                                depth.saturating_sub(1),
+                                visiting,
+                            ));
+                        }
+                        roots
+                    }
                 }
             }
         }
         ValueDef::Operator(op, arg_ref, _) => {
+            let mut dependencies = BTreeSet::new();
             for argument in &body.arg_pool[*arg_ref] {
-                discover_runtime_boundaries(
+                dependencies.extend(discover_runtime_roots(
                     body,
                     *argument,
                     bindings,
                     discovery,
                     depth.saturating_sub(1),
                     visiting,
-                );
+                ));
             }
-            if is_runtime_boundary(op) && !discovery.names.contains_key(&value) {
+            if is_runtime_boundary(op) {
                 let name = format!("$runtime{}", discovery.ordered.len());
                 discovery.names.insert(value, name);
                 discovery.ordered.push(value);
+                discovery.dependencies.insert(value, dependencies);
+                [value].into_iter().collect()
+            } else {
+                dependencies
             }
         }
-        ValueDef::PickOutput(source, _, _) | ValueDef::Alias(source) => {
-            discover_runtime_boundaries(
-                body,
-                *source,
-                bindings,
-                discovery,
-                depth.saturating_sub(1),
-                visiting,
-            );
-        }
-        ValueDef::Placeholder(_) | ValueDef::None => {}
-    }
+        ValueDef::PickOutput(source, _, _) | ValueDef::Alias(source) => discover_runtime_roots(
+            body,
+            *source,
+            bindings,
+            discovery,
+            depth.saturating_sub(1),
+            visiting,
+        ),
+        ValueDef::Placeholder(_) | ValueDef::None => BTreeSet::new(),
+    };
     visiting.remove(&value);
+    roots
 }
 
 fn semantic_runtime_dependencies(expression: &SemanticExpression) -> Vec<usize> {
@@ -501,7 +522,7 @@ pub(super) fn render_return_semantics(
         };
         for value in values {
             let resolved = body.resolve_alias(*value);
-            discover_runtime_boundaries(
+            let dependencies = discover_runtime_roots(
                 body,
                 resolved,
                 bindings,
@@ -509,14 +530,24 @@ pub(super) fn render_return_semantics(
                 48,
                 &mut BTreeSet::new(),
             );
-            discovered_returns.push(resolved);
+            discovered_returns.push((resolved, dependencies));
         }
     }
 
     let mut runtime_bindings = Vec::new();
-    let mut visible_runtime_names = BTreeMap::new();
     for value in &discovery.ordered {
-        visible_runtime_names.insert(*value, discovery.names[value].clone());
+        let visible_runtime_names = discovery
+            .dependencies
+            .get(value)
+            .into_iter()
+            .flatten()
+            .filter_map(|dependency| {
+                discovery
+                    .names
+                    .get(dependency)
+                    .map(|name| (*dependency, name.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
         let semantic_ir = semantic_expression_for(
             body,
             *value,
@@ -538,7 +569,7 @@ pub(super) fn render_return_semantics(
     }
 
     let mut returns = Vec::new();
-    for resolved in discovered_returns {
+    for (resolved, _) in discovered_returns {
         let semantic_ir =
             semantic_expression_for(body, resolved, bindings, call_names, &discovery.names, None);
         let normalized_semantic_ir = normalize_semantic_expression(&semantic_ir);
