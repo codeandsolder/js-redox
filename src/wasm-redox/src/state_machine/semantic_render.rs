@@ -13,6 +13,14 @@ pub struct SemanticRuntimeBindingReport {
     pub value: usize,
     pub name: String,
     pub expression: String,
+    pub runtime_dependencies: Vec<usize>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct SemanticReturnReport {
+    pub value: usize,
+    pub expression: String,
+    pub runtime_dependencies: Vec<usize>,
 }
 
 fn is_runtime_boundary(op: &Operator) -> bool {
@@ -39,12 +47,14 @@ fn render_semantic_value(
     context: &mut SemanticRenderContext<'_>,
     depth: usize,
     visiting: &mut BTreeSet<Value>,
+    runtime_dependencies: &mut BTreeSet<Value>,
 ) -> String {
     let value = body.resolve_alias(value);
     if let Some(binding) = context.bindings.get(&value) {
         return binding.clone();
     }
     if let Some(binding) = context.runtime_names.get(&value) {
+        runtime_dependencies.insert(value);
         return binding.clone();
     }
     if let Some(constant) = i32_const(body, value) {
@@ -54,7 +64,14 @@ fn render_semantic_value(
         if source != value {
             return format!(
                 "reverse_bits32({})",
-                render_semantic_value(body, source, context, depth.saturating_sub(1), visiting)
+                render_semantic_value(
+                    body,
+                    source,
+                    context,
+                    depth.saturating_sub(1),
+                    visiting,
+                    runtime_dependencies,
+                )
             );
         }
     }
@@ -62,9 +79,9 @@ fn render_semantic_value(
         return format!("v{}", value.index());
     }
 
-    let (rendered, runtime_boundary) = match &body.values[value] {
+    let rendered = match &body.values[value] {
         ValueDef::BlockParam(block, index, _) => {
-            let rendered = if *block == body.entry
+            if *block == body.entry
                 && usize::try_from(*index).is_ok_and(|index| index < body.n_params)
             {
                 format!("$arg{index}")
@@ -84,6 +101,7 @@ fn render_semantic_value(
                             context,
                             depth.saturating_sub(1),
                             visiting,
+                            runtime_dependencies,
                         )
                     }
                     _ => {
@@ -96,6 +114,7 @@ fn render_semantic_value(
                                 context,
                                 depth.saturating_sub(1),
                                 visiting,
+                                runtime_dependencies,
                             );
                             let if_true = render_semantic_value(
                                 body,
@@ -103,6 +122,7 @@ fn render_semantic_value(
                                 context,
                                 depth.saturating_sub(1),
                                 visiting,
+                                runtime_dependencies,
                             );
                             let if_false = render_semantic_value(
                                 body,
@@ -110,6 +130,7 @@ fn render_semantic_value(
                                 context,
                                 depth.saturating_sub(1),
                                 visiting,
+                                runtime_dependencies,
                             );
                             format!("phi_if({condition}, {if_true}, {if_false})")
                         } else {
@@ -122,6 +143,7 @@ fn render_semantic_value(
                                         context,
                                         depth.saturating_sub(1),
                                         visiting,
+                                        runtime_dependencies,
                                     )
                                 })
                                 .collect::<BTreeSet<_>>();
@@ -132,107 +154,125 @@ fn render_semantic_value(
                         }
                     }
                 }
-            };
-            (rendered, false)
+            }
         }
         ValueDef::Operator(op, arg_ref, _) => {
             let raw_args = &body.arg_pool[*arg_ref];
-            {
-                let args = raw_args
-                    .iter()
-                    .map(|arg| {
-                        render_semantic_value(
+            let mut operator_runtime_dependencies = BTreeSet::new();
+            let args = raw_args
+                .iter()
+                .map(|arg| {
+                    render_semantic_value(
+                        body,
+                        *arg,
+                        context,
+                        depth.saturating_sub(1),
+                        visiting,
+                        &mut operator_runtime_dependencies,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let family = operator_family(op);
+            let rendered = if let Operator::Call { function_index } = op {
+                if context.call_names.is_memory_grow_import(*function_index) {
+                    let [receiver, delta] = raw_args else {
+                        visiting.remove(&value);
+                        runtime_dependencies.extend(operator_runtime_dependencies);
+                        return format!("{op}({})", args.join(", "));
+                    };
+                    if let Some(slot) =
+                        memory_slot_from_table_get(body, *receiver, context.call_names)
+                    {
+                        let slot = render_semantic_value(
                             body,
-                            *arg,
+                            slot,
                             context,
                             depth.saturating_sub(1),
                             visiting,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let family = operator_family(op);
-                let rendered = if let Operator::Call { function_index } = op {
-                    if context.call_names.is_memory_grow_import(*function_index) {
-                        let [receiver, delta] = raw_args else {
-                            return format!("{op}({})", args.join(", "));
-                        };
-                        if let Some(slot) =
-                            memory_slot_from_table_get(body, *receiver, context.call_names)
-                        {
-                            let slot = render_semantic_value(
-                                body,
-                                slot,
-                                context,
-                                depth.saturating_sub(1),
-                                visiting,
-                            );
-                            let delta = render_semantic_value(
-                                body,
-                                *delta,
-                                context,
-                                depth.saturating_sub(1),
-                                visiting,
-                            );
-                            format!("wasm.memory_grow({delta}, externref_slot={slot})")
-                        } else {
-                            context.call_names.label(*function_index).map_or_else(
-                                || format!("{op}({})", args.join(", ")),
-                                |name| format!("{name}({})", args.join(", ")),
-                            )
-                        }
+                            &mut operator_runtime_dependencies,
+                        );
+                        let delta = render_semantic_value(
+                            body,
+                            *delta,
+                            context,
+                            depth.saturating_sub(1),
+                            visiting,
+                            &mut operator_runtime_dependencies,
+                        );
+                        format!("wasm.memory_grow({delta}, externref_slot={slot})")
                     } else {
                         context.call_names.label(*function_index).map_or_else(
                             || format!("{op}({})", args.join(", ")),
                             |name| format!("{name}({})", args.join(", ")),
                         )
                     }
-                } else if is_inlineable_scalar(op) {
-                    render_scalar_family(&family, &args)
-                        .unwrap_or_else(|| format!("{family}({})", args.join(", ")))
                 } else {
-                    format!("{op}({})", args.join(", "))
-                };
-                (rendered, is_runtime_boundary(op))
+                    context.call_names.label(*function_index).map_or_else(
+                        || format!("{op}({})", args.join(", ")),
+                        |name| format!("{name}({})", args.join(", ")),
+                    )
+                }
+            } else if is_inlineable_scalar(op) {
+                render_scalar_family(&family, &args)
+                    .unwrap_or_else(|| format!("{family}({})", args.join(", ")))
+            } else {
+                format!("{op}({})", args.join(", "))
+            };
+
+            if is_runtime_boundary(op) {
+                visiting.remove(&value);
+                let name = format!("$runtime{}", context.runtime_bindings.len());
+                context.runtime_names.insert(value, name.clone());
+                context.runtime_bindings.push(SemanticRuntimeBindingReport {
+                    value: value.index(),
+                    name: name.clone(),
+                    expression: rendered,
+                    runtime_dependencies: operator_runtime_dependencies
+                        .iter()
+                        .map(|value| value.index())
+                        .collect(),
+                });
+                runtime_dependencies.insert(value);
+                return name;
             }
+            runtime_dependencies.extend(operator_runtime_dependencies);
+            rendered
         }
-        ValueDef::PickOutput(source, index, _) => (
-            format!(
-                "pick{index}({})",
-                render_semantic_value(body, *source, context, depth.saturating_sub(1), visiting,)
-            ),
-            false,
+        ValueDef::PickOutput(source, index, _) => format!(
+            "pick{index}({})",
+            render_semantic_value(
+                body,
+                *source,
+                context,
+                depth.saturating_sub(1),
+                visiting,
+                runtime_dependencies,
+            )
         ),
-        ValueDef::Alias(source) => (
-            render_semantic_value(body, *source, context, depth.saturating_sub(1), visiting),
-            false,
+        ValueDef::Alias(source) => render_semantic_value(
+            body,
+            *source,
+            context,
+            depth.saturating_sub(1),
+            visiting,
+            runtime_dependencies,
         ),
-        ValueDef::Placeholder(_) | ValueDef::None => (format!("v{}", value.index()), false),
+        ValueDef::Placeholder(_) | ValueDef::None => format!("v{}", value.index()),
     };
     visiting.remove(&value);
-    if runtime_boundary {
-        let name = format!("$runtime{}", context.runtime_bindings.len());
-        context.runtime_names.insert(value, name.clone());
-        context.runtime_bindings.push(SemanticRuntimeBindingReport {
-            value: value.index(),
-            name: name.clone(),
-            expression: rendered,
-        });
-        name
-    } else {
-        rendered
-    }
+    rendered
 }
 
-pub(super) fn render_return_expressions(
+pub(super) fn render_return_semantics(
     body: &FunctionBody,
     bindings: &BTreeMap<Value, String>,
     call_names: &SemanticCallNames,
 ) -> (
-    Vec<String>,
+    Vec<SemanticReturnReport>,
     Vec<SemanticRuntimeBindingReport>,
     BTreeMap<Value, String>,
 ) {
-    let mut expressions = Vec::new();
+    let mut returns = Vec::new();
     let mut context = SemanticRenderContext {
         bindings,
         call_names,
@@ -245,11 +285,28 @@ pub(super) fn render_return_expressions(
         };
         for value in values {
             let mut visiting = BTreeSet::new();
-            let expression = render_semantic_value(body, *value, &mut context, 48, &mut visiting);
-            if !expressions.contains(&expression) {
-                expressions.push(expression);
+            let mut runtime_dependencies = BTreeSet::new();
+            let resolved = body.resolve_alias(*value);
+            let expression = render_semantic_value(
+                body,
+                resolved,
+                &mut context,
+                48,
+                &mut visiting,
+                &mut runtime_dependencies,
+            );
+            let report = SemanticReturnReport {
+                value: resolved.index(),
+                expression,
+                runtime_dependencies: runtime_dependencies
+                    .iter()
+                    .map(|value| value.index())
+                    .collect(),
+            };
+            if !returns.contains(&report) {
+                returns.push(report);
             }
         }
     }
-    (expressions, context.runtime_bindings, context.runtime_names)
+    (returns, context.runtime_bindings, context.runtime_names)
 }

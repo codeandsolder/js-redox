@@ -172,7 +172,7 @@ def main():
     deep_path = PROJECT / module["deep_path"]
     assert deep_path.is_file()
     deep = json.loads(deep_path.read_text())
-    assert deep["schema"] == "wasm-redox/deep-v10"
+    assert deep["schema"] == "wasm-redox/deep-v11"
     pairs = [
         pair
         for export in deep["exports"]
@@ -191,7 +191,7 @@ def main():
         TOOL_ROOT / "wasm-import-semantics",
    )
     boundary = json.loads((PROJECT / "analysis/wasm-js-boundary.json").read_text())
-    assert boundary["schema"] == "wasm-js-boundary-correlation/v2", boundary
+    assert boundary["schema"] == "wasm-js-boundary-correlation/v3", boundary
     assert boundary["summary"]["host_effect_pairs"] == 2, boundary
     assert boundary["summary"]["proven_js_set_u32_shapes"] == 1, boundary
     assert boundary["summary"]["proven_js_import_object_instantiation_sites"] == 2, boundary

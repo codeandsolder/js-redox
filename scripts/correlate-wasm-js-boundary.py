@@ -425,25 +425,128 @@ def interpreted_destination_loads(
 RUNTIME_BINDING_TOKEN = re.compile(r"\$runtime\d+\b")
 
 
-def source_word_semantic_overlay(
-    analysis: dict, destination_load_interpretations: list[dict]
-) -> tuple[list[dict], list[str]]:
+def semantic_runtime_graph(
+    analysis: dict,
+) -> tuple[dict[int, dict], dict[int, tuple[int, ...]], list[dict]] | None:
+    bindings = analysis.get("runtime_bindings")
+    returns = analysis.get("returns")
+    if not isinstance(bindings, list) or not isinstance(returns, list):
+        return None
+
     runtime_by_value: dict[int, dict] = {}
-    for binding in analysis.get("runtime_bindings", []):
+    graph: dict[int, tuple[int, ...]] = {}
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            return None
         value = binding.get("value")
         name = binding.get("name")
+        expression = binding.get("expression")
+        dependencies = binding.get("runtime_dependencies")
         if (
             not isinstance(value, int)
             or isinstance(value, bool)
             or not isinstance(name, str)
+            or not isinstance(expression, str)
+            or not isinstance(dependencies, list)
+            or any(
+                not isinstance(dependency, int) or isinstance(dependency, bool)
+                for dependency in dependencies
+            )
+            or len(set(dependencies)) != len(dependencies)
+            or value in runtime_by_value
         ):
-            continue
-        if value in runtime_by_value:
-            return [], []
+            return None
         runtime_by_value[value] = binding
+        graph[value] = tuple(dependencies)
+
+    runtime_values = set(runtime_by_value)
+    if any(
+        dependency not in runtime_values
+        for dependencies in graph.values()
+        for dependency in dependencies
+    ):
+        return None
+
+    normalized_returns = []
+    for report in returns:
+        if not isinstance(report, dict):
+            return None
+        value = report.get("value")
+        expression = report.get("expression")
+        dependencies = report.get("runtime_dependencies")
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not isinstance(expression, str)
+            or not isinstance(dependencies, list)
+            or any(
+                not isinstance(dependency, int) or isinstance(dependency, bool)
+                for dependency in dependencies
+            )
+            or len(set(dependencies)) != len(dependencies)
+            or any(dependency not in runtime_values for dependency in dependencies)
+        ):
+            return None
+        normalized_returns.append(report)
+
+    # Cycles should not exist in the rendered SSA dependency DAG. If one
+    # appears, fail closed rather than silently truncating a dependency walk.
+    state: dict[int, int] = {}
+
+    def visit(value: int) -> bool:
+        status = state.get(value, 0)
+        if status == 1:
+            return False
+        if status == 2:
+            return True
+        state[value] = 1
+        if not all(visit(dependency) for dependency in graph[value]):
+            return False
+        state[value] = 2
+        return True
+
+    if not all(visit(value) for value in graph):
+        return None
+    return runtime_by_value, graph, normalized_returns
+
+
+def runtime_dependency_closure(
+    graph: dict[int, tuple[int, ...]], roots: list[int]
+) -> list[int] | None:
+    closure: set[int] = set()
+    visiting: set[int] = set()
+
+    def visit(value: int) -> bool:
+        if value in visiting:
+            return False
+        if value in closure:
+            return True
+        dependencies = graph.get(value)
+        if dependencies is None:
+            return False
+        visiting.add(value)
+        closure.add(value)
+        if not all(visit(dependency) for dependency in dependencies):
+            return False
+        visiting.remove(value)
+        return True
+
+    if not all(visit(root) for root in roots):
+        return None
+    return sorted(closure)
+
+
+def source_word_semantic_overlay(
+    analysis: dict, destination_load_interpretations: list[dict]
+) -> tuple[list[dict], list[dict], bool]:
+    graph_info = semantic_runtime_graph(analysis)
+    if graph_info is None:
+        return [], [], False
+    runtime_by_value, graph, returns = graph_info
 
     overlays: list[dict] = []
     replacements: dict[str, str] = {}
+    source_by_value: dict[int, dict] = {}
     for interpretation in destination_load_interpretations:
         value = interpretation.get("load_value")
         source_parameter = interpretation.get("source_parameter")
@@ -456,38 +559,63 @@ def source_word_semantic_overlay(
             or not isinstance(source_index, int)
             or isinstance(source_index, bool)
         ):
-            return [], []
+            return [], [], False
         binding = runtime_by_value.get(value)
-        if binding is None:
-            return [], []
+        if binding is None or value in source_by_value:
+            return [], [], False
         semantic_expression = f"source_u32(arg{source_parameter}, {source_index})"
-        overlays.append(
-            {
-                "load_value": value,
-                "runtime_binding": binding["name"],
-                "runtime_expression": binding.get("expression"),
-                "source_parameter": source_parameter,
-                "source_element_index": source_index,
-                "source_conversion": interpretation.get("source_conversion"),
-                "semantic_expression": semantic_expression,
-            }
-        )
+        overlay = {
+            "load_value": value,
+            "runtime_binding": binding["name"],
+            "runtime_expression": binding.get("expression"),
+            "runtime_dependencies": binding.get("runtime_dependencies"),
+            "source_parameter": source_parameter,
+            "source_element_index": source_index,
+            "source_conversion": interpretation.get("source_conversion"),
+            "semantic_expression": semantic_expression,
+        }
+        overlays.append(overlay)
+        source_by_value[value] = overlay
         replacements[binding["name"]] = semantic_expression
 
     if not overlays:
-        return [], []
-    return_expressions = analysis.get("return_expressions", [])
-    if not isinstance(return_expressions, list) or not all(
-        isinstance(expression, str) for expression in return_expressions
-    ):
-        return [], []
-    rewritten = [
-        RUNTIME_BINDING_TOKEN.sub(
-            lambda match: replacements.get(match.group(0), match.group(0)), expression
+        return [], [], True
+
+    return_semantics = []
+    for report in returns:
+        direct_dependencies = report["runtime_dependencies"]
+        transitive_dependencies = runtime_dependency_closure(graph, direct_dependencies)
+        if transitive_dependencies is None:
+            return overlays, [], False
+        source_dependencies = [
+            source_by_value[value]
+            for value in transitive_dependencies
+            if value in source_by_value
+        ]
+        source_dependencies.sort(
+            key=lambda row: (
+                row["source_parameter"],
+                row["source_element_index"],
+                row["load_value"],
+            )
         )
-        for expression in return_expressions
-    ]
-    return overlays, rewritten
+        expression = report["expression"]
+        return_semantics.append(
+            {
+                "return_value": report["value"],
+                "expression": expression,
+                "runtime_dependencies": direct_dependencies,
+                "transitive_runtime_dependencies": transitive_dependencies,
+                "source_word_dependencies": source_dependencies,
+                # Presentation only. Dependency proof above is entirely based on
+                # SSA value identity and the explicit runtime DAG.
+                "source_word_expression": RUNTIME_BINDING_TOKEN.sub(
+                    lambda match: replacements.get(match.group(0), match.group(0)),
+                    expression,
+                ),
+            }
+        )
+    return overlays, return_semantics, True
 
 
 def matching_module_memory_proofs(
@@ -976,18 +1104,18 @@ def main() -> None:
         report = load(project / module["report_path"])
         # module.report preserves WASM import-section order; filtering to function
         # imports therefore preserves the WebAssembly function-index prefix used
-        # by deep-v10 host_import_function.
+        # by deep-v11 host_import_function.
         function_imports = [
             imported
             for imported in report.get("imports", [])
             if imported.get("kind") == "function"
         ]
-        if deep.get("schema") != "wasm-redox/deep-v10":
+        if deep.get("schema") != "wasm-redox/deep-v11":
             skipped_modules.append(
                 {
                     "sha256": module.get("sha256"),
                     "schema": deep.get("schema"),
-                    "reason": "host-effect/read proof requires wasm-redox/deep-v10",
+                    "reason": "host-effect/read proof requires wasm-redox/deep-v11",
                 }
             )
             continue
@@ -1306,16 +1434,21 @@ def main() -> None:
                     and len(destination_load_interpretations) == len(destination_loads)
                     and bool(destination_load_interpretations)
                 )
-                source_word_runtime_bindings, source_word_return_expressions = (
+                source_word_runtime_bindings, source_word_returns, runtime_dependency_graph_proven = (
                     source_word_semantic_overlay(analysis, destination_load_interpretations)
                     if destination_load_interpretation_proven
-                    else ([], [])
+                    else ([], [], False)
                 )
                 source_word_semantic_overlay_proven = (
                     destination_load_interpretation_proven
                     and len(source_word_runtime_bindings)
                     == len(destination_load_interpretations)
                     and bool(source_word_runtime_bindings)
+                )
+                source_word_return_dependencies_proven = (
+                    source_word_semantic_overlay_proven
+                    and runtime_dependency_graph_proven
+                    and bool(source_word_returns)
                 )
                 row = {
                     "module_sha256": module.get("sha256"),
@@ -1357,10 +1490,21 @@ def main() -> None:
                     "destination_load_interpretations": destination_load_interpretations,
                     "source_word_semantic_overlay_proven": source_word_semantic_overlay_proven,
                     "source_word_runtime_bindings": source_word_runtime_bindings,
-                    "source_word_return_expressions": (
-                        source_word_return_expressions
-                        if source_word_semantic_overlay_proven
+                    "runtime_dependency_graph_proven": runtime_dependency_graph_proven,
+                    "source_word_return_dependencies_proven": source_word_return_dependencies_proven,
+                    "source_word_returns": (
+                        source_word_returns
+                        if source_word_return_dependencies_proven
                         else []
+                    ),
+                    "source_word_return_dependencies_limitation": (
+                        None
+                        if source_word_return_dependencies_proven
+                        else (
+                            "source-word runtime binding identity is not proven"
+                            if not source_word_semantic_overlay_proven
+                            else "the deep runtime dependency graph or semantic return records are missing, invalid, cyclic, or empty"
+                        )
                     ),
                     "source_word_semantic_overlay_limitation": (
                         None
@@ -1415,11 +1559,11 @@ def main() -> None:
 
     out = {
         "schema": WASM_JS_BOUNDARY.schema,
-        "wasm_schema_required": "wasm-redox/deep-v10",
+        "wasm_schema_required": "wasm-redox/deep-v11",
         "js_schema": "jsvm-wasm-import-semantics/v8",
         "safe_static_only": True,
         "bounded_wasm_ir_interpretation": True,
-        "source_word_semantic_overlay_contract": "deep runtime bindings preserve originating SSA value IDs; post-correlation source-word facts join by exact value identity and may replace only the matching generated $runtimeN token in derived return expressions",
+        "source_word_semantic_overlay_contract": "deep runtime bindings and semantic returns preserve exact SSA runtime-dependency edges; post-correlation source-word facts join by exact value identity and transitive source-word return dependencies are proven by graph reachability. Generated $runtimeN replacement is presentation only.",
         "correlation_contract": (
             "cross-language claims require exact WASM import module+name matches. "
             "Host-effect writes and typed-array input-copy candidates remain independent evidence "
@@ -1470,6 +1614,9 @@ def main() -> None:
             ),
             "proven_source_word_semantic_overlays": sum(
                 row["source_word_semantic_overlay_proven"] for row in copied_input_rows
+            ),
+            "proven_source_word_return_dependencies": sum(
+                row["source_word_return_dependencies_proven"] for row in copied_input_rows
             ),
             "modules": len({
                 row["module_sha256"] for row in [*host_effect_rows, *copied_input_rows]

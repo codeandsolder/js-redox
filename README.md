@@ -129,7 +129,7 @@ The string-recovery CLI likewise reads and writes explicit UTF-8 bytes rather th
 
 ## WebAssembly recovery
 
-WASM is treated as another exact binary source, not as an opaque attachment. Captured and statically recoverable inline modules are content-addressed while preserving every origin; readable WAT and deeper analysis are derived artifacts. The current machine contracts are `wasm-redox/deep-v10`, `jsvm-wasm-import-semantics/v8`, and `wasm-js-boundary-correlation/v2`.
+WASM is treated as another exact binary source, not as an opaque attachment. Captured and statically recoverable inline modules are content-addressed while preserving every origin; readable WAT and deeper analysis are derived artifacts. The current machine contracts are `wasm-redox/deep-v11`, `jsvm-wasm-import-semantics/v8`, and `wasm-js-boundary-correlation/v3`.
 
 The JavaScript/WASM boundary is fail-closed. The correlation layer can prove exact recovered module bytes, exact import-object binding, instance/export/module-memory identity, selected typed-array copy semantics, destination alignment, and whether intervening linear-memory effects can touch the copied interval. Concrete input-word interpretation is emitted only when both byte integrity and alignment are independently proven; ambiguous host effects or unconstrained memory writes remain barriers.
 

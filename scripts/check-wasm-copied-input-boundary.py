@@ -2,6 +2,7 @@
 import base64
 import json
 import os
+import runpy
 import shutil
 import subprocess
 from pathlib import Path
@@ -213,7 +214,56 @@ def cleanup_fixture_js(wasm_b64: str) -> str:
     )
 
 
+def check_transitive_runtime_dependency_overlay() -> None:
+    correlation = runpy.run_path(ROOT / "scripts/correlate-wasm-js-boundary.py")
+    overlay = correlation["source_word_semantic_overlay"]
+    analysis = {
+        "runtime_bindings": [
+            {
+                "value": 10,
+                "name": "$runtime0",
+                "expression": "i32load<memory0, align=2, offset=8>($arg0)",
+                "runtime_dependencies": [],
+            },
+            {
+                "value": 20,
+                "name": "$runtime1",
+                "expression": "host.transform($runtime0)",
+                "runtime_dependencies": [10],
+            },
+        ],
+        "returns": [
+            {
+                "value": 30,
+                "expression": "$runtime1",
+                "runtime_dependencies": [20],
+            }
+        ],
+    }
+    interpretations = [
+        {
+            "load_value": 10,
+            "source_parameter": 0,
+            "source_element_index": 2,
+            "source_conversion": "ToUint32",
+        }
+    ]
+    bindings, returns, graph_proven = overlay(analysis, interpretations)
+    assert graph_proven is True, (bindings, returns)
+    assert [binding["load_value"] for binding in bindings] == [10], bindings
+    [semantic_return] = returns
+    assert semantic_return["runtime_dependencies"] == [20], semantic_return
+    assert semantic_return["transitive_runtime_dependencies"] == [10, 20], semantic_return
+    assert [
+        dependency["source_element_index"]
+        for dependency in semantic_return["source_word_dependencies"]
+    ] == [2], semantic_return
+    # Presentation rewriting cannot see through runtime1. The structured DAG can.
+    assert semantic_return["source_word_expression"] == "$runtime1", semantic_return
+
+
 def main() -> None:
+    check_transitive_runtime_dependency_overlay()
     shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(parents=True)
     js = (
@@ -257,7 +307,7 @@ def main() -> None:
     }, index
     module = index["modules"][0]
     deep = json.loads((PROJECT / module["deep_path"]).read_text())
-    assert deep["schema"] == "wasm-redox/deep-v10", deep
+    assert deep["schema"] == "wasm-redox/deep-v11", deep
     copy_export = next(row for row in deep["exports"] if row.get("export") == "copy")
     candidates = copy_export["analysis"]["externref_bulk_copy_candidates"]
     assert len(candidates) == 1, candidates
@@ -271,7 +321,7 @@ def main() -> None:
     assert all(load["copied_bytes_unmodified_since_set"] for load in candidate["destination_loads"]), candidate
 
     boundary = json.loads((PROJECT / "analysis/wasm-js-boundary.json").read_text())
-    assert boundary["schema"] == "wasm-js-boundary-correlation/v2", boundary
+    assert boundary["schema"] == "wasm-js-boundary-correlation/v3", boundary
     assert boundary["summary"]["host_effect_pairs"] == 0, boundary
     assert boundary["summary"]["copied_input_candidates"] == 1, boundary
     assert boundary["summary"]["proven_js_typed_array_copy_semantics"] == 1, boundary
@@ -302,16 +352,25 @@ def main() -> None:
         proof["source_element_index"] for proof in row["destination_load_interpretations"]
     ] == [0, 1], row
     assert row["source_word_semantic_overlay_proven"] is True, row
+    assert row["runtime_dependency_graph_proven"] is True, row
+    assert row["source_word_return_dependencies_proven"] is True, row
+    assert boundary["summary"]["proven_source_word_return_dependencies"] == 1, boundary
     assert [binding["load_value"] for binding in row["source_word_runtime_bindings"]] == [
         proof["load_value"] for proof in row["destination_load_interpretations"]
     ], row
     assert [binding["semantic_expression"] for binding in row["source_word_runtime_bindings"]] == [
         "source_u32(arg0, 0)", "source_u32(arg0, 1)"
     ], row
-    assert all(
-        "source_u32(arg0," in expression
-        for expression in row["source_word_return_expressions"]
-    ), row
+    [source_word_return] = row["source_word_returns"]
+    assert [
+        dependency["source_element_index"]
+        for dependency in source_word_return["source_word_dependencies"]
+    ] == [0, 1], source_word_return
+    assert set(source_word_return["runtime_dependencies"]) <= set(
+        source_word_return["transitive_runtime_dependencies"]
+    ), source_word_return
+    assert "source_u32(arg0, 0)" in source_word_return["source_word_expression"], source_word_return
+    assert "source_u32(arg0, 1)" in source_word_return["source_word_expression"], source_word_return
 
     fresh_js = (
         "var host = window;\n"
@@ -359,7 +418,7 @@ def main() -> None:
     assert fresh_index["summary"]["modules"] == 1, fresh_index
     fresh_module = fresh_index["modules"][0]
     fresh_deep = json.loads((FRESH_PROJECT / fresh_module["deep_path"]).read_text())
-    assert fresh_deep["schema"] == "wasm-redox/deep-v10", fresh_deep
+    assert fresh_deep["schema"] == "wasm-redox/deep-v11", fresh_deep
     fresh_copy = next(row for row in fresh_deep["exports"] if row.get("export") == "copy")
     [fresh_candidate] = fresh_copy["analysis"]["externref_bulk_copy_candidates"]
     assert fresh_candidate["destination_base_guaranteed_trailing_zero_bits"] == 0, fresh_candidate
@@ -392,6 +451,13 @@ def main() -> None:
         proof["source_element_index"] for proof in fresh_row["destination_load_interpretations"]
     ] == [0, 1], fresh_row
     assert fresh_row["source_word_semantic_overlay_proven"] is True, fresh_row
+    assert fresh_row["runtime_dependency_graph_proven"] is True, fresh_row
+    assert fresh_row["source_word_return_dependencies_proven"] is True, fresh_row
+    [fresh_source_word_return] = fresh_row["source_word_returns"]
+    assert [
+        dependency["source_element_index"]
+        for dependency in fresh_source_word_return["source_word_dependencies"]
+    ] == [0, 1], fresh_source_word_return
 
     cleanup_cases = [
         (CLEANUP_WASM_B64, CLEANUP_HAR, CLEANUP_PROJECT, True),
@@ -438,16 +504,25 @@ def main() -> None:
                 for proof in cleanup_row["destination_load_interpretations"]
             ] == [0, 1], cleanup_row
             assert cleanup_row["source_word_semantic_overlay_proven"] is True, cleanup_row
+            assert cleanup_row["runtime_dependency_graph_proven"] is True, cleanup_row
+            assert cleanup_row["source_word_return_dependencies_proven"] is True, cleanup_row
+            [cleanup_source_word_return] = cleanup_row["source_word_returns"]
+            assert [
+                dependency["source_element_index"]
+                for dependency in cleanup_source_word_return["source_word_dependencies"]
+            ] == [0, 1], cleanup_source_word_return
         else:
             assert cleanup_proof is None, cleanup_row
             assert cleanup_row["destination_byte_integrity_proven"] is False, cleanup_row
             assert cleanup_row["destination_load_interpretation_proven"] is False, cleanup_row
             assert cleanup_row["source_word_semantic_overlay_proven"] is False, cleanup_row
+            assert cleanup_row["source_word_return_dependencies_proven"] is False, cleanup_row
+            assert cleanup_row["source_word_returns"] == [], cleanup_row
 
     print(
         "WASM copied-input boundary regression: inline extraction + structural copy + "
         "1/1 JS Uint32Array semantics + exact module/import binding + exact module-memory identity + "
-        "static/fresh alignment + positive/overlapping cleanup disjointness + source-word interpretation OK"
+        "static/fresh alignment + positive/overlapping cleanup disjointness + source-word dependency DAG OK"
     )
 
 

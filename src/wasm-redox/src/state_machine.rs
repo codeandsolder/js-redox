@@ -27,12 +27,20 @@ pub use reporting::{
 };
 #[cfg(test)]
 use scalar::{fold_closed_i32_expression, render_scalar_family, try_eval_i32_expression};
-pub use semantic_render::SemanticRuntimeBindingReport;
+pub use semantic_render::{SemanticReturnReport, SemanticRuntimeBindingReport};
 
 #[cfg(test)]
 mod tests {
     use super::copied_input::FreshCleanupSlotRole;
     use super::*;
+
+    fn return_expressions(analysis: &ExportSemanticAnalysis) -> Vec<&str> {
+        analysis
+            .returns
+            .iter()
+            .map(|report| report.expression.as_str())
+            .collect()
+    }
 
     #[test]
     fn reports_structural_externref_bulk_copy_candidate() -> Result<()> {
@@ -1019,7 +1027,7 @@ mod tests {
         )?;
 
         let analysis = analyze_export_semantics(&bytes, "reverse")?;
-        assert_eq!(analysis.return_expressions, ["reverse_bits32($arg0)"]);
+        assert_eq!(return_expressions(&analysis), ["reverse_bits32($arg0)"]);
         assert!(analysis.state_machines.is_empty());
         Ok(())
     }
@@ -1109,7 +1117,7 @@ mod tests {
         )?;
 
         let analysis = analyze_export_semantics(&bytes, "run")?;
-        assert_eq!(analysis.return_expressions, ["$runtime0"]);
+        assert_eq!(return_expressions(&analysis), ["$runtime0"]);
         assert_eq!(analysis.runtime_bindings.len(), 1);
         assert_eq!(analysis.runtime_bindings[0].name, "$runtime0");
         assert_eq!(
@@ -1142,7 +1150,7 @@ mod tests {
         )?;
 
         let analysis = analyze_export_semantics(&bytes, "run")?;
-        assert_eq!(analysis.return_expressions.len(), 1);
+        assert_eq!(return_expressions(&analysis).len(), 1);
         assert!(analysis
             .runtime_bindings
             .iter()
@@ -1171,7 +1179,7 @@ mod tests {
 
         let analysis = analyze_export_semantics(&bytes, "run")?;
         assert_eq!(
-            analysis.return_expressions,
+            return_expressions(&analysis),
             ["table_get<table0>($runtime0)"]
         );
         assert_eq!(analysis.runtime_bindings.len(), 1);
@@ -1198,7 +1206,7 @@ mod tests {
         )?;
 
         let analysis = analyze_export_semantics(&bytes, "run")?;
-        assert_eq!(analysis.return_expressions, ["$runtime0"]);
+        assert_eq!(return_expressions(&analysis), ["$runtime0"]);
         assert_eq!(analysis.runtime_bindings.len(), 1);
         assert_eq!(
             analysis.runtime_bindings[0].expression,
@@ -1229,9 +1237,39 @@ mod tests {
             "host.read(0x00000003)"
         );
         assert_eq!(
-            analysis.return_expressions,
+            return_expressions(&analysis),
             ["wrapping_add($runtime0, $runtime0)"]
         );
+        assert!(analysis.runtime_bindings[0].runtime_dependencies.is_empty());
+        assert_eq!(
+            analysis.returns[0].runtime_dependencies,
+            [analysis.runtime_bindings[0].value]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_dag_records_direct_nested_runtime_dependencies() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (import "host" "read" (func $read (param i32) (result i32)))
+                (import "host" "transform" (func $transform (param i32) (result i32)))
+                (func (export "run") (result i32)
+                    i32.const 3
+                    call $read
+                    call $transform))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert_eq!(analysis.runtime_bindings.len(), 2);
+        let inner = &analysis.runtime_bindings[0];
+        let outer = &analysis.runtime_bindings[1];
+        assert_eq!(inner.expression, "host.read(0x00000003)");
+        assert!(inner.runtime_dependencies.is_empty());
+        assert_eq!(outer.expression, "host.transform($runtime0)");
+        assert_eq!(outer.runtime_dependencies, [inner.value]);
+        assert_eq!(return_expressions(&analysis), ["$runtime1"]);
+        assert_eq!(analysis.returns[0].runtime_dependencies, [outer.value]);
         Ok(())
     }
 
@@ -1272,8 +1310,9 @@ mod tests {
 
         let analysis = analyze_export_semantics(&bytes, "run")?;
         let expression = analysis
-            .return_expressions
+            .returns
             .first()
+            .map(|report| report.expression.as_str())
             .context("return expression")?;
         assert!(expression.contains("phi(0x00000014, 0x00000015)"));
         assert!(expression.contains("phi(0x00000028, 0x00000029)"));
@@ -1352,7 +1391,7 @@ mod tests {
         )?;
 
         let analysis = analyze_export_semantics(&bytes, "run")?;
-        assert_eq!(analysis.return_expressions, ["$runtime0"]);
+        assert_eq!(return_expressions(&analysis), ["$runtime0"]);
         assert_eq!(analysis.runtime_bindings.len(), 1);
         assert_eq!(
             analysis.runtime_bindings[0].expression,
@@ -1375,7 +1414,7 @@ mod tests {
         )?;
 
         let analysis = analyze_export_semantics(&bytes, "run")?;
-        assert_eq!(analysis.return_expressions, ["$runtime0"]);
+        assert_eq!(return_expressions(&analysis), ["$runtime0"]);
         assert_eq!(analysis.runtime_bindings.len(), 1);
         assert!(!analysis.runtime_bindings[0]
             .expression
@@ -1404,8 +1443,9 @@ mod tests {
 
         let analysis = analyze_export_semantics(&bytes, "run")?;
         let expression = analysis
-            .return_expressions
+            .returns
             .first()
+            .map(|report| report.expression.as_str())
             .context("return expression")?;
         assert_eq!(expression, "phi_if($arg0, 0x00000014, 0x0000001e)");
         Ok(())
