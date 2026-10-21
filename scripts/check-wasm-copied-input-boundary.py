@@ -223,12 +223,24 @@ def check_transitive_runtime_dependency_overlay() -> None:
                 "value": 10,
                 "name": "$runtime0",
                 "expression": "i32load<memory0, align=2, offset=8>($arg0)",
+                "semantic_ir": {
+                    "kind": "operation",
+                    "value": 10,
+                    "operator": "i32load<memory0, align=2, offset=8>",
+                    "arguments": [{"kind": "argument", "index": 0}],
+                },
                 "runtime_dependencies": [],
             },
             {
                 "value": 20,
                 "name": "$runtime1",
                 "expression": "host.transform($runtime0)",
+                "semantic_ir": {
+                    "kind": "operation",
+                    "value": 20,
+                    "operator": "host.transform",
+                    "arguments": [{"kind": "runtime", "value": 10, "name": "$runtime0"}],
+                },
                 "runtime_dependencies": [10],
             },
         ],
@@ -236,6 +248,7 @@ def check_transitive_runtime_dependency_overlay() -> None:
             {
                 "value": 30,
                 "expression": "$runtime1",
+                "semantic_ir": {"kind": "runtime", "value": 20, "name": "$runtime1"},
                 "runtime_dependencies": [20],
             }
         ],
@@ -258,8 +271,63 @@ def check_transitive_runtime_dependency_overlay() -> None:
         dependency["source_element_index"]
         for dependency in semantic_return["source_word_dependencies"]
     ] == [2], semantic_return
-    # Presentation rewriting cannot see through runtime1. The structured DAG can.
+    # Presentation rewriting cannot see through runtime1. The structured DAG and
+    # source-aware IR can: runtime1 remains a runtime leaf but carries the exact
+    # copied source word reachable through runtime1 -> runtime0.
     assert semantic_return["source_word_expression"] == "$runtime1", semantic_return
+    assert semantic_return["source_word_semantic_ir"] == {
+        "kind": "runtime",
+        "value": 20,
+        "name": "$runtime1",
+        "source_word_dependencies": [
+            {
+                "load_value": 10,
+                "runtime_binding": "$runtime0",
+                "source_parameter": 0,
+                "source_element_index": 2,
+                "source_conversion": "ToUint32",
+            }
+        ],
+    }, semantic_return
+
+    inconsistent = json.loads(json.dumps(analysis))
+    inconsistent["returns"][0]["semantic_ir"] = {
+        "kind": "runtime",
+        "value": 10,
+        "name": "$runtime0",
+    }
+    bad_bindings, bad_returns, bad_graph = overlay(inconsistent, interpretations)
+    assert bad_graph is False, (bad_bindings, bad_returns)
+    assert bad_bindings == [] and bad_returns == [], (bad_bindings, bad_returns)
+
+    cyclic = json.loads(json.dumps(analysis))
+    cyclic["runtime_bindings"][0]["runtime_dependencies"] = [20]
+    cyclic["runtime_bindings"][0]["semantic_ir"] = {
+        "kind": "runtime",
+        "value": 20,
+        "name": "$runtime1",
+    }
+    cyclic["runtime_bindings"][1]["runtime_dependencies"] = [10]
+    cyclic["runtime_bindings"][1]["semantic_ir"] = {
+        "kind": "runtime",
+        "value": 10,
+        "name": "$runtime0",
+    }
+    cycle_bindings, cycle_returns, cycle_graph = overlay(cyclic, interpretations)
+    assert cycle_graph is False, (cycle_bindings, cycle_returns)
+    assert cycle_bindings == [] and cycle_returns == [], (cycle_bindings, cycle_returns)
+
+
+def source_word_ir_indices(expression: dict) -> list[int]:
+    if expression.get("kind") == "source_word":
+        return [expression["source_element_index"]]
+    if expression.get("kind") == "operation":
+        return [
+            index
+            for argument in expression.get("arguments", [])
+            for index in source_word_ir_indices(argument)
+        ]
+    return []
 
 
 def main() -> None:
@@ -307,7 +375,7 @@ def main() -> None:
     }, index
     module = index["modules"][0]
     deep = json.loads((PROJECT / module["deep_path"]).read_text())
-    assert deep["schema"] == "wasm-redox/deep-v11", deep
+    assert deep["schema"] == "wasm-redox/deep-v12", deep
     copy_export = next(row for row in deep["exports"] if row.get("export") == "copy")
     candidates = copy_export["analysis"]["externref_bulk_copy_candidates"]
     assert len(candidates) == 1, candidates
@@ -321,7 +389,7 @@ def main() -> None:
     assert all(load["copied_bytes_unmodified_since_set"] for load in candidate["destination_loads"]), candidate
 
     boundary = json.loads((PROJECT / "analysis/wasm-js-boundary.json").read_text())
-    assert boundary["schema"] == "wasm-js-boundary-correlation/v3", boundary
+    assert boundary["schema"] == "wasm-js-boundary-correlation/v4", boundary
     assert boundary["summary"]["host_effect_pairs"] == 0, boundary
     assert boundary["summary"]["copied_input_candidates"] == 1, boundary
     assert boundary["summary"]["proven_js_typed_array_copy_semantics"] == 1, boundary
@@ -371,6 +439,7 @@ def main() -> None:
     ), source_word_return
     assert "source_u32(arg0, 0)" in source_word_return["source_word_expression"], source_word_return
     assert "source_u32(arg0, 1)" in source_word_return["source_word_expression"], source_word_return
+    assert sorted(source_word_ir_indices(source_word_return["source_word_semantic_ir"])) == [0, 1], source_word_return
 
     fresh_js = (
         "var host = window;\n"
@@ -418,7 +487,7 @@ def main() -> None:
     assert fresh_index["summary"]["modules"] == 1, fresh_index
     fresh_module = fresh_index["modules"][0]
     fresh_deep = json.loads((FRESH_PROJECT / fresh_module["deep_path"]).read_text())
-    assert fresh_deep["schema"] == "wasm-redox/deep-v11", fresh_deep
+    assert fresh_deep["schema"] == "wasm-redox/deep-v12", fresh_deep
     fresh_copy = next(row for row in fresh_deep["exports"] if row.get("export") == "copy")
     [fresh_candidate] = fresh_copy["analysis"]["externref_bulk_copy_candidates"]
     assert fresh_candidate["destination_base_guaranteed_trailing_zero_bits"] == 0, fresh_candidate

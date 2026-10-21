@@ -425,6 +425,68 @@ def interpreted_destination_loads(
 RUNTIME_BINDING_TOKEN = re.compile(r"\$runtime\d+\b")
 
 
+def semantic_ir_runtime_values(
+    expression: object, runtime_by_value: dict[int, dict]
+) -> set[int] | None:
+    if not isinstance(expression, dict):
+        return None
+    kind = expression.get("kind")
+    if kind == "i32_const":
+        value = expression.get("value")
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 0xFFFFFFFF:
+            return None
+        return set()
+    if kind == "argument":
+        index = expression.get("index")
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            return None
+        return set()
+    if kind == "runtime":
+        value = expression.get("value")
+        name = expression.get("name")
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not isinstance(name, str)
+        ):
+            return None
+        binding = runtime_by_value.get(value)
+        if binding is None or binding.get("name") != name:
+            return None
+        return {value}
+    if kind == "symbol":
+        return set() if isinstance(expression.get("name"), str) else None
+    if kind == "ssa_value":
+        value = expression.get("value")
+        return (
+            set()
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            else None
+        )
+    if kind == "opaque":
+        return set() if isinstance(expression.get("expression"), str) else None
+    if kind == "operation":
+        value = expression.get("value")
+        operator = expression.get("operator")
+        arguments = expression.get("arguments")
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or not isinstance(operator, str)
+            or not isinstance(arguments, list)
+        ):
+            return None
+        runtime_values: set[int] = set()
+        for argument in arguments:
+            nested = semantic_ir_runtime_values(argument, runtime_by_value)
+            if nested is None:
+                return None
+            runtime_values.update(nested)
+        return runtime_values
+    return None
+
+
 def semantic_runtime_graph(
     analysis: dict,
 ) -> tuple[dict[int, dict], dict[int, tuple[int, ...]], list[dict]] | None:
@@ -441,12 +503,14 @@ def semantic_runtime_graph(
         value = binding.get("value")
         name = binding.get("name")
         expression = binding.get("expression")
+        semantic_ir = binding.get("semantic_ir")
         dependencies = binding.get("runtime_dependencies")
         if (
             not isinstance(value, int)
             or isinstance(value, bool)
             or not isinstance(name, str)
             or not isinstance(expression, str)
+            or not isinstance(semantic_ir, dict)
             or not isinstance(dependencies, list)
             or any(
                 not isinstance(dependency, int) or isinstance(dependency, bool)
@@ -467,17 +531,29 @@ def semantic_runtime_graph(
     ):
         return None
 
+    # Every structured runtime expression must contain exactly the runtime
+    # references claimed by its direct dependency list. This makes the graph
+    # and the IR independent cross-checks rather than two drifting views.
+    for value, binding in runtime_by_value.items():
+        semantic_dependencies = semantic_ir_runtime_values(
+            binding["semantic_ir"], runtime_by_value
+        )
+        if semantic_dependencies is None or semantic_dependencies != set(graph[value]):
+            return None
+
     normalized_returns = []
     for report in returns:
         if not isinstance(report, dict):
             return None
         value = report.get("value")
         expression = report.get("expression")
+        semantic_ir = report.get("semantic_ir")
         dependencies = report.get("runtime_dependencies")
         if (
             not isinstance(value, int)
             or isinstance(value, bool)
             or not isinstance(expression, str)
+            or not isinstance(semantic_ir, dict)
             or not isinstance(dependencies, list)
             or any(
                 not isinstance(dependency, int) or isinstance(dependency, bool)
@@ -486,6 +562,9 @@ def semantic_runtime_graph(
             or len(set(dependencies)) != len(dependencies)
             or any(dependency not in runtime_values for dependency in dependencies)
         ):
+            return None
+        semantic_dependencies = semantic_ir_runtime_values(semantic_ir, runtime_by_value)
+        if semantic_dependencies is None or semantic_dependencies != set(dependencies):
             return None
         normalized_returns.append(report)
 
@@ -536,6 +615,90 @@ def runtime_dependency_closure(
     return sorted(closure)
 
 
+def source_word_dependency_summary(overlay: dict) -> dict:
+    return {
+        "load_value": overlay["load_value"],
+        "runtime_binding": overlay["runtime_binding"],
+        "source_parameter": overlay["source_parameter"],
+        "source_element_index": overlay["source_element_index"],
+        "source_conversion": overlay.get("source_conversion"),
+    }
+
+
+def source_word_semantic_ir(
+    expression: dict,
+    runtime_by_value: dict[int, dict],
+    graph: dict[int, tuple[int, ...]],
+    source_by_value: dict[int, dict],
+) -> dict | None:
+    kind = expression.get("kind")
+    if kind == "runtime":
+        value = expression.get("value")
+        name = expression.get("name")
+        binding = runtime_by_value.get(value)
+        if binding is None or binding.get("name") != name:
+            return None
+        direct_source = source_by_value.get(value)
+        if direct_source is not None:
+            return {
+                "kind": "source_word",
+                **source_word_dependency_summary(direct_source),
+            }
+        closure = runtime_dependency_closure(graph, [value])
+        if closure is None:
+            return None
+        source_dependencies = [
+            source_word_dependency_summary(source_by_value[dependency])
+            for dependency in closure
+            if dependency in source_by_value
+        ]
+        source_dependencies.sort(
+            key=lambda row: (
+                row["source_parameter"],
+                row["source_element_index"],
+                row["load_value"],
+            )
+        )
+        return {
+            "kind": "runtime",
+            "value": value,
+            "name": name,
+            "source_word_dependencies": source_dependencies,
+        }
+    if kind == "operation":
+        value = expression.get("value")
+        arguments = expression.get("arguments")
+        operator = expression.get("operator")
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or not isinstance(operator, str)
+            or not isinstance(arguments, list)
+        ):
+            return None
+        transformed = []
+        for argument in arguments:
+            if not isinstance(argument, dict):
+                return None
+            transformed_argument = source_word_semantic_ir(
+                argument, runtime_by_value, graph, source_by_value
+            )
+            if transformed_argument is None:
+                return None
+            transformed.append(transformed_argument)
+        return {
+            "kind": "operation",
+            "value": value,
+            "operator": operator,
+            "arguments": transformed,
+        }
+    if kind in {"i32_const", "argument", "symbol", "ssa_value", "opaque"}:
+        # Shape validity has already been checked by semantic_runtime_graph.
+        return dict(expression)
+    return None
+
+
 def source_word_semantic_overlay(
     analysis: dict, destination_load_interpretations: list[dict]
 ) -> tuple[list[dict], list[dict], bool]:
@@ -568,6 +731,7 @@ def source_word_semantic_overlay(
             "load_value": value,
             "runtime_binding": binding["name"],
             "runtime_expression": binding.get("expression"),
+            "runtime_semantic_ir": binding.get("semantic_ir"),
             "runtime_dependencies": binding.get("runtime_dependencies"),
             "source_parameter": source_parameter,
             "source_element_index": source_index,
@@ -600,10 +764,17 @@ def source_word_semantic_overlay(
             )
         )
         expression = report["expression"]
+        annotated_ir = source_word_semantic_ir(
+            report["semantic_ir"], runtime_by_value, graph, source_by_value
+        )
+        if annotated_ir is None:
+            return overlays, [], False
         return_semantics.append(
             {
                 "return_value": report["value"],
                 "expression": expression,
+                "semantic_ir": report["semantic_ir"],
+                "source_word_semantic_ir": annotated_ir,
                 "runtime_dependencies": direct_dependencies,
                 "transitive_runtime_dependencies": transitive_dependencies,
                 "source_word_dependencies": source_dependencies,
@@ -1104,18 +1275,18 @@ def main() -> None:
         report = load(project / module["report_path"])
         # module.report preserves WASM import-section order; filtering to function
         # imports therefore preserves the WebAssembly function-index prefix used
-        # by deep-v11 host_import_function.
+        # by deep-v12 host_import_function.
         function_imports = [
             imported
             for imported in report.get("imports", [])
             if imported.get("kind") == "function"
         ]
-        if deep.get("schema") != "wasm-redox/deep-v11":
+        if deep.get("schema") != "wasm-redox/deep-v12":
             skipped_modules.append(
                 {
                     "sha256": module.get("sha256"),
                     "schema": deep.get("schema"),
-                    "reason": "host-effect/read proof requires wasm-redox/deep-v11",
+                    "reason": "host-effect/read proof requires wasm-redox/deep-v12",
                 }
             )
             continue
@@ -1559,11 +1730,11 @@ def main() -> None:
 
     out = {
         "schema": WASM_JS_BOUNDARY.schema,
-        "wasm_schema_required": "wasm-redox/deep-v11",
+        "wasm_schema_required": "wasm-redox/deep-v12",
         "js_schema": "jsvm-wasm-import-semantics/v8",
         "safe_static_only": True,
         "bounded_wasm_ir_interpretation": True,
-        "source_word_semantic_overlay_contract": "deep runtime bindings and semantic returns preserve exact SSA runtime-dependency edges; post-correlation source-word facts join by exact value identity and transitive source-word return dependencies are proven by graph reachability. Generated $runtimeN replacement is presentation only.",
+        "source_word_semantic_overlay_contract": "deep runtime bindings and semantic returns preserve structured semantic IR plus exact SSA runtime-dependency edges; the boundary validates that each IR runtime leaf set exactly matches its declared direct dependencies. Proven copied loads become source_word leaves in the boundary semantic IR; unmatched runtime leaves retain exact identity plus transitive source-word provenance. Generated $runtimeN replacement is presentation only.",
         "correlation_contract": (
             "cross-language claims require exact WASM import module+name matches. "
             "Host-effect writes and typed-array input-copy candidates remain independent evidence "

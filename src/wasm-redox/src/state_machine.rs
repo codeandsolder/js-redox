@@ -27,7 +27,7 @@ pub use reporting::{
 };
 #[cfg(test)]
 use scalar::{fold_closed_i32_expression, render_scalar_family, try_eval_i32_expression};
-pub use semantic_render::{SemanticReturnReport, SemanticRuntimeBindingReport};
+pub use semantic_render::{SemanticExpression, SemanticReturnReport, SemanticRuntimeBindingReport};
 
 #[cfg(test)]
 mod tests {
@@ -40,6 +40,20 @@ mod tests {
             .iter()
             .map(|report| report.expression.as_str())
             .collect()
+    }
+
+    fn semantic_runtime_values(expression: &SemanticExpression) -> BTreeSet<usize> {
+        match expression {
+            SemanticExpression::Runtime { value, .. } => [*value].into_iter().collect(),
+            SemanticExpression::Operation { arguments, .. } => {
+                arguments.iter().flat_map(semantic_runtime_values).collect()
+            }
+            SemanticExpression::I32Const { .. }
+            | SemanticExpression::Argument { .. }
+            | SemanticExpression::Symbol { .. }
+            | SemanticExpression::SsaValue { .. }
+            | SemanticExpression::Opaque { .. } => BTreeSet::new(),
+        }
     }
 
     #[test]
@@ -1245,6 +1259,67 @@ mod tests {
             analysis.returns[0].runtime_dependencies,
             [analysis.runtime_bindings[0].value]
         );
+        assert_eq!(
+            semantic_runtime_values(&analysis.returns[0].semantic_ir),
+            analysis.returns[0]
+                .runtime_dependencies
+                .iter()
+                .copied()
+                .collect()
+        );
+        assert!(matches!(
+            &analysis.returns[0].semantic_ir,
+            SemanticExpression::Operation { operator, arguments, .. }
+                if operator == "i32add"
+                    && matches!(&arguments[..], [
+                        SemanticExpression::Runtime { value: left, .. },
+                        SemanticExpression::Runtime { value: right, .. }
+                    ] if left == right && *left == analysis.runtime_bindings[0].value)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_ir_reuses_shared_pure_ssa_by_value_reference() -> Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (func (export "run") (param $input i32) (result i32)
+                    (local $shared i32)
+                    local.get $input
+                    i32.const 1
+                    i32.add
+                    local.set $shared
+                    local.get $shared
+                    local.get $shared
+                    i32.mul))"#,
+        )?;
+
+        let analysis = analyze_export_semantics(&bytes, "run")?;
+        assert!(analysis.returns[0].runtime_dependencies.is_empty());
+        let SemanticExpression::Operation {
+            operator,
+            arguments,
+            ..
+        } = &analysis.returns[0].semantic_ir
+        else {
+            anyhow::bail!("expected multiply root")
+        };
+        assert_eq!(operator, "i32mul");
+        assert_eq!(arguments.len(), 2);
+        let expanded_value = arguments.iter().find_map(|argument| match argument {
+            SemanticExpression::Operation {
+                value,
+                operator,
+                arguments: add_arguments,
+            } if operator == "i32add" && add_arguments.len() == 2 => Some(*value),
+            _ => None,
+        });
+        let referenced_value = arguments.iter().find_map(|argument| match argument {
+            SemanticExpression::SsaValue { value } => Some(*value),
+            _ => None,
+        });
+        assert_eq!(expanded_value, referenced_value);
+        assert!(expanded_value.is_some());
         Ok(())
     }
 
@@ -1268,8 +1343,31 @@ mod tests {
         assert!(inner.runtime_dependencies.is_empty());
         assert_eq!(outer.expression, "host.transform($runtime0)");
         assert_eq!(outer.runtime_dependencies, [inner.value]);
+        assert_eq!(
+            semantic_runtime_values(&outer.semantic_ir),
+            outer.runtime_dependencies.iter().copied().collect()
+        );
+        assert!(matches!(
+            &outer.semantic_ir,
+            SemanticExpression::Operation { operator, arguments, .. }
+                if operator == "host.transform"
+                    && matches!(&arguments[..], [SemanticExpression::Runtime { value, .. }] if *value == inner.value)
+        ));
         assert_eq!(return_expressions(&analysis), ["$runtime1"]);
         assert_eq!(analysis.returns[0].runtime_dependencies, [outer.value]);
+        assert_eq!(
+            semantic_runtime_values(&analysis.returns[0].semantic_ir),
+            analysis.returns[0]
+                .runtime_dependencies
+                .iter()
+                .copied()
+                .collect()
+        );
+        assert!(matches!(
+            &analysis.returns[0].semantic_ir,
+            SemanticExpression::Runtime { value, name }
+                if *value == outer.value && name == "$runtime1"
+        ));
         Ok(())
     }
 

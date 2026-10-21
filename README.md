@@ -129,9 +129,11 @@ The string-recovery CLI likewise reads and writes explicit UTF-8 bytes rather th
 
 ## WebAssembly recovery
 
-WASM is treated as another exact binary source, not as an opaque attachment. Captured and statically recoverable inline modules are content-addressed while preserving every origin; readable WAT and deeper analysis are derived artifacts. The current machine contracts are `wasm-redox/deep-v11`, `jsvm-wasm-import-semantics/v8`, and `wasm-js-boundary-correlation/v3`.
+WASM is treated as another exact binary source, not as an opaque attachment. Captured and statically recoverable inline modules are content-addressed while preserving every origin; readable WAT and deeper analysis are derived artifacts. The current machine contracts are `wasm-redox/deep-v12`, `jsvm-wasm-import-semantics/v8`, and `wasm-js-boundary-correlation/v4`.
 
 The JavaScript/WASM boundary is fail-closed. The correlation layer can prove exact recovered module bytes, exact import-object binding, instance/export/module-memory identity, selected typed-array copy semantics, destination alignment, and whether intervening linear-memory effects can touch the copied interval. Concrete input-word interpretation is emitted only when both byte integrity and alignment are independently proven; ambiguous host effects or unconstrained memory writes remain barriers.
+
+Deep semantic returns and runtime boundaries also carry a structured expression IR alongside the readable expression string. Runtime-reference leaves are keyed by exact Waffle SSA value identity, and their leaf set must exactly equal the separately recorded direct runtime-dependency edges. Boundary correlation preserves that structure: proven copied-input loads become `source_word` leaves, while other runtime leaves retain their identity plus any transitively proven source-word provenance. The rendered `$runtimeN`/`source_u32(...)` expression remains a human-readable projection, not the proof substrate.
 
 `fresh-eval` is a bounded proof helper for closed internal `i32` computations. It can execute a sequence of internal calls in one fresh interpreter state, feed earlier proven results into later calls, and report the relevant memory accesses. Imported calls, unsupported mutable host state, ambiguous control flow, and exhausted fuel fail closed. Public synthetic fixtures exercise the complete proof boundary; private real-world corpus material is validation data rather than hard-coded names, addresses, or exceptions.
 
