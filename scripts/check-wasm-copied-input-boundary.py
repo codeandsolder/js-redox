@@ -298,6 +298,23 @@ def check_transitive_runtime_dependency_overlay() -> None:
     assert bad_graph is False, (bad_bindings, bad_returns)
     assert bad_bindings == [] and bad_returns == [], (bad_bindings, bad_returns)
 
+    cyclic = json.loads(json.dumps(analysis))
+    cyclic["runtime_bindings"][0]["runtime_dependencies"] = [20]
+    cyclic["runtime_bindings"][0]["semantic_ir"] = {
+        "kind": "runtime",
+        "value": 20,
+        "name": "$runtime1",
+    }
+    cyclic["runtime_bindings"][1]["runtime_dependencies"] = [10]
+    cyclic["runtime_bindings"][1]["semantic_ir"] = {
+        "kind": "runtime",
+        "value": 10,
+        "name": "$runtime0",
+    }
+    cycle_bindings, cycle_returns, cycle_graph = overlay(cyclic, interpretations)
+    assert cycle_graph is False, (cycle_bindings, cycle_returns)
+    assert cycle_bindings == [] and cycle_returns == [], (cycle_bindings, cycle_returns)
+
 
 def source_word_ir_indices(expression: dict) -> list[int]:
     if expression.get("kind") == "source_word":
