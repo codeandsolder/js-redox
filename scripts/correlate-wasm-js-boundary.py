@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
 import subprocess
 from pathlib import Path
 
@@ -422,9 +421,6 @@ def interpreted_destination_loads(
     return interpreted, source_length
 
 
-RUNTIME_BINDING_TOKEN = re.compile(r"\$runtime\d+\b")
-
-
 def semantic_ir_runtime_values(
     expression: object, runtime_by_value: dict[int, dict]
 ) -> set[int] | None:
@@ -750,6 +746,88 @@ def source_word_semantic_ir(
     return None
 
 
+def render_source_word_semantic_ir(expression: object) -> str | None:
+    if not isinstance(expression, dict):
+        return None
+    kind = expression.get("kind")
+    if kind == "i32_const":
+        value = expression.get("value")
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 0xFFFFFFFF:
+            return None
+        return f"0x{value:08x}"
+    if kind == "argument":
+        index = expression.get("index")
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            return None
+        return f"$arg{index}"
+    if kind in {"runtime", "symbol"}:
+        name = expression.get("name")
+        return name if isinstance(name, str) else None
+    if kind == "source_word":
+        parameter = expression.get("source_parameter")
+        index = expression.get("source_element_index")
+        if (
+            not isinstance(parameter, int)
+            or isinstance(parameter, bool)
+            or parameter < 0
+            or not isinstance(index, int)
+            or isinstance(index, bool)
+            or index < 0
+        ):
+            return None
+        return f"source_u32(arg{parameter}, {index})"
+    if kind == "ssa_value":
+        value = expression.get("value")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        return f"v{value}"
+    if kind == "opaque":
+        opaque = expression.get("expression")
+        return opaque if isinstance(opaque, str) else None
+    if kind != "operation":
+        return None
+    operator = expression.get("operator")
+    arguments = expression.get("arguments")
+    if not isinstance(operator, str) or not isinstance(arguments, list):
+        return None
+    rendered = [render_source_word_semantic_ir(argument) for argument in arguments]
+    if any(argument is None for argument in rendered):
+        return None
+    args = [argument for argument in rendered if argument is not None]
+    if operator == "wasm.memory_grow" and len(args) == 2:
+        return f"wasm.memory_grow({args[0]}, externref_slot={args[1]})"
+    if len(args) == 1 and operator == "i32eqz":
+        return f"is_zero({args[0]})"
+    if len(args) == 2:
+        left, right = args
+        binary = {
+            "i32add": f"wrapping_add({left}, {right})",
+            "i32sub": f"wrapping_sub({left}, {right})",
+            "i32mul": f"wrapping_mul({left}, {right})",
+            "i32and": f"({left} & {right})",
+            "i32or": f"({left} | {right})",
+            "i32xor": f"({left} ^ {right})",
+            "i32shl": f"({left} << {right})",
+            "i32shrs": f"ashr({left}, {right})",
+            "i32shru": f"({left} >> {right})",
+            "i32rotl": f"rotl({left}, {right})",
+            "i32rotr": f"rotr({left}, {right})",
+            "i32eq": f"({left} == {right})",
+            "i32ne": f"({left} != {right})",
+            "i32ltu": f"ult({left}, {right})",
+            "i32leu": f"ule({left}, {right})",
+            "i32gtu": f"ugt({left}, {right})",
+            "i32geu": f"uge({left}, {right})",
+            "i32lts": f"slt({left}, {right})",
+            "i32les": f"sle({left}, {right})",
+            "i32gts": f"sgt({left}, {right})",
+            "i32ges": f"sge({left}, {right})",
+        }.get(operator)
+        if binary is not None:
+            return binary
+    return f"{operator}({', '.join(args)})"
+
+
 def source_word_semantic_overlay(
     analysis: dict, destination_load_interpretations: list[dict]
 ) -> tuple[list[dict], list[dict], bool]:
@@ -759,7 +837,6 @@ def source_word_semantic_overlay(
     runtime_by_value, graph, returns = graph_info
 
     overlays: list[dict] = []
-    replacements: dict[str, str] = {}
     source_by_value: dict[int, dict] = {}
     for interpretation in destination_load_interpretations:
         value = interpretation.get("load_value")
@@ -792,7 +869,6 @@ def source_word_semantic_overlay(
         }
         overlays.append(overlay)
         source_by_value[value] = overlay
-        replacements[binding["name"]] = semantic_expression
 
     if not overlays:
         return [], [], True
@@ -824,6 +900,12 @@ def source_word_semantic_overlay(
         )
         if annotated_ir is None or normalized_annotated_ir is None:
             return overlays, [], False
+        source_word_expression = render_source_word_semantic_ir(annotated_ir)
+        normalized_source_word_expression = render_source_word_semantic_ir(
+            normalized_annotated_ir
+        )
+        if source_word_expression is None or normalized_source_word_expression is None:
+            return overlays, [], False
         return_semantics.append(
             {
                 "return_value": report["value"],
@@ -835,12 +917,10 @@ def source_word_semantic_overlay(
                 "runtime_dependencies": direct_dependencies,
                 "transitive_runtime_dependencies": transitive_dependencies,
                 "source_word_dependencies": source_dependencies,
-                # Presentation only. Dependency proof above is entirely based on
-                # SSA value identity and the explicit runtime DAG.
-                "source_word_expression": RUNTIME_BINDING_TOKEN.sub(
-                    lambda match: replacements.get(match.group(0), match.group(0)),
-                    expression,
-                ),
+                # Presentation only. Render the already validated structured IR;
+                # no runtime-token parsing participates in proof or display.
+                "raw_source_word_expression": source_word_expression,
+                "source_word_expression": normalized_source_word_expression,
             }
         )
     return overlays, return_semantics, True
@@ -1332,18 +1412,18 @@ def main() -> None:
         report = load(project / module["report_path"])
         # module.report preserves WASM import-section order; filtering to function
         # imports therefore preserves the WebAssembly function-index prefix used
-        # by deep-v13 host_import_function.
+        # by deep-v14 host_import_function.
         function_imports = [
             imported
             for imported in report.get("imports", [])
             if imported.get("kind") == "function"
         ]
-        if deep.get("schema") != "wasm-redox/deep-v13":
+        if deep.get("schema") != "wasm-redox/deep-v14":
             skipped_modules.append(
                 {
                     "sha256": module.get("sha256"),
                     "schema": deep.get("schema"),
-                    "reason": "host-effect/read proof requires wasm-redox/deep-v13",
+                    "reason": "host-effect/read proof requires wasm-redox/deep-v14",
                 }
             )
             continue
@@ -1787,11 +1867,11 @@ def main() -> None:
 
     out = {
         "schema": WASM_JS_BOUNDARY.schema,
-        "wasm_schema_required": "wasm-redox/deep-v13",
+        "wasm_schema_required": "wasm-redox/deep-v14",
         "js_schema": "jsvm-wasm-import-semantics/v8",
         "safe_static_only": True,
         "bounded_wasm_ir_interpretation": True,
-        "source_word_semantic_overlay_contract": "deep runtime bindings and semantic returns preserve raw plus normalized structured semantic IR and exact SSA runtime-dependency edges. Boundary validation requires both IR forms to have the same exact runtime leaf set as the declared direct dependencies and to contain no duplicate definitions or dangling SSA references. Proven copied loads become source_word leaves in both boundary IR forms; unmatched runtime leaves retain exact identity plus transitive source-word provenance. Generated $runtimeN replacement is presentation only.",
+        "source_word_semantic_overlay_contract": "deep runtime bindings and semantic returns preserve raw plus normalized structured semantic IR and exact SSA runtime-dependency edges. Boundary validation requires both IR forms to have the same exact runtime leaf set as the declared direct dependencies and to contain no duplicate definitions or dangling SSA references. Proven copied loads become source_word leaves in both boundary IR forms; unmatched runtime leaves retain exact identity plus transitive source-word provenance. Presentation is rendered from the validated structured IR; no $runtimeN text matching is used.",
         "correlation_contract": (
             "cross-language claims require exact WASM import module+name matches. "
             "Host-effect writes and typed-array input-copy candidates remain independent evidence "
