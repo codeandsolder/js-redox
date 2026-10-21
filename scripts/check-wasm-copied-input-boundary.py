@@ -225,6 +225,7 @@ def check_transitive_runtime_dependency_overlay() -> None:
                 "expression": "i32load<memory0, align=2, offset=8>($arg0)",
                 "semantic_ir": {
                     "kind": "operation",
+                    "value": 10,
                     "operator": "i32load<memory0, align=2, offset=8>",
                     "arguments": [{"kind": "argument", "index": 0}],
                 },
@@ -236,6 +237,7 @@ def check_transitive_runtime_dependency_overlay() -> None:
                 "expression": "host.transform($runtime0)",
                 "semantic_ir": {
                     "kind": "operation",
+                    "value": 20,
                     "operator": "host.transform",
                     "arguments": [{"kind": "runtime", "value": 10, "name": "$runtime0"}],
                 },

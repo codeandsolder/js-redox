@@ -466,9 +466,16 @@ def semantic_ir_runtime_values(
     if kind == "opaque":
         return set() if isinstance(expression.get("expression"), str) else None
     if kind == "operation":
+        value = expression.get("value")
         operator = expression.get("operator")
         arguments = expression.get("arguments")
-        if not isinstance(operator, str) or not isinstance(arguments, list):
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or not isinstance(operator, str)
+            or not isinstance(arguments, list)
+        ):
             return None
         runtime_values: set[int] = set()
         for argument in arguments:
@@ -659,9 +666,16 @@ def source_word_semantic_ir(
             "source_word_dependencies": source_dependencies,
         }
     if kind == "operation":
+        value = expression.get("value")
         arguments = expression.get("arguments")
         operator = expression.get("operator")
-        if not isinstance(operator, str) or not isinstance(arguments, list):
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or not isinstance(operator, str)
+            or not isinstance(arguments, list)
+        ):
             return None
         transformed = []
         for argument in arguments:
@@ -675,6 +689,7 @@ def source_word_semantic_ir(
             transformed.append(transformed_argument)
         return {
             "kind": "operation",
+            "value": value,
             "operator": operator,
             "arguments": transformed,
         }
