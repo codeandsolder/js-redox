@@ -4,12 +4,12 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 project="$root/src/jsvm-lift"
 publish_root="$root/.cargo-target-nodebug"
-toolchain="/opt/toolchains/rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu"
-cargo_bin="$toolchain/bin/cargo"
-rustc_bin="$toolchain/bin/rustc"
+toolchain="$(cd "$root" && rustup show active-toolchain | awk '{print $1}')"
+cargo_bin="$(RUSTUP_TOOLCHAIN="$toolchain" rustup which cargo)"
+rustc_bin="$(RUSTUP_TOOLCHAIN="$toolchain" rustup which rustc)"
 
 export RUSTC="$rustc_bin"
-export RUSTUP_TOOLCHAIN="1.99.0-x86_64-unknown-linux-gnu"
+export RUSTUP_TOOLCHAIN="$toolchain"
 export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_PROFILE_DEV_INCREMENTAL=false
 
