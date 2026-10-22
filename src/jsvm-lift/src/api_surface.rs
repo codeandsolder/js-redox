@@ -224,6 +224,125 @@ fn allowed_xhr_path(path: &str) -> bool {
     )
 }
 
+fn sink_family(path: &str) -> Option<&'static str> {
+    if allowed_fetch_path(path) {
+        Some("fetch")
+    } else if allowed_send_beacon_path(path) {
+        Some("send_beacon")
+    } else if allowed_websocket_path(path) {
+        Some("websocket")
+    } else if allowed_xhr_path(path) {
+        Some("xhr")
+    } else {
+        None
+    }
+}
+
+fn assignment_global_path(
+    scoping: &Scoping,
+    target: &oxc_ast::ast::AssignmentTarget<'_>,
+) -> Option<String> {
+    match target {
+        oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+            let reference = scoping.get_reference(identifier.reference_id.get()?);
+            reference
+                .symbol_id()
+                .is_none()
+                .then(|| identifier.name.to_string())
+        }
+        oxc_ast::ast::AssignmentTarget::StaticMemberExpression(member) if !member.optional => {
+            Some(format!(
+                "{}.{}",
+                global_path(scoping, &member.object)?,
+                member.property.name
+            ))
+        }
+        oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
+            let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
+                return None;
+            };
+            Some(format!(
+                "{}.{}",
+                global_path(scoping, &member.object)?,
+                property.value
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn simple_assignment_global_path(
+    scoping: &Scoping,
+    target: &oxc_ast::ast::SimpleAssignmentTarget<'_>,
+) -> Option<String> {
+    match target {
+        oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+            let reference = scoping.get_reference(identifier.reference_id.get()?);
+            reference
+                .symbol_id()
+                .is_none()
+                .then(|| identifier.name.to_string())
+        }
+        oxc_ast::ast::SimpleAssignmentTarget::StaticMemberExpression(member)
+            if !member.optional =>
+        {
+            Some(format!(
+                "{}.{}",
+                global_path(scoping, &member.object)?,
+                member.property.name
+            ))
+        }
+        oxc_ast::ast::SimpleAssignmentTarget::ComputedMemberExpression(member)
+            if !member.optional =>
+        {
+            let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
+                return None;
+            };
+            Some(format!(
+                "{}.{}",
+                global_path(scoping, &member.object)?,
+                property.value
+            ))
+        }
+        _ => None,
+    }
+}
+
+struct SinkMutationCollector<'c> {
+    scoping: &'c Scoping,
+    mutated: BTreeSet<&'static str>,
+}
+
+impl SinkMutationCollector<'_> {
+    fn record(&mut self, path: Option<String>) {
+        if let Some(family) = path.as_deref().and_then(sink_family) {
+            self.mutated.insert(family);
+        }
+    }
+}
+
+impl<'a> Visit<'a> for SinkMutationCollector<'_> {
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        self.record(assignment_global_path(self.scoping, &assignment.left));
+        walk::walk_assignment_expression(self, assignment);
+    }
+
+    fn visit_update_expression(&mut self, update: &oxc_ast::ast::UpdateExpression<'a>) {
+        self.record(simple_assignment_global_path(
+            self.scoping,
+            &update.argument,
+        ));
+        walk::walk_update_expression(self, update);
+    }
+
+    fn visit_unary_expression(&mut self, unary: &oxc_ast::ast::UnaryExpression<'a>) {
+        if unary.operator.as_str() == "delete" {
+            self.record(global_path(self.scoping, &unary.argument));
+        }
+        walk::walk_unary_expression(self, unary);
+    }
+}
+
 fn exact_argument(
     source: &str,
     argument: Option<&oxc_ast::ast::Argument<'_>>,
@@ -243,6 +362,7 @@ fn exact_argument(
 struct XhrBindingCollector<'c> {
     scoping: &'c Scoping,
     safe_member_refs: &'c BTreeSet<ReferenceId>,
+    standard_xhr_available: bool,
     symbols: BTreeSet<SymbolId>,
 }
 
@@ -253,9 +373,10 @@ impl<'a> Visit<'a> for XhrBindingCollector<'_> {
         {
             let initializer = unparenthesized(initializer);
             if let Expression::NewExpression(new_expression) = initializer {
-                if global_path(self.scoping, &new_expression.callee)
-                    .as_deref()
-                    .is_some_and(allowed_xhr_path)
+                if self.standard_xhr_available
+                    && global_path(self.scoping, &new_expression.callee)
+                        .as_deref()
+                        .is_some_and(allowed_xhr_path)
                 {
                     if let Some(symbol) = identifier.symbol_id.get() {
                         if symbol_is_safe_xhr_receiver(self.scoping, symbol, self.safe_member_refs)
@@ -273,6 +394,7 @@ impl<'a> Visit<'a> for XhrBindingCollector<'_> {
 struct Collector<'s, 'c> {
     source: &'s str,
     scoping: &'c Scoping,
+    mutated_sinks: &'c BTreeSet<&'static str>,
     xhr_symbols: &'c BTreeSet<SymbolId>,
     lines: LineIndex,
     callsites: BTreeSet<ApiCallsite>,
@@ -332,7 +454,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
             if let Some(path) = global_path(self.scoping, &call.callee) {
-                if allowed_fetch_path(&path) {
+                if allowed_fetch_path(&path) && !self.mutated_sinks.contains("fetch") {
                     let (url, url_expression) = exact_argument(self.source, call.arguments.first());
                     let method =
                         (call.arguments.len() == 1 && url.is_some()).then(|| "GET".to_string());
@@ -344,7 +466,9 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                         (method, None),
                         (url, url_expression),
                     );
-                } else if allowed_send_beacon_path(&path) {
+                } else if allowed_send_beacon_path(&path)
+                    && !self.mutated_sinks.contains("send_beacon")
+                {
                     let (url, url_expression) = exact_argument(self.source, call.arguments.first());
                     self.push(
                         "send_beacon",
@@ -378,7 +502,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
 
     fn visit_new_expression(&mut self, expression: &NewExpression<'a>) {
         if let Some(path) = global_path(self.scoping, &expression.callee) {
-            if allowed_websocket_path(&path) {
+            if allowed_websocket_path(&path) && !self.mutated_sinks.contains("websocket") {
                 let (url, url_expression) =
                     exact_argument(self.source, expression.arguments.first());
                 self.push(
@@ -444,9 +568,16 @@ pub fn analyze_api_surface(source: &str) -> Result<Vec<ApiCallsite>> {
         let mut safe_member_refs = SafeMemberReferenceCollector::default();
         safe_member_refs.visit_program(&program);
 
+        let mut mutations = SinkMutationCollector {
+            scoping,
+            mutated: BTreeSet::new(),
+        };
+        mutations.visit_program(&program);
+
         let mut xhr = XhrBindingCollector {
             scoping,
             safe_member_refs: &safe_member_refs.refs,
+            standard_xhr_available: !mutations.mutated.contains("xhr"),
             symbols: BTreeSet::new(),
         };
         xhr.visit_program(&program);
@@ -454,6 +585,7 @@ pub fn analyze_api_surface(source: &str) -> Result<Vec<ApiCallsite>> {
         let mut collector = Collector {
             source,
             scoping,
+            mutated_sinks: &mutations.mutated,
             xhr_symbols: &xhr.symbols,
             lines: LineIndex::new(source),
             callsites: BTreeSet::new(),
@@ -528,6 +660,38 @@ fetch("https://api.example.test/default-get");
         assert_eq!(
             rows[1].url.as_deref(),
             Some("https://api.example.test/default-get")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_visibly_monkey_patched_standard_sink_families() -> Result<()> {
+        let source = r#"
+fetch = fakeFetch;
+fetch("https://fake.invalid/fetch");
+window["fetch"]("https://fake.invalid/window-fetch");
+navigator.sendBeacon = fakeBeacon;
+navigator.sendBeacon("https://fake.invalid/beacon", body);
+WebSocket = FakeSocket;
+new WebSocket("wss://fake.invalid/socket");
+XMLHttpRequest = FakeXhr;
+const xhr = new XMLHttpRequest();
+xhr.open("GET", "https://fake.invalid/xhr");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert!(rows.is_empty(), "{rows:#?}");
+
+        let selective = r#"
+window.fetch = fakeFetch;
+window.fetch("https://fake.invalid/fetch");
+navigator.sendBeacon("https://real.example.test/beacon", body);
+"#;
+        let rows = analyze_api_surface(selective)?;
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        assert_eq!(rows[0].kind, "send_beacon");
+        assert_eq!(
+            rows[0].url.as_deref(),
+            Some("https://real.example.test/beacon")
         );
         Ok(())
     }
