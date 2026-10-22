@@ -334,12 +334,8 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             if let Some(path) = global_path(self.scoping, &call.callee) {
                 if allowed_fetch_path(&path) {
                     let (url, url_expression) = exact_argument(self.source, call.arguments.first());
-                    let method = (call.arguments.len() == 1
-                        && call
-                            .arguments
-                            .first()
-                            .is_some_and(|argument| argument.as_expression().is_some()))
-                    .then(|| "GET".to_string());
+                    let method =
+                        (call.arguments.len() == 1 && url.is_some()).then(|| "GET".to_string());
                     self.push(
                         "fetch",
                         call.span,
@@ -513,6 +509,26 @@ xhr.send(payload);
         assert_eq!(rows[5].kind, "xhr_open");
         assert_eq!(rows[5].method.as_deref(), Some("POST"));
         assert_eq!(rows[5].line, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_request_object_does_not_claim_default_get() -> Result<()> {
+        let source = r#"
+const request = new Request("https://api.example.test/items", { method: "POST" });
+fetch(request);
+fetch("https://api.example.test/default-get");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        assert_eq!(rows[0].kind, "fetch");
+        assert_eq!(rows[0].method, None);
+        assert_eq!(rows[0].url, None);
+        assert_eq!(rows[1].method.as_deref(), Some("GET"));
+        assert_eq!(
+            rows[1].url.as_deref(),
+            Some("https://api.example.test/default-get")
+        );
         Ok(())
     }
 
