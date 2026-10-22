@@ -36,7 +36,6 @@ jobs:
           printf '%s\n' "$stats"
           /usr/bin/grep -q 'L0 (s3)' <<<"$stats"
           ! /usr/bin/grep -q 'Cache location                  Local disk' <<<"$stats"
-      - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
       - name: Test
@@ -59,7 +58,6 @@ jobs:
           printf '%s\n' "$stats"
           /usr/bin/grep -q 'L0 (s3)' <<<"$stats"
           ! /usr/bin/grep -q 'Cache location                  Local disk' <<<"$stats"
-      - uses: Swatinem/rust-cache@v2
       - name: Install uv
         uses: astral-sh/setup-uv@v10.3.0
         with:
