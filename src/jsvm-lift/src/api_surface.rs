@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BindingPattern, CallExpression, Expression, NewExpression, Program, VariableDeclarator,
-    WithStatement,
+    BindingPattern, CallExpression, ComputedMemberExpression, Expression, NewExpression, Program,
+    StaticMemberExpression, VariableDeclarator, WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
-use oxc_semantic::{Scoping, SemanticBuilder};
+use oxc_semantic::{ReferenceId, Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::symbol::SymbolId;
 use rolldown_redox::ecmascript::parse_program;
@@ -50,14 +50,60 @@ fn expression_symbol(scoping: &Scoping, expression: &Expression<'_>) -> Option<S
         .symbol_id()
 }
 
-fn symbol_is_stable(scoping: &Scoping, symbol: SymbolId) -> bool {
+fn symbol_is_safe_xhr_receiver(
+    scoping: &Scoping,
+    symbol: SymbolId,
+    safe_member_refs: &BTreeSet<ReferenceId>,
+) -> bool {
     scoping
         .get_resolved_reference_ids(symbol)
         .iter()
         .all(|reference_id| {
             let reference = scoping.get_reference(*reference_id);
-            !reference.is_write() && !reference.flags().is_member_write_target()
+            safe_member_refs.contains(reference_id)
+                && !reference.is_write()
+                && !reference.flags().is_member_write_target()
         })
+}
+
+fn direct_reference_id(expression: &Expression<'_>) -> Option<ReferenceId> {
+    let Expression::Identifier(identifier) = unparenthesized(expression) else {
+        return None;
+    };
+    identifier.reference_id.get()
+}
+
+fn safe_xhr_member_name(name: &str) -> bool {
+    !matches!(name, "constructor" | "__proto__" | "prototype")
+}
+
+#[derive(Default)]
+struct SafeMemberReferenceCollector {
+    refs: BTreeSet<ReferenceId>,
+}
+
+impl<'a> Visit<'a> for SafeMemberReferenceCollector {
+    fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
+        if !member.optional && safe_xhr_member_name(member.property.name.as_str()) {
+            if let Some(reference_id) = direct_reference_id(&member.object) {
+                self.refs.insert(reference_id);
+            }
+        }
+        walk::walk_static_member_expression(self, member);
+    }
+
+    fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
+        if !member.optional {
+            if let Expression::StringLiteral(property) = unparenthesized(&member.expression) {
+                if safe_xhr_member_name(property.value.as_str()) {
+                    if let Some(reference_id) = direct_reference_id(&member.object) {
+                        self.refs.insert(reference_id);
+                    }
+                }
+            }
+        }
+        walk::walk_computed_member_expression(self, member);
+    }
 }
 
 fn global_path(scoping: &Scoping, expression: &Expression<'_>) -> Option<String> {
@@ -196,6 +242,7 @@ fn exact_argument(
 
 struct XhrBindingCollector<'c> {
     scoping: &'c Scoping,
+    safe_member_refs: &'c BTreeSet<ReferenceId>,
     symbols: BTreeSet<SymbolId>,
 }
 
@@ -211,7 +258,8 @@ impl<'a> Visit<'a> for XhrBindingCollector<'_> {
                     .is_some_and(allowed_xhr_path)
                 {
                     if let Some(symbol) = identifier.symbol_id.get() {
-                        if symbol_is_stable(self.scoping, symbol) {
+                        if symbol_is_safe_xhr_receiver(self.scoping, symbol, self.safe_member_refs)
+                        {
                             self.symbols.insert(symbol);
                         }
                     }
@@ -397,8 +445,12 @@ pub fn analyze_api_surface(source: &str) -> Result<Vec<ApiCallsite>> {
         }
         let scoping = semantic.semantic.scoping();
 
+        let mut safe_member_refs = SafeMemberReferenceCollector::default();
+        safe_member_refs.visit_program(&program);
+
         let mut xhr = XhrBindingCollector {
             scoping,
+            safe_member_refs: &safe_member_refs.refs,
             symbols: BTreeSet::new(),
         };
         xhr.visit_program(&program);
@@ -506,6 +558,34 @@ fetch("https://classic.example.test/");
     fn with_statement_fails_closed() {
         let source = r#"with (scope) { fetch("https://ambiguous.example.test/"); }"#;
         assert!(analyze_api_surface(source).is_err());
+    }
+
+    #[test]
+    fn xhr_receiver_must_not_escape_or_reach_prototype_mutation() -> Result<()> {
+        let source = r#"
+const aliased = new XMLHttpRequest();
+const alias = aliased;
+alias.open = fakeOpen;
+aliased.open("GET", "https://fake.invalid/alias");
+const passed = new XMLHttpRequest();
+unknown(passed);
+passed.open("GET", "https://fake.invalid/passed");
+const prototype = new XMLHttpRequest();
+prototype.constructor.prototype.open = fakeOpen;
+prototype.open("GET", "https://fake.invalid/prototype");
+const direct = new XMLHttpRequest();
+direct.open("POST", "https://real.example.test/direct");
+direct.send(payload);
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 1, "{rows:#?}");
+        assert_eq!(rows[0].kind, "xhr_open");
+        assert_eq!(rows[0].method.as_deref(), Some("POST"));
+        assert_eq!(
+            rows[0].url.as_deref(),
+            Some("https://real.example.test/direct")
+        );
+        Ok(())
     }
 
     #[test]
