@@ -41,6 +41,7 @@ def main() -> None:
 fetch("https://api.example.test/v1" + "/users");
 fetch("/relative");
 fetch("/unknown-method", opts);
+fetch("https://api.example.test/write", { ...opts, method: "POST" });
 navigator.sendBeacon("https://api.example.test/beacon", body);
 const xhr = new XMLHttpRequest();
 xhr.open("PATCH", "https://api.example.test/items");
@@ -143,17 +144,17 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         artifact = load_artifact(project, API_SURFACE)
         assert artifact["summary"] == {
             "units": 2,
-            "callsites": 6,
+            "callsites": 7,
             "failures": 1,
             "kinds": {
-                "fetch": 3,
+                "fetch": 4,
                 "send_beacon": 1,
                 "websocket": 1,
                 "xhr_open": 1,
             },
-            "static_urls": 6,
-            "absolute_network_urls": 4,
-            "static_methods": 4,
+            "static_urls": 7,
+            "absolute_network_urls": 5,
+            "static_methods": 5,
         }, artifact["summary"]
         assert all("fake.invalid" not in str(row) for row in artifact["callsites"])
         assert {row["source_index_ordinal"] for row in artifact["callsites"]} == {1}
@@ -162,22 +163,37 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         assert artifact["failures"][0]["error"].strip(), artifact["failures"]
         relative = next(row for row in artifact["callsites"] if row.get("url") == "/relative")
         assert relative["absolute_network_url"] is False
+        write = next(
+            row
+            for row in artifact["callsites"]
+            if row.get("url") == "https://api.example.test/write"
+        )
+        assert write["method"] == "POST", write
+        assert write["method_expression"] == '"POST"', write
 
         run(sys.executable, ROOT / "scripts/build-source-graph.py", project)
         graph = load_artifact(project, SOURCE_GRAPH)
         api_nodes = [node for node in graph["nodes"] if node["type"] == "api_callsite"]
-        assert len(api_nodes) == 6, api_nodes
+        assert len(api_nodes) == 7, api_nodes
         assert all(node["source_index_ordinal"] == 1 for node in api_nodes), api_nodes
         assert all(node["id"].startswith("api-call:1:") for node in api_nodes), api_nodes
         request_edges = [edge for edge in graph["edges"] if edge["kind"] == "api_target"]
-        assert len(request_edges) == 4, request_edges
+        assert len(request_edges) == 5, request_edges
         assert any(
             node.get("url") == "wss://socket.example.test/ws"
             for node in graph["nodes"]
             if node["type"] == "external_url"
         )
+
+        run(sys.executable, ROOT / "scripts/refresh-project-readme.py", project)
+        readme = (project / "README.md").read_text()
+        assert "[analysis/api-surface.json](analysis/api-surface.json)" in readme, readme
+        assert "Static browser API callsites: **7**" in readme, readme
+        assert "exact absolute network targets: **5**" in readme, readme
+        assert "failed source units: **1**" in readme, readme
+
         print(
-            "static API surface regression: exact callsites + per-unit fail-closed handling + URL graph linkage OK"
+            "static API surface regression: exact callsites + ordered fetch init + per-unit fail-closed handling + URL graph + analyst README OK"
         )
 
 

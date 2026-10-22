@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BindingPattern, CallExpression, ComputedMemberExpression, Expression, NewExpression, Program,
-    StaticMemberExpression, VariableDeclarator, WithStatement,
+    BindingPattern, CallExpression, ComputedMemberExpression, Expression, NewExpression,
+    ObjectPropertyKind, Program, PropertyKind, StaticMemberExpression, VariableDeclarator,
+    WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{ReferenceId, Scoping, SemanticBuilder};
@@ -359,6 +360,83 @@ fn exact_argument(
     )
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum FetchInitMethod {
+    Absent,
+    Exact { value: String, expression: String },
+    Unknown,
+}
+
+fn fetch_init_method(
+    source: &str,
+    argument: Option<&oxc_ast::ast::Argument<'_>>,
+) -> FetchInitMethod {
+    let Some(argument) = argument else {
+        return FetchInitMethod::Absent;
+    };
+    let Some(expression) = argument.as_expression() else {
+        return FetchInitMethod::Unknown;
+    };
+    let Expression::ObjectExpression(object) = unparenthesized(expression) else {
+        return FetchInitMethod::Unknown;
+    };
+
+    let mut state = FetchInitMethod::Absent;
+    for item in &object.properties {
+        let ObjectPropertyKind::ObjectProperty(property) = item else {
+            state = FetchInitMethod::Unknown;
+            continue;
+        };
+
+        let static_name = property.key.static_name();
+        if property.computed && static_name.is_none() {
+            state = FetchInitMethod::Unknown;
+            continue;
+        }
+        let Some(name) = static_name else {
+            state = FetchInitMethod::Unknown;
+            continue;
+        };
+        if name != "method" {
+            continue;
+        }
+
+        if property.kind != PropertyKind::Init || property.method {
+            state = FetchInitMethod::Unknown;
+            continue;
+        }
+
+        state = if let Some(value) = static_string(&property.value) {
+            FetchInitMethod::Exact {
+                value,
+                expression: source_fragment(source, property.value.span()),
+            }
+        } else {
+            FetchInitMethod::Unknown
+        };
+    }
+    state
+}
+
+fn fetch_method(
+    source: &str,
+    arguments: &[oxc_ast::ast::Argument<'_>],
+    input_is_static_string: bool,
+) -> (Option<String>, Option<String>) {
+    if arguments
+        .first()
+        .is_some_and(|argument| argument.as_expression().is_none())
+    {
+        return (None, None);
+    }
+
+    match fetch_init_method(source, arguments.get(1)) {
+        FetchInitMethod::Exact { value, expression } => (Some(value), Some(expression)),
+        FetchInitMethod::Absent if input_is_static_string => (Some("GET".to_string()), None),
+        FetchInitMethod::Absent | FetchInitMethod::Unknown => (None, None),
+    }
+}
+
 struct XhrBindingCollector<'c> {
     scoping: &'c Scoping,
     safe_member_refs: &'c BTreeSet<ReferenceId>,
@@ -456,14 +534,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             if let Some(path) = global_path(self.scoping, &call.callee) {
                 if allowed_fetch_path(&path) && !self.mutated_sinks.contains("fetch") {
                     let (url, url_expression) = exact_argument(self.source, call.arguments.first());
-                    let method =
-                        (call.arguments.len() == 1 && url.is_some()).then(|| "GET".to_string());
+                    let method = fetch_method(self.source, &call.arguments, url.is_some());
                     self.push(
                         "fetch",
                         call.span,
                         path,
                         STANDARD_BROWSER_API_ASSUMPTION,
-                        (method, None),
+                        method,
                         (url, url_expression),
                     );
                 } else if allowed_send_beacon_path(&path)
@@ -641,6 +718,36 @@ xhr.send(payload);
         assert_eq!(rows[5].kind, "xhr_open");
         assert_eq!(rows[5].method.as_deref(), Some("POST"));
         assert_eq!(rows[5].line, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_inline_init_method_respects_object_overwrite_order() -> Result<()> {
+        let source = r#"
+fetch("https://api.example.test/post", { method: "POST" });
+fetch("https://api.example.test/default", { headers: { "x-test": "1" } });
+fetch("https://api.example.test/later-exact", { ...opts, method: "PATCH" });
+fetch("https://api.example.test/later-spread", { method: "DELETE", ...opts });
+fetch("https://api.example.test/later-dynamic", { method: "PUT", [key]: "POST" });
+fetch("https://api.example.test/later-method", { [key]: "POST", method: "PUT" });
+const request = new Request("https://api.example.test/original", { method: "POST" });
+fetch(request, { method: "PATCH" });
+fetch(request, { headers: {} });
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 8, "{rows:#?}");
+
+        assert_eq!(rows[0].method.as_deref(), Some("POST"));
+        assert_eq!(rows[0].method_expression.as_deref(), Some(r#""POST""#));
+        assert_eq!(rows[1].method.as_deref(), Some("GET"));
+        assert_eq!(rows[2].method.as_deref(), Some("PATCH"));
+        assert_eq!(rows[3].method, None);
+        assert_eq!(rows[4].method, None);
+        assert_eq!(rows[5].method.as_deref(), Some("PUT"));
+        assert_eq!(rows[6].method.as_deref(), Some("PATCH"));
+        assert_eq!(rows[6].url, None);
+        assert_eq!(rows[7].method, None);
+        assert_eq!(rows[7].url, None);
         Ok(())
     }
 

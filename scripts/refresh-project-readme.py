@@ -4,6 +4,7 @@ from collections import Counter
 from pathlib import Path
 
 from analysis_artifacts import (
+    API_SURFACE,
     BUNDLES,
     DEOBFUSCATION,
     GENERATED_RECOVERY,
@@ -39,6 +40,8 @@ def main():
         "code_units": [], "dynamic_code_units": [], "devirtualized_units": []
     }
     graph = load_artifact(project, SOURCE_GRAPH, optional=True) or {"summary": {}}
+    api_surface_doc = load_artifact(project, API_SURFACE, optional=True)
+    api_surface = api_surface_doc or {"callsites": [], "failures": [], "summary": {}}
     bundles = load_artifact(project, BUNDLES, optional=True) or {
         "bundles": [], "modules": [], "summary": {}
     }
@@ -112,6 +115,7 @@ def main():
     generated_recovery_summary = generated_recovery.get("summary", {})
     runtime_summary = runtime_scripts.get("summary", {})
     runtime_classes = runtime_summary.get("classifications", {})
+    api_summary = api_surface.get("summary", {})
 
     lines = [
         "# Recovered source project",
@@ -135,6 +139,7 @@ def main():
         "- [capture-manifest.json](capture-manifest.json) — canonical normalized capture provenance and resource inventory.",
         "- [analysis/import-maps.json](analysis/import-maps.json) — captured import-map definitions, normalized mappings and merge diagnostics.",
         "- [analysis/source-graph.json](analysis/source-graph.json) — machine-readable relationship/provenance graph.",
+        *(["- [analysis/api-surface.json](analysis/api-surface.json) — proof-gated static browser API callsites with exact URL/method evidence and per-source failures."] if api_surface_doc is not None else []),
         *(["- [analysis/runtime-scripts.json](analysis/runtime-scripts.json) — Debugger runtime-script provenance, generated-expression recovery, and capture-instrumentation classification."] if runtime_summary else []),
         "",
         "## Capture summary",
@@ -154,6 +159,10 @@ def main():
         f"**{jsref_summary.get('deduplicated_units', 0)}** exact-hash reuses",
         f"- Source kinds: {dict(sorted(source_kinds.items()))}",
         f"- JS/module/worker references: **{jsrefs.get('summary', {}).get('references', 0)}**",
+        *([
+            f"- Static browser API callsites: **{api_summary.get('callsites', 0)}**; exact absolute network targets: **{api_summary.get('absolute_network_urls', 0)}**; failed source units: **{api_summary.get('failures', 0)}**",
+            f"- Static browser API sink kinds: {api_summary.get('kinds', {})}",
+        ] if api_surface_doc is not None else []),
         f"- Bounded dynamic-import patterns: **{jsrefs.get('summary', {}).get('dynamic_import_globs', 0)}**; "
         f"captured candidate URLs: **{jsrefs.get('summary', {}).get('dynamic_import_candidate_urls', 0)}**; "
         f"unmatched patterns: **{jsrefs.get('summary', {}).get('dynamic_import_unmatched', 0)}**",
