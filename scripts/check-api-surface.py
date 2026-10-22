@@ -33,7 +33,9 @@ def main() -> None:
         raw = project / "resources/app.js"
         src = project / "src/app.js"
         deob = project / "src/_deobfuscated/app.js"
-        for path in (raw, src, deob):
+        rejected_raw = project / "resources/rejected.js"
+        rejected_src = project / "src/rejected.js"
+        for path in (raw, src, deob, rejected_raw, rejected_src):
             path.parent.mkdir(parents=True, exist_ok=True)
         source = """
 fetch("https://api.example.test/v1" + "/users");
@@ -48,6 +50,9 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         raw.write_text(source)
         src.write_text(source)
         deob.write_text(source)
+        rejected_source = 'with (scope) { fetch("https://rejected.invalid/"); }\n'
+        rejected_raw.write_text(rejected_source)
+        rejected_src.write_text(rejected_source)
         (project / "capture-manifest.json").write_text(
             json.dumps(
                 {
@@ -63,10 +68,19 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
                             "body_present": True,
                             "references": [],
                             "response_headers": [],
-                        }
+                        },
+                        {
+                            "id": 1,
+                            "url": "https://app.example.test/rejected.js",
+                            "kind": "javascript",
+                            "output_path": "resources/rejected.js",
+                            "body_present": True,
+                            "references": [],
+                            "response_headers": [],
+                        },
                     ],
                     "inline_scripts": [],
-                    "counts": {"pages": 0, "resources": 1, "inline_scripts": 0},
+                    "counts": {"pages": 0, "resources": 2, "inline_scripts": 0},
                 }
             )
         )
@@ -88,7 +102,14 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
                             "resource_id": 0,
                             "url": "https://app.example.test/app.js",
                             "source_path": "src/app.js",
-                        }
+                        },
+                        {
+                            "kind": "javascript",
+                            "raw_path": "resources/rejected.js",
+                            "resource_id": 1,
+                            "url": "https://app.example.test/rejected.js",
+                            "source_path": "src/rejected.js",
+                        },
                     ],
                     "summary": {},
                 }
@@ -121,9 +142,9 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         )
         artifact = load_artifact(project, API_SURFACE)
         assert artifact["summary"] == {
-            "units": 1,
+            "units": 2,
             "callsites": 6,
-            "failures": 0,
+            "failures": 1,
             "kinds": {
                 "fetch": 3,
                 "send_beacon": 1,
@@ -136,6 +157,9 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         }, artifact["summary"]
         assert all("fake.invalid" not in str(row) for row in artifact["callsites"])
         assert {row["source_index_ordinal"] for row in artifact["callsites"]} == {1}
+        assert len(artifact["failures"]) == 1, artifact["failures"]
+        assert artifact["failures"][0]["source_index_ordinal"] == 2, artifact["failures"]
+        assert artifact["failures"][0]["error"].strip(), artifact["failures"]
         relative = next(row for row in artifact["callsites"] if row.get("url") == "/relative")
         assert relative["absolute_network_url"] is False
 
@@ -152,7 +176,9 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             for node in graph["nodes"]
             if node["type"] == "external_url"
         )
-        print("static API surface regression: exact callsites + fail-closed URL graph linkage OK")
+        print(
+            "static API surface regression: exact callsites + per-unit fail-closed handling + URL graph linkage OK"
+        )
 
 
 if __name__ == "__main__":
