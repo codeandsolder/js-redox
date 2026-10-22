@@ -1,3 +1,4 @@
+use jsvm_safe_core::string_literal_value;
 use oxc_allocator::Allocator;
 use oxc_ast::{
     ast::{
@@ -88,7 +89,7 @@ fn arrow_block_body<'a>(
 
 fn computed_string(expr: &Expression<'_>) -> Option<String> {
     match expr {
-        Expression::StringLiteral(value) => Some(value.value.to_string()),
+        Expression::StringLiteral(value) => string_literal_value(value),
         Expression::ParenthesizedExpression(paren) => computed_string(&paren.expression),
         _ => None,
     }
@@ -120,7 +121,7 @@ impl<'a> Visit<'a> for DependencyCollector<'_> {
             {
                 Some(format!("{:.0}", value.value))
             }
-            Argument::StringLiteral(value) => Some(value.value.to_string()),
+            Argument::StringLiteral(value) => string_literal_value(value),
             _ => None,
         };
         if let Some(dependency) = dependency {
@@ -305,7 +306,7 @@ impl Collector<'_, '_> {
             PropertyKey::NumericLiteral(n) if n.value.is_finite() && n.value.fract() == 0.0 => {
                 Some(format!("{:.0}", n.value))
             }
-            PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
+            PropertyKey::StringLiteral(s) => string_literal_value(s),
             _ => None,
         }
     }
@@ -319,7 +320,7 @@ impl Collector<'_, '_> {
                 {
                     ids.push(format!("{:.0}", n.value));
                 }
-                ArrayExpressionElement::StringLiteral(s) => ids.push(s.value.to_string()),
+                ArrayExpressionElement::StringLiteral(s) => ids.push(string_literal_value(s)?),
                 _ => return None,
             }
         }
@@ -434,7 +435,7 @@ impl Collector<'_, '_> {
             .filter(|dep| !matches!(dep.as_str(), "require" | "exports" | "module"))
             .collect();
         Some(ModuleRecord {
-            id: name.value.to_string(),
+            id: string_literal_value(name)?,
             property_start: call.span.start,
             property_end: call.span.end,
             value_start: span.start,
@@ -707,7 +708,7 @@ impl Collector<'_, '_> {
                 {
                     format!("{:.0}", value.value)
                 }
-                Expression::StringLiteral(value) => value.value.to_string(),
+                Expression::StringLiteral(value) => string_literal_value(value)?,
                 Expression::Identifier(value)
                     if value.name.as_str() == "undefined"
                         && reference_symbol(self.scoping, value).is_none() =>

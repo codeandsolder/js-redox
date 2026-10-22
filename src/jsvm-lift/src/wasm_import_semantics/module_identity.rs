@@ -374,7 +374,7 @@ fn webassembly_namespace_global(
             let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
                 return None;
             };
-            if property.value.as_str() != "WebAssembly" {
+            if property.value.as_str() != Some("WebAssembly") {
                 return None;
             }
             global_aliases
@@ -400,7 +400,7 @@ pub(super) fn webassembly_member_name<'a>(
                 return None;
             };
             Some((
-                property.value.as_str(),
+                property.value.as_str()?,
                 webassembly_namespace_global(scoping, global_aliases, &member.object)?,
             ))
         }
@@ -429,7 +429,7 @@ impl Evaluator<'_, '_, '_, '_> {
     fn expression(&self, expression: &Expression<'_>) -> Option<StaticWasmValue> {
         let expression = unparenthesized(expression);
         match expression {
-            Expression::StringLiteral(literal) => base64_module_value(literal.value.as_str()),
+            Expression::StringLiteral(literal) => base64_module_value(literal.value.as_str()?),
             Expression::Identifier(_) => self
                 .values
                 .get(&symbol_of(self.scoping, expression)?)

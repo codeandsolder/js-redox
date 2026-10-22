@@ -1,6 +1,7 @@
 use crate::numeric::exact_u64;
 use anyhow::{ensure, Result};
 use base64::{engine::general_purpose, Engine as _};
+use jsvm_safe_core::{string_literal_value, template_element_value};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, BinaryExpression, CallExpression,
@@ -158,16 +159,9 @@ impl Collector<'_> {
 
     fn argument_string(arg: &Argument<'_>) -> Option<String> {
         match arg {
-            Argument::StringLiteral(value) => Some(value.value.to_string()),
+            Argument::StringLiteral(value) => string_literal_value(value),
             Argument::TemplateLiteral(value) if value.expressions.is_empty() => {
-                value.quasis.first().map(|quasi| {
-                    quasi
-                        .value
-                        .cooked
-                        .as_ref()
-                        .unwrap_or(&quasi.value.raw)
-                        .to_string()
-                })
+                value.quasis.first().and_then(template_element_value)
             }
             _ => None,
         }
@@ -271,7 +265,9 @@ impl Collector<'_> {
             match element {
                 ArrayExpressionElement::StringLiteral(s) => {
                     strings += 1;
-                    let value = s.value.as_str();
+                    let Some(value) = s.value.as_str() else {
+                        continue;
+                    };
                     string_chars += value.len();
                     if is_identifierish(value) {
                         identifier_strings += 1;
@@ -642,7 +638,11 @@ impl<'a> Visit<'a> for Collector<'_> {
 
     fn visit_expression(&mut self, it: &Expression<'a>) {
         match it {
-            Expression::StringLiteral(value) => self.record_blob(value.span, value.value.as_str()),
+            Expression::StringLiteral(value) => {
+                if let Some(text) = value.value.as_str() {
+                    self.record_blob(value.span, text);
+                }
+            }
             Expression::TemplateLiteral(value) if value.expressions.len() >= 4 => self.push(
                 "template_assembly",
                 3 + capped_u32(value.expressions.len() / 4, 4),

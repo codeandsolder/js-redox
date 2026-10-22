@@ -79,7 +79,7 @@ fn expression_property_name<'a>(expression: &'a Expression<'a>) -> Option<&'a st
         }
         Expression::ComputedMemberExpression(member) if !member.optional => {
             match unparenthesized(&member.expression) {
-                Expression::StringLiteral(literal) => Some(literal.value.as_str()),
+                Expression::StringLiteral(literal) => Some(literal.value.as_str()?),
                 _ => None,
             }
         }
@@ -98,7 +98,7 @@ fn assignment_property<'a>(target: &'a AssignmentTarget<'a>) -> Option<(&'a str,
                 return None;
             };
             Some((
-                literal.value.as_str(),
+                literal.value.as_str()?,
                 expression_property_name(&member.object),
             ))
         }
@@ -275,7 +275,7 @@ fn global_constructor(
             let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
                 return None;
             };
-            if property.value.as_str() != constructor {
+            if property.value.as_str() != Some(constructor) {
                 return None;
             }
             global_aliases
@@ -300,7 +300,7 @@ fn static_member_of_symbol(
         }
         Expression::ComputedMemberExpression(member) if !member.optional => {
             expression_is_symbol(scoping, &member.object, symbol)
-                && matches!(unparenthesized(&member.expression), Expression::StringLiteral(literal) if literal.value.as_str() == property)
+                && matches!(unparenthesized(&member.expression), Expression::StringLiteral(literal) if literal.value.as_str() == Some(property))
         }
         _ => false,
     }

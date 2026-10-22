@@ -172,7 +172,7 @@ fn member_object_named<'a>(
             let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
                 return None;
             };
-            (property.value.as_str() == expected).then_some(&member.object)
+            (property.value.as_str() == Some(expected)).then_some(&member.object)
         }
         _ => None,
     }
@@ -189,7 +189,7 @@ fn member_name_and_object<'a>(
             let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
                 return None;
             };
-            Some((property.value.as_str(), &member.object))
+            Some((property.value.as_str()?, &member.object))
         }
         _ => None,
     }
@@ -457,7 +457,7 @@ impl<'a> Visit<'a> for PromiseModuleReferenceCollector<'_> {
     ) {
         if !member.optional {
             if let Expression::StringLiteral(property) = unparenthesized(&member.expression) {
-                if property.value.as_str() == "module"
+                if property.value.as_str() == Some("module")
                     && symbol_of(self.scoping, &member.object) == Some(self.symbol)
                 {
                     self.count += 1;
@@ -1207,7 +1207,7 @@ fn normalized_initializer_proof(
                                                 {
                                                     match unparenthesized(&member.expression) {
                                                         Expression::StringLiteral(property) => {
-                                                            Some(property.value.as_str())
+                                                            property.value.as_str()
                                                         }
                                                         _ => None,
                                                     }
@@ -1252,7 +1252,7 @@ fn normalized_initializer_proof(
                                             {
                                                 match unparenthesized(&member.expression) {
                                                     Expression::StringLiteral(property) => {
-                                                        Some(property.value.as_str())
+                                                        property.value.as_str()
                                                     }
                                                     _ => None,
                                                 }

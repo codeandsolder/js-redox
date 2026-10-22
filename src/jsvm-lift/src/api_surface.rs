@@ -99,7 +99,7 @@ impl<'a> Visit<'a> for SafeMemberReferenceCollector {
     fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
         if !member.optional {
             if let Expression::StringLiteral(property) = unparenthesized(&member.expression) {
-                if safe_xhr_member_name(property.value.as_str()) {
+                if property.value.as_str().is_some_and(safe_xhr_member_name) {
                     if let Some(reference_id) = direct_reference_id(&member.object) {
                         self.refs.insert(reference_id);
                     }
@@ -131,7 +131,7 @@ fn global_path(scoping: &Scoping, expression: &Expression<'_>) -> Option<String>
             Some(format!(
                 "{}.{}",
                 global_path(scoping, &member.object)?,
-                property.value
+                property.value.as_str()?
             ))
         }
         _ => None,
@@ -305,7 +305,7 @@ fn assignment_global_path(
             Some(format!(
                 "{}.{}",
                 global_path(scoping, &member.object)?,
-                property.value
+                property.value.as_str()?
             ))
         }
         _ => None,
@@ -342,7 +342,7 @@ fn simple_assignment_global_path(
             Some(format!(
                 "{}.{}",
                 global_path(scoping, &member.object)?,
-                property.value
+                property.value.as_str()?
             ))
         }
         _ => None,

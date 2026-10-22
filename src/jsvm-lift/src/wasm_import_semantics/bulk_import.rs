@@ -208,7 +208,7 @@ fn static_member_parts<'a>(
             let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
                 return None;
             };
-            Some((&member.object, property.value.as_str()))
+            Some((&member.object, property.value.as_str()?))
         }
         _ => None,
     }

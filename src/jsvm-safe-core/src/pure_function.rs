@@ -1,4 +1,6 @@
-use crate::value_eval::{eval_binary, js_to_int32, Value};
+use crate::value_eval::{
+    eval_binary, js_to_int32, string_literal_value, template_element_value, Value,
+};
 use oxc_ast::ast::{BindingPattern, Expression, Statement, VariableDeclarationKind};
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
@@ -149,15 +151,17 @@ fn compile_pure_expr(
             .get(id.name.as_str())
             .cloned()
             .or_else(|| params.get(id.name.as_str()).copied().map(PureExpr::Param)),
-        Expression::StringLiteral(v) => Some(PureExpr::Value(Value::String(v.value.to_string()))),
+        Expression::StringLiteral(v) => {
+            string_literal_value(v).map(|value| PureExpr::Value(Value::String(value)))
+        }
         Expression::NumericLiteral(v) => Some(PureExpr::Value(Value::Number(v.value))),
         Expression::BooleanLiteral(v) => Some(PureExpr::Value(Value::Bool(v.value))),
         Expression::NullLiteral(_) => Some(PureExpr::Value(Value::Null)),
-        Expression::TemplateLiteral(v) if v.expressions.is_empty() => v.quasis.first().map(|q| {
-            PureExpr::Value(Value::String(
-                q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string(),
-            ))
-        }),
+        Expression::TemplateLiteral(v) if v.expressions.is_empty() => v
+            .quasis
+            .first()
+            .and_then(template_element_value)
+            .map(|value| PureExpr::Value(Value::String(value))),
         Expression::ParenthesizedExpression(v) => compile_pure_expr(&v.expression, params, locals),
         Expression::AssignmentExpression(v) if v.operator.as_str() == "=" => {
             let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(target) = &v.left else {

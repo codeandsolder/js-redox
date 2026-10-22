@@ -6,9 +6,33 @@
 //! expression preserves its effects (for example `void sideEffect()`).  Callers
 //! may resolve identifiers only after independently proving their bindings safe.
 
-use oxc_ast::ast::{Expression, IdentifierReference, LogicalExpression, UnaryExpression};
+use oxc_ast::ast::{
+    Expression, IdentifierReference, LogicalExpression, StringLiteral, TemplateElement,
+    UnaryExpression,
+};
 use oxc_ecmascript::{StringToNumber, ToInt32, ToUint32};
 use oxc_syntax::number::ToJsString;
+
+/// Convert an Oxc JavaScript string literal into Rust UTF-8.
+///
+/// Oxc preserves lone UTF-16 surrogates in `JSStr`; js-redox's proof domain
+/// uses Rust `String`, so those values are deliberately not approximated.
+#[must_use]
+pub fn string_literal_value(literal: &StringLiteral<'_>) -> Option<String> {
+    literal.value.as_str().map(str::to_owned)
+}
+
+/// Recover a template quasi using the same semantics as the pre-`JSStr` AST:
+/// prefer cooked text, and fall back to raw source spelling when cooked is absent.
+/// A cooked value containing a lone surrogate is not representable in the Rust
+/// string proof domain and therefore fails closed.
+#[must_use]
+pub fn template_element_value(quasi: &TemplateElement<'_>) -> Option<String> {
+    match quasi.value.cooked.as_ref() {
+        Some(cooked) => (*cooked).as_str().map(str::to_owned),
+        None => Some(quasi.value.raw.as_str().to_owned()),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -109,14 +133,15 @@ where
 {
     match expr {
         Expression::Identifier(id) => resolve(id),
-        Expression::StringLiteral(v) => Some(Value::String(v.value.to_string())),
+        Expression::StringLiteral(v) => string_literal_value(v).map(Value::String),
         Expression::NumericLiteral(v) => Some(Value::Number(v.value)),
         Expression::BooleanLiteral(v) => Some(Value::Bool(v.value)),
         Expression::NullLiteral(_) => Some(Value::Null),
         Expression::TemplateLiteral(v) if v.expressions.is_empty() => v
             .quasis
             .first()
-            .map(|q| Value::String(q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string())),
+            .and_then(template_element_value)
+            .map(Value::String),
         Expression::ParenthesizedExpression(v) => eval_with_resolver(&v.expression, resolve),
         Expression::UnaryExpression(v) => eval_unary_with_resolver(v, resolve),
         Expression::BinaryExpression(v) => eval_binary(

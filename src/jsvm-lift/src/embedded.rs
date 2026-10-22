@@ -1,3 +1,4 @@
+use jsvm_safe_core::string_literal_value;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, CallExpression, Expression, Function,
 };
@@ -135,10 +136,17 @@ fn split_literal_keywords(arg: &Argument<'_>) -> Option<Vec<String>> {
     let Argument::StringLiteral(separator) = &call.arguments[0] else {
         return None;
     };
-    if separator.value.as_str() != "|" {
+    if separator.value.as_str() != Some("|") {
         return None;
     }
-    Some(words.value.split('|').map(ToOwned::to_owned).collect())
+    Some(
+        words
+            .value
+            .as_str()?
+            .split('|')
+            .map(ToOwned::to_owned)
+            .collect(),
+    )
 }
 
 fn exact_bounded_u64(value: f64, max: u32) -> Option<u64> {
@@ -249,7 +257,7 @@ pub fn detect_packer_eval(call: &CallExpression<'_>) -> Option<EmbeddedCodeCandi
         return None;
     }
 
-    let mut body = payload.value.to_string();
+    let mut body = string_literal_value(payload)?;
     for index in (0..count).rev() {
         let token = packer_token(u64::try_from(index).ok()?, radix)?;
         let replacement = keywords
@@ -293,13 +301,13 @@ pub fn detect_literal_string_join(call: &CallExpression<'_>) -> Option<EmbeddedC
         let ArrayExpressionElement::StringLiteral(value) = element else {
             return None;
         };
-        parts.push(value.value.as_str());
+        parts.push(value.value.as_str()?);
     }
     if parts.len() < 2 {
         return None;
     }
 
-    let body = parts.join(separator.value.as_str());
+    let body = parts.join(separator.value.as_str()?);
     if body.len() < 1024 || body.len() > 5_000_000 {
         return None;
     }
@@ -337,7 +345,7 @@ pub fn detect_function_constructor(
         let Argument::StringLiteral(value) = arg else {
             return None;
         };
-        strings.push(value.value.to_string());
+        strings.push(string_literal_value(value)?);
     }
 
     let body = strings.pop()?;
