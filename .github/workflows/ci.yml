@@ -37,6 +37,7 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
   semantic:
     name: Semantic/runtime regressions
+    needs: rust
     runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-24.04]
     env:
       SCCACHE_SERVER_PORT: "4237"
@@ -49,12 +50,6 @@ jobs:
         uses: astral-sh/setup-uv@v10.3.0
         with:
           version: latest-known
-      - name: Validate Rust compiler cache wrapper
-        run: |
-          env | grep -E '^(RUST|SCCACHE|CARGO_)' | sort
-          rustc_path="$(rustup which rustc)"
-          echo "rustc_path=$rustc_path"
-          /usr/local/bin/sccache "$rustc_path" -vV
       - name: Persisted capture contracts
         run: |
           uv run --no-project python scripts/check-capture-project-contract.py
