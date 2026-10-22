@@ -30,18 +30,18 @@ jobs:
           components: rustfmt,clippy
       - name: Refresh isolated CI sccache
         run: |
-          systemctl reset-failed sccache-ci-root.service || true
-          systemctl restart sccache-ci-root.service
-          for _ in $(seq 1 50); do
-            ss -ltn | grep -q '127.0.0.1:4247' && break
-            sleep 0.1
+          /usr/bin/systemctl reset-failed sccache-ci-root.service || true
+          /usr/bin/systemctl restart sccache-ci-root.service
+          for _ in {1..50}; do
+            /usr/bin/ss -ltn | /usr/bin/grep -q '127.0.0.1:4247' && break
+            /usr/bin/sleep 0.1
           done
-          ss -ltn | grep -q '127.0.0.1:4247'
+          /usr/bin/ss -ltn | /usr/bin/grep -q '127.0.0.1:4247'
           rustc_path="$(rustup which rustc)"
           /usr/local/bin/sccache "$rustc_path" -vV
           stats="$(/usr/local/bin/sccache --show-stats)"
-          grep -q 'L0 (s3)' <<<"$stats"
-          grep -q '/opt/actions-runner/' <<<"$stats"
+          /usr/bin/grep -q 'L0 (s3)' <<<"$stats"
+          /usr/bin/grep -q '/opt/actions-runner/' <<<"$stats"
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
@@ -61,18 +61,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.1
       - name: Refresh isolated CI sccache
         run: |
-          systemctl reset-failed sccache-ci-root.service || true
-          systemctl restart sccache-ci-root.service
-          for _ in $(seq 1 50); do
-            ss -ltn | grep -q '127.0.0.1:4247' && break
-            sleep 0.1
+          /usr/bin/systemctl reset-failed sccache-ci-root.service || true
+          /usr/bin/systemctl restart sccache-ci-root.service
+          for _ in {1..50}; do
+            /usr/bin/ss -ltn | /usr/bin/grep -q '127.0.0.1:4247' && break
+            /usr/bin/sleep 0.1
           done
-          ss -ltn | grep -q '127.0.0.1:4247'
+          /usr/bin/ss -ltn | /usr/bin/grep -q '127.0.0.1:4247'
           rustc_path="$(rustup which rustc)"
           /usr/local/bin/sccache "$rustc_path" -vV
           stats="$(/usr/local/bin/sccache --show-stats)"
-          grep -q 'L0 (s3)' <<<"$stats"
-          grep -q '/opt/actions-runner/' <<<"$stats"
+          /usr/bin/grep -q 'L0 (s3)' <<<"$stats"
+          /usr/bin/grep -q '/opt/actions-runner/' <<<"$stats"
       - uses: Swatinem/rust-cache@v2
       - name: Install uv
         uses: astral-sh/setup-uv@v10.3.0
