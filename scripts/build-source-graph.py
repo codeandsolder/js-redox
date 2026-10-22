@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 from analysis_artifacts import (
+    API_SURFACE,
     BUNDLES,
     DEOBFUSCATION,
     IMPORT_MAPS,
@@ -44,6 +45,7 @@ def main():
     jsvm = load_artifact(project, JSVM_INDEX, optional=True) or {'code_units': [], 'dynamic_code_units': []}
     jsrefs = load_artifact(project, JS_REFERENCES, optional=True) or {'code_units': []}
     deobfuscation = load_artifact(project, DEOBFUSCATION, optional=True) or {'units': []}
+    api_surface = load_artifact(project, API_SURFACE, optional=True) or {'callsites': []}
     bundles = load_artifact(project, BUNDLES, optional=True) or {'bundles': [], 'modules': []}
     wasm = load_artifact(project, WASM_INDEX, optional=True) or {'modules': []}
     runtime = load_artifact(project, RUNTIME_SCRIPTS, optional=True) or {
@@ -390,6 +392,57 @@ def main():
                 transforms=unit.get('transforms', {}),
                 string_recovery_replacements=unit.get('string_recovery_replacements', 0),
             )
+
+    # Static browser API callsites hang off the exact selected source derivative.
+    for row in api_surface.get('callsites', []):
+        source_index_ordinal = int(row['source_index_ordinal'])
+        callsite_ordinal = int(row['callsite_ordinal'])
+        node_id = f'api-call:{source_index_ordinal}:{callsite_ordinal}'
+        add_node(
+            node_id,
+            type='api_callsite',
+            sink_kind=row.get('kind'),
+            resource_id=row.get('resource_id'),
+            source_index_ordinal=source_index_ordinal,
+            source_path=row.get('analysis_path'),
+            raw_path=row.get('raw_path'),
+            start=row.get('start'),
+            end=row.get('end'),
+            line=row.get('line'),
+            column=row.get('column'),
+            callee=row.get('callee'),
+            proof=row.get('proof'),
+            method=row.get('method'),
+            method_expression=row.get('method_expression'),
+            url=row.get('url'),
+            url_expression=row.get('url_expression'),
+            standard_browser_api_semantics_required=bool(
+                row.get('standard_browser_api_semantics_required')
+            ),
+        )
+        parent = None
+        deob_ordinal = row.get('deobfuscation_ordinal')
+        if deob_ordinal is not None:
+            parent = deob_nodes.get(int(deob_ordinal))
+        if parent is None:
+            parent = inline_node_by_raw.get(row.get('raw_path'))
+        if parent is None and row.get('resource_id') is not None:
+            parent = f"resource:{int(row['resource_id'])}"
+        if parent:
+            add_edge(parent, node_id, 'api_callsite')
+        url = row.get('url')
+        if row.get('absolute_network_url') and isinstance(url, str):
+            for target in targets_for(url):
+                add_edge(
+                    node_id,
+                    target,
+                    'api_target',
+                    sink_kind=row.get('kind'),
+                    method=row.get('method'),
+                    standard_browser_api_semantics_required=bool(
+                        row.get('standard_browser_api_semantics_required')
+                    ),
+                )
 
     # Statically explicit Webpack/Next module tables become navigable project modules.
     bundle_nodes = {}

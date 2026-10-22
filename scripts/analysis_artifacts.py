@@ -113,6 +113,13 @@ RUNTIME_SCRIPTS = ArtifactSpec(
     array_fields=("alpine_families", "gtm_families", "sources"),
     object_fields=("summary",),
 )
+API_SURFACE = ArtifactSpec(
+    "static API surface",
+    Path("analysis/api-surface.json"),
+    "capture-api-surface/v1",
+    array_fields=("callsites", "failures"),
+    object_fields=("summary",),
+)
 
 ALL_ARTIFACTS = (
     SOURCE_INDEX,
@@ -128,6 +135,7 @@ ALL_ARTIFACTS = (
     JSVM_INDEX,
     SOURCE_GRAPH,
     RUNTIME_SCRIPTS,
+    API_SURFACE,
 )
 
 
