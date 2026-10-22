@@ -165,6 +165,33 @@ fn collect_const_values(
     constants
 }
 
+/// Immutable primitive bindings proven from `const` declarations.
+///
+/// Bindings are keyed by Oxc semantic identity, become available only after
+/// their declaration, and use the same deliberately narrow pure-expression
+/// evaluator as safe deobfuscation.
+#[derive(Debug)]
+pub struct ProvenConstantEnvironment {
+    bindings: HashMap<SymbolId, ConstBinding>,
+}
+
+impl ProvenConstantEnvironment {
+    #[must_use]
+    pub fn collect(program: &oxc_ast::ast::Program<'_>, scoping: &Scoping) -> Self {
+        Self {
+            bindings: collect_const_values(program, scoping),
+        }
+    }
+
+    #[must_use]
+    pub fn exact_string(&self, expr: &Expression<'_>, scoping: &Scoping) -> Option<String> {
+        match eval_with_constants(expr, scoping, &self.bindings)? {
+            Value::String(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
 fn array_element(el: &ArrayExpressionElement<'_>) -> Option<Value> {
     match el {
         ArrayExpressionElement::StringLiteral(v) => Some(Value::String(v.value.to_string())),
@@ -1310,8 +1337,78 @@ pub fn deobfuscate_with_standard_numeric_builtins(
 mod tests {
     use super::{
         deobfuscate, deobfuscate_with_source_mode, deobfuscate_with_standard_numeric_builtins,
-        SafeSourceMode,
+        ProvenConstantEnvironment, SafeSourceMode,
     };
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::{CallExpression, Expression};
+    use oxc_ast_visit::{walk, Visit};
+    use oxc_semantic::{Scoping, SemanticBuilder};
+    use oxc_span::SourceType;
+    use rolldown_redox::ecmascript::parse_program;
+
+    #[test]
+    fn proven_constant_environment_respects_identity_and_declaration_order() {
+        let source = r#"
+            const scheme = "https://";
+            const host = "api.example.test";
+            const exact = scheme + host;
+            sink(exact);
+            sink(later);
+            const later = "https://later.example.test";
+            let mutable = "https://mutable.example.test";
+            sink(mutable);
+            function nested() {
+                const exact = "https://nested.example.test";
+                sink(exact);
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::unambiguous());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let scoping = semantic.semantic.scoping();
+        let constants = ProvenConstantEnvironment::collect(&parsed.program, scoping);
+
+        struct Probe<'c> {
+            scoping: &'c Scoping,
+            constants: &'c ProvenConstantEnvironment,
+            values: Vec<Option<String>>,
+        }
+        impl<'a> Visit<'a> for Probe<'_> {
+            fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+                if matches!(&call.callee, Expression::Identifier(id) if id.name == "sink") {
+                    self.values.push(
+                        call.arguments
+                            .first()
+                            .and_then(|argument| argument.as_expression())
+                            .and_then(|expression| {
+                                self.constants.exact_string(expression, self.scoping)
+                            }),
+                    );
+                }
+                walk::walk_call_expression(self, call);
+            }
+        }
+
+        let mut probe = Probe {
+            scoping,
+            constants: &constants,
+            values: Vec::new(),
+        };
+        probe.visit_program(&parsed.program);
+        assert_eq!(
+            probe.values,
+            [
+                Some("https://api.example.test".to_string()),
+                None,
+                None,
+                Some("https://nested.example.test".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn explicit_source_mode_does_not_fall_back_across_module_commonjs_boundary() {
