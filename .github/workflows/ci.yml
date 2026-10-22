@@ -21,13 +21,27 @@ jobs:
     name: Rust 1.99 quality gate
     runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-24.04]
     env:
-      SCCACHE_SERVER_PORT: "4227"
+      SCCACHE_SERVER_PORT: "4247"
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt,clippy
+      - name: Refresh isolated CI sccache
+        run: |
+          systemctl reset-failed sccache-ci-root.service || true
+          systemctl restart sccache-ci-root.service
+          for _ in $(seq 1 50); do
+            ss -ltn | grep -q '127.0.0.1:4247' && break
+            sleep 0.1
+          done
+          ss -ltn | grep -q '127.0.0.1:4247'
+          rustc_path="$(rustup which rustc)"
+          /usr/local/bin/sccache "$rustc_path" -vV
+          stats="$(/usr/local/bin/sccache --show-stats)"
+          grep -q 'L0 (s3)' <<<"$stats"
+          grep -q '/opt/actions-runner/' <<<"$stats"
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
@@ -40,11 +54,25 @@ jobs:
     needs: rust
     runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-24.04]
     env:
-      SCCACHE_SERVER_PORT: "4237"
+      SCCACHE_SERVER_PORT: "4247"
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Refresh isolated CI sccache
+        run: |
+          systemctl reset-failed sccache-ci-root.service || true
+          systemctl restart sccache-ci-root.service
+          for _ in $(seq 1 50); do
+            ss -ltn | grep -q '127.0.0.1:4247' && break
+            sleep 0.1
+          done
+          ss -ltn | grep -q '127.0.0.1:4247'
+          rustc_path="$(rustup which rustc)"
+          /usr/local/bin/sccache "$rustc_path" -vV
+          stats="$(/usr/local/bin/sccache --show-stats)"
+          grep -q 'L0 (s3)' <<<"$stats"
+          grep -q '/opt/actions-runner/' <<<"$stats"
       - uses: Swatinem/rust-cache@v2
       - name: Install uv
         uses: astral-sh/setup-uv@v10.3.0
