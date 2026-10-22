@@ -83,6 +83,8 @@ role-normalized devirtualization where the dispatcher linkage is proven
   ↓
 exact WASM extraction/dedup + readable/deep analysis + JavaScript/WASM boundary correlation
   ↓
+proof-gated static browser API callsite recovery (fetch/XHR/beacon/WebSocket)
+  ↓
 readable recovered modules + analysis/provenance graph
 ```
 
@@ -96,7 +98,7 @@ The directory contract is intentionally simple:
 - `src/_dynamic_deobfuscated/` contains proven safe recovery of generated-code children; exact recovered bytes remain the fallback when validation refuses a child.
 - `src/_dynamic/` contains formatted analyst views of generated-code children after the selected safe stage.
 - `src/_devirtualized/` contains semantic modules and pseudocode for supported direct-switch and function-table VMs.
-- `analysis/` contains machine-readable provenance, import-map/module-resolution state, VM evidence and transform metadata.
+- `analysis/` contains machine-readable provenance, import-map/module-resolution state, VM evidence, transform metadata, and `api-surface.json` static browser-request callsites.
 
 This separation is important: presentation/deobfuscation passes never overwrite the original capture or make provenance ambiguous.
 
@@ -113,7 +115,9 @@ uv run python scripts/capture-to-project.py capture.har work/capture-project --j
 
 For a normal browser **Save Page / Webpage, Complete** export, the companion `Saved Page_files/` directory is discovered automatically. `--assets-dir` can override it. Saved-page files get stable synthetic URLs for graph resolution; an original page URL from Chromium's `saved from url=(...)` marker is retained separately when available.
 
-The driver runs capture normalization, readable-source materialization, source-map recovery, literal module/worker reference analysis, document import-map resolution, safe deobfuscation, explicit bundle-module extraction, generated-code recovery, VM triage/devirtualization, provenance-graph construction, and an analyst-facing project README. Import maps are resolved with exact, prefix and scoped mappings; multiple maps keep earlier exact definitions, and document context is propagated only through captured module imports so worker graphs do not accidentally inherit page import maps.
+The driver runs capture normalization, readable-source materialization, source-map recovery, literal module/worker reference analysis, document import-map resolution, safe deobfuscation, explicit bundle-module extraction, generated-code recovery, VM triage/devirtualization, WASM correlation, static browser-API callsite recovery, provenance-graph construction, and an analyst-facing project README. Import maps are resolved with exact, prefix and scoped mappings; multiple maps keep earlier exact definitions, and document context is propagated only through captured module imports so worker graphs do not accidentally inherit page import maps.
+
+`analyze-api-surface.py` analyzes the selected safe-deobfuscated source when available and otherwise the parser-validated source view. Its first contract, `capture-api-surface/v1`, is deliberately narrow: it recognizes unshadowed standard `fetch`, `navigator.sendBeacon`, and `WebSocket` plus scope-proven stable, non-escaping `XMLHttpRequest` receivers; suppresses a sink family when the same source visibly assigns, updates, or deletes an equivalent standard sink path; resolves only exact literal/template/string-concatenation URL or method values; and preserves unresolved argument expressions and exact source spans instead of guessing. A one-argument `fetch(...)` is reported as default `GET` only when its input itself is an exact static string—a prebuilt `Request` remains method-unknown because it may already carry another method. Standard browser API semantics remain an explicit assumption on accepted callsites, including mutations not statically proven by this first contract. Relative URLs remain relative unless a real document base is proven, and only exact absolute `http`/`https`/`ws`/`wss` URLs become `api_target` edges in the source graph. Wrapper libraries, axios/GraphQL inference, fetch-options object interpretation, generated-code recursion, and speculative URL reconstruction are intentionally outside v1.
 
 `har-project` handles HAR ingestion and `saved-page-to-manifest.py` handles saved HTML plus its resource directory. Both emit the same `capture-project/v1` contract in `capture-manifest.json`. The stage ordering and tool wiring live in importable `scripts/capture_pipeline.py`; `capture-to-project.py` is the supported CLI front door.
 

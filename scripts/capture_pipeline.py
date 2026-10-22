@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Sequence
 
 from analysis_artifacts import (
+    API_SURFACE,
     BUNDLES,
     DEOBFUSCATION,
     GENERATED_RECOVERY,
@@ -45,6 +46,7 @@ class Toolchain:
     table_ir: Path = TOOL_ROOT / "table-ir"
     js_refs: Path = TOOL_ROOT / "js-refs"
     source_directives: Path = TOOL_ROOT / "source-directives"
+    api_surface: Path = TOOL_ROOT / "api-surface"
     deobfuscator: Path = TOOL_ROOT / "deobfuscate-safe"
     string_recoverer: Path = ROOT / "scripts/recover-js-obfuscator-strings.py"
     bundle_inventory: Path = TOOL_ROOT / "bundle-unpack"
@@ -80,6 +82,9 @@ class ProjectSummary:
     references: int
     import_map_resolutions: int
     unresolved_bare_specifiers: int
+    api_callsites: int
+    api_absolute_urls: int
+    api_failures: int
     safe_deobfuscated_units: int
     bundle_modules: int
     sourcemap_originals: int
@@ -318,6 +323,15 @@ def run_capture_pipeline(
         )
         run_checked([sys.executable, ROOT / "scripts/materialize-switch-ir.py", output])
 
+    run_checked(
+        [
+            sys.executable,
+            ROOT / "scripts/analyze-api-surface.py",
+            output,
+            "--analyzer",
+            tools.api_surface,
+        ]
+    )
     run_checked([sys.executable, ROOT / "scripts/build-source-graph.py", output])
     run_checked([sys.executable, ROOT / "scripts/refresh-project-readme.py", output])
 
@@ -346,6 +360,7 @@ def load_project_summary(
     source_index = load_artifact(output, SOURCE_INDEX)
     maps = load_artifact(output, SOURCEMAPS)
     graph = load_artifact(output, SOURCE_GRAPH)
+    api_surface = load_artifact(output, API_SURFACE, optional=True) or {"summary": {}}
     jsrefs = load_artifact(output, JS_REFERENCES)
     wasm = (
         load_artifact(output, WASM_INDEX, optional=True) or {"summary": {}}
@@ -413,6 +428,9 @@ def load_project_summary(
         references=jsrefs["summary"]["references"],
         import_map_resolutions=jsrefs["summary"].get("resolved_by_import_map", 0),
         unresolved_bare_specifiers=jsrefs["summary"].get("unresolved_bare_specifiers", 0),
+        api_callsites=api_surface.get("summary", {}).get("callsites", 0),
+        api_absolute_urls=api_surface.get("summary", {}).get("absolute_network_urls", 0),
+        api_failures=api_surface.get("summary", {}).get("failures", 0),
         safe_deobfuscated_units=deob["summary"]["changed_units"] if deob else 0,
         bundle_modules=bundles.get("summary", {}).get("modules", 0),
         sourcemap_originals=originals,
@@ -453,6 +471,9 @@ def print_project_summary(summary: ProjectSummary) -> None:
         f"  JS/module/worker references: {summary.references}\n"
         f"  import-map resolutions: {summary.import_map_resolutions} "
         f"(unresolved bare: {summary.unresolved_bare_specifiers})\n"
+        f"  static API callsites: {summary.api_callsites} "
+        f"({summary.api_absolute_urls} exact absolute URL(s); "
+        f"{summary.api_failures} failed unit(s))\n"
         f"  safe-deobfuscated JS units: {summary.safe_deobfuscated_units}\n"
         f"  structured bundle modules: {summary.bundle_modules}\n"
         f"  source-map originals: {summary.sourcemap_originals}\n"

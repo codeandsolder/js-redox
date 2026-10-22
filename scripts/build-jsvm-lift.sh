@@ -74,7 +74,7 @@ bins=(
   jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir
   switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack
   sourcemap-compose sus-scan wasm-redox fresh-eval wasm-import-semantics
-  source-directives
+  source-directives api-surface
 )
 published=0
 for bin in "${bins[@]}"; do
