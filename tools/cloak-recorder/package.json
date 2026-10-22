@@ -12,7 +12,7 @@
   "type": "module",
   "dependencies": {
     "@duckduckgo/autoconsent": "^16.47.0",
-    "cloakbrowser": "^0.5.12",
+    "cloakbrowser": "^0.6.0",
     "esbuild": "^0.28.2",
     "playwright-core": "^1.63.0"
   },
