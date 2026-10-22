@@ -28,15 +28,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt,clippy
-      - name: Refresh isolated CI sccache
+      - name: Validate isolated CI sccache
         run: |
-          /usr/bin/systemctl reset-failed sccache-ci-root.service || true
-          /usr/bin/systemctl restart sccache-ci-root.service
-          for _ in {1..50}; do
-            /usr/bin/ss -ltn | /usr/bin/grep -q '127.0.0.1:4247' && break
-            /usr/bin/sleep 0.1
-          done
-          /usr/bin/ss -ltn | /usr/bin/grep -q '127.0.0.1:4247'
           rustc_path="$(rustup which rustc)"
           /usr/local/bin/sccache "$rustc_path" -vV
           stats="$(/usr/local/bin/sccache --show-stats)"
@@ -59,15 +52,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.1
-      - name: Refresh isolated CI sccache
+      - name: Validate isolated CI sccache
         run: |
-          /usr/bin/systemctl reset-failed sccache-ci-root.service || true
-          /usr/bin/systemctl restart sccache-ci-root.service
-          for _ in {1..50}; do
-            /usr/bin/ss -ltn | /usr/bin/grep -q '127.0.0.1:4247' && break
-            /usr/bin/sleep 0.1
-          done
-          /usr/bin/ss -ltn | /usr/bin/grep -q '127.0.0.1:4247'
           rustc_path="$(rustup which rustc)"
           /usr/local/bin/sccache "$rustc_path" -vV
           stats="$(/usr/local/bin/sccache --show-stats)"
