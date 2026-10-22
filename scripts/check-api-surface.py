@@ -189,7 +189,7 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         readme = (project / "README.md").read_text()
         assert "[analysis/api-surface.json](analysis/api-surface.json)" in readme, readme
         assert "Static browser API callsites: **7**" in readme, readme
-        assert "exact absolute network targets: **5**" in readme, readme
+        assert "callsites with exact absolute network URLs: **5**" in readme, readme
         assert "failed source units: **1**" in readme, readme
 
         print(

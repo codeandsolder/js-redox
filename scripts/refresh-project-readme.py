@@ -160,7 +160,7 @@ def main():
         f"- Source kinds: {dict(sorted(source_kinds.items()))}",
         f"- JS/module/worker references: **{jsrefs.get('summary', {}).get('references', 0)}**",
         *([
-            f"- Static browser API callsites: **{api_summary.get('callsites', 0)}**; exact absolute network targets: **{api_summary.get('absolute_network_urls', 0)}**; failed source units: **{api_summary.get('failures', 0)}**",
+            f"- Static browser API callsites: **{api_summary.get('callsites', 0)}**; callsites with exact absolute network URLs: **{api_summary.get('absolute_network_urls', 0)}**; failed source units: **{api_summary.get('failures', 0)}**",
             f"- Static browser API sink kinds: {api_summary.get('kinds', {})}",
         ] if api_surface_doc is not None else []),
         f"- Bounded dynamic-import patterns: **{jsrefs.get('summary', {}).get('dynamic_import_globs', 0)}**; "
