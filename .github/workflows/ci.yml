@@ -19,7 +19,7 @@ permissions:
 jobs:
   rust:
     name: Rust 1.99 quality gate
-    runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-24.04]
+    runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-26.04]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -35,7 +35,7 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
   semantic:
     name: Semantic/runtime regressions
-    runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-24.04]
+    runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-26.04]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
