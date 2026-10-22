@@ -20,6 +20,8 @@ jobs:
   rust:
     name: Rust 1.99 quality gate
     runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-24.04]
+    env:
+      SCCACHE_SERVER_PORT: "4227"
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -36,6 +38,8 @@ jobs:
   semantic:
     name: Semantic/runtime regressions
     runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-24.04]
+    env:
+      SCCACHE_SERVER_PORT: "4237"
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
