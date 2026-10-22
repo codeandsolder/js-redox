@@ -10,6 +10,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # The host sccache daemon must see Cargo registry paths at the same absolute path.
+  CARGO_HOME: /srv/ci/github-actions-rustup/js-redox/cargo-home
   CARGO_INCREMENTAL: "0"
   RUSTC_WRAPPER: /usr/local/bin/sccache
 
@@ -26,7 +28,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt,clippy
-      - name: Validate isolated CI sccache
+      - name: Validate Garage sccache
         run: |
           rustc_path="$(rustup which rustc)"
           /usr/local/bin/sccache "$rustc_path" -vV
@@ -49,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.1
-      - name: Validate isolated CI sccache
+      - name: Validate Garage sccache
         run: |
           rustc_path="$(rustup which rustc)"
           /usr/local/bin/sccache "$rustc_path" -vV
