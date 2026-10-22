@@ -38,10 +38,13 @@ def main() -> None:
         for path in (raw, src, deob, rejected_raw, rejected_src):
             path.parent.mkdir(parents=True, exist_ok=True)
         source = """
-fetch("https://api.example.test/v1" + "/users");
+const apiOrigin = "https://api.example.test";
+const usersUrl = apiOrigin + "/v1/users";
+const writeMethod = "POST";
+fetch(usersUrl);
 fetch("/relative");
 fetch("/unknown-method", opts);
-fetch("https://api.example.test/write", { ...opts, method: "POST" });
+fetch(apiOrigin + "/write", { ...opts, method: writeMethod });
 navigator.sendBeacon("https://api.example.test/beacon", body);
 const xhr = new XMLHttpRequest();
 xhr.open("PATCH", "https://api.example.test/items");
@@ -161,6 +164,13 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         assert len(artifact["failures"]) == 1, artifact["failures"]
         assert artifact["failures"][0]["source_index_ordinal"] == 2, artifact["failures"]
         assert artifact["failures"][0]["error"].strip(), artifact["failures"]
+        users = next(
+            row
+            for row in artifact["callsites"]
+            if row.get("url") == "https://api.example.test/v1/users"
+        )
+        assert users["url_expression"] == "usersUrl", users
+        assert users["method"] == "GET", users
         relative = next(row for row in artifact["callsites"] if row.get("url") == "/relative")
         assert relative["absolute_network_url"] is False
         write = next(
@@ -169,7 +179,8 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             if row.get("url") == "https://api.example.test/write"
         )
         assert write["method"] == "POST", write
-        assert write["method_expression"] == '"POST"', write
+        assert write["url_expression"] == 'apiOrigin + "/write"', write
+        assert write["method_expression"] == "writeMethod", write
 
         run(sys.executable, ROOT / "scripts/build-source-graph.py", project)
         graph = load_artifact(project, SOURCE_GRAPH)

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use jsvm_safe_core::ProvenConstantEnvironment;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingPattern, CallExpression, ComputedMemberExpression, Expression, NewExpression,
@@ -135,26 +136,12 @@ fn global_path(scoping: &Scoping, expression: &Expression<'_>) -> Option<String>
     }
 }
 
-fn static_string(expression: &Expression<'_>) -> Option<String> {
-    match unparenthesized(expression) {
-        Expression::StringLiteral(value) => Some(value.value.to_string()),
-        Expression::TemplateLiteral(value) if value.expressions.is_empty() => {
-            value.quasis.first().map(|quasi| {
-                quasi
-                    .value
-                    .cooked
-                    .as_ref()
-                    .unwrap_or(&quasi.value.raw)
-                    .to_string()
-            })
-        }
-        Expression::BinaryExpression(binary) if binary.operator.as_str() == "+" => {
-            let mut left = static_string(&binary.left)?;
-            left.push_str(&static_string(&binary.right)?);
-            Some(left)
-        }
-        _ => None,
-    }
+fn static_string(
+    expression: &Expression<'_>,
+    scoping: &Scoping,
+    constants: &ProvenConstantEnvironment,
+) -> Option<String> {
+    constants.exact_string(expression, scoping)
 }
 
 fn source_fragment(source: &str, span: Span) -> String {
@@ -359,6 +346,8 @@ impl<'a> Visit<'a> for SinkMutationCollector<'_> {
 fn exact_argument(
     source: &str,
     argument: Option<&oxc_ast::ast::Argument<'_>>,
+    scoping: &Scoping,
+    constants: &ProvenConstantEnvironment,
 ) -> (Option<String>, Option<String>) {
     let Some(argument) = argument else {
         return (None, None);
@@ -367,7 +356,7 @@ fn exact_argument(
         return (None, Some(source_fragment(source, argument.span())));
     };
     (
-        static_string(expression),
+        static_string(expression, scoping, constants),
         Some(source_fragment(source, expression.span())),
     )
 }
@@ -383,6 +372,8 @@ enum FetchInitMethod {
 fn fetch_init_method(
     source: &str,
     argument: Option<&oxc_ast::ast::Argument<'_>>,
+    scoping: &Scoping,
+    constants: &ProvenConstantEnvironment,
 ) -> FetchInitMethod {
     let Some(argument) = argument else {
         return FetchInitMethod::Missing;
@@ -432,7 +423,7 @@ fn fetch_init_method(
             continue;
         }
 
-        state = if let Some(value) = static_string(&property.value) {
+        state = if let Some(value) = static_string(&property.value, scoping, constants) {
             FetchInitMethod::Exact {
                 value,
                 expression: source_fragment(source, property.value.span()),
@@ -449,6 +440,8 @@ fn fetch_method(
     arguments: &[oxc_ast::ast::Argument<'_>],
     input_is_static_string: bool,
     request_init_method_prototype_mutated: bool,
+    scoping: &Scoping,
+    constants: &ProvenConstantEnvironment,
 ) -> (Option<String>, Option<String>) {
     if arguments
         .first()
@@ -457,7 +450,7 @@ fn fetch_method(
         return (None, None);
     }
 
-    match fetch_init_method(source, arguments.get(1)) {
+    match fetch_init_method(source, arguments.get(1), scoping, constants) {
         FetchInitMethod::Exact { value, expression } => (Some(value), Some(expression)),
         FetchInitMethod::Missing if input_is_static_string => (Some("GET".to_string()), None),
         FetchInitMethod::NoOwnMethod
@@ -506,6 +499,7 @@ impl<'a> Visit<'a> for XhrBindingCollector<'_> {
 struct Collector<'s, 'c> {
     source: &'s str,
     scoping: &'c Scoping,
+    constants: &'c ProvenConstantEnvironment,
     mutated_sinks: &'c BTreeSet<&'static str>,
     xhr_symbols: &'c BTreeSet<SymbolId>,
     lines: LineIndex,
@@ -567,12 +561,19 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         if !call.optional {
             if let Some(path) = global_path(self.scoping, &call.callee) {
                 if allowed_fetch_path(&path) && !self.mutated_sinks.contains("fetch") {
-                    let (url, url_expression) = exact_argument(self.source, call.arguments.first());
+                    let (url, url_expression) = exact_argument(
+                        self.source,
+                        call.arguments.first(),
+                        self.scoping,
+                        self.constants,
+                    );
                     let method = fetch_method(
                         self.source,
                         &call.arguments,
                         url.is_some(),
                         self.mutated_sinks.contains("request_init_method_prototype"),
+                        self.scoping,
+                        self.constants,
                     );
                     self.push(
                         "fetch",
@@ -585,7 +586,12 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 } else if allowed_send_beacon_path(&path)
                     && !self.mutated_sinks.contains("send_beacon")
                 {
-                    let (url, url_expression) = exact_argument(self.source, call.arguments.first());
+                    let (url, url_expression) = exact_argument(
+                        self.source,
+                        call.arguments.first(),
+                        self.scoping,
+                        self.constants,
+                    );
                     self.push(
                         "send_beacon",
                         call.span,
@@ -599,9 +605,18 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
 
             if let Some(symbol) = self.xhr_receiver_symbol(&call.callee) {
                 if self.xhr_symbols.contains(&symbol) {
-                    let (method, method_expression) =
-                        exact_argument(self.source, call.arguments.first());
-                    let (url, url_expression) = exact_argument(self.source, call.arguments.get(1));
+                    let (method, method_expression) = exact_argument(
+                        self.source,
+                        call.arguments.first(),
+                        self.scoping,
+                        self.constants,
+                    );
+                    let (url, url_expression) = exact_argument(
+                        self.source,
+                        call.arguments.get(1),
+                        self.scoping,
+                        self.constants,
+                    );
                     self.push(
                         "xhr_open",
                         call.span,
@@ -619,8 +634,12 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_new_expression(&mut self, expression: &NewExpression<'a>) {
         if let Some(path) = global_path(self.scoping, &expression.callee) {
             if allowed_websocket_path(&path) && !self.mutated_sinks.contains("websocket") {
-                let (url, url_expression) =
-                    exact_argument(self.source, expression.arguments.first());
+                let (url, url_expression) = exact_argument(
+                    self.source,
+                    expression.arguments.first(),
+                    self.scoping,
+                    self.constants,
+                );
                 self.push(
                     "websocket",
                     expression.span,
@@ -680,6 +699,7 @@ pub fn analyze_api_surface(source: &str) -> Result<Vec<ApiCallsite>> {
             continue;
         }
         let scoping = semantic.semantic.scoping();
+        let constants = ProvenConstantEnvironment::collect(&program, scoping);
 
         let mut safe_member_refs = SafeMemberReferenceCollector::default();
         safe_member_refs.visit_program(&program);
@@ -701,6 +721,7 @@ pub fn analyze_api_surface(source: &str) -> Result<Vec<ApiCallsite>> {
         let mut collector = Collector {
             source,
             scoping,
+            constants: &constants,
             mutated_sinks: &mutations.mutated,
             xhr_symbols: &xhr.symbols,
             lines: LineIndex::new(source),
@@ -757,6 +778,43 @@ xhr.send(payload);
         assert_eq!(rows[5].kind, "xhr_open");
         assert_eq!(rows[5].method.as_deref(), Some("POST"));
         assert_eq!(rows[5].line, 8);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_only_available_proven_const_strings() -> Result<()> {
+        let source = r#"
+const scheme = "https://";
+const host = "api.example.test";
+const url = scheme + host + "/v1";
+const method = "PA" + "TCH";
+fetch(url, { method });
+navigator.sendBeacon(url, payload);
+const xhr = new XMLHttpRequest();
+xhr.open(method, url);
+const socket = "wss://socket.example.test/ws";
+new WebSocket(socket);
+fetch(later);
+const later = "https://later.example.test/";
+let mutable = "https://mutable.example.test/";
+fetch(mutable);
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 6, "{rows:#?}");
+        assert_eq!(rows[0].url.as_deref(), Some("https://api.example.test/v1"));
+        assert_eq!(rows[0].method.as_deref(), Some("PATCH"));
+        assert_eq!(rows[0].url_expression.as_deref(), Some("url"));
+        assert_eq!(rows[0].method_expression.as_deref(), Some("method"));
+        assert_eq!(rows[1].url.as_deref(), Some("https://api.example.test/v1"));
+        assert_eq!(rows[2].kind, "xhr_open");
+        assert_eq!(rows[2].method.as_deref(), Some("PATCH"));
+        assert_eq!(rows[2].url.as_deref(), Some("https://api.example.test/v1"));
+        assert_eq!(rows[3].kind, "websocket");
+        assert_eq!(rows[3].url.as_deref(), Some("wss://socket.example.test/ws"));
+        assert_eq!(rows[4].url, None, "TDZ/forward const must stay unresolved");
+        assert_eq!(rows[4].url_expression.as_deref(), Some("later"));
+        assert_eq!(rows[5].url, None, "mutable let must stay unresolved");
+        assert_eq!(rows[5].url_expression.as_deref(), Some("mutable"));
         Ok(())
     }
 

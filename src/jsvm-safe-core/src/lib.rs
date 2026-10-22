@@ -165,6 +165,33 @@ fn collect_const_values(
     constants
 }
 
+/// Immutable primitive bindings proven from `const` declarations.
+///
+/// Bindings are keyed by Oxc semantic identity, become available only after
+/// their declaration, and use the same deliberately narrow pure-expression
+/// evaluator as safe deobfuscation.
+#[derive(Debug)]
+pub struct ProvenConstantEnvironment {
+    bindings: HashMap<SymbolId, ConstBinding>,
+}
+
+impl ProvenConstantEnvironment {
+    #[must_use]
+    pub fn collect(program: &oxc_ast::ast::Program<'_>, scoping: &Scoping) -> Self {
+        Self {
+            bindings: collect_const_values(program, scoping),
+        }
+    }
+
+    #[must_use]
+    pub fn exact_string(&self, expr: &Expression<'_>, scoping: &Scoping) -> Option<String> {
+        match eval_with_constants(expr, scoping, &self.bindings)? {
+            Value::String(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
 fn array_element(el: &ArrayExpressionElement<'_>) -> Option<Value> {
     match el {
         ArrayExpressionElement::StringLiteral(v) => Some(Value::String(v.value.to_string())),
