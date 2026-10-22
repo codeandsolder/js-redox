@@ -61,6 +61,7 @@ jobs:
             target/debug/table-ir \
             target/debug/js-refs \
             target/debug/source-directives \
+            target/debug/api-surface \
             target/debug/deobfuscate-safe \
             target/debug/bundle-unpack \
             target/debug/sourcemap-compose \
@@ -72,6 +73,8 @@ jobs:
         run: uv run --no-project python scripts/check-safe-deobfuscate.py
       - name: Deobfuscation source-mode pipeline
         run: uv run --no-project python scripts/check-deobfuscation-source-mode-pipeline.py
+      - name: Static API surface
+        run: uv run --no-project python scripts/check-api-surface.py
       - name: Static string recovery
         run: uv run --no-project python scripts/check-static-string-recovery.py
       - name: VM capture pipeline

@@ -84,6 +84,7 @@ class ProjectSummary:
     unresolved_bare_specifiers: int
     api_callsites: int
     api_absolute_urls: int
+    api_failures: int
     safe_deobfuscated_units: int
     bundle_modules: int
     sourcemap_originals: int
@@ -429,6 +430,7 @@ def load_project_summary(
         unresolved_bare_specifiers=jsrefs["summary"].get("unresolved_bare_specifiers", 0),
         api_callsites=api_surface.get("summary", {}).get("callsites", 0),
         api_absolute_urls=api_surface.get("summary", {}).get("absolute_network_urls", 0),
+        api_failures=api_surface.get("summary", {}).get("failures", 0),
         safe_deobfuscated_units=deob["summary"]["changed_units"] if deob else 0,
         bundle_modules=bundles.get("summary", {}).get("modules", 0),
         sourcemap_originals=originals,
@@ -470,7 +472,8 @@ def print_project_summary(summary: ProjectSummary) -> None:
         f"  import-map resolutions: {summary.import_map_resolutions} "
         f"(unresolved bare: {summary.unresolved_bare_specifiers})\n"
         f"  static API callsites: {summary.api_callsites} "
-        f"({summary.api_absolute_urls} exact absolute URL(s))\n"
+        f"({summary.api_absolute_urls} exact absolute URL(s); "
+        f"{summary.api_failures} failed unit(s))\n"
         f"  safe-deobfuscated JS units: {summary.safe_deobfuscated_units}\n"
         f"  structured bundle modules: {summary.bundle_modules}\n"
         f"  source-map originals: {summary.sourcemap_originals}\n"
