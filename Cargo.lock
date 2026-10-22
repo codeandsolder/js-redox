@@ -1327,7 +1327,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "waffle",
- "wasmparser 0.261.0",
+ "wasmparser 0.262.0",
  "wasmprinter",
  "wat",
 ]
@@ -1349,10 +1349,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f20f20e44f7e8aeb6744823ea9d869ede51e51be4fdaedede2852282e54d2d8"
 dependencies = [
  "bitflags",
- "hashbrown",
  "indexmap",
  "semver",
- "serde",
 ]
 
 [[package]]
@@ -1362,8 +1360,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "974d643b125b272607e2fff8012ea14a8328acd7621e4bafa7afb32500052b1b"
 dependencies = [
  "bitflags",
+ "hashbrown",
  "indexmap",
  "semver",
+ "serde",
 ]
 
 [[package]]
