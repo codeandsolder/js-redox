@@ -32,7 +32,7 @@ base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 oxc_allocator = "0.153.0"
 oxc_ast = "0.153.0"
-oxc_ast_visit = "0.153.0"
+oxc_ast_visit = "0.155.0"
 oxc_codegen = "0.153.0"
 oxc_ecmascript = "0.153.0"
 oxc_semantic = "0.153.0"
