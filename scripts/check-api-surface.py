@@ -45,6 +45,7 @@ fetch(usersUrl);
 fetch("/relative");
 fetch("/unknown-method", opts);
 fetch(apiOrigin + "/write", { ...opts, method: writeMethod });
+fetch("https://api.example.test/forbidden", { method: "trace" });
 navigator.sendBeacon("https://api.example.test/beacon", body);
 const xhr = new XMLHttpRequest();
 xhr.open("PATCH", "https://api.example.test/items");
@@ -147,17 +148,18 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         artifact = load_artifact(project, API_SURFACE)
         assert artifact["summary"] == {
             "units": 2,
-            "callsites": 7,
+            "callsites": 8,
             "failures": 1,
             "kinds": {
-                "fetch": 4,
+                "fetch": 5,
                 "send_beacon": 1,
                 "websocket": 1,
                 "xhr_open": 1,
             },
-            "static_urls": 7,
-            "absolute_network_urls": 5,
+            "static_urls": 8,
+            "absolute_network_urls": 6,
             "static_methods": 5,
+            "invalid_methods": 1,
         }, artifact["summary"]
         assert all("fake.invalid" not in str(row) for row in artifact["callsites"])
         assert {row["source_index_ordinal"] for row in artifact["callsites"]} == {1}
@@ -181,15 +183,28 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         assert write["method"] == "POST", write
         assert write["url_expression"] == 'apiOrigin + "/write"', write
         assert write["method_expression"] == "writeMethod", write
+        forbidden = next(
+            row
+            for row in artifact["callsites"]
+            if row.get("url") == "https://api.example.test/forbidden"
+        )
+        assert forbidden.get("method") is None, forbidden
+        assert forbidden.get("method_expression") == '"trace"', forbidden
+        assert forbidden.get("method_status") == "invalid", forbidden
 
         run(sys.executable, ROOT / "scripts/build-source-graph.py", project)
         graph = load_artifact(project, SOURCE_GRAPH)
         api_nodes = [node for node in graph["nodes"] if node["type"] == "api_callsite"]
-        assert len(api_nodes) == 7, api_nodes
+        assert len(api_nodes) == 8, api_nodes
         assert all(node["source_index_ordinal"] == 1 for node in api_nodes), api_nodes
         assert all(node["id"].startswith("api-call:1:") for node in api_nodes), api_nodes
         request_edges = [edge for edge in graph["edges"] if edge["kind"] == "api_target"]
         assert len(request_edges) == 5, request_edges
+        assert not any(
+            node.get("url") == "https://api.example.test/forbidden"
+            for node in graph["nodes"]
+            if node["type"] == "external_url"
+        ), graph["nodes"]
         assert any(
             node.get("url") == "wss://socket.example.test/ws"
             for node in graph["nodes"]
@@ -199,12 +214,13 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         run(sys.executable, ROOT / "scripts/refresh-project-readme.py", project)
         readme = (project / "README.md").read_text()
         assert "[analysis/api-surface.json](analysis/api-surface.json)" in readme, readme
-        assert "Static browser API callsites: **7**" in readme, readme
-        assert "callsites with exact absolute network URLs: **5**" in readme, readme
+        assert "Static browser API callsites: **8**" in readme, readme
+        assert "callsites with exact absolute network URLs: **6**" in readme, readme
+        assert "proven invalid methods: **1**" in readme, readme
         assert "failed source units: **1**" in readme, readme
 
         print(
-            "static API surface regression: exact callsites + ordered fetch init + per-unit fail-closed handling + URL graph + analyst README OK"
+            "static API surface regression: exact callsites + ordered fetch init + method semantics + per-unit fail-closed handling + URL graph + analyst README OK"
         )
 
 

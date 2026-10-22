@@ -116,7 +116,7 @@ RUNTIME_SCRIPTS = ArtifactSpec(
 API_SURFACE = ArtifactSpec(
     "static API surface",
     Path("analysis/api-surface.json"),
-    "capture-api-surface/v1",
+    "capture-api-surface/v2",
     array_fields=("callsites", "failures"),
     object_fields=("summary",),
 )
