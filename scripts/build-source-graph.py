@@ -414,6 +414,7 @@ def main():
             proof=row.get('proof'),
             method=row.get('method'),
             method_expression=row.get('method_expression'),
+            method_status=row.get('method_status'),
             url=row.get('url'),
             url_expression=row.get('url_expression'),
             standard_browser_api_semantics_required=bool(
@@ -431,7 +432,11 @@ def main():
         if parent:
             add_edge(parent, node_id, 'api_callsite')
         url = row.get('url')
-        if row.get('absolute_network_url') and isinstance(url, str):
+        if (
+            row.get('absolute_network_url')
+            and isinstance(url, str)
+            and row.get('method_status') != 'invalid'
+        ):
             for target in targets_for(url):
                 add_edge(
                     node_id,
@@ -439,6 +444,7 @@ def main():
                     'api_target',
                     sink_kind=row.get('kind'),
                     method=row.get('method'),
+                    method_status=row.get('method_status'),
                     standard_browser_api_semantics_required=bool(
                         row.get('standard_browser_api_semantics_required')
                     ),

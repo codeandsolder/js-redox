@@ -10,6 +10,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # The host sccache daemon must see Cargo registry paths at the same absolute path.
+  CARGO_HOME: /srv/ci/github-actions-rustup/js-redox/cargo-home
   CARGO_INCREMENTAL: "0"
   RUSTC_WRAPPER: /usr/local/bin/sccache
 
@@ -23,10 +25,17 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt,clippy
-      - uses: Swatinem/rust-cache@v2
+      - name: Validate Garage sccache
+        run: |
+          rustc_path="$(rustup which rustc)"
+          /usr/local/bin/sccache "$rustc_path" -vV
+          stats="$(/usr/local/bin/sccache --show-stats)"
+          printf '%s\n' "$stats"
+          /usr/bin/grep -q 'L0 (s3)' <<<"$stats"
+          ! /usr/bin/grep -q 'Cache location                  Local disk' <<<"$stats"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Test
@@ -35,12 +44,23 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
   semantic:
     name: Semantic/runtime regressions
+    needs: rust
     runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-24.04]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Validate Garage sccache
+        run: |
+          rustc_path="$(rustup which rustc)"
+          /usr/local/bin/sccache "$rustc_path" -vV
+          stats="$(/usr/local/bin/sccache --show-stats)"
+          printf '%s\n' "$stats"
+          /usr/bin/grep -q 'L0 (s3)' <<<"$stats"
+          ! /usr/bin/grep -q 'Cache location                  Local disk' <<<"$stats"
       - name: Install uv
         uses: astral-sh/setup-uv@v10.3.0
         with:

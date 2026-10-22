@@ -31,6 +31,8 @@ pub struct ApiCallsite {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method_expression: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub method_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url_expression: Option<String>,
@@ -142,6 +144,45 @@ fn static_string(
     constants: &ProvenConstantEnvironment,
 ) -> Option<String> {
     constants.exact_string(expression, scoping)
+}
+
+fn effective_http_method(value: &str) -> Option<String> {
+    if value.is_empty()
+        || !value.as_bytes().iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+    {
+        return None;
+    }
+    if ["CONNECT", "TRACE", "TRACK"]
+        .iter()
+        .any(|forbidden| value.eq_ignore_ascii_case(forbidden))
+    {
+        return None;
+    }
+    for normalized in ["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"] {
+        if value.eq_ignore_ascii_case(normalized) {
+            return Some(normalized.to_string());
+        }
+    }
+    Some(value.to_string())
 }
 
 fn source_fragment(source: &str, span: Span) -> String {
@@ -366,6 +407,7 @@ enum FetchInitMethod {
     Missing,
     NoOwnMethod,
     Exact { value: String, expression: String },
+    Invalid { expression: String },
     Unknown,
 }
 
@@ -408,7 +450,7 @@ fn fetch_init_method(
             && !property.shorthand
             && property.kind == PropertyKind::Init;
         if prototype_setter {
-            if !matches!(state, FetchInitMethod::Exact { .. }) {
+            if matches!(state, FetchInitMethod::NoOwnMethod) {
                 state = FetchInitMethod::Unknown;
             }
             continue;
@@ -424,9 +466,11 @@ fn fetch_init_method(
         }
 
         state = if let Some(value) = static_string(&property.value, scoping, constants) {
-            FetchInitMethod::Exact {
-                value,
-                expression: source_fragment(source, property.value.span()),
+            let expression = source_fragment(source, property.value.span());
+            if let Some(value) = effective_http_method(&value) {
+                FetchInitMethod::Exact { value, expression }
+            } else {
+                FetchInitMethod::Invalid { expression }
             }
         } else {
             FetchInitMethod::Unknown
@@ -442,24 +486,31 @@ fn fetch_method(
     request_init_method_prototype_mutated: bool,
     scoping: &Scoping,
     constants: &ProvenConstantEnvironment,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<String>) {
     if arguments
         .first()
         .is_some_and(|argument| argument.as_expression().is_none())
     {
-        return (None, None);
+        return (None, None, Some("unknown".to_string()));
     }
 
     match fetch_init_method(source, arguments.get(1), scoping, constants) {
-        FetchInitMethod::Exact { value, expression } => (Some(value), Some(expression)),
-        FetchInitMethod::Missing if input_is_static_string => (Some("GET".to_string()), None),
+        FetchInitMethod::Exact { value, expression } => {
+            (Some(value), Some(expression), Some("exact".to_string()))
+        }
+        FetchInitMethod::Invalid { expression } => {
+            (None, Some(expression), Some("invalid".to_string()))
+        }
+        FetchInitMethod::Missing if input_is_static_string => {
+            (Some("GET".to_string()), None, Some("exact".to_string()))
+        }
         FetchInitMethod::NoOwnMethod
             if input_is_static_string && !request_init_method_prototype_mutated =>
         {
-            (Some("GET".to_string()), None)
+            (Some("GET".to_string()), None, Some("exact".to_string()))
         }
         FetchInitMethod::Missing | FetchInitMethod::NoOwnMethod | FetchInitMethod::Unknown => {
-            (None, None)
+            (None, None, Some("unknown".to_string()))
         }
     }
 }
@@ -513,10 +564,10 @@ impl Collector<'_, '_> {
         span: Span,
         callee: String,
         proof: &str,
-        method: (Option<String>, Option<String>),
+        method: (Option<String>, Option<String>, Option<String>),
         url: (Option<String>, Option<String>),
     ) {
-        let (method, method_expression) = method;
+        let (method, method_expression, method_status) = method;
         let (url, url_expression) = url;
         let (line, column) = self.lines.line_column(span.start);
         self.callsites.insert(ApiCallsite {
@@ -530,6 +581,7 @@ impl Collector<'_, '_> {
             standard_browser_api_semantics_required: true,
             method,
             method_expression,
+            method_status,
             url,
             url_expression,
         });
@@ -597,7 +649,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                         call.span,
                         path,
                         STANDARD_BROWSER_API_ASSUMPTION,
-                        (Some("POST".to_string()), None),
+                        (Some("POST".to_string()), None, Some("exact".to_string())),
                         (url, url_expression),
                     );
                 }
@@ -611,6 +663,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                         self.scoping,
                         self.constants,
                     );
+                    let (method, method_status) = match method {
+                        Some(value) => match effective_http_method(&value) {
+                            Some(value) => (Some(value), Some("exact".to_string())),
+                            None => (None, Some("invalid".to_string())),
+                        },
+                        None => (None, Some("unknown".to_string())),
+                    };
                     let (url, url_expression) = exact_argument(
                         self.source,
                         call.arguments.get(1),
@@ -622,7 +681,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                         call.span,
                         source_fragment(self.source, call.callee.span()),
                         "stable_symbol_initialized_from_standard_XMLHttpRequest",
-                        (method, method_expression),
+                        (method, method_expression, method_status),
                         (url, url_expression),
                     );
                 }
@@ -645,7 +704,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                     expression.span,
                     path,
                     STANDARD_BROWSER_API_ASSUMPTION,
-                    (None, None),
+                    (None, None, None),
                     (url, url_expression),
                 );
             }
@@ -819,6 +878,36 @@ fetch(mutable);
     }
 
     #[test]
+    fn normalizes_valid_methods_and_marks_proven_invalid_methods() -> Result<()> {
+        let source = r#"
+fetch("https://api.example.test/get", { method: "gEt" });
+fetch("https://api.example.test/custom", { method: "eGg" });
+fetch("https://api.example.test/forbidden", { method: "trace" });
+fetch("https://api.example.test/bad-token", { method: "bad method" });
+const xhr = new XMLHttpRequest();
+xhr.open("pOsT", "https://api.example.test/xhr-ok");
+const blocked = new XMLHttpRequest();
+blocked.open("CONNECT", "https://api.example.test/xhr-blocked");
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 6, "{rows:#?}");
+        assert_eq!(rows[0].method.as_deref(), Some("GET"));
+        assert_eq!(rows[0].method_status.as_deref(), Some("exact"));
+        assert_eq!(rows[1].method.as_deref(), Some("eGg"));
+        assert_eq!(rows[1].method_status.as_deref(), Some("exact"));
+        assert_eq!(rows[2].method, None);
+        assert_eq!(rows[2].method_expression.as_deref(), Some(r#""trace""#));
+        assert_eq!(rows[2].method_status.as_deref(), Some("invalid"));
+        assert_eq!(rows[3].method, None);
+        assert_eq!(rows[3].method_status.as_deref(), Some("invalid"));
+        assert_eq!(rows[4].method.as_deref(), Some("POST"));
+        assert_eq!(rows[4].method_status.as_deref(), Some("exact"));
+        assert_eq!(rows[5].method, None);
+        assert_eq!(rows[5].method_status.as_deref(), Some("invalid"));
+        Ok(())
+    }
+
+    #[test]
     fn fetch_inline_init_method_respects_object_overwrite_order() -> Result<()> {
         let source = r#"
 fetch("https://api.example.test/post", { method: "POST" });
@@ -854,12 +943,15 @@ fetch(request, { headers: {} });
 fetch("https://api.example.test/proto-only", { __proto__: { method: "POST" } });
 fetch("https://api.example.test/own-before", { method: "PUT", __proto__: { method: "POST" } });
 fetch("https://api.example.test/own-after", { __proto__: { method: "POST" }, method: "PATCH" });
+fetch("https://api.example.test/invalid-own", { method: "TRACE", __proto__: { method: "GET" } });
 "#;
         let rows = analyze_api_surface(source)?;
-        assert_eq!(rows.len(), 3, "{rows:#?}");
+        assert_eq!(rows.len(), 4, "{rows:#?}");
         assert_eq!(rows[0].method, None);
         assert_eq!(rows[1].method.as_deref(), Some("PUT"));
         assert_eq!(rows[2].method.as_deref(), Some("PATCH"));
+        assert_eq!(rows[3].method, None);
+        assert_eq!(rows[3].method_status.as_deref(), Some("invalid"));
         Ok(())
     }
 

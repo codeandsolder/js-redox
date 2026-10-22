@@ -101,7 +101,7 @@ def main() -> None:
             )
             analyzed_units += 1
             continue
-        if report.get("schema") != "jsvm-api-surface/v1" or not isinstance(
+        if report.get("schema") != "jsvm-api-surface/v2" or not isinstance(
             report.get("callsites"), list
         ):
             failures.append(
@@ -143,6 +143,7 @@ def main() -> None:
             bool(row.get("absolute_network_url")) for row in callsites
         ),
         "static_methods": sum(isinstance(row.get("method"), str) for row in callsites),
+        "invalid_methods": sum(row.get("method_status") == "invalid" for row in callsites),
     }
     document = {
         "schema": API_SURFACE.schema,
