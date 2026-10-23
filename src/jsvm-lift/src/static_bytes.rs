@@ -106,6 +106,7 @@ pub struct RecoveredInlineWasmArtifact {
     pub source_start: u32,
     pub source_end: u32,
     pub encoding: &'static str,
+    pub carrier_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -615,6 +616,95 @@ fn decode_validated_wasm_base64(text: &str) -> Option<Vec<u8>> {
     validated_wasm_bytes(decode_atob(text)?)
 }
 
+fn decode_validated_wasm_data_url(text: &str) -> Option<Vec<u8>> {
+    if !text.starts_with("data:") {
+        return None;
+    }
+    let (metadata, payload) = text.split_once(',')?;
+    let base64 = metadata
+        .rsplit(';')
+        .next()
+        .is_some_and(|part| part.eq_ignore_ascii_case("base64"));
+    if !base64 {
+        return None;
+    }
+    validated_wasm_bytes(decode_atob(payload)?)
+}
+
+fn json_pointer_component(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+fn collect_json_wasm_carriers(
+    value: &serde_json::Value,
+    path: &str,
+    depth: usize,
+    budget: &mut usize,
+    out: &mut Vec<(Vec<u8>, &'static str, String)>,
+) {
+    const MAX_JSON_DEPTH: usize = 64;
+    if depth > MAX_JSON_DEPTH || *budget == 0 {
+        return;
+    }
+    *budget -= 1;
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(bytes) = decode_validated_wasm_base64(text) {
+                out.push((bytes, "json_base64", path.to_string()));
+            } else if let Some(bytes) = decode_validated_wasm_data_url(text) {
+                out.push((bytes, "json_data_url_base64", path.to_string()));
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for (index, item) in values.iter().enumerate() {
+                collect_json_wasm_carriers(
+                    item,
+                    &format!("{path}/{index}"),
+                    depth + 1,
+                    budget,
+                    out,
+                );
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, item) in values {
+                collect_json_wasm_carriers(
+                    item,
+                    &format!("{path}/{}", json_pointer_component(key)),
+                    depth + 1,
+                    budget,
+                    out,
+                );
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn decoded_static_wasm_carriers(text: &str) -> Vec<(Vec<u8>, &'static str, Option<String>)> {
+    if let Some(bytes) = decode_validated_wasm_base64(text) {
+        return vec![(bytes, "base64", None)];
+    }
+    if let Some(bytes) = decode_validated_wasm_data_url(text) {
+        return vec![(bytes, "data_url_base64", None)];
+    }
+    let trimmed = text.trim_start();
+    if !text.contains("AGFzbQ") || !(trimmed.starts_with('[') || trimmed.starts_with('{')) {
+        return Vec::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    const MAX_JSON_NODES: usize = 100_000;
+    let mut budget = MAX_JSON_NODES;
+    let mut nested = Vec::new();
+    collect_json_wasm_carriers(&value, "", 0, &mut budget, &mut nested);
+    nested
+        .into_iter()
+        .map(|(bytes, encoding, path)| (bytes, encoding, Some(path)))
+        .collect()
+}
+
 #[derive(Default)]
 struct InlineWasmLiteralCollector {
     artifacts: Vec<RecoveredInlineWasmArtifact>,
@@ -625,16 +715,16 @@ impl<'a> Visit<'a> for InlineWasmLiteralCollector {
         let Some(text) = literal.value.as_str() else {
             return;
         };
-        let Some(bytes) = decode_validated_wasm_base64(text) else {
-            return;
-        };
-        self.artifacts.push(RecoveredInlineWasmArtifact {
-            sha256: sha256_hex(&bytes),
-            bytes,
-            source_start: literal.span.start,
-            source_end: literal.span.end,
-            encoding: "base64",
-        });
+        for (bytes, encoding, carrier_path) in decoded_static_wasm_carriers(text) {
+            self.artifacts.push(RecoveredInlineWasmArtifact {
+                sha256: sha256_hex(&bytes),
+                bytes,
+                source_start: literal.span.start,
+                source_end: literal.span.end,
+                encoding,
+                carrier_path,
+            });
+        }
     }
 }
 
@@ -1287,6 +1377,39 @@ mod tests {
             return;
         };
         assert!(analysis.inline_wasm_literals.is_empty());
+    }
+
+    #[test]
+    fn recovers_valid_wasm_from_generic_static_carriers() {
+        let source = r#"
+            const direct = "AGFzbQEAAAA=";
+            const data = "data:application/octet-stream;base64,AGFzbQEAAAA=";
+            const serialized = '["not wasm", "AGFzbQEAAAA=", {"nested":"AGFzbQEAAAA="}]';
+        "#;
+        let analysis = analyze_webassembly_byte_artifacts(source);
+        assert!(analysis.is_ok());
+        let Ok(analysis) = analysis else {
+            return;
+        };
+        assert_eq!(analysis.inline_wasm_literals.len(), 4);
+        assert_eq!(analysis.inline_wasm_literals[0].encoding, "base64");
+        assert_eq!(analysis.inline_wasm_literals[0].carrier_path, None);
+        assert_eq!(analysis.inline_wasm_literals[1].encoding, "data_url_base64");
+        assert_eq!(analysis.inline_wasm_literals[1].carrier_path, None);
+        assert_eq!(analysis.inline_wasm_literals[2].encoding, "json_base64");
+        assert_eq!(
+            analysis.inline_wasm_literals[2].carrier_path.as_deref(),
+            Some("/1")
+        );
+        assert_eq!(analysis.inline_wasm_literals[3].encoding, "json_base64");
+        assert_eq!(
+            analysis.inline_wasm_literals[3].carrier_path.as_deref(),
+            Some("/2/nested")
+        );
+        assert!(analysis
+            .inline_wasm_literals
+            .iter()
+            .all(|artifact| artifact.bytes == b"\0asm\x01\0\0\0"));
     }
 
     #[test]

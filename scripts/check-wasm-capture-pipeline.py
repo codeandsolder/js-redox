@@ -188,7 +188,7 @@ def main():
         origin.get("recovery_kind")
         for origin in module["origins"]
         if origin.get("recovery_kind")
-    } == {"validated_inline_base64_literal", "proven_static_byte_assembly"}
+    } == {"validated_static_wasm_carrier", "proven_static_byte_assembly"}
     assert (PROJECT / module["report_path"]).is_file()
 
     deep_path = PROJECT / module["deep_path"]

@@ -178,7 +178,8 @@ def main() -> None:
                     "encoding": artifact["encoding"],
                     "byte_start": start,
                     "byte_end": end,
-                    "recovery_kind": "validated_inline_base64_literal",
+                    "carrier_path": artifact.get("carrier_path"),
+                    "recovery_kind": "validated_static_wasm_carrier",
                 }
             )
 

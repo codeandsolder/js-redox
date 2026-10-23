@@ -20,6 +20,7 @@ struct InlineWasmLiteralReport {
     source_start: u32,
     source_end: u32,
     encoding: &'static str,
+    carrier_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +85,7 @@ fn main() -> Result<()> {
             source_start: artifact.source_start,
             source_end: artifact.source_end,
             encoding: artifact.encoding,
+            carrier_path: artifact.carrier_path,
         });
     }
 
