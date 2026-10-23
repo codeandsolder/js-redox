@@ -74,7 +74,7 @@ fn literal_member<'a>(expr: &'a Expression<'a>) -> Option<(&'a Expression<'a>, &
             let Expression::StringLiteral(property) = &member.expression else {
                 return None;
             };
-            Some((&member.object, property.value.as_str()))
+            Some((&member.object, property.value.as_str()?))
         }
         _ => None,
     }
@@ -478,7 +478,7 @@ fn detect_operator_proxy_table(object: &ObjectExpression<'_>) -> Option<Structur
             continue;
         };
         static_properties += 1;
-        if looks_generated_proxy_key(key.as_ref()) {
+        if key.as_str().is_some_and(looks_generated_proxy_key) {
             generated_keys += 1;
         }
         if is_tiny_proxy_function(&property.value) {

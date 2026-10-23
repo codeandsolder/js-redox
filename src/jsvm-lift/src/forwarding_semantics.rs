@@ -1,4 +1,4 @@
-use jsvm_safe_core::exact_u32;
+use jsvm_safe_core::{exact_u32, string_literal_value};
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, CallExpression, Expression,
     Function, FunctionBody, IfStatement, Program, Statement, VariableDeclaration,
@@ -621,7 +621,7 @@ fn getter_return_forwards(
     {
         return false;
     }
-    matches!(&test.right, Expression::StringLiteral(value) if value.value.as_str() == "undefined")
+    matches!(&test.right, Expression::StringLiteral(value) if value.value.as_str() == Some("undefined"))
 }
 
 struct SetterProbe<'c, 'o, 'b> {
@@ -843,7 +843,7 @@ struct HelperProbe<'c> {
 impl HelperProbe<'_> {
     fn string_value(&self, expression: &Expression<'_>) -> Option<String> {
         match expression {
-            Expression::StringLiteral(value) => Some(value.value.to_string()),
+            Expression::StringLiteral(value) => string_literal_value(value),
             _ => self
                 .strings
                 .get(&expr_key(self.scoping, expression)?)

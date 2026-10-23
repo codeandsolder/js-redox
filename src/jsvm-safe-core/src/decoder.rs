@@ -3,7 +3,10 @@ use crate::decoder_encoding::{
 };
 use crate::rewrite::Replacement;
 use crate::value_eval::{eval, js_to_uint32, render_value_array, same_values, Value};
-use crate::{argument_integer, array_element, decoder_argument_integer, fragment, symbol_of};
+use crate::{
+    argument_integer, array_element, decoder_argument_integer, fragment, string_literal_value,
+    symbol_of, template_element_value,
+};
 use oxc_ast::ast::{
     Argument, BindingPattern, CallExpression, Expression, ExpressionStatement, Statement,
     VariableDeclarationKind,
@@ -488,16 +491,9 @@ fn eval_from_char_code_concat(
     used_aliases: &mut HashSet<SymbolId>,
 ) -> Option<String> {
     match expression {
-        Expression::StringLiteral(literal) => Some(literal.value.to_string()),
+        Expression::StringLiteral(literal) => string_literal_value(literal),
         Expression::TemplateLiteral(template) if template.expressions.is_empty() => {
-            template.quasis.first().map(|quasi| {
-                quasi
-                    .value
-                    .cooked
-                    .as_ref()
-                    .unwrap_or(&quasi.value.raw)
-                    .to_string()
-            })
+            template.quasis.first().and_then(template_element_value)
         }
         Expression::ParenthesizedExpression(parenthesized) => {
             eval_from_char_code_concat(&parenthesized.expression, scoping, aliases, used_aliases)

@@ -8,7 +8,8 @@
 
 use crate::numeric::exact_u32;
 use crate::value_eval::{
-    eval, eval_binary, js_to_int32, js_to_uint32, known_bool, same_value, Value,
+    eval, eval_binary, js_to_int32, js_to_uint32, known_bool, same_value, string_literal_value,
+    template_element_value, Value,
 };
 use crate::{
     array_element, direct_identifier_name, fragment, js_parse_int, symbol_of, ArithmeticStateProof,
@@ -51,13 +52,13 @@ fn static_dispatch_order(expr: &Expression<'_>) -> Option<Vec<String>> {
             let Expression::StringLiteral(separator) = argument else {
                 return None;
             };
-            let separator = separator.value.as_str();
+            let separator = separator.value.as_str()?;
             if separator.len() != 1 || !separator.is_ascii() {
                 return None;
             }
             let order = source
                 .value
-                .as_str()
+                .as_str()?
                 .split(separator)
                 .map(str::to_string)
                 .collect::<Vec<_>>();
@@ -870,14 +871,15 @@ fn eval_with_env(expr: &Expression<'_>, env: &HashMap<String, Value>) -> Option<
                 env.get(id.name.as_str()).cloned()
             }
         }
-        Expression::StringLiteral(v) => Some(Value::String(v.value.to_string())),
+        Expression::StringLiteral(v) => string_literal_value(v).map(Value::String),
         Expression::NumericLiteral(v) => Some(Value::Number(v.value)),
         Expression::BooleanLiteral(v) => Some(Value::Bool(v.value)),
         Expression::NullLiteral(_) => Some(Value::Null),
         Expression::TemplateLiteral(v) if v.expressions.is_empty() => v
             .quasis
             .first()
-            .map(|q| Value::String(q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string())),
+            .and_then(template_element_value)
+            .map(Value::String),
         Expression::ParenthesizedExpression(v) => eval_with_env(&v.expression, env),
         Expression::ComputedMemberExpression(member) if !member.optional => {
             let Expression::Identifier(object) = &member.object else {
@@ -1781,22 +1783,15 @@ impl Collector<'_, '_> {
         }
         match expression {
             Expression::Identifier(identifier) => env.get(identifier.name.as_str()).cloned(),
-            Expression::StringLiteral(value) => Some(Value::String(value.value.to_string())),
+            Expression::StringLiteral(value) => string_literal_value(value).map(Value::String),
             Expression::NumericLiteral(value) => Some(Value::Number(value.value)),
             Expression::BooleanLiteral(value) => Some(Value::Bool(value.value)),
             Expression::NullLiteral(_) => Some(Value::Null),
-            Expression::TemplateLiteral(value) if value.expressions.is_empty() => {
-                value.quasis.first().map(|quasi| {
-                    Value::String(
-                        quasi
-                            .value
-                            .cooked
-                            .as_ref()
-                            .unwrap_or(&quasi.value.raw)
-                            .to_string(),
-                    )
-                })
-            }
+            Expression::TemplateLiteral(value) if value.expressions.is_empty() => value
+                .quasis
+                .first()
+                .and_then(template_element_value)
+                .map(Value::String),
             Expression::ParenthesizedExpression(value) => {
                 self.reference_state_eval(&value.expression, env)
             }

@@ -197,7 +197,7 @@ fn resolve_parse_int(preview: &str, aliases: &BTreeSet<String>) -> Option<u64> {
     if !(2..=36).contains(&radix) {
         return None;
     }
-    let raw = text.value.trim();
+    let raw = text.value.as_str()?.trim();
     let raw = raw.strip_prefix('+').unwrap_or(raw);
     u64::from_str_radix(raw, radix).ok()
 }

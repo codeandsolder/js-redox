@@ -198,7 +198,12 @@ fn analyze_proxy_object(
         if prop.kind != PropertyKind::Init || prop.computed || prop.method || prop.shorthand {
             continue;
         }
-        let Some(key) = prop.key.static_name().map(std::borrow::Cow::into_owned) else {
+        let Some(key) = prop
+            .key
+            .static_name()
+            .and_then(oxc_ast::StaticPropertyName::into_cow_str)
+            .map(std::borrow::Cow::into_owned)
+        else {
             continue;
         };
         if let Some(value) = eval(&prop.value) {

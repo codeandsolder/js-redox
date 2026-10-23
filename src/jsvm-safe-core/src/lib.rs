@@ -40,6 +40,7 @@ use value_eval::{
     eval, eval_binary, eval_logical, eval_unary, eval_with_resolver, js_to_uint32, known_bool,
     Value,
 };
+pub use value_eval::{string_literal_value, template_element_value};
 
 #[derive(Debug, Clone)]
 pub struct ArithmeticStateProof {
@@ -194,7 +195,7 @@ impl ProvenConstantEnvironment {
 
 fn array_element(el: &ArrayExpressionElement<'_>) -> Option<Value> {
     match el {
-        ArrayExpressionElement::StringLiteral(v) => Some(Value::String(v.value.to_string())),
+        ArrayExpressionElement::StringLiteral(v) => string_literal_value(v).map(Value::String),
         ArrayExpressionElement::NumericLiteral(v) => Some(Value::Number(v.value)),
         ArrayExpressionElement::BooleanLiteral(v) => Some(Value::Bool(v.value)),
         ArrayExpressionElement::NullLiteral(_) => Some(Value::Null),
@@ -997,14 +998,15 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
 
 fn eval_static_argument(arg: &Argument<'_>) -> Option<Value> {
     match arg {
-        Argument::StringLiteral(v) => Some(Value::String(v.value.to_string())),
+        Argument::StringLiteral(v) => string_literal_value(v).map(Value::String),
         Argument::NumericLiteral(v) => Some(Value::Number(v.value)),
         Argument::BooleanLiteral(v) => Some(Value::Bool(v.value)),
         Argument::NullLiteral(_) => Some(Value::Null),
         Argument::TemplateLiteral(v) if v.expressions.is_empty() => v
             .quasis
             .first()
-            .map(|q| Value::String(q.value.cooked.as_ref().unwrap_or(&q.value.raw).to_string())),
+            .and_then(template_element_value)
+            .map(Value::String),
         Argument::ParenthesizedExpression(v) => eval(&v.expression),
         Argument::UnaryExpression(v) => eval_unary(v),
         Argument::BinaryExpression(v) => {
@@ -1037,7 +1039,7 @@ fn decoder_argument_integer(arg: &Argument<'_>) -> Option<i64> {
     let Argument::StringLiteral(literal) = arg else {
         return None;
     };
-    let text = literal.value.trim();
+    let text = literal.value.as_str()?.trim();
     let (negative, text) = if let Some(rest) = text.strip_prefix('-') {
         (true, rest)
     } else if let Some(rest) = text.strip_prefix('+') {
@@ -1407,6 +1409,59 @@ mod tests {
                 None,
                 Some("https://nested.example.test".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn proven_constants_fail_closed_on_lone_surrogate_strings() {
+        let source = r#"
+            const normal = "hello";
+            const lone = "\uD800";
+            const cooked = `world`;
+            sink(normal);
+            sink(lone);
+            sink(cooked);
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::unambiguous());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let scoping = semantic.semantic.scoping();
+        let constants = ProvenConstantEnvironment::collect(&parsed.program, scoping);
+
+        struct Probe<'c> {
+            scoping: &'c Scoping,
+            constants: &'c ProvenConstantEnvironment,
+            values: Vec<Option<String>>,
+        }
+        impl<'a> Visit<'a> for Probe<'_> {
+            fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+                if matches!(&call.callee, Expression::Identifier(id) if id.name == "sink") {
+                    self.values.push(
+                        call.arguments
+                            .first()
+                            .and_then(|argument| argument.as_expression())
+                            .and_then(|expression| {
+                                self.constants.exact_string(expression, self.scoping)
+                            }),
+                    );
+                }
+                walk::walk_call_expression(self, call);
+            }
+        }
+
+        let mut probe = Probe {
+            scoping,
+            constants: &constants,
+            values: Vec::new(),
+        };
+        probe.visit_program(&parsed.program);
+        assert_eq!(
+            probe.values,
+            [Some("hello".to_string()), None, Some("world".to_string())]
         );
     }
 

@@ -1,4 +1,5 @@
 use crate::forwarding_semantics::structurally_proven_forwarding_installers;
+use jsvm_safe_core::string_literal_value;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, Expression, Function, ReturnStatement,
@@ -348,15 +349,23 @@ impl<'a> Visit<'a> for CallCollector<'_> {
                 walk::walk_call_expression(self, it);
                 return;
             };
+            let Some(source_property) = string_literal_value(source_property) else {
+                walk::walk_call_expression(self, it);
+                return;
+            };
+            let Some(alias_property) = string_literal_value(alias_property) else {
+                walk::walk_call_expression(self, it);
+                return;
+            };
             self.calls.push(StaticAliasInstallerCall {
                 start: it.span.start,
                 end: it.span.end,
                 installer: callee.name.to_string(),
                 resolver: resolver.name.clone(),
                 resolver_member: resolver.member.clone(),
-                source_property: source_property.value.to_string(),
+                source_property,
                 target_selector,
-                alias_property: alias_property.value.to_string(),
+                alias_property,
                 forwarding_installer_proven,
                 // A proven installer contains a live-forwarding installation path.
                 // This call may still early-return on pre-existing aliases or fail

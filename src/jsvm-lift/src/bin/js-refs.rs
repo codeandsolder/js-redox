@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
+use jsvm_safe_core::string_literal_value;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, CallExpression, ExportAllDeclaration, ExportFromDeclaration, ExportNamedDeclaration,
@@ -55,7 +56,7 @@ impl Collector<'_> {
 
     fn literal_expr(expr: &Expression<'_>) -> Option<String> {
         match expr {
-            Expression::StringLiteral(value) => Some(value.value.to_string()),
+            Expression::StringLiteral(value) => string_literal_value(value),
             Expression::TemplateLiteral(value) if value.expressions.is_empty() => value
                 .quasis
                 .first()
@@ -66,7 +67,7 @@ impl Collector<'_> {
 
     fn literal_arg(arg: &Argument<'_>) -> Option<String> {
         match arg {
-            Argument::StringLiteral(value) => Some(value.value.to_string()),
+            Argument::StringLiteral(value) => string_literal_value(value),
             Argument::TemplateLiteral(value) if value.expressions.is_empty() => value
                 .quasis
                 .first()
@@ -90,7 +91,7 @@ impl Collector<'_> {
 
     fn worker_url_from_arg(arg: &Argument<'_>) -> Option<String> {
         match arg {
-            Argument::StringLiteral(value) => Some(value.value.to_string()),
+            Argument::StringLiteral(value) => string_literal_value(value),
             Argument::TemplateLiteral(value) if value.expressions.is_empty() => value
                 .quasis
                 .first()
@@ -107,12 +108,9 @@ impl Collector<'_> {
 
 impl<'a> Visit<'a> for Collector<'_> {
     fn visit_import_declaration(&mut self, it: &ImportDeclaration<'a>) {
-        self.push(
-            "import_static",
-            it.source.value.to_string(),
-            it.span.start,
-            it.span.end,
-        );
+        if let Some(specifier) = string_literal_value(&it.source) {
+            self.push("import_static", specifier, it.span.start, it.span.end);
+        }
         walk::walk_import_declaration(self, it);
     }
 
@@ -121,22 +119,16 @@ impl<'a> Visit<'a> for Collector<'_> {
     }
 
     fn visit_export_from_declaration(&mut self, it: &ExportFromDeclaration<'a>) {
-        self.push(
-            "reexport_named",
-            it.source.value.to_string(),
-            it.span.start,
-            it.span.end,
-        );
+        if let Some(specifier) = string_literal_value(&it.source) {
+            self.push("reexport_named", specifier, it.span.start, it.span.end);
+        }
         walk::walk_export_from_declaration(self, it);
     }
 
     fn visit_export_all_declaration(&mut self, it: &ExportAllDeclaration<'a>) {
-        self.push(
-            "reexport_all",
-            it.source.value.to_string(),
-            it.span.start,
-            it.span.end,
-        );
+        if let Some(specifier) = string_literal_value(&it.source) {
+            self.push("reexport_all", specifier, it.span.start, it.span.end);
+        }
         walk::walk_export_all_declaration(self, it);
     }
 

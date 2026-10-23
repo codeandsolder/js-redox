@@ -13,6 +13,25 @@
   "rebaseWhen": "behind-base-branch",
   "packageRules": [
     {
+      "description": "Group Oxc crates so one type/version universe moves together",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["/^oxc_/"],
+      "groupName": "Oxc crates",
+      "automerge": false
+    },
+    {
+      "description": "Group wasmparser and wasmprinter lockstep updates",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["wasmparser", "wasmprinter"],
+      "groupName": "Wasm parser and printer",
+      "automerge": false
+    },
+    {
+      "description": "Self-hosted runner labels are infrastructure, not hosted runner dependencies",
+      "matchDatasources": ["github-runners"],
+      "enabled": false
+    },
+    {
       "description": "Automerge ordinary compatible updates after CI",
       "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
       "matchCurrentVersion": "!/^0/",

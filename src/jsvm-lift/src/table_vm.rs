@@ -1,5 +1,6 @@
 use crate::ast_utils::target_ident;
 use jsvm_lift::numeric::exact_u64;
+use jsvm_safe_core::string_literal_value;
 use oxc_ast::{
     ast::{
         ArrayExpressionElement, AssignmentTarget, BindingPattern, CallExpression, Expression,
@@ -219,7 +220,7 @@ fn static_method(call: &CallExpression<'_>) -> Option<String> {
     match unwrap_parens(&call.callee) {
         Expression::StaticMemberExpression(sm) => Some(sm.property.name.to_string()),
         Expression::ComputedMemberExpression(cm) => match unwrap_parens(&cm.expression) {
-            Expression::StringLiteral(value) => Some(value.value.to_string()),
+            Expression::StringLiteral(value) => string_literal_value(value),
             _ => None,
         },
         _ => None,
@@ -471,7 +472,7 @@ impl<'s> Analyzer<'s> {
                 let Expression::StringLiteral(property) = unwrap_parens(&bind.expression) else {
                     return;
                 };
-                if property.value.as_str() != "bind" {
+                if property.value.as_str() != Some("bind") {
                     return;
                 }
                 &bind.object
