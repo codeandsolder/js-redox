@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Recover captured and simple inline-base64 WebAssembly with provenance."""
+"""Recover captured and statically produced WebAssembly with exact provenance."""
 
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
-import re
+import json
 import subprocess
 from collections import defaultdict
 from pathlib import Path
@@ -14,10 +13,6 @@ from pathlib import Path
 from analysis_artifacts import WASM_INDEX, write_artifact
 
 from capture_project import load_manifest
-
-BASE64_WASM = re.compile(rb"AGFzbQ[A-Za-z0-9+/]{8,}={0,2}")
-WASM_MAGIC = b"\x00asm"
-MAX_INLINE_BASE64 = 64 * 1024 * 1024
 
 
 def sha256(data: bytes) -> str:
@@ -28,17 +23,30 @@ def rel(project: Path, path: Path) -> str:
     return path.relative_to(project).as_posix()
 
 
-def decode_inline_candidates(data: bytes):
-    for match in BASE64_WASM.finditer(data):
-        encoded = match.group(0)
-        if len(encoded) > MAX_INLINE_BASE64:
-            continue
-        try:
-            decoded = base64.b64decode(encoded, validate=True)
-        except ValueError:
-            continue
-        if decoded.startswith(WASM_MAGIC):
-            yield match.start(), match.end(), decoded
+def run_static_byte_recovery(tool: Path, source: Path, output_dir: Path) -> dict | None:
+    cp = subprocess.run(
+        [str(tool), str(source), "--output-dir", str(output_dir)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if cp.returncode:
+        diagnostic = (cp.stderr or cp.stdout or f"exit {cp.returncode}").strip()
+        if "JavaScript did not parse as unambiguous or CommonJS source" in diagnostic:
+            return None
+        raise RuntimeError(
+            f"static byte recovery failed for {source} with exit {cp.returncode}: {diagnostic}"
+        )
+    try:
+        report = json.loads(cp.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"static byte recovery returned invalid JSON for {source}") from error
+    schema = report.get("schema")
+    if schema != "js-static-byte-artifacts/v2":
+        raise RuntimeError(
+            f"unexpected static byte recovery schema for {source}: {schema!r}"
+        )
+    return report
 
 
 def run_analysis(tool: Path, binary: Path, output: Path) -> tuple[bool, str | None]:
@@ -59,9 +67,19 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("project", type=Path)
     ap.add_argument("--wasm-redox", type=Path, required=True)
+    ap.add_argument(
+        "--static-byte-artifacts",
+        type=Path,
+        help="Rust static byte producer; defaults to the wasm-redox tool directory",
+    )
     args = ap.parse_args()
 
     project = args.project.resolve()
+    static_byte_artifacts = (
+        args.static_byte_artifacts
+        if args.static_byte_artifacts is not None
+        else args.wasm_redox.with_name("static-byte-artifacts")
+    )
     manifest = load_manifest(project)
     analysis_root = project / "analysis/wasm"
     modules_root = analysis_root / "modules"
@@ -94,9 +112,6 @@ def main() -> None:
             }
         )
 
-    # Recover simple contiguous Base64 literals from captured JavaScript and
-    # inline scripts. Validation of the decoded \0asm magic makes this a narrow
-    # extraction rule rather than a generic "looks base64-ish" guess.
     sources: list[tuple[Path, dict]] = []
     for resource in manifest.get("resources", []):
         if resource.get("kind") != "javascript" or not resource.get("body_present"):
@@ -129,27 +144,74 @@ def main() -> None:
                 )
             )
 
-    seen_occurrences: set[tuple[str, int, int]] = set()
+    # Recover exact static byte producers from captured JavaScript. The Rust
+    # analyzer owns both complete validated Base64 literals and proof-gated
+    # multi-chunk byte assembly; this Python layer only records provenance and
+    # feeds recovered bytes into the normal wasm-redox analysis pipeline.
+    seen_occurrences: set[tuple[str, str, int, int]] = set()
     for source, provenance in sources:
         raw = source.read_bytes()
-        for start, end, data in decode_inline_candidates(raw):
-            key = (provenance["source_path"], start, end)
+        # Cheap lexical candidate gate. The semantic analyzer remains
+        # authoritative and validates complete modules before reporting them.
+        if b"AGFzbQ" not in raw and b"WebAssembly" not in raw:
+            continue
+        report = run_static_byte_recovery(static_byte_artifacts, source, inline_root)
+        if report is None:
+            continue
+
+        for artifact in report.get("inline_wasm_literals", []):
+            start = int(artifact["source_start"])
+            end = int(artifact["source_end"])
+            key = (provenance["source_path"], "inline_base64_literal", start, end)
             if key in seen_occurrences:
                 continue
             seen_occurrences.add(key)
-            digest = sha256(data)
-            inline_root.mkdir(parents=True, exist_ok=True)
+            digest = artifact["sha256"]
             binary = inline_root / f"{digest}.wasm"
-            if not binary.exists():
-                binary.write_bytes(data)
+            if not binary.is_file():
+                continue
             binary_paths.setdefault(digest, binary)
             inline_origin[digest] = True
             origins[digest].append(
                 {
                     **provenance,
-                    "encoding": "base64",
+                    "encoding": artifact["encoding"],
                     "byte_start": start,
                     "byte_end": end,
+                    "recovery_kind": "validated_inline_base64_literal",
+                }
+            )
+
+        for artifact in report.get("artifacts", []):
+            start = int(artifact["allocation_start"])
+            end = int(artifact["sink_end"])
+            key = (provenance["source_path"], "static_byte_assembly", start, end)
+            if key in seen_occurrences:
+                continue
+            seen_occurrences.add(key)
+            digest = artifact["sha256"]
+            binary = inline_root / f"{digest}.wasm"
+            if not binary.is_file():
+                continue
+            binary_paths.setdefault(digest, binary)
+            inline_origin[digest] = True
+            assembled_type = (
+                "resource_static_bytes"
+                if provenance["type"] == "resource_inline_base64"
+                else "inline_script_static_bytes"
+            )
+            origins[digest].append(
+                {
+                    **provenance,
+                    "type": assembled_type,
+                    "encoding": "static_byte_assembly",
+                    "byte_start": start,
+                    "byte_end": end,
+                    "recovery_kind": "proven_static_byte_assembly",
+                    "sink_kind": artifact["sink_kind"],
+                    "sink_start": int(artifact["sink_start"]),
+                    "sink_end": int(artifact["sink_end"]),
+                    "copy_writes": int(artifact["copy_writes"]),
                 }
             )
 

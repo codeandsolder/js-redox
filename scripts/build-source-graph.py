@@ -932,16 +932,23 @@ def main():
         for origin in module.get('origins', []):
             kind = origin.get('type')
             parent = None
-            if kind in {'resource', 'resource_inline_base64'} and origin.get('resource_id') is not None:
+            if kind in {'resource', 'resource_inline_base64', 'resource_static_bytes'} and origin.get('resource_id') is not None:
                 parent = f"resource:{int(origin['resource_id'])}"
-            elif kind == 'inline_script_base64':
+            elif kind in {'inline_script_base64', 'inline_script_static_bytes'}:
                 parent = f"inline:{int(origin['parent_resource_id'])}:{int(origin['ordinal'])}"
             if parent:
+                if kind == 'resource':
+                    edge_kind = 'wasm_resource'
+                elif kind in {'resource_static_bytes', 'inline_script_static_bytes'}:
+                    edge_kind = 'wasm_static_bytes'
+                else:
+                    edge_kind = 'wasm_inline_base64'
                 add_edge(
                     parent,
                     node_id,
-                    'wasm_resource' if kind == 'resource' else 'wasm_inline_base64',
+                    edge_kind,
                     encoding=origin.get('encoding'),
+                    recovery_kind=origin.get('recovery_kind'),
                     start=origin.get('byte_start'),
                     end=origin.get('byte_end'),
                 )

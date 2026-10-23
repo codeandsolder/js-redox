@@ -18,6 +18,7 @@ use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use rolldown_redox::ecmascript::parse_program;
 use std::collections::HashMap;
+use wasmparser::{Parser, Validator};
 
 const MAX_STATIC_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
@@ -99,8 +100,18 @@ pub struct RecoveredByteArtifact {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RecoveredInlineWasmArtifact {
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+    pub source_start: u32,
+    pub source_end: u32,
+    pub encoding: &'static str,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StaticByteRecoverySummary {
     pub artifacts: Vec<RecoveredByteArtifact>,
+    pub inline_wasm_literals: Vec<RecoveredInlineWasmArtifact>,
     pub proven_copy_helpers: usize,
     pub webassembly_sinks: usize,
     pub sink_diagnostics: Vec<SinkRecoveryDiagnostic>,
@@ -589,6 +600,55 @@ fn decode_atob(text: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+fn validated_wasm_bytes(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    if bytes.len() > MAX_STATIC_BUFFER_BYTES || !Parser::is_core_wasm(&bytes) {
+        return None;
+    }
+    Validator::new().validate_all(&bytes).ok()?;
+    Some(bytes)
+}
+
+fn decode_validated_wasm_base64(text: &str) -> Option<Vec<u8>> {
+    if !text.starts_with("AGFzbQ") {
+        return None;
+    }
+    validated_wasm_bytes(decode_atob(text)?)
+}
+
+#[derive(Default)]
+struct InlineWasmLiteralCollector {
+    artifacts: Vec<RecoveredInlineWasmArtifact>,
+}
+
+impl<'a> Visit<'a> for InlineWasmLiteralCollector {
+    fn visit_string_literal(&mut self, literal: &oxc_ast::ast::StringLiteral<'a>) {
+        let Some(text) = literal.value.as_str() else {
+            return;
+        };
+        let Some(bytes) = decode_validated_wasm_base64(text) else {
+            return;
+        };
+        self.artifacts.push(RecoveredInlineWasmArtifact {
+            sha256: sha256_hex(&bytes),
+            bytes,
+            source_start: literal.span.start,
+            source_end: literal.span.end,
+            encoding: "base64",
+        });
+    }
+}
+
+fn collect_inline_wasm_literals(
+    program: &oxc_ast::ast::Program<'_>,
+) -> Vec<RecoveredInlineWasmArtifact> {
+    let mut collector = InlineWasmLiteralCollector::default();
+    collector.visit_program(program);
+    collector
+        .artifacts
+        .sort_by_key(|artifact| (artifact.source_start, artifact.source_end));
+    collector.artifacts
+}
+
 struct Evaluator<'c, 'h> {
     scoping: &'c Scoping,
     helpers: &'h HashMap<SymbolId, CopyHelper>,
@@ -898,13 +958,13 @@ fn artifact_at_sink(
         state.sink_failure = Some("sink_buffer_invalid");
         return None;
     }
-    if !buffer.bytes.starts_with(b"\0asm") {
-        state.sink_failure = Some("sink_buffer_not_wasm_magic");
+    let Some(bytes) = validated_wasm_bytes(buffer.bytes.clone()) else {
+        state.sink_failure = Some("sink_buffer_not_valid_core_wasm");
         return None;
-    }
+    };
     Some(RecoveredByteArtifact {
-        sha256: sha256_hex(&buffer.bytes),
-        bytes: buffer.bytes.clone(),
+        sha256: sha256_hex(&bytes),
+        bytes,
         sink_start: sink.span.start,
         sink_end: sink.span.end,
         sink_kind: sink.kind,
@@ -1117,6 +1177,7 @@ pub fn recover_webassembly_byte_artifacts_from_program(
     scoping: &Scoping,
 ) -> StaticByteRecoverySummary {
     let helpers = collect_helpers(program, scoping);
+    let inline_wasm_literals = collect_inline_wasm_literals(program);
     let mut sink_collector = SinkCollector {
         scoping,
         sinks: Vec::new(),
@@ -1154,6 +1215,7 @@ pub fn recover_webassembly_byte_artifacts_from_program(
     out.sort_by_key(|artifact| artifact.sink_start);
     StaticByteRecoverySummary {
         artifacts: out,
+        inline_wasm_literals,
         proven_copy_helpers: helpers.len(),
         webassembly_sinks: sink_count,
         sink_diagnostics,
@@ -1202,6 +1264,32 @@ mod tests {
     }
 
     #[test]
+    fn recovers_only_complete_valid_inline_wasm_literals() {
+        let complete = r#"
+            const module = "AGFzbQEAAAA=";
+            consume(module);
+        "#;
+        let analysis = analyze_webassembly_byte_artifacts(complete);
+        assert!(analysis.is_ok());
+        let Ok(analysis) = analysis else {
+            return;
+        };
+        assert_eq!(analysis.inline_wasm_literals.len(), 1);
+        assert_eq!(analysis.inline_wasm_literals[0].bytes, b"\0asm\x01\0\0\0");
+
+        let truncated = r#"
+            const chunk = "AGFzbQEAAAAB";
+            consume(chunk);
+        "#;
+        let analysis = analyze_webassembly_byte_artifacts(truncated);
+        assert!(analysis.is_ok());
+        let Ok(analysis) = analysis else {
+            return;
+        };
+        assert!(analysis.inline_wasm_literals.is_empty());
+    }
+
+    #[test]
     fn recovers_split_base64_byte_builder_without_target_specific_names() {
         let source = r#"
             function load(imports) {
@@ -1245,6 +1333,32 @@ mod tests {
         let artifacts = recover(source);
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].bytes, b"\0asm\x01\0\0\0");
+    }
+
+    #[test]
+    fn rejects_magic_prefixed_but_invalid_assembled_wasm() {
+        let source = r#"
+            function load(imports) {
+                var bytes = new Uint8Array(8), decode = atob;
+                var copy = function(offset, chunk) {
+                    for (var i = 0; i < chunk.length; i++)
+                        bytes[offset + i] = chunk.charCodeAt(i);
+                };
+                copy(0, decode("AGFzbQIAAAA="));
+                return WebAssembly.instantiate(bytes, imports);
+            }
+        "#;
+        let analysis = analyze_webassembly_byte_artifacts(source);
+        assert!(analysis.is_ok());
+        let Ok(analysis) = analysis else {
+            return;
+        };
+        assert!(analysis.artifacts.is_empty());
+        assert_eq!(analysis.sink_diagnostics.len(), 1);
+        assert_eq!(
+            analysis.sink_diagnostics[0].sink_failure,
+            Some("sink_buffer_not_valid_core_wasm")
+        );
     }
 
     #[test]

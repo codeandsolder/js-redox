@@ -86,6 +86,22 @@ def main():
         "var bytes = bA(embedded)[0];\n"
         "host.WebAssembly.instantiate(bytes, imports);\n"
     )
+    split_at = len(WASM) // 2
+    left_b64 = base64.b64encode(WASM[:split_at]).decode()
+    right_b64 = base64.b64encode(WASM[split_at:]).decode()
+    split_js = (
+        "function loadSplit() {\n"
+        f"  const left = atob(\"{left_b64}\");\n"
+        f"  const right = atob(\"{right_b64}\");\n"
+        f"  const output = new Uint8Array({len(WASM)});\n"
+        "  function copy(chunk, offset) {\n"
+        "    for (let i = 0; i < chunk.length; i++) output[offset + i] = chunk.charCodeAt(i);\n"
+        "  }\n"
+        "  copy(left, 0);\n"
+        f"  copy(right, {split_at});\n"
+        "  return new WebAssembly.Module(output);\n"
+        "}\n"
+    )
     fixture = {
         "log": {
             "version": "1.2",
@@ -101,6 +117,7 @@ def main():
             "entries": [
                 entry("https://fixture.invalid/index.html", "text/html", html),
                 entry("https://fixture.invalid/fixture.js", "application/javascript", js),
+                entry("https://fixture.invalid/split.js", "application/javascript", split_js),
                 entry(
                     "https://fixture.invalid/module.wasm",
                     "application/wasm",
@@ -161,12 +178,17 @@ def main():
         "direct_resources": 1,
             "inline_extracted": 1,
         "failed": 0,
-        "origins": 2,
+        "origins": 3,
     }
     module = index["modules"][0]
     assert module["status"] == "ok"
     assert module["has_direct_resource"] is True
     assert module["has_inline_origin"] is True
+    assert {
+        origin.get("recovery_kind")
+        for origin in module["origins"]
+        if origin.get("recovery_kind")
+    } == {"validated_inline_base64_literal", "proven_static_byte_assembly"}
     assert (PROJECT / module["report_path"]).is_file()
 
     deep_path = PROJECT / module["deep_path"]
@@ -216,6 +238,7 @@ def main():
     assert {edge["kind"] for edge in wasm_edges} == {
         "wasm_resource",
         "wasm_inline_base64",
+        "wasm_static_bytes",
     }
     print(
         "wasm capture regression: dedup + provenance + 1/2 host DataView.setUint32 "

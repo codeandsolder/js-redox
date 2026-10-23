@@ -13,6 +13,16 @@ struct Args {
 }
 
 #[derive(Debug, Serialize)]
+struct InlineWasmLiteralReport {
+    sha256: String,
+    byte_len: usize,
+    output_path: String,
+    source_start: u32,
+    source_end: u32,
+    encoding: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct ArtifactReport {
     sha256: String,
     byte_len: usize,
@@ -47,6 +57,7 @@ struct Report {
     proven_copy_helpers: usize,
     webassembly_sinks: usize,
     sink_diagnostics: Vec<SinkDiagnosticReport>,
+    inline_wasm_literals: Vec<InlineWasmLiteralReport>,
     artifacts: Vec<ArtifactReport>,
 }
 
@@ -58,6 +69,23 @@ fn main() -> Result<()> {
         .with_context(|| format!("analyzing {}", args.input.display()))?;
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("creating {}", args.output_dir.display()))?;
+
+    let mut inline_wasm_literals = Vec::with_capacity(recovery.inline_wasm_literals.len());
+    for artifact in recovery.inline_wasm_literals {
+        let output = args.output_dir.join(format!("{}.wasm", artifact.sha256));
+        if !output.exists() {
+            fs::write(&output, &artifact.bytes)
+                .with_context(|| format!("writing {}", output.display()))?;
+        }
+        inline_wasm_literals.push(InlineWasmLiteralReport {
+            sha256: artifact.sha256,
+            byte_len: artifact.bytes.len(),
+            output_path: output.display().to_string(),
+            source_start: artifact.source_start,
+            source_end: artifact.source_end,
+            encoding: artifact.encoding,
+        });
+    }
 
     let mut report_artifacts = Vec::with_capacity(recovery.artifacts.len());
     for artifact in recovery.artifacts {
@@ -95,12 +123,13 @@ fn main() -> Result<()> {
         .collect();
 
     let report = Report {
-        schema: "js-static-byte-artifacts/v1",
+        schema: "js-static-byte-artifacts/v2",
         input: args.input.display().to_string(),
         source_bytes: source.len(),
         proven_copy_helpers: recovery.proven_copy_helpers,
         webassembly_sinks: recovery.webassembly_sinks,
         sink_diagnostics,
+        inline_wasm_literals,
         artifacts: report_artifacts,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
