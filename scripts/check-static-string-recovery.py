@@ -34,11 +34,6 @@ def recover(name, source, timeout=120):
     return out, json.loads(report.read_text())
 
 
-def decoder(report):
-    assert len(report["decoders"]) == 1, report
-    return report["decoders"][0]
-
-
 def load_recover_module():
     spec = importlib.util.spec_from_file_location("static_string_recover", RECOVER)
     module = importlib.util.module_from_spec(spec)
@@ -122,12 +117,13 @@ def main():
     if acw1.is_file() and acw2.is_file():
         for name, source in (("acw1", acw1), ("acw2", acw2)):
             out, report = recover(name, source)
-            d = decoder(report)
-            assert d["mode"] == "base64"
-            assert d["offset"] == 251
-            assert d["rotation"] == 8
-            assert d["table_entries"] == 42
-            assert d["replacements"] == 57
+            classic = report["classic_decoder_recovery"]
+            assert classic["schema"] == "js-static-decoder-recovery/v1"
+            assert classic["status"] == "proven", classic
+            assert classic["decoder_candidates"] >= 1
+            assert classic["transforms"].get("string_array_decode") == 57, classic
+            assert classic["transforms"].get("materialize_decoder_rotation") == 1, classic
+            assert classic["transforms"].get("remove_decoder_rotation_iife") == 1, classic
             assert report["replacements"] == 57
             text = out.read_text()
             for needle in (
@@ -147,9 +143,9 @@ def main():
         assert bad_text != acw1.read_text()
         bad.write_text(bad_text)
         out, report = recover("acw-bad-rotation", bad)
-        d = decoder(report)
-        assert d["rotation"] is None
-        assert d["status"] == "rotation-unproven"
+        classic = report["classic_decoder_recovery"]
+        assert classic["transforms"].get("string_array_decode", 0) == 0, classic
+        assert classic["transforms"].get("materialize_decoder_rotation", 0) == 0, classic
         assert report["replacements"] == 0
         assert out.read_text() == bad_text
 
@@ -161,12 +157,11 @@ def main():
     if taobao_available:
         for name, source in taobao_cases:
             out, report = recover(name, source, timeout=180)
-            d = decoder(report)
-            assert d["mode"] == "rc4"
-            assert d["offset"] == 0xC2
-            assert d["rotation"] == 409
-            assert d["table_entries"] == 1855
-            assert d["replacements"] >= 646
+            classic = report["classic_decoder_recovery"]
+            assert classic["status"] == "proven", classic
+            assert classic["decoder_candidates"] >= 1, classic
+            assert classic["transforms"].get("string_array_decode", 0) >= 646, classic
+            assert classic["transforms"].get("materialize_decoder_rotation", 0) >= 1, classic
             text = out.read_text()
             for needle in ('"defineProperty"', '"length"', '"prototype"', '"undefined"'):
                 assert needle in text, (name, needle)
@@ -175,11 +170,27 @@ def main():
     plain_text = 'const table = ["alpha", "beta"]; function f(x) { return table[x]; } console.log(f(1));\n'
     plain.write_text(plain_text)
     out, report = recover("plain", plain)
+    assert report["classic_decoder_recovery"]["status"] == "proven", report
     assert report["decoders"] == []
     assert report["replacements"] == 0
     assert report["base91_iterations"][0]["preflight_skipped"] is True
     assert out.read_text() == plain_text
     assert run(["node", out]).stdout.strip() == "beta"
+
+    classic_rejected = TMP / "classic-stage-rejected.js"
+    classic_rejected_text = (
+        'const box = { value: 7 }; '
+        'with (box) { console.log(value); }\n'
+    )
+    classic_rejected.write_text(classic_rejected_text)
+    out, report = recover("classic-stage-rejected", classic_rejected)
+    classic = report["classic_decoder_recovery"]
+    assert classic["status"] == "parse_or_semantic_rejected", classic
+    assert classic["changed"] is False, classic
+    assert classic["replacements"] == 0, classic
+    assert report["replacements"] == 0, report
+    assert report["base91_iterations"][0]["preflight_skipped"] is True, report
+    assert out.read_text() == classic_rejected_text
 
     plain_crlf = TMP / "plain-crlf.js"
     plain_crlf_bytes = (
@@ -207,6 +218,7 @@ def main():
     else:
         print("  Taobao securitySDK: skipped (external corpus absent)")
     print("  unresolved-rotation negative: zero rewrites")
+    print("  Rust classic-stage rejection: exact identity before independent Base91 proof")
     print("  ordinary-JS negatives: LF/CRLF byte-identical + runtime-equivalent + Base91 preflight skipped")
 
 

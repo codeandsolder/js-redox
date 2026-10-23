@@ -70,6 +70,33 @@ pub fn decode_lower_alphabet_base64_uri(input: &str) -> Option<String> {
     String::from_utf8(lower_engine()?.decode(encoded).ok()?).ok()
 }
 
+pub fn decode_lower_alphabet_base64_rc4(input: &str, key: &str) -> Option<String> {
+    let data = decode_lower_alphabet_base64_uri(input)?;
+    let key_units = key.encode_utf16().collect::<Vec<_>>();
+    if key_units.is_empty() {
+        return None;
+    }
+
+    let mut state = (0u16..=255).collect::<Vec<_>>();
+    let mut j = 0usize;
+    for i in 0..256usize {
+        j = (j + usize::from(state[i]) + usize::from(key_units[i % key_units.len()])) % 256;
+        state.swap(i, j);
+    }
+
+    let mut i = 0usize;
+    j = 0;
+    let mut out = Vec::with_capacity(data.encode_utf16().count());
+    for unit in data.encode_utf16() {
+        i = (i + 1) % 256;
+        j = (j + usize::from(state[i])) % 256;
+        state.swap(i, j);
+        let stream = state[(usize::from(state[i]) + usize::from(state[j])) % 256];
+        out.push(unit ^ stream);
+    }
+    String::from_utf16(&out).ok()
+}
+
 pub fn decode_fixed_base64_latin1(input: &str, alphabet: &str) -> Option<String> {
     let alphabet = alphabet.chars().collect::<Vec<_>>();
     if alphabet.len() != 65 {
@@ -125,6 +152,45 @@ pub fn decode_fixed_base64_latin1(input: &str, alphabet: &str) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rc4_utf16(input: &str, key: &str) -> Option<String> {
+        let key_units = key.encode_utf16().collect::<Vec<_>>();
+        if key_units.is_empty() {
+            return None;
+        }
+        let mut state = (0u16..=255).collect::<Vec<_>>();
+        let mut j = 0usize;
+        for i in 0..256usize {
+            j = (j + usize::from(state[i]) + usize::from(key_units[i % key_units.len()])) % 256;
+            state.swap(i, j);
+        }
+        let mut i = 0usize;
+        j = 0;
+        let mut out = Vec::new();
+        for unit in input.encode_utf16() {
+            i = (i + 1) % 256;
+            j = (j + usize::from(state[i])) % 256;
+            state.swap(i, j);
+            let stream = state[(usize::from(state[i]) + usize::from(state[j])) % 256];
+            out.push(unit ^ stream);
+        }
+        String::from_utf16(&out).ok()
+    }
+
+    #[test]
+    fn lower_alphabet_rc4_matches_javascript_utf16_units() {
+        let key = "k€y";
+        let plain = "hello λ";
+        let cipher = rc4_utf16(plain, key).unwrap_or_default();
+        let encoded = lower_engine()
+            .map(|engine| engine.encode(cipher.as_bytes()))
+            .unwrap_or_default();
+        assert_eq!(
+            decode_lower_alphabet_base64_rc4(&encoded, key),
+            Some(plain.into())
+        );
+        assert_eq!(decode_lower_alphabet_base64_rc4(&encoded, ""), None);
+    }
 
     #[test]
     fn standard_decoder_keeps_atob_compatibility_edges() {
