@@ -3,6 +3,10 @@ use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
     Engine as _,
 };
+use jsvm_safe_core::{
+    exact_usize as exact_static_usize, statically_resolved_symbol,
+    statically_unresolved_global_reference,
+};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Expression, ForStatementInit, Function,
@@ -126,21 +130,6 @@ fn span_contains(outer: Span, inner: Span) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
-fn statically_resolved_symbol(scoping: &Scoping, reference_id: ReferenceId) -> Option<SymbolId> {
-    let reference = scoping.get_reference(reference_id);
-    let symbol = reference.symbol_id()?;
-    let symbol_scope = scoping.symbol_scope_id(symbol);
-    for scope_id in scoping.scope_ancestors(reference.scope_id()) {
-        if scope_id == symbol_scope {
-            return Some(symbol);
-        }
-        if scoping.scope_flags(scope_id).is_with() {
-            return None;
-        }
-    }
-    None
-}
-
 fn symbol_of(scoping: &Scoping, expression: &Expression<'_>) -> Option<SymbolId> {
     let Expression::Identifier(identifier) = unparenthesized(expression) else {
         return None;
@@ -175,28 +164,15 @@ fn unresolved_global(scoping: &Scoping, expression: &Expression<'_>, expected: &
     let Some(reference_id) = identifier.reference_id.get() else {
         return false;
     };
-    let reference = scoping.get_reference(reference_id);
-    if reference.symbol_id().is_some() {
-        return false;
-    }
-    scoping
-        .scope_ancestors(reference.scope_id())
-        .all(|scope_id| !scoping.scope_flags(scope_id).is_with())
+    statically_unresolved_global_reference(scoping, reference_id)
 }
 
 fn exact_usize(expression: &Expression<'_>) -> Option<usize> {
     let Expression::NumericLiteral(number) = unparenthesized(expression) else {
         return None;
     };
-    if !number.value.is_finite() || number.value < 0.0 || number.value.fract() != 0.0 {
-        return None;
-    }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let value = number.value as usize;
-    #[allow(clippy::cast_precision_loss)]
-    ((value as f64) == number.value).then_some(value)
+    exact_static_usize(number.value)
 }
-
 fn static_member<'a>(expression: &'a Expression<'a>, property: &str) -> Option<&'a Expression<'a>> {
     let Expression::StaticMemberExpression(member) = unparenthesized(expression) else {
         return None;

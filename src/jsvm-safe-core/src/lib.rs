@@ -46,7 +46,11 @@ use value_eval::{
     eval, eval_binary, eval_logical, eval_unary, eval_with_resolver, js_to_uint32, known_bool,
     Value,
 };
-pub use value_eval::{string_literal_value, template_element_value};
+pub use value_eval::{
+    eval as eval_static_primitive, eval_with_resolver as eval_static_primitive_with_resolver,
+    known_bool_with_resolver as known_static_bool_with_resolver, string_literal_value,
+    template_element_value, Value as StaticPrimitiveValue,
+};
 
 #[must_use]
 pub fn decode_base91_ascii(encoded: &str, alphabet: &str) -> Option<String> {
@@ -84,26 +88,52 @@ fn symbol_of(scoping: &Scoping, expr: &Expression<'_>) -> Option<SymbolId> {
     scoping.get_reference(id.reference_id.get()?).symbol_id()
 }
 
-fn reference_is_statically_resolved_read(
+/// Resolve a reference to its lexical symbol only when dynamic `with` scope
+/// cannot intercept the lookup before the symbol's declaration scope.
+#[must_use]
+pub fn statically_resolved_symbol(
+    scoping: &Scoping,
+    reference_id: ReferenceId,
+) -> Option<SymbolId> {
+    let reference = scoping.get_reference(reference_id);
+    let symbol = reference.symbol_id()?;
+    let symbol_scope = scoping.symbol_scope_id(symbol);
+    for scope_id in scoping.scope_ancestors(reference.scope_id()) {
+        if scope_id == symbol_scope {
+            return Some(symbol);
+        }
+        if scoping.scope_flags(scope_id).is_with() {
+            return None;
+        }
+    }
+    None
+}
+
+/// Prove an unresolved identifier lookup reaches the host/global environment
+/// without crossing dynamic `with` scope.
+#[must_use]
+pub fn statically_unresolved_global_reference(
+    scoping: &Scoping,
+    reference_id: ReferenceId,
+) -> bool {
+    let reference = scoping.get_reference(reference_id);
+    reference.symbol_id().is_none()
+        && scoping
+            .scope_ancestors(reference.scope_id())
+            .all(|scope_id| !scoping.scope_flags(scope_id).is_with())
+}
+
+#[must_use]
+pub fn reference_is_statically_resolved_read(
     scoping: &Scoping,
     reference_id: ReferenceId,
     symbol: SymbolId,
 ) -> bool {
     let reference = scoping.get_reference(reference_id);
-    if !reference.is_read() || reference.is_write() || reference.flags().is_member_write_target() {
-        return false;
-    }
-
-    let symbol_scope = scoping.symbol_scope_id(symbol);
-    for scope_id in scoping.scope_ancestors(reference.scope_id()) {
-        if scope_id == symbol_scope {
-            return true;
-        }
-        if scoping.scope_flags(scope_id).is_with() {
-            return false;
-        }
-    }
-    false
+    !reference.is_write()
+        && !reference.flags().is_member_write_target()
+        && reference.is_read()
+        && statically_resolved_symbol(scoping, reference_id) == Some(symbol)
 }
 
 fn symbol_has_only_read_references(scoping: &Scoping, symbol: SymbolId) -> bool {
