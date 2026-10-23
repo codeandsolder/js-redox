@@ -44,7 +44,7 @@ pub enum Value {
 }
 
 impl Value {
-    pub(super) fn truthy(&self) -> bool {
+    pub fn truthy(&self) -> bool {
         match self {
             Self::String(s) => !s.is_empty(),
             Self::Number(n) => *n != 0.0 && !n.is_nan(),
@@ -53,7 +53,7 @@ impl Value {
         }
     }
 
-    pub(super) fn number(&self) -> Option<f64> {
+    pub fn number(&self) -> Option<f64> {
         match self {
             Self::Number(n) => Some(*n),
             Self::Bool(v) => Some(if *v { 1.0 } else { 0.0 }),
@@ -63,7 +63,7 @@ impl Value {
         }
     }
 
-    pub(super) fn js_string(&self) -> Option<String> {
+    pub fn js_string(&self) -> Option<String> {
         Some(match self {
             Self::String(s) => s.clone(),
             Self::Number(n) => n.to_js_string(),
@@ -73,7 +73,7 @@ impl Value {
         })
     }
 
-    pub(super) fn render(&self) -> Option<String> {
+    pub fn render(&self) -> Option<String> {
         match self {
             Self::String(s) => serde_json::to_string(s).ok(),
             Self::Number(n) if n.is_finite() => Some(render_number(*n)),

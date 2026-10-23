@@ -83,6 +83,7 @@ jobs:
             target/debug/source-directives \
             target/debug/api-surface \
             target/debug/static-string-recover \
+            target/debug/static-byte-artifacts \
             target/debug/deobfuscate-safe \
             target/debug/bundle-unpack \
             target/debug/sourcemap-compose \

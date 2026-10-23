@@ -547,6 +547,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "url",
+ "wasmparser 0.262.0",
 ]
 
 [[package]]
