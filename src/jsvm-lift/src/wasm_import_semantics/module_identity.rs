@@ -1,5 +1,5 @@
 use super::{symbol_of, unparenthesized};
-use crate::sha256_hex;
+use crate::{sha256_hex, static_bytes::recover_webassembly_byte_artifacts_from_program};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Expression, ForStatementInit, Function, Program,
@@ -770,5 +770,64 @@ pub(super) fn collect_exact_module_sites(
         sites: HashMap::new(),
     };
     collector.visit_program(program);
+
+    let assembled = recover_webassembly_byte_artifacts_from_program(program, scoping);
+    for artifact in assembled.artifacts {
+        if artifact.sink_kind != "WebAssembly.instantiate" {
+            continue;
+        }
+        collector
+            .sites
+            .entry((artifact.sink_start, artifact.sink_end))
+            .or_insert(ExactModuleSite {
+                sha256: artifact.sha256,
+                identity_kind: "assembled_exact_bytes",
+                standard_decode_builtins_required: artifact.standard_builtins_required,
+            });
+    }
     collector.sites
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_allocator::Allocator;
+    use oxc_semantic::SemanticBuilder;
+    use oxc_span::SourceType;
+    use rolldown_redox::ecmascript::parse_program;
+
+    #[test]
+    fn generic_static_byte_assembly_augments_exact_module_sites() {
+        let source = r#"
+            function load(imports) {
+                var bytes = new Uint8Array(8), decode = atob;
+                var copy = function(offset, chunk) {
+                    for (var i = 0; i < chunk.length; i++)
+                        bytes[offset + i] = chunk.charCodeAt(i);
+                };
+                copy(0, decode("AGFzbQEAAAA="));
+                return WebAssembly.instantiate(bytes, imports);
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let sites = collect_exact_module_sites(
+            source,
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &HashMap::new(),
+        );
+        assert_eq!(sites.len(), 1);
+        let Some(site) = sites.values().next() else {
+            return;
+        };
+        assert_eq!(site.sha256, crate::sha256_hex(b"\0asm\x01\0\0\0"));
+        assert_eq!(site.identity_kind, "assembled_exact_bytes");
+        assert!(site.standard_decode_builtins_required);
+    }
 }

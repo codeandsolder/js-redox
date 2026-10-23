@@ -35,5 +35,6 @@ pub mod semantic_ir;
 
 pub mod api_surface;
 
+pub mod static_bytes;
 pub mod structural_signals;
 pub mod sus_scan;
