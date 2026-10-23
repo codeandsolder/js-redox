@@ -12,8 +12,8 @@ use crate::value_eval::{
     template_element_value, Value,
 };
 use crate::{
-    array_element, direct_identifier_name, fragment, js_parse_int, symbol_of, ArithmeticStateProof,
-    Collector,
+    array_element, direct_identifier_name, fragment, js_parse_int, symbol_has_only_read_references,
+    symbol_of, ArithmeticStateProof, Collector,
 };
 use oxc_ast::ast::{BindingPattern, Expression, Statement, VariableDeclarationKind};
 use oxc_ast_visit::{walk, Visit};
@@ -522,13 +522,7 @@ fn parse_sync_reference_identity_shape(
                 .get(reference_id)
                 .is_none_or(|span| span.start < start || span.end > end)
         })
-        || scoping
-            .get_resolved_reference_ids(target_symbol)
-            .iter()
-            .any(|reference_id| {
-                let reference = scoping.get_reference(*reference_id);
-                reference.is_write() || reference.flags().is_member_write_target()
-            })
+        || !symbol_has_only_read_references(scoping, target_symbol)
     {
         return None;
     }

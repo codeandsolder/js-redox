@@ -6,7 +6,7 @@ use crate::rewrite::Replacement;
 use crate::value_eval::{eval, js_to_uint32, render_value_array, same_values, Value};
 use crate::{
     argument_integer, array_element, decoder_argument_integer, expression_integer, fragment,
-    string_literal_value, symbol_of, template_element_value,
+    string_literal_value, symbol_has_only_read_references, symbol_of, template_element_value,
 };
 use oxc_ast::ast::{
     Argument, BindingPattern, CallExpression, Expression, ExpressionStatement, Statement,
@@ -19,7 +19,10 @@ use oxc_syntax::{
     scope::{ScopeFlags, ScopeId},
     symbol::SymbolId,
 };
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+};
 
 /// Convert an integer into the JavaScript Number domain. Precision loss above
 /// 2^53 is intentional here: JavaScript itself stores the value as IEEE-754 f64.
@@ -141,15 +144,9 @@ fn partial_decoder_arrays(
 ) -> Vec<PartialStaticArrayInfo> {
     let mut collector = PartialStaticArrayCollector::default();
     collector.visit_program(program);
-    collector.candidates.retain(|candidate| {
-        scoping
-            .get_resolved_reference_ids(candidate.symbol)
-            .iter()
-            .all(|reference_id| {
-                let reference = scoping.get_reference(*reference_id);
-                !reference.is_write() && !reference.flags().is_member_write_target()
-            })
-    });
+    collector
+        .candidates
+        .retain(|candidate| symbol_has_only_read_references(scoping, candidate.symbol));
     collector.candidates
 }
 
@@ -158,15 +155,7 @@ fn decoder_static_arrays(
     scoping: &Scoping,
 ) -> Vec<StaticArrayInfo> {
     let mut candidates = all_static_arrays(program);
-    candidates.retain(|candidate| {
-        scoping
-            .get_resolved_reference_ids(candidate.symbol)
-            .iter()
-            .all(|reference_id| {
-                let reference = scoping.get_reference(*reference_id);
-                !reference.is_write() && !reference.flags().is_member_write_target()
-            })
-    });
+    candidates.retain(|candidate| symbol_has_only_read_references(scoping, candidate.symbol));
     candidates
 }
 
@@ -1100,6 +1089,14 @@ fn compile_regex(pattern: &str) -> Option<regex::Regex> {
     regex::Regex::new(pattern).ok()
 }
 
+static FIXED_BASE64_ALPHABET_RE: LazyLock<Option<regex::Regex>> =
+    LazyLock::new(|| compile_regex(r#"["']([A-Za-z0-9+/=]{65})["']"#));
+static BASE64_SENTINEL_RE: LazyLock<Option<regex::Regex>> =
+    LazyLock::new(|| compile_regex(r"(?:64\s*!=|!=\s*64)"));
+static RC4_CHAR_CODE_AT_RE: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
+    compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*charCodeAt\s*\(([^)]*)\)")
+});
+
 fn fixed_base64_alphabet(body: &str) -> Option<String> {
     if !body.contains("String.fromCharCode")
         || !body.contains(".indexOf")
@@ -1107,7 +1104,7 @@ fn fixed_base64_alphabet(body: &str) -> Option<String> {
     {
         return None;
     }
-    let re = compile_regex(r#"["']([A-Za-z0-9+/=]{65})["']"#)?;
+    let re = FIXED_BASE64_ALPHABET_RE.as_ref()?;
     let standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
         .chars()
         .collect::<HashSet<_>>();
@@ -1210,7 +1207,7 @@ fn fixed_base64_decoder_matches(
     {
         return None;
     }
-    let sentinel_checks = compile_regex(r"(?:64\s*!=|!=\s*64)")?;
+    let sentinel_checks = BASE64_SENTINEL_RE.as_ref()?;
     if sentinel_checks.find_iter(body).count() != 2 {
         return None;
     }
@@ -2422,7 +2419,7 @@ struct DecoderPatterns {
     index: regex::Regex,
 }
 
-fn decoder_patterns() -> Option<DecoderPatterns> {
+static DECODER_PATTERNS: LazyLock<Option<DecoderPatterns>> = LazyLock::new(|| {
     Some(DecoderPatterns {
         local: compile_regex(
             r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\(\)\s*;",
@@ -2434,6 +2431,10 @@ fn decoder_patterns() -> Option<DecoderPatterns> {
             r"\b(?:let|const|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$]*)\[([A-Za-z_$][A-Za-z0-9_$]*)\]\s*;",
         )?,
     })
+});
+
+fn decoder_patterns() -> Option<&'static DecoderPatterns> {
+    DECODER_PATTERNS.as_ref()
 }
 
 fn function_name_counts(functions: &[FnInfo]) -> HashMap<String, usize> {
@@ -2478,10 +2479,7 @@ fn decoder_transform(body: &str, keyed_decode_call: bool) -> Option<DecoderTrans
     }
 
     let char_code_at_count = body.matches(".charCodeAt(").count();
-    let rc4_key_shape = compile_regex(
-        r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*charCodeAt\s*\(([^)]*)\)",
-    )
-    .is_some_and(|pattern| {
+    let rc4_key_shape = RC4_CHAR_CODE_AT_RE.as_ref().is_some_and(|pattern| {
         pattern.captures_iter(body).any(|captures| {
             let key = &captures[1];
             let argument = &captures[2];
@@ -2646,7 +2644,7 @@ fn detect_decoders(
     let mut by_name = functions
         .iter()
         .filter_map(|function| {
-            detect_decoder_candidate(source, function, &patterns, &name_counts, &providers)
+            detect_decoder_candidate(source, function, patterns, &name_counts, &providers)
                 .map(|decoder| (function.name.clone(), decoder))
         })
         .collect::<HashMap<_, _>>();
