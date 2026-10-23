@@ -1,11 +1,12 @@
 use crate::decoder_encoding::{
-    decode_fixed_base64_latin1, decode_lower_alphabet_base64_uri, decode_standard_base64_latin1,
+    decode_fixed_base64_latin1, decode_lower_alphabet_base64_rc4, decode_lower_alphabet_base64_uri,
+    decode_standard_base64_latin1,
 };
 use crate::rewrite::Replacement;
 use crate::value_eval::{eval, js_to_uint32, render_value_array, same_values, Value};
 use crate::{
-    argument_integer, array_element, decoder_argument_integer, fragment, string_literal_value,
-    symbol_of, template_element_value,
+    argument_integer, array_element, decoder_argument_integer, expression_integer, fragment,
+    string_literal_value, symbol_of, template_element_value,
 };
 use oxc_ast::ast::{
     Argument, BindingPattern, CallExpression, Expression, ExpressionStatement, Statement,
@@ -13,7 +14,7 @@ use oxc_ast::ast::{
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{ReferenceId, Scoping};
-use oxc_span::Span;
+use oxc_span::{GetSpan, Span};
 use oxc_syntax::{
     scope::{ScopeFlags, ScopeId},
     symbol::SymbolId,
@@ -917,6 +918,7 @@ fn variable_functions(program: &oxc_ast::ast::Program<'_>) -> Vec<VariableFuncti
 enum DecoderTransform {
     Plain,
     LowerAlphabetBase64Uri,
+    LowerAlphabetBase64Rc4,
     StandardBase64,
     FixedBase64Alphabet(String),
 }
@@ -931,7 +933,35 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    fn value_for_raw_rotated(&self, raw: i64, rotation: usize) -> Option<Value> {
+    fn transform_value(&self, value: Value, key: Option<&str>) -> Option<Value> {
+        match (&self.transform, value) {
+            (DecoderTransform::LowerAlphabetBase64Uri, Value::String(encoded)) => {
+                decode_lower_alphabet_base64_uri(&encoded).map(Value::String)
+            }
+            (DecoderTransform::LowerAlphabetBase64Uri, _) => None,
+            (DecoderTransform::LowerAlphabetBase64Rc4, Value::String(encoded)) => {
+                decode_lower_alphabet_base64_rc4(&encoded, key?).map(Value::String)
+            }
+            (DecoderTransform::LowerAlphabetBase64Rc4, _) => None,
+            (DecoderTransform::StandardBase64, Value::String(encoded)) => {
+                decode_standard_base64_latin1(&encoded).map(Value::String)
+            }
+            (DecoderTransform::StandardBase64, _) => None,
+            (DecoderTransform::FixedBase64Alphabet(alphabet), Value::String(encoded)) => {
+                decode_fixed_base64_latin1(&encoded, alphabet).map(Value::String)
+            }
+            (DecoderTransform::Plain | DecoderTransform::FixedBase64Alphabet(_), value) => {
+                Some(value)
+            }
+        }
+    }
+
+    fn value_for_raw_rotated_with_key(
+        &self,
+        raw: i64,
+        rotation: usize,
+        key: Option<&str>,
+    ) -> Option<Value> {
         let index = raw - self.offset;
         if index < 0 || self.values.is_empty() {
             return None;
@@ -939,37 +969,130 @@ impl Decoder {
         let index = usize::try_from(index).ok()?;
         // Array indexing never wraps. Rotation only maps an already-valid
         // logical table index onto the physically rotated backing array.
-        // Applying modulo before this bounds check would incorrectly turn an
-        // out-of-range runtime lookup (undefined) into an unrelated entry.
         if index >= self.values.len() {
             return None;
         }
         let index = index.checked_add(rotation)? % self.values.len();
-        let value = self.values.get(index)?.clone();
-        match (&self.transform, value) {
-            (DecoderTransform::LowerAlphabetBase64Uri, Value::String(encoded)) => {
-                decode_lower_alphabet_base64_uri(&encoded).map(Value::String)
-            }
-            (DecoderTransform::StandardBase64, Value::String(encoded)) => {
-                decode_standard_base64_latin1(&encoded).map(Value::String)
-            }
-            (DecoderTransform::LowerAlphabetBase64Uri | DecoderTransform::StandardBase64, _) => {
-                None
-            }
-            (DecoderTransform::FixedBase64Alphabet(alphabet), Value::String(encoded)) => {
-                decode_fixed_base64_latin1(&encoded, alphabet).map(Value::String)
-            }
-            // DataDome-style tables intentionally mix encoded strings with
-            // literal numbers, booleans, and null. The runtime decoder only
-            // transforms strings and returns every other table value as-is.
-            (DecoderTransform::Plain | DecoderTransform::FixedBase64Alphabet(_), value) => {
-                Some(value)
-            }
-        }
+        self.transform_value(self.values.get(index)?.clone(), key)
     }
 
-    pub(super) fn value_for_raw(&self, raw: i64) -> Option<Value> {
-        self.value_for_raw_rotated(raw, 0)
+    pub(super) fn value_for_call(&self, raw: i64, key: Option<&str>) -> Option<Value> {
+        self.value_for_raw_rotated_with_key(raw, 0, key)
+    }
+}
+
+pub(super) struct DecoderCallRewrite {
+    pub(super) text: String,
+    pub(super) stop: bool,
+}
+
+pub(super) fn decoder_call_rewrite(
+    source: &str,
+    scoping: &Scoping,
+    decoders: &HashMap<SymbolId, Decoder>,
+    call: &CallExpression<'_>,
+) -> Option<DecoderCallRewrite> {
+    if call.optional
+        || !(1..=2).contains(&call.arguments.len())
+        || call.arguments.iter().any(Argument::is_spread)
+    {
+        return None;
+    }
+    let symbol = symbol_of(scoping, &call.callee)?;
+    let decoder = decoders.get(&symbol)?;
+    let key = match call.arguments.get(1) {
+        Some(Argument::StringLiteral(literal)) => Some(string_literal_value(literal)?),
+        Some(_) => return None,
+        None => None,
+    };
+    let argument = call.arguments.first()?;
+    if let Some(raw) = decoder_argument_integer(argument) {
+        let text = decoder
+            .value_for_call(raw, key.as_deref())
+            .and_then(|value| value.render())?;
+        return Some(DecoderCallRewrite { text, stop: false });
+    }
+
+    let Argument::ConditionalExpression(conditional) = argument else {
+        return None;
+    };
+    let consequent = expression_integer(&conditional.consequent)
+        .and_then(|raw| decoder.value_for_call(raw, key.as_deref()))
+        .and_then(|value| value.render())?;
+    let alternate = expression_integer(&conditional.alternate)
+        .and_then(|raw| decoder.value_for_call(raw, key.as_deref()))
+        .and_then(|value| value.render())?;
+    let test = fragment(source, conditional.test.span());
+    Some(DecoderCallRewrite {
+        text: format!("(({test}) ? ({consequent}) : ({alternate}))"),
+        stop: true,
+    })
+}
+
+struct DecoderOnlyCallCollector<'c> {
+    source: &'c str,
+    scoping: &'c Scoping,
+    decoders: &'c HashMap<SymbolId, Decoder>,
+    protected_spans: &'c [(usize, usize)],
+    replacements: Vec<Replacement>,
+}
+
+impl DecoderOnlyCallCollector<'_> {
+    fn protected(&self, span: Span) -> bool {
+        let start = span.start as usize;
+        let end = span.end as usize;
+        self.protected_spans
+            .iter()
+            .any(|(protected_start, protected_end)| {
+                start < *protected_end && *protected_start < end
+            })
+    }
+}
+
+impl<'a> Visit<'a> for DecoderOnlyCallCollector<'_> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        let Some(rewrite) = decoder_call_rewrite(self.source, self.scoping, self.decoders, call)
+        else {
+            walk::walk_call_expression(self, call);
+            return;
+        };
+        if self.protected(call.span) {
+            return;
+        }
+        self.replacements.push(Replacement {
+            start: call.span.start as usize,
+            end: call.span.end as usize,
+            text: rewrite.text,
+            kind: "string_array_decode",
+            arithmetic_state_proof: None,
+        });
+    }
+}
+
+pub(super) struct StaticDecoderPass {
+    pub(super) replacements: Vec<Replacement>,
+    pub(super) decoder_count: usize,
+}
+
+pub(super) fn static_decoder_pass(
+    source: &str,
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> StaticDecoderPass {
+    let analysis = analyze_decoders(source, program, scoping, reference_spans);
+    let decoder_count = analysis.decoders.len();
+    let mut collector = DecoderOnlyCallCollector {
+        source,
+        scoping,
+        decoders: &analysis.decoders,
+        protected_spans: &analysis.protected_spans,
+        replacements: analysis.replacements,
+    };
+    collector.visit_program(program);
+    StaticDecoderPass {
+        replacements: collector.replacements,
+        decoder_count,
     }
 }
 
@@ -1644,16 +1767,114 @@ impl RotationExprParser<'_, '_> {
         parse_i64_literal(&self.source[start..self.pos].replace(char::is_whitespace, ""))
     }
 
+    fn string_literal(&mut self) -> Option<String> {
+        self.skip_ws();
+        let quote = self.rest().chars().next()?;
+        if !matches!(quote, '\'' | '"') {
+            return None;
+        }
+        self.pos += quote.len_utf8();
+        let mut units = Vec::<u16>::new();
+        loop {
+            let ch = self.rest().chars().next()?;
+            if ch == quote {
+                self.pos += ch.len_utf8();
+                return String::from_utf16(&units).ok();
+            }
+            if matches!(ch, '\n' | '\r') {
+                return None;
+            }
+            if ch != '\\' {
+                let mut buf = [0u16; 2];
+                units.extend_from_slice(ch.encode_utf16(&mut buf));
+                self.pos += ch.len_utf8();
+                continue;
+            }
+
+            self.pos += ch.len_utf8();
+            let escape = self.rest().chars().next()?;
+            self.pos += escape.len_utf8();
+            match escape {
+                '\\' | '\'' | '"' | '/' => units.push(u16::try_from(u32::from(escape)).ok()?),
+                'b' => units.push(0x08),
+                'f' => units.push(0x0c),
+                'n' => units.push(u16::from(b'\n')),
+                'r' => units.push(u16::from(b'\r')),
+                't' => units.push(u16::from(b'\t')),
+                'v' => units.push(0x0b),
+                '0' => {
+                    if self
+                        .rest()
+                        .chars()
+                        .next()
+                        .is_some_and(|next| next.is_ascii_digit())
+                    {
+                        return None;
+                    }
+                    units.push(0);
+                }
+                'x' => {
+                    let digits = self.rest().get(..2)?;
+                    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        return None;
+                    }
+                    units.push(u16::from_str_radix(digits, 16).ok()?);
+                    self.pos += 2;
+                }
+                'u' => {
+                    if self.rest().starts_with('{') {
+                        self.pos += 1;
+                        let end = self.rest().find('}')?;
+                        let digits = self.rest().get(..end)?;
+                        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        {
+                            return None;
+                        }
+                        let scalar = u32::from_str_radix(digits, 16).ok()?;
+                        let value = char::from_u32(scalar)?;
+                        let mut buf = [0u16; 2];
+                        units.extend_from_slice(value.encode_utf16(&mut buf));
+                        self.pos += end + 1;
+                    } else {
+                        let digits = self.rest().get(..4)?;
+                        if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                            return None;
+                        }
+                        units.push(u16::from_str_radix(digits, 16).ok()?);
+                        self.pos += 4;
+                    }
+                }
+                '\n' => {}
+                '\r' => {
+                    if self.rest().starts_with('\n') {
+                        self.pos += 1;
+                    }
+                }
+                other => {
+                    let mut buf = [0u16; 2];
+                    units.extend_from_slice(other.encode_utf16(&mut buf));
+                }
+            }
+        }
+    }
+
     fn decoder_call(&mut self) -> Option<String> {
         let name = self.ident()?;
         if name != self.alias || !self.eat("(") {
             return None;
         }
         let raw = self.signed_integer()?;
+        let key = if self.eat(",") {
+            Some(self.string_literal()?)
+        } else {
+            None
+        };
         if !self.eat(")") {
             return None;
         }
-        let value = self.decoder.value_for_raw_rotated(raw, self.rotation)?;
+        let value =
+            self.decoder
+                .value_for_raw_rotated_with_key(raw, self.rotation, key.as_deref())?;
         match value {
             Value::String(value) => Some(value),
             value => value.js_string(),
@@ -2067,23 +2288,19 @@ fn prove_rotation_iifes(
     rotation_iifes: &[RotationIife],
     checksum_re: &regex::Regex,
     decoders: &mut HashMap<String, Decoder>,
-) -> (Vec<(usize, usize)>, Vec<ProvenRotationIife>) {
-    let mut protected_spans = Vec::new();
+) -> Vec<ProvenRotationIife> {
     let mut proven_iifes = Vec::new();
     for iife in rotation_iifes {
         if !prove_rotation_iife(source, iife, checksum_re, decoders) {
             continue;
         }
-        let start = iife.statement_span.start as usize;
-        let end = iife.statement_span.end as usize;
-        protected_spans.push((start, end));
         proven_iifes.push(ProvenRotationIife {
             provider: iife.provider.clone(),
-            start,
-            end,
+            start: iife.statement_span.start as usize,
+            end: iife.statement_span.end as usize,
         });
     }
-    (protected_spans, proven_iifes)
+    proven_iifes
 }
 
 fn materializable_rotated_providers(
@@ -2165,8 +2382,29 @@ fn apply_proven_decoder_rotations(
     ) else {
         return (Vec::new(), Vec::new());
     };
-    let (protected_spans, proven_iifes) =
-        prove_rotation_iifes(source, rotation_iifes, &checksum_re, decoders);
+    let mut proven_iifes = prove_rotation_iifes(source, rotation_iifes, &checksum_re, decoders);
+
+    let mut required = HashMap::<String, usize>::new();
+    for iife in rotation_iifes {
+        *required.entry(iife.provider.clone()).or_default() += 1;
+    }
+    let mut proven = HashMap::<String, usize>::new();
+    for iife in &proven_iifes {
+        *proven.entry(iife.provider.clone()).or_default() += 1;
+    }
+    let unproven_providers = required
+        .into_iter()
+        .filter_map(|(provider, count)| {
+            (proven.get(&provider).copied().unwrap_or_default() != count).then_some(provider)
+        })
+        .collect::<HashSet<_>>();
+
+    decoders.retain(|_, decoder| !unproven_providers.contains(&decoder.provider));
+    proven_iifes.retain(|iife| !unproven_providers.contains(&iife.provider));
+    let protected_spans = proven_iifes
+        .iter()
+        .map(|iife| (iife.start, iife.end))
+        .collect::<Vec<_>>();
     let materialized = materializable_rotated_providers(decoders, &proven_iifes);
     let replacements = rotation_replacements(materialized, &proven_iifes);
     (protected_spans, replacements)
@@ -2232,17 +2470,33 @@ fn decoder_providers(
     providers
 }
 
-fn decoder_transform(body: &str) -> Option<DecoderTransform> {
+fn decoder_transform(body: &str, keyed_decode_call: bool) -> Option<DecoderTransform> {
     if !body.contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=")
         || !body.contains("decodeURIComponent")
     {
         return Some(DecoderTransform::Plain);
     }
 
+    let char_code_at_count = body.matches(".charCodeAt(").count();
+    let rc4_key_shape = compile_regex(
+        r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*charCodeAt\s*\(([^)]*)\)",
+    )
+    .is_some_and(|pattern| {
+        pattern.captures_iter(body).any(|captures| {
+            let key = &captures[1];
+            let argument = &captures[2];
+            argument.contains('%')
+                && compile_regex(&format!(r"\b{}\s*\.\s*length\b", regex::escape(key),))
+                    .is_some_and(|length| length.is_match(argument))
+        })
+    });
+    if keyed_decode_call && rc4_key_shape && body.contains("0x100") && char_code_at_count >= 2 {
+        return Some(DecoderTransform::LowerAlphabetBase64Rc4);
+    }
+
     // Recognize the pure javascript-obfuscator Base64 -> percent-URI decoder
     // by its dataflow ingredients. Extra charCodeAt probes are source-sensitive
     // self-defence unless the exact decoder representation is one physical line.
-    let char_code_at_count = body.matches(".charCodeAt(").count();
     let base64_uri_shape = body.contains(".charAt(")
         && body.contains(".indexOf(")
         && body.contains("String.fromCharCode")
@@ -2330,12 +2584,28 @@ fn detect_decoder_candidate(
         return None;
     }
 
+    let nested_key_param = compile_regex(&format!(
+        r"\b{}\s*=\s*function\s*\(\s*{}\s*,\s*([A-Za-z_$][A-Za-z0-9_$]*)\b",
+        regex::escape(&function.name),
+        regex::escape(&param),
+    ))
+    .and_then(|pattern| pattern.captures(body))
+    .map(|captures| captures[1].to_string());
+    let keyed_decode_call = nested_key_param.is_some_and(|key| {
+        compile_regex(&format!(
+            r"\(\s*{}\s*,\s*{}\s*\)",
+            regex::escape(&value_var),
+            regex::escape(&key),
+        ))
+        .is_some_and(|pattern| pattern.is_match(body))
+    });
+
     Some(Decoder {
         values: provider_info.values.clone(),
         offset,
         provider,
         provider_array_span: provider_info.span,
-        transform: decoder_transform(body)?,
+        transform: decoder_transform(body, keyed_decode_call)?,
     })
 }
 
@@ -2501,4 +2771,39 @@ fn collect_symbol_aliases(
     };
     collector.visit_program(program);
     collector.aliases
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rc4_rotation_checksum_uses_literal_key_without_external_evaluation() {
+        let decoder = Decoder {
+            // Logical order after rotation 3: "17", "23", "hello", "world".
+            values: vec![
+                Value::String("xCor".into()),
+                Value::String("b8khW4W9WQG=".into()),
+                Value::String("gmknW5i9WQm=".into()),
+                Value::String("xSov".into()),
+            ],
+            offset: 0x10,
+            provider: "p".into(),
+            provider_array_span: Span::new(0, 0),
+            transform: DecoderTransform::LowerAlphabetBase64Rc4,
+        };
+        assert_eq!(
+            eval_rotation_checksum(
+                "parseInt(G(0x10, 'k')) * 10 + parseInt(G(0x11, \"k\"))",
+                "G",
+                &decoder,
+                3,
+            ),
+            Some(193.0)
+        );
+        assert_eq!(
+            eval_rotation_checksum("parseInt(G(0x10, dynamic))", "G", &decoder, 3),
+            None
+        );
+    }
 }

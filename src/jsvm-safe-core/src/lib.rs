@@ -12,7 +12,7 @@ use control_flow::{
     collect_dispatch_bindings, collect_reference_spans, detect_reference_identity_tables,
     reference_identity, ReferenceIdentityTable,
 };
-use decoder::{analyze_decoders, js_parse_int, Decoder};
+use decoder::{analyze_decoders, decoder_call_rewrite, js_parse_int, static_decoder_pass, Decoder};
 pub use numeric::{exact_i64, exact_u32, exact_u64, exact_usize};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -344,7 +344,7 @@ fn collect_var_number_initializers(
     collector.candidates
 }
 
-fn expression_integer(expr: &Expression<'_>) -> Option<i64> {
+pub(crate) fn expression_integer(expr: &Expression<'_>) -> Option<i64> {
     let Value::Number(number) = eval(expr)? else {
         return None;
     };
@@ -740,35 +740,13 @@ impl Collector<'_, '_> {
     }
 
     fn try_decoder_rewrite(&mut self, call: &CallExpression<'_>) -> Option<CallRewriteTraversal> {
-        let symbol = symbol_of(self.scoping, &call.callee)?;
-        let decoder = self.decoders.get(&symbol)?;
-        let argument = call.arguments.first()?;
-        if let Some(raw) = decoder_argument_integer(argument) {
-            let text = decoder
-                .value_for_raw(raw)
-                .and_then(|value| value.render())?;
-            self.push(call.span, text, "string_array_decode");
-            return Some(CallRewriteTraversal::WalkChildren);
-        }
-
-        let Argument::ConditionalExpression(conditional) = argument else {
-            return None;
-        };
-        let consequent = expression_integer(&conditional.consequent)
-            .and_then(|raw| decoder.value_for_raw(raw))
-            .and_then(|value| value.render())?;
-        let alternate = expression_integer(&conditional.alternate)
-            .and_then(|raw| decoder.value_for_raw(raw))
-            .and_then(|value| value.render())?;
-        let test = fragment(self.source, conditional.test.span());
-        self.push(
-            call.span,
-            format!("(({test}) ? ({consequent}) : ({alternate}))"),
-            "string_array_decode",
-        );
-        // The replacement spans the whole call. Revisit its copied test on the
-        // next fixed-point iteration instead of creating overlapping edits.
-        Some(CallRewriteTraversal::Stop)
+        let rewrite = decoder_call_rewrite(self.source, self.scoping, self.decoders, call)?;
+        self.push(call.span, rewrite.text, "string_array_decode");
+        Some(if rewrite.stop {
+            CallRewriteTraversal::Stop
+        } else {
+            CallRewriteTraversal::WalkChildren
+        })
     }
 }
 
@@ -1259,6 +1237,80 @@ fn transform_once(
 }
 
 #[derive(Debug, Clone)]
+pub struct StaticDecoderRecoveryResult {
+    pub source: String,
+    pub iterations: usize,
+    pub transforms: BTreeMap<String, usize>,
+    pub decoder_candidates: usize,
+}
+
+fn recover_static_decoders_with_mode(
+    source: &str,
+    max_iterations: usize,
+    source_mode: SafeSourceMode,
+) -> Option<StaticDecoderRecoveryResult> {
+    let source_type = semantically_valid_source_type(source, source_mode)?;
+    let mut current = source.to_string();
+    let mut counts = Counts::default();
+    let mut iterations = 0usize;
+    let mut decoder_candidates = 0usize;
+
+    for iteration in 1..=max_iterations {
+        let allocator = Allocator::default();
+        let program = parse_as(&allocator, &current, source_type)?;
+        let semantic_ret = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&program);
+        if !semantic_ret.diagnostics.is_empty() {
+            return None;
+        }
+        let scoping = semantic_ret.semantic.scoping();
+        let reference_spans = collect_reference_spans(&program);
+        let pass = static_decoder_pass(&current, &program, scoping, &reference_spans);
+        decoder_candidates = decoder_candidates.max(pass.decoder_count);
+        if pass.replacements.is_empty() {
+            break;
+        }
+        let next = apply(
+            &current,
+            pass.replacements,
+            &mut counts,
+            &mut Vec::new(),
+            iteration,
+        )?;
+        if next == current {
+            break;
+        }
+        iterations += 1;
+        current = next;
+    }
+
+    Some(StaticDecoderRecoveryResult {
+        source: current,
+        iterations,
+        transforms: counts.into_inner(),
+        decoder_candidates,
+    })
+}
+
+#[must_use]
+pub fn recover_static_decoders(
+    source: &str,
+    max_iterations: usize,
+) -> Option<StaticDecoderRecoveryResult> {
+    recover_static_decoders_with_mode(source, max_iterations, SafeSourceMode::Auto)
+}
+
+#[must_use]
+pub fn recover_static_decoders_with_source_mode(
+    source: &str,
+    max_iterations: usize,
+    source_mode: SafeSourceMode,
+) -> Option<StaticDecoderRecoveryResult> {
+    recover_static_decoders_with_mode(source, max_iterations, source_mode)
+}
+
+#[derive(Debug, Clone)]
 pub struct SafeTransformResult {
     pub source: String,
     pub iterations: usize,
@@ -1339,7 +1391,7 @@ pub fn deobfuscate_with_standard_numeric_builtins(
 mod tests {
     use super::{
         deobfuscate, deobfuscate_with_source_mode, deobfuscate_with_standard_numeric_builtins,
-        ProvenConstantEnvironment, SafeSourceMode,
+        recover_static_decoders, ProvenConstantEnvironment, SafeSourceMode,
     };
     use oxc_allocator::Allocator;
     use oxc_ast::ast::{CallExpression, Expression};
@@ -1410,6 +1462,58 @@ mod tests {
                 Some("https://nested.example.test".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn decoder_only_recovery_proves_rotation_and_rejects_bad_checksum() {
+        let source = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/rotated-base64-string-array.js"
+        );
+        let recovered = recover_static_decoders(source, 8);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert!(
+            recovered
+                .transforms
+                .get("string_array_decode")
+                .copied()
+                .unwrap_or_default()
+                >= 2
+        );
+        assert_eq!(
+            recovered.transforms.get("materialize_decoder_rotation"),
+            Some(&1)
+        );
+        assert_eq!(
+            recovered.transforms.get("remove_decoder_rotation_iife"),
+            Some(&1)
+        );
+
+        let bad = source.replace("2454246", "2454247");
+        let rejected = recover_static_decoders(&bad, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.source, bad);
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        assert_eq!(
+            rejected.transforms.get("materialize_decoder_rotation"),
+            None
+        );
+    }
+
+    #[test]
+    fn decoder_only_recovery_handles_literal_key_rc4() {
+        let source = r#"
+function p(){var table=["xSov","xCor"];p=function(){return table;};return p();}
+function d(a,b){var c=p();return d=function(x,y){x=x-0x10;var v=c[x];if(d.ready===undefined){var decode=function(s){var alphabet="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=";var bytes="",uri="",helper=bytes+decode;for(var q=0,r,ch,i=0;ch=s.charAt(i++);~ch&&(r=q%4?r*64+ch:ch,q++%4)?bytes+=helper.charCodeAt(i+10)-10!==0?String.fromCharCode(255&r>>(-2*q&6)):q:0){ch=alphabet.indexOf(ch);}for(var z=0;z<bytes.length;z++){uri+="%"+("00"+bytes.charCodeAt(z).toString(16)).slice(-2);}return decodeURIComponent(uri);};var rc4=function(str,key){var state=[],j=0,tmp,out="";for(var i=0;i<0x100;i++){state[i]=i;}for(i=0;i<0x100;i++){j=(j+state[i]+key.charCodeAt(i%key.length))%0x100;tmp=state[i];state[i]=state[j];state[j]=tmp;}i=0;j=0;for(var n=0;n<str.length;n++){i=(i+1)%0x100;j=(j+state[i])%0x100;tmp=state[i];state[i]=state[j];state[j]=tmp;out+=String.fromCharCode(str.charCodeAt(n)^state[(state[i]+state[j])%0x100]);}return out;};d.decode=function(value,key){return rc4(decode(value),key);};d.ready=true;}v=d.decode(v,y);return v;},d(a,b);}
+console.log(d(0x10,"k"),d(0x11,"k"));
+"#;
+        let recovered = recover_static_decoders(source, 8);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert_eq!(recovered.transforms.get("string_array_decode"), Some(&2));
+        assert!(recovered.source.contains("\"17\""));
+        assert!(recovered.source.contains("\"23\""));
     }
 
     #[test]
