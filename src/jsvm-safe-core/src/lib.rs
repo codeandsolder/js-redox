@@ -73,6 +73,18 @@ fn symbol_of(scoping: &Scoping, expr: &Expression<'_>) -> Option<SymbolId> {
     scoping.get_reference(id.reference_id.get()?).symbol_id()
 }
 
+fn symbol_has_only_read_references(scoping: &Scoping, symbol: SymbolId) -> bool {
+    scoping
+        .get_resolved_reference_ids(symbol)
+        .iter()
+        .all(|reference_id| {
+            let reference = scoping.get_reference(*reference_id);
+            reference.is_read()
+                && !reference.is_write()
+                && !reference.flags().is_member_write_target()
+        })
+}
+
 fn direct_identifier_name<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
     match expr {
         Expression::Identifier(id) => Some(id.name.as_str()),
@@ -204,7 +216,35 @@ fn array_element(el: &ArrayExpressionElement<'_>) -> Option<Value> {
     }
 }
 
-fn top_level_arrays(program: &oxc_ast::ast::Program<'_>) -> HashMap<SymbolId, Vec<Value>> {
+#[derive(Default)]
+struct StaticArrayReadCollector {
+    references: HashSet<ReferenceId>,
+}
+
+impl<'a> Visit<'a> for StaticArrayReadCollector {
+    fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
+        if !member.optional
+            && eval(&member.expression)
+                .and_then(|value| value.number())
+                .and_then(exact_usize)
+                .is_some()
+        {
+            if let Expression::Identifier(identifier) = &member.object {
+                if let Some(reference_id) = identifier.reference_id.get() {
+                    self.references.insert(reference_id);
+                }
+            }
+        }
+        walk::walk_computed_member_expression(self, member);
+    }
+}
+
+fn top_level_arrays(
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+) -> HashMap<SymbolId, Vec<Value>> {
+    let mut read_collector = StaticArrayReadCollector::default();
+    read_collector.visit_program(program);
     let mut out = HashMap::new();
     for stmt in &program.body {
         let Statement::VariableDeclaration(decl) = stmt else {
@@ -236,6 +276,19 @@ fn top_level_arrays(program: &oxc_ast::ast::Program<'_>) -> HashMap<SymbolId, Ve
             }
         }
     }
+    out.retain(|symbol, _| {
+        scoping
+            .get_resolved_reference_ids(*symbol)
+            .iter()
+            .all(|reference_id| {
+                read_collector.references.contains(reference_id) && {
+                    let reference = scoping.get_reference(*reference_id);
+                    reference.is_read()
+                        && !reference.is_write()
+                        && !reference.flags().is_member_write_target()
+                }
+            })
+    });
     out
 }
 
@@ -276,15 +329,9 @@ fn collect_stable_var_numbers(
 ) -> HashMap<SymbolId, i64> {
     let mut collector = StableVarNumberCollector::default();
     collector.visit_program(program);
-    collector.candidates.retain(|symbol, _| {
-        scoping
-            .get_resolved_reference_ids(*symbol)
-            .iter()
-            .all(|reference_id| {
-                let reference = scoping.get_reference(*reference_id);
-                !reference.is_write() && !reference.flags().is_member_write_target()
-            })
-    });
+    collector
+        .candidates
+        .retain(|symbol, _| symbol_has_only_read_references(scoping, *symbol));
     collector.candidates
 }
 
@@ -415,15 +462,9 @@ fn collect_from_char_code_aliases(
         candidates: HashMap::new(),
     };
     collector.visit_program(program);
-    collector.candidates.retain(|symbol, _initialized_after| {
-        scoping
-            .get_resolved_reference_ids(*symbol)
-            .iter()
-            .all(|reference_id| {
-                let reference = scoping.get_reference(*reference_id);
-                !reference.is_write() && !reference.flags().is_member_write_target()
-            })
-    });
+    collector
+        .candidates
+        .retain(|symbol, _| symbol_has_only_read_references(scoping, *symbol));
     collector.candidates
 }
 
@@ -1171,7 +1212,7 @@ fn transform_once(
     let semantic = semantic_ret.semantic;
     let scoping = semantic.scoping();
 
-    let arrays = top_level_arrays(&program);
+    let arrays = top_level_arrays(&program, scoping);
     let reference_spans = collect_reference_spans(&program);
     let decoder_analysis = analyze_decoders(source, &program, scoping, &reference_spans);
     let decoders = decoder_analysis.decoders;
@@ -1462,6 +1503,29 @@ mod tests {
                 Some("https://nested.example.test".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn static_array_lookup_requires_non_escaping_read_only_array() {
+        let immutable = r#"const table = ["alpha"]; sink(table[0]);"#;
+        let result = deobfuscate(immutable, 4);
+        assert!(result.is_some());
+        let result = result.unwrap_or_else(|| unreachable!());
+        assert!(result.source.contains("sink(\"alpha\")"));
+        assert_eq!(result.transforms.get("static_array_lookup"), Some(&1));
+
+        for source in [
+            r#"const table = ["before"]; table[0] = "after"; sink(table[0]);"#,
+            r#"const table = ["before"]; const alias = table; alias[0] = "after"; sink(table[0]);"#,
+            r#"const table = ["before"]; mutate(table); sink(table[0]);"#,
+            r#"const table = ["before"]; table["push"]("after"); sink(table[0]);"#,
+        ] {
+            let result = deobfuscate(source, 4);
+            assert!(result.is_some());
+            let result = result.unwrap_or_else(|| unreachable!());
+            assert!(result.source.contains("sink(table[0])"));
+            assert_eq!(result.transforms.get("static_array_lookup"), None);
+        }
     }
 
     #[test]

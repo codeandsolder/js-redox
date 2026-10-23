@@ -6,8 +6,9 @@
 //! to the shared value evaluator.
 
 use super::{
-    expression_integer, known_bool, symbol_of, walk, BindingPattern, Expression, GetSpan, HashMap,
-    HashSet, ScopeFlags, Scoping, Span, Statement, SymbolId, Visit,
+    expression_integer, known_bool, symbol_has_only_read_references, symbol_of, walk,
+    BindingPattern, Expression, GetSpan, HashMap, HashSet, ScopeFlags, Scoping, Span, Statement,
+    SymbolId, Visit,
 };
 
 fn selector_identifier_symbol(expr: &Expression<'_>, scoping: &Scoping) -> Option<SymbolId> {
@@ -286,14 +287,8 @@ impl<'a> Visit<'a> for SelectorDispatcherCollector<'_> {
         if !function.r#async && !function.generator && function.params.rest.is_none() {
             if let (Some(id), Some(body)) = (&function.id, &function.body) {
                 if let Some(function_symbol) = id.symbol_id.get() {
-                    let binding_is_stable = self
-                        .scoping
-                        .get_resolved_reference_ids(function_symbol)
-                        .iter()
-                        .all(|reference_id| {
-                            let reference = self.scoping.get_reference(*reference_id);
-                            !reference.is_write() && !reference.flags().is_member_write_target()
-                        });
+                    let binding_is_stable =
+                        symbol_has_only_read_references(self.scoping, function_symbol);
 
                     let params = function
                         .params
