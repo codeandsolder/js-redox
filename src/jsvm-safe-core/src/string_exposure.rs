@@ -1,7 +1,8 @@
 use crate::rewrite::{apply, Counts, Replacement};
 use crate::value_eval::{eval, eval_binary, Value};
 use crate::{
-    array_element, exact_usize, parse_as, semantically_valid_source_type, symbol_of, SafeSourceMode,
+    array_element, exact_usize, parse_as, reference_is_statically_resolved_read,
+    semantically_valid_source_type, symbol_of, SafeSourceMode,
 };
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{BindingPattern, ComputedMemberExpression, Expression, VariableDeclarationKind};
@@ -83,12 +84,8 @@ pub(crate) fn static_readonly_arrays(
             .get_resolved_reference_ids(*symbol)
             .iter()
             .all(|reference_id| {
-                read_collector.references.contains(reference_id) && {
-                    let reference = scoping.get_reference(*reference_id);
-                    reference.is_read()
-                        && !reference.is_write()
-                        && !reference.flags().is_member_write_target()
-                }
+                read_collector.references.contains(reference_id)
+                    && reference_is_statically_resolved_read(scoping, *reference_id, *symbol)
             })
     });
     out
@@ -238,4 +235,47 @@ pub fn expose_static_strings_with_source_mode(
     source_mode: SafeSourceMode,
 ) -> Option<StaticStringExposureResult> {
     expose_static_strings_with_mode(source, max_iterations, source_mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxc_span::SourceType;
+
+    #[test]
+    fn dynamic_with_scope_blocks_only_affected_array_reads() {
+        let source = r#"
+            const blocked = ["outer"];
+            const safe = ["safe"];
+            with ({ blocked: ["inner"] }) {
+                sink(blocked[0]);
+            }
+            sink(safe[0]);
+        "#;
+        let allocator = Allocator::default();
+        let program = parse_as(&allocator, source, SourceType::cjs());
+        assert!(program.is_some());
+        let Some(program) = program else {
+            return;
+        };
+        let semantic_ret = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&program);
+        assert!(semantic_ret.diagnostics.is_empty());
+        let scoping = semantic_ret.semantic.scoping();
+        let replacements = static_string_exposure_pass(&program, scoping);
+        assert_eq!(replacements.len(), 1);
+
+        let rewritten = apply(
+            source,
+            replacements,
+            &mut Counts::default(),
+            &mut Vec::new(),
+            1,
+        );
+        assert!(rewritten.is_some());
+        let rewritten = rewritten.unwrap_or_default();
+        assert!(rewritten.contains("sink(blocked[0])"));
+        assert!(rewritten.contains("sink(\"safe\")"));
+    }
 }

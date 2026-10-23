@@ -84,16 +84,33 @@ fn symbol_of(scoping: &Scoping, expr: &Expression<'_>) -> Option<SymbolId> {
     scoping.get_reference(id.reference_id.get()?).symbol_id()
 }
 
+fn reference_is_statically_resolved_read(
+    scoping: &Scoping,
+    reference_id: ReferenceId,
+    symbol: SymbolId,
+) -> bool {
+    let reference = scoping.get_reference(reference_id);
+    if !reference.is_read() || reference.is_write() || reference.flags().is_member_write_target() {
+        return false;
+    }
+
+    let symbol_scope = scoping.symbol_scope_id(symbol);
+    for scope_id in scoping.scope_ancestors(reference.scope_id()) {
+        if scope_id == symbol_scope {
+            return true;
+        }
+        if scoping.scope_flags(scope_id).is_with() {
+            return false;
+        }
+    }
+    false
+}
+
 fn symbol_has_only_read_references(scoping: &Scoping, symbol: SymbolId) -> bool {
     scoping
         .get_resolved_reference_ids(symbol)
         .iter()
-        .all(|reference_id| {
-            let reference = scoping.get_reference(*reference_id);
-            reference.is_read()
-                && !reference.is_write()
-                && !reference.flags().is_member_write_target()
-        })
+        .all(|reference_id| reference_is_statically_resolved_read(scoping, *reference_id, symbol))
 }
 
 fn direct_identifier_name<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
