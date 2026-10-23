@@ -1,3 +1,4 @@
+mod base91;
 mod control_flow;
 mod decoder;
 mod decoder_encoding;
@@ -6,6 +7,7 @@ mod proxy;
 mod pure_function;
 mod rewrite;
 mod selector;
+mod string_exposure;
 mod value_eval;
 
 use control_flow::{
@@ -36,11 +38,20 @@ use rewrite::{apply, Counts, Replacement};
 use rolldown_redox::ecmascript::parse_program;
 use selector::{collect_selector_dispatchers, SelectorDispatcher};
 use std::collections::{BTreeMap, HashMap, HashSet};
+pub use string_exposure::{
+    expose_static_strings, expose_static_strings_with_source_mode, StaticStringExposureResult,
+};
+use string_exposure::{static_array_lookup_text, static_readonly_arrays};
 use value_eval::{
     eval, eval_binary, eval_logical, eval_unary, eval_with_resolver, js_to_uint32, known_bool,
     Value,
 };
 pub use value_eval::{string_literal_value, template_element_value};
+
+#[must_use]
+pub fn decode_base91_ascii(encoded: &str, alphabet: &str) -> Option<String> {
+    base91::Base91Alphabet::parse(alphabet)?.decode_ascii(encoded)
+}
 
 #[derive(Debug, Clone)]
 pub struct ArithmeticStateProof {
@@ -214,82 +225,6 @@ fn array_element(el: &ArrayExpressionElement<'_>) -> Option<Value> {
         ArrayExpressionElement::UnaryExpression(v) => eval_unary(v),
         _ => None,
     }
-}
-
-#[derive(Default)]
-struct StaticArrayReadCollector {
-    references: HashSet<ReferenceId>,
-}
-
-impl<'a> Visit<'a> for StaticArrayReadCollector {
-    fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
-        if !member.optional
-            && eval(&member.expression)
-                .and_then(|value| value.number())
-                .and_then(exact_usize)
-                .is_some()
-        {
-            if let Expression::Identifier(identifier) = &member.object {
-                if let Some(reference_id) = identifier.reference_id.get() {
-                    self.references.insert(reference_id);
-                }
-            }
-        }
-        walk::walk_computed_member_expression(self, member);
-    }
-}
-
-fn top_level_arrays(
-    program: &oxc_ast::ast::Program<'_>,
-    scoping: &Scoping,
-) -> HashMap<SymbolId, Vec<Value>> {
-    let mut read_collector = StaticArrayReadCollector::default();
-    read_collector.visit_program(program);
-    let mut out = HashMap::new();
-    for stmt in &program.body {
-        let Statement::VariableDeclaration(decl) = stmt else {
-            continue;
-        };
-        if decl.kind != VariableDeclarationKind::Const {
-            continue;
-        }
-        for d in &decl.declarations {
-            let BindingPattern::BindingIdentifier(id) = &d.id else {
-                continue;
-            };
-            let Some(symbol) = id.symbol_id.get() else {
-                continue;
-            };
-            let Some(Expression::ArrayExpression(arr)) = &d.init else {
-                continue;
-            };
-            let Some(values) = arr
-                .elements
-                .iter()
-                .map(array_element)
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
-            if !values.is_empty() {
-                out.insert(symbol, values);
-            }
-        }
-    }
-    out.retain(|symbol, _| {
-        scoping
-            .get_resolved_reference_ids(*symbol)
-            .iter()
-            .all(|reference_id| {
-                read_collector.references.contains(reference_id) && {
-                    let reference = scoping.get_reference(*reference_id);
-                    reference.is_read()
-                        && !reference.is_write()
-                        && !reference.flags().is_member_write_target()
-                }
-            })
-    });
-    out
 }
 
 #[derive(Default)]
@@ -980,19 +915,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                     return;
                 }
             }
-            if let Some(symbol) = symbol_of(self.scoping, &it.object) {
-                if let Some(values) = self.arrays.get(&symbol) {
-                    if let Some(index) = eval(&it.expression)
-                        .and_then(|v| v.number())
-                        .and_then(exact_usize)
-                    {
-                        if let Some(text) = values.get(index).and_then(Value::render) {
-                            self.push(it.span, text, "static_array_lookup");
-                            walk::walk_computed_member_expression(self, it);
-                            return;
-                        }
-                    }
-                }
+            if let Some(text) = static_array_lookup_text(it, self.scoping, self.arrays) {
+                self.push(it.span, text, "static_array_lookup");
+                walk::walk_computed_member_expression(self, it);
+                return;
             }
         }
         walk::walk_computed_member_expression(self, it);
@@ -1212,7 +1138,7 @@ fn transform_once(
     let semantic = semantic_ret.semantic;
     let scoping = semantic.scoping();
 
-    let arrays = top_level_arrays(&program, scoping);
+    let arrays = static_readonly_arrays(&program, scoping);
     let reference_spans = collect_reference_spans(&program);
     let decoder_analysis = analyze_decoders(source, &program, scoping, &reference_spans);
     let decoders = decoder_analysis.decoders;
@@ -1432,7 +1358,7 @@ pub fn deobfuscate_with_standard_numeric_builtins(
 mod tests {
     use super::{
         deobfuscate, deobfuscate_with_source_mode, deobfuscate_with_standard_numeric_builtins,
-        recover_static_decoders, ProvenConstantEnvironment, SafeSourceMode,
+        expose_static_strings, recover_static_decoders, ProvenConstantEnvironment, SafeSourceMode,
     };
     use oxc_allocator::Allocator;
     use oxc_ast::ast::{CallExpression, Expression};
@@ -1503,6 +1429,38 @@ mod tests {
                 Some("https://nested.example.test".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn static_string_exposure_reaches_fixed_point_without_accepting_escaping_arrays() {
+        let source = r#"
+            function recover() {
+                const table = ["al", "pha"];
+                return table[0] + table[1];
+            }
+        "#;
+        let result = expose_static_strings(source, 4);
+        assert!(result.is_some());
+        let result = result.unwrap_or_else(|| unreachable!());
+        assert!(result.source.contains("return \"alpha\";"));
+        assert_eq!(result.iterations, 2);
+        assert_eq!(
+            result.transforms.get("static_string_table_lookup"),
+            Some(&2)
+        );
+        assert_eq!(result.transforms.get("literal_string_concat"), Some(&1));
+
+        for source in [
+            r#"const table = ["a", "b"]; table[0] = "x"; sink(table[0] + table[1]);"#,
+            r#"const table = ["a", "b"]; const alias = table; sink(alias, table[0]);"#,
+            r#"const table = ["a", "b"]; sink(table[index]);"#,
+        ] {
+            let result = expose_static_strings(source, 4);
+            assert!(result.is_some());
+            let result = result.unwrap_or_else(|| unreachable!());
+            assert_eq!(result.source, source);
+            assert!(result.transforms.is_empty());
+        }
     }
 
     #[test]
