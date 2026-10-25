@@ -38,12 +38,14 @@ def entry(
     failure=None,
     response_headers=None,
     body_ref=None,
+    method: str = "GET",
+    status: int = 200,
 ):
     headers = [{"name": "content-type", "value": mime}]
     if response_headers:
         headers.extend(response_headers)
     response = {
-        "status": 200,
+        "status": status,
         "statusText": "OK",
         "httpVersion": "HTTP/2",
         "headers": headers,
@@ -68,7 +70,7 @@ def entry(
         "startedDateTime": "2026-10-08T00:00:00.000Z",
         "time": 1,
         "request": {
-            "method": "GET",
+            "method": method,
             "url": url,
             "httpVersion": "HTTP/2",
             "headers": [],
@@ -150,6 +152,21 @@ def main():
             "application/javascript",
             normal_js,
         ),
+        entry(
+            "https://fixture.invalid/probe.wasm",
+            "application/wasm",
+            b"",
+            resource_type="fetch",
+            method="HEAD",
+            failure={"errorText": "net::ERR_ABORTED"},
+        ),
+        entry(
+            "https://fixture.invalid/redirect.wasm",
+            "application/wasm",
+            b"",
+            resource_type="fetch",
+            status=302,
+        ),
     ]
     fixture = {
         "log": {
@@ -203,6 +220,19 @@ def main():
     assert incomplete_row["kind"] == "javascript"
     assert incomplete_row["body_complete"] is False
     assert incomplete_row["network_failure"]["errorText"] == "net::ERR_NETWORK_CHANGED"
+
+    normal_row = resources["https://fixture.invalid/assets/app.js"]
+    assert normal_row["body_expected"] is True
+    assert normal_row["body_complete"] is True
+
+    head_row = resources["https://fixture.invalid/probe.wasm"]
+    assert head_row["body_expected"] is False
+    assert head_row["body_complete"] is True
+    assert head_row["network_failure"]["errorText"] == "net::ERR_ABORTED"
+
+    redirect_row = resources["https://fixture.invalid/redirect.wasm"]
+    assert redirect_row["body_expected"] is False
+    assert redirect_row["body_complete"] is True
 
     error_row = resources["https://fixture.invalid/assets/proxy-error.js"]
     assert error_row["transport_kind"] == "javascript"

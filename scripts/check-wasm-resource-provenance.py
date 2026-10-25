@@ -21,6 +21,8 @@ JS_URL = "https://cdn.example.test/loader.js"
 INITIATOR_URL = "https://cdn.example.test/loader"
 WASM_URL = "https://cdn.example.test/module.wasm?v=1"
 BRIDGE_WASM_URL = "https://cdn.example.test/bridge.wasm"
+HEAD_WASM_URL = "https://cdn.example.test/probe.wasm"
+NO_CONTENT_WASM_URL = "https://cdn.example.test/no-content.wasm"
 JS = "export async function load() { return fetch('dynamic'); }\n"
 CONFLICT_JS = "globalThis.conflictingLoader = true;\n"
 WASM = b"\0asm\x01\0\0\0"
@@ -93,7 +95,24 @@ def main() -> None:
         "requestId": "req-bad",
         "body": {"sha256": "f" * 64, "size": len(WASM), "path": "bodies/mismatch"},
     }
-    (CAPTURE / "cdp-streams.json").write_text(json.dumps([good, bridge, bad]))
+    head = {
+        **good,
+        "requestId": "req-head",
+        "url": HEAD_WASM_URL,
+        "method": "HEAD",
+        "body": None,
+    }
+    no_content = {
+        **good,
+        "requestId": "req-no-content",
+        "url": NO_CONTENT_WASM_URL,
+        "method": "GET",
+        "status": 204,
+        "body": None,
+    }
+    (CAPTURE / "cdp-streams.json").write_text(
+        json.dumps([good, bridge, bad, head, no_content])
+    )
 
     manifest = {
         "schema": "capture-project/v1",
@@ -130,6 +149,30 @@ def main() -> None:
                 "output_path": f"resources/{bridge_wasm_sha}.wasm",
                 "sha256": bridge_wasm_sha,
                 "status": 200,
+            },
+            {
+                "id": 4,
+                "kind": "wasm",
+                "url": HEAD_WASM_URL,
+                "method": "HEAD",
+                "status": 200,
+                "body_expected": False,
+                "body_present": False,
+                "body_complete": False,
+                "body_bytes": 0,
+                "sha256": None,
+            },
+            {
+                "id": 5,
+                "kind": "wasm",
+                "url": NO_CONTENT_WASM_URL,
+                "method": "GET",
+                "status": 204,
+                "body_expected": False,
+                "body_present": False,
+                "body_complete": True,
+                "body_bytes": 0,
+                "sha256": None,
             },
         ],
         "inline_scripts": [],
@@ -168,6 +211,10 @@ def main() -> None:
     assert provenance["summary"]["direct_body_identities"] == 1, provenance
     assert provenance["summary"]["url_unique_body_identities"] == 1, provenance
     assert provenance["summary"]["unmatched_wasm_events"] == 1, provenance
+    assert provenance["summary"]["ignored_non_body_wasm_events"] == 2, provenance
+    ignored = {row["request_id"]: row for row in provenance["ignored_non_body"]}
+    assert ignored["req-head"]["reason"] == "method_HEAD", ignored
+    assert ignored["req-no-content"]["reason"] == "status_204", ignored
     by_request = {row["request_id"]: row for row in provenance["observations"]}
     observation = by_request["req-good"]
     assert observation["wasm_resource_ids"] == [2], observation
@@ -184,6 +231,10 @@ def main() -> None:
     graph = json.loads((PROJECT / "analysis" / "source-graph.json").read_text())
     observation_nodes = [n for n in graph["nodes"] if n["type"] == "runtime_wasm_request"]
     assert len(observation_nodes) == 2, observation_nodes
+    assert not any(
+        n.get("request_id") in {"req-head", "req-no-content"}
+        for n in observation_nodes
+    ), observation_nodes
     observation_ids = {node["request_id"]: node["id"] for node in observation_nodes}
     for request_id in ("req-good", "req-bridge"):
         assert any(

@@ -53,6 +53,7 @@ struct ResourceMeta {
     resource_type: Option<String>,
     declared_size: i64,
     encoding: Option<String>,
+    body_expected: bool,
     body_present: bool,
     body_complete: bool,
     body_bytes: usize,
@@ -192,6 +193,17 @@ fn materialize_inline_scripts(
     Ok(())
 }
 
+fn response_body_expected(method: &str, status: i64) -> bool {
+    if method.eq_ignore_ascii_case("HEAD") {
+        return false;
+    }
+    !((100..200).contains(&status) || (300..400).contains(&status) || matches!(status, 204 | 205))
+}
+
+fn response_body_complete(body_expected: bool, network_failed: bool) -> bool {
+    !body_expected || !network_failed
+}
+
 fn materialize_entry(
     id: usize,
     entry: &HarEntry,
@@ -209,8 +221,9 @@ fn materialize_entry(
         har_root,
     )
     .with_context(|| format!("entry {id}: {}", entry.request.url))?;
+    let body_expected = response_body_expected(&entry.request.method, entry.response.status);
     let body_present = body.is_some();
-    let body_complete = entry.failure.is_none();
+    let body_complete = response_body_complete(body_expected, entry.failure.is_some());
     let mut kind = transport_kind.clone();
     let mut output_path = None;
     let mut body_bytes = 0;
@@ -277,6 +290,7 @@ fn materialize_entry(
         resource_type: entry.resource_type.clone(),
         declared_size: entry.response.content.size,
         encoding: entry.response.content.encoding.clone(),
+        body_expected,
         body_present,
         body_complete,
         body_bytes,
@@ -372,4 +386,31 @@ pub(super) fn materialize_project(
         script_records: manifest.inline_scripts.len(),
         counts: manifest.counts,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{response_body_complete, response_body_expected};
+
+    #[test]
+    fn response_body_expectation_matches_capture_semantics() {
+        assert!(!response_body_expected("HEAD", 200));
+        assert!(!response_body_expected("head", 404));
+        assert!(!response_body_expected("GET", 101));
+        assert!(!response_body_expected("GET", 204));
+        assert!(!response_body_expected("GET", 205));
+        assert!(!response_body_expected("GET", 304));
+        assert!(response_body_expected("CONNECT", 200));
+        assert!(response_body_expected("CONNECT", 407));
+        assert!(response_body_expected("GET", 200));
+        assert!(!response_body_expected("POST", 302));
+    }
+
+    #[test]
+    fn response_body_completion_ignores_failures_when_no_body_is_expected() {
+        assert!(response_body_complete(false, true));
+        assert!(response_body_complete(false, false));
+        assert!(response_body_complete(true, false));
+        assert!(!response_body_complete(true, true));
+    }
 }
