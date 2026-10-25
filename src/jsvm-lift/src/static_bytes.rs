@@ -66,6 +66,20 @@ impl EvalState {
         Some(StaticValue::Buffer(id))
     }
 
+    fn allocate_initialized(&mut self, bytes: Vec<u8>, span: Span) -> Option<StaticValue> {
+        if bytes.len() > MAX_STATIC_BUFFER_BYTES {
+            return None;
+        }
+        let id = self.buffers.len();
+        self.buffers.push(StaticBuffer {
+            bytes,
+            valid: true,
+            writes: 0,
+            allocation_span: span,
+        });
+        Some(StaticValue::Buffer(id))
+    }
+
     fn invalidate_all_buffers(&mut self, reason: &'static str) {
         self.last_invalidation_reason = Some(reason);
         for buffer in &mut self.buffers {
@@ -541,27 +555,52 @@ struct Sink {
     kind: &'static str,
 }
 
-struct SinkCollector<'c, 'g> {
+struct SinkCollector<'c, 'g, 'e, 'h> {
     scoping: &'c Scoping,
     global_aliases: &'g HashMap<SymbolId, String>,
+    evaluator: &'e Evaluator<'c, 'h, 'g>,
     sinks: Vec<Sink>,
+    direct_artifacts: HashMap<(u32, u32), RecoveredByteArtifact>,
 }
 
-impl<'a> Visit<'a> for SinkCollector<'_, '_> {
+impl<'a> Visit<'a> for SinkCollector<'_, '_, '_, '_> {
     fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
-        if !call.optional
-            && namespace_member_name(
-                self.scoping,
-                self.global_aliases,
-                &call.callee,
-                "WebAssembly",
-            )
-            .is_some_and(|(member, _)| member == "instantiate")
-        {
-            self.sinks.push(Sink {
+        let webassembly_member = (!call.optional)
+            .then(|| {
+                namespace_member_name(
+                    self.scoping,
+                    self.global_aliases,
+                    &call.callee,
+                    "WebAssembly",
+                )
+            })
+            .flatten();
+        if let Some((member, _)) = webassembly_member {
+            let kind = match member {
+                "instantiate" => "WebAssembly.instantiate",
+                "compile" => "WebAssembly.compile",
+                "validate" => "WebAssembly.validate",
+                _ => {
+                    walk::walk_call_expression(self, call);
+                    return;
+                }
+            };
+            let sink = Sink {
                 span: call.span,
-                kind: "WebAssembly.instantiate",
-            });
+                kind,
+            };
+            if let Some(argument) = call.arguments.first().and_then(Argument::as_expression) {
+                let mut state = EvalState::default();
+                if let Some(artifact) =
+                    artifact_from_argument(argument, sink, self.evaluator, &mut state)
+                {
+                    self.direct_artifacts
+                        .insert((sink.span.start, sink.span.end), artifact);
+                }
+            }
+            self.sinks.push(sink);
+            walk::walk_call_expression(self, call);
+            return;
         }
         walk::walk_call_expression(self, call);
     }
@@ -575,10 +614,24 @@ impl<'a> Visit<'a> for SinkCollector<'_, '_> {
         )
         .is_some_and(|(member, _)| member == "Module")
         {
-            self.sinks.push(Sink {
+            let sink = Sink {
                 span: expression.span,
                 kind: "new WebAssembly.Module",
-            });
+            };
+            if let Some(argument) = expression
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+            {
+                let mut state = EvalState::default();
+                if let Some(artifact) =
+                    artifact_from_argument(argument, sink, self.evaluator, &mut state)
+                {
+                    self.direct_artifacts
+                        .insert((sink.span.start, sink.span.end), artifact);
+                }
+            }
+            self.sinks.push(sink);
         }
         walk::walk_new_expression(self, expression);
     }
@@ -736,6 +789,29 @@ fn collect_inline_wasm_literals(
     collector.artifacts
 }
 
+fn exact_byte(expression: &Expression<'_>) -> Option<u8> {
+    u8::try_from(exact_usize(expression)?).ok()
+}
+
+fn exact_byte_array(array: &oxc_ast::ast::ArrayExpression<'_>) -> Option<Vec<u8>> {
+    array
+        .elements
+        .iter()
+        .map(|element| match element {
+            oxc_ast::ast::ArrayExpressionElement::NumericLiteral(value)
+                if value.value.is_finite()
+                    && value.value >= 0.0
+                    && value.value.fract() == 0.0
+                    && value.value <= f64::from(u8::MAX) =>
+            {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                Some(value.value as u8)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 struct Evaluator<'c, 'h, 'g> {
     scoping: &'c Scoping,
     helpers: &'h HashMap<SymbolId, CopyHelper>,
@@ -762,6 +838,21 @@ impl Evaluator<'_, '_, '_> {
             Expression::CallExpression(call)
                 if !call.optional && !call.arguments.iter().any(Argument::is_spread) =>
             {
+                if namespace_member_name(
+                    self.scoping,
+                    self.global_aliases,
+                    &call.callee,
+                    "Uint8Array",
+                )
+                .is_some_and(|(member, _)| member == "of")
+                {
+                    let bytes = call
+                        .arguments
+                        .iter()
+                        .map(|argument| exact_byte(argument.as_expression()?))
+                        .collect::<Option<Vec<_>>>()?;
+                    return state.allocate_initialized(bytes, call.span);
+                }
                 let decoder = self.eval(&call.callee, state)?;
                 if decoder != StaticValue::Base64Decoder || call.arguments.len() != 1 {
                     return None;
@@ -786,8 +877,12 @@ impl Evaluator<'_, '_, '_> {
                 let [argument] = new_expression.arguments.as_slice() else {
                     return None;
                 };
-                let StaticValue::Number(byte_len) = self.eval(argument.as_expression()?, state)?
-                else {
+                let argument = argument.as_expression()?;
+                if let Expression::ArrayExpression(array) = unparenthesized(argument) {
+                    return state
+                        .allocate_initialized(exact_byte_array(array)?, new_expression.span);
+                }
+                let StaticValue::Number(byte_len) = self.eval(argument, state)? else {
                     return None;
                 };
                 state.allocate(byte_len, new_expression.span)
@@ -1026,16 +1121,12 @@ fn sink_argument<'a>(expression: &'a Expression<'a>, sink: Sink) -> Option<&'a E
     }
 }
 
-fn artifact_at_sink(
-    expression: &Expression<'_>,
+fn artifact_from_argument(
+    argument: &Expression<'_>,
     sink: Sink,
     evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
 ) -> Option<RecoveredByteArtifact> {
-    let Some(argument) = sink_argument(expression, sink) else {
-        state.sink_failure = Some("sink_argument_missing");
-        return None;
-    };
     let Some(value) = evaluator.eval(argument, state) else {
         state.sink_failure = Some("sink_argument_not_static");
         return None;
@@ -1067,6 +1158,19 @@ fn artifact_at_sink(
         copy_writes: buffer.writes,
         standard_builtins_required: true,
     })
+}
+
+fn artifact_at_sink(
+    expression: &Expression<'_>,
+    sink: Sink,
+    evaluator: &Evaluator<'_, '_, '_>,
+    state: &mut EvalState,
+) -> Option<RecoveredByteArtifact> {
+    let Some(argument) = sink_argument(expression, sink) else {
+        state.sink_failure = Some("sink_argument_missing");
+        return None;
+    };
+    artifact_from_argument(argument, sink, evaluator, state)
 }
 
 fn expression_to_sink(
@@ -1273,24 +1377,28 @@ pub fn recover_webassembly_byte_artifacts_from_program(
     let helpers = collect_helpers(program, scoping);
     let inline_wasm_literals = collect_inline_wasm_literals(program);
     let global_aliases = collect_global_aliases(program, scoping);
-    let mut sink_collector = SinkCollector {
-        scoping,
-        global_aliases: &global_aliases,
-        sinks: Vec::new(),
-    };
-    sink_collector.visit_program(program);
-
     let evaluator = Evaluator {
         scoping,
         helpers: &helpers,
         global_aliases: &global_aliases,
     };
+    let mut sink_collector = SinkCollector {
+        scoping,
+        global_aliases: &global_aliases,
+        evaluator: &evaluator,
+        sinks: Vec::new(),
+        direct_artifacts: HashMap::new(),
+    };
+    sink_collector.visit_program(program);
     let sink_count = sink_collector.sinks.len();
     let mut out = Vec::new();
     let mut sink_diagnostics = Vec::with_capacity(sink_count);
     for sink in sink_collector.sinks {
         let mut state = EvalState::default();
-        let artifact = statements_to_sink(&program.body, sink, &evaluator, &mut state);
+        let artifact = sink_collector
+            .direct_artifacts
+            .remove(&(sink.span.start, sink.span.end))
+            .or_else(|| statements_to_sink(&program.body, sink, &evaluator, &mut state));
         let recovered = artifact.is_some();
         if let Some(artifact) = artifact {
             out.push(artifact);
@@ -1617,6 +1725,77 @@ mod tests {
             };
         "#;
         assert_eq!(recover(object).len(), 1);
+    }
+
+    #[test]
+    fn compile_and_validate_are_exact_byte_observation_sinks() {
+        let source = r#"
+            WebAssembly.compile(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
+            WebAssembly.validate(Uint8Array.of(0, 97, 115, 109, 1, 0, 0, 0));
+        "#;
+        let artifacts = recover(source);
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].bytes, b"\0asm\x01\0\0\0");
+        assert_eq!(artifacts[1].bytes, b"\0asm\x01\0\0\0");
+        assert_eq!(artifacts[0].sink_kind, "WebAssembly.compile");
+        assert_eq!(artifacts[1].sink_kind, "WebAssembly.validate");
+    }
+
+    #[test]
+    fn invalid_validate_input_is_not_claimed_as_a_wasm_artifact() {
+        let source = r#"
+            WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 255, 255, 255, 255]));
+        "#;
+        assert!(recover(source).is_empty());
+    }
+
+    #[test]
+    fn self_contained_sink_does_not_require_enclosing_control_flow_replay() {
+        let source = r#"
+            try {
+                unknownSideEffect();
+                const module = new WebAssembly.Module(
+                    new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0])
+                );
+            } catch (error) {
+                report(error);
+            }
+        "#;
+        let artifacts = recover(source);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].bytes, b"\0asm\x01\0\0\0");
+    }
+
+    #[test]
+    fn recovers_wasm_from_numeric_uint8array_carriers() {
+        let constructor = r#"
+            const module = new WebAssembly.Module(
+                new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0])
+            );
+        "#;
+        let artifacts = recover(constructor);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].bytes, b"\0asm\x01\0\0\0");
+
+        let of = r#"
+            WebAssembly.instantiate(Uint8Array.of(0, 97, 115, 109, 1, 0, 0, 0), {});
+        "#;
+        let artifacts = recover(of);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].bytes, b"\0asm\x01\0\0\0");
+    }
+
+    #[test]
+    fn numeric_uint8array_carriers_fail_closed_on_non_bytes() {
+        let fractional = r#"
+            WebAssembly.instantiate(new Uint8Array([0, 97, 115, 109, 1.5, 0, 0, 0]), {});
+        "#;
+        assert!(recover(fractional).is_empty());
+
+        let out_of_range = r#"
+            WebAssembly.instantiate(Uint8Array.of(0, 97, 115, 109, 256, 0, 0, 0), {});
+        "#;
+        assert!(recover(out_of_range).is_empty());
     }
 
     #[test]
