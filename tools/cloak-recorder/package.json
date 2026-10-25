@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node check-scroll-retry.mjs && node check-network-completeness.mjs",
+    "test": "node check-nested-cdp-session.mjs && node check-scroll-retry.mjs && node check-network-completeness.mjs && node check-worker-cdp-recorder.mjs",
     "build": "node build-autoconsent.mjs",
     "record": "npm run build --silent && node recorder.mjs"
   },

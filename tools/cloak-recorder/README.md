@@ -47,13 +47,19 @@ export after the fact:
 - Playwright request/response events retain request metadata and immediately
   request response bodies. This is the cross-frame/OOPIF path.
 - CDP `Network.streamResourceContent` starts at `responseReceived` for the main
-  target and every out-of-process iframe target, streaming bytes as they arrive
-  and reducing dependence on Chromium's inspector response cache.
+  target, every out-of-process iframe target, and auto-attached worker-like target,
+  streaming bytes as they arrive and reducing dependence on Chromium's inspector
+  response cache. If streaming loses a race with a completed binary response, a
+  base64 `Network.getResponseBody` result is accepted as an exact-byte fallback;
+  decoded-text fallbacks are deliberately not promoted to exact bytes. Worker
+  targets enable Network before Runtime/Debugger so their first fetch retains its
+  exact initiator stack.
 - CDP `Debugger.scriptParsed` + `getScriptSource` retain runtime/eval/inline/blob
-  JavaScript from the main page and out-of-process iframe targets even when it
-  never exists as a network response. `scriptParsed` generation stack
-  traces and execution-context auxiliary data are retained so nested `eval`/Function
-  children can be linked back to the captured script that compiled them.
+  JavaScript from the main page, out-of-process iframe targets, and Chromium
+  worker-like targets even when it never exists as a network response.
+  `scriptParsed` generation stack traces and execution-context auxiliary data are
+  retained so nested `eval`/Function children can be linked back to the captured
+  script that compiled them.
 - WebSocket frames and SSE/EventSource messages are recorded separately.
 - Final per-frame DOM, MHTML, cookies/localStorage/sessionStorage/IndexedDB state,
   console/exception data and a screenshot are retained.
@@ -81,11 +87,19 @@ uv run python scripts/capture-to-project.py \
 Keep raw captures under `work/` or the private corpus; do not commit real captured
 site bodies to the public repository.
 
-## Known gap
+## Worker-target coverage
 
-The main-page and out-of-process-iframe debugger sessions capture runtime-created
-scripts for page/frame targets. Dedicated/shared/service-worker target-local `eval`
-source is not yet attached with its own debugger session. Their network-fetched
-scripts are still captured normally. If a corpus sample proves worker-local
-generated code matters, add worker-target sessions rather than pretending the
-current capture is complete.
+The recorder uses Chromium Target auto-attach for dedicated, shared, service and
+worklet-style worker targets. First-level worker targets are attached before page
+navigation and arrive paused; Network capture is enabled first, then
+Debugger/Runtime, then the worker resumes. This keeps their earliest fetches, CDP
+initiator stacks, and worker-local generated script source in the same
+session-scoped provenance model as page/OOPIF capture.
+
+Worker sessions also install recursive auto-attach for child workers. Chromium can
+report a recursively created child as already running while that policy is being
+installed; those sessions are still captured, but the manifest counts them as
+`workerCdpSessionsUnpausedAtAttach` and does not claim early-event completeness for
+them. Observed events remain exact evidence. Playwright response capture remains
+the cross-target byte fallback when Chromium does not expose a corresponding
+target/session.
