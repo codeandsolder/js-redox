@@ -69,6 +69,7 @@ jobs:
         run: |
           uv run --no-project python scripts/check-capture-project-contract.py
           uv run --no-project python scripts/check-analysis-artifact-contract.py
+          node tools/cloak-recorder/check-nested-cdp-session.mjs
       - name: Build analysis tools
         run: |
           cargo build --locked --workspace --bins

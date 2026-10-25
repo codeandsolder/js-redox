@@ -15,6 +15,11 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { evaluateDuringScroll, isTerminalTargetClosedError } from "./scroll-retry.mjs";
 import { classifyRelevantBodies } from "./network-completeness.mjs";
+import {
+  WORKER_TARGET_FILTER,
+  createNestedCdpRouter,
+  isWorkerTargetType,
+} from "./nested-cdp-session.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../..");
@@ -596,7 +601,10 @@ async function main() {
   const streamed = new Map();
   const frameCdpStates = new WeakMap();
   let nextFrameCdpSession = 1;
+  let nextWorkerCdpSession = 1;
   let oopifCdpSessionsAttached = 0;
+  let workerCdpSessionsAttached = 0;
+  let workerCdpSessionsUnpausedAtAttach = 0;
   let recorderClosing = false;
   let finalCaptureComplete = false;
   let targetClosedError = null;
@@ -835,23 +843,12 @@ async function main() {
     });
   }
 
-  async function configureCdpCapture(cdpSession, cdpSessionName, { enablePage = false } = {}) {
+  async function configureCdpCapture(
+    cdpSession,
+    cdpSessionName,
+    { enablePage = false, beforeRuntime = null } = {},
+  ) {
     const requests = new Map();
-    const enables = [
-      cdpSession.send("Runtime.enable"),
-      cdpSession.send("Debugger.enable"),
-      cdpSession.send("Log.enable"),
-      cdpSession.send("Network.enable", {
-        maxTotalBufferSize: 512 * 1024 * 1024,
-        maxResourceBufferSize: 128 * 1024 * 1024,
-        maxPostDataSize: 16 * 1024 * 1024,
-        enableDurableMessages: true,
-      }),
-    ];
-    if (enablePage) enables.push(cdpSession.send("Page.enable"));
-    await Promise.all(enables);
-    if (!opts.keepCache) await cdpSession.send("Network.setCacheDisabled", { cacheDisabled: true });
-
     const streamKey = (requestId) => `${cdpSessionName}:${requestId}`;
 
     cdpSession.on("Network.requestWillBeSent", (event) => {
@@ -889,6 +886,8 @@ async function main() {
         streamEnabled: false,
         streamStart: null,
         body: null,
+        bodyCapture: null,
+        streamError: null,
         error: null,
       };
       streamed.set(streamKey(event.requestId), record);
@@ -909,7 +908,7 @@ async function main() {
           if (result.bufferedData) record.chunks.push(Buffer.from(result.bufferedData, "base64"));
           record.streamEnabled = true;
         } catch (error) {
-          record.error = `streamResourceContent:${String(error)}`;
+          record.streamError = `streamResourceContent:${String(error)}`;
         }
       })();
       queueJob(record.streamStart, `stream-start ${cdpSessionName} ${record.url}`);
@@ -925,9 +924,34 @@ async function main() {
       const record = streamed.get(streamKey(event.requestId));
       if (!record) return;
       queueJob((async () => {
-        if (record.streamStart) await record.streamStart;
-        if (!record.streamEnabled) return;
-        const body = Buffer.concat(record.chunks);
+        if (!record.streamStart) return;
+        await record.streamStart;
+
+        let body;
+        if (record.streamEnabled) {
+          body = Buffer.concat(record.chunks);
+          record.bodyCapture = "streamResourceContent";
+        } else {
+          try {
+            const result = await withTimeout(
+              cdpSession.send("Network.getResponseBody", { requestId: event.requestId }),
+              Math.min(opts.timeoutMs, 15_000),
+              "getResponseBody",
+            );
+            if (!result.base64Encoded) {
+              throw new Error("getResponseBody returned decoded text; exact response bytes not claimed");
+            }
+            body = Buffer.from(result.body || "", "base64");
+            record.bodyCapture = "getResponseBody-fallback";
+          } catch (error) {
+            record.error = [
+              record.streamError,
+              `getResponseBody:${String(error)}`,
+            ].filter(Boolean).join("; ");
+            return;
+          }
+        }
+
         if (body.length > opts.maxBodyMiB * 1024 * 1024) {
           record.error = `body-over-limit:${body.length}`;
           record.chunks = [];
@@ -1025,10 +1049,115 @@ async function main() {
         }
       })(), `script-source ${cdpSessionName} ${url || script.scriptId}`);
     });
+
+    // Register every event handler before enabling domains. A worker paused by
+    // Target auto-attach can begin progressing while Debugger/Runtime are enabled,
+    // so late listener registration would lose its first fetch/scriptParsed events.
+    await cdpSession.send("Network.enable", {
+      maxTotalBufferSize: 512 * 1024 * 1024,
+      maxResourceBufferSize: 128 * 1024 * 1024,
+      maxPostDataSize: 16 * 1024 * 1024,
+      enableDurableMessages: true,
+    });
+    if (!opts.keepCache) await cdpSession.send("Network.setCacheDisabled", { cacheDisabled: true });
+    if (beforeRuntime) await beforeRuntime();
+    const enables = [
+      cdpSession.send("Debugger.enable"),
+      cdpSession.send("Runtime.enable"),
+      cdpSession.send("Log.enable"),
+    ];
+    if (enablePage) enables.push(cdpSession.send("Page.enable"));
+    await Promise.all(enables);
   }
 
   const cdp = await context.newCDPSession(page);
+  const nestedCdp = createNestedCdpRouter(cdp);
+  const workerCdpSessions = new Set();
+
+  async function maybeAttachWorkerCdp(attached) {
+    const { sessionId, targetInfo, waitingForDebugger } = attached;
+    if (!sessionId || !isWorkerTargetType(targetInfo?.type)) return;
+    if (workerCdpSessions.has(sessionId)) return;
+
+    const name = `${String(targetInfo.type).replaceAll("_", "-")}-${nextWorkerCdpSession++}`;
+    const session = nestedCdp.session(sessionId);
+    workerCdpSessions.add(sessionId);
+
+    session.on("Target.attachedToTarget", (child) => {
+      queueJob(
+        maybeAttachWorkerCdp(child),
+        `worker-cdp-child ${name} ${child.targetInfo?.url || child.targetInfo?.targetId || "unknown"}`,
+      );
+    });
+    session.on("close", () => {
+      workerCdpSessions.delete(sessionId);
+      events.push({
+        at: Date.now(),
+        type: "worker-cdp-closed",
+        cdpSession: name,
+        targetType: targetInfo.type,
+        targetId: targetInfo.targetId,
+        url: targetInfo.url || "",
+      });
+    });
+
+    try {
+      await configureCdpCapture(session, name, {
+        // Network and all listeners are active before recursive auto-attach.
+        // Target.setAutoAttach itself may let a paused worker progress.
+        beforeRuntime: () => session.send("Target.setAutoAttach", {
+          autoAttach: true,
+          waitForDebuggerOnStart: true,
+          flatten: false,
+          filter: WORKER_TARGET_FILTER,
+        }),
+      });
+      workerCdpSessionsAttached += 1;
+      if (!waitingForDebugger) workerCdpSessionsUnpausedAtAttach += 1;
+      events.push({
+        at: Date.now(),
+        type: "worker-cdp-attached",
+        cdpSession: name,
+        targetType: targetInfo.type,
+        targetId: targetInfo.targetId,
+        url: targetInfo.url || "",
+        waitingForDebugger: Boolean(waitingForDebugger),
+      });
+    } catch (error) {
+      failures.push({
+        at: Date.now(),
+        label: `worker-cdp-configure ${targetInfo.type} ${targetInfo.url || targetInfo.targetId || sessionId}`,
+        error: String(error?.stack || error),
+      });
+    } finally {
+      try {
+        await session.send("Runtime.runIfWaitingForDebugger");
+      } catch (error) {
+        if (workerCdpSessions.has(sessionId)) {
+          failures.push({
+            at: Date.now(),
+            label: `worker-cdp-resume ${targetInfo.type} ${targetInfo.url || targetInfo.targetId || sessionId}`,
+            error: String(error?.stack || error),
+          });
+        }
+      }
+    }
+  }
+
+  cdp.on("Target.attachedToTarget", (attached) => {
+    queueJob(
+      maybeAttachWorkerCdp(attached),
+      `worker-cdp-root ${attached.targetInfo?.url || attached.targetInfo?.targetId || "unknown"}`,
+    );
+  });
+
   await configureCdpCapture(cdp, "main", { enablePage: true });
+  await cdp.send("Target.setAutoAttach", {
+    autoAttach: true,
+    waitForDebuggerOnStart: true,
+    flatten: false,
+    filter: WORKER_TARGET_FILTER,
+  });
 
   async function maybeAttachFrameCdp(frame) {
     if (frame === page.mainFrame() || frame.isDetached()) return;
@@ -1309,6 +1438,8 @@ async function main() {
     documentURL: row.documentURL,
     frameId: row.frameId,
     body: row.body,
+    bodyCapture: row.bodyCapture,
+    streamError: row.streamError,
     error: row.error,
   }));
 
@@ -1333,6 +1464,8 @@ async function main() {
     abortedRelevantResponses: abortedRelevantResponses.length,
     inflightRelevantResponses: inflightRelevantResponses.length,
     oopifCdpSessionsAttached,
+    workerCdpSessionsAttached,
+    workerCdpSessionsUnpausedAtAttach,
     cdpStreams: streamRows.length,
     capturedCdpStreams: streamRows.filter((r) => r.body).length,
     runtimeScriptsSeen: runtimeScripts.size,
@@ -1404,7 +1537,7 @@ async function main() {
         mimeType: r.mimeType,
         bodyCapture: r.bodyCapture,
       })),
-      note: "Relevant responses that fail/abort after headers or remain in flight when the capture window ends are reported separately because no completed response body is expected to exist. Playwright response.body is the cross-frame body channel; CDP streamResourceContent independently streams the main target and attached out-of-process iframe targets. Runtime Debugger capture preserves eval/inline/blob-created script source when Chromium exposes it.",
+      note: "Relevant responses that fail/abort after headers or remain in flight when the capture window ends are reported separately because no completed response body is expected to exist. Playwright response.body is the cross-frame body channel; CDP streamResourceContent independently streams the main target, attached out-of-process iframe targets, and auto-attached worker-like targets. Runtime Debugger capture preserves eval/inline/blob-created script source when Chromium exposes it.",
     },
     artifacts: {
       har: "capture.har",
@@ -1427,7 +1560,10 @@ async function main() {
       ...(targetClosedError ? [
         `Top page/context/browser target closed during ${targetClosedError.phase}; final page-only artifacts may be unavailable. Network/CDP/runtime channels captured before closure are preserved.`,
       ] : []),
-      "Runtime Debugger/Network capture covers the main page plus out-of-process iframe targets; dedicated/shared worker-created eval source may require worker-target sessions in a future revision.",
+      "Runtime Debugger/Network capture covers the main page, out-of-process iframe targets, and auto-attached dedicated/shared/service/worklet-style worker targets. Target types not exposed through Chromium Target auto-attach remain outside this guarantee.",
+      ...(workerCdpSessionsUnpausedAtAttach ? [
+        `${workerCdpSessionsUnpausedAtAttach} worker target(s) were already running when recursively attached; observed evidence is exact, but early CDP-event completeness is not claimed for those targets.`,
+      ] : []),
       "Bodies larger than maxBodyMiB are intentionally reported but not persisted unless the limit is increased.",
       "Image/media/font bodies are intentionally omitted unless --all-bodies is used.",
     ],
@@ -1443,6 +1579,7 @@ async function main() {
     `requests: ${summary.requests}`,
     `captured response bodies: ${summary.capturedResponseBodies}`,
     `runtime scripts captured: ${summary.runtimeScriptsCaptured}`,
+    `worker CDP sessions attached: ${summary.workerCdpSessionsAttached} (${summary.workerCdpSessionsUnpausedAtAttach} already running)`,
     "",
     "Feed capture.har to the existing js-redox capture pipeline:",
     `uv run python scripts/capture-to-project.py ${path.relative(ROOT, path.join(out, "capture.har"))} work/capture-project`,
