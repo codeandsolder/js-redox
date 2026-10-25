@@ -1,4 +1,7 @@
-use crate::sha256_hex;
+use crate::{
+    global_builtin::{collect_global_aliases, global_constructor, namespace_member_name},
+    sha256_hex,
+};
 use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
     Engine as _,
@@ -538,36 +541,23 @@ struct Sink {
     kind: &'static str,
 }
 
-fn webassembly_member(scoping: &Scoping, expression: &Expression<'_>, property: &str) -> bool {
-    let Some(object) = static_member(expression, property) else {
-        return false;
-    };
-    if unresolved_global(scoping, object, "WebAssembly") {
-        return true;
-    }
-    let Expression::StaticMemberExpression(namespace) = unparenthesized(object) else {
-        return false;
-    };
-    !namespace.optional
-        && namespace.property.name.as_str() == "WebAssembly"
-        && matches!(
-            unparenthesized(&namespace.object),
-            Expression::Identifier(global)
-                if matches!(global.name.as_str(), "window" | "globalThis" | "self")
-                    && global.reference_id.get().is_some_and(|reference_id| {
-                        scoping.get_reference(reference_id).symbol_id().is_none()
-                    })
-        )
-}
-
-struct SinkCollector<'c> {
+struct SinkCollector<'c, 'g> {
     scoping: &'c Scoping,
+    global_aliases: &'g HashMap<SymbolId, String>,
     sinks: Vec<Sink>,
 }
 
-impl<'a> Visit<'a> for SinkCollector<'_> {
+impl<'a> Visit<'a> for SinkCollector<'_, '_> {
     fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
-        if !call.optional && webassembly_member(self.scoping, &call.callee, "instantiate") {
+        if !call.optional
+            && namespace_member_name(
+                self.scoping,
+                self.global_aliases,
+                &call.callee,
+                "WebAssembly",
+            )
+            .is_some_and(|(member, _)| member == "instantiate")
+        {
             self.sinks.push(Sink {
                 span: call.span,
                 kind: "WebAssembly.instantiate",
@@ -577,7 +567,14 @@ impl<'a> Visit<'a> for SinkCollector<'_> {
     }
 
     fn visit_new_expression(&mut self, expression: &oxc_ast::ast::NewExpression<'a>) {
-        if webassembly_member(self.scoping, &expression.callee, "Module") {
+        if namespace_member_name(
+            self.scoping,
+            self.global_aliases,
+            &expression.callee,
+            "WebAssembly",
+        )
+        .is_some_and(|(member, _)| member == "Module")
+        {
             self.sinks.push(Sink {
                 span: expression.span,
                 kind: "new WebAssembly.Module",
@@ -739,12 +736,13 @@ fn collect_inline_wasm_literals(
     collector.artifacts
 }
 
-struct Evaluator<'c, 'h> {
+struct Evaluator<'c, 'h, 'g> {
     scoping: &'c Scoping,
     helpers: &'h HashMap<SymbolId, CopyHelper>,
+    global_aliases: &'g HashMap<SymbolId, String>,
 }
 
-impl Evaluator<'_, '_> {
+impl Evaluator<'_, '_, '_> {
     fn eval(&self, expression: &Expression<'_>, state: &mut EvalState) -> Option<StaticValue> {
         match unparenthesized(expression) {
             Expression::NumericLiteral(_) => exact_usize(expression).map(StaticValue::Number),
@@ -777,7 +775,13 @@ impl Evaluator<'_, '_> {
             }
             Expression::NewExpression(new_expression)
                 if !new_expression.arguments.iter().any(Argument::is_spread)
-                    && unresolved_global(self.scoping, &new_expression.callee, "Uint8Array") =>
+                    && global_constructor(
+                        self.scoping,
+                        self.global_aliases,
+                        &new_expression.callee,
+                        "Uint8Array",
+                    )
+                    .is_some() =>
             {
                 let [argument] = new_expression.arguments.as_slice() else {
                     return None;
@@ -916,7 +920,7 @@ fn expression_buffer_ids(
 
 fn normal_expression(
     expression: &Expression<'_>,
-    evaluator: &Evaluator<'_, '_>,
+    evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
 ) {
     match unparenthesized(expression) {
@@ -969,7 +973,7 @@ fn normal_expression(
 
 fn normal_statement(
     statement: &Statement<'_>,
-    evaluator: &Evaluator<'_, '_>,
+    evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
 ) {
     match statement {
@@ -1025,7 +1029,7 @@ fn sink_argument<'a>(expression: &'a Expression<'a>, sink: Sink) -> Option<&'a E
 fn artifact_at_sink(
     expression: &Expression<'_>,
     sink: Sink,
-    evaluator: &Evaluator<'_, '_>,
+    evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
 ) -> Option<RecoveredByteArtifact> {
     let Some(argument) = sink_argument(expression, sink) else {
@@ -1068,7 +1072,7 @@ fn artifact_at_sink(
 fn expression_to_sink(
     expression: &Expression<'_>,
     sink: Sink,
-    evaluator: &Evaluator<'_, '_>,
+    evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
 ) -> Option<RecoveredByteArtifact> {
     if expression.span() == sink.span {
@@ -1177,7 +1181,7 @@ fn expression_to_sink(
 fn statement_to_sink(
     statement: &Statement<'_>,
     sink: Sink,
-    evaluator: &Evaluator<'_, '_>,
+    evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
 ) -> Option<RecoveredByteArtifact> {
     match statement {
@@ -1247,7 +1251,7 @@ fn statement_to_sink(
 fn statements_to_sink(
     statements: &[Statement<'_>],
     sink: Sink,
-    evaluator: &Evaluator<'_, '_>,
+    evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
 ) -> Option<RecoveredByteArtifact> {
     for statement in statements {
@@ -1268,8 +1272,10 @@ pub fn recover_webassembly_byte_artifacts_from_program(
 ) -> StaticByteRecoverySummary {
     let helpers = collect_helpers(program, scoping);
     let inline_wasm_literals = collect_inline_wasm_literals(program);
+    let global_aliases = collect_global_aliases(program, scoping);
     let mut sink_collector = SinkCollector {
         scoping,
+        global_aliases: &global_aliases,
         sinks: Vec::new(),
     };
     sink_collector.visit_program(program);
@@ -1277,6 +1283,7 @@ pub fn recover_webassembly_byte_artifacts_from_program(
     let evaluator = Evaluator {
         scoping,
         helpers: &helpers,
+        global_aliases: &global_aliases,
     };
     let sink_count = sink_collector.sinks.len();
     let mut out = Vec::new();
@@ -1610,6 +1617,60 @@ mod tests {
             };
         "#;
         assert_eq!(recover(object).len(), 1);
+    }
+
+    #[test]
+    fn allocates_typed_arrays_through_stable_global_aliases() {
+        let source = r#"
+            function load(imports) {
+                var host = window, host2 = host;
+                var bytes = new host2["Uint8Array"](8), decode = atob;
+                var copy = function(offset, chunk) {
+                    for (var i = 0; i < chunk.length; i++)
+                        bytes[offset + i] = chunk.charCodeAt(i);
+                };
+                copy(0, decode("AGFzbQEAAAA="));
+                return host2["WebAssembly"]["instantiate"](bytes, imports);
+            }
+        "#;
+        let artifacts = recover(source);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].bytes, b"\0asm\x01\0\0\0");
+
+        let reassigned = r#"
+            function load(imports) {
+                var host = window;
+                host = fakeGlobal;
+                var bytes = new host.Uint8Array(8), decode = atob;
+                var copy = function(offset, chunk) {
+                    for (var i = 0; i < chunk.length; i++)
+                        bytes[offset + i] = chunk.charCodeAt(i);
+                };
+                copy(0, decode("AGFzbQEAAAA="));
+                return WebAssembly.instantiate(bytes, imports);
+            }
+        "#;
+        assert!(recover(reassigned).is_empty());
+    }
+
+    #[test]
+    fn recognizes_webassembly_sinks_through_stable_global_aliases() {
+        let source = r#"
+            var host = window;
+            var host2 = host;
+            function load(imports) {
+                var bytes = new Uint8Array(8), decode = atob;
+                var copy = function(offset, chunk) {
+                    for (var i = 0; i < chunk.length; i++)
+                        bytes[offset + i] = chunk.charCodeAt(i);
+                };
+                copy(0, decode("AGFzbQEAAAA="));
+                return host2["WebAssembly"]["instantiate"](bytes, imports);
+            }
+        "#;
+        let artifacts = recover(source);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].bytes, b"\0asm\x01\0\0\0");
     }
 
     #[test]

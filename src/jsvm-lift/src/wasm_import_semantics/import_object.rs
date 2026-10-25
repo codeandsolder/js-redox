@@ -1,8 +1,5 @@
-use super::{
-    assignment_property,
-    module_identity::{webassembly_member_name, ExactModuleSite},
-    symbol_of, unparenthesized,
-};
+use super::{assignment_property, module_identity::ExactModuleSite, symbol_of, unparenthesized};
+use crate::global_builtin::namespace_member_name;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, BlockStatement, CallExpression, Expression,
     Function, Program, Statement, SwitchCase,
@@ -143,9 +140,12 @@ struct InstantiationSiteCollector<'c, 'g, 'm> {
 impl<'a> Visit<'a> for InstantiationSiteCollector<'_, '_, '_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
-            if let Some((member, global_object)) =
-                webassembly_member_name(self.scoping, self.global_aliases, &call.callee)
-            {
+            if let Some((member, global_object)) = namespace_member_name(
+                self.scoping,
+                self.global_aliases,
+                &call.callee,
+                "WebAssembly",
+            ) {
                 if matches!(member, "instantiate" | "instantiateStreaming") {
                     if let Some(symbol) = second_argument_symbol(self.scoping, &call.arguments) {
                         self.sites.entry(symbol).or_default().push(site_record(
@@ -168,9 +168,12 @@ impl<'a> Visit<'a> for InstantiationSiteCollector<'_, '_, '_> {
     }
 
     fn visit_new_expression(&mut self, expression: &oxc_ast::ast::NewExpression<'a>) {
-        if let Some((member, global_object)) =
-            webassembly_member_name(self.scoping, self.global_aliases, &expression.callee)
-        {
+        if let Some((member, global_object)) = namespace_member_name(
+            self.scoping,
+            self.global_aliases,
+            &expression.callee,
+            "WebAssembly",
+        ) {
             if member == "Instance" {
                 if let Some(symbol) = second_argument_symbol(self.scoping, &expression.arguments) {
                     self.sites.entry(symbol).or_default().push(site_record(
