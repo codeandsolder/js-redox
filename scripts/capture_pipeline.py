@@ -27,6 +27,7 @@ from analysis_artifacts import (
     SOURCEMAPS,
     WASM_JS_BOUNDARY,
     WASM_INDEX,
+    WASM_RESOURCE_PROVENANCE,
     artifact_path,
     load_artifact,
 )
@@ -75,6 +76,9 @@ class ProjectSummary:
     javascript_units: int
     wasm_modules: int
     wasm_origins: int
+    wasm_runtime_provenance_available: bool
+    wasm_runtime_observations: int
+    wasm_runtime_initiators: int
     wasm_host_effect_pairs: int
     wasm_copied_input_candidates: int
     wasm_proven_typed_array_copy_semantics: int
@@ -238,6 +242,14 @@ def run_capture_pipeline(
                 tools.wasm_redox,
             ]
         )
+        if kind == "recorder":
+            run_checked(
+                [
+                    sys.executable,
+                    ROOT / "scripts/correlate-wasm-resource-provenance.py",
+                    output,
+                ]
+            )
 
     run_checked(
         [
@@ -372,6 +384,11 @@ def load_project_summary(
         if wasm_analysis and safe_deobfuscation
         else {"summary": {}}
     )
+    wasm_resource_provenance = (
+        load_artifact(output, WASM_RESOURCE_PROVENANCE, optional=True) or {"summary": {}}
+        if wasm_analysis
+        else {"summary": {}}
+    )
     deob = load_artifact(output, DEOBFUSCATION) if safe_deobfuscation else None
     bundles = (
         load_artifact(output, BUNDLES)
@@ -415,6 +432,11 @@ def load_project_summary(
         javascript_units=sum(unit.get("kind") == "javascript" for unit in source_index["units"]),
         wasm_modules=wasm.get("summary", {}).get("modules", 0),
         wasm_origins=wasm.get("summary", {}).get("origins", 0),
+        wasm_runtime_provenance_available=bool(
+            wasm_resource_provenance.get("summary", {}).get("applicable", False)
+        ),
+        wasm_runtime_observations=wasm_resource_provenance.get("summary", {}).get("observations", 0),
+        wasm_runtime_initiators=wasm_resource_provenance.get("summary", {}).get("runtime_script_identities", 0),
         wasm_host_effect_pairs=wasm_js_boundary.get("summary", {}).get("host_effect_pairs", 0),
         wasm_copied_input_candidates=wasm_js_boundary.get("summary", {}).get(
             "copied_input_candidates", 0
@@ -466,7 +488,13 @@ def print_project_summary(summary: ProjectSummary) -> None:
         f"  captured resources: {summary.captured_resources}\n"
         f"  JavaScript units:   {summary.javascript_units}\n"
         f"  WebAssembly modules: {summary.wasm_modules} ({summary.wasm_origins} origin(s))\n"
-        f"  WASM host-effect DataView.setUint32 shapes: {summary.wasm_proven_host_set_u32_shapes}/{summary.wasm_host_effect_pairs} proven\n"
+        + (
+            f"  runtime-observed WASM responses: {summary.wasm_runtime_observations} "
+            f"({summary.wasm_runtime_initiators} exact runtime initiator(s))\n"
+            if summary.wasm_runtime_provenance_available
+            else ""
+        )
+        + f"  WASM host-effect DataView.setUint32 shapes: {summary.wasm_proven_host_set_u32_shapes}/{summary.wasm_host_effect_pairs} proven\n"
         f"  WASM copied-input Uint32Array semantics: {summary.wasm_proven_typed_array_copy_semantics}/{summary.wasm_copied_input_candidates} proven\n"
         f"  JS/module/worker references: {summary.references}\n"
         f"  import-map resolutions: {summary.import_map_resolutions} "

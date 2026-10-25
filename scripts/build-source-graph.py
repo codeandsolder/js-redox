@@ -18,6 +18,7 @@ from analysis_artifacts import (
     SOURCE_INDEX,
     SOURCEMAPS,
     WASM_INDEX,
+    WASM_RESOURCE_PROVENANCE,
     load_artifact,
     write_artifact,
 )
@@ -48,6 +49,9 @@ def main():
     api_surface = load_artifact(project, API_SURFACE, optional=True) or {'callsites': []}
     bundles = load_artifact(project, BUNDLES, optional=True) or {'bundles': [], 'modules': []}
     wasm = load_artifact(project, WASM_INDEX, optional=True) or {'modules': []}
+    wasm_resource_provenance = load_artifact(
+        project, WASM_RESOURCE_PROVENANCE, optional=True
+    ) or {'observations': [], 'unmatched': [], 'summary': {}}
     runtime = load_artifact(project, RUNTIME_SCRIPTS, optional=True) or {
         'sources': [], 'alpine_families': [], 'gtm_families': []
     }
@@ -178,6 +182,8 @@ def main():
         for row in runtime.get('gtm_families', [])
         if row.get('shape')
     }
+    runtime_node_by_instance = {}
+    runtime_instance_conflicts = set()
     for source in runtime.get('sources', []):
         digest = source.get('sha256')
         if not digest:
@@ -206,6 +212,19 @@ def main():
             generation_max_depth=generated.get('max_depth'),
             application_source=classification != 'capture_instrumentation',
         )
+        for instance in source.get('script_instances', []):
+            script_id = instance.get('script_id')
+            if script_id is None:
+                continue
+            key = (instance.get('cdp_session') or 'main', str(script_id))
+            if key in runtime_instance_conflicts:
+                continue
+            previous = runtime_node_by_instance.get(key)
+            if previous is not None and previous != runtime_node:
+                runtime_instance_conflicts.add(key)
+                runtime_node_by_instance.pop(key, None)
+                continue
+            runtime_node_by_instance[key] = runtime_node
 
         for origin in generated.get('origins', []):
             chain = origin.get('chain') or []
@@ -346,6 +365,87 @@ def main():
                     source_count=gtm_family_counts.get(shape),
                 )
                 add_edge(runtime_node, family_node, 'runtime_expression_family')
+
+    # Runtime-observed WASM requests are capture evidence, not universal static
+    # control-flow claims. Preserve the observation as its own node so an exact
+    # response can remain linked even when the initiating script or resource is
+    # ambiguous.
+    for observation in wasm_resource_provenance.get('observations', []):
+        key = json.dumps(
+            [
+                observation.get('cdp_session') or 'main',
+                observation.get('request_id'),
+                observation.get('url'),
+                observation.get('sha256'),
+            ],
+            separators=(',', ':'),
+        )
+        observation_id = f"runtime-wasm-request:{hashlib.sha256(key.encode()).hexdigest()[:20]}"
+        primary = observation.get('primary_initiator') or {}
+        add_node(
+            observation_id,
+            type='runtime_wasm_request',
+            cdp_session=observation.get('cdp_session'),
+            request_id=observation.get('request_id'),
+            url=observation.get('url'),
+            sha256=observation.get('sha256'),
+            bytes=observation.get('byte_len'),
+            initiator_type=observation.get('initiator_type'),
+            initiator_function=primary.get('function_name'),
+            initiator_script_id=primary.get('script_id'),
+            initiator_url=primary.get('url'),
+            line_number=primary.get('line_number'),
+            column_number=primary.get('column_number'),
+            runtime_observed=True,
+            exact_response_identity=bool(observation.get('exact_response_identity')),
+            response_identity_basis=observation.get('response_identity_basis'),
+            matching_resource_count=len(observation.get('wasm_resource_ids', [])),
+        )
+
+        source_nodes = []
+        script_id = primary.get('script_id')
+        if script_id is not None:
+            runtime_node = runtime_node_by_instance.get(
+                (observation.get('cdp_session') or 'main', str(script_id))
+            )
+            if runtime_node:
+                source_nodes.append(runtime_node)
+        if not source_nodes:
+            source_nodes.extend(
+                f"resource:{int(rid)}" for rid in observation.get('initiator_resource_ids', [])
+            )
+        if not source_nodes and primary.get('url'):
+            source_nodes.extend(targets_for(primary['url']))
+        for source_node in dict.fromkeys(source_nodes):
+            add_edge(
+                source_node,
+                observation_id,
+                'runtime_wasm_request_initiator',
+                evidence=observation.get('evidence'),
+                function_name=primary.get('function_name'),
+                script_id=primary.get('script_id'),
+                line_number=primary.get('line_number'),
+                column_number=primary.get('column_number'),
+                runtime_observed=True,
+            )
+
+        resource_ids = observation.get('wasm_resource_ids', [])
+        exact_resource_occurrence = len(resource_ids) == 1
+        for resource_id in resource_ids:
+            add_edge(
+                observation_id,
+                f"resource:{int(resource_id)}",
+                (
+                    'runtime_observed_wasm_response'
+                    if exact_resource_occurrence
+                    else 'runtime_observed_wasm_response_candidate'
+                ),
+                sha256=observation.get('sha256'),
+                url=observation.get('url'),
+                exact_response_identity=True,
+                exact_resource_occurrence=exact_resource_occurrence,
+                response_identity_basis=observation.get('response_identity_basis'),
+            )
 
     # Safe static deobfuscation is a provenance-preserving source transform.
     deob_nodes = {}

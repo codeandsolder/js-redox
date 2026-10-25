@@ -86,6 +86,13 @@ WASM_JS_BOUNDARY = ArtifactSpec(
     array_fields=("host_effect_rows", "copied_input_rows", "skipped_modules"),
     object_fields=("summary",),
 )
+WASM_RESOURCE_PROVENANCE = ArtifactSpec(
+    "WASM runtime resource provenance",
+    Path("analysis/wasm-resource-provenance.json"),
+    "wasm-runtime-resource-provenance/v1",
+    array_fields=("observations", "unmatched"),
+    object_fields=("summary",),
+)
 GENERATED_RECOVERY = ArtifactSpec(
     "generated-code recovery",
     Path("analysis/generated-recovery.json"),
@@ -131,6 +138,7 @@ ALL_ARTIFACTS = (
     BUNDLES,
     WASM_INDEX,
     WASM_JS_BOUNDARY,
+    WASM_RESOURCE_PROVENANCE,
     GENERATED_RECOVERY,
     JSVM_INDEX,
     SOURCE_GRAPH,
