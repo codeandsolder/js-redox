@@ -13,6 +13,7 @@ from analysis_artifacts import (
     JSVM_INDEX,
     RUNTIME_SCRIPTS,
     SOURCE_GRAPH,
+    WASM_RESOURCE_PROVENANCE,
     SOURCE_INDEX,
     SOURCEMAPS,
     load_artifact,
@@ -51,6 +52,9 @@ def main():
     runtime_scripts = load_artifact(project, RUNTIME_SCRIPTS, optional=True) or {
         "sources": [], "alpine_families": [], "gtm_families": [], "summary": {}
     }
+    wasm_resource_provenance = load_artifact(
+        project, WASM_RESOURCE_PROVENANCE, optional=True
+    )
 
     resources = manifest.get("resources", [])
     source_units = source_index.get("units", [])
@@ -115,6 +119,11 @@ def main():
     generated_recovery_summary = generated_recovery.get("summary", {})
     runtime_summary = runtime_scripts.get("summary", {})
     runtime_classes = runtime_summary.get("classifications", {})
+    wasm_runtime_summary = (
+        wasm_resource_provenance.get("summary", {})
+        if wasm_resource_provenance is not None
+        else {}
+    )
     api_summary = api_surface.get("summary", {})
 
     lines = [
@@ -141,6 +150,7 @@ def main():
         "- [analysis/source-graph.json](analysis/source-graph.json) — machine-readable relationship/provenance graph.",
         *(["- [analysis/api-surface.json](analysis/api-surface.json) — proof-gated static browser API callsites with exact URL/method evidence and per-source failures."] if api_surface_doc is not None else []),
         *(["- [analysis/runtime-scripts.json](analysis/runtime-scripts.json) — Debugger runtime-script provenance, generated-expression recovery, and capture-instrumentation classification."] if runtime_summary else []),
+        *(["- [analysis/wasm-resource-provenance.json](analysis/wasm-resource-provenance.json) — runtime-observed exact WASM responses linked to their CDP script initiators."] if wasm_resource_provenance is not None else []),
         "",
         "## Capture summary",
         "",
@@ -152,6 +162,12 @@ def main():
             f"- Alpine runtime reduction: **{runtime_classes.get('alpine_expression', 0)}** generated sources -> **{runtime_summary.get('alpine_expression_shapes', 0)}** literal-normalized expression families; **{runtime_summary.get('alpine_dom_mapped_sources', 0)}** mapped back to captured DOM directives",
             f"- GTM runtime reduction: **{runtime_classes.get('gtm_custom_javascript', 0)}** generated custom-JavaScript sources -> **{runtime_summary.get('gtm_expression_shapes', 0)}** literal-normalized families",
         ] if runtime_summary else []),
+        *([
+            f"- Runtime-observed WASM responses: **{wasm_runtime_summary.get('observations', 0)}** exact response observations / **{wasm_runtime_summary.get('unique_wasm_sha256', 0)}** unique module bodies; exact runtime-script initiators: **{wasm_runtime_summary.get('runtime_script_identities', 0)}**; identity proof: **{wasm_runtime_summary.get('direct_body_identities', 0)}** CDP-body + **{wasm_runtime_summary.get('url_unique_body_identities', 0)}** unique-URL/cardinality; unmatched WASM events: **{wasm_runtime_summary.get('unmatched_wasm_events', 0)}**",
+        ] if wasm_runtime_summary.get("applicable") else []),
+        *([
+            f"- Runtime WASM provenance unavailable: **{wasm_runtime_summary.get('unavailable_reason', 'unknown')}**",
+        ] if wasm_resource_provenance is not None and not wasm_runtime_summary.get("applicable") else []),
         f"- Readable source units: **{len(source_units)}** ({len(js_units)} JavaScript)",
         f"- Exact-content JS reuse: **{source_summary.get('unique_javascript_inputs', len(js_units))}** unique bodies / "
         f"**{len(js_units)}** occurrences (**{source_summary.get('deduplicated_javascript_units', 0)}** formatter reuses)",

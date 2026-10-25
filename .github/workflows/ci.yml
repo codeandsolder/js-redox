@@ -103,5 +103,7 @@ jobs:
         run: uv run --no-project python scripts/check-vm-capture-pipeline.py
       - name: WebAssembly capture pipeline
         run: uv run --no-project python scripts/check-wasm-capture-pipeline.py
+      - name: WebAssembly runtime resource provenance
+        run: uv run --no-project python scripts/check-wasm-resource-provenance.py
       - name: WebAssembly copied-input boundary
         run: uv run --no-project python scripts/check-wasm-copied-input-boundary.py
