@@ -163,7 +163,7 @@ def main():
             f"- GTM runtime reduction: **{runtime_classes.get('gtm_custom_javascript', 0)}** generated custom-JavaScript sources -> **{runtime_summary.get('gtm_expression_shapes', 0)}** literal-normalized families",
         ] if runtime_summary else []),
         *([
-            f"- Runtime-observed WASM responses: **{wasm_runtime_summary.get('observations', 0)}** exact response observations / **{wasm_runtime_summary.get('unique_wasm_sha256', 0)}** unique module bodies; exact runtime-script initiators: **{wasm_runtime_summary.get('runtime_script_identities', 0)}**; identity proof: **{wasm_runtime_summary.get('direct_body_identities', 0)}** CDP-body + **{wasm_runtime_summary.get('url_unique_body_identities', 0)}** unique-URL/cardinality; unmatched WASM events: **{wasm_runtime_summary.get('unmatched_wasm_events', 0)}**",
+            f"- Runtime-observed WASM responses: **{wasm_runtime_summary.get('observations', 0)}** exact response observations / **{wasm_runtime_summary.get('unique_wasm_sha256', 0)}** unique module bodies; exact runtime-script initiators: **{wasm_runtime_summary.get('runtime_script_identities', 0)}**; identity proof: **{wasm_runtime_summary.get('direct_body_identities', 0)}** CDP-body + **{wasm_runtime_summary.get('url_unique_body_identities', 0)}** unique-URL/cardinality; unmatched body-bearing WASM events: **{wasm_runtime_summary.get('unmatched_wasm_events', 0)}**; non-body WASM observations: **{wasm_runtime_summary.get('ignored_non_body_wasm_events', 0)}**",
         ] if wasm_runtime_summary.get("applicable") else []),
         *([
             f"- Runtime WASM provenance unavailable: **{wasm_runtime_summary.get('unavailable_reason', 'unknown')}**",

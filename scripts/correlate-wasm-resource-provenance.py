@@ -23,6 +23,39 @@ def is_wasm_response(url: object, mime_type: object) -> bool:
     return mime == "application/wasm" or ".wasm" in url.lower().split("#", 1)[0]
 
 
+def response_body_expected(method: object, status: object) -> bool:
+    normalized_method = str(method or "").upper()
+    try:
+        normalized_status = int(status)
+    except (TypeError, ValueError):
+        normalized_status = 0
+    if normalized_method == "HEAD":
+        return False
+    return not (
+        100 <= normalized_status < 200
+        or 300 <= normalized_status < 400
+        or normalized_status in {204, 205}
+    )
+
+
+def resource_body_expected(resource: dict) -> bool:
+    explicit = resource.get("body_expected")
+    if isinstance(explicit, bool):
+        return explicit
+    return response_body_expected(resource.get("method"), resource.get("status"))
+
+
+def non_body_reason(method: object, status: object) -> str:
+    normalized_method = str(method or "").upper()
+    try:
+        normalized_status = int(status)
+    except (TypeError, ValueError):
+        normalized_status = 0
+    if normalized_method == "HEAD":
+        return "method_HEAD"
+    return f"status_{normalized_status}"
+
+
 def captured_runtime_scripts(capture: Path) -> dict[tuple[str, str], dict]:
     path = capture / "runtime-scripts.json"
     if not path.is_file():
@@ -76,6 +109,7 @@ def unavailable_result(reason: str) -> dict:
         "schema": WASM_RESOURCE_PROVENANCE.schema,
         "observations": [],
         "unmatched": [],
+        "ignored_non_body": [],
         "summary": {
             "observations": 0,
             "unique_wasm_sha256": 0,
@@ -86,6 +120,7 @@ def unavailable_result(reason: str) -> dict:
             "url_unique_body_identities": 0,
             "unmatched_wasm_events": 0,
             "unmatched_reasons": {},
+            "ignored_non_body_wasm_events": 0,
             "applicable": False,
             "unavailable_reason": reason,
         },
@@ -102,6 +137,7 @@ def main() -> None:
     source = manifest["source"]
     observations: list[dict] = []
     unmatched: list[dict] = []
+    ignored_non_body: list[dict] = []
 
     if source.get("kind") != "recorder":
         write_artifact(
@@ -139,7 +175,11 @@ def main() -> None:
     for resource in manifest.get("resources", []):
         url = resource.get("url")
         digest = resource.get("sha256")
-        if resource.get("kind") == "wasm" and isinstance(url, str):
+        if (
+            resource.get("kind") == "wasm"
+            and isinstance(url, str)
+            and resource_body_expected(resource)
+        ):
             wasm_resources_by_url[url].append(resource)
             if (
                 resource.get("body_present")
@@ -153,7 +193,11 @@ def main() -> None:
     cdp_wasm_counts = Counter(
         row.get("url")
         for row in cdp_rows
-        if isinstance(row, dict) and is_wasm_response(row.get("url"), row.get("mimeType"))
+        if (
+            isinstance(row, dict)
+            and is_wasm_response(row.get("url"), row.get("mimeType"))
+            and response_body_expected(row.get("method"), row.get("status"))
+        )
     )
     runtime_scripts = captured_runtime_scripts(capture)
     for row in cdp_rows:
@@ -161,6 +205,18 @@ def main() -> None:
             continue
         url = row.get("url")
         if not is_wasm_response(url, row.get("mimeType")) or not isinstance(url, str):
+            continue
+        if not response_body_expected(row.get("method"), row.get("status")):
+            ignored_non_body.append(
+                {
+                    "cdp_session": cdp_session(row),
+                    "request_id": row.get("requestId"),
+                    "url": url,
+                    "method": row.get("method"),
+                    "status": row.get("status"),
+                    "reason": non_body_reason(row.get("method"), row.get("status")),
+                }
+            )
             continue
 
         body = row.get("body") or {}
@@ -300,12 +356,14 @@ def main() -> None:
         ),
         "unmatched_wasm_events": len(unmatched),
         "unmatched_reasons": dict(sorted(Counter(row["reason"] for row in unmatched).items())),
+        "ignored_non_body_wasm_events": len(ignored_non_body),
         "applicable": True,
     }
     result = {
         "schema": WASM_RESOURCE_PROVENANCE.schema,
         "observations": observations,
         "unmatched": unmatched,
+        "ignored_non_body": ignored_non_body,
         "summary": summary,
     }
     write_artifact(project, WASM_RESOURCE_PROVENANCE, result)
@@ -313,7 +371,8 @@ def main() -> None:
         "WASM runtime provenance: "
         f"{summary['observations']} exact response observation(s), "
         f"{summary['runtime_script_identities']} exact runtime initiator(s), "
-        f"{summary['unmatched_wasm_events']} unmatched"
+        f"{summary['unmatched_wasm_events']} unmatched, "
+        f"{summary['ignored_non_body_wasm_events']} non-body observation(s)"
     )
 
 

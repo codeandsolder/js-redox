@@ -89,8 +89,8 @@ WASM_JS_BOUNDARY = ArtifactSpec(
 WASM_RESOURCE_PROVENANCE = ArtifactSpec(
     "WASM runtime resource provenance",
     Path("analysis/wasm-resource-provenance.json"),
-    "wasm-runtime-resource-provenance/v1",
-    array_fields=("observations", "unmatched"),
+    "wasm-runtime-resource-provenance/v2",
+    array_fields=("observations", "unmatched", "ignored_non_body"),
     object_fields=("summary",),
 )
 GENERATED_RECOVERY = ArtifactSpec(

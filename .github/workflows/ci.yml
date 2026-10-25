@@ -92,6 +92,8 @@ jobs:
             target/debug/fresh-eval \
             target/debug/wasm-import-semantics \
             .cargo-target-nodebug/debug/
+      - name: HAR content/body semantics
+        run: uv run --no-project python scripts/check-har-content-classification.py
       - name: Safe deobfuscation runtime equivalence
         run: uv run --no-project python scripts/check-safe-deobfuscate.py
       - name: Deobfuscation source-mode pipeline
