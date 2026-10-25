@@ -1,3 +1,4 @@
+use crate::global_builtin::{collect_global_aliases, global_constructor};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, CallExpression, Expression, Function, Program,
@@ -163,18 +164,6 @@ fn symbol_is_stable(scoping: &Scoping, symbol: SymbolId) -> bool {
         })
 }
 
-fn direct_global_name(scoping: &Scoping, expression: &Expression<'_>) -> Option<String> {
-    let Expression::Identifier(identifier) = unparenthesized(expression) else {
-        return None;
-    };
-    let reference = scoping.get_reference(identifier.reference_id.get()?);
-    if reference.symbol_id().is_some() {
-        return None;
-    }
-    matches!(identifier.name.as_str(), "window" | "globalThis" | "self")
-        .then(|| identifier.name.to_string())
-}
-
 struct DynamicScopeProbe<'c> {
     scoping: &'c Scoping,
     found: bool,
@@ -213,77 +202,6 @@ fn has_dynamic_scope(program: &Program<'_>, scoping: &Scoping) -> bool {
     };
     probe.visit_program(program);
     probe.found
-}
-
-fn collect_global_aliases(program: &Program<'_>, scoping: &Scoping) -> HashMap<SymbolId, String> {
-    struct Collector<'c> {
-        scoping: &'c Scoping,
-        aliases: HashMap<SymbolId, String>,
-    }
-    impl<'a> Visit<'a> for Collector<'_> {
-        fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
-            for declarator in &declaration.declarations {
-                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                    continue;
-                };
-                let Some(symbol) = identifier.symbol_id.get() else {
-                    continue;
-                };
-                let Some(initializer) = &declarator.init else {
-                    continue;
-                };
-                let Some(global) = direct_global_name(self.scoping, initializer) else {
-                    continue;
-                };
-                if symbol_binding_is_stable(self.scoping, symbol) {
-                    self.aliases.insert(symbol, global);
-                }
-            }
-            walk::walk_variable_declaration(self, declaration);
-        }
-    }
-    let mut collector = Collector {
-        scoping,
-        aliases: HashMap::new(),
-    };
-    collector.visit_program(program);
-    collector.aliases
-}
-
-fn global_constructor(
-    scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
-    callee: &Expression<'_>,
-    constructor: &str,
-) -> Option<String> {
-    match unparenthesized(callee) {
-        Expression::Identifier(identifier) if identifier.name.as_str() == constructor => {
-            let reference = scoping.get_reference(identifier.reference_id.get()?);
-            reference
-                .symbol_id()
-                .is_none()
-                .then(|| "globalThis".to_string())
-        }
-        Expression::StaticMemberExpression(member)
-            if !member.optional && member.property.name.as_str() == constructor =>
-        {
-            global_aliases
-                .get(&symbol_of(scoping, &member.object)?)
-                .cloned()
-        }
-        Expression::ComputedMemberExpression(member) if !member.optional => {
-            let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
-                return None;
-            };
-            if property.value.as_str() != Some(constructor) {
-                return None;
-            }
-            global_aliases
-                .get(&symbol_of(scoping, &member.object)?)
-                .cloned()
-        }
-        _ => None,
-    }
 }
 
 fn static_member_of_symbol(

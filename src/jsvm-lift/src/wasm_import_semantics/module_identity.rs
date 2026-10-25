@@ -1,5 +1,8 @@
 use super::{symbol_of, unparenthesized};
-use crate::{sha256_hex, static_bytes::recover_webassembly_byte_artifacts_from_program};
+use crate::{
+    global_builtin::namespace_member_name, sha256_hex,
+    static_bytes::recover_webassembly_byte_artifacts_from_program,
+};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Expression, ForStatementInit, Function, Program,
@@ -337,77 +340,6 @@ fn collect_helpers(
     collector.helpers
 }
 
-fn unresolved_global_identifier(
-    scoping: &Scoping,
-    expression: &Expression<'_>,
-    expected: &str,
-) -> bool {
-    let Expression::Identifier(identifier) = unparenthesized(expression) else {
-        return false;
-    };
-    if identifier.name.as_str() != expected {
-        return false;
-    }
-    identifier
-        .reference_id
-        .get()
-        .is_some_and(|reference_id| scoping.get_reference(reference_id).symbol_id().is_none())
-}
-
-fn webassembly_namespace_global(
-    scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
-    expression: &Expression<'_>,
-) -> Option<String> {
-    if unresolved_global_identifier(scoping, expression, "WebAssembly") {
-        return Some("globalThis".to_string());
-    }
-    match unparenthesized(expression) {
-        Expression::StaticMemberExpression(member)
-            if !member.optional && member.property.name.as_str() == "WebAssembly" =>
-        {
-            global_aliases
-                .get(&symbol_of(scoping, &member.object)?)
-                .cloned()
-        }
-        Expression::ComputedMemberExpression(member) if !member.optional => {
-            let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
-                return None;
-            };
-            if property.value.as_str() != Some("WebAssembly") {
-                return None;
-            }
-            global_aliases
-                .get(&symbol_of(scoping, &member.object)?)
-                .cloned()
-        }
-        _ => None,
-    }
-}
-
-pub(super) fn webassembly_member_name<'a>(
-    scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
-    expression: &'a Expression<'a>,
-) -> Option<(&'a str, String)> {
-    match unparenthesized(expression) {
-        Expression::StaticMemberExpression(member) if !member.optional => Some((
-            member.property.name.as_str(),
-            webassembly_namespace_global(scoping, global_aliases, &member.object)?,
-        )),
-        Expression::ComputedMemberExpression(member) if !member.optional => {
-            let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
-                return None;
-            };
-            Some((
-                property.value.as_str()?,
-                webassembly_namespace_global(scoping, global_aliases, &member.object)?,
-            ))
-        }
-        _ => None,
-    }
-}
-
 fn base64_module_value(value: &str) -> Option<StaticWasmValue> {
     if !value.starts_with("AGFzbQ") {
         return None;
@@ -464,10 +396,11 @@ impl Evaluator<'_, '_, '_, '_> {
             Expression::NewExpression(new_expression)
                 if !new_expression.arguments.iter().any(Argument::is_spread) =>
             {
-                let (member, _) = webassembly_member_name(
+                let (member, _) = namespace_member_name(
                     self.scoping,
                     self.global_aliases,
                     &new_expression.callee,
+                    "WebAssembly",
                 )?;
                 if member != "Module" {
                     return None;
@@ -698,10 +631,11 @@ impl SiteCollector<'_, '_, '_, '_, '_> {
 impl<'a> Visit<'a> for SiteCollector<'_, '_, '_, '_, '_> {
     fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
         if !call.optional && !call.arguments.iter().any(Argument::is_spread) {
-            if let Some((member, _)) = webassembly_member_name(
+            if let Some((member, _)) = namespace_member_name(
                 self.evaluator.scoping,
                 self.evaluator.global_aliases,
                 &call.callee,
+                "WebAssembly",
             ) {
                 if member == "instantiate" {
                     if let Some(argument) = call.arguments.first() {
@@ -718,10 +652,11 @@ impl<'a> Visit<'a> for SiteCollector<'_, '_, '_, '_, '_> {
     }
 
     fn visit_new_expression(&mut self, expression: &oxc_ast::ast::NewExpression<'a>) {
-        if let Some((member, _)) = webassembly_member_name(
+        if let Some((member, _)) = namespace_member_name(
             self.evaluator.scoping,
             self.evaluator.global_aliases,
             &expression.callee,
+            "WebAssembly",
         ) {
             if member == "Instance" && !expression.arguments.iter().any(Argument::is_spread) {
                 if let Some(argument) = expression.arguments.first() {
