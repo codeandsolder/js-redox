@@ -19,6 +19,22 @@ SCANNER = ROOT / ".cargo-target-nodebug/debug/jsvm-lift"
 MIN_DEOB_TRANSFORMS = {
     # Filled only for transforms whose presence is part of the readability
     # contract, not for incidental optimizer counts.
+    # These two independent Cloudflare captures exercise the same generalized
+    # proof chain: split-built static table -> affine sequence accessor ->
+    # checksum-proven rotation -> stable dominated decoder alias. The engine
+    # itself contains no site/protector names.
+    "cloudflare-ecosia-orchestrate-1": {
+        "string_array_decode": 90,
+        "computed_property": 90,
+        "materialize_decoder_rotation": 1,
+        "remove_decoder_rotation_iife": 1,
+    },
+    "cloudflare-ecosia-orchestrate-2": {
+        "string_array_decode": 90,
+        "computed_property": 90,
+        "materialize_decoder_rotation": 1,
+        "remove_decoder_rotation_iife": 1,
+    },
     "datadome-qwant-5.10.0": {
         "string_array_decode": 4000,
         "pure_function_eval": 120,
@@ -42,6 +58,14 @@ FORBIDDEN_DEOB_STRINGS = {
     # Use this sparingly for known-bad rewrite signatures caught by a real
     # regression, not as a generic textual blacklist.
 }
+
+MAX_SCAN_DIAGNOSTICS = {
+    # Castle is valid Node/CommonJS input and scans successfully, but Oxc
+    # reports two recoverable parser diagnostics for this captured bundle.
+    # Keep that known ceiling explicit so new diagnostics still fail the gate.
+    "castle-raw": 2,
+}
+
 
 MIN_SIGNALS = {
     "cloudflare-ecosia-orchestrate-1": {
@@ -191,8 +215,17 @@ def main():
         scan_lines = [line for line in scan_cp.stdout.splitlines() if line.strip()]
         assert len(scan_lines) == 1, (sample["id"], len(scan_lines))
         scan = json.loads(scan_lines[0])
-        assert scan.get("panicked") is False, sample["id"]
-        assert not scan.get("diagnostics"), (sample["id"], scan.get("diagnostics"))
+        assert scan.get("fatal_error") is False, sample["id"]
+        diagnostics = scan.get("diagnostics")
+        assert isinstance(diagnostics, int) and not isinstance(diagnostics, bool), (
+            sample["id"],
+            diagnostics,
+        )
+        assert 0 <= diagnostics <= MAX_SCAN_DIAGNOSTICS.get(sample["id"], 0), (
+            sample["id"],
+            diagnostics,
+            MAX_SCAN_DIAGNOSTICS.get(sample["id"], 0),
+        )
 
         metrics = {
             key: count_list(scan, key)
