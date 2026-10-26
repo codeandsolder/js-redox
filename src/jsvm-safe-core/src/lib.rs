@@ -1571,6 +1571,249 @@ mod tests {
     }
 
     #[test]
+    fn decoder_only_recovery_generalizes_split_provider_sequence_accessor_and_nested_rotation() {
+        let source = r#"
+function provider(table) {
+    return table = `12!34!56!78`.split(`!`), provider = function() { return table; }, provider();
+}
+function decode(index, unused, table, value) {
+    return index = index - 0x10, table = provider(), value = table[index], value;
+}
+let setup, after;
+for (
+    setup = 1,
+    function(provider_arg, target, indices, alias, table, sum) {
+        for (
+            indices = { a: 0x10, b: 0x11 },
+            alias = decode,
+            table = provider_arg();
+            !![];
+        ) try {
+            if (
+                sum = parseInt(alias(indices.a)) * 10 + parseInt(alias(indices.b)),
+                target === sum
+            ) break;
+            else table.push(table.shift());
+        } catch (error) {
+            table.push(table.shift());
+        }
+    }(provider, 396),
+    after = 2;
+    false;
+) {}
+sink(decode(0x10), decode(0x11));
+"#;
+        let recovered = recover_static_decoders(source, 8);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert_eq!(recovered.transforms.get("string_array_decode"), Some(&2));
+        assert_eq!(
+            recovered.transforms.get("materialize_decoder_rotation"),
+            Some(&1)
+        );
+        assert_eq!(
+            recovered.transforms.get("remove_decoder_rotation_iife"),
+            Some(&1)
+        );
+        assert!(recovered.source.contains("sink(\"34\", \"56\")"));
+        assert!(recovered.source.contains("void 0"));
+
+        let bad = source.replace("provider, 396", "provider, 397");
+        let rejected = recover_static_decoders(&bad, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        assert_eq!(
+            rejected.transforms.get("materialize_decoder_rotation"),
+            None
+        );
+        assert_eq!(
+            rejected.transforms.get("remove_decoder_rotation_iife"),
+            None
+        );
+
+        let special_proto = source.replace(
+            "indices = { a: 0x10, b: 0x11 }",
+            "indices = { a: 0x10, b: 0x11, __proto__: 1 }",
+        );
+        let rejected = recover_static_decoders(&special_proto, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        assert_eq!(
+            rejected.transforms.get("materialize_decoder_rotation"),
+            None
+        );
+
+        let shadowed_parameter = source.replace(
+            "        ) try {\n            if (",
+            "        ) try {\n            let indices = { a: 0x20, b: 0x21 };\n            if (",
+        );
+        let rejected = recover_static_decoders(&shadowed_parameter, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        assert_eq!(
+            rejected.transforms.get("materialize_decoder_rotation"),
+            None
+        );
+
+        let shadowed_decoder = source.replace(
+            "    function(provider_arg, target, indices, alias, table, sum) {",
+            "    function(provider_arg, target, indices, alias, table, sum) { let decode = other;",
+        );
+        let rejected = recover_static_decoders(&shadowed_decoder, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        assert_eq!(
+            rejected.transforms.get("materialize_decoder_rotation"),
+            None
+        );
+
+        let provider_rebound = source.replace(
+            "sink(decode(0x10), decode(0x11));",
+            "provider = replacement; sink(decode(0x10), decode(0x11));",
+        );
+        let rejected = recover_static_decoders(&provider_rebound, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+
+        let outer_table = source.replace(
+            "function decode(index, unused, table, value) {",
+            "let table; function decode(index, unused, value) {",
+        );
+        let rejected = recover_static_decoders(&outer_table, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+
+        let outer_value = source.replace(
+            "function decode(index, unused, table, value) {",
+            "let value; function decode(index, unused, table) {",
+        );
+        let rejected = recover_static_decoders(&outer_value, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+
+        let collapsed_table_role = source.replace(
+            "function decode(index, unused, table, value) {\n    return index = index - 0x10, table = provider(), value = table[index], value;",
+            "function decode(index, unused, value) {\n    return index = index - 0x10, index = provider(), value = index[index], value;",
+        );
+        let rejected = recover_static_decoders(&collapsed_table_role, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+
+        let collapsed_value_role = source.replace(
+            "function decode(index, unused, table, value) {\n    return index = index - 0x10, table = provider(), value = table[index], value;",
+            "function decode(index, unused, table) {\n    return index = index - 0x10, table = provider(), table = table[index], table;",
+        );
+        let rejected = recover_static_decoders(&collapsed_value_role, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+
+        let rebound_rotation_alias = source.replace(
+            "        ) try {\n            if (",
+            "        ) try {\n            alias = replacement;\n            if (",
+        );
+        let rejected = recover_static_decoders(&rebound_rotation_alias, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        assert_eq!(
+            rejected.transforms.get("materialize_decoder_rotation"),
+            None
+        );
+
+        let dynamic_eval = source.replace(
+            "        ) try {\n            if (",
+            "        ) try {\n            eval(\"alias = replacement\");\n            if (",
+        );
+        let rejected = recover_static_decoders(&dynamic_eval, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+    }
+
+    #[test]
+    fn decoder_alias_assigned_in_for_initializer_is_dominating_and_stable() {
+        let source = r#"
+function provider(table) {
+    return table = `alpha!beta`.split(`!`), provider = function() { return table; }, provider();
+}
+function decode(index, table, value) {
+    return index = index - 0x10, table = provider(), value = table[index], value;
+}
+function use(alias) {
+    for (alias = decode; true;) {
+        sink(alias(0x10), alias(0x11));
+        break;
+    }
+}
+use();
+"#;
+        let recovered = recover_static_decoders(source, 8);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert_eq!(recovered.transforms.get("string_array_decode"), Some(&2));
+        assert!(recovered.source.contains("sink(\"alpha\", \"beta\")"));
+
+        let mutated = source.replace(
+            "sink(alias(0x10), alias(0x11));",
+            "sink(alias(0x10), alias(0x11)); alias = replacement;",
+        );
+        let rejected = recover_static_decoders(&mutated, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+    }
+
+    #[test]
+    fn decoder_alias_first_statement_dominates_closure_reads() {
+        let source = r#"
+function provider(table) {
+    return table = `alpha!beta`.split(`!`), provider = function() { return table; }, provider();
+}
+function decode(index, table, value) {
+    return index = index - 0x10, table = provider(), value = table[index], value;
+}
+function use(alias) {
+    for (alias = decode; false;) {}
+    function later() {
+        return alias(0x10);
+    }
+    sink(later(), alias(0x11));
+}
+use();
+"#;
+        let recovered = recover_static_decoders(source, 8);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert_eq!(recovered.transforms.get("string_array_decode"), Some(&2));
+        assert!(recovered.source.contains("return \"alpha\""));
+        assert!(recovered.source.contains("sink(later(), \"beta\")"));
+
+        let preceded = source.replace(
+            "function use(alias) {\n    for",
+            "function use(alias) {\n    before();\n    for",
+        );
+        let rejected = recover_static_decoders(&preceded, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+
+        let delayed = source.replace("for (alias = decode;", "for (before(), alias = decode;");
+        let rejected = recover_static_decoders(&delayed, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+    }
+
+    #[test]
     fn decoder_only_recovery_handles_literal_key_rc4() {
         let source = r#"
 function p(){var table=["xSov","xCor"];p=function(){return table;};return p();}
