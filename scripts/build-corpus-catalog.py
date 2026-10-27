@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import json
 import os
 import re
@@ -15,8 +16,26 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CORPUS = ROOT / "work/scum-corpus-20261007"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 SCAN_VERSION = 1
+WINDOWS_1252_C1 = str.maketrans({
+    0x80: 0x20AC, 0x81: 0x0081, 0x82: 0x201A, 0x83: 0x0192,
+    0x84: 0x201E, 0x85: 0x2026, 0x86: 0x2020, 0x87: 0x2021,
+    0x88: 0x02C6, 0x89: 0x2030, 0x8A: 0x0160, 0x8B: 0x2039,
+    0x8C: 0x0152, 0x8D: 0x008D, 0x8E: 0x017D, 0x8F: 0x008F,
+    0x90: 0x0090, 0x91: 0x2018, 0x92: 0x2019, 0x93: 0x201C,
+    0x94: 0x201D, 0x95: 0x2022, 0x96: 0x2013, 0x97: 0x2014,
+    0x98: 0x02DC, 0x99: 0x2122, 0x9A: 0x0161, 0x9B: 0x203A,
+    0x9C: 0x0153, 0x9D: 0x009D, 0x9E: 0x017E, 0x9F: 0x0178,
+})
+
+
+def whatwg_windows_1252(raw: bytes) -> bytes:
+    """Decode bytes using the WHATWG Windows-1252 index and emit UTF-8."""
+    return raw.decode("latin1").translate(WINDOWS_1252_C1).encode("utf-8")
+
+PROGRESS_CONTRACT = "safe-deob+sus/v1"
+SEMANTIC_CONTRACT = "js-sus-scan/v3"
 
 TRIVIAL_ANONYMOUS = {
     "", "[]", "{}", "({})", "null", "undefined", "true", "false", "0", "1",
@@ -71,7 +90,11 @@ FEATURES = {
 CANDIDATE_QUERIES = {
     "javascript": """
         SELECT c.representative_path FROM current_body c JOIN body_scan s USING (sha256)
-        WHERE s.content_kind LIKE 'javascript%' AND s.nuisance IS NULL ORDER BY c.sha256
+        WHERE s.content_kind LIKE 'javascript%' AND s.nuisance IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM body_representation_edge e WHERE e.transport_sha256=c.sha256 AND e.evidence LIKE 'exact:%'
+          )
+        ORDER BY c.sha256
     """,
     "runtime-confirmed": """
         SELECT c.representative_path FROM current_body c JOIN body_scan s USING (sha256)
@@ -138,6 +161,80 @@ CANDIDATE_QUERIES = {
           OR (f.feature = 'large_minified' AND c.cohort_count = 1)
         )
         ORDER BY c.cohort_count ASC, c.domain_count ASC, c.bytes DESC, c.sha256
+    """,
+    "known-residual": f"""
+        SELECT c.representative_path FROM current_body c JOIN body_analysis_best b USING (sha256)
+        WHERE b.analysis_contract = '{PROGRESS_CONTRACT}'
+          AND (b.fatal_error != 0 OR b.actionable_top_score > 0 OR b.actionable_signal_count > 0)
+        ORDER BY b.fatal_error DESC, b.actionable_top_score DESC, b.actionable_signal_count DESC,
+                 c.cohort_count ASC, c.domain_count ASC, c.bytes DESC, c.sha256
+    """,
+    "known-zero": f"""
+        SELECT c.representative_path FROM current_body c JOIN body_analysis_best b USING (sha256)
+        WHERE b.analysis_contract = '{PROGRESS_CONTRACT}'
+          AND b.fatal_error = 0 AND b.actionable_top_score = 0 AND b.actionable_signal_count = 0
+        ORDER BY c.cohort_count ASC, c.domain_count ASC, c.bytes DESC, c.sha256
+    """,
+    "untested-interesting": f"""
+        SELECT DISTINCT c.representative_path FROM current_body c JOIN body_scan s USING (sha256)
+        JOIN body_feature f USING (sha256)
+        WHERE s.nuisance IS NULL AND s.content_kind LIKE 'javascript%'
+          AND NOT EXISTS (SELECT 1 FROM body_analysis_best b WHERE b.sha256=c.sha256 AND b.analysis_contract='{PROGRESS_CONTRACT}')
+          AND (f.feature IN ('dynamic_code_shape','flattening_shape','encoded_payload_shape','self_defending_shape','string_table_rotation_shape','wasm_carrier_shape','javascript_obfuscator_names','packer_eval','anti_debug_interval','worker_constructor') OR (f.feature='large_minified' AND c.cohort_count=1))
+        ORDER BY c.cohort_count ASC, c.domain_count ASC, c.bytes DESC, c.sha256
+    """,
+    "quick-focus": f"""
+        SELECT c.representative_path FROM current_body c JOIN body_scan s USING (sha256)
+        LEFT JOIN body_analysis_best b ON b.sha256=c.sha256 AND b.analysis_contract='{PROGRESS_CONTRACT}'
+        LEFT JOIN body_analysis_latest l ON l.sha256=c.sha256 AND l.analysis_contract='{PROGRESS_CONTRACT}'
+        WHERE s.nuisance IS NULL AND s.content_kind LIKE 'javascript%' AND (
+          (l.sha256 IS NOT NULL AND (l.fatal_error!=0 OR l.actionable_top_score>0 OR l.actionable_signal_count>0))
+          OR (l.sha256 IS NULL AND (
+            EXISTS (SELECT 1 FROM body_semantic_scan ss WHERE ss.sha256=c.sha256 AND ss.scan_contract='{SEMANTIC_CONTRACT}' AND (ss.fatal_error!=0 OR ss.actionable_top_score>0 OR ss.actionable_signal_count>0))
+            OR EXISTS (SELECT 1 FROM body_feature f WHERE f.sha256=c.sha256 AND (f.feature IN ('dynamic_code_shape','flattening_shape','encoded_payload_shape','self_defending_shape','string_table_rotation_shape','wasm_carrier_shape','javascript_obfuscator_names','packer_eval','anti_debug_interval','worker_constructor') OR (f.feature='large_minified' AND c.cohort_count=1)))
+          ))
+        )
+        ORDER BY CASE WHEN l.sha256 IS NULL THEN 1 ELSE 0 END,
+                 CASE WHEN b.sha256 IS NOT NULL AND (l.fatal_error>b.fatal_error OR l.actionable_top_score>b.actionable_top_score OR l.actionable_signal_count>b.actionable_signal_count) THEN 0 ELSE 1 END,
+                 COALESCE(l.fatal_error,0) DESC, COALESCE(l.actionable_top_score,0) DESC,
+                 COALESCE(l.actionable_signal_count,0) DESC, c.cohort_count ASC, c.domain_count ASC,
+                 c.bytes DESC, c.sha256
+    """,
+    "regressed-from-best": f"""
+        SELECT c.representative_path FROM current_body c
+        JOIN body_analysis_best b ON b.sha256=c.sha256 AND b.analysis_contract='{PROGRESS_CONTRACT}'
+        JOIN body_analysis_latest l ON l.sha256=c.sha256 AND l.analysis_contract='{PROGRESS_CONTRACT}'
+        WHERE l.fatal_error>b.fatal_error OR l.actionable_top_score>b.actionable_top_score OR l.actionable_signal_count>b.actionable_signal_count
+        ORDER BY (l.actionable_top_score-b.actionable_top_score) DESC, (l.actionable_signal_count-b.actionable_signal_count) DESC, c.sha256
+    """,
+    "semantic-actionable": f"""
+        SELECT c.representative_path FROM current_body c JOIN body_semantic_scan ss USING (sha256)
+        WHERE ss.scan_contract='{SEMANTIC_CONTRACT}'
+          AND (ss.fatal_error!=0 OR ss.actionable_top_score>0 OR ss.actionable_signal_count>0)
+        ORDER BY ss.fatal_error DESC, ss.actionable_top_score DESC, ss.actionable_signal_count DESC,
+                 c.cohort_count ASC, c.domain_count ASC, c.bytes DESC, c.sha256
+    """,
+    "semantic-zero": f"""
+        SELECT c.representative_path FROM current_body c JOIN body_semantic_scan ss USING (sha256)
+        WHERE ss.scan_contract='{SEMANTIC_CONTRACT}'
+          AND ss.fatal_error=0 AND ss.actionable_top_score=0 AND ss.actionable_signal_count=0
+        ORDER BY c.cohort_count ASC, c.domain_count ASC, c.bytes DESC, c.sha256
+    """,
+    "semantic-untested": f"""
+        SELECT c.representative_path FROM current_body c JOIN body_scan s USING (sha256)
+        WHERE s.content_kind LIKE 'javascript%' AND s.nuisance IS NULL
+          AND NOT EXISTS (SELECT 1 FROM body_semantic_scan ss WHERE ss.sha256=c.sha256 AND ss.scan_contract='{SEMANTIC_CONTRACT}')
+        ORDER BY c.cohort_count ASC, c.domain_count ASC, c.bytes DESC, c.sha256
+    """,
+    "llm-review-zero": f"""
+        SELECT c.representative_path FROM current_body c JOIN body_analysis_latest l USING (sha256)
+        WHERE l.analysis_contract='{PROGRESS_CONTRACT}' AND l.fatal_error=0 AND l.actionable_top_score=0 AND l.actionable_signal_count=0
+        ORDER BY c.cohort_count ASC, c.domain_count ASC, c.capture_count ASC, c.bytes DESC, c.sha256
+    """,
+    "decode-anomaly": f"""
+        SELECT c.representative_path FROM current_body c JOIN body_semantic_scan ss USING (sha256)
+        WHERE ss.scan_contract='{SEMANTIC_CONTRACT}' AND ss.decode_had_errors!=0
+        ORDER BY ss.decode_uncertain DESC, c.bytes DESC, c.sha256
     """,
 }
 
@@ -299,13 +396,16 @@ def new_group(digest: str, path: Path, size: int) -> dict:
     }
 
 
-def collect_metadata(capture_root: Path) -> tuple[dict[str, dict], int, list[dict]]:
+def collect_metadata(capture_root: Path) -> tuple[dict[str, dict], int, list[dict], list[tuple[str, str, str, str, str]]]:
     groups: dict[str, dict] = {}
     bad_inputs: list[dict] = []
+    representation_edges: set[tuple[str, str, str, str, str]] = set()
     manifests = sorted(capture_root.glob("*/recorder-manifest.json"))
     for index, manifest in enumerate(manifests, 1):
         capture = manifest.parent
         cohort = cohort_name(capture)
+        network_rows: list[dict] = []
+        runtime_rows: list[dict] = []
         network_path = capture / "network.json"
         if network_path.is_file():
             try:
@@ -370,9 +470,75 @@ def collect_metadata(capture_root: Path) -> tuple[dict[str, dict], int, list[dic
                 domain = urlparse(url).netloc.lower()
                 if domain:
                     group["domains"].add(domain)
+        representation_edges.update(_representation_edges_for_capture(capture, network_rows, runtime_rows))
         if index % 500 == 0:
             print(f"metadata {index}/{len(manifests)} captures; {len(groups)} unique bodies", flush=True)
-    return groups, len(manifests), bad_inputs
+    return groups, len(manifests), bad_inputs, sorted(representation_edges)
+
+
+def _representation_edges_for_capture(
+    capture: Path,
+    network_rows: list[dict],
+    runtime_rows: list[dict],
+) -> set[tuple[str, str, str, str, str]]:
+    edges: set[tuple[str, str, str, str, str]] = set()
+    runtime_by_url: dict[str, set[str]] = collections.defaultdict(set)
+    for row in runtime_rows:
+        body = row.get("captured") or {}
+        url = str(row.get("url") or "")
+        digest = body.get("sha256") or row.get("hash")
+        if url and digest and body.get("kind") == "javascript":
+            runtime_by_url[url].add(str(digest))
+
+    network_by_url: dict[str, dict[str, Path]] = collections.defaultdict(dict)
+    for row in network_rows:
+        body = row.get("body") or {}
+        url = str(row.get("url") or "")
+        digest, rel = body.get("sha256"), body.get("path")
+        if url and digest and rel and (row.get("resourceType") or "").lower() == "script":
+            network_by_url[url][str(digest)] = capture / str(rel)
+
+    for url, network_bodies in network_by_url.items():
+        runtime_digests = runtime_by_url.get(url) or set()
+        if len(runtime_digests) != 1:
+            continue
+        browser_sha = next(iter(runtime_digests))
+        for transport_sha, body_path in network_bodies.items():
+            if transport_sha == browser_sha:
+                continue
+            try:
+                raw = body_path.read_bytes()
+            except OSError:
+                continue
+            variants = [
+                ("exact:utf8-replacement", raw.decode("utf-8", errors="replace").encode("utf-8")),
+            ]
+            variants.append(("exact:windows-1252", whatwg_windows_1252(raw)))
+            if raw.startswith(b"\xef\xbb\xbf"):
+                variants.append(("exact:utf8-bom", raw.decode("utf-8-sig", errors="replace").encode("utf-8")))
+            evidence = next(
+                (name for name, decoded in variants if hashlib.sha256(decoded).hexdigest() == browser_sha),
+                None,
+            )
+            if evidence is None and len(network_bodies) == 1:
+                evidence = "url-unique"
+            if evidence is not None:
+                edges.add((transport_sha, browser_sha, capture.name, url, evidence))
+    return edges
+
+
+def collect_representation_edges(capture_root: Path) -> list[tuple[str, str, str, str, str]]:
+    """Compatibility helper for callers that only need browser representation edges."""
+    edges: set[tuple[str, str, str, str, str]] = set()
+    for manifest in sorted(capture_root.glob("*/recorder-manifest.json")):
+        capture = manifest.parent
+        try:
+            network_rows = json.loads((capture / "network.json").read_text(encoding="utf-8"))
+            runtime_rows = json.loads((capture / "runtime-scripts.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        edges.update(_representation_edges_for_capture(capture, network_rows, runtime_rows))
+    return sorted(edges)
 
 
 def scan_body(item: tuple[str, str, bool, bool, bool, list[dict]]) -> dict:
@@ -483,6 +649,62 @@ def open_database(path: Path) -> sqlite3.Connection:
           sha256 TEXT NOT NULL, feature TEXT NOT NULL, count INTEGER NOT NULL,
           PRIMARY KEY (sha256, feature)
         ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS body_semantic_scan (
+          sha256 TEXT NOT NULL, scan_contract TEXT NOT NULL, scanned_at TEXT NOT NULL,
+          diagnostics INTEGER NOT NULL, fatal_error INTEGER NOT NULL,
+          raw_signal_count INTEGER NOT NULL, raw_cluster_count INTEGER NOT NULL, raw_top_score INTEGER NOT NULL,
+          raw_signal_kinds_json TEXT NOT NULL, actionable_signal_count INTEGER NOT NULL,
+          actionable_cluster_count INTEGER NOT NULL, actionable_top_score INTEGER NOT NULL,
+          actionable_signal_kinds_json TEXT NOT NULL,
+          decode_encoding TEXT NOT NULL DEFAULT 'UTF-8', decode_source TEXT NOT NULL DEFAULT 'legacy',
+          decode_had_errors INTEGER NOT NULL DEFAULT 0, decode_uncertain INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (sha256, scan_contract)
+        );
+        CREATE TABLE IF NOT EXISTS body_representation_edge (
+          transport_sha256 TEXT NOT NULL, browser_sha256 TEXT NOT NULL,
+          capture TEXT NOT NULL, url TEXT NOT NULL, evidence TEXT NOT NULL,
+          PRIMARY KEY (transport_sha256, browser_sha256, capture, url)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS representation_transport_idx ON body_representation_edge(transport_sha256);
+        CREATE INDEX IF NOT EXISTS representation_browser_idx ON body_representation_edge(browser_sha256);
+        CREATE INDEX IF NOT EXISTS semantic_contract_idx ON body_semantic_scan(scan_contract, sha256);
+        CREATE INDEX IF NOT EXISTS semantic_actionable_idx ON body_semantic_scan(scan_contract, fatal_error, actionable_top_score, actionable_signal_count);
+        CREATE TABLE IF NOT EXISTS body_llm_review (
+          sha256 TEXT NOT NULL, review_contract TEXT NOT NULL, deterministic_pipeline_id TEXT NOT NULL,
+          reviewed_at TEXT NOT NULL, transformed_sha256 TEXT NOT NULL, model TEXT NOT NULL, provider TEXT NOT NULL,
+          verdict TEXT NOT NULL, confidence REAL NOT NULL, categories_json TEXT NOT NULL,
+          note TEXT NOT NULL, response_json TEXT NOT NULL,
+          PRIMARY KEY (sha256, review_contract, deterministic_pipeline_id, transformed_sha256, model, provider)
+        );
+        CREATE INDEX IF NOT EXISTS llm_review_verdict_idx ON body_llm_review(review_contract, verdict, confidence);
+        CREATE TABLE IF NOT EXISTS body_analysis_run (
+          sha256 TEXT NOT NULL, analysis_contract TEXT NOT NULL, pipeline_id TEXT NOT NULL,
+          observed_at TEXT NOT NULL, input_path TEXT NOT NULL, output_sha256 TEXT, output_bytes INTEGER,
+          deob_changed INTEGER NOT NULL, deob_iterations INTEGER, transform_total INTEGER NOT NULL,
+          transforms_json TEXT NOT NULL, deob_error TEXT, diagnostics INTEGER NOT NULL, fatal_error INTEGER NOT NULL,
+          raw_signal_count INTEGER NOT NULL, raw_cluster_count INTEGER NOT NULL, raw_top_score INTEGER NOT NULL,
+          raw_signal_kinds_json TEXT NOT NULL, actionable_signal_count INTEGER NOT NULL,
+          actionable_cluster_count INTEGER NOT NULL, actionable_top_score INTEGER NOT NULL,
+          actionable_signal_kinds_json TEXT NOT NULL,
+          PRIMARY KEY (sha256, analysis_contract, pipeline_id)
+        );
+        CREATE INDEX IF NOT EXISTS analysis_contract_idx ON body_analysis_run(analysis_contract, sha256);
+        CREATE INDEX IF NOT EXISTS analysis_residual_idx ON body_analysis_run(analysis_contract, fatal_error, actionable_top_score, actionable_signal_count);
+        DROP VIEW IF EXISTS body_analysis_best;
+        CREATE VIEW body_analysis_best AS
+          SELECT * FROM (
+            SELECT r.*, ROW_NUMBER() OVER (
+              PARTITION BY sha256, analysis_contract
+              ORDER BY fatal_error ASC, actionable_top_score ASC, actionable_signal_count ASC, actionable_cluster_count ASC, diagnostics ASC, transform_total DESC, observed_at DESC, pipeline_id DESC
+            ) AS _rank FROM body_analysis_run r
+          ) WHERE _rank = 1;
+        DROP VIEW IF EXISTS body_analysis_latest;
+        CREATE VIEW body_analysis_latest AS
+          SELECT * FROM (
+            SELECT r.*, ROW_NUMBER() OVER (
+              PARTITION BY sha256, analysis_contract ORDER BY observed_at DESC, pipeline_id DESC
+            ) AS _rank FROM body_analysis_run r
+          ) WHERE _rank = 1;
         CREATE INDEX IF NOT EXISTS current_runtime_idx ON current_body(runtime_present);
         CREATE INDEX IF NOT EXISTS current_network_idx ON current_body(network_present);
         CREATE INDEX IF NOT EXISTS scan_kind_idx ON body_scan(content_kind);
@@ -491,6 +713,16 @@ def open_database(path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS cohort_name_idx ON body_cohort(cohort);
         CREATE INDEX IF NOT EXISTS domain_name_idx ON body_domain(domain);
     """)
+    semantic_columns = {row[1] for row in db.execute("PRAGMA table_info(body_semantic_scan)")}
+    additions = {
+        "decode_encoding": "TEXT NOT NULL DEFAULT 'UTF-8'",
+        "decode_source": "TEXT NOT NULL DEFAULT 'legacy'",
+        "decode_had_errors": "INTEGER NOT NULL DEFAULT 0",
+        "decode_uncertain": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, declaration in additions.items():
+        if name not in semantic_columns:
+            db.execute(f"ALTER TABLE body_semantic_scan ADD COLUMN {name} {declaration}")
     return db
 
 
@@ -505,7 +737,7 @@ def emit_candidates(db: sqlite3.Connection, directory: Path) -> dict[str, int]:
 
 
 def build(args: argparse.Namespace) -> dict:
-    groups, capture_count, bad_inputs = collect_metadata(args.captures)
+    groups, capture_count, bad_inputs, representation_edges = collect_metadata(args.captures)
     db = open_database(args.database)
     cached = {
         row[0]
@@ -533,6 +765,18 @@ def build(args: argparse.Namespace) -> dict:
         db.execute("DELETE FROM current_body")
         db.execute("DELETE FROM body_cohort")
         db.execute("DELETE FROM body_domain")
+        db.execute("DELETE FROM body_representation_edge")
+        db.executemany("INSERT INTO body_representation_edge VALUES (?,?,?,?,?)", representation_edges)
+        # Transport bytes remain catalogued for provenance. Once Chromium has
+        # supplied the decoded source, they are not a second semantic program.
+        db.execute(
+            "DELETE FROM body_semantic_scan WHERE sha256 IN "
+            "(SELECT transport_sha256 FROM body_representation_edge WHERE evidence LIKE 'exact:%')"
+        )
+        db.execute(
+            "DELETE FROM body_analysis_run WHERE sha256 IN "
+            "(SELECT transport_sha256 FROM body_representation_edge WHERE evidence LIKE 'exact:%')"
+        )
         for digest, group in groups.items():
             db.execute(
                 "INSERT INTO current_body VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -584,6 +828,9 @@ def build(args: argparse.Namespace) -> dict:
         "cached_scans_reused": len(cached & groups.keys()),
         "new_scans": len(scan_items),
         "bad_inputs": len(bad_inputs),
+        "representation_edges": len(representation_edges),
+        "exact_representation_edges": sum(edge[4].startswith("exact:") for edge in representation_edges),
+        "weak_representation_edges": sum(not edge[4].startswith("exact:") for edge in representation_edges),
         "content_kinds": kind_counts,
         "nuisance": nuisance_counts,
         "features": feature_counts,

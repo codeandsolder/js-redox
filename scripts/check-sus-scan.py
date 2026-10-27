@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import subprocess
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,7 +37,18 @@ def main():
         FIXTURES,
     )
     report = json.loads(cp.stdout)
-    assert report["schema"] == "js-sus-scan/v1"
+    assert report["schema"] == "js-sus-scan/v3"
+
+    # Explicit corpus bodies are content-addressed and intentionally have no
+    # JavaScript extension. Explicit file arguments must therefore be scanned
+    # even though recursive directory discovery remains extension-filtered.
+    with tempfile.TemporaryDirectory(dir=ROOT / "work") as tmp:
+        extensionless = Path(tmp) / "0123456789abcdef"
+        extensionless.write_text("const value = 1;\n")
+        direct = json.loads(run(BIN, "--json", extensionless).stdout)
+        assert direct["schema"] == "js-sus-scan/v3"
+        assert len(direct["files"]) == 1, direct
+        assert Path(direct["files"][0]["input"]) == extensionless, direct
 
     by_name = {Path(item["input"]).name: item for item in report["files"]}
     expected = {
@@ -61,8 +73,24 @@ def main():
     }
     assert expected <= by_name.keys(), sorted(by_name)
 
+    # Invalid transport bytes are a decode anomaly, not automatically a JS parse
+    # failure. Browser-compatible replacement must keep the batch alive and keep
+    # decode provenance separate from parser diagnostics.
+    with tempfile.TemporaryDirectory(prefix="sus-scan-extensionless-") as tmp:
+        malformed = Path(tmp) / "deadbeef"
+        malformed.write_bytes(b"// Copyright \xa9 2013\nconst ok = 1;\n")
+        malformed_report = json.loads(run(BIN, "--json", malformed).stdout)
+        assert malformed_report["schema"] == "js-sus-scan/v3"
+        assert len(malformed_report["files"]) == 1, malformed_report
+        malformed_file = malformed_report["files"][0]
+        assert malformed_file["fatal_error"] is False, malformed_file
+        assert malformed_file["decode_had_errors"] is True, malformed_file
+        assert malformed_file["decode_uncertain"] is True, malformed_file
+        assert malformed_file["decode_encoding"] == "UTF-8", malformed_file
+
     dense = by_name["dense-obfuscation.js"]
     clean = by_name["clean-control.js"]
+    module_loader = by_name["module-loader-control.js"]
     asset = by_name["asset-control.js"]
     long_string = by_name["long-string-control.js"]
     rotation = by_name["array-rotation.js"]
@@ -82,6 +110,8 @@ def main():
 
     assert dense["clusters"], dense
     assert dense["top_score"] >= 30, dense["top_score"]
+    assert dense["actionable_clusters"], dense
+    assert dense["actionable_top_score"] >= 12, dense["actionable_top_score"]
     kinds = dense["signal_kinds"]
     assert kinds.get("api_string_table", 0) >= 1, kinds
     assert kinds.get("indexed_lookup", 0) >= 10, kinds
@@ -100,6 +130,12 @@ def main():
 
     assert clean["clusters"] == [], clean
     assert clean["top_score"] == 0, clean["top_score"]
+    assert clean["actionable_clusters"] == [], clean
+    assert clean["actionable_top_score"] == 0, clean["actionable_top_score"]
+    assert module_loader["signal_kinds"].get("numeric_decoder_call_candidate", 0) >= 4, module_loader["signal_kinds"]
+    assert module_loader["top_score"] > 0, module_loader["top_score"]
+    assert module_loader["actionable_top_score"] == 0, module_loader
+    assert module_loader["actionable_clusters"] == [], module_loader
     assert asset["clusters"] == [], asset
     assert asset["signal_kinds"].get("base64_blob", 0) == 0, asset["signal_kinds"]
 

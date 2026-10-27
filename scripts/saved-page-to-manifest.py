@@ -7,6 +7,7 @@ import mimetypes
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from capture_project import MANIFEST_NAME, SCHEMA
@@ -92,6 +93,24 @@ def read_text_lossless(path: Path) -> str | None:
             continue
     return None
 
+
+
+def decode_html_with_browser(path: Path, browser_decode_bin: Path) -> tuple[str, dict]:
+    if not browser_decode_bin.is_file():
+        raise SystemExit(f"browser decoder does not exist: {browser_decode_bin}")
+    with tempfile.TemporaryDirectory(prefix="js-redox-html-decode-") as tmp:
+        decoded_path = Path(tmp) / "decoded.html"
+        cp = subprocess.run(
+            [str(browser_decode_bin), str(path), "--kind", "html", "--output", str(decoded_path), "--json"],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if cp.returncode:
+            raise SystemExit(f"browser HTML decode failed for {path}: {cp.stderr or cp.stdout}")
+        report = json.loads(cp.stdout)
+        return decoded_path.read_text(encoding="utf-8"), report
 
 def find_tag_end(text: str, start: int) -> int | None:
     quote_char = None
@@ -330,12 +349,18 @@ def main():
         type=Path,
         default=ROOT / ".cargo-target-nodebug/debug/source-directives",
     )
+    ap.add_argument(
+        "--browser-decode",
+        type=Path,
+        default=ROOT / ".cargo-target-nodebug/debug/browser-decode",
+    )
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
     page = args.html.resolve()
     output = args.output.resolve()
     source_directives_bin = args.source_directives.resolve()
+    browser_decode_bin = args.browser_decode.resolve()
     if not page.is_file():
         raise SystemExit(f"saved page HTML does not exist: {page}")
     if output.exists():
@@ -344,9 +369,7 @@ def main():
         shutil.rmtree(output)
     output.mkdir(parents=True)
 
-    page_text = read_text_lossless(page)
-    if page_text is None:
-        raise SystemExit("saved page HTML is not decodable as UTF-8")
+    page_text, page_decode = decode_html_with_browser(page, browser_decode_bin)
 
     assets = args.assets_dir.resolve() if args.assets_dir else discover_assets_dir(page, page_text)
     if args.assets_dir and not assets.is_dir():
@@ -367,7 +390,7 @@ def main():
         kind = kind_for(src, mime)
         base_url = canonical_url(capture_rel)
         refs = []
-        text = read_text_lossless(src) if kind in {"javascript", "html", "css", "json", "text"} else None
+        text = (page_text if src == page else read_text_lossless(src)) if kind in {"javascript", "html", "css", "json", "text"} else None
         resources.append({
             "id": rid,
             "pageref": "saved-page",
@@ -390,6 +413,12 @@ def main():
             "response_headers": [],
             "references": refs,
             "saved_source_path": str(src),
+            **({
+                "document_encoding": page_decode["encoding"],
+                "document_decode_source": page_decode["decode_source"],
+                "document_decode_had_errors": bool(page_decode["had_errors"]),
+                "document_decode_uncertain": bool(page_decode["uncertain"]),
+            } if src == page else {}),
         })
         rel_to_id[capture_rel] = rid
         counts[kind] = counts.get(kind, 0) + 1
@@ -451,6 +480,10 @@ def main():
                 "output_path": None,
                 "body_bytes": 0,
                 "sha256": None,
+                "charset": attrs.get("charset"),
+                "parent_document_encoding": page_decode["encoding"],
+                "parent_decode_source": page_decode["decode_source"],
+                "parent_decode_uncertain": bool(page_decode["uncertain"]),
             })
             continue
         body = script["body"]
@@ -480,6 +513,10 @@ def main():
             "output_path": out_rel.as_posix(),
             "body_bytes": len(body_bytes),
             "sha256": digest,
+            "charset": attrs.get("charset"),
+            "parent_document_encoding": page_decode["encoding"],
+            "parent_decode_source": page_decode["decode_source"],
+            "parent_decode_uncertain": bool(page_decode["uncertain"]),
         })
 
     counts["resources_total"] = len(resources)

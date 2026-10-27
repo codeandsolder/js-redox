@@ -86,12 +86,20 @@ pub struct SusCluster {
 pub struct SusFileReport {
     pub input: String,
     pub bytes: usize,
+    pub decode_encoding: String,
+    pub decode_source: String,
+    pub decode_had_errors: bool,
+    pub decode_uncertain: bool,
     pub diagnostics: usize,
     pub fatal_error: bool,
     pub signal_count: usize,
     pub signal_kinds: BTreeMap<String, usize>,
     pub top_score: u32,
     pub clusters: Vec<SusCluster>,
+    pub actionable_signal_count: usize,
+    pub actionable_signal_kinds: BTreeMap<String, usize>,
+    pub actionable_top_score: u32,
+    pub actionable_clusters: Vec<SusCluster>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signals: Option<Vec<SusSignal>>,
 }
@@ -105,6 +113,9 @@ pub struct SusScanReport {
     pub files_scanned: usize,
     pub files_with_clusters: usize,
     pub total_clusters: usize,
+    pub files_with_actionable_clusters: usize,
+    pub total_actionable_clusters: usize,
+    pub total_actionable_signals: usize,
     pub files: Vec<SusFileReport>,
 }
 
@@ -961,6 +972,23 @@ fn materialize_signal(raw: &RawSignal, lines: &[usize]) -> SusSignal {
     }
 }
 
+fn is_actionable_signal(kind: &str) -> bool {
+    // Broad discovery signals below are common in ordinary minified/bundled code.
+    // Keep them in raw evidence, but do not let them alone keep a body in residual debt.
+    !matches!(
+        kind,
+        "indexed_lookup"
+            | "numeric_decoder_call_candidate"
+            | "computed_dispatch_call"
+            | "string_plus_chain"
+            | "string_join"
+            | "concat_call"
+            | "template_assembly"
+            | "bitwise_mix"
+            | "identifier_string_table"
+            | "byte_array"
+    )
+}
 fn normalize_signals(raw: Vec<RawSignal>) -> Vec<RawSignal> {
     // Left-associative string concatenation is represented as nested BinaryExpression
     // nodes. Without normalization, one ordinary long expression such as
@@ -1228,18 +1256,48 @@ pub fn analyze_source(
         options.min_signals,
         options.max_clusters,
     );
-    let lines = line_starts(source);
     let top_score = clusters.first().map_or(0, |cluster| cluster.score);
+    let actionable_signals = signals
+        .iter()
+        .filter(|signal| is_actionable_signal(signal.kind))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut actionable_signal_kinds = BTreeMap::new();
+    for signal in &actionable_signals {
+        *actionable_signal_kinds
+            .entry(signal.kind.to_string())
+            .or_default() += 1;
+    }
+    let actionable_clusters = cluster_signals(
+        source,
+        &actionable_signals,
+        options.window_bytes,
+        options.min_score,
+        options.min_signals,
+        options.max_clusters,
+    );
+    let actionable_top_score = actionable_clusters
+        .first()
+        .map_or(0, |cluster| cluster.score);
+    let lines = line_starts(source);
 
     Ok(SusFileReport {
         input: input.display().to_string(),
         bytes: source.len(),
+        decode_encoding: "UTF-8".to_string(),
+        decode_source: "already-unicode".to_string(),
+        decode_had_errors: false,
+        decode_uncertain: false,
         diagnostics,
         fatal_error,
         signal_count: signals.len(),
         signal_kinds,
         top_score,
         clusters,
+        actionable_signal_count: actionable_signals.len(),
+        actionable_signal_kinds,
+        actionable_top_score,
+        actionable_clusters,
         signals: options.include_signals.then(|| {
             signals
                 .iter()
@@ -1255,8 +1313,9 @@ pub fn build_report(
 ) -> Result<SusScanReport> {
     options.validate()?;
     files.sort_by(|a, b| {
-        b.top_score
-            .cmp(&a.top_score)
+        b.actionable_top_score
+            .cmp(&a.actionable_top_score)
+            .then_with(|| b.top_score.cmp(&a.top_score))
             .then_with(|| a.input.cmp(&b.input))
     });
     let files_with_clusters = files
@@ -1264,14 +1323,26 @@ pub fn build_report(
         .filter(|file| !file.clusters.is_empty())
         .count();
     let total_clusters = files.iter().map(|file| file.clusters.len()).sum();
+    let files_with_actionable_clusters = files
+        .iter()
+        .filter(|file| !file.actionable_clusters.is_empty())
+        .count();
+    let total_actionable_clusters = files
+        .iter()
+        .map(|file| file.actionable_clusters.len())
+        .sum();
+    let total_actionable_signals = files.iter().map(|file| file.actionable_signal_count).sum();
     Ok(SusScanReport {
-        schema: "js-sus-scan/v1",
+        schema: "js-sus-scan/v3",
         window_bytes: options.window_bytes,
         min_score: options.min_score,
         min_signals: options.min_signals,
         files_scanned: files.len(),
         files_with_clusters,
         total_clusters,
+        files_with_actionable_clusters,
+        total_actionable_clusters,
+        total_actionable_signals,
         files,
     })
 }

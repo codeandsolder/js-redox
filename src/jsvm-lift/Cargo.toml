@@ -12,6 +12,7 @@ jsvm-safe-core = { path = "../jsvm-safe-core" }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
+encoding_rs.workspace = true
 oxc_allocator.workspace = true
 oxc_ast.workspace = true
 oxc_ast_visit.workspace = true

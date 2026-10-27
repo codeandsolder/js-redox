@@ -34,15 +34,15 @@ def main():
     shutil.rmtree(WORK, ignore_errors=True)
     ASSETS.mkdir(parents=True)
 
-    PAGE.write_text(
-        "<!-- saved from url=(0032)https://example.invalid/demo -->\n"
-        "<!doctype html><html><head>\n"
-        '  <link rel="stylesheet" href="./Saved_files/site.css">\n'
-        "</head><body>\n"
-        '  <script type="text/javascript; charset=utf-8" src="./Saved_files/app.js"></script>\n'
-        '  <script type="module">import "./Saved_files/inline-dep.js"; console.log("inline");</script>\n'
-        '  <script type="speculationrules">{"prefetch":[{"source":"list","urls":["/next"]}]}</script>\n'
-        "</body></html>\n"
+    PAGE.write_bytes(
+        b"<!-- saved from url=(0032)https://example.invalid/demo -->\n"
+        b'<!doctype html><html><head><meta charset="windows-1252">\n'
+        b'  <link rel="stylesheet" href="./Saved_files/site.css">\n'
+        b"</head><body>\n"
+        b'  <script type="text/javascript" charset="windows-1252" src="./Saved_files/app.js"></script>\n'
+        b'  <script type="module">import "./Saved_files/inline-dep.js"; console.log("\xa9");</script>\n'
+        b'  <script type="speculationrules">{"prefetch":[{"source":"list","urls":["/next"]}]}</script>\n'
+        b"</body></html>\n"
     )
 
     app = (
@@ -116,7 +116,21 @@ def main():
         for script in manifest["inline_scripts"]
         if str(script.get("src", "")).endswith("app.js")
     )
-    assert external_app["script_type"] == "text/javascript; charset=utf-8"
+    assert external_app["script_type"] == "text/javascript"
+    assert external_app["charset"] == "windows-1252"
+    assert external_app["parent_document_encoding"] == "windows-1252"
+    assert external_app["parent_decode_source"] == "html-meta"
+    assert external_app["parent_decode_uncertain"] is False
+    page_resource = next(r for r in manifest["resources"] if r["url"].endswith("/Saved.html"))
+    assert page_resource["document_encoding"] == "windows-1252"
+    assert page_resource["document_decode_source"] == "html-meta"
+    assert page_resource["document_decode_had_errors"] is False
+    assert page_resource["document_decode_uncertain"] is False
+    module_inline = next(
+        script for script in manifest["inline_scripts"]
+        if script.get("script_type") == "module"
+    )
+    assert "©" in (PROJECT / module_inline["output_path"]).read_text()
     speculation = next(
         script
         for script in manifest["inline_scripts"]
