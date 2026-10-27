@@ -37,7 +37,7 @@ def main():
         FIXTURES,
     )
     report = json.loads(cp.stdout)
-    assert report["schema"] == "js-sus-scan/v4"
+    assert report["schema"] == "js-sus-scan/v5"
 
     # Explicit corpus bodies are content-addressed and intentionally have no
     # JavaScript extension. Explicit file arguments must therefore be scanned
@@ -46,7 +46,7 @@ def main():
         extensionless = Path(tmp) / "0123456789abcdef"
         extensionless.write_text("const value = 1;\n")
         direct = json.loads(run(BIN, "--json", extensionless).stdout)
-        assert direct["schema"] == "js-sus-scan/v4"
+        assert direct["schema"] == "js-sus-scan/v5"
         assert len(direct["files"]) == 1, direct
         assert Path(direct["files"][0]["input"]) == extensionless, direct
 
@@ -80,7 +80,7 @@ def main():
         malformed = Path(tmp) / "deadbeef"
         malformed.write_bytes(b"// Copyright \xa9 2013\nconst ok = 1;\n")
         malformed_report = json.loads(run(BIN, "--json", malformed).stdout)
-        assert malformed_report["schema"] == "js-sus-scan/v4"
+        assert malformed_report["schema"] == "js-sus-scan/v5"
         assert len(malformed_report["files"]) == 1, malformed_report
         malformed_file = malformed_report["files"][0]
         assert malformed_file["fatal_error"] is False, malformed_file
@@ -127,6 +127,35 @@ def main():
         assert invalid_file["analysis_complete"] is False, invalid_file
         assert invalid_file.get("parse_recovery") is None, invalid_file
         assert invalid_file["opaque_parse_spans"] == [], invalid_file
+
+    # Generic codec operations are useful discovery evidence, but they are common
+    # in ordinary Unicode/base64/identifier plumbing and must not create residual
+    # debt on their own. Literal code-point reconstruction remains actionable.
+    with tempfile.TemporaryDirectory(prefix="sus-scan-codec-policy-") as tmp:
+        tmp = Path(tmp)
+        codec = tmp / "codec-control.js"
+        codec.write_text(
+            "function utf8(cp) { return String.fromCharCode(cp); }\n"
+            "function decode(x) { return atob(x); }\n"
+            "function id(n) { return n.toString(36); }\n"
+        )
+        codec_file = json.loads(run(BIN, "--json", codec).stdout)["files"][0]
+        assert codec_file["signal_kinds"].get("charcode_decode_call", 0) == 1, codec_file
+        assert codec_file["signal_kinds"].get("base64_decode_call", 0) == 1, codec_file
+        assert codec_file["signal_kinds"].get("radix_string_call", 0) == 1, codec_file
+        assert codec_file["actionable_signal_count"] == 0, codec_file
+        assert codec_file["actionable_top_score"] == 0, codec_file
+
+        literal = tmp / "literal-codepoints.js"
+        literal.write_text(
+            "const hidden = String.fromCharCode(120, 116, 49);\n"
+            "sink(hidden);\n"
+        )
+        literal_file = json.loads(run(BIN, "--json", literal).stdout)["files"][0]
+        assert literal_file["signal_kinds"].get("charcode_decode_call", 0) == 1, literal_file
+        assert literal_file["signal_kinds"].get("charcode_literal_decode", 0) == 1, literal_file
+        assert literal_file["actionable_signal_kinds"].get("charcode_literal_decode", 0) == 1, literal_file
+        assert literal_file["actionable_signal_kinds"].get("charcode_decode_call", 0) == 0, literal_file
 
     dense = by_name["dense-obfuscation.js"]
     clean = by_name["clean-control.js"]

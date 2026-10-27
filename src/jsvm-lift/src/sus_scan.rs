@@ -448,6 +448,15 @@ impl Collector<'_> {
                     it.arguments.len()
                 ),
             );
+            if numeric_args > 0 && numeric_args == it.arguments.len() {
+                self.push(
+                    "charcode_literal_decode",
+                    7 + capped_u32(numeric_args / 4, 6),
+                    it.span,
+                    None,
+                    format!("{numeric_args} immediate numeric code point(s)"),
+                );
+            }
         }
 
         if is_identifierish(callee)
@@ -1002,6 +1011,9 @@ fn is_actionable_signal(kind: &str) -> bool {
             | "bitwise_mix"
             | "identifier_string_table"
             | "byte_array"
+            | "charcode_decode_call"
+            | "base64_decode_call"
+            | "radix_string_call"
     )
 }
 fn normalize_signals(raw: Vec<RawSignal>) -> Vec<RawSignal> {
@@ -1573,7 +1585,7 @@ pub fn build_report(
         .sum();
     let total_actionable_signals = files.iter().map(|file| file.actionable_signal_count).sum();
     Ok(SusScanReport {
-        schema: "js-sus-scan/v4",
+        schema: "js-sus-scan/v5",
         window_bytes: options.window_bytes,
         min_score: options.min_score,
         min_signals: options.min_signals,
