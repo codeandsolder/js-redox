@@ -728,8 +728,25 @@ def open_database(path: Path) -> sqlite3.Connection:
 
 def emit_candidates(db: sqlite3.Connection, directory: Path) -> dict[str, int]:
     directory.mkdir(parents=True, exist_ok=True)
+
+    # The best/latest views use window functions. Re-evaluating those views for
+    # every candidate query turns a cheap bookkeeping pass into hours of repeated
+    # sorting on a full corpus. Snapshot them once for this emission and index the
+    # materialized rows; the underlying analysis tables are immutable while the
+    # candidate files are being generated.
+    db.executescript("\n".join([
+        "DROP TABLE IF EXISTS temp._candidate_analysis_best;",
+        "DROP TABLE IF EXISTS temp._candidate_analysis_latest;",
+        "CREATE TEMP TABLE _candidate_analysis_best AS SELECT sha256, analysis_contract, fatal_error, actionable_top_score, actionable_signal_count FROM (SELECT sha256, analysis_contract, fatal_error, actionable_top_score, actionable_signal_count, ROW_NUMBER() OVER (PARTITION BY sha256, analysis_contract ORDER BY fatal_error ASC, actionable_top_score ASC, actionable_signal_count ASC, actionable_cluster_count ASC, diagnostics ASC, transform_total DESC, observed_at DESC, pipeline_id DESC) AS _rank FROM body_analysis_run) WHERE _rank=1;",
+        "CREATE TEMP TABLE _candidate_analysis_latest AS SELECT sha256, analysis_contract, fatal_error, actionable_top_score, actionable_signal_count FROM (SELECT sha256, analysis_contract, fatal_error, actionable_top_score, actionable_signal_count, ROW_NUMBER() OVER (PARTITION BY sha256, analysis_contract ORDER BY observed_at DESC, pipeline_id DESC) AS _rank FROM body_analysis_run) WHERE _rank=1;",
+        "CREATE INDEX _candidate_best_sha_contract ON _candidate_analysis_best(sha256, analysis_contract);",
+        "CREATE INDEX _candidate_latest_sha_contract ON _candidate_analysis_latest(sha256, analysis_contract);",
+    ]))
+
     counts = {}
     for name, query in CANDIDATE_QUERIES.items():
+        query = query.replace("body_analysis_best", "_candidate_analysis_best")
+        query = query.replace("body_analysis_latest", "_candidate_analysis_latest")
         rows = [str(row[0]) for row in db.execute(query)]
         (directory / f"{name}.txt").write_text("".join(f"{path}\n" for path in rows), encoding="utf-8")
         counts[name] = len(rows)

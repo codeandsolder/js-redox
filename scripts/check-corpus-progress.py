@@ -26,7 +26,9 @@ path=sys.argv[-1]; print(json.dumps({'schema':'js-sus-scan/v3','files':[{'input'
   assert 'semantic pending=0' in semantic2.stdout,semantic2.stdout
   paths=w/'paths.txt'; paths.write_text(str(cap/body)+'\n')
   cp=subprocess.run([sys.executable,str(UPDATER),'--database',str(db),'--candidate-dir',str(cand),'--paths-file',str(paths),'--deobfuscate-safe',str(deob),'--sus-scan',str(sus),'--pipeline-id','test-p1','--nice','0'],check=True,text=True,capture_output=True)
-  report=json.loads(cp.stdout); assert report['recorded']==1,report; assert report['best_known']['residual']==1,report
+  report=json.loads(cp.stdout); assert report['recorded']==1,report; assert report['scheduled']==1,report; assert report['skipped_existing']==0,report; assert report['best_known']['residual']==1,report
+  cp2=subprocess.run([sys.executable,str(UPDATER),'--database',str(db),'--candidate-dir',str(cand),'--paths-file',str(paths),'--deobfuscate-safe',str(deob),'--sus-scan',str(sus),'--pipeline-id','test-p1','--nice','0'],check=True,text=True,capture_output=True)
+  report2=json.loads(cp2.stdout); assert report2['requested']==1,report2; assert report2['scheduled']==0,report2; assert report2['skipped_existing']==1,report2; assert report2['recorded']==0,report2
   con=sqlite3.connect(db); row=con.execute('SELECT actionable_top_score,actionable_signal_count,transform_total FROM body_analysis_best WHERE sha256=?',(sha,)).fetchone(); assert row==(15,3,3),row; con.close()
   assert (cand/'known-residual.txt').read_text().strip()==str(cap/body); assert (cand/'quick-focus.txt').read_text().strip()==str(cap/body)
   sample=subprocess.run([sys.executable,str(SAMPLER),'--database',str(db),'--sus-scan',str(sus),'--sample-per-stratum','1'],check=True,text=True,capture_output=True); sampled=json.loads(sample.stdout); assert sampled['schema']=='js-redox-corpus-classifier-sample/v2',sampled
