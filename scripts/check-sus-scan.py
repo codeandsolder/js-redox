@@ -37,7 +37,7 @@ def main():
         FIXTURES,
     )
     report = json.loads(cp.stdout)
-    assert report["schema"] == "js-sus-scan/v5"
+    assert report["schema"] == "js-sus-scan/v6"
 
     # Explicit corpus bodies are content-addressed and intentionally have no
     # JavaScript extension. Explicit file arguments must therefore be scanned
@@ -46,7 +46,7 @@ def main():
         extensionless = Path(tmp) / "0123456789abcdef"
         extensionless.write_text("const value = 1;\n")
         direct = json.loads(run(BIN, "--json", extensionless).stdout)
-        assert direct["schema"] == "js-sus-scan/v5"
+        assert direct["schema"] == "js-sus-scan/v6"
         assert len(direct["files"]) == 1, direct
         assert Path(direct["files"][0]["input"]) == extensionless, direct
 
@@ -80,7 +80,7 @@ def main():
         malformed = Path(tmp) / "deadbeef"
         malformed.write_bytes(b"// Copyright \xa9 2013\nconst ok = 1;\n")
         malformed_report = json.loads(run(BIN, "--json", malformed).stdout)
-        assert malformed_report["schema"] == "js-sus-scan/v5"
+        assert malformed_report["schema"] == "js-sus-scan/v6"
         assert len(malformed_report["files"]) == 1, malformed_report
         malformed_file = malformed_report["files"][0]
         assert malformed_file["fatal_error"] is False, malformed_file
@@ -156,6 +156,21 @@ def main():
         assert literal_file["signal_kinds"].get("charcode_literal_decode", 0) == 1, literal_file
         assert literal_file["actionable_signal_kinds"].get("charcode_literal_decode", 0) == 1, literal_file
         assert literal_file["actionable_signal_kinds"].get("charcode_decode_call", 0) == 0, literal_file
+
+        encoded = "QUJD" * 40
+        opaque = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_~!@#$%^&*()[]{}:;,.?|" * 6
+        blobs = tmp / "data-blobs.js"
+        blobs.write_text(
+            f'const encoded = "{encoded}";\n'
+            f'const opaque = "{opaque}";\n'
+            'sink(encoded, opaque);\n'
+        )
+        blob_file = json.loads(run(BIN, "--json", blobs).stdout)["files"][0]
+        assert blob_file["signal_kinds"].get("base64_blob", 0) >= 1, blob_file
+        assert blob_file["signal_kinds"].get("opaque_blob", 0) >= 1, blob_file
+        assert blob_file["actionable_signal_kinds"].get("base64_blob", 0) == 0, blob_file
+        assert blob_file["actionable_signal_kinds"].get("opaque_blob", 0) == 0, blob_file
+        assert blob_file["actionable_signal_count"] == 0, blob_file
 
     dense = by_name["dense-obfuscation.js"]
     clean = by_name["clean-control.js"]

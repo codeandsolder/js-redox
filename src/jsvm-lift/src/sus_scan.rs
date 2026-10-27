@@ -1014,6 +1014,8 @@ fn is_actionable_signal(kind: &str) -> bool {
             | "charcode_decode_call"
             | "base64_decode_call"
             | "radix_string_call"
+            | "base64_blob"
+            | "opaque_blob"
     )
 }
 fn normalize_signals(raw: Vec<RawSignal>) -> Vec<RawSignal> {
@@ -1585,7 +1587,7 @@ pub fn build_report(
         .sum();
     let total_actionable_signals = files.iter().map(|file| file.actionable_signal_count).sum();
     Ok(SusScanReport {
-        schema: "js-sus-scan/v5",
+        schema: "js-sus-scan/v6",
         window_bytes: options.window_bytes,
         min_score: options.min_score,
         min_signals: options.min_signals,
