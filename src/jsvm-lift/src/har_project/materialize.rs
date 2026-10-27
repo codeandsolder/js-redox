@@ -294,7 +294,10 @@ fn materialize_entry(
         reused_body = reused;
         if kind == "html" && body_complete {
             let transport_content_type = header_value(&entry.response.headers, "content-type")
-                .or_else(|| (!entry.response.content.mime_type.is_empty()).then_some(entry.response.content.mime_type.as_str()));
+                .or_else(|| {
+                    (!entry.response.content.mime_type.is_empty())
+                        .then_some(entry.response.content.mime_type.as_str())
+                });
             let decoded = decode_html(&body, transport_content_type, None);
             document_encoding = Some(decoded.encoding.clone());
             document_decode_source = Some(decoded.decode_source.as_str().to_string());

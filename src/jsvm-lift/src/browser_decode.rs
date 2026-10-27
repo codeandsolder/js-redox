@@ -50,8 +50,6 @@ impl DecodeSource {
     }
 }
 
-
-
 #[derive(Debug, Clone, Serialize)]
 pub struct DecodedHtml {
     pub source: String,
@@ -114,10 +112,7 @@ fn parse_ascii_attrs(tag: &[u8]) -> Vec<(String, String)> {
             break;
         }
         let name_start = i;
-        while i < tag.len()
-            && !is_html_space(tag[i])
-            && !matches!(tag[i], b'=' | b'>' | b'/')
-        {
+        while i < tag.len() && !is_html_space(tag[i]) && !matches!(tag[i], b'=' | b'>' | b'/') {
             i += 1;
         }
         if name_start == i {
@@ -189,7 +184,10 @@ fn sniff_html_meta_encoding(bytes: &[u8]) -> Option<&'static Encoding> {
     let mut i = 0usize;
     while i + 5 <= bytes.len() {
         if ascii_prefix_ignore_case(&bytes[i..], b"<!--") {
-            if let Some(end) = bytes[i + 4..].windows(3).position(|window| window == b"-->") {
+            if let Some(end) = bytes[i + 4..]
+                .windows(3)
+                .position(|window| window == b"-->")
+            {
                 i += 4 + end + 3;
                 continue;
             }
@@ -200,7 +198,10 @@ fn sniff_html_meta_encoding(bytes: &[u8]) -> Option<&'static Encoding> {
             continue;
         }
         let after_name = i + 5;
-        if after_name < bytes.len() && !is_html_space(bytes[after_name]) && bytes[after_name] != b'/' {
+        if after_name < bytes.len()
+            && !is_html_space(bytes[after_name])
+            && bytes[after_name] != b'/'
+        {
             i += 1;
             continue;
         }
@@ -273,7 +274,11 @@ pub fn decode_html(
         (encoding, DecodeSource::HtmlMeta, false)
     } else {
         let encoding = label_encoding(default_encoding).unwrap_or(WINDOWS_1252);
-        (html_compatible_encoding(encoding), DecodeSource::HtmlFallback, true)
+        (
+            html_compatible_encoding(encoding),
+            DecodeSource::HtmlFallback,
+            true,
+        )
     };
     let (source, actual_encoding, had_errors) = selected.decode(bytes);
     DecodedHtml {
@@ -472,5 +477,4 @@ mod tests {
         assert_eq!(decoded.decode_source, DecodeSource::HtmlFallback);
         assert!(decoded.uncertain);
     }
-
 }

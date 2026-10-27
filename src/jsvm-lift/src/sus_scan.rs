@@ -1245,7 +1245,9 @@ fn expression_is_call(source: &str) -> bool {
     fn is_call(expression: &Expression<'_>) -> bool {
         match expression {
             Expression::CallExpression(_) => true,
-            Expression::ParenthesizedExpression(parenthesized) => is_call(&parenthesized.expression),
+            Expression::ParenthesizedExpression(parenthesized) => {
+                is_call(&parenthesized.expression)
+            }
             _ => false,
         }
     }
@@ -1290,7 +1292,11 @@ fn recover_browser_legacy_call_assignments(
         let start = usize::try_from(label.offset()).ok()?;
         let len = usize::try_from(label.len()).ok()?;
         let end = start.checked_add(len)?;
-        if len == 0 || end > source.len() || !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+        if len == 0
+            || end > source.len()
+            || !source.is_char_boundary(start)
+            || !source.is_char_boundary(end)
+        {
             return None;
         }
         if opaque_spans.iter().any(|span| {
@@ -1474,7 +1480,8 @@ pub fn analyze_source(
         }
         if let Some(recovery) = recover_browser_legacy_call_assignments(source, SourceType::cjs()) {
             let recovery_allocator = Allocator::default();
-            let recovered = Parser::new(&recovery_allocator, &recovery.source, SourceType::cjs()).parse();
+            let recovered =
+                Parser::new(&recovery_allocator, &recovery.source, SourceType::cjs()).parse();
             if !recovered.fatal_error {
                 return analyze_program(
                     source,
@@ -1548,10 +1555,8 @@ pub fn build_report(
         .iter()
         .filter(|file| file.parse_recovery.is_some())
         .count();
-    let files_with_incomplete_analysis = files
-        .iter()
-        .filter(|file| !file.analysis_complete)
-        .count();
+    let files_with_incomplete_analysis =
+        files.iter().filter(|file| !file.analysis_complete).count();
     let files_with_fatal_error = files.iter().filter(|file| file.fatal_error).count();
     let files_with_clusters = files
         .iter()

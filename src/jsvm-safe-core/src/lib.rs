@@ -1202,10 +1202,7 @@ fn semantically_valid_source_type(source: &str, mode: SafeSourceMode) -> Option<
 }
 
 #[must_use]
-pub fn safe_source_rejection(
-    source: &str,
-    mode: SafeSourceMode,
-) -> Option<SafeSourceRejection> {
+pub fn safe_source_rejection(source: &str, mode: SafeSourceMode) -> Option<SafeSourceRejection> {
     validate_source_type(source, mode).err()
 }
 
@@ -1935,7 +1932,10 @@ console.log(d(0x10,"k"),d(0x11,"k"));
             safe_source_rejection("(1 + 2) = 3;", SafeSourceMode::CommonJs),
             Some(SafeSourceRejection::ParseFailure)
         );
-        assert_eq!(safe_source_rejection("const value = 1;", SafeSourceMode::CommonJs), None);
+        assert_eq!(
+            safe_source_rejection("const value = 1;", SafeSourceMode::CommonJs),
+            None
+        );
     }
 
     #[test]
