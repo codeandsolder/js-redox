@@ -33,6 +33,7 @@ jobs:
       rust-toolchain: "1.99.1"
       timeout-minutes: 20
       command: |
+        pipx install uv
         python3 scripts/check-capture-project-contract.py
         python3 scripts/check-analysis-artifact-contract.py
         node tools/cloak-recorder/check-nested-cdp-session.mjs
