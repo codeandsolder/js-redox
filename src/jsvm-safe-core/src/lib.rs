@@ -1137,7 +1137,28 @@ pub enum SafeSourceMode {
     CommonJs,
 }
 
-fn semantically_valid_source_type(source: &str, mode: SafeSourceMode) -> Option<SourceType> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafeSourceRejection {
+    ParseFailure,
+    DynamicWithScope,
+    SemanticFailure,
+}
+
+impl SafeSourceRejection {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ParseFailure => "parse-failure",
+            Self::DynamicWithScope => "dynamic-with-scope",
+            Self::SemanticFailure => "semantic-failure",
+        }
+    }
+}
+
+fn validate_source_type(
+    source: &str,
+    mode: SafeSourceMode,
+) -> Result<SourceType, SafeSourceRejection> {
     // Browser-captured `.js` is normally either a classic Script or an ES
     // Module. Let Oxc resolve that from syntax first, then pin the resolved
     // Program source type for every rewrite iteration. Explicit `.mjs`/`.cjs`
@@ -1148,22 +1169,44 @@ fn semantically_valid_source_type(source: &str, mode: SafeSourceMode) -> Option<
         SafeSourceMode::Module => [Some(SourceType::mjs()), None],
         SafeSourceMode::CommonJs => [Some(SourceType::cjs()), None],
     };
+    let mut saw_with = false;
+    let mut saw_semantic_failure = false;
     for source_type in candidates.into_iter().flatten() {
         let allocator = Allocator::default();
         let Some(program) = parse_as(&allocator, source, source_type) else {
             continue;
         };
         if contains_with_statement(&program) {
+            saw_with = true;
             continue;
         }
         let semantic_ret = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&program);
         if semantic_ret.diagnostics.is_empty() {
-            return Some(program.source_type);
+            return Ok(program.source_type);
         }
+        saw_semantic_failure = true;
     }
-    None
+    if saw_with {
+        Err(SafeSourceRejection::DynamicWithScope)
+    } else if saw_semantic_failure {
+        Err(SafeSourceRejection::SemanticFailure)
+    } else {
+        Err(SafeSourceRejection::ParseFailure)
+    }
+}
+
+fn semantically_valid_source_type(source: &str, mode: SafeSourceMode) -> Option<SourceType> {
+    validate_source_type(source, mode).ok()
+}
+
+#[must_use]
+pub fn safe_source_rejection(
+    source: &str,
+    mode: SafeSourceMode,
+) -> Option<SafeSourceRejection> {
+    validate_source_type(source, mode).err()
 }
 
 fn transform_once(
@@ -1405,7 +1448,8 @@ pub fn deobfuscate_with_standard_numeric_builtins(
 mod tests {
     use super::{
         deobfuscate, deobfuscate_with_source_mode, deobfuscate_with_standard_numeric_builtins,
-        expose_static_strings, recover_static_decoders, ProvenConstantEnvironment, SafeSourceMode,
+        expose_static_strings, recover_static_decoders, safe_source_rejection,
+        ProvenConstantEnvironment, SafeSourceMode, SafeSourceRejection,
     };
     use oxc_allocator::Allocator;
     use oxc_ast::ast::{CallExpression, Expression};
@@ -1879,6 +1923,19 @@ console.log(d(0x10,"k"),d(0x11,"k"));
             probe.values,
             [Some("hello".to_string()), None, Some("world".to_string())]
         );
+    }
+
+    #[test]
+    fn safe_source_rejection_distinguishes_dynamic_scope_from_parse_failure() {
+        assert_eq!(
+            safe_source_rejection("with (scope) { value; }", SafeSourceMode::CommonJs),
+            Some(SafeSourceRejection::DynamicWithScope)
+        );
+        assert_eq!(
+            safe_source_rejection("(1 + 2) = 3;", SafeSourceMode::CommonJs),
+            Some(SafeSourceRejection::ParseFailure)
+        );
+        assert_eq!(safe_source_rejection("const value = 1;", SafeSourceMode::CommonJs), None);
     }
 
     #[test]

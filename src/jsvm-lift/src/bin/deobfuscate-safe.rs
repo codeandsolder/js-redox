@@ -133,8 +133,10 @@ fn main() -> Result<()> {
     let result =
         jsvm_safe_core::deobfuscate_with_source_mode(&original, args.max_iterations, source_mode)
             .ok_or_else(|| {
-            anyhow::anyhow!("source failed parse or semantic validation during safe deobfuscation")
-        })?;
+                let reason = jsvm_safe_core::safe_source_rejection(&original, source_mode)
+                    .map_or("rewrite-validation-failure", jsvm_safe_core::SafeSourceRejection::as_str);
+                anyhow::anyhow!("source rejected by safe deobfuscation: {reason}")
+            })?;
 
     let arithmetic_state_proofs = result
         .arithmetic_state_proofs
