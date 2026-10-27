@@ -5,12 +5,12 @@ use jsvm_safe_core::{string_literal_value, template_element_value};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, BinaryExpression, CallExpression,
-    ComputedMemberExpression, Expression, Function, NewExpression, ObjectExpression,
+    ComputedMemberExpression, Expression, Function, NewExpression, ObjectExpression, Statement,
 };
 use oxc_ast_visit::{walk, Visit};
+use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::scope::ScopeFlags;
-use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -82,6 +82,13 @@ pub struct SusCluster {
     pub snippet: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SusOpaqueParseSpan {
+    pub start: u32,
+    pub end: u32,
+    pub kind: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SusFileReport {
     pub input: String,
@@ -91,7 +98,12 @@ pub struct SusFileReport {
     pub decode_had_errors: bool,
     pub decode_uncertain: bool,
     pub diagnostics: usize,
+    pub parser_fatal_error: bool,
     pub fatal_error: bool,
+    pub analysis_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parse_recovery: Option<String>,
+    pub opaque_parse_spans: Vec<SusOpaqueParseSpan>,
     pub signal_count: usize,
     pub signal_kinds: BTreeMap<String, usize>,
     pub top_score: u32,
@@ -111,6 +123,9 @@ pub struct SusScanReport {
     pub min_score: u32,
     pub min_signals: usize,
     pub files_scanned: usize,
+    pub files_with_parse_recovery: usize,
+    pub files_with_incomplete_analysis: usize,
+    pub files_with_fatal_error: usize,
     pub files_with_clusters: usize,
     pub total_clusters: usize,
     pub files_with_actionable_clusters: usize,
@@ -1211,36 +1226,135 @@ fn cluster_signals(
     materialize_clusters(source, &signals, selected)
 }
 
-fn parse_source<'a>(
-    allocator: &'a Allocator,
-    source: &'a str,
-    path: &Path,
-) -> (oxc_ast::ast::Program<'a>, usize, bool) {
-    let source_type = match path.extension().and_then(|ext| ext.to_str()) {
+fn primary_source_type(path: &Path) -> SourceType {
+    match path.extension().and_then(|ext| ext.to_str()) {
         Some("cjs") => SourceType::cjs(),
         _ => SourceType::mjs(),
-    };
-    let parsed = parse_program(allocator, source, source_type);
-    let diagnostics = parsed.diagnostics;
-    (parsed.program, diagnostics, parsed.fatal_error)
+    }
 }
 
-pub fn analyze_source(
+fn expression_is_call(source: &str) -> bool {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::cjs()).parse();
+    if parsed.fatal_error || !parsed.diagnostics.is_empty() || parsed.program.body.len() != 1 {
+        return false;
+    }
+    let Statement::ExpressionStatement(statement) = &parsed.program.body[0] else {
+        return false;
+    };
+    fn is_call(expression: &Expression<'_>) -> bool {
+        match expression {
+            Expression::CallExpression(_) => true,
+            Expression::ParenthesizedExpression(parenthesized) => is_call(&parenthesized.expression),
+            _ => false,
+        }
+    }
+    is_call(&statement.expression)
+}
+
+#[derive(Debug)]
+struct BrowserParseRecovery {
+    source: String,
+    opaque_spans: Vec<SusOpaqueParseSpan>,
+}
+
+fn recover_browser_legacy_call_assignments(
+    source: &str,
+    source_type: SourceType,
+) -> Option<BrowserParseRecovery> {
+    let mut masked = source.to_string();
+    let mut opaque_spans = Vec::new();
+
+    // Oxc intentionally models only spec-valid AssignmentTarget nodes. V8 also
+    // accepts a legacy web form such as `f() = value` and throws ReferenceError
+    // if execution reaches it. Recover an AST for scanning by masking only that
+    // invalid target, preserving byte offsets exactly. The original source is
+    // never rewritten or published from this recovery view.
+    for _ in 0..64 {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, &masked, source_type).parse();
+        if !parsed.fatal_error {
+            return (!opaque_spans.is_empty()).then_some(BrowserParseRecovery {
+                source: masked,
+                opaque_spans,
+            });
+        }
+        if parsed.diagnostics.len() != 1 {
+            return None;
+        }
+        let diagnostic = &parsed.diagnostics[0];
+        if diagnostic.message.as_ref() != "Cannot assign to this expression" {
+            return None;
+        }
+        let label = diagnostic.labels.first()?;
+        let start = usize::try_from(label.offset()).ok()?;
+        let len = usize::try_from(label.len()).ok()?;
+        let end = start.checked_add(len)?;
+        if len == 0 || end > source.len() || !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+            return None;
+        }
+        if opaque_spans.iter().any(|span| {
+            let span_start = span.start as usize;
+            let span_end = span.end as usize;
+            start < span_end && span_start < end
+        }) {
+            return None;
+        }
+        if !expression_is_call(&source[start..end]) {
+            return None;
+        }
+        masked.replace_range(start..end, &"_".repeat(len));
+        opaque_spans.push(SusOpaqueParseSpan {
+            start: u32::try_from(start).ok()?,
+            end: u32::try_from(end).ok()?,
+            kind: "browser_legacy_call_assignment_target".to_string(),
+        });
+    }
+    None
+}
+
+fn overlaps_opaque_span(signal: &RawSignal, opaque_spans: &[SusOpaqueParseSpan]) -> bool {
+    opaque_spans
+        .iter()
+        .any(|span| signal.start < span.end && span.start < signal.end)
+}
+
+struct ParseAnalysisState {
+    diagnostics: usize,
+    parser_fatal_error: bool,
+    fatal_error: bool,
+    analysis_complete: bool,
+    parse_recovery: Option<String>,
+    opaque_parse_spans: Vec<SusOpaqueParseSpan>,
+}
+
+fn analyze_program(
     source: &str,
     input: &Path,
     options: &SusScanOptions,
+    program: &oxc_ast::ast::Program<'_>,
+    state: ParseAnalysisState,
 ) -> Result<SusFileReport> {
-    options.validate()?;
-    let allocator = Allocator::default();
-    let (program, diagnostics, fatal_error) = parse_source(&allocator, source, input);
-
+    let ParseAnalysisState {
+        diagnostics,
+        parser_fatal_error,
+        fatal_error,
+        analysis_complete,
+        parse_recovery,
+        opaque_parse_spans,
+    } = state;
     let mut collector = Collector {
         source,
         blob_min_len: options.blob_min_len,
         signals: Vec::new(),
     };
     if !fatal_error {
-        collector.visit_program(&program);
+        collector.visit_program(program);
+    }
+    if !opaque_parse_spans.is_empty() {
+        collector
+            .signals
+            .retain(|signal| !overlaps_opaque_span(signal, &opaque_parse_spans));
     }
 
     let signals = normalize_signals(collector.signals);
@@ -1289,7 +1403,11 @@ pub fn analyze_source(
         decode_had_errors: false,
         decode_uncertain: false,
         diagnostics,
+        parser_fatal_error,
         fatal_error,
+        analysis_complete,
+        parse_recovery,
+        opaque_parse_spans,
         signal_count: signals.len(),
         signal_kinds,
         top_score,
@@ -1307,6 +1425,114 @@ pub fn analyze_source(
     })
 }
 
+pub fn analyze_source(
+    source: &str,
+    input: &Path,
+    options: &SusScanOptions,
+) -> Result<SusFileReport> {
+    options.validate()?;
+    let source_type = primary_source_type(input);
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if !parsed.fatal_error {
+        return analyze_program(
+            source,
+            input,
+            options,
+            &parsed.program,
+            ParseAnalysisState {
+                diagnostics: parsed.diagnostics.len(),
+                parser_fatal_error: false,
+                fatal_error: false,
+                analysis_complete: true,
+                parse_recovery: None,
+                opaque_parse_spans: Vec::new(),
+            },
+        );
+    }
+
+    let initial_diagnostics = parsed.diagnostics.len();
+    let may_try_classic = path_allows_classic_fallback(input);
+    if may_try_classic {
+        let classic_allocator = Allocator::default();
+        let classic = Parser::new(&classic_allocator, source, SourceType::cjs()).parse();
+        if !classic.fatal_error {
+            return analyze_program(
+                source,
+                input,
+                options,
+                &classic.program,
+                ParseAnalysisState {
+                    diagnostics: classic.diagnostics.len(),
+                    parser_fatal_error: true,
+                    fatal_error: false,
+                    analysis_complete: true,
+                    parse_recovery: Some("classic-script-fallback".to_string()),
+                    opaque_parse_spans: Vec::new(),
+                },
+            );
+        }
+        if let Some(recovery) = recover_browser_legacy_call_assignments(source, SourceType::cjs()) {
+            let recovery_allocator = Allocator::default();
+            let recovered = Parser::new(&recovery_allocator, &recovery.source, SourceType::cjs()).parse();
+            if !recovered.fatal_error {
+                return analyze_program(
+                    source,
+                    input,
+                    options,
+                    &recovered.program,
+                    ParseAnalysisState {
+                        diagnostics: recovered.diagnostics.len(),
+                        parser_fatal_error: true,
+                        fatal_error: false,
+                        analysis_complete: false,
+                        parse_recovery: Some("browser-legacy-call-assignment".to_string()),
+                        opaque_parse_spans: recovery.opaque_spans,
+                    },
+                );
+            }
+        }
+    } else if let Some(recovery) = recover_browser_legacy_call_assignments(source, source_type) {
+        let recovery_allocator = Allocator::default();
+        let recovered = Parser::new(&recovery_allocator, &recovery.source, source_type).parse();
+        if !recovered.fatal_error {
+            return analyze_program(
+                source,
+                input,
+                options,
+                &recovered.program,
+                ParseAnalysisState {
+                    diagnostics: recovered.diagnostics.len(),
+                    parser_fatal_error: true,
+                    fatal_error: false,
+                    analysis_complete: false,
+                    parse_recovery: Some("browser-legacy-call-assignment".to_string()),
+                    opaque_parse_spans: recovery.opaque_spans,
+                },
+            );
+        }
+    }
+
+    analyze_program(
+        source,
+        input,
+        options,
+        &parsed.program,
+        ParseAnalysisState {
+            diagnostics: initial_diagnostics,
+            parser_fatal_error: true,
+            fatal_error: true,
+            analysis_complete: false,
+            parse_recovery: None,
+            opaque_parse_spans: Vec::new(),
+        },
+    )
+}
+
+fn path_allows_classic_fallback(path: &Path) -> bool {
+    !matches!(path.extension().and_then(|ext| ext.to_str()), Some("mjs"))
+}
+
 pub fn build_report(
     mut files: Vec<SusFileReport>,
     options: &SusScanOptions,
@@ -1318,6 +1544,15 @@ pub fn build_report(
             .then_with(|| b.top_score.cmp(&a.top_score))
             .then_with(|| a.input.cmp(&b.input))
     });
+    let files_with_parse_recovery = files
+        .iter()
+        .filter(|file| file.parse_recovery.is_some())
+        .count();
+    let files_with_incomplete_analysis = files
+        .iter()
+        .filter(|file| !file.analysis_complete)
+        .count();
+    let files_with_fatal_error = files.iter().filter(|file| file.fatal_error).count();
     let files_with_clusters = files
         .iter()
         .filter(|file| !file.clusters.is_empty())
@@ -1333,11 +1568,14 @@ pub fn build_report(
         .sum();
     let total_actionable_signals = files.iter().map(|file| file.actionable_signal_count).sum();
     Ok(SusScanReport {
-        schema: "js-sus-scan/v3",
+        schema: "js-sus-scan/v4",
         window_bytes: options.window_bytes,
         min_score: options.min_score,
         min_signals: options.min_signals,
         files_scanned: files.len(),
+        files_with_parse_recovery,
+        files_with_incomplete_analysis,
+        files_with_fatal_error,
         files_with_clusters,
         total_clusters,
         files_with_actionable_clusters,

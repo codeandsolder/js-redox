@@ -37,7 +37,7 @@ def main():
         FIXTURES,
     )
     report = json.loads(cp.stdout)
-    assert report["schema"] == "js-sus-scan/v3"
+    assert report["schema"] == "js-sus-scan/v4"
 
     # Explicit corpus bodies are content-addressed and intentionally have no
     # JavaScript extension. Explicit file arguments must therefore be scanned
@@ -46,7 +46,7 @@ def main():
         extensionless = Path(tmp) / "0123456789abcdef"
         extensionless.write_text("const value = 1;\n")
         direct = json.loads(run(BIN, "--json", extensionless).stdout)
-        assert direct["schema"] == "js-sus-scan/v3"
+        assert direct["schema"] == "js-sus-scan/v4"
         assert len(direct["files"]) == 1, direct
         assert Path(direct["files"][0]["input"]) == extensionless, direct
 
@@ -80,13 +80,53 @@ def main():
         malformed = Path(tmp) / "deadbeef"
         malformed.write_bytes(b"// Copyright \xa9 2013\nconst ok = 1;\n")
         malformed_report = json.loads(run(BIN, "--json", malformed).stdout)
-        assert malformed_report["schema"] == "js-sus-scan/v3"
+        assert malformed_report["schema"] == "js-sus-scan/v4"
         assert len(malformed_report["files"]) == 1, malformed_report
         malformed_file = malformed_report["files"][0]
         assert malformed_file["fatal_error"] is False, malformed_file
         assert malformed_file["decode_had_errors"] is True, malformed_file
         assert malformed_file["decode_uncertain"] is True, malformed_file
         assert malformed_file["decode_encoding"] == "UTF-8", malformed_file
+
+    # Chromium/V8 accepts the legacy web form `CallExpression = value` and
+    # throws ReferenceError only if execution reaches the assignment. Oxc has
+    # no AssignmentTarget AST variant for the call expression. sus-scan must
+    # therefore recover an analysis-only AST without treating the original
+    # source as rewritten or semantically complete.
+    with tempfile.TemporaryDirectory(prefix="sus-scan-browser-legacy-") as tmp:
+        legacy = Path(tmp) / "legacy.js"
+        legacy.write_text(
+            "function target() { return 1; }\n"
+            "target() = 2;\n"
+            "eval('visible');\n"
+        )
+        legacy_file = json.loads(run(BIN, "--json", legacy).stdout)["files"][0]
+        assert legacy_file["parser_fatal_error"] is True, legacy_file
+        assert legacy_file["fatal_error"] is False, legacy_file
+        assert legacy_file["analysis_complete"] is False, legacy_file
+        assert legacy_file["parse_recovery"] == "browser-legacy-call-assignment", legacy_file
+        assert [span["kind"] for span in legacy_file["opaque_parse_spans"]] == [
+            "browser_legacy_call_assignment_target"
+        ], legacy_file
+        assert legacy_file["signal_kinds"].get("dynamic_code_call", 0) >= 1, legacy_file
+
+        legacy_html = Path(tmp) / "legacy-html-comment.js"
+        legacy_html.write_text("<!--\n$(document).ready(function() { $('#slideshow0').nivoSlider(); });\n-->")
+        html_file = json.loads(run(BIN, "--json", legacy_html).stdout)["files"][0]
+        assert html_file["parser_fatal_error"] is True, html_file
+        assert html_file["fatal_error"] is False, html_file
+        assert html_file["analysis_complete"] is True, html_file
+        assert html_file["parse_recovery"] == "classic-script-fallback", html_file
+        assert html_file["opaque_parse_spans"] == [], html_file
+
+        invalid = Path(tmp) / "invalid-assignment.js"
+        invalid.write_text("(1 + 2) = 3;\n")
+        invalid_file = json.loads(run(BIN, "--json", invalid).stdout)["files"][0]
+        assert invalid_file["parser_fatal_error"] is True, invalid_file
+        assert invalid_file["fatal_error"] is True, invalid_file
+        assert invalid_file["analysis_complete"] is False, invalid_file
+        assert invalid_file.get("parse_recovery") is None, invalid_file
+        assert invalid_file["opaque_parse_spans"] == [], invalid_file
 
     dense = by_name["dense-obfuscation.js"]
     clean = by_name["clean-control.js"]
