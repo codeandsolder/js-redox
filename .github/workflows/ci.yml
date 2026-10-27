@@ -9,104 +9,40 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-env:
-  # The host sccache daemon must see Cargo registry paths at the same absolute path.
-  CARGO_HOME: /srv/ci/github-actions-rustup/js-redox/cargo-home
-  CARGO_INCREMENTAL: "0"
-  RUSTC_WRAPPER: /usr/local/bin/sccache
-
 permissions:
   contents: read
 
 jobs:
   rust:
     name: Rust 1.99 quality gate
-    runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-24.04]
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
-        with:
-          components: rustfmt,clippy
-      - name: Validate Garage sccache
-        run: |
-          rustc_path="$(rustup which rustc)"
-          /usr/local/bin/sccache "$rustc_path" -vV
-          stats="$(/usr/local/bin/sccache --show-stats)"
-          printf '%s\n' "$stats"
-          /usr/bin/grep -q 'L0 (s3)' <<<"$stats"
-          ! /usr/bin/grep -q 'Cache location                  Local disk' <<<"$stats"
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Test
-        run: cargo test --locked --workspace
-      - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@1232321acb7d4d8ceefabe1950e3ebc9227f8f36
+    with:
+      rust-toolchain: "1.99.1"
+      rust-components: "rustfmt clippy"
+      timeout-minutes: 20
+      command: |
+        cargo +1.99.1 fmt --all -- --check
+        cargo +1.99.1 test --locked --workspace
+        cargo +1.99.1 clippy --locked --workspace --all-targets -- -D warnings
+
   semantic:
     name: Semantic/runtime regressions
     needs: rust
-    runs-on: [self-hosted, Linux, X64, codeandsolder-private, ubuntu-24.04]
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-      - name: Validate Garage sccache
-        run: |
-          rustc_path="$(rustup which rustc)"
-          /usr/local/bin/sccache "$rustc_path" -vV
-          stats="$(/usr/local/bin/sccache --show-stats)"
-          printf '%s\n' "$stats"
-          /usr/bin/grep -q 'L0 (s3)' <<<"$stats"
-          ! /usr/bin/grep -q 'Cache location                  Local disk' <<<"$stats"
-      - name: Install uv
-        uses: astral-sh/setup-uv@v10.3.2
-        with:
-          version: latest-known
-      - name: Persisted capture contracts
-        run: |
-          uv run --no-project python scripts/check-capture-project-contract.py
-          uv run --no-project python scripts/check-analysis-artifact-contract.py
-          node tools/cloak-recorder/check-nested-cdp-session.mjs
-      - name: Build analysis tools
-        run: |
-          cargo build --locked --workspace --bins
-          mkdir -p .cargo-target-nodebug/debug
-          install -m 0755 \
-            target/debug/har-project \
-            target/debug/jsvm-lift \
-            target/debug/js-format \
-            target/debug/switch-ir \
-            target/debug/table-ir \
-            target/debug/js-refs \
-            target/debug/source-directives \
-            target/debug/api-surface \
-            target/debug/static-string-recover \
-            target/debug/static-byte-artifacts \
-            target/debug/deobfuscate-safe \
-            target/debug/bundle-unpack \
-            target/debug/sourcemap-compose \
-            target/debug/wasm-redox \
-            target/debug/fresh-eval \
-            target/debug/wasm-import-semantics \
-            .cargo-target-nodebug/debug/
-      - name: HAR content/body semantics
-        run: uv run --no-project python scripts/check-har-content-classification.py
-      - name: Safe deobfuscation runtime equivalence
-        run: uv run --no-project python scripts/check-safe-deobfuscate.py
-      - name: Deobfuscation source-mode pipeline
-        run: uv run --no-project python scripts/check-deobfuscation-source-mode-pipeline.py
-      - name: Static API surface
-        run: uv run --no-project python scripts/check-api-surface.py
-      - name: Static string recovery
-        run: uv run --no-project python scripts/check-static-string-recovery.py
-      - name: VM capture pipeline
-        run: uv run --no-project python scripts/check-vm-capture-pipeline.py
-      - name: WebAssembly capture pipeline
-        run: uv run --no-project python scripts/check-wasm-capture-pipeline.py
-      - name: WebAssembly runtime resource provenance
-        run: uv run --no-project python scripts/check-wasm-resource-provenance.py
-      - name: WebAssembly copied-input boundary
-        run: uv run --no-project python scripts/check-wasm-copied-input-boundary.py
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@1232321acb7d4d8ceefabe1950e3ebc9227f8f36
+    with:
+      rust-toolchain: "1.99.1"
+      timeout-minutes: 20
+      command: |
+        python3 scripts/check-capture-project-contract.py
+        python3 scripts/check-analysis-artifact-contract.py
+        node tools/cloak-recorder/check-nested-cdp-session.mjs
+        cargo +1.99.1 build --locked --workspace --bins --target-dir .cargo-target-nodebug
+        python3 scripts/check-har-content-classification.py
+        python3 scripts/check-safe-deobfuscate.py
+        python3 scripts/check-deobfuscation-source-mode-pipeline.py
+        python3 scripts/check-api-surface.py
+        python3 scripts/check-static-string-recovery.py
+        python3 scripts/check-vm-capture-pipeline.py
+        python3 scripts/check-wasm-capture-pipeline.py
+        python3 scripts/check-wasm-resource-provenance.py
+        python3 scripts/check-wasm-copied-input-boundary.py
