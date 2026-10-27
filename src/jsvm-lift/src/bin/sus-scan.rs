@@ -191,8 +191,13 @@ fn print_text(report: &SusScanReport) {
         }
     }
     println!(
-        "\nSUS summary: {} file(s) scanned; {} with clusters; {} cluster(s)",
-        report.files_scanned, report.files_with_clusters, report.total_clusters
+        "\nSUS summary: {} file(s) scanned; {} parse-recovered; {} incomplete; {} fatal; {} with clusters; {} cluster(s)",
+        report.files_scanned,
+        report.files_with_parse_recovery,
+        report.files_with_incomplete_analysis,
+        report.files_with_fatal_error,
+        report.files_with_clusters,
+        report.total_clusters
     );
 }
 
