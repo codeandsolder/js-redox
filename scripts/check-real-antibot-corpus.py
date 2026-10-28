@@ -87,7 +87,7 @@ MIN_SIGNALS = {
     },
     "google-knitsail-current": {
         "embedded": 1,
-        "if_ladder_state_machines_recursive": 4,
+        "if_ladder_state_machines_recursive": 40,
     },
 }
 
