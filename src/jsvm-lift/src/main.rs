@@ -1,3 +1,4 @@
+use std::path::Path;
 mod ast_utils;
 mod bytecode;
 mod decoder;
@@ -151,7 +152,7 @@ fn scan_embedded_candidate(
     }
 }
 
-fn scan_file(path: &PathBuf, dump_dir: Option<&std::path::Path>) -> Result<ScanReport> {
+fn scan_file(path: &Path, dump_dir: Option<&std::path::Path>) -> Result<ScanReport> {
     let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let core = scan_source_core(&source);
     let embedded = core
