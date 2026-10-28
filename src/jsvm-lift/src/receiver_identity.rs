@@ -596,22 +596,13 @@ pub struct ProvenOriginFlow {
     pub direct_calls: Vec<ProvenOriginDirectCall>,
 }
 
-#[must_use]
-pub fn structurally_proven_origin_flow(
+fn analyze_origin_contexts(
     program: &Program<'_>,
     scoping: &Scoping,
+    functions: &FunctionCollector,
+    initial_contexts: impl IntoIterator<Item = FunctionContext>,
 ) -> ProvenOriginFlow {
-    let mut functions = FunctionCollector::new();
-    functions.visit_program(program);
-
-    let mut allocations = AllocationCollector {
-        scoping,
-        functions: &functions.by_symbol,
-        contexts: Vec::new(),
-    };
-    allocations.visit_program(program);
-
-    let mut queue = VecDeque::from(allocations.contexts);
+    let mut queue = initial_contexts.into_iter().collect::<VecDeque<_>>();
     let mut seen = HashSet::new();
     let mut flow = ProvenOriginFlow::default();
     while let Some(mut context) = queue.pop_front() {
@@ -672,6 +663,75 @@ pub fn structurally_proven_origin_flow(
     });
     flow.direct_calls.dedup();
     flow
+}
+
+#[must_use]
+pub fn structurally_proven_origin_flow(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> ProvenOriginFlow {
+    let mut functions = FunctionCollector::new();
+    functions.visit_program(program);
+
+    let mut allocations = AllocationCollector {
+        scoping,
+        functions: &functions.by_symbol,
+        contexts: Vec::new(),
+    };
+    allocations.visit_program(program);
+    analyze_origin_contexts(program, scoping, &functions, allocations.contexts)
+}
+
+/// Continue exact-origin propagation from contexts proven by another theorem.
+///
+/// This function validates that each seed names a regular, statically collected
+/// function and that its parameter indices are in range, but it deliberately
+/// does not re-prove the seed itself. Callers must only construct seeds from
+/// already-proven object identity and call-target facts.
+#[must_use]
+pub fn propagate_proven_origin_contexts(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    seeds: &[ProvenOriginContext],
+) -> ProvenOriginFlow {
+    let mut functions = FunctionCollector::new();
+    functions.visit_program(program);
+
+    let initial_contexts = seeds.iter().filter_map(|seed| {
+        let function = FunctionKey {
+            start: seed.function_start,
+            end: seed.function_end,
+        };
+        let constructor = FunctionKey {
+            start: seed.constructor_start,
+            end: seed.constructor_end,
+        };
+        let info = functions.by_key.get(&function)?;
+        functions.by_key.get(&constructor)?;
+        if seed
+            .parameter_indices
+            .iter()
+            .any(|index| *index >= info.parameters.len())
+        {
+            return None;
+        }
+        let origin = ObjectOrigin {
+            allocation_start: seed.allocation_start,
+            allocation_end: seed.allocation_end,
+            constructor,
+        };
+        let mut parameter_origins = vec![None; info.parameters.len()];
+        for index in &seed.parameter_indices {
+            parameter_origins[*index] = Some(origin);
+        }
+        (seed.this_origin || !seed.parameter_indices.is_empty()).then_some(FunctionContext {
+            function,
+            this_origin: seed.this_origin.then_some(origin),
+            parameter_origins,
+        })
+    });
+
+    analyze_origin_contexts(program, scoping, &functions, initial_contexts)
 }
 
 #[must_use]
@@ -1551,8 +1611,9 @@ pub fn structurally_proven_prototype_method_receiver_effects(
 #[cfg(test)]
 mod tests {
     use super::{
-        structurally_proven_member_receiver_origins, structurally_proven_member_write_origins,
-        structurally_proven_origin_direct_calls, structurally_proven_prototype_method_assignments,
+        propagate_proven_origin_contexts, structurally_proven_member_receiver_origins,
+        structurally_proven_member_write_origins, structurally_proven_origin_direct_calls,
+        structurally_proven_prototype_method_assignments,
         structurally_proven_prototype_method_lookup_targets,
         structurally_proven_prototype_method_receiver_effects,
     };
@@ -1610,6 +1671,56 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping())
+    }
+
+    #[test]
+    fn propagates_already_proven_method_this_through_direct_calls() {
+        let source = r#"
+            const C = function() { this.marker = 1; };
+            C.prototype.run = function() { bridge(this); };
+            function bridge(state) { state.finish(); }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+
+        let origin =
+            structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping())
+                .into_iter()
+                .find(|write| write.property.as_deref() == Some("marker"))
+                .expect("constructor-origin write");
+        let method = structurally_proven_prototype_method_assignments(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .into_iter()
+        .find(|method| method.property == "run")
+        .expect("run assignment");
+        let [function] = method.possible_functions.as_slice() else {
+            panic!("one run body");
+        };
+        let seed = super::ProvenOriginContext {
+            function_start: function.function_start,
+            function_end: function.function_end,
+            allocation_start: origin.allocation_start,
+            allocation_end: origin.allocation_end,
+            constructor_start: origin.constructor_start,
+            constructor_end: origin.constructor_end,
+            this_origin: true,
+            parameter_indices: Vec::new(),
+        };
+
+        let flow =
+            propagate_proven_origin_contexts(&parsed.program, semantic.semantic.scoping(), &[seed]);
+        assert_eq!(flow.direct_calls.len(), 1);
+        assert_eq!(flow.member_calls.len(), 1);
+        assert_eq!(flow.member_calls[0].property, "finish");
+        assert_eq!(flow.member_calls[0].context.parameter_indices, vec![0]);
     }
 
     #[test]
