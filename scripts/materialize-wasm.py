@@ -49,10 +49,15 @@ def run_static_byte_recovery(tool: Path, source: Path, output_dir: Path) -> dict
     return report
 
 
-def run_analysis(tool: Path, binary: Path, output: Path) -> tuple[bool, str | None]:
+def run_analysis(
+    tool: Path, binary: Path, output: Path, *, skip_wax: bool = False
+) -> tuple[bool, str | None]:
     output.mkdir(parents=True, exist_ok=True)
+    command = [str(tool), str(binary), "--output-dir", str(output)]
+    if skip_wax:
+        command.append("--skip-wax")
     cp = subprocess.run(
-        [str(tool), str(binary), "--output-dir", str(output), "--skip-wax"],
+        command,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -71,6 +76,11 @@ def main() -> None:
         "--static-byte-artifacts",
         type=Path,
         help="Rust static byte producer; defaults to the wasm-redox tool directory",
+    )
+    ap.add_argument(
+        "--skip-wax",
+        action="store_true",
+        help="skip the optional high-level Wax decompile; enabled by default",
     )
     args = ap.parse_args()
 
@@ -220,7 +230,7 @@ def main() -> None:
     for digest in sorted(origins):
         binary = binary_paths[digest]
         out = modules_root / digest
-        ok, error = run_analysis(args.wasm_redox, binary, out)
+        ok, error = run_analysis(args.wasm_redox, binary, out, skip_wax=args.skip_wax)
         row = {
             "sha256": digest,
             "byte_len": binary.stat().st_size,
@@ -238,6 +248,11 @@ def main() -> None:
                     "report_path": rel(project, out / "module.report.json"),
                     "wat_path": rel(project, out / "module.readable.wat"),
                     "deep_path": rel(project, out / "module.deep.json"),
+                    **(
+                        {"wax_path": rel(project, out / "module.readable.wax")}
+                        if (out / "module.readable.wax").is_file()
+                        else {}
+                    ),
                 }
             )
         modules.append(row)

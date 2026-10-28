@@ -13,6 +13,7 @@ Provenance-preserving static recovery for hostile browser JavaScript and embedde
 - `src/sourcemap-compose/` — isolated source-map chain composition.
 - `src/wasm-redox/` — WASM validation/readability, deep CFG/state-machine recovery and JavaScript/WASM boundary proofs.
 - `scripts/` — capture pipeline, proof correlation, build, benchmark and regression helpers.
+- Large unpinned-corpus acquisition, grading, catalog, and review tooling lives in [`codeandsolder/js-redox-corpus`](https://github.com/codeandsolder/js-redox-corpus); this repository keeps only engine-facing and pinned-regression tooling.
 - `third_party/` — pinned reference implementations / corpus generators.
 - `work/` — disposable derived analysis output.
 

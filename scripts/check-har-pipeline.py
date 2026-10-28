@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import hashlib
 import json
 import runpy
@@ -38,7 +39,12 @@ def run(*args):
 
 
 def entry(url, mime, text, when="2026-09-29T00:00:00.000Z"):
-    size = len(text.encode())
+    if isinstance(text, bytes):
+        size = len(text)
+        content = {"size": size, "mimeType": mime, "text": base64.b64encode(text).decode(), "encoding": "base64"}
+    else:
+        size = len(text.encode())
+        content = {"size": size, "mimeType": mime, "text": text}
     return {
         "pageref": "page_1",
         "startedDateTime": when,
@@ -59,7 +65,7 @@ def entry(url, mime, text, when="2026-09-29T00:00:00.000Z"):
             "httpVersion": "HTTP/2",
             "headers": [{"name": "content-type", "value": mime}],
             "cookies": [],
-            "content": {"size": size, "mimeType": mime, "text": text},
+            "content": content,
             "redirectURL": "",
             "headersSize": -1,
             "bodySize": size,
@@ -96,11 +102,11 @@ def main():
         + '//# sourceMappingURL=app.js.map\n'
     )
     html = (
-        "<!doctype html><html><body>"
-        '<script src="/assets/app.js"></script>'
-        '<script type="80bb470769a376240e5e4e06-text/javascript">globalThis.inlineHar = 1;</script>'
-        '<script type="speculationrules">{"prefetch":[{"source":"list","urls":["/next"]}]}</script>'
-        "</body></html>"
+        b'<!doctype html><html><head><meta charset="windows-1252"></head><body>'
+        b'<script charset="windows-1252" src="/assets/app.js"></script>'
+        b'<script type="80bb470769a376240e5e4e06-text/javascript">globalThis.inlineHar = "\xa9";</script>'
+        b'<script type="speculationrules">{"prefetch":[{"source":"list","urls":["/next"]}]}</script>'
+        b"</body></html>"
     )
     worker_js = 'postMessage("ready");\n'
     source_map = {
@@ -221,6 +227,18 @@ def main():
         if script.get("output_path", "").endswith(".js")
     )
     assert executable_inline["script_type"] == "80bb470769a376240e5e4e06-text/javascript"
+    assert executable_inline["parent_document_encoding"] == "windows-1252"
+    assert executable_inline["parent_decode_source"] == "html-meta"
+    assert executable_inline["parent_decode_uncertain"] is False
+    assert "©" in (PROJECT / executable_inline["output_path"]).read_text()
+    page_resource = next(r for r in manifest["resources"] if r["url"].endswith("/index.html"))
+    assert page_resource["document_encoding"] == "windows-1252"
+    assert page_resource["document_decode_source"] == "html-meta"
+    assert page_resource["document_decode_had_errors"] is False
+    assert page_resource["document_decode_uncertain"] is False
+    external_app = next(script for script in manifest["inline_scripts"] if script.get("resolved_src", "").endswith("/assets/app.js"))
+    assert external_app["charset"] == "windows-1252"
+    assert external_app["parent_document_encoding"] == "windows-1252"
     app_resource = next(r for r in manifest["resources"] if r["url"].endswith("/app.js"))
     assert app_resource["sha256"] == hashlib.sha256(app_js.encode()).hexdigest()
     app_source_maps = [

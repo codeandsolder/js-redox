@@ -62,7 +62,10 @@ export after the fact:
   script that compiled them.
 - WebSocket frames and SSE/EventSource messages are recorded separately.
 - Final per-frame DOM, MHTML, cookies/localStorage/sessionStorage/IndexedDB state,
-  console/exception data and a screenshot are retained.
+  console/exception data and a screenshot are retained. `frames.json` also keeps
+  each frame's `document.characterSet` plus external script `src`/`charset`/`type`
+  metadata so classic-script byte decoding can be reconstructed when CDP source
+  capture is unavailable.
 - Network bodies are content-addressed by SHA-256. The generated `capture.har`
   embeds bodies needed by the existing importer and points back to capture
   status/provenance.

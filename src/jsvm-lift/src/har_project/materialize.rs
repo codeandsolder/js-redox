@@ -8,7 +8,7 @@ use super::resource::{
     write_resource,
 };
 use super::{HarProjectOptions, HarProjectSummary};
-use crate::sha256_hex;
+use crate::{browser_decode::decode_html, sha256_hex};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::{
@@ -70,6 +70,14 @@ struct ResourceMeta {
     request_headers: Vec<HeaderMeta>,
     response_headers: Vec<HeaderMeta>,
     references: Vec<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document_encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document_decode_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document_decode_had_errors: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document_decode_uncertain: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,6 +94,14 @@ struct InlineScriptMeta {
     body_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    charset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_document_encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_decode_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_decode_uncertain: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +133,13 @@ fn headers(src: &[NameValue]) -> Vec<HeaderMeta> {
         .collect()
 }
 
+fn header_value<'a>(headers: &'a [NameValue], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .map(|header| header.value.as_str())
+}
+
 fn page_metadata(har: &Har) -> Vec<PageMeta> {
     har.log
         .pages
@@ -140,6 +163,9 @@ fn materialize_inline_scripts(
     counts: &mut BTreeMap<String, usize>,
     references: &mut Vec<Reference>,
     inline_scripts: &mut Vec<InlineScriptMeta>,
+    document_encoding: &str,
+    document_decode_source: &str,
+    document_decode_uncertain: bool,
 ) -> Result<()> {
     for (ordinal0, script) in extract_script_tags(html).into_iter().enumerate() {
         let ordinal = ordinal0 + 1;
@@ -163,6 +189,10 @@ fn materialize_inline_scripts(
                 output_path: None,
                 body_bytes: 0,
                 sha256: None,
+                charset: script.attrs.get("charset").cloned(),
+                parent_document_encoding: Some(document_encoding.to_string()),
+                parent_decode_source: Some(document_decode_source.to_string()),
+                parent_decode_uncertain: Some(document_decode_uncertain),
             });
             continue;
         }
@@ -188,6 +218,10 @@ fn materialize_inline_scripts(
             output_path: Some(script_path),
             body_bytes: body.len(),
             sha256: Some(sha256_hex(&body)),
+            charset: script.attrs.get("charset").cloned(),
+            parent_document_encoding: Some(document_encoding.to_string()),
+            parent_decode_source: Some(document_decode_source.to_string()),
+            parent_decode_uncertain: Some(document_decode_uncertain),
         });
     }
     Ok(())
@@ -230,6 +264,10 @@ fn materialize_entry(
     let mut sha256 = None;
     let mut reused_body = false;
     let mut references = Vec::new();
+    let mut document_encoding = None;
+    let mut document_decode_source = None;
+    let mut document_decode_had_errors = None;
+    let mut document_decode_uncertain = None;
 
     if let Some(body) = body {
         body_bytes = body.len();
@@ -255,19 +293,30 @@ fn materialize_entry(
         output_path = Some(written.clone());
         reused_body = reused;
         if kind == "html" && body_complete {
-            if let Ok(html) = std::str::from_utf8(&body) {
-                materialize_inline_scripts(
-                    id,
-                    &entry.request.url,
-                    html,
-                    &written,
-                    output_root,
-                    seen,
-                    counts,
-                    &mut references,
-                    inline_scripts,
-                )?;
-            }
+            let transport_content_type = header_value(&entry.response.headers, "content-type")
+                .or_else(|| {
+                    (!entry.response.content.mime_type.is_empty())
+                        .then_some(entry.response.content.mime_type.as_str())
+                });
+            let decoded = decode_html(&body, transport_content_type, None);
+            document_encoding = Some(decoded.encoding.clone());
+            document_decode_source = Some(decoded.decode_source.as_str().to_string());
+            document_decode_had_errors = Some(decoded.had_errors);
+            document_decode_uncertain = Some(decoded.uncertain);
+            materialize_inline_scripts(
+                id,
+                &entry.request.url,
+                &decoded.source,
+                &written,
+                output_root,
+                seen,
+                counts,
+                &mut references,
+                inline_scripts,
+                &decoded.encoding,
+                decoded.decode_source.as_str(),
+                decoded.uncertain,
+            )?;
         }
     } else {
         *counts.entry("resources_without_body".into()).or_insert(0) += 1;
@@ -304,6 +353,10 @@ fn materialize_entry(
         request_headers: headers(&entry.request.headers),
         response_headers: headers(&entry.response.headers),
         references,
+        document_encoding,
+        document_decode_source,
+        document_decode_had_errors,
+        document_decode_uncertain,
     })
 }
 

@@ -1310,6 +1310,8 @@ async function main() {
       name: frame.name(),
       parentUrl: frame.parentFrame()?.url() || null,
       html: null,
+      documentCharacterSet: null,
+      scriptElements: [],
       storage: null,
       errors: [],
     };
@@ -1322,6 +1324,25 @@ async function main() {
     } catch (error) {
       row.errors.push(`content:${String(error)}`);
       markTargetClosed("frame-content", error);
+    }
+
+    try {
+      const encodingContext = await frame.evaluate(() => ({
+        documentCharacterSet: document.characterSet || null,
+        scriptElements: [...document.scripts]
+          .filter((script) => Boolean(script.src))
+          .map((script) => ({
+            src: script.src,
+            charset: script.getAttribute("charset"),
+            type: script.getAttribute("type"),
+            noModule: Boolean(script.noModule),
+          })),
+      }));
+      row.documentCharacterSet = encodingContext.documentCharacterSet;
+      row.scriptElements = encodingContext.scriptElements;
+    } catch (error) {
+      row.errors.push(`encoding-context:${String(error)}`);
+      markTargetClosed("frame-encoding-context", error);
     }
 
     try {

@@ -1137,7 +1137,28 @@ pub enum SafeSourceMode {
     CommonJs,
 }
 
-fn semantically_valid_source_type(source: &str, mode: SafeSourceMode) -> Option<SourceType> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafeSourceRejection {
+    ParseFailure,
+    DynamicWithScope,
+    SemanticFailure,
+}
+
+impl SafeSourceRejection {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ParseFailure => "parse-failure",
+            Self::DynamicWithScope => "dynamic-with-scope",
+            Self::SemanticFailure => "semantic-failure",
+        }
+    }
+}
+
+fn validate_source_type(
+    source: &str,
+    mode: SafeSourceMode,
+) -> Result<SourceType, SafeSourceRejection> {
     // Browser-captured `.js` is normally either a classic Script or an ES
     // Module. Let Oxc resolve that from syntax first, then pin the resolved
     // Program source type for every rewrite iteration. Explicit `.mjs`/`.cjs`
@@ -1148,22 +1169,41 @@ fn semantically_valid_source_type(source: &str, mode: SafeSourceMode) -> Option<
         SafeSourceMode::Module => [Some(SourceType::mjs()), None],
         SafeSourceMode::CommonJs => [Some(SourceType::cjs()), None],
     };
+    let mut saw_with = false;
+    let mut saw_semantic_failure = false;
     for source_type in candidates.into_iter().flatten() {
         let allocator = Allocator::default();
         let Some(program) = parse_as(&allocator, source, source_type) else {
             continue;
         };
         if contains_with_statement(&program) {
+            saw_with = true;
             continue;
         }
         let semantic_ret = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&program);
         if semantic_ret.diagnostics.is_empty() {
-            return Some(program.source_type);
+            return Ok(program.source_type);
         }
+        saw_semantic_failure = true;
     }
-    None
+    if saw_with {
+        Err(SafeSourceRejection::DynamicWithScope)
+    } else if saw_semantic_failure {
+        Err(SafeSourceRejection::SemanticFailure)
+    } else {
+        Err(SafeSourceRejection::ParseFailure)
+    }
+}
+
+fn semantically_valid_source_type(source: &str, mode: SafeSourceMode) -> Option<SourceType> {
+    validate_source_type(source, mode).ok()
+}
+
+#[must_use]
+pub fn safe_source_rejection(source: &str, mode: SafeSourceMode) -> Option<SafeSourceRejection> {
+    validate_source_type(source, mode).err()
 }
 
 fn transform_once(
@@ -1405,7 +1445,8 @@ pub fn deobfuscate_with_standard_numeric_builtins(
 mod tests {
     use super::{
         deobfuscate, deobfuscate_with_source_mode, deobfuscate_with_standard_numeric_builtins,
-        expose_static_strings, recover_static_decoders, ProvenConstantEnvironment, SafeSourceMode,
+        expose_static_strings, recover_static_decoders, safe_source_rejection,
+        ProvenConstantEnvironment, SafeSourceMode, SafeSourceRejection,
     };
     use oxc_allocator::Allocator;
     use oxc_ast::ast::{CallExpression, Expression};
@@ -1566,6 +1607,149 @@ mod tests {
         assert_eq!(rejected.transforms.get("string_array_decode"), None);
         assert_eq!(
             rejected.transforms.get("materialize_decoder_rotation"),
+            None
+        );
+    }
+
+    #[test]
+    fn decoder_only_recovery_proves_inline_self_rewriting_plain_decoder() {
+        let source = r#"
+function provider() {
+    var table = ["alpha", "beta"];
+    return (provider = function() { return table; })();
+}
+function decode(index, unused) {
+    var table = provider();
+    return (decode = function(index, unused) { return table[index -= 0x10]; })(index, unused);
+}
+var alias = decode;
+sink(alias(0x10), alias(0x11));
+"#;
+        let recovered = recover_static_decoders(source, 8);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert_eq!(recovered.transforms.get("string_array_decode"), Some(&2));
+        assert!(recovered.source.contains("sink(\"alpha\", \"beta\")"));
+
+        let rebound = source.replace("var alias = decode;", "var alias = decode; alias = other;");
+        let rebound_result = recover_static_decoders(&rebound, 8);
+        assert!(rebound_result.is_some());
+        let rebound_result = rebound_result.unwrap_or_else(|| unreachable!());
+        assert_eq!(rebound_result.transforms.get("string_array_decode"), None);
+
+        let conditional = source.replace(
+            "var alias = decode;",
+            "if (enabled) { var alias = decode; }",
+        );
+        let conditional_result = recover_static_decoders(&conditional, 8);
+        assert!(conditional_result.is_some());
+        let conditional_result = conditional_result.unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            conditional_result.transforms.get("string_array_decode"),
+            None
+        );
+
+        let dynamic = source.replace(
+            "var alias = decode;",
+            "var alias = decode; eval(\"alias = other\");",
+        );
+        let dynamic_result = recover_static_decoders(&dynamic, 8);
+        assert!(dynamic_result.is_some());
+        let dynamic_result = dynamic_result.unwrap_or_else(|| unreachable!());
+        assert_eq!(dynamic_result.transforms.get("string_array_decode"), None);
+
+        let local_alias = source.replace(
+            "sink(alias(0x10), alias(0x11));",
+            "function use() { var unused, local = alias; return sink(local(0x10), local(0x11)); } use();",
+        );
+        let local_result = recover_static_decoders(&local_alias, 8);
+        assert!(local_result.is_some());
+        let local_result = local_result.unwrap_or_else(|| unreachable!());
+        assert!(
+            local_result
+                .transforms
+                .get("string_array_decode")
+                .copied()
+                .unwrap_or_default()
+                >= 2
+        );
+
+        let unsafe_leading = source.replace(
+            "sink(alias(0x10), alias(0x11));",
+            "function use() { var before = helper(), local = alias; return sink(local(0x10), local(0x11)); } use();",
+        );
+        let unsafe_result = recover_static_decoders(&unsafe_leading, 8);
+        assert!(unsafe_result.is_some());
+        let unsafe_result = unsafe_result.unwrap_or_else(|| unreachable!());
+        assert_eq!(unsafe_result.transforms.get("string_array_decode"), None);
+
+        let impure = source.replace(
+            "var table = [\"alpha\", \"beta\"];",
+            "var table = [\"alpha\", \"beta\"]; sideEffect();",
+        );
+        let rejected = recover_static_decoders(&impure, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+    }
+
+    #[test]
+    fn decoder_only_recovery_proves_closed_over_checksum_rotation() {
+        let original = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/rotated-base64-string-array.js"
+        );
+        let rotation_start = original
+            .find("(function (provider, target)")
+            .unwrap_or_else(|| unreachable!());
+        let rotation_end = original[rotation_start..]
+            .find("\n\nconsole.log")
+            .map(|offset| rotation_start + offset)
+            .unwrap_or_else(|| unreachable!());
+        let mut source = original.to_string();
+        source.replace_range(
+            rotation_start..rotation_end,
+            r#"!function() {
+  for (var alias = d, table = p();;) try {
+    if (2454246 === parseInt(alias(0x10)) * 10 + parseInt(alias(0x11))) break;
+    table.push(table.shift());
+  } catch (error) {
+    table.push(table.shift());
+  }
+}();"#,
+        );
+
+        let recovered = recover_static_decoders(&source, 8);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert!(
+            recovered
+                .transforms
+                .get("string_array_decode")
+                .copied()
+                .unwrap_or_default()
+                >= 2
+        );
+        assert_eq!(
+            recovered.transforms.get("materialize_decoder_rotation"),
+            Some(&1)
+        );
+        assert_eq!(
+            recovered.transforms.get("remove_decoder_rotation_iife"),
+            Some(&1)
+        );
+        assert!(!recovered.source.contains("table.push(table.shift())"));
+
+        let bad = source.replace("2454246 ===", "2454247 ===");
+        let rejected = recover_static_decoders(&bad, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        assert_eq!(
+            rejected.transforms.get("materialize_decoder_rotation"),
+            None
+        );
+        assert_eq!(
+            rejected.transforms.get("remove_decoder_rotation_iife"),
             None
         );
     }
@@ -1878,6 +2062,22 @@ console.log(d(0x10,"k"),d(0x11,"k"));
         assert_eq!(
             probe.values,
             [Some("hello".to_string()), None, Some("world".to_string())]
+        );
+    }
+
+    #[test]
+    fn safe_source_rejection_distinguishes_dynamic_scope_from_parse_failure() {
+        assert_eq!(
+            safe_source_rejection("with (scope) { value; }", SafeSourceMode::CommonJs),
+            Some(SafeSourceRejection::DynamicWithScope)
+        );
+        assert_eq!(
+            safe_source_rejection("(1 + 2) = 3;", SafeSourceMode::CommonJs),
+            Some(SafeSourceRejection::ParseFailure)
+        );
+        assert_eq!(
+            safe_source_rejection("const value = 1;", SafeSourceMode::CommonJs),
+            None
         );
     }
 

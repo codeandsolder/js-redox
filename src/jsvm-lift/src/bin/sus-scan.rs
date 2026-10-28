@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
-use jsvm_lift::sus_scan::{
-    analyze_source, build_report, SusFileReport, SusScanOptions, SusScanReport,
+use jsvm_lift::{
+    browser_decode::{decode_script, ScriptDecodeContext},
+    sus_scan::{analyze_source, build_report, SusFileReport, SusScanOptions, SusScanReport},
 };
 use std::{
     fs,
@@ -57,9 +58,10 @@ fn collect_paths(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
     if metadata.is_file() {
-        if is_js_file(path) {
-            out.push(path.to_path_buf());
-        }
+        // An explicit file argument is authoritative. Corpus bodies are often
+        // content-addressed and extensionless, while recursive directory walks
+        // still need the JavaScript-extension filter below.
+        out.push(path.to_path_buf());
         return Ok(());
     }
     if !metadata.is_dir() {
@@ -86,20 +88,45 @@ fn collect_paths(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 fn scan_file(path: &Path, options: &SusScanOptions) -> Result<SusFileReport> {
-    let source = fs::read_to_string(path)
-        .with_context(|| format!("reading JavaScript {}", path.display()))?;
-    analyze_source(&source, path, options)
+    let bytes = fs::read(path).with_context(|| format!("reading JavaScript {}", path.display()))?;
+    if let Ok(source) = std::str::from_utf8(&bytes) {
+        return analyze_source(source, path, options);
+    }
+
+    // A detached corpus body does not carry enough embedding context to recover
+    // the exact classic-script encoding. Use WHATWG UTF-8 replacement as a
+    // non-fatal analysis view and make the uncertainty explicit. Capture-level
+    // code can replace this with the browser runtime source when one exists.
+    let decoded = decode_script(&bytes, ScriptDecodeContext::classic_unknown());
+    let mut report = analyze_source(&decoded.source, path, options)?;
+    report.bytes = bytes.len();
+    report.decode_encoding = decoded.encoding;
+    report.decode_source = decoded.decode_source.as_str().to_string();
+    report.decode_had_errors = decoded.had_errors;
+    report.decode_uncertain = decoded.uncertain;
+    Ok(report)
 }
 
 fn print_text(report: &SusScanReport) {
     for file in report.files.iter().filter(|file| !file.clusters.is_empty()) {
         println!(
-            "\n{}  bytes={} signals={} top_score={} diagnostics={}{}",
+            "\n{}  bytes={} signals={} top_score={} diagnostics={} decode={}{}{}{}",
             file.input,
             file.bytes,
             file.signal_count,
             file.top_score,
             file.diagnostics,
+            file.decode_encoding,
+            if file.decode_had_errors {
+                " DECODE_ERRORS"
+            } else {
+                ""
+            },
+            if file.decode_uncertain {
+                " DECODE_UNCERTAIN"
+            } else {
+                ""
+            },
             if file.fatal_error {
                 " FATAL_PARSE_ERROR"
             } else {
@@ -164,8 +191,13 @@ fn print_text(report: &SusScanReport) {
         }
     }
     println!(
-        "\nSUS summary: {} file(s) scanned; {} with clusters; {} cluster(s)",
-        report.files_scanned, report.files_with_clusters, report.total_clusters
+        "\nSUS summary: {} file(s) scanned; {} parse-recovered; {} incomplete; {} fatal; {} with clusters; {} cluster(s)",
+        report.files_scanned,
+        report.files_with_parse_recovery,
+        report.files_with_incomplete_analysis,
+        report.files_with_fatal_error,
+        report.files_with_clusters,
+        report.total_clusters
     );
 }
 

@@ -7,7 +7,7 @@ use oxc_ast::ast::{
 use oxc_ast_visit::{walk, Visit};
 use oxc_span::Span;
 use oxc_syntax::scope::ScopeFlags;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 fn saturating_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
@@ -531,17 +531,14 @@ fn decode_primitive(call: &CallExpression<'_>) -> bool {
     )
 }
 
-struct DirectTableDecoderProbe<'p> {
+struct DirectDecodedLookupProbe<'p> {
     index_param: &'p str,
-    table: Option<String>,
-    table_conflict: bool,
-    indexed_uses: usize,
-    decode_calls: usize,
+    tables: Vec<String>,
 }
 
-impl<'a> Visit<'a> for DirectTableDecoderProbe<'_> {
+impl<'a> Visit<'a> for DirectDecodedLookupProbe<'_> {
     fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {
-        // Nested functions do not execute as part of the candidate decoder.
+        // A lookup inside a nested callback is not data flow into the decoder call.
     }
 
     fn visit_computed_member_expression(
@@ -550,20 +547,96 @@ impl<'a> Visit<'a> for DirectTableDecoderProbe<'_> {
     ) {
         if direct_identifier(&it.expression) == Some(self.index_param) {
             if let Some(table) = direct_identifier(&it.object) {
-                self.indexed_uses += 1;
-                match &self.table {
-                    None => self.table = Some(table.to_string()),
-                    Some(existing) if existing == table => {}
-                    Some(_) => self.table_conflict = true,
-                }
+                self.tables.push(table.to_string());
             }
         }
         walk::walk_computed_member_expression(self, it);
     }
+}
+
+struct DirectTableDecoderProbe<'p> {
+    index_param: &'p str,
+    table: Option<String>,
+    table_conflict: bool,
+    indexed_uses: usize,
+    decode_calls: usize,
+    lookup_aliases: HashMap<String, String>,
+}
+
+impl DirectTableDecoderProbe<'_> {
+    fn record_table(&mut self, table: &str) {
+        self.indexed_uses += 1;
+        match &self.table {
+            None => self.table = Some(table.to_string()),
+            Some(existing) if existing == table => {}
+            Some(_) => self.table_conflict = true,
+        }
+    }
+
+    fn table_lookup(&self, expression: &Expression<'_>) -> Option<String> {
+        let Expression::ComputedMemberExpression(member) = expression else {
+            return None;
+        };
+        (direct_identifier(&member.expression) == Some(self.index_param))
+            .then(|| direct_identifier(&member.object))
+            .flatten()
+            .map(str::to_string)
+    }
+}
+
+impl<'a> Visit<'a> for DirectTableDecoderProbe<'_> {
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {
+        // Nested functions do not execute as part of the candidate decoder.
+    }
+
+    fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+        if it.operator.as_str() == "=" {
+            if let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(alias) = &it.left {
+                let name = alias.name.to_string();
+                if let Some(table) = self.table_lookup(&it.right) {
+                    self.lookup_aliases.insert(name, table);
+                } else {
+                    self.lookup_aliases.remove(&name);
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, it);
+    }
+
+    fn visit_variable_declarator(&mut self, it: &oxc_ast::ast::VariableDeclarator<'a>) {
+        if let (BindingPattern::BindingIdentifier(alias), Some(init)) = (&it.id, &it.init) {
+            if let Some(table) = self.table_lookup(init) {
+                self.lookup_aliases.insert(alias.name.to_string(), table);
+            }
+        }
+        walk::walk_variable_declarator(self, it);
+    }
 
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
         if decode_primitive(it) {
-            self.decode_calls += 1;
+            let mut tables = Vec::new();
+            for argument in &it.arguments {
+                let Some(expression) = argument.as_expression() else {
+                    continue;
+                };
+                let mut lookup = DirectDecodedLookupProbe {
+                    index_param: self.index_param,
+                    tables: Vec::new(),
+                };
+                lookup.visit_expression(expression);
+                tables.extend(lookup.tables);
+                if let Some(alias) = direct_identifier(expression) {
+                    if let Some(table) = self.lookup_aliases.get(alias) {
+                        tables.push(table.clone());
+                    }
+                }
+            }
+            if !tables.is_empty() {
+                self.decode_calls += 1;
+                for table in tables {
+                    self.record_table(&table);
+                }
+            }
         }
         walk::walk_call_expression(self, it);
     }
@@ -581,6 +654,7 @@ fn detect_direct_table_decoder(function: &Function<'_>) -> Option<StructuralSign
         table_conflict: false,
         indexed_uses: 0,
         decode_calls: 0,
+        lookup_aliases: HashMap::new(),
     };
     probe.visit_function_body(body);
     if probe.table_conflict || probe.indexed_uses == 0 || probe.decode_calls == 0 {
