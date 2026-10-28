@@ -18,13 +18,13 @@ use crate::{
     },
     source_text::preview,
     state_flatten::{
-        self, detect_for_state_machines, IfLadderStateMachineCandidate, OpcodeMapCandidate,
-        StateMachineCandidate, StateMachineInfo,
+        self, detect_for_state_machines, detect_while_state_machine, IfLadderStateMachineCandidate,
+        OpcodeMapCandidate, StateMachineCandidate, StateMachineInfo,
     },
     table_vm,
 };
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{ArrayExpressionElement, Expression};
+use oxc_ast::ast::{ArrayExpressionElement, Expression, FunctionBody, Statement};
 use oxc_ast_visit::{walk, Visit};
 use oxc_span::SourceType;
 use oxc_syntax::scope::ScopeFlags;
@@ -203,6 +203,22 @@ impl<'s> Scanner<'s> {
         }
     }
 
+    fn record_while_state_machines(&mut self, statements: &[Statement<'_>]) {
+        let Some(function_id) = self.stack.last().map(|current| current.m.id.clone()) else {
+            return;
+        };
+        for pair in statements.windows(2) {
+            let [init, Statement::WhileStatement(while_statement)] = pair else {
+                continue;
+            };
+            if let Some(machine) =
+                detect_while_state_machine(self.source, &function_id, init, while_statement)
+            {
+                self.if_ladder_state_machines.push(machine);
+            }
+        }
+    }
+
     fn record_array(&mut self, arr: &oxc_ast::ast::ArrayExpression<'_>) {
         let n = arr.elements.len();
 
@@ -275,6 +291,16 @@ impl<'a> Visit<'a> for Scanner<'_> {
                 .push(expression_evidence(self.source, &switch.discriminant));
         }
         walk::walk_switch_statement(self, switch);
+    }
+
+    fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+        self.record_while_state_machines(&body.statements);
+        walk::walk_function_body(self, body);
+    }
+
+    fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+        self.record_while_state_machines(&block.body);
+        walk::walk_block_statement(self, block);
     }
 
     fn visit_for_statement(&mut self, statement: &oxc_ast::ast::ForStatement<'a>) {

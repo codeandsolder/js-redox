@@ -5,7 +5,10 @@ use crate::{
 use jsvm_lift::numeric::{eval_js_bitwise_i64, exact_i64, exact_u64, js_int32_from_i64};
 use jsvm_safe_core::eval_static_primitive as eval_static;
 use oxc_ast::{
-    ast::{Argument, Expression, ForStatement, Function, FunctionBody, Statement, SwitchStatement},
+    ast::{
+        Argument, Expression, ForStatement, Function, FunctionBody, Statement, SwitchStatement,
+        WhileStatement,
+    },
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
@@ -147,6 +150,66 @@ fn for_state_init(for_stmt: &ForStatement<'_>) -> Option<(String, u64)> {
     }
 }
 
+fn assignment_state_value(
+    assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    state_var: &str,
+) -> Option<u64> {
+    if !assignment.operator.is_assign() || target_ident(&assignment.left) != Some(state_var) {
+        return None;
+    }
+    static_u64(&assignment.right)
+}
+
+fn statement_state_init(statement: &Statement<'_>, state_var: &str) -> Option<u64> {
+    match statement {
+        Statement::ExpressionStatement(statement) => match &statement.expression {
+            Expression::AssignmentExpression(assignment) => {
+                assignment_state_value(assignment, state_var)
+            }
+            Expression::SequenceExpression(sequence) => {
+                sequence
+                    .expressions
+                    .iter()
+                    .rev()
+                    .find_map(|expression| match expression {
+                        Expression::AssignmentExpression(assignment) => {
+                            assignment_state_value(assignment, state_var)
+                        }
+                        Expression::ParenthesizedExpression(parenthesized) => {
+                            match &parenthesized.expression {
+                                Expression::AssignmentExpression(assignment) => {
+                                    assignment_state_value(assignment, state_var)
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    })
+            }
+            Expression::ParenthesizedExpression(parenthesized) => {
+                let Expression::AssignmentExpression(assignment) = &parenthesized.expression else {
+                    return None;
+                };
+                assignment_state_value(assignment, state_var)
+            }
+            _ => None,
+        },
+        Statement::VariableDeclaration(declaration) => {
+            declaration.declarations.iter().find_map(|declarator| {
+                let oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) = &declarator.id
+                else {
+                    return None;
+                };
+                if identifier.name != state_var {
+                    return None;
+                }
+                declarator.init.as_ref().and_then(static_u64)
+            })
+        }
+        _ => None,
+    }
+}
+
 fn shifted_state(expr: &Expression<'_>, state: &str) -> Option<u64> {
     let binary = match expr {
         Expression::ParenthesizedExpression(paren) => {
@@ -225,6 +288,26 @@ fn state_exit_literal(expr: &Expression<'_>, state_var: &str) -> Option<u64> {
     }
     if expr_ident(&binary.right) == Some(state_var) {
         return numeric_u64(&binary.left);
+    }
+    None
+}
+
+fn state_exit(expr: &Expression<'_>) -> Option<(String, u64)> {
+    let Expression::BinaryExpression(binary) = expr else {
+        return None;
+    };
+    if !matches!(binary.operator.as_str(), "!=" | "!==") {
+        return None;
+    }
+    if let (Some(state_var), Some(exit_state)) =
+        (expr_ident(&binary.left), numeric_u64(&binary.right))
+    {
+        return Some((state_var.to_string(), exit_state));
+    }
+    if let (Some(exit_state), Some(state_var)) =
+        (numeric_u64(&binary.left), expr_ident(&binary.right))
+    {
+        return Some((state_var.to_string(), exit_state));
     }
     None
 }
@@ -432,27 +515,22 @@ fn branch_state_for_span(statement: &Statement<'_>, state_var: &str, target: Spa
 /// reaching the event are irrelevant. Barriers in the event's own state are
 /// ordered by source evaluation position; callers decide what constitutes a
 /// barrier.
-pub(crate) fn prove_if_ladder_event_before_barriers(
-    source: &str,
-    for_stmt: &ForStatement<'_>,
+fn prove_machine_event_before_barriers(
+    machine: &IfLadderStateMachineCandidate,
+    body: &Statement<'_>,
     event: Span,
     barriers: &[Span],
 ) -> bool {
-    let detected = detect_for_state_machines(source, "pre-escape-proof", for_stmt);
-    let [machine] = detected.if_ladder_machines.as_slice() else {
-        return false;
-    };
-    let Some(event_state) = branch_state_for_span(&for_stmt.body, &machine.state_var, event) else {
+    let Some(event_state) = branch_state_for_span(body, &machine.state_var, event) else {
         return false;
     };
 
     let mut barrier_states: HashMap<u64, Vec<Span>> = HashMap::new();
     for barrier in barriers {
-        if barrier.start < for_stmt.span.start || barrier.end > for_stmt.span.end {
+        if barrier.start < machine.start || barrier.end > machine.end {
             continue;
         }
-        let Some(state) = branch_state_for_span(&for_stmt.body, &machine.state_var, *barrier)
-        else {
+        let Some(state) = branch_state_for_span(body, &machine.state_var, *barrier) else {
             return false;
         };
         barrier_states.entry(state).or_default().push(*barrier);
@@ -501,6 +579,34 @@ pub(crate) fn prove_if_ladder_event_before_barriers(
     !reached_unsafe
 }
 
+pub(crate) fn prove_if_ladder_event_before_barriers(
+    source: &str,
+    for_stmt: &ForStatement<'_>,
+    event: Span,
+    barriers: &[Span],
+) -> bool {
+    let detected = detect_for_state_machines(source, "pre-escape-proof", for_stmt);
+    let [machine] = detected.if_ladder_machines.as_slice() else {
+        return false;
+    };
+    prove_machine_event_before_barriers(machine, &for_stmt.body, event, barriers)
+}
+
+pub(crate) fn prove_while_if_ladder_event_before_barriers(
+    source: &str,
+    init_statement: &Statement<'_>,
+    while_statement: &WhileStatement<'_>,
+    event: Span,
+    barriers: &[Span],
+) -> bool {
+    let Some(machine) =
+        detect_while_state_machine(source, "pre-escape-proof", init_statement, while_statement)
+    else {
+        return false;
+    };
+    prove_machine_event_before_barriers(&machine, &while_statement.body, event, barriers)
+}
+
 impl<'a> Visit<'a> for IfLadderEvidenceVisitor<'_> {
     fn enter_node(&mut self, kind: AstKind<'a>) {
         match kind {
@@ -526,6 +632,71 @@ impl<'a> Visit<'a> for IfLadderEvidenceVisitor<'_> {
     fn visit_function(&mut self, _it: &Function<'a>, _flags: ScopeFlags) {}
     fn visit_arrow_function_expression(&mut self, _it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
     }
+}
+
+fn detect_if_ladder_candidate(
+    source: &str,
+    function_id: &str,
+    start: u32,
+    end: u32,
+    body: &Statement<'_>,
+    state_var: String,
+    init_state: u64,
+    exit_state: u64,
+) -> Option<IfLadderStateMachineCandidate> {
+    let mut visitor = IfLadderEvidenceVisitor {
+        state_var: &state_var,
+        evidence: IfLadderEvidence::default(),
+    };
+    visitor.visit_statement(body);
+    let evidence = visitor.evidence;
+    if evidence.compared_states.len() < 4 || evidence.state_assignments < 4 {
+        return None;
+    }
+    let mut transitions = collect_branch_ladder_transitions(source, body, &state_var);
+    transitions.sort_by(|a, b| {
+        (a.from_state, a.assignment_start, a.assignment_end).cmp(&(
+            b.from_state,
+            b.assignment_start,
+            b.assignment_end,
+        ))
+    });
+    transitions.dedup();
+    Some(IfLadderStateMachineCandidate {
+        function_id: function_id.to_string(),
+        start,
+        end,
+        state_var,
+        init_state,
+        exit_state,
+        compared_states: evidence.compared_states.into_iter().collect(),
+        state_assignments: evidence.state_assignments,
+        constant_state_assignments: evidence.constant_state_assignments,
+        dynamic_state_assignments: evidence.dynamic_state_assignments,
+        transitions,
+        preview: preview(source, start, end, 180),
+    })
+}
+
+#[must_use]
+pub fn detect_while_state_machine(
+    source: &str,
+    function_id: &str,
+    init_statement: &Statement<'_>,
+    while_statement: &WhileStatement<'_>,
+) -> Option<IfLadderStateMachineCandidate> {
+    let (state_var, exit_state) = state_exit(&while_statement.test)?;
+    let init_state = statement_state_init(init_statement, &state_var)?;
+    detect_if_ladder_candidate(
+        source,
+        function_id,
+        while_statement.span.start,
+        while_statement.span.end,
+        &while_statement.body,
+        state_var,
+        init_state,
+        exit_state,
+    )
 }
 
 pub fn detect_for_state_machines(
@@ -593,39 +764,17 @@ pub fn detect_for_state_machines(
             }
         }
         if let Some(exit_state) = state_exit_literal(test, &state_var) {
-            let mut visitor = IfLadderEvidenceVisitor {
-                state_var: &state_var,
-                evidence: IfLadderEvidence::default(),
-            };
-            visitor.visit_statement(&for_stmt.body);
-            let evidence = visitor.evidence;
-            if evidence.compared_states.len() >= 4 && evidence.state_assignments >= 4 {
-                let mut transitions =
-                    collect_branch_ladder_transitions(source, &for_stmt.body, &state_var);
-                transitions.sort_by(|a, b| {
-                    (a.from_state, a.assignment_start, a.assignment_end).cmp(&(
-                        b.from_state,
-                        b.assignment_start,
-                        b.assignment_end,
-                    ))
-                });
-                transitions.dedup();
-                detected
-                    .if_ladder_machines
-                    .push(IfLadderStateMachineCandidate {
-                        function_id: function_id.to_string(),
-                        start: for_stmt.span.start,
-                        end: for_stmt.span.end,
-                        state_var,
-                        init_state,
-                        exit_state,
-                        compared_states: evidence.compared_states.into_iter().collect(),
-                        state_assignments: evidence.state_assignments,
-                        constant_state_assignments: evidence.constant_state_assignments,
-                        dynamic_state_assignments: evidence.dynamic_state_assignments,
-                        transitions,
-                        preview: preview(source, for_stmt.span.start, for_stmt.span.end, 180),
-                    });
+            if let Some(machine) = detect_if_ladder_candidate(
+                source,
+                function_id,
+                for_stmt.span.start,
+                for_stmt.span.end,
+                &for_stmt.body,
+                state_var,
+                init_state,
+                exit_state,
+            ) {
+                detected.if_ladder_machines.push(machine);
             }
         }
     }
@@ -1764,6 +1913,138 @@ mod tests {
             }
         "#;
         assert!(!prove_order(source, "target()", &[]))
+    }
+
+    fn prove_while_order(source: &str, event_text: &str, barrier_texts: &[&str]) -> bool {
+        struct Harness<'s> {
+            source: &'s str,
+            event: Span,
+            barriers: Vec<Span>,
+            result: Option<bool>,
+        }
+        impl Harness<'_> {
+            fn inspect_statements<'a>(&mut self, statements: &[Statement<'a>]) {
+                for pair in statements.windows(2) {
+                    let [init, Statement::WhileStatement(while_statement)] = pair else {
+                        continue;
+                    };
+                    if while_statement.span.start <= self.event.start
+                        && self.event.end <= while_statement.span.end
+                    {
+                        self.result = Some(prove_while_if_ladder_event_before_barriers(
+                            self.source,
+                            init,
+                            while_statement,
+                            self.event,
+                            &self.barriers,
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        impl<'a> Visit<'a> for Harness<'_> {
+            fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+                self.inspect_statements(&body.statements);
+                if self.result.is_none() {
+                    walk::walk_function_body(self, body);
+                }
+            }
+
+            fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+                self.inspect_statements(&block.body);
+                if self.result.is_none() {
+                    walk::walk_block_statement(self, block);
+                }
+            }
+        }
+
+        let event_start = source.find(event_text).expect("event text") as u32;
+        let event = Span::new(event_start, event_start + event_text.len() as u32);
+        let barriers = barrier_texts
+            .iter()
+            .map(|text| {
+                let start = source.find(text).expect("barrier text") as u32;
+                Span::new(start, start + text.len() as u32)
+            })
+            .collect();
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let mut harness = Harness {
+            source,
+            event,
+            barriers,
+            result: None,
+        };
+        harness.visit_program(&parsed.program);
+        harness.result.unwrap_or(false)
+    }
+
+    #[test]
+    fn proves_while_if_ladder_event_before_later_same_state_barrier() {
+        let source = r#"
+            function flattened() {
+                let state;
+                state = 0;
+                while (state !== 99) {
+                    if (state === 0) { target(); barrier(); state = 99; }
+                    else if (state === 1) { state = 99; }
+                    else if (state === 2) { state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        assert!(prove_while_order(source, "target()", &["barrier()"]));
+    }
+
+    #[test]
+    fn while_detector_matches_condition_state_in_mixed_sequence_init() {
+        let source = r#"
+            function flattened() {
+                let state, noise;
+                noise = 7, state = 0, noise = 9;
+                while (99 !== state) {
+                    if (state === 0) { target(); state = 99; }
+                    else if (state === 1) { state = 99; }
+                    else if (state === 2) { state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        assert!(prove_while_order(source, "target()", &[]));
+    }
+
+    #[test]
+    fn while_detector_matches_condition_state_in_multi_declarator_init() {
+        let source = r#"
+            function flattened() {
+                let noise = 7, state = 0, tail = 9;
+                while (state !== 99) {
+                    if (state === 0) { target(); state = 99; }
+                    else if (state === 1) { state = 99; }
+                    else if (state === 2) { state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        assert!(prove_while_order(source, "target()", &[]));
+    }
+
+    #[test]
+    fn rejects_while_if_ladder_barrier_before_event() {
+        let source = r#"
+            function flattened() {
+                let state;
+                state = 0;
+                while (state !== 99) {
+                    if (state === 0) { barrier(); target(); state = 99; }
+                    else if (state === 1) { state = 99; }
+                    else if (state === 2) { state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        assert!(!prove_while_order(source, "target()", &["barrier()"]));
     }
 
     #[test]
