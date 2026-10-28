@@ -3894,7 +3894,8 @@ fn leading_mutable_aliases_in_statements(
                 prior_initializer = true;
                 continue;
             };
-            let Some(target_symbol) = statically_resolved_symbol(scoping, target_reference_id) else {
+            let Some(target_symbol) = statically_resolved_symbol(scoping, target_reference_id)
+            else {
                 prior_initializer = true;
                 continue;
             };
@@ -3902,19 +3903,20 @@ fn leading_mutable_aliases_in_statements(
                 prior_initializer = true;
                 continue;
             }
-            let stable = scoping
-                .get_resolved_reference_ids(alias_symbol)
-                .iter()
-                .all(|reference_id| {
-                    reference_spans.get(reference_id).is_some_and(|span| {
-                        span.start >= declarator.span.end
-                            && reference_is_statically_resolved_read(
-                                scoping,
-                                *reference_id,
-                                alias_symbol,
-                            )
-                    })
-                });
+            let stable =
+                scoping
+                    .get_resolved_reference_ids(alias_symbol)
+                    .iter()
+                    .all(|reference_id| {
+                        reference_spans.get(reference_id).is_some_and(|span| {
+                            span.start >= declarator.span.end
+                                && reference_is_statically_resolved_read(
+                                    scoping,
+                                    *reference_id,
+                                    alias_symbol,
+                                )
+                        })
+                    });
             stable.then_some((alias_symbol, target_symbol))
         } else {
             None

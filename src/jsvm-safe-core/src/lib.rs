@@ -1644,7 +1644,10 @@ sink(alias(0x10), alias(0x11));
         let conditional_result = recover_static_decoders(&conditional, 8);
         assert!(conditional_result.is_some());
         let conditional_result = conditional_result.unwrap_or_else(|| unreachable!());
-        assert_eq!(conditional_result.transforms.get("string_array_decode"), None);
+        assert_eq!(
+            conditional_result.transforms.get("string_array_decode"),
+            None
+        );
 
         let dynamic = source.replace(
             "var alias = decode;",
