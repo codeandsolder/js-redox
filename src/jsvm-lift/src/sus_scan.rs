@@ -1,7 +1,7 @@
 use crate::numeric::exact_u64;
 use anyhow::{ensure, Result};
 use base64::{engine::general_purpose, Engine as _};
-use jsvm_safe_core::{string_literal_value, template_element_value};
+use jsvm_safe_core::{eval_static_primitive, string_literal_value, template_element_value};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, BinaryExpression, CallExpression,
@@ -191,6 +191,10 @@ impl Collector<'_> {
             }
             _ => None,
         }
+    }
+
+    fn argument_static_string(arg: &Argument<'_>) -> Option<String> {
+        eval_static_primitive(arg.as_expression()?)?.js_string()
     }
 
     fn identifier(expr: &Expression<'_>) -> Option<String> {
@@ -514,12 +518,29 @@ impl Collector<'_> {
             || callee.ends_with(".eval")
             || lower.ends_with(".constructor")
         {
+            let static_source = if callee == "eval" || callee.ends_with(".eval") {
+                it.arguments
+                    .first()
+                    .is_none_or(|arg| Self::argument_static_string(arg).is_some())
+            } else {
+                it.arguments
+                    .iter()
+                    .all(|arg| Self::argument_static_string(arg).is_some())
+            };
             self.push(
-                "dynamic_code_call",
-                9,
+                if static_source {
+                    "static_dynamic_code_call"
+                } else {
+                    "dynamic_code_call"
+                },
+                if static_source { 3 } else { 9 },
                 it.span,
                 None,
-                format!("dynamic-code-like call via {callee}"),
+                if static_source {
+                    format!("dynamic-code-like call via {callee} with statically known source")
+                } else {
+                    format!("dynamic-code-like call via {callee}")
+                },
             );
         }
 
@@ -654,12 +675,24 @@ impl Collector<'_> {
     fn record_new(&mut self, it: &NewExpression<'_>) {
         let callee = self.fragment(it.callee.span()).trim().to_string();
         if callee == "Function" || callee.ends_with(".Function") {
+            let static_source = it
+                .arguments
+                .iter()
+                .all(|arg| Self::argument_static_string(arg).is_some());
             self.push(
-                "dynamic_code_constructor",
-                10,
+                if static_source {
+                    "static_dynamic_code_constructor"
+                } else {
+                    "dynamic_code_constructor"
+                },
+                if static_source { 3 } else { 10 },
                 it.span,
                 None,
-                format!("new {callee}(...)"),
+                if static_source {
+                    format!("new {callee}(...) with statically known source")
+                } else {
+                    format!("new {callee}(...)")
+                },
             );
         }
     }
@@ -1016,6 +1049,9 @@ fn is_actionable_signal(kind: &str) -> bool {
             | "radix_string_call"
             | "base64_blob"
             | "opaque_blob"
+            | "static_dynamic_code_call"
+            | "static_dynamic_code_constructor"
+            | "string_timer_call"
     )
 }
 fn normalize_signals(raw: Vec<RawSignal>) -> Vec<RawSignal> {
@@ -1587,7 +1623,7 @@ pub fn build_report(
         .sum();
     let total_actionable_signals = files.iter().map(|file| file.actionable_signal_count).sum();
     Ok(SusScanReport {
-        schema: "js-sus-scan/v7",
+        schema: "js-sus-scan/v8",
         window_bytes: options.window_bytes,
         min_score: options.min_score,
         min_signals: options.min_signals,
