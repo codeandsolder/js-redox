@@ -405,7 +405,7 @@ fn evaluate_sequence_inner(
             fuel_consumed,
             initial_memory_pages,
             final_memory_pages,
-            outcome: outcome.clone(),
+            outcome,
             i32_result,
             memory_accesses,
         });
