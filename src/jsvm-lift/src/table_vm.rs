@@ -1,4 +1,8 @@
 use crate::ast_utils::target_ident;
+use jsvm_lift::forwarding_semantics::{
+    structurally_proven_registry_forwarding_calls, structurally_proven_registry_read_calls,
+    ProvenRegistryForwardingCall, ProvenRegistryReadCall,
+};
 use jsvm_lift::numeric::exact_u64;
 use jsvm_safe_core::string_literal_value;
 use oxc_ast::{
@@ -9,6 +13,7 @@ use oxc_ast::{
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
+use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, Span};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -35,6 +40,9 @@ pub struct DetailedHandlerTableCandidate {
     pub function_values: usize,
     pub dynamic_call_sites: usize,
     pub looped_dynamic_call_sites: usize,
+    pub read_sites: usize,
+    pub dynamic_read_sites: usize,
+    pub looped_dynamic_read_sites: usize,
     pub handlers: Vec<HandlerFunctionSlot>,
 }
 
@@ -99,6 +107,12 @@ struct HandlerCall {
 }
 
 #[derive(Debug, Clone)]
+struct RegistryReadCall {
+    table: String,
+    index: String,
+}
+
+#[derive(Debug, Clone)]
 struct ProducerCall {
     target: String,
     method: String,
@@ -112,6 +126,7 @@ struct FunctionState {
     loops: usize,
     transitions: HashMap<String, TransitionDraft>,
     handler_calls: Vec<HandlerCall>,
+    registry_reads: Vec<RegistryReadCall>,
     handler_aliases: HashMap<String, HandlerCall>,
     producers: Vec<ProducerCall>,
     numeric_schedules: HashSet<String>,
@@ -124,6 +139,7 @@ struct FunctionSummary {
     end: u32,
     loops: usize,
     handler_calls: Vec<HandlerCall>,
+    registry_reads: Vec<RegistryReadCall>,
     producers: Vec<ProducerCall>,
 }
 
@@ -135,6 +151,10 @@ struct Analyzer<'s> {
     registry_handlers: HashMap<(u32, u32, String), Vec<HandlerFunctionSlot>>,
     registry_spans: HashMap<(u32, u32, String), (u32, u32)>,
     registry_sources: HashMap<(u32, u32, String), String>,
+    forwarded_registry_calls: HashMap<(u32, u32), ProvenRegistryForwardingCall>,
+    registry_read_calls: HashMap<(u32, u32), ProvenRegistryReadCall>,
+    forwarded_registry_handlers: HashMap<(u32, u32, String), Vec<HandlerFunctionSlot>>,
+    forwarded_registry_spans: HashMap<(u32, u32, String), (u32, u32)>,
     transducers: Vec<ByteTransducerCandidate>,
     functions: Vec<FunctionSummary>,
 }
@@ -283,7 +303,11 @@ fn is_static_numeric_index(index: &str) -> bool {
 }
 
 impl<'s> Analyzer<'s> {
-    fn new(source: &'s str) -> Self {
+    fn new(
+        source: &'s str,
+        forwarded_calls: Vec<ProvenRegistryForwardingCall>,
+        read_calls: Vec<ProvenRegistryReadCall>,
+    ) -> Self {
         Self {
             source,
             function_stack: Vec::new(),
@@ -292,6 +316,16 @@ impl<'s> Analyzer<'s> {
             registry_handlers: HashMap::new(),
             registry_spans: HashMap::new(),
             registry_sources: HashMap::new(),
+            forwarded_registry_calls: forwarded_calls
+                .into_iter()
+                .map(|call| ((call.call_start, call.call_end), call))
+                .collect(),
+            registry_read_calls: read_calls
+                .into_iter()
+                .map(|call| ((call.call_start, call.call_end), call))
+                .collect(),
+            forwarded_registry_handlers: HashMap::new(),
+            forwarded_registry_spans: HashMap::new(),
             transducers: Vec::new(),
             functions: Vec::new(),
         }
@@ -324,6 +358,87 @@ impl<'s> Analyzer<'s> {
         }
         let (_, start, end) = self.current_scope();
         (start, end, binding)
+    }
+
+    fn registry_binding(
+        &self,
+        receiver_start: u32,
+        receiver_end: u32,
+        registry_path: &[String],
+    ) -> String {
+        let mut binding = fragment(self.source, Span::new(receiver_start, receiver_end));
+        for property in registry_path {
+            let identifier = property.chars().enumerate().all(|(index, character)| {
+                character == '_'
+                    || character == '$'
+                    || (index == 0 && character.is_ascii_alphabetic())
+                    || (index > 0 && character.is_ascii_alphanumeric())
+            });
+            if identifier {
+                binding.push('.');
+                binding.push_str(property);
+            } else {
+                binding.push('[');
+                binding.push_str(&format!("{property:?}"));
+                binding.push(']');
+            }
+        }
+        binding
+    }
+
+    fn record_forwarded_registry_call(&mut self, call: &CallExpression<'_>) {
+        let Some(proof) = self
+            .forwarded_registry_calls
+            .get(&(call.span.start, call.span.end))
+            .cloned()
+        else {
+            return;
+        };
+        let binding = self.registry_binding(
+            proof.receiver_start,
+            proof.receiver_end,
+            &proof.registry_path,
+        );
+        let key = fragment(self.source, Span::new(proof.key_start, proof.key_end));
+        let scope_key = self.registry_scope_key(binding);
+        self.forwarded_registry_handlers
+            .entry(scope_key.clone())
+            .or_default()
+            .push(HandlerFunctionSlot {
+                key,
+                start: proof.handler_start,
+                end: proof.handler_end,
+                params: proof.handler_params,
+                r#async: proof.handler_async,
+            });
+        self.forwarded_registry_spans
+            .entry(scope_key)
+            .and_modify(|span| {
+                span.0 = span.0.min(proof.call_start);
+                span.1 = span.1.max(proof.call_end);
+            })
+            .or_insert((proof.call_start, proof.call_end));
+    }
+
+    fn record_registry_read_call(&mut self, call: &CallExpression<'_>) {
+        let Some(proof) = self
+            .registry_read_calls
+            .get(&(call.span.start, call.span.end))
+            .cloned()
+        else {
+            return;
+        };
+        let table = self.registry_binding(
+            proof.receiver_start,
+            proof.receiver_end,
+            &proof.registry_path,
+        );
+        let index = fragment(self.source, Span::new(proof.key_start, proof.key_end));
+        if let Some(current) = self.current_mut() {
+            current
+                .registry_reads
+                .push(RegistryReadCall { table, index });
+        }
     }
 
     fn record_transition(&mut self, binding: String, expr: &Expression<'_>) {
@@ -389,6 +504,9 @@ impl<'s> Analyzer<'s> {
                 function_values: handlers.len(),
                 dynamic_call_sites: 0,
                 looped_dynamic_call_sites: 0,
+                read_sites: 0,
+                dynamic_read_sites: 0,
+                looped_dynamic_read_sites: 0,
                 handlers,
             });
         }
@@ -427,6 +545,9 @@ impl<'s> Analyzer<'s> {
                 function_values: handlers.len(),
                 dynamic_call_sites: 0,
                 looped_dynamic_call_sites: 0,
+                read_sites: 0,
+                dynamic_read_sites: 0,
+                looped_dynamic_read_sites: 0,
                 handlers,
             });
         }
@@ -502,6 +623,7 @@ impl<'s> Analyzer<'s> {
             loops: 0,
             transitions: HashMap::new(),
             handler_calls: Vec::new(),
+            registry_reads: Vec::new(),
             handler_aliases: HashMap::new(),
             producers: Vec::new(),
             numeric_schedules: HashSet::new(),
@@ -633,6 +755,8 @@ impl<'s> Analyzer<'s> {
     }
 
     fn enter_call_expression(&mut self, call: &CallExpression<'_>) {
+        self.record_forwarded_registry_call(call);
+        self.record_registry_read_call(call);
         match unwrap_parens(&call.callee) {
             Expression::ComputedMemberExpression(member) => {
                 let table = fragment(self.source, member.object.span());
@@ -720,6 +844,7 @@ impl<'s> Analyzer<'s> {
             end: state.end,
             loops: state.loops,
             handler_calls: state.handler_calls,
+            registry_reads: state.registry_reads,
             producers: state.producers,
         });
     }
@@ -748,6 +873,47 @@ impl<'s> Analyzer<'s> {
                 function_values: handlers.len(),
                 dynamic_call_sites: 0,
                 looped_dynamic_call_sites: 0,
+                read_sites: 0,
+                dynamic_read_sites: 0,
+                looped_dynamic_read_sites: 0,
+                handlers,
+            });
+        }
+    }
+
+    fn materialize_forwarded_registries(&mut self) {
+        for ((scope_start, scope_end, binding), handlers) in
+            self.forwarded_registry_handlers.drain()
+        {
+            if handlers.len() < 4 {
+                continue;
+            }
+            let key = (scope_start, scope_end, binding.clone());
+            let (start, end) = self
+                .forwarded_registry_spans
+                .get(&key)
+                .copied()
+                .unwrap_or((0, 0));
+            let scope_function_id = self
+                .functions
+                .iter()
+                .find(|function| function.start == scope_start && function.end == scope_end)
+                .map(|function| function.id.clone());
+            self.tables.push(DetailedHandlerTableCandidate {
+                binding,
+                start,
+                end,
+                scope_function_id,
+                scope_start,
+                scope_end,
+                container_kind: "forwarded-registry".into(),
+                entries: handlers.len(),
+                function_values: handlers.len(),
+                dynamic_call_sites: 0,
+                looped_dynamic_call_sites: 0,
+                read_sites: 0,
+                dynamic_read_sites: 0,
+                looped_dynamic_read_sites: 0,
                 handlers,
             });
         }
@@ -785,6 +951,9 @@ impl<'s> Analyzer<'s> {
                 function_values: source_table.function_values,
                 dynamic_call_sites: 0,
                 looped_dynamic_call_sites: 0,
+                read_sites: 0,
+                dynamic_read_sites: 0,
+                looped_dynamic_read_sites: 0,
                 handlers: source_table.handlers.clone(),
             });
         }
@@ -826,6 +995,17 @@ impl<'s> Analyzer<'s> {
                         table.dynamic_call_sites += 1;
                         if function.loops > 0 {
                             table.looped_dynamic_call_sites += 1;
+                        }
+                    }
+                }
+                for read in &function.registry_reads {
+                    if read.table == table.binding {
+                        table.read_sites += 1;
+                        if !is_static_numeric_index(&read.index) {
+                            table.dynamic_read_sites += 1;
+                            if function.loops > 0 {
+                                table.looped_dynamic_read_sites += 1;
+                            }
                         }
                     }
                 }
@@ -950,6 +1130,7 @@ impl<'s> Analyzer<'s> {
 
     fn finish(mut self) -> TableVmAnalysis {
         self.materialize_registry_tables();
+        self.materialize_forwarded_registries();
         self.materialize_derived_registries();
         self.normalize_inventory();
         self.count_dynamic_call_sites();
@@ -1017,7 +1198,51 @@ impl<'a> Visit<'a> for Analyzer<'_> {
 }
 
 pub fn analyze(source: &str, program: &oxc_ast::ast::Program<'_>) -> TableVmAnalysis {
-    let mut analyzer = Analyzer::new(source);
+    let semantic_ret = SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(program);
+    let (forwarded_calls, read_calls) = if semantic_ret.diagnostics.is_empty() {
+        (
+            structurally_proven_registry_forwarding_calls(program, semantic_ret.semantic.scoping()),
+            structurally_proven_registry_read_calls(program, semantic_ret.semantic.scoping()),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut analyzer = Analyzer::new(source, forwarded_calls, read_calls);
     analyzer.visit_program(program);
     analyzer.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::analyze;
+    use oxc_allocator::Allocator;
+    use oxc_span::SourceType;
+    use rolldown_redox::ecmascript::parse_program;
+
+    #[test]
+    fn materializes_proven_forwarded_registry_calls() {
+        let source = r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            function vm(state) {
+                install(state, 1, function(a) { return a; });
+                install(state, 2, function(a, b) { return a + b; });
+                install(state, 3, function() { return 3; });
+                install(state, 4, function(a) { return a * 4; });
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let analysis = analyze(source, &parsed.program);
+        assert_eq!(analysis.handler_function_tables.len(), 1);
+        let table = &analysis.handler_function_tables[0];
+        assert_eq!(table.container_kind, "forwarded-registry");
+        assert_eq!(table.binding, "state.handlers");
+        assert_eq!(table.function_values, 4);
+        assert_eq!(table.handlers[0].key, "1");
+    }
 }

@@ -5,6 +5,7 @@ use oxc_ast::ast::{
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
+use oxc_span::GetSpan;
 use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use std::collections::{HashMap, HashSet};
 
@@ -12,6 +13,40 @@ use std::collections::{HashMap, HashSet};
 enum ExprKey {
     Symbol(SymbolId),
     Index(Box<ExprKey>, u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenRegistryForwardingCall {
+    pub call_start: u32,
+    pub call_end: u32,
+    pub receiver_start: u32,
+    pub receiver_end: u32,
+    pub key_start: u32,
+    pub key_end: u32,
+    pub registry_path: Vec<String>,
+    pub handler_start: u32,
+    pub handler_end: u32,
+    pub handler_params: usize,
+    pub handler_async: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenRegistryReadCall {
+    pub call_start: u32,
+    pub call_end: u32,
+    pub receiver_start: u32,
+    pub receiver_end: u32,
+    pub key_start: u32,
+    pub key_end: u32,
+    pub registry_path: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryForwarderProof {
+    receiver_argument: u32,
+    key_argument: u32,
+    value_argument: u32,
+    registry_path: Vec<String>,
 }
 
 fn reference_symbol(scoping: &Scoping, expression: &Expression<'_>) -> Option<SymbolId> {
@@ -348,6 +383,33 @@ fn argument_roles_are_stable(
     let mut safety = ArgumentRoleSafety {
         scoping,
         parameters: parameters.iter().copied().collect(),
+        boxes,
+        declarations,
+        valid: true,
+    };
+    safety.visit_function_body(body);
+    safety.valid
+}
+
+fn selected_argument_roles_are_stable(
+    scoping: &Scoping,
+    body: &FunctionBody<'_>,
+    parameters: &[SymbolId],
+    boxes: &HashSet<SymbolId>,
+    indices: &[u32],
+) -> bool {
+    let selected = indices
+        .iter()
+        .filter_map(|index| usize::try_from(*index).ok())
+        .filter_map(|index| parameters.get(index).copied())
+        .collect::<HashSet<_>>();
+    if selected.len() != indices.len() {
+        return false;
+    }
+    let declarations = argument_box_declarations(body);
+    let mut safety = ArgumentRoleSafety {
+        scoping,
+        parameters: selected,
         boxes,
         declarations,
         valid: true,
@@ -1251,6 +1313,679 @@ impl<'a> Visit<'a> for InstallerCollector<'_, '_> {
     }
 }
 
+fn parameter_member_path(
+    scoping: &Scoping,
+    expression: &Expression<'_>,
+    parameters: &[SymbolId],
+    boxes: &HashSet<SymbolId>,
+) -> Option<(u32, Vec<String>)> {
+    if let Some(argument) = argument_index_expr(scoping, expression, parameters, boxes) {
+        return Some((argument, Vec::new()));
+    }
+    match expression {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            parameter_member_path(scoping, &parenthesized.expression, parameters, boxes)
+        }
+        Expression::StaticMemberExpression(member) if !member.optional => {
+            let (argument, mut path) =
+                parameter_member_path(scoping, &member.object, parameters, boxes)?;
+            path.push(member.property.name.to_string());
+            Some((argument, path))
+        }
+        Expression::ComputedMemberExpression(member) if !member.optional => {
+            let Expression::StringLiteral(property) = &member.expression else {
+                return None;
+            };
+            let (argument, mut path) =
+                parameter_member_path(scoping, &member.object, parameters, boxes)?;
+            path.push(string_literal_value(property)?);
+            Some((argument, path))
+        }
+        _ => None,
+    }
+}
+
+struct ParameterReferenceCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    arguments: HashSet<u32>,
+}
+
+impl<'a> Visit<'a> for ParameterReferenceCollector<'_, '_> {
+    fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
+        let Some(symbol) = identifier
+            .reference_id
+            .get()
+            .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+        else {
+            return;
+        };
+        if let Some(index) = self
+            .parameters
+            .iter()
+            .position(|parameter| *parameter == symbol)
+        {
+            if let Ok(index) = u32::try_from(index) {
+                self.arguments.insert(index);
+            }
+        }
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn parameter_references(
+    scoping: &Scoping,
+    expression: &Expression<'_>,
+    parameters: &[SymbolId],
+) -> HashSet<u32> {
+    let mut collector = ParameterReferenceCollector {
+        scoping,
+        parameters,
+        arguments: HashSet::new(),
+    };
+    collector.visit_expression(expression);
+    collector.arguments
+}
+
+struct RegistryWriteCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    boxes: &'p HashSet<SymbolId>,
+    proofs: Vec<RegistryForwarderProof>,
+}
+
+impl<'a> Visit<'a> for RegistryWriteCollector<'_, '_> {
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment.operator.is_assign() {
+            if let AssignmentTarget::ComputedMemberExpression(member) = &assignment.left {
+                if !member.optional {
+                    if let (Some((receiver_argument, registry_path)), Some(key_argument)) = (
+                        parameter_member_path(
+                            self.scoping,
+                            &member.object,
+                            self.parameters,
+                            self.boxes,
+                        ),
+                        argument_index_expr(
+                            self.scoping,
+                            &member.expression,
+                            self.parameters,
+                            self.boxes,
+                        ),
+                    ) {
+                        let mut references =
+                            parameter_references(self.scoping, &assignment.right, self.parameters);
+                        references.remove(&receiver_argument);
+                        references.remove(&key_argument);
+                        if references.len() == 1 {
+                            if let Some(value_argument) = references.iter().next().copied() {
+                                if value_argument != receiver_argument
+                                    && value_argument != key_argument
+                                {
+                                    self.proofs.push(RegistryForwarderProof {
+                                        receiver_argument,
+                                        key_argument,
+                                        value_argument,
+                                        registry_path,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn registry_forwarder_proof(
+    scoping: &Scoping,
+    function: &Function<'_>,
+) -> Option<RegistryForwarderProof> {
+    if function.r#async || function.generator {
+        return None;
+    }
+    let (Some(body), Some(parameters)) = (&function.body, parameter_symbols(function)) else {
+        return None;
+    };
+    if parameters.len() < 3 {
+        return None;
+    }
+    let boxes = argument_boxes(body);
+    let mut collector = RegistryWriteCollector {
+        scoping,
+        parameters: &parameters,
+        boxes: &boxes,
+        proofs: Vec::new(),
+    };
+    collector.visit_function_body(body);
+    let first = collector.proofs.first()?.clone();
+    if !collector.proofs.iter().all(|proof| proof == &first) {
+        return None;
+    }
+    selected_argument_roles_are_stable(
+        scoping,
+        body,
+        &parameters,
+        &boxes,
+        &[
+            first.receiver_argument,
+            first.key_argument,
+            first.value_argument,
+        ],
+    )
+    .then_some(first)
+}
+
+struct RegistryForwarderCollector<'c> {
+    scoping: &'c Scoping,
+    proofs: HashMap<SymbolId, RegistryForwarderProof>,
+}
+impl RegistryForwarderCollector<'_> {
+    fn record(&mut self, symbol: SymbolId, function: &Function<'_>) {
+        if let Some(proof) = registry_forwarder_proof(self.scoping, function) {
+            self.proofs.insert(symbol, proof);
+        }
+    }
+}
+impl<'a> Visit<'a> for RegistryForwarderCollector<'_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some(symbol) = function
+            .id
+            .as_ref()
+            .and_then(|identifier| identifier.symbol_id.get())
+        {
+            self.record(symbol, function);
+        }
+        walk::walk_function(self, function, flags);
+    }
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            let Some(Expression::FunctionExpression(function)) = &declarator.init else {
+                continue;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+            self.record(symbol, function);
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
+struct RegistryDelegateProbe<'c, 'p, 'k> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    boxes: &'p HashSet<SymbolId>,
+    known: &'k HashMap<SymbolId, RegistryForwarderProof>,
+    proofs: Vec<RegistryForwarderProof>,
+}
+
+impl<'a> Visit<'a> for RegistryDelegateProbe<'_, '_, '_> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            if let Expression::Identifier(callee) = &call.callee {
+                if let Some(symbol) = callee
+                    .reference_id
+                    .get()
+                    .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                {
+                    if let Some(delegate) = self.known.get(&symbol) {
+                        let mapped = [
+                            delegate.receiver_argument,
+                            delegate.key_argument,
+                            delegate.value_argument,
+                        ]
+                        .map(|role| {
+                            usize::try_from(role)
+                                .ok()
+                                .and_then(|index| call.arguments.get(index))
+                                .and_then(|argument| {
+                                    argument_index_arg(
+                                        self.scoping,
+                                        argument,
+                                        self.parameters,
+                                        self.boxes,
+                                    )
+                                })
+                        });
+                        if let [Some(receiver_argument), Some(key_argument), Some(value_argument)] =
+                            mapped
+                        {
+                            if receiver_argument != key_argument
+                                && receiver_argument != value_argument
+                                && key_argument != value_argument
+                            {
+                                self.proofs.push(RegistryForwarderProof {
+                                    receiver_argument,
+                                    key_argument,
+                                    value_argument,
+                                    registry_path: delegate.registry_path.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn registry_delegate_proof(
+    scoping: &Scoping,
+    function: &Function<'_>,
+    known: &HashMap<SymbolId, RegistryForwarderProof>,
+) -> Option<RegistryForwarderProof> {
+    if function.r#async || function.generator {
+        return None;
+    }
+    let (Some(body), Some(parameters)) = (&function.body, parameter_symbols(function)) else {
+        return None;
+    };
+    if parameters.len() < 3 {
+        return None;
+    }
+    let boxes = argument_boxes(body);
+    let mut probe = RegistryDelegateProbe {
+        scoping,
+        parameters: &parameters,
+        boxes: &boxes,
+        known,
+        proofs: Vec::new(),
+    };
+    probe.visit_function_body(body);
+    let first = probe.proofs.first()?.clone();
+    if !probe.proofs.iter().all(|proof| proof == &first) {
+        return None;
+    }
+    selected_argument_roles_are_stable(
+        scoping,
+        body,
+        &parameters,
+        &boxes,
+        &[
+            first.receiver_argument,
+            first.key_argument,
+            first.value_argument,
+        ],
+    )
+    .then_some(first)
+}
+
+struct RegistryDelegateCollector<'c, 'k> {
+    scoping: &'c Scoping,
+    known: &'k HashMap<SymbolId, RegistryForwarderProof>,
+    proofs: HashMap<SymbolId, RegistryForwarderProof>,
+}
+
+impl RegistryDelegateCollector<'_, '_> {
+    fn record(&mut self, symbol: SymbolId, function: &Function<'_>) {
+        if self.known.contains_key(&symbol) {
+            return;
+        }
+        if let Some(proof) = registry_delegate_proof(self.scoping, function, self.known) {
+            self.proofs.insert(symbol, proof);
+        }
+    }
+}
+
+impl<'a> Visit<'a> for RegistryDelegateCollector<'_, '_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some(symbol) = function
+            .id
+            .as_ref()
+            .and_then(|identifier| identifier.symbol_id.get())
+        {
+            self.record(symbol, function);
+        }
+        walk::walk_function(self, function, flags);
+    }
+
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            let Some(Expression::FunctionExpression(function)) = &declarator.init else {
+                continue;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+            self.record(symbol, function);
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryAccessorProof {
+    receiver_argument: u32,
+    key_argument: u32,
+    registry_path: Vec<String>,
+}
+
+struct RegistryReadProbe<'c, 'p> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    boxes: &'p HashSet<SymbolId>,
+    proofs: Vec<RegistryAccessorProof>,
+}
+
+impl<'a> Visit<'a> for RegistryReadProbe<'_, '_> {
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment.operator.is_assign() {
+            if let Expression::ComputedMemberExpression(member) = &assignment.right {
+                if !member.optional {
+                    if let (Some((receiver_argument, registry_path)), Some(key_argument)) = (
+                        parameter_member_path(
+                            self.scoping,
+                            &member.object,
+                            self.parameters,
+                            self.boxes,
+                        ),
+                        argument_index_expr(
+                            self.scoping,
+                            &member.expression,
+                            self.parameters,
+                            self.boxes,
+                        ),
+                    ) {
+                        if receiver_argument != key_argument {
+                            self.proofs.push(RegistryAccessorProof {
+                                receiver_argument,
+                                key_argument,
+                                registry_path,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn registry_accessor_proof(
+    scoping: &Scoping,
+    function: &Function<'_>,
+) -> Option<RegistryAccessorProof> {
+    if function.r#async || function.generator {
+        return None;
+    }
+    let (Some(body), Some(parameters)) = (&function.body, parameter_symbols(function)) else {
+        return None;
+    };
+    if parameters.len() < 2 {
+        return None;
+    }
+    let boxes = argument_boxes(body);
+    let mut probe = RegistryReadProbe {
+        scoping,
+        parameters: &parameters,
+        boxes: &boxes,
+        proofs: Vec::new(),
+    };
+    probe.visit_function_body(body);
+    let first = probe.proofs.first()?.clone();
+    if !probe.proofs.iter().all(|proof| proof == &first) {
+        return None;
+    }
+    selected_argument_roles_are_stable(
+        scoping,
+        body,
+        &parameters,
+        &boxes,
+        &[first.receiver_argument, first.key_argument],
+    )
+    .then_some(first)
+}
+
+struct RegistryAccessorCollector<'c> {
+    scoping: &'c Scoping,
+    proofs: HashMap<SymbolId, RegistryAccessorProof>,
+}
+impl RegistryAccessorCollector<'_> {
+    fn record(&mut self, symbol: SymbolId, function: &Function<'_>) {
+        if let Some(proof) = registry_accessor_proof(self.scoping, function) {
+            self.proofs.insert(symbol, proof);
+        }
+    }
+}
+impl<'a> Visit<'a> for RegistryAccessorCollector<'_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some(symbol) = function
+            .id
+            .as_ref()
+            .and_then(|identifier| identifier.symbol_id.get())
+        {
+            self.record(symbol, function);
+        }
+        walk::walk_function(self, function, flags);
+    }
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            let Some(Expression::FunctionExpression(function)) = &declarator.init else {
+                continue;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+            self.record(symbol, function);
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
+struct RegistryReadCallCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    proofs: &'p HashMap<SymbolId, RegistryAccessorProof>,
+    calls: Vec<ProvenRegistryReadCall>,
+}
+impl<'a> Visit<'a> for RegistryReadCallCollector<'_, '_> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            if let Expression::Identifier(callee) = &call.callee {
+                if let Some(symbol) = callee
+                    .reference_id
+                    .get()
+                    .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                {
+                    if let Some(proof) = self.proofs.get(&symbol) {
+                        let receiver = usize::try_from(proof.receiver_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression);
+                        let key = usize::try_from(proof.key_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression);
+                        if let (Some(receiver), Some(key)) = (receiver, key) {
+                            self.calls.push(ProvenRegistryReadCall {
+                                call_start: call.span.start,
+                                call_end: call.span.end,
+                                receiver_start: receiver.span().start,
+                                receiver_end: receiver.span().end,
+                                key_start: key.span().start,
+                                key_end: key.span().end,
+                                registry_path: proof.registry_path.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+#[must_use]
+pub fn structurally_proven_registry_read_calls(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenRegistryReadCall> {
+    let mut accessors = RegistryAccessorCollector {
+        scoping,
+        proofs: HashMap::new(),
+    };
+    accessors.visit_program(program);
+    let mut calls = RegistryReadCallCollector {
+        scoping,
+        proofs: &accessors.proofs,
+        calls: Vec::new(),
+    };
+    calls.visit_program(program);
+    calls
+        .calls
+        .sort_by_key(|call| (call.call_start, call.call_end));
+    calls
+        .calls
+        .dedup_by_key(|call| (call.call_start, call.call_end));
+    calls.calls
+}
+
+struct RegistryForwardingCallCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    proofs: &'p HashMap<SymbolId, RegistryForwarderProof>,
+    calls: Vec<ProvenRegistryForwardingCall>,
+}
+impl<'a> Visit<'a> for RegistryForwardingCallCollector<'_, '_> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            if let Expression::Identifier(callee) = &call.callee {
+                if let Some(symbol) = callee
+                    .reference_id
+                    .get()
+                    .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                {
+                    if let Some(proof) = self.proofs.get(&symbol) {
+                        let receiver = usize::try_from(proof.receiver_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression);
+                        let key = usize::try_from(proof.key_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression);
+                        let value = usize::try_from(proof.value_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression);
+                        if let (Some(receiver), Some(key), Some(value)) = (receiver, key, value) {
+                            let handler = match value {
+                                Expression::FunctionExpression(function) => Some((
+                                    function.span.start,
+                                    function.span.end,
+                                    function.params.items.len(),
+                                    function.r#async,
+                                )),
+                                Expression::ArrowFunctionExpression(function) => Some((
+                                    function.span.start,
+                                    function.span.end,
+                                    function.params.items.len(),
+                                    function.r#async,
+                                )),
+                                _ => None,
+                            };
+                            if let Some((
+                                handler_start,
+                                handler_end,
+                                handler_params,
+                                handler_async,
+                            )) = handler
+                            {
+                                self.calls.push(ProvenRegistryForwardingCall {
+                                    call_start: call.span.start,
+                                    call_end: call.span.end,
+                                    receiver_start: receiver.span().start,
+                                    receiver_end: receiver.span().end,
+                                    key_start: key.span().start,
+                                    key_end: key.span().end,
+                                    registry_path: proof.registry_path.clone(),
+                                    handler_start,
+                                    handler_end,
+                                    handler_params,
+                                    handler_async,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+#[must_use]
+pub fn structurally_proven_registry_forwarding_calls(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenRegistryForwardingCall> {
+    let mut forwarders = RegistryForwarderCollector {
+        scoping,
+        proofs: HashMap::new(),
+    };
+    forwarders.visit_program(program);
+    loop {
+        let mut delegates = RegistryDelegateCollector {
+            scoping,
+            known: &forwarders.proofs,
+            proofs: HashMap::new(),
+        };
+        delegates.visit_program(program);
+        if delegates.proofs.is_empty() {
+            break;
+        }
+        forwarders.proofs.extend(delegates.proofs);
+    }
+    let mut calls = RegistryForwardingCallCollector {
+        scoping,
+        proofs: &forwarders.proofs,
+        calls: Vec::new(),
+    };
+    calls.visit_program(program);
+    calls
+        .calls
+        .sort_by_key(|call| (call.call_start, call.call_end));
+    calls
+        .calls
+        .dedup_by_key(|call| (call.call_start, call.call_end));
+    calls.calls
+}
+
 #[must_use]
 pub fn structurally_proven_forwarding_installers(
     program: &Program<'_>,
@@ -1272,7 +2007,10 @@ pub fn structurally_proven_forwarding_installers(
 
 #[cfg(test)]
 mod tests {
-    use super::structurally_proven_forwarding_installers;
+    use super::{
+        structurally_proven_forwarding_installers, structurally_proven_registry_forwarding_calls,
+        structurally_proven_registry_read_calls,
+    };
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
@@ -1288,6 +2026,144 @@ mod tests {
         assert!(semantic_ret.diagnostics.is_empty());
         structurally_proven_forwarding_installers(&parsed.program, semantic_ret.semantic.scoping())
             .len()
+    }
+
+    fn registry_calls(source: &str) -> Vec<super::ProvenRegistryForwardingCall> {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic_ret = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic_ret.diagnostics.is_empty());
+        structurally_proven_registry_forwarding_calls(
+            &parsed.program,
+            semantic_ret.semantic.scoping(),
+        )
+    }
+
+    #[test]
+    fn proves_parameter_forwarding_into_computed_registry_write() {
+        let calls = registry_calls(
+            r#"
+            const wrap = (value) => ({ value });
+            const install = function(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            };
+            const state = { handlers: {} };
+            install(state, 7, function(a) { return a + 1; });
+        "#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].registry_path, vec!["handlers"]);
+        assert_eq!(calls[0].handler_params, 1);
+    }
+
+    #[test]
+    fn rejects_registry_write_when_value_does_not_reach_rhs() {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = make(receiver, key);
+            }
+            install(state, 7, function(a) { return a; });
+        "#,
+        );
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn rejects_registry_write_with_ambiguous_extra_parameter_flow() {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value, salt) {
+                receiver.handlers[key] = make(receiver, key, value, salt);
+            }
+            install(state, 7, function(a) { return a; }, 12);
+        "#,
+        );
+        assert!(calls.is_empty());
+    }
+
+    fn registry_reads(source: &str) -> Vec<super::ProvenRegistryReadCall> {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic_ret = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic_ret.diagnostics.is_empty());
+        structurally_proven_registry_read_calls(&parsed.program, semantic_ret.semantic.scoping())
+    }
+
+    #[test]
+    fn proves_computed_registry_accessor_calls() {
+        let reads = registry_reads(
+            r#"
+            function get(receiver, key, cell) {
+                cell = receiver.handlers[key];
+                if (cell.value) return cell.create();
+                return cell.prototype;
+            }
+            const a = get(state, opcode);
+            const b = get(other, 17);
+        "#,
+        );
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].registry_path, vec!["handlers"]);
+    }
+
+    #[test]
+    fn rejects_accessor_when_receiver_role_is_reassigned() {
+        let reads = registry_reads(
+            r#"
+            function get(receiver, key, cell) {
+                receiver = other;
+                cell = receiver.handlers[key];
+                return cell;
+            }
+            get(state, opcode);
+        "#,
+        );
+        assert!(reads.is_empty());
+    }
+
+    #[test]
+    fn proves_registry_forwarding_through_delegate_fixed_point() {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            function delegate(selector, receiver, value, key) {
+                if (selector) install(receiver, key, value);
+            }
+            function outer(receiver, value, key, selector) {
+                delegate(selector, receiver, value, key);
+            }
+            outer(state, function(a) { return a; }, 9, true);
+        "#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].registry_path, vec!["handlers"]);
+        assert_eq!(calls[0].handler_params, 1);
+    }
+
+    #[test]
+    fn rejects_delegate_when_forwarded_value_role_is_reassigned() {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            function delegate(receiver, key, value) {
+                value = replacement;
+                install(receiver, key, value);
+            }
+            delegate(state, 9, function(a) { return a; });
+        "#,
+        );
+        assert!(calls.is_empty());
     }
 
     #[test]
