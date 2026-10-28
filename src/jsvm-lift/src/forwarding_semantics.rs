@@ -58,6 +58,13 @@ fn reference_symbol(scoping: &Scoping, expression: &Expression<'_>) -> Option<Sy
         .symbol_id()
 }
 
+fn symbol_binding_is_stable(scoping: &Scoping, symbol: SymbolId) -> bool {
+    scoping
+        .get_resolved_reference_ids(symbol)
+        .iter()
+        .all(|reference_id| !scoping.get_reference(*reference_id).is_write())
+}
+
 fn expr_key(scoping: &Scoping, expression: &Expression<'_>) -> Option<ExprKey> {
     match expression {
         Expression::Identifier(identifier) => scoping
@@ -508,6 +515,28 @@ fn last_sequence_expression<'a>(expression: &'a Expression<'a>) -> &'a Expressio
             .map_or(expression, last_sequence_expression)
     } else {
         expression
+    }
+}
+
+fn stable_receiver_expression<'a>(
+    scoping: &Scoping,
+    expression: &'a Expression<'a>,
+) -> Option<&'a Expression<'a>> {
+    match expression {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            stable_receiver_expression(scoping, &parenthesized.expression)
+        }
+        Expression::SequenceExpression(sequence) => {
+            let receiver = stable_receiver_expression(scoping, sequence.expressions.last()?)?;
+            match receiver {
+                Expression::Identifier(_) => reference_symbol(scoping, receiver)
+                    .filter(|symbol| symbol_binding_is_stable(scoping, *symbol))
+                    .map(|_| receiver),
+                Expression::ThisExpression(_) => Some(receiver),
+                _ => None,
+            }
+        }
+        _ => Some(expression),
     }
 }
 
@@ -1212,7 +1241,7 @@ struct DelegateProbe<'c, 'h> {
 
 impl<'a> Visit<'a> for DelegateProbe<'_, '_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        let Expression::Identifier(callee) = &call.callee else {
+        let Expression::Identifier(callee) = last_sequence_expression(&call.callee) else {
             walk::walk_call_expression(self, call);
             return;
         };
@@ -1220,6 +1249,7 @@ impl<'a> Visit<'a> for DelegateProbe<'_, '_> {
             .reference_id
             .get()
             .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+            .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
         else {
             walk::walk_call_expression(self, call);
             return;
@@ -1539,11 +1569,12 @@ struct RegistryDelegateProbe<'c, 'p, 'k> {
 impl<'a> Visit<'a> for RegistryDelegateProbe<'_, '_, '_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
-            if let Expression::Identifier(callee) = &call.callee {
+            if let Expression::Identifier(callee) = last_sequence_expression(&call.callee) {
                 if let Some(symbol) = callee
                     .reference_id
                     .get()
                     .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                    .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
                 {
                     if let Some(delegate) = self.known.get(&symbol) {
                         let mapped = [
@@ -1817,21 +1848,26 @@ struct RegistryReadCallCollector<'c, 'p> {
 impl<'a> Visit<'a> for RegistryReadCallCollector<'_, '_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
-            if let Expression::Identifier(callee) = &call.callee {
+            if let Expression::Identifier(callee) = last_sequence_expression(&call.callee) {
                 if let Some(symbol) = callee
                     .reference_id
                     .get()
                     .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                    .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
                 {
                     if let Some(proof) = self.proofs.get(&symbol) {
                         let receiver = usize::try_from(proof.receiver_argument)
                             .ok()
                             .and_then(|index| call.arguments.get(index))
-                            .and_then(Argument::as_expression);
+                            .and_then(Argument::as_expression)
+                            .and_then(|expression| {
+                                stable_receiver_expression(self.scoping, expression)
+                            });
                         let key = usize::try_from(proof.key_argument)
                             .ok()
                             .and_then(|index| call.arguments.get(index))
-                            .and_then(Argument::as_expression);
+                            .and_then(Argument::as_expression)
+                            .map(last_sequence_expression);
                         if let (Some(receiver), Some(key)) = (receiver, key) {
                             self.calls.push(ProvenRegistryReadCall {
                                 call_start: call.span.start,
@@ -1884,25 +1920,31 @@ struct RegistryForwardingCallCollector<'c, 'p> {
 impl<'a> Visit<'a> for RegistryForwardingCallCollector<'_, '_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
-            if let Expression::Identifier(callee) = &call.callee {
+            if let Expression::Identifier(callee) = last_sequence_expression(&call.callee) {
                 if let Some(symbol) = callee
                     .reference_id
                     .get()
                     .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                    .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
                 {
                     if let Some(proof) = self.proofs.get(&symbol) {
                         let receiver = usize::try_from(proof.receiver_argument)
                             .ok()
                             .and_then(|index| call.arguments.get(index))
-                            .and_then(Argument::as_expression);
+                            .and_then(Argument::as_expression)
+                            .and_then(|expression| {
+                                stable_receiver_expression(self.scoping, expression)
+                            });
                         let key = usize::try_from(proof.key_argument)
                             .ok()
                             .and_then(|index| call.arguments.get(index))
-                            .and_then(Argument::as_expression);
+                            .and_then(Argument::as_expression)
+                            .map(last_sequence_expression);
                         let value = usize::try_from(proof.value_argument)
                             .ok()
                             .and_then(|index| call.arguments.get(index))
-                            .and_then(Argument::as_expression);
+                            .and_then(Argument::as_expression)
+                            .map(last_sequence_expression);
                         if let (Some(receiver), Some(key), Some(value)) = (receiver, key, value) {
                             let handler = match value {
                                 Expression::FunctionExpression(function) => Some((
@@ -2060,6 +2102,78 @@ mod tests {
     }
 
     #[test]
+    fn proves_registry_forwarding_through_sequence_callee() {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            (0, install)(state, 7, function(a) { return a + 1; });
+        "#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].registry_path, vec!["handlers"]);
+    }
+
+    #[test]
+    fn rejects_sequence_callee_when_binding_can_be_reassigned() {
+        let calls = registry_calls(
+            r#"
+            let install = function(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            };
+            function replace() { install = other; }
+            (replace(), install)(state, 7, function(a) { return a + 1; });
+        "#,
+        );
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn proves_registry_forwarding_through_sequence_arguments() {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            install(state, (side(), 7), (other(), function(a) { return a + 1; }));
+        "#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].registry_path, vec!["handlers"]);
+    }
+
+    #[test]
+    fn proves_registry_forwarding_through_stable_sequence_receiver() {
+        let source = r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            const state = {};
+            install((side(), state), 7, function(a) { return a + 1; });
+        "#;
+        let calls = registry_calls(source);
+        assert_eq!(calls.len(), 1);
+        let receiver = &source[calls[0].receiver_start as usize..calls[0].receiver_end as usize];
+        assert_eq!(receiver, "state");
+    }
+
+    #[test]
+    fn rejects_registry_forwarding_through_mutable_sequence_receiver() {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            let state = {};
+            function swap() { state = other; }
+            install((swap(), state), 7, function(a) { return a + 1; });
+        "#,
+        );
+        assert!(calls.is_empty());
+    }
+
+    #[test]
     fn rejects_registry_write_when_value_does_not_reach_rhs() {
         let calls = registry_calls(
             r#"
@@ -2110,6 +2224,21 @@ mod tests {
         "#,
         );
         assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].registry_path, vec!["handlers"]);
+    }
+
+    #[test]
+    fn proves_registry_read_through_sequence_callee() {
+        let reads = registry_reads(
+            r#"
+            function get(receiver, key, cell) {
+                cell = receiver.handlers[key];
+                return cell;
+            }
+            const result = (0, get)(state, opcode);
+        "#,
+        );
+        assert_eq!(reads.len(), 1);
         assert_eq!(reads[0].registry_path, vec!["handlers"]);
     }
 

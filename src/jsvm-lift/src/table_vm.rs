@@ -1245,4 +1245,37 @@ mod tests {
         assert_eq!(table.function_values, 4);
         assert_eq!(table.handlers[0].key, "1");
     }
+
+    #[test]
+    fn groups_proven_sequence_receivers_by_stable_final_binding() {
+        let source = r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            function vm() {
+                const state = {};
+                install((touch(1), state), 1, function(a) { return a; });
+                install((touch(2), state), (noise(), 2), function(a) { return a + 2; });
+                install((touch(3), state), 3, (noise(), function() { return 3; }));
+                (noise(), install)((touch(4), state), 4, function(a) { return a * 4; });
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let analysis = analyze(source, &parsed.program);
+        assert_eq!(analysis.handler_function_tables.len(), 1);
+        let table = &analysis.handler_function_tables[0];
+        assert_eq!(table.container_kind, "forwarded-registry");
+        assert_eq!(table.binding, "state.handlers");
+        assert_eq!(table.function_values, 4);
+        assert_eq!(
+            table
+                .handlers
+                .iter()
+                .map(|handler| handler.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3", "4"]
+        );
+    }
 }
