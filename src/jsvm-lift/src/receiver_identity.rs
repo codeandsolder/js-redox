@@ -795,6 +795,13 @@ pub struct ProvenPrototypeMethodLookupTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrototypeMethodCallCandidate {
+    pub call: ProvenMemberReceiverOrigin,
+    pub lookup_target: ProvenPrototypeMethodLookupTarget,
+    pub receiver_effects: ProvenPrototypeMethodReceiverEffects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenPrototypeMethodReceiverEffects {
     pub constructor_start: u32,
     pub constructor_end: u32,
@@ -1608,12 +1615,85 @@ pub fn structurally_proven_prototype_method_receiver_effects(
         .collect()
 }
 
+/// Match exact-origin member calls to independently proven stable prototype
+/// lookup targets and their finite receiver-effect summaries.
+///
+/// This is intentionally not a call-time lookup proof. It only joins the
+/// structural facts needed by a later ordering/barrier theorem. Ambiguous
+/// lookup targets or effect summaries fail closed.
+#[must_use]
+pub fn structurally_matched_prototype_method_calls(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<PrototypeMethodCallCandidate> {
+    type MethodKey = (u32, u32, String);
+
+    let calls = structurally_proven_member_receiver_origins(program, scoping);
+    let mut targets = HashMap::<MethodKey, Vec<ProvenPrototypeMethodLookupTarget>>::new();
+    for target in structurally_proven_prototype_method_lookup_targets(program, scoping) {
+        targets
+            .entry((
+                target.constructor_start,
+                target.constructor_end,
+                target.property.clone(),
+            ))
+            .or_default()
+            .push(target);
+    }
+    let mut effects = HashMap::<MethodKey, Vec<ProvenPrototypeMethodReceiverEffects>>::new();
+    for effect in structurally_proven_prototype_method_receiver_effects(program, scoping) {
+        effects
+            .entry((
+                effect.constructor_start,
+                effect.constructor_end,
+                effect.property.clone(),
+            ))
+            .or_default()
+            .push(effect);
+    }
+
+    let mut matched = calls
+        .into_iter()
+        .filter_map(|call| {
+            let key = (
+                call.constructor_start,
+                call.constructor_end,
+                call.property.clone(),
+            );
+            let [lookup_target] = targets.get(&key)?.as_slice() else {
+                return None;
+            };
+            let [receiver_effects] = effects.get(&key)?.as_slice() else {
+                return None;
+            };
+            (lookup_target.assignment_start == receiver_effects.assignment_start
+                && lookup_target.assignment_end == receiver_effects.assignment_end
+                && lookup_target.possible_functions == receiver_effects.possible_functions)
+                .then(|| PrototypeMethodCallCandidate {
+                    call,
+                    lookup_target: lookup_target.clone(),
+                    receiver_effects: receiver_effects.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
+    matched.sort_by_key(|candidate| {
+        (
+            candidate.call.call_start,
+            candidate.call.call_end,
+            candidate.call.allocation_start,
+            candidate.call.property.clone(),
+        )
+    });
+    matched.dedup();
+    matched
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        propagate_proven_origin_contexts, structurally_proven_member_receiver_origins,
-        structurally_proven_member_write_origins, structurally_proven_origin_direct_calls,
-        structurally_proven_prototype_method_assignments,
+        propagate_proven_origin_contexts, structurally_matched_prototype_method_calls,
+        structurally_proven_member_receiver_origins, structurally_proven_member_write_origins,
+        structurally_proven_origin_direct_calls, structurally_proven_prototype_method_assignments,
         structurally_proven_prototype_method_lookup_targets,
         structurally_proven_prototype_method_receiver_effects,
     };
@@ -1671,6 +1751,54 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping())
+    }
+
+    #[test]
+    fn matches_exact_origin_member_call_to_stable_prototype_method() {
+        let source = r#"
+            const C = function() { launch(this); };
+            function launch(state) { state.run(); }
+            C.prototype.run = function() { return this.value; };
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let matched = structurally_matched_prototype_method_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        );
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].call.property, "run");
+        assert_eq!(matched[0].receiver_effects.receiver_reads, vec!["value"]);
+        assert!(!matched[0].receiver_effects.mutates_receiver);
+    }
+
+    #[test]
+    fn does_not_match_method_from_different_constructor() {
+        let source = r#"
+            const A = function() { launch(this); };
+            const B = function() {};
+            function launch(state) { state.run(); }
+            B.prototype.run = function() {};
+            new A();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        assert!(structurally_matched_prototype_method_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .is_empty());
     }
 
     #[test]
