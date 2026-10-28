@@ -1049,6 +1049,43 @@ fn static_member_name<'a>(expression: &'a Expression<'a>) -> Option<(&'a Express
     }
 }
 
+struct PrototypeMentionProbe<'c, 'f, 'a> {
+    scoping: &'c Scoping,
+    constructors: &'f HashMap<SymbolId, FunctionKey>,
+    aliases: &'a HashMap<SymbolId, FunctionKey>,
+    owners: HashSet<FunctionKey>,
+}
+
+impl<'a> Visit<'a> for PrototypeMentionProbe<'_, '_, '_> {
+    fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
+        if let Some(symbol) = identifier
+            .reference_id
+            .get()
+            .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+        {
+            if let Some(owner) = self.aliases.get(&symbol).copied() {
+                self.owners.insert(owner);
+            }
+        }
+    }
+
+    fn visit_static_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::StaticMemberExpression<'a>,
+    ) {
+        if !member.optional && member.property.name.as_str() == "prototype" {
+            if let Some(symbol) = reference_symbol(self.scoping, &member.object) {
+                if symbol_binding_is_stable(self.scoping, symbol) {
+                    if let Some(owner) = self.constructors.get(&symbol).copied() {
+                        self.owners.insert(owner);
+                    }
+                }
+            }
+        }
+        walk::walk_static_member_expression(self, member);
+    }
+}
+
 struct PrototypeMethodProof<'c, 'f> {
     scoping: &'c Scoping,
     constructors: &'f HashMap<SymbolId, FunctionKey>,
@@ -1245,8 +1282,53 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                     }
                 }
                 Statement::FunctionDeclaration(_) | Statement::EmptyStatement(_) => {}
-                _ => self.aliases.clear(),
+                _ => {
+                    // We do not model branch/loop execution as a stable installation
+                    // sequence. Any prototype identity mentioned inside such a
+                    // construct may participate in a conditional mutation or escape,
+                    // so stable lookup fails closed for that constructor.
+                    let mut probe = PrototypeMentionProbe {
+                        scoping: self.scoping,
+                        constructors: self.constructors,
+                        aliases: &self.aliases,
+                        owners: HashSet::new(),
+                    };
+                    probe.visit_statement(statement);
+                    for owner in probe.owners {
+                        self.invalidate_lookup(owner);
+                    }
+                    self.aliases.clear();
+                }
             }
+        }
+    }
+
+    fn invalidate_static_prototype_member(&mut self, object: &Expression<'_>, property: String) {
+        if property == "prototype" {
+            if let Some(symbol) = reference_symbol(self.scoping, object) {
+                if let Some(constructor) = self.constructors.get(&symbol).copied() {
+                    self.invalidate_constructor(constructor);
+                }
+            }
+            return;
+        }
+        if let Some(owner) = self.prototype_value(object) {
+            self.invalidate_property(owner, property);
+        }
+    }
+
+    fn invalidate_computed_prototype_member(
+        &mut self,
+        object: &Expression<'_>,
+        property: &Expression<'_>,
+    ) {
+        let Some(owner) = self.prototype_value(object) else {
+            return;
+        };
+        if let Some(property) = proof_property_key(property, self.scoping, self.property_keys) {
+            self.invalidate_property(owner, property);
+        } else {
+            self.invalidate_lookup(owner);
         }
     }
 
@@ -1262,16 +1344,29 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
             }
             Expression::AssignmentExpression(assignment) => {
                 if assignment.operator.as_str() != "=" {
-                    if let AssignmentTarget::AssignmentTargetIdentifier(identifier) =
-                        &assignment.left
-                    {
-                        if let Some(symbol) =
-                            identifier.reference_id.get().and_then(|reference_id| {
-                                self.scoping.get_reference(reference_id).symbol_id()
-                            })
-                        {
-                            self.aliases.remove(&symbol);
+                    match &assignment.left {
+                        AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                            if let Some(symbol) =
+                                identifier.reference_id.get().and_then(|reference_id| {
+                                    self.scoping.get_reference(reference_id).symbol_id()
+                                })
+                            {
+                                self.aliases.remove(&symbol);
+                            }
                         }
+                        AssignmentTarget::StaticMemberExpression(member) => {
+                            self.invalidate_static_prototype_member(
+                                &member.object,
+                                member.property.name.to_string(),
+                            );
+                        }
+                        AssignmentTarget::ComputedMemberExpression(member) => {
+                            self.invalidate_computed_prototype_member(
+                                &member.object,
+                                &member.expression,
+                            );
+                        }
+                        _ => {}
                     }
                     self.aliases.clear();
                     return;
@@ -1400,7 +1495,46 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                 self.process_expression(&logical.left);
                 self.aliases.clear();
             }
-            Expression::UnaryExpression(unary) => self.process_expression(&unary.argument),
+            Expression::UpdateExpression(update) => {
+                match &update.argument {
+                    oxc_ast::ast::SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                        self.invalidate_static_prototype_member(
+                            &member.object,
+                            member.property.name.to_string(),
+                        );
+                    }
+                    oxc_ast::ast::SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+                        self.invalidate_computed_prototype_member(
+                            &member.object,
+                            &member.expression,
+                        );
+                    }
+                    _ => {}
+                }
+                self.aliases.clear();
+            }
+            Expression::UnaryExpression(unary) => {
+                if unary.operator.as_str() == "delete" {
+                    match last_sequence_expression(&unary.argument) {
+                        Expression::StaticMemberExpression(member) => {
+                            self.invalidate_static_prototype_member(
+                                &member.object,
+                                member.property.name.to_string(),
+                            );
+                        }
+                        Expression::ComputedMemberExpression(member) => {
+                            self.invalidate_computed_prototype_member(
+                                &member.object,
+                                &member.expression,
+                            );
+                        }
+                        _ => self.process_expression(&unary.argument),
+                    }
+                    self.aliases.clear();
+                } else {
+                    self.process_expression(&unary.argument);
+                }
+            }
             Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {}
             _ => {}
         }
@@ -2246,6 +2380,57 @@ mod tests {
         let targets = lookup_targets(source);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].property, "run");
+    }
+
+    #[test]
+    fn lookup_target_rejects_conditional_prototype_mutation() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            if (flag) C.prototype.run = function() {};
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_rejects_conditional_alias_prototype_mutation() {
+        let source = r#"
+            const C = function() {};
+            let p = C.prototype;
+            p.run = function() {};
+            if (flag) p.run = function() {};
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_rejects_compound_prototype_method_write() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            C.prototype.run += 1;
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_rejects_prototype_method_update() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            C.prototype.run++;
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_rejects_prototype_method_delete() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            delete C.prototype.run;
+        "#;
+        assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
