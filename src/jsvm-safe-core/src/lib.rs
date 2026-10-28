@@ -1612,6 +1612,146 @@ mod tests {
     }
 
     #[test]
+    fn decoder_only_recovery_proves_inline_self_rewriting_plain_decoder() {
+        let source = r#"
+function provider() {
+    var table = ["alpha", "beta"];
+    return (provider = function() { return table; })();
+}
+function decode(index, unused) {
+    var table = provider();
+    return (decode = function(index, unused) { return table[index -= 0x10]; })(index, unused);
+}
+var alias = decode;
+sink(alias(0x10), alias(0x11));
+"#;
+        let recovered = recover_static_decoders(source, 8);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert_eq!(recovered.transforms.get("string_array_decode"), Some(&2));
+        assert!(recovered.source.contains("sink(\"alpha\", \"beta\")"));
+
+        let rebound = source.replace("var alias = decode;", "var alias = decode; alias = other;");
+        let rebound_result = recover_static_decoders(&rebound, 8);
+        assert!(rebound_result.is_some());
+        let rebound_result = rebound_result.unwrap_or_else(|| unreachable!());
+        assert_eq!(rebound_result.transforms.get("string_array_decode"), None);
+
+        let conditional = source.replace(
+            "var alias = decode;",
+            "if (enabled) { var alias = decode; }",
+        );
+        let conditional_result = recover_static_decoders(&conditional, 8);
+        assert!(conditional_result.is_some());
+        let conditional_result = conditional_result.unwrap_or_else(|| unreachable!());
+        assert_eq!(conditional_result.transforms.get("string_array_decode"), None);
+
+        let dynamic = source.replace(
+            "var alias = decode;",
+            "var alias = decode; eval(\"alias = other\");",
+        );
+        let dynamic_result = recover_static_decoders(&dynamic, 8);
+        assert!(dynamic_result.is_some());
+        let dynamic_result = dynamic_result.unwrap_or_else(|| unreachable!());
+        assert_eq!(dynamic_result.transforms.get("string_array_decode"), None);
+
+        let local_alias = source.replace(
+            "sink(alias(0x10), alias(0x11));",
+            "function use() { var unused, local = alias; return sink(local(0x10), local(0x11)); } use();",
+        );
+        let local_result = recover_static_decoders(&local_alias, 8);
+        assert!(local_result.is_some());
+        let local_result = local_result.unwrap_or_else(|| unreachable!());
+        assert!(
+            local_result
+                .transforms
+                .get("string_array_decode")
+                .copied()
+                .unwrap_or_default()
+                >= 2
+        );
+
+        let unsafe_leading = source.replace(
+            "sink(alias(0x10), alias(0x11));",
+            "function use() { var before = helper(), local = alias; return sink(local(0x10), local(0x11)); } use();",
+        );
+        let unsafe_result = recover_static_decoders(&unsafe_leading, 8);
+        assert!(unsafe_result.is_some());
+        let unsafe_result = unsafe_result.unwrap_or_else(|| unreachable!());
+        assert_eq!(unsafe_result.transforms.get("string_array_decode"), None);
+
+        let impure = source.replace(
+            "var table = [\"alpha\", \"beta\"];",
+            "var table = [\"alpha\", \"beta\"]; sideEffect();",
+        );
+        let rejected = recover_static_decoders(&impure, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+    }
+
+    #[test]
+    fn decoder_only_recovery_proves_closed_over_checksum_rotation() {
+        let original = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/rotated-base64-string-array.js"
+        );
+        let rotation_start = original
+            .find("(function (provider, target)")
+            .unwrap_or_else(|| unreachable!());
+        let rotation_end = original[rotation_start..]
+            .find("\n\nconsole.log")
+            .map(|offset| rotation_start + offset)
+            .unwrap_or_else(|| unreachable!());
+        let mut source = original.to_string();
+        source.replace_range(
+            rotation_start..rotation_end,
+            r#"!function() {
+  for (var alias = d, table = p();;) try {
+    if (2454246 === parseInt(alias(0x10)) * 10 + parseInt(alias(0x11))) break;
+    table.push(table.shift());
+  } catch (error) {
+    table.push(table.shift());
+  }
+}();"#,
+        );
+
+        let recovered = recover_static_decoders(&source, 8);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert!(
+            recovered
+                .transforms
+                .get("string_array_decode")
+                .copied()
+                .unwrap_or_default()
+                >= 2
+        );
+        assert_eq!(
+            recovered.transforms.get("materialize_decoder_rotation"),
+            Some(&1)
+        );
+        assert_eq!(
+            recovered.transforms.get("remove_decoder_rotation_iife"),
+            Some(&1)
+        );
+        assert!(!recovered.source.contains("table.push(table.shift())"));
+
+        let bad = source.replace("2454246 ===", "2454247 ===");
+        let rejected = recover_static_decoders(&bad, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        assert_eq!(
+            rejected.transforms.get("materialize_decoder_rotation"),
+            None
+        );
+        assert_eq!(
+            rejected.transforms.get("remove_decoder_rotation_iife"),
+            None
+        );
+    }
+
+    #[test]
     fn decoder_only_recovery_generalizes_split_provider_sequence_accessor_and_nested_rotation() {
         let source = r#"
 function provider(table) {

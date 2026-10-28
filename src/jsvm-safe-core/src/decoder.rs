@@ -2273,6 +2273,7 @@ struct RotationIife {
     count_param: String,
     numeric_members: HashMap<(String, String), i64>,
     stable_aliases: HashMap<String, String>,
+    checksum_expression: Option<String>,
     proof_eligible: bool,
     body_span: Span,
     statement_span: Span,
@@ -2294,6 +2295,9 @@ fn rotation_iife_call<'a>(expr: &'a Expression<'a>) -> Option<&'a CallExpression
         Expression::CallExpression(call) => Some(call),
         Expression::ParenthesizedExpression(parenthesized) => {
             rotation_iife_call(&parenthesized.expression)
+        }
+        Expression::UnaryExpression(unary) if unary.operator.as_str() == "!" => {
+            rotation_iife_call(&unary.argument)
         }
         _ => None,
     }
@@ -2645,7 +2649,138 @@ fn rotation_numeric_members(
     out
 }
 
+fn rotation_statement_matches(source: &str, statement: &Statement<'_>, array_alias: &str) -> bool {
+    let Statement::ExpressionStatement(statement) = statement else {
+        return false;
+    };
+    let alias = regex::escape(array_alias);
+    let Some(pattern) = compile_regex(&format!(
+        r#"^\s*{alias}\s*(?:\.\s*push|\[\s*["']push["']\s*\])\s*\(\s*{alias}\s*(?:\.\s*shift|\[\s*["']shift["']\s*\])\s*\(\s*\)\s*\)\s*;?\s*$"#,
+    )) else {
+        return false;
+    };
+    pattern.is_match(fragment(source, statement.span))
+}
+
+fn closed_over_rotation_iife(
+    source: &str,
+    call: &CallExpression<'_>,
+    function: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+    statement_span: Option<Span>,
+) -> Option<RotationIife> {
+    if call.optional
+        || !call.arguments.is_empty()
+        || function.r#async
+        || function.generator
+        || !function.params.items.is_empty()
+        || function.params.rest.is_some()
+        || rotation_has_dynamic_scope(function)
+    {
+        return None;
+    }
+    let body = function.body.as_ref()?;
+    let [Statement::ForStatement(for_statement)] = body.statements.as_slice() else {
+        return None;
+    };
+    if for_statement.test.is_some() || for_statement.update.is_some() {
+        return None;
+    }
+    let oxc_ast::ast::ForStatementInit::VariableDeclaration(init) = for_statement.init.as_ref()?
+    else {
+        return None;
+    };
+    let [decoder_decl, table_decl] = init.declarations.as_slice() else {
+        return None;
+    };
+    let BindingPattern::BindingIdentifier(decoder_alias) = &decoder_decl.id else {
+        return None;
+    };
+    let Some(Expression::Identifier(decoder)) = &decoder_decl.init else {
+        return None;
+    };
+    let decoder_reference = decoder.reference_id.get()?;
+    let decoder_symbol = statically_resolved_symbol(scoping, decoder_reference)?;
+    if !scoping.symbol_flags(decoder_symbol).is_function() {
+        return None;
+    }
+
+    let BindingPattern::BindingIdentifier(array_alias) = &table_decl.id else {
+        return None;
+    };
+    let Some(Expression::CallExpression(provider_call)) = &table_decl.init else {
+        return None;
+    };
+    if provider_call.optional || !provider_call.arguments.is_empty() {
+        return None;
+    }
+    let Expression::Identifier(provider) = &provider_call.callee else {
+        return None;
+    };
+    let provider_reference = provider.reference_id.get()?;
+    let provider_symbol = statically_resolved_symbol(scoping, provider_reference)?;
+    if !scoping.symbol_flags(provider_symbol).is_function() {
+        return None;
+    }
+
+    let Statement::TryStatement(try_statement) = &for_statement.body else {
+        return None;
+    };
+    if try_statement.finalizer.is_some() {
+        return None;
+    }
+    let [Statement::IfStatement(if_statement), rotate_statement] =
+        try_statement.block.body.as_slice()
+    else {
+        return None;
+    };
+    if if_statement.alternate.is_some()
+        || !matches!(&if_statement.consequent, Statement::BreakStatement(_))
+        || !rotation_statement_matches(source, rotate_statement, array_alias.name.as_str())
+    {
+        return None;
+    }
+    let handler = try_statement.handler.as_ref()?;
+    let [catch_rotate] = handler.body.body.as_slice() else {
+        return None;
+    };
+    if !rotation_statement_matches(source, catch_rotate, array_alias.name.as_str()) {
+        return None;
+    }
+
+    let Expression::BinaryExpression(check) = unparenthesized(&if_statement.test) else {
+        return None;
+    };
+    if !matches!(check.operator.as_str(), "==" | "===") {
+        return None;
+    }
+    let (target, checksum) = if let Some(target) = expression_integer(&check.left) {
+        (target, &check.right)
+    } else {
+        let target = expression_integer(&check.right)?;
+        (target, &check.left)
+    };
+
+    let mut stable_aliases = HashMap::new();
+    stable_aliases.insert(decoder.name.to_string(), decoder_alias.name.to_string());
+    let standalone = statement_span.is_some();
+    Some(RotationIife {
+        provider: provider.name.to_string(),
+        target,
+        array_param: array_alias.name.to_string(),
+        count_param: String::new(),
+        numeric_members: HashMap::new(),
+        stable_aliases,
+        checksum_expression: Some(fragment(source, checksum.span()).to_string()),
+        proof_eligible: true,
+        body_span: body.span,
+        statement_span: statement_span.unwrap_or(call.span),
+        standalone_statement: standalone,
+    })
+}
+
 struct RotationIifeCollector<'c, 's> {
+    source: &'s str,
     scoping: &'c Scoping,
     statement_spans: &'s HashMap<(u32, u32), Span>,
     reference_spans: &'s HashMap<ReferenceId, Span>,
@@ -2654,6 +2789,23 @@ struct RotationIifeCollector<'c, 's> {
 
 impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if call.arguments.is_empty() {
+            if let Some(function) = rotation_iife_function(&call.callee) {
+                let statement_span = self
+                    .statement_spans
+                    .get(&(call.span.start, call.span.end))
+                    .copied();
+                if let Some(rotation) = closed_over_rotation_iife(
+                    self.source,
+                    call,
+                    function,
+                    self.scoping,
+                    statement_span,
+                ) {
+                    self.out.push(rotation);
+                }
+            }
+        }
         if !call.optional && call.arguments.len() == 2 {
             let provider = match &call.arguments[0] {
                 Argument::Identifier(identifier) => Some(identifier),
@@ -2709,6 +2861,7 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
                         count_param,
                         numeric_members,
                         stable_aliases,
+                        checksum_expression: None,
                         proof_eligible,
                         body_span: body.span,
                         statement_span: standalone_statement.unwrap_or(call.span),
@@ -2722,6 +2875,7 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
 }
 
 fn collect_rotation_iifes(
+    source: &str,
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
@@ -2729,6 +2883,7 @@ fn collect_rotation_iifes(
     let mut statement_spans = RotationStatementSpanCollector::default();
     statement_spans.visit_program(program);
     let mut collector = RotationIifeCollector {
+        source,
         scoping,
         statement_spans: &statement_spans.spans,
         reference_spans,
@@ -2800,7 +2955,7 @@ fn detect_fixed_rotated_direct_decoders(
 ) -> DecoderDetection {
     let arrays = all_static_arrays(program);
     let functions = variable_functions(program);
-    let rotations = collect_rotation_iifes(program, scoping, reference_spans);
+    let rotations = collect_rotation_iifes(source, program, scoping, reference_spans);
     let mut decoders = HashMap::new();
     let mut protected_spans = Vec::new();
     let mut replacements = Vec::new();
@@ -2921,6 +3076,9 @@ struct ProvenRotationIife {
 }
 
 fn rotation_checksum_expression(source: &str, iife: &RotationIife) -> Option<String> {
+    if let Some(expression) = &iife.checksum_expression {
+        return Some(expression.clone());
+    }
     let body = fragment(source, iife.body_span);
     if let Some(pattern) = compile_regex(
         r"(?s)\btry\s*\{\s*(?:var|let|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*(?P<expr>[^;]+);",
@@ -3189,14 +3347,22 @@ fn decoder_providers(
             continue;
         }
         let body = fragment(source, function.span);
-        if (!body.contains(&format!("{} = function", function.name))
-            && !body.contains(&format!("{}=function", function.name)))
-            || !body.contains(&format!("return {}();", function.name))
-        {
-            continue;
-        }
+        let classic_self_rewrite = (body.contains(&format!("{} = function", function.name))
+            || body.contains(&format!("{}=function", function.name)))
+            && body.contains(&format!("return {}();", function.name));
         for (array_name, values) in &function.static_arrays {
-            if body.contains(&format!("return {array_name};")) {
+            let inline_self_rewrite = compile_regex(&format!(
+                r"(?s)^\s*function\s+{}\s*\(\s*\)\s*\{{\s*(?:const|let|var)\s+{}\s*=\s*{}\s*;\s*return\s*\(\s*{}\s*=\s*function\s*\(\s*\)\s*\{{\s*return\s+{}\s*;?\s*\}}\s*\)\s*\(\s*\)\s*;?\s*\}}\s*$",
+                regex::escape(&function.name),
+                regex::escape(array_name),
+                regex::escape(fragment(source, values.span)),
+                regex::escape(&function.name),
+                regex::escape(array_name),
+            ))
+            .is_some_and(|pattern| pattern.is_match(body));
+            if (classic_self_rewrite && body.contains(&format!("return {array_name};")))
+                || inline_self_rewrite
+            {
                 providers.insert((function.scope, function.name.clone()), values.clone());
                 break;
             }
@@ -3242,6 +3408,52 @@ fn decoder_transform(body: &str, keyed_decode_call: bool) -> Option<DecoderTrans
     Some(DecoderTransform::LowerAlphabetBase64Uri)
 }
 
+fn inline_self_rewriting_direct_decoder(
+    source: &str,
+    function: &FnInfo,
+    name_counts: &HashMap<String, usize>,
+    providers: &HashMap<(ScopeId, String), LocalStaticArrayInfo>,
+) -> Option<Decoder> {
+    if function.params.is_empty() || name_counts.get(&function.name).copied() != Some(1) {
+        return None;
+    }
+    let params = function
+        .params
+        .iter()
+        .map(|param| regex::escape(param))
+        .collect::<Vec<_>>()
+        .join(r"\s*,\s*");
+    let first = regex::escape(function.params.first()?);
+    let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
+    let body = fragment(source, function.span);
+    let pattern = compile_regex(&format!(
+        r"(?s)^\s*function\s+{}\s*\(\s*{}\s*\)\s*\{{\s*(?:const|let|var)\s+(?P<table>{identifier})\s*=\s*(?P<provider>{identifier})\s*\(\s*\)\s*;\s*return\s*\(\s*{}\s*=\s*function\s*\(\s*{}\s*\)\s*\{{\s*return\s+(?P<lookup>{identifier})\s*\[\s*{}\s*-=\s*(?P<offset>0[xX][0-9A-Fa-f]+|[0-9]+)\s*\]\s*;?\s*\}}\s*\)\s*\(\s*{}\s*\)\s*;?\s*\}}\s*$",
+        regex::escape(&function.name),
+        params,
+        regex::escape(&function.name),
+        params,
+        first,
+        params,
+    ))?;
+    let captures = pattern.captures(body)?;
+    if captures.name("table")?.as_str() != captures.name("lookup")?.as_str() {
+        return None;
+    }
+    let provider = captures.name("provider")?.as_str().to_string();
+    if name_counts.get(&provider).copied() != Some(1) {
+        return None;
+    }
+    let provider_info = providers.get(&(function.scope, provider.clone()))?;
+    let offset = parse_i64_literal(captures.name("offset")?.as_str())?;
+    Some(Decoder {
+        values: provider_info.values.clone(),
+        offset,
+        provider,
+        provider_array_span: provider_info.span,
+        transform: DecoderTransform::Plain,
+    })
+}
+
 fn detect_decoder_candidate(
     source: &str,
     function: &FnInfo,
@@ -3266,6 +3478,11 @@ fn detect_decoder_candidate(
             provider_array_span: provider_info.span,
             transform: DecoderTransform::Plain,
         });
+    }
+    if let Some(decoder) =
+        inline_self_rewriting_direct_decoder(source, function, name_counts, providers)
+    {
+        return Some(decoder);
     }
     let body = fragment(source, function.span);
     let local = patterns.local.captures(body)?;
@@ -3400,7 +3617,7 @@ fn detect_decoders(
         })
         .collect::<HashMap<_, _>>();
 
-    let rotation_iifes = collect_rotation_iifes(program, scoping, reference_spans);
+    let rotation_iifes = collect_rotation_iifes(source, program, scoping, reference_spans);
     let (protected_spans, rotation_replacements) =
         apply_proven_decoder_rotations(source, &mut by_name, &rotation_iifes);
 
@@ -3526,9 +3743,8 @@ struct SymbolAliasCollector<'s, 'r> {
 
 impl<'a> Visit<'a> for SymbolAliasCollector<'_, '_> {
     fn visit_variable_declaration(&mut self, it: &oxc_ast::ast::VariableDeclaration<'a>) {
-        // Decoder aliases are only propagated when JavaScript itself proves
-        // the binding cannot later be rebound. This keeps the transform
-        // fail-closed without needing a second write-analysis pass.
+        // Nested aliases stay const-only. Mutable aliases need an explicit
+        // execution-order proof and are handled separately at program scope.
         if it.kind != VariableDeclarationKind::Const {
             walk::walk_variable_declaration(self, it);
             return;
@@ -3546,7 +3762,7 @@ impl<'a> Visit<'a> for SymbolAliasCollector<'_, '_> {
             let Some(reference_id) = target.reference_id.get() else {
                 continue;
             };
-            let Some(target_symbol) = self.scoping.get_reference(reference_id).symbol_id() else {
+            let Some(target_symbol) = statically_resolved_symbol(self.scoping, reference_id) else {
                 continue;
             };
             self.aliases.push((alias_symbol, target_symbol));
@@ -3640,6 +3856,111 @@ impl<'a> Visit<'a> for SymbolAliasCollector<'_, '_> {
     }
 }
 
+fn leading_mutable_aliases_in_statements(
+    statements: &[Statement<'_>],
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> Vec<(SymbolId, SymbolId)> {
+    let first_executable = statements.iter().find(|statement| {
+        !matches!(
+            statement,
+            Statement::FunctionDeclaration(_) | Statement::EmptyStatement(_)
+        )
+    });
+    let Some(Statement::VariableDeclaration(declaration)) = first_executable else {
+        return Vec::new();
+    };
+    if declaration.kind == VariableDeclarationKind::Const {
+        return Vec::new();
+    }
+
+    let mut aliases = Vec::new();
+    let mut prior_initializer = false;
+    for declarator in &declaration.declarations {
+        let candidate = if !prior_initializer {
+            let BindingPattern::BindingIdentifier(alias) = &declarator.id else {
+                prior_initializer |= declarator.init.is_some();
+                continue;
+            };
+            let Some(alias_symbol) = alias.symbol_id.get() else {
+                prior_initializer |= declarator.init.is_some();
+                continue;
+            };
+            let Some(Expression::Identifier(target)) = &declarator.init else {
+                prior_initializer |= declarator.init.is_some();
+                continue;
+            };
+            let Some(target_reference_id) = target.reference_id.get() else {
+                prior_initializer = true;
+                continue;
+            };
+            let Some(target_symbol) = statically_resolved_symbol(scoping, target_reference_id) else {
+                prior_initializer = true;
+                continue;
+            };
+            if target_symbol == alias_symbol {
+                prior_initializer = true;
+                continue;
+            }
+            let stable = scoping
+                .get_resolved_reference_ids(alias_symbol)
+                .iter()
+                .all(|reference_id| {
+                    reference_spans.get(reference_id).is_some_and(|span| {
+                        span.start >= declarator.span.end
+                            && reference_is_statically_resolved_read(
+                                scoping,
+                                *reference_id,
+                                alias_symbol,
+                            )
+                    })
+                });
+            stable.then_some((alias_symbol, target_symbol))
+        } else {
+            None
+        };
+        if let Some(alias) = candidate {
+            aliases.push(alias);
+        }
+        prior_initializer |= declarator.init.is_some();
+    }
+    aliases
+}
+
+struct LeadingMutableAliasCollector<'s, 'r> {
+    scoping: &'s Scoping,
+    reference_spans: &'r HashMap<ReferenceId, Span>,
+    aliases: Vec<(SymbolId, SymbolId)>,
+}
+
+impl<'a> Visit<'a> for LeadingMutableAliasCollector<'_, '_> {
+    fn visit_program(&mut self, program: &oxc_ast::ast::Program<'a>) {
+        let mut dynamic_scope = RotationDynamicScopeProbe::default();
+        dynamic_scope.visit_program(program);
+        if !dynamic_scope.found {
+            self.aliases.extend(leading_mutable_aliases_in_statements(
+                &program.body,
+                self.scoping,
+                self.reference_spans,
+            ));
+        }
+        walk::walk_program(self, program);
+    }
+
+    fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        if !rotation_has_dynamic_scope(function) {
+            if let Some(body) = &function.body {
+                self.aliases.extend(leading_mutable_aliases_in_statements(
+                    &body.statements,
+                    self.scoping,
+                    self.reference_spans,
+                ));
+            }
+        }
+        walk::walk_function(self, function, flags);
+    }
+}
+
 fn collect_symbol_aliases(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
@@ -3654,6 +3975,13 @@ fn collect_symbol_aliases(
         aliases: Vec::new(),
     };
     collector.visit_program(program);
+    let mut mutable_collector = LeadingMutableAliasCollector {
+        scoping,
+        reference_spans,
+        aliases: Vec::new(),
+    };
+    mutable_collector.visit_program(program);
+    collector.aliases.extend(mutable_collector.aliases);
     collector.aliases
 }
 
@@ -3670,6 +3998,7 @@ mod tests {
             count_param: "target".into(),
             numeric_members: HashMap::new(),
             stable_aliases: HashMap::from([("decode".into(), "alias".into())]),
+            checksum_expression: None,
             proof_eligible: true,
             body_span: Span::new(0, 0),
             statement_span: Span::new(0, 0),
