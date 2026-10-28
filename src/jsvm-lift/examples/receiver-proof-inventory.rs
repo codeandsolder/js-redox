@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use jsvm_lift::cfg_order::prove_event_before_barriers;
 use jsvm_lift::receiver_identity::{
     structurally_matched_prototype_method_calls, structurally_proven_origin_flow,
     structurally_proven_prototype_method_lookup_targets,
@@ -6,7 +7,7 @@ use jsvm_lift::receiver_identity::{
 };
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
-use oxc_span::SourceType;
+use oxc_span::{SourceType, Span};
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::{json, Value};
 use std::{env, fs, path::PathBuf};
@@ -34,6 +35,8 @@ fn main() -> Result<()> {
         "parse diagnostics"
     );
     let semantic = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .with_cfg(true)
         .with_check_syntax_error(true)
         .build(&parsed.program);
     anyhow::ensure!(semantic.diagnostics.is_empty(), "semantic diagnostics");
@@ -135,6 +138,63 @@ fn main() -> Result<()> {
     let candidates = matched
         .iter()
         .map(|candidate| {
+            let function = (
+                candidate.call.context.function_start,
+                candidate.call.context.function_end,
+            );
+            let allocation = (
+                candidate.call.allocation_start,
+                candidate.call.allocation_end,
+            );
+            let mut barriers = flow
+                .exposures
+                .iter()
+                .filter(|exposure| {
+                    (exposure.context.function_start, exposure.context.function_end) == function
+                        && (exposure.allocation_start, exposure.allocation_end) == allocation
+                })
+                .map(|exposure| Span::new(exposure.exposure_start, exposure.exposure_end))
+                .chain(
+                    flow.member_writes
+                        .iter()
+                        .filter(|write| {
+                            (write.context.function_start, write.context.function_end) == function
+                                && (write.allocation_start, write.allocation_end) == allocation
+                                && write.property.as_deref().is_none_or(|property| {
+                                    property == candidate.call.property.as_str()
+                                })
+                        })
+                        .map(|write| Span::new(write.write_start, write.write_end)),
+                )
+                .chain(
+                    flow.member_calls
+                        .iter()
+                        .filter(|call| {
+                            (call.context.function_start, call.context.function_end) == function
+                                && (call.allocation_start, call.allocation_end) == allocation
+                                && (call.call_start, call.call_end)
+                                    != (candidate.call.call_start, candidate.call.call_end)
+                        })
+                        .map(|call| Span::new(call.call_start, call.call_end)),
+                )
+                .collect::<Vec<_>>();
+            barriers.sort_by_key(|span| (span.start, span.end));
+            barriers.dedup();
+            let local_prefix_clean = prove_event_before_barriers(
+                &semantic.semantic,
+                Span::new(candidate.call.call_start, candidate.call.call_end),
+                &barriers,
+            );
+            let local_barriers = barriers
+                .iter()
+                .map(|span| {
+                    json!({
+                        "start": span.start,
+                        "end": span.end,
+                        "source": snippet(&source, span.start, span.end),
+                    })
+                })
+                .collect::<Vec<_>>();
             json!({
                 "call_start": candidate.call.call_start,
                 "call_end": candidate.call.call_end,
@@ -149,6 +209,8 @@ fn main() -> Result<()> {
                 "mutates_receiver": candidate.receiver_effects.mutates_receiver,
                 "exposes_receiver": candidate.receiver_effects.exposes_receiver,
                 "dynamic_receiver_access": candidate.receiver_effects.dynamic_receiver_access,
+                "local_prefix_clean": local_prefix_clean,
+                "local_barriers": local_barriers,
             })
         })
         .collect::<Vec<_>>();

@@ -4,6 +4,8 @@ pub mod bundle_unpack;
 
 pub mod browser_decode;
 
+pub mod cfg_order;
+
 pub mod effect_shape;
 
 pub mod numeric;
