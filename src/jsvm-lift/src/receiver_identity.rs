@@ -1,7 +1,7 @@
 use jsvm_safe_core::string_literal_value;
 use oxc_ast::ast::{
-    Argument, BindingPattern, CallExpression, Expression, Function, FunctionBody, NewExpression,
-    Program, VariableDeclaration,
+    Argument, AssignmentTarget, BindingPattern, CallExpression, Expression, Function, FunctionBody,
+    NewExpression, Program, Statement, VariableDeclaration,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
@@ -441,13 +441,377 @@ pub fn structurally_proven_member_receiver_origins(
     calls
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenPrototypeMethodAssignment {
+    pub constructor_start: u32,
+    pub constructor_end: u32,
+    pub property: String,
+    pub function_start: u32,
+    pub function_end: u32,
+    pub assignment_start: u32,
+    pub assignment_end: u32,
+    /// Resolving this assignment as an installed own prototype method requires ordinary
+    /// function-prototype / Object.prototype property semantics at runtime.
+    pub standard_prototype_semantics_required: bool,
+}
+
+fn regular_function_key(function: &Function<'_>) -> Option<FunctionKey> {
+    (!function.r#async && !function.generator).then(|| FunctionKey::of(function))
+}
+
+fn returned_regular_function(call: &CallExpression<'_>) -> Option<FunctionKey> {
+    if call.optional {
+        return None;
+    }
+    let Expression::FunctionExpression(factory) = last_sequence_expression(&call.callee) else {
+        return None;
+    };
+    if factory.r#async || factory.generator {
+        return None;
+    }
+    let body = factory.body.as_ref()?;
+    let [Statement::ReturnStatement(ret)] = body.statements.as_slice() else {
+        return None;
+    };
+    let Expression::FunctionExpression(function) = last_sequence_expression(ret.argument.as_ref()?)
+    else {
+        return None;
+    };
+    regular_function_key(function)
+}
+
+fn method_value_function(expression: &Expression<'_>) -> Option<FunctionKey> {
+    match last_sequence_expression(expression) {
+        Expression::FunctionExpression(function) => regular_function_key(function),
+        Expression::CallExpression(call) => returned_regular_function(call),
+        _ => None,
+    }
+}
+
+fn static_member_name<'a>(expression: &'a Expression<'a>) -> Option<(&'a Expression<'a>, String)> {
+    match last_sequence_expression(expression) {
+        Expression::StaticMemberExpression(member) if !member.optional => {
+            Some((&member.object, member.property.name.to_string()))
+        }
+        Expression::ComputedMemberExpression(member) if !member.optional => {
+            let Expression::StringLiteral(property) = last_sequence_expression(&member.expression)
+            else {
+                return None;
+            };
+            Some((&member.object, string_literal_value(property)?))
+        }
+        _ => None,
+    }
+}
+
+struct PrototypeMethodProof<'c, 'f> {
+    scoping: &'c Scoping,
+    constructors: &'f HashMap<SymbolId, FunctionKey>,
+    aliases: HashMap<SymbolId, FunctionKey>,
+    methods: HashMap<(FunctionKey, String), ProvenPrototypeMethodAssignment>,
+    conflicts: HashSet<(FunctionKey, String)>,
+    invalid_constructors: HashSet<FunctionKey>,
+}
+
+impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
+    fn new(scoping: &'c Scoping, constructors: &'f HashMap<SymbolId, FunctionKey>) -> Self {
+        Self {
+            scoping,
+            constructors,
+            aliases: HashMap::new(),
+            methods: HashMap::new(),
+            conflicts: HashSet::new(),
+            invalid_constructors: HashSet::new(),
+        }
+    }
+
+    fn constructor_prototype(&self, expression: &Expression<'_>) -> Option<FunctionKey> {
+        let (object, property) = static_member_name(expression)?;
+        if property != "prototype" {
+            return None;
+        }
+        let symbol = reference_symbol(self.scoping, last_sequence_expression(object))?;
+        symbol_binding_is_stable(self.scoping, symbol)
+            .then(|| self.constructors.get(&symbol).copied())
+            .flatten()
+    }
+
+    fn prototype_value(&self, expression: &Expression<'_>) -> Option<FunctionKey> {
+        let expression = last_sequence_expression(expression);
+        if let Some(owner) = self.constructor_prototype(expression) {
+            return Some(owner);
+        }
+        let symbol = reference_symbol(self.scoping, expression)?;
+        self.aliases.get(&symbol).copied()
+    }
+
+    fn invalidate_property(&mut self, owner: FunctionKey, property: String) {
+        self.conflicts.insert((owner, property.clone()));
+        self.methods.remove(&(owner, property));
+    }
+
+    fn invalidate_constructor(&mut self, owner: FunctionKey) {
+        self.invalid_constructors.insert(owner);
+        self.methods.retain(|(candidate, _), _| *candidate != owner);
+    }
+
+    fn record_method(
+        &mut self,
+        owner: FunctionKey,
+        property: String,
+        function: FunctionKey,
+        assignment_start: u32,
+        assignment_end: u32,
+    ) {
+        let key = (owner, property.clone());
+        if self.invalid_constructors.contains(&owner) || self.conflicts.contains(&key) {
+            return;
+        }
+        let method = ProvenPrototypeMethodAssignment {
+            constructor_start: owner.start,
+            constructor_end: owner.end,
+            property,
+            function_start: function.start,
+            function_end: function.end,
+            assignment_start,
+            assignment_end,
+            standard_prototype_semantics_required: true,
+        };
+        if self.methods.insert(key.clone(), method).is_some() {
+            self.invalidate_property(owner, key.1);
+        }
+    }
+
+    fn process_statement_list(&mut self, statements: &[Statement<'_>]) {
+        self.aliases.clear();
+        for statement in statements {
+            match statement {
+                Statement::ExpressionStatement(statement) => {
+                    self.process_expression(&statement.expression);
+                }
+                Statement::VariableDeclaration(declaration) => {
+                    for declarator in &declaration.declarations {
+                        let Some(init) = declarator.init.as_ref() else {
+                            continue;
+                        };
+                        self.process_expression(init);
+                        let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                            self.aliases.clear();
+                            continue;
+                        };
+                        let Some(symbol) = identifier.symbol_id.get() else {
+                            self.aliases.clear();
+                            continue;
+                        };
+                        if let Some(owner) = self.prototype_value(init) {
+                            self.aliases.insert(symbol, owner);
+                        } else {
+                            self.aliases.remove(&symbol);
+                        }
+                    }
+                }
+                Statement::FunctionDeclaration(_) | Statement::EmptyStatement(_) => {}
+                _ => self.aliases.clear(),
+            }
+        }
+    }
+
+    fn process_expression(&mut self, expression: &Expression<'_>) {
+        match expression {
+            Expression::ParenthesizedExpression(parenthesized) => {
+                self.process_expression(&parenthesized.expression);
+            }
+            Expression::SequenceExpression(sequence) => {
+                for expression in &sequence.expressions {
+                    self.process_expression(expression);
+                }
+            }
+            Expression::AssignmentExpression(assignment) => {
+                if assignment.operator.as_str() != "=" {
+                    if let AssignmentTarget::AssignmentTargetIdentifier(identifier) =
+                        &assignment.left
+                    {
+                        if let Some(symbol) =
+                            identifier.reference_id.get().and_then(|reference_id| {
+                                self.scoping.get_reference(reference_id).symbol_id()
+                            })
+                        {
+                            self.aliases.remove(&symbol);
+                        }
+                    }
+                    self.aliases.clear();
+                    return;
+                }
+
+                if let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left {
+                    self.process_expression(&assignment.right);
+                    let Some(symbol) = identifier.reference_id.get().and_then(|reference_id| {
+                        self.scoping.get_reference(reference_id).symbol_id()
+                    }) else {
+                        self.aliases.clear();
+                        return;
+                    };
+                    if let Some(owner) = self.prototype_value(&assignment.right) {
+                        self.aliases.insert(symbol, owner);
+                    } else {
+                        self.aliases.remove(&symbol);
+                    }
+                    return;
+                }
+
+                match &assignment.left {
+                    AssignmentTarget::StaticMemberExpression(member) => {
+                        self.process_expression(&member.object);
+                        let owner = self.prototype_value(&member.object);
+                        let property = member.property.name.to_string();
+                        self.process_expression(&assignment.right);
+                        if property == "prototype" {
+                            if let Some(symbol) = reference_symbol(self.scoping, &member.object) {
+                                if let Some(constructor) = self.constructors.get(&symbol).copied() {
+                                    self.invalidate_constructor(constructor);
+                                }
+                            }
+                            return;
+                        }
+                        if let Some(owner) = owner {
+                            if let Some(function) = method_value_function(&assignment.right) {
+                                self.record_method(
+                                    owner,
+                                    property,
+                                    function,
+                                    assignment.span.start,
+                                    assignment.span.end,
+                                );
+                            } else {
+                                self.invalidate_property(owner, property);
+                            }
+                        }
+                    }
+                    AssignmentTarget::ComputedMemberExpression(member) => {
+                        self.process_expression(&member.object);
+                        let owner = self.prototype_value(&member.object);
+                        self.process_expression(&member.expression);
+                        let property = match last_sequence_expression(&member.expression) {
+                            Expression::StringLiteral(property) => string_literal_value(property),
+                            _ => None,
+                        };
+                        self.process_expression(&assignment.right);
+                        if let Some(owner) = owner {
+                            if let Some(property) = property {
+                                if let Some(function) = method_value_function(&assignment.right) {
+                                    self.record_method(
+                                        owner,
+                                        property,
+                                        function,
+                                        assignment.span.start,
+                                        assignment.span.end,
+                                    );
+                                } else {
+                                    self.invalidate_property(owner, property);
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        self.process_expression(&assignment.right);
+                        self.aliases.clear();
+                    }
+                }
+            }
+            Expression::StaticMemberExpression(member) => self.process_expression(&member.object),
+            Expression::ComputedMemberExpression(member) => {
+                self.process_expression(&member.object);
+                self.process_expression(&member.expression);
+            }
+            Expression::CallExpression(call) => {
+                self.process_expression(&call.callee);
+                for argument in &call.arguments {
+                    if let Some(argument) = argument.as_expression() {
+                        self.process_expression(argument);
+                    } else {
+                        self.aliases.clear();
+                    }
+                }
+                self.aliases.clear();
+            }
+            Expression::ConditionalExpression(conditional) => {
+                self.process_expression(&conditional.test);
+                self.aliases.clear();
+            }
+            Expression::LogicalExpression(logical) => {
+                self.process_expression(&logical.left);
+                self.aliases.clear();
+            }
+            Expression::UnaryExpression(unary) => self.process_expression(&unary.argument),
+            Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {}
+            _ => {}
+        }
+    }
+}
+
+struct PrototypeMethodCollector<'c, 'f> {
+    proof: PrototypeMethodProof<'c, 'f>,
+}
+
+impl<'a> Visit<'a> for PrototypeMethodCollector<'_, '_> {
+    fn visit_program(&mut self, program: &Program<'a>) {
+        self.proof.process_statement_list(&program.body);
+        walk::walk_program(self, program);
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some(body) = &function.body {
+            self.proof.process_statement_list(&body.statements);
+        }
+        walk::walk_function(self, function, flags);
+    }
+}
+
+#[must_use]
+pub fn structurally_proven_prototype_method_assignments(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenPrototypeMethodAssignment> {
+    let mut functions = FunctionCollector::new();
+    functions.visit_program(program);
+    let proof = PrototypeMethodProof::new(scoping, &functions.by_symbol);
+    let mut collector = PrototypeMethodCollector { proof };
+    collector.visit_program(program);
+    let mut methods = collector.proof.methods.into_values().collect::<Vec<_>>();
+    methods.sort_by_key(|method| {
+        (
+            method.constructor_start,
+            method.property.clone(),
+            method.assignment_start,
+        )
+    });
+    methods
+}
+
 #[cfg(test)]
 mod tests {
-    use super::structurally_proven_member_receiver_origins;
+    use super::{
+        structurally_proven_member_receiver_origins,
+        structurally_proven_prototype_method_assignments,
+    };
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
+
+    fn method_assignments(source: &str) -> Vec<super::ProvenPrototypeMethodAssignment> {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        structurally_proven_prototype_method_assignments(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+    }
 
     fn calls(source: &str) -> Vec<super::ProvenMemberReceiverOrigin> {
         let allocator = Allocator::default();
@@ -526,6 +890,52 @@ mod tests {
             new C();
         "#;
         assert!(calls(source).is_empty());
+    }
+
+    #[test]
+    fn proves_straight_line_prototype_alias_iife_method() {
+        let source = r#"
+            const C = function() {};
+            var p;
+            p = C.prototype;
+            p.run = function(seed) {
+                return (seed = 1, function(value) { return value + seed; });
+            }();
+        "#;
+        let proven = method_assignments(source);
+        assert_eq!(proven.len(), 1);
+        assert_eq!(proven[0].property, "run");
+        assert!(proven[0].standard_prototype_semantics_required);
+        assert!(
+            source[proven[0].function_start as usize..proven[0].function_end as usize]
+                .starts_with("function(value)")
+        );
+    }
+
+    #[test]
+    fn rejects_prototype_alias_across_unknown_call() {
+        let source = r#"
+            const C = function() {};
+            var p;
+            p = C.prototype;
+            unknown();
+            p.run = function() {};
+        "#;
+        assert!(method_assignments(source).is_empty());
+    }
+
+    #[test]
+    fn dynamic_property_write_does_not_destroy_prototype_alias_identity() {
+        let source = r#"
+            const C = function() {};
+            var p;
+            p = C.prototype;
+            p[key] = 1;
+            p.run = function() {};
+        "#;
+        let proven = method_assignments(source);
+        assert_eq!(proven.len(), 1);
+        assert_eq!(proven[0].property, "run");
     }
 
     #[test]
