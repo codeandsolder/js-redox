@@ -37,7 +37,7 @@ def main():
         FIXTURES,
     )
     report = json.loads(cp.stdout)
-    assert report["schema"] == "js-sus-scan/v6"
+    assert report["schema"] == "js-sus-scan/v7"
 
     # Explicit corpus bodies are content-addressed and intentionally have no
     # JavaScript extension. Explicit file arguments must therefore be scanned
@@ -46,7 +46,7 @@ def main():
         extensionless = Path(tmp) / "0123456789abcdef"
         extensionless.write_text("const value = 1;\n")
         direct = json.loads(run(BIN, "--json", extensionless).stdout)
-        assert direct["schema"] == "js-sus-scan/v6"
+        assert direct["schema"] == "js-sus-scan/v7"
         assert len(direct["files"]) == 1, direct
         assert Path(direct["files"][0]["input"]) == extensionless, direct
 
@@ -80,7 +80,7 @@ def main():
         malformed = Path(tmp) / "deadbeef"
         malformed.write_bytes(b"// Copyright \xa9 2013\nconst ok = 1;\n")
         malformed_report = json.loads(run(BIN, "--json", malformed).stdout)
-        assert malformed_report["schema"] == "js-sus-scan/v6"
+        assert malformed_report["schema"] == "js-sus-scan/v7"
         assert len(malformed_report["files"]) == 1, malformed_report
         malformed_file = malformed_report["files"][0]
         assert malformed_file["fatal_error"] is False, malformed_file
@@ -171,6 +171,29 @@ def main():
         assert blob_file["actionable_signal_kinds"].get("base64_blob", 0) == 0, blob_file
         assert blob_file["actionable_signal_kinds"].get("opaque_blob", 0) == 0, blob_file
         assert blob_file["actionable_signal_count"] == 0, blob_file
+
+        cookie_helper = tmp / "cookie-helper.js"
+        cookie_helper.write_text(
+            'function getCookieValue(name) {\n'
+            '  const cookie = {};\n'
+            '  document.cookie.split(";").forEach((item) => {\n'
+            '    const [key, value] = item.split("=");\n'
+            '    cookie[key.trim()] = value ? decodeURIComponent(value) : "";\n'
+            '  });\n'
+            '  return cookie[name];\n'
+            '}\n'
+        )
+        cookie_file = json.loads(run(BIN, "--json", cookie_helper).stdout)["files"][0]
+        assert cookie_file["actionable_signal_kinds"].get("direct_table_decoder", 0) == 0, cookie_file
+
+        direct_decoder = tmp / "direct-table-decoder.js"
+        direct_decoder.write_text(
+            'const table = ["QQ==", "Qg=="];\n'
+            'function decode(i) { return atob(table[i]); }\n'
+            'sink(decode(0));\n'
+        )
+        direct_file = json.loads(run(BIN, "--json", direct_decoder).stdout)["files"][0]
+        assert direct_file["actionable_signal_kinds"].get("direct_table_decoder", 0) >= 1, direct_file
 
     dense = by_name["dense-obfuscation.js"]
     clean = by_name["clean-control.js"]

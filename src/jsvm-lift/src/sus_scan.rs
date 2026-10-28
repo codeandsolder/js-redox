@@ -1587,7 +1587,7 @@ pub fn build_report(
         .sum();
     let total_actionable_signals = files.iter().map(|file| file.actionable_signal_count).sum();
     Ok(SusScanReport {
-        schema: "js-sus-scan/v6",
+        schema: "js-sus-scan/v7",
         window_bytes: options.window_bytes,
         min_score: options.min_score,
         min_signals: options.min_signals,
