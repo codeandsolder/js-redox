@@ -12,7 +12,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::scope::ScopeFlags;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 #[derive(Debug, Clone)]
 pub struct DecoderControlInfo {
@@ -367,6 +367,138 @@ fn collect_branch_ladder_transitions(
     };
     visitor.visit_statement(statement);
     visitor.transitions
+}
+
+struct BranchStateForSpan<'s> {
+    state_var: &'s str,
+    target: Span,
+    best: Option<(u32, u64)>,
+}
+
+impl BranchStateForSpan<'_> {
+    fn consider(&mut self, state: u64, span: Span) {
+        if span.start <= self.target.start && self.target.end <= span.end {
+            let width = span.end.saturating_sub(span.start);
+            if self.best.is_none_or(|(best_width, _)| width < best_width) {
+                self.best = Some((width, state));
+            }
+        }
+    }
+}
+
+impl<'a> Visit<'a> for BranchStateForSpan<'_> {
+    fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
+        if let Expression::BinaryExpression(binary) = &statement.test {
+            if let Some(state) = binary_state_comparison_literal(binary, self.state_var) {
+                self.consider(state, statement.consequent.span());
+            }
+        }
+        walk::walk_if_statement(self, statement);
+    }
+
+    fn visit_conditional_expression(
+        &mut self,
+        expression: &oxc_ast::ast::ConditionalExpression<'a>,
+    ) {
+        if let Expression::BinaryExpression(binary) = &expression.test {
+            if let Some(state) = binary_state_comparison_literal(binary, self.state_var) {
+                self.consider(state, expression.consequent.span());
+            }
+        }
+        walk::walk_conditional_expression(self, expression);
+    }
+
+    fn visit_function(&mut self, _it: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+    }
+}
+
+fn branch_state_for_span(statement: &Statement<'_>, state_var: &str, target: Span) -> Option<u64> {
+    let mut visitor = BranchStateForSpan {
+        state_var,
+        target,
+        best: None,
+    };
+    visitor.visit_statement(statement);
+    visitor.best.map(|(_, state)| state)
+}
+
+/// Prove that, if an event inside a recognized flattened if-ladder executes,
+/// no listed barrier can have executed earlier on any statically known path
+/// from the machine's initial state.
+///
+/// Finite transition sets are treated as nondeterministic edges. An unresolved
+/// transition on any reachable prefix fails closed. Paths that exit without
+/// reaching the event are irrelevant. Barriers in the event's own state are
+/// ordered by source evaluation position; callers decide what constitutes a
+/// barrier.
+pub(crate) fn prove_if_ladder_event_before_barriers(
+    source: &str,
+    for_stmt: &ForStatement<'_>,
+    event: Span,
+    barriers: &[Span],
+) -> bool {
+    let detected = detect_for_state_machines(source, "pre-escape-proof", for_stmt);
+    let [machine] = detected.if_ladder_machines.as_slice() else {
+        return false;
+    };
+    let Some(event_state) = branch_state_for_span(&for_stmt.body, &machine.state_var, event) else {
+        return false;
+    };
+
+    let mut barrier_states: HashMap<u64, Vec<Span>> = HashMap::new();
+    for barrier in barriers {
+        if barrier.start < for_stmt.span.start || barrier.end > for_stmt.span.end {
+            continue;
+        }
+        let Some(state) = branch_state_for_span(&for_stmt.body, &machine.state_var, *barrier)
+        else {
+            return false;
+        };
+        barrier_states.entry(state).or_default().push(*barrier);
+    }
+
+    let mut edges: HashMap<u64, BTreeSet<u64>> = HashMap::new();
+    let mut unresolved = BTreeSet::new();
+    for transition in &machine.transitions {
+        if transition.possible_target_states.is_empty() {
+            unresolved.insert(transition.from_state);
+            continue;
+        }
+        edges
+            .entry(transition.from_state)
+            .or_default()
+            .extend(transition.possible_target_states.iter().copied());
+    }
+
+    let mut queue = VecDeque::from([(machine.init_state, false)]);
+    let mut seen = BTreeSet::new();
+    let mut reached_unsafe = false;
+    while let Some((state, already_crossed_barrier)) = queue.pop_front() {
+        if !seen.insert((state, already_crossed_barrier)) {
+            continue;
+        }
+
+        let barriers_here = barrier_states.get(&state);
+        if state == event_state {
+            let crossed_before_event = already_crossed_barrier
+                || barriers_here
+                    .is_some_and(|spans| spans.iter().any(|barrier| barrier.start < event.start));
+            reached_unsafe |= crossed_before_event;
+            continue;
+        }
+
+        let crossed_barrier =
+            already_crossed_barrier || barriers_here.is_some_and(|spans| !spans.is_empty());
+        if unresolved.contains(&state) {
+            return false;
+        }
+        if let Some(targets) = edges.get(&state) {
+            queue.extend(targets.iter().map(|target| (*target, crossed_barrier)));
+        }
+    }
+
+    !reached_unsafe
 }
 
 impl<'a> Visit<'a> for IfLadderEvidenceVisitor<'_> {
@@ -1510,6 +1642,128 @@ mod tests {
         );
         assert_eq!(detected.if_ladder_machines.len(), 1);
         assert_eq!(detected.if_ladder_machines[0].init_state, 3);
+    }
+
+    fn prove_order(source: &str, event_text: &str, barrier_texts: &[&str]) -> bool {
+        struct Harness<'s> {
+            source: &'s str,
+            event: Span,
+            barriers: Vec<Span>,
+            result: Option<bool>,
+        }
+        impl<'a> Visit<'a> for Harness<'_> {
+            fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+                if statement.span.start <= self.event.start && self.event.end <= statement.span.end
+                {
+                    self.result = Some(prove_if_ladder_event_before_barriers(
+                        self.source,
+                        statement,
+                        self.event,
+                        &self.barriers,
+                    ));
+                    return;
+                }
+                walk::walk_for_statement(self, statement);
+            }
+        }
+
+        let event_start = source.find(event_text).expect("event text") as u32;
+        let event = Span::new(event_start, event_start + event_text.len() as u32);
+        let barriers = barrier_texts
+            .iter()
+            .map(|text| {
+                let start = source.find(text).expect("barrier text") as u32;
+                Span::new(start, start + text.len() as u32)
+            })
+            .collect();
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let mut harness = Harness {
+            source,
+            event,
+            barriers,
+            result: None,
+        };
+        harness.visit_program(&parsed.program);
+        harness.result.unwrap_or(false)
+    }
+
+    #[test]
+    fn proves_if_ladder_event_before_later_barrier_state() {
+        let source = r#"
+            function flattened() {
+                for (let state = 0; state !== 99;) {
+                    if (state === 0) { state = 1; }
+                    else if (state === 1) { target(); state = 2; }
+                    else if (state === 2) { barrier(); state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        assert!(prove_order(source, "target()", &["barrier()"]))
+    }
+
+    #[test]
+    fn rejects_if_ladder_barrier_on_path_before_event() {
+        let source = r#"
+            function flattened() {
+                for (let state = 0; state !== 99;) {
+                    if (state === 0) { barrier(); state = 1; }
+                    else if (state === 1) { target(); state = 99; }
+                    else if (state === 2) { state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        assert!(!prove_order(source, "target()", &["barrier()"]))
+    }
+
+    #[test]
+    fn orders_barriers_within_target_state() {
+        let before = r#"
+            function flattened() {
+                for (let state = 0; state !== 99;) {
+                    if (state === 0) { barrier(); target(); state = 99; }
+                    else if (state === 1) { state = 99; }
+                    else if (state === 2) { state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        assert!(!prove_order(before, "target()", &["barrier()"]));
+
+        let after = before.replace("barrier(); target();", "target(); barrier();");
+        assert!(prove_order(&after, "target()", &["barrier()"]));
+    }
+
+    #[test]
+    fn allows_known_alternate_path_that_exits_without_event() {
+        let source = r#"
+            function flattened(flag) {
+                for (let state = 0; state !== 99;) {
+                    if (state === 0) { state = flag ? 1 : 3; }
+                    else if (state === 1) { target(); state = 99; }
+                    else if (state === 2) { barrier(); state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        assert!(prove_order(source, "target()", &["barrier()"]))
+    }
+
+    #[test]
+    fn rejects_reachable_unresolved_transition_before_event() {
+        let source = r#"
+            function flattened(next) {
+                for (let state = 0; state !== 99;) {
+                    if (state === 0) { state = next; }
+                    else if (state === 1) { target(); state = 99; }
+                    else if (state === 2) { state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        assert!(!prove_order(source, "target()", &[]))
     }
 
     #[test]
