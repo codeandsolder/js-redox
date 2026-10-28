@@ -9,7 +9,7 @@ const DEFAULT_FUEL: u64 = 1_000_000;
 const MAX_MEMORY_PAGES: usize = 2048;
 const MAX_TABLE_ELEMENTS: usize = 100_000;
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FreshEvalOutcome {
     Returned,
@@ -40,7 +40,7 @@ impl FreshI32CallReport {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FreshI32Arg {
     Literal { value: u32 },
@@ -53,20 +53,20 @@ pub struct FreshI32CallRequest {
     pub i32_args: Vec<FreshI32Arg>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 pub struct FreshTableGrowRequest {
     pub table_index: usize,
     pub delta: u32,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FreshMemoryAccessKind {
     Read,
     Write,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 pub struct FreshMemoryAccessReport {
     pub kind: FreshMemoryAccessKind,
     pub memory: usize,
