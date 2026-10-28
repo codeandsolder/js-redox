@@ -1,4 +1,4 @@
-use jsvm_safe_core::string_literal_value;
+use jsvm_safe_core::{eval_static_primitive, string_literal_value};
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, CallExpression, Expression, Function, FunctionBody,
     NewExpression, Program, Statement, VariableDeclaration,
@@ -635,6 +635,20 @@ pub struct ProvenPrototypeMethodAssignment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenPrototypeMethodLookupTarget {
+    pub constructor_start: u32,
+    pub constructor_end: u32,
+    pub property: String,
+    pub assignment_start: u32,
+    pub assignment_end: u32,
+    pub possible_functions: Vec<ProvenFunctionValue>,
+    /// The proof permits standard ECMAScript property-key coercion for otherwise
+    /// effect-free literals such as an empty array and ordinary function/Object
+    /// prototype lookup semantics. It is not assumption-free rewrite evidence.
+    pub standard_prototype_semantics_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenPrototypeMethodReceiverEffects {
     pub constructor_start: u32,
     pub constructor_end: u32,
@@ -694,6 +708,61 @@ fn returned_regular_functions(call: &CallExpression<'_>) -> Option<Vec<FunctionK
     possible_regular_functions(ret.argument.as_ref()?)
 }
 
+fn proof_property_key(
+    expression: &Expression<'_>,
+    scoping: &Scoping,
+    bindings: &HashMap<SymbolId, String>,
+) -> Option<String> {
+    match last_sequence_expression(expression) {
+        Expression::Identifier(_) => {
+            let symbol = reference_symbol(scoping, last_sequence_expression(expression))?;
+            bindings.get(&symbol).cloned()
+        }
+        Expression::ArrayExpression(array) if array.elements.is_empty() => Some(String::new()),
+        expression => eval_static_primitive(expression)?.js_string(),
+    }
+}
+
+struct PropertyKeyCollector<'c> {
+    scoping: &'c Scoping,
+    bindings: HashMap<SymbolId, String>,
+}
+
+impl<'a> Visit<'a> for PropertyKeyCollector<'_> {
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+            if !symbol_binding_is_stable(self.scoping, symbol) {
+                continue;
+            }
+            let Some(init) = declarator.init.as_ref() else {
+                continue;
+            };
+            if let Some(key) = proof_property_key(init, self.scoping, &self.bindings) {
+                self.bindings.insert(symbol, key);
+            }
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
+fn collect_property_key_bindings(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> HashMap<SymbolId, String> {
+    let mut collector = PropertyKeyCollector {
+        scoping,
+        bindings: HashMap::new(),
+    };
+    collector.visit_program(program);
+    collector.bindings
+}
+
 fn static_member_name<'a>(expression: &'a Expression<'a>) -> Option<(&'a Expression<'a>, String)> {
     match last_sequence_expression(expression) {
         Expression::StaticMemberExpression(member) if !member.optional => {
@@ -710,24 +779,69 @@ fn static_member_name<'a>(expression: &'a Expression<'a>) -> Option<(&'a Express
     }
 }
 
+struct PrototypeValueUseProbe<'c, 'f, 'a> {
+    scoping: &'c Scoping,
+    constructors: &'f HashMap<SymbolId, FunctionKey>,
+    aliases: &'a HashMap<SymbolId, FunctionKey>,
+    owners: HashSet<FunctionKey>,
+}
+
+impl<'a> Visit<'a> for PrototypeValueUseProbe<'_, '_, '_> {
+    fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
+        if let Some(symbol) = identifier
+            .reference_id
+            .get()
+            .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+        {
+            if let Some(owner) = self.aliases.get(&symbol).copied() {
+                self.owners.insert(owner);
+            }
+        }
+    }
+
+    fn visit_static_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::StaticMemberExpression<'a>,
+    ) {
+        if !member.optional && member.property.name.as_str() == "prototype" {
+            if let Some(symbol) = reference_symbol(self.scoping, &member.object) {
+                if symbol_binding_is_stable(self.scoping, symbol) {
+                    if let Some(owner) = self.constructors.get(&symbol).copied() {
+                        self.owners.insert(owner);
+                    }
+                }
+            }
+        }
+        walk::walk_static_member_expression(self, member);
+    }
+}
+
 struct PrototypeMethodProof<'c, 'f> {
     scoping: &'c Scoping,
     constructors: &'f HashMap<SymbolId, FunctionKey>,
+    property_keys: &'f HashMap<SymbolId, String>,
     aliases: HashMap<SymbolId, FunctionKey>,
     methods: HashMap<(FunctionKey, String), ProvenPrototypeMethodAssignment>,
     conflicts: HashSet<(FunctionKey, String)>,
     invalid_constructors: HashSet<FunctionKey>,
+    lookup_invalid_constructors: HashSet<FunctionKey>,
 }
 
 impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
-    fn new(scoping: &'c Scoping, constructors: &'f HashMap<SymbolId, FunctionKey>) -> Self {
+    fn new(
+        scoping: &'c Scoping,
+        constructors: &'f HashMap<SymbolId, FunctionKey>,
+        property_keys: &'f HashMap<SymbolId, String>,
+    ) -> Self {
         Self {
             scoping,
             constructors,
+            property_keys,
             aliases: HashMap::new(),
             methods: HashMap::new(),
             conflicts: HashSet::new(),
             invalid_constructors: HashSet::new(),
+            lookup_invalid_constructors: HashSet::new(),
         }
     }
 
@@ -751,6 +865,29 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
         self.aliases.get(&symbol).copied()
     }
 
+    fn prototype_owners_used_in(&self, expression: &Expression<'_>) -> HashSet<FunctionKey> {
+        let mut probe = PrototypeValueUseProbe {
+            scoping: self.scoping,
+            constructors: self.constructors,
+            aliases: &self.aliases,
+            owners: HashSet::new(),
+        };
+        probe.visit_expression(expression);
+        probe.owners
+    }
+
+    fn member_receiver_owner(&self, expression: &Expression<'_>) -> Option<FunctionKey> {
+        match last_sequence_expression(expression) {
+            Expression::StaticMemberExpression(member) if !member.optional => {
+                self.prototype_value(&member.object)
+            }
+            Expression::ComputedMemberExpression(member) if !member.optional => {
+                self.prototype_value(&member.object)
+            }
+            _ => None,
+        }
+    }
+
     fn invalidate_property(&mut self, owner: FunctionKey, property: String) {
         self.conflicts.insert((owner, property.clone()));
         self.methods.remove(&(owner, property));
@@ -758,7 +895,12 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
 
     fn invalidate_constructor(&mut self, owner: FunctionKey) {
         self.invalid_constructors.insert(owner);
+        self.lookup_invalid_constructors.insert(owner);
         self.methods.retain(|(candidate, _), _| *candidate != owner);
+    }
+
+    fn invalidate_lookup(&mut self, owner: FunctionKey) {
+        self.lookup_invalid_constructors.insert(owner);
     }
 
     fn record_method(
@@ -870,6 +1012,10 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                     return;
                 }
 
+                if let Some(owner) = self.prototype_value(&assignment.right) {
+                    self.invalidate_lookup(owner);
+                }
+
                 match &assignment.left {
                     AssignmentTarget::StaticMemberExpression(member) => {
                         self.process_expression(&member.object);
@@ -902,10 +1048,11 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                         self.process_expression(&member.object);
                         let owner = self.prototype_value(&member.object);
                         self.process_expression(&member.expression);
-                        let property = match last_sequence_expression(&member.expression) {
-                            Expression::StringLiteral(property) => string_literal_value(property),
-                            _ => None,
-                        };
+                        let property = proof_property_key(
+                            &member.expression,
+                            self.scoping,
+                            self.property_keys,
+                        );
                         self.process_expression(&assignment.right);
                         if let Some(owner) = owner {
                             if let Some(property) = property {
@@ -922,6 +1069,8 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                                 } else {
                                     self.invalidate_property(owner, property);
                                 }
+                            } else {
+                                self.invalidate_lookup(owner);
                             }
                         }
                     }
@@ -937,6 +1086,21 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                 self.process_expression(&member.expression);
             }
             Expression::CallExpression(call) => {
+                if let Some(owner) = self.prototype_value(&call.callee) {
+                    self.invalidate_lookup(owner);
+                }
+                if let Some(owner) = self.member_receiver_owner(&call.callee) {
+                    self.invalidate_lookup(owner);
+                }
+                let argument_owners = call
+                    .arguments
+                    .iter()
+                    .filter_map(Argument::as_expression)
+                    .flat_map(|argument| self.prototype_owners_used_in(argument))
+                    .collect::<HashSet<_>>();
+                for owner in argument_owners {
+                    self.invalidate_lookup(owner);
+                }
                 self.process_expression(&call.callee);
                 for argument in &call.arguments {
                     if let Some(argument) = argument.as_expression() {
@@ -981,16 +1145,29 @@ impl<'a> Visit<'a> for PrototypeMethodCollector<'_, '_> {
 }
 
 #[must_use]
+fn collect_prototype_method_proof<'c, 'f>(
+    program: &Program<'_>,
+    scoping: &'c Scoping,
+    constructors: &'f HashMap<SymbolId, FunctionKey>,
+    property_keys: &'f HashMap<SymbolId, String>,
+) -> PrototypeMethodProof<'c, 'f> {
+    let proof = PrototypeMethodProof::new(scoping, constructors, property_keys);
+    let mut collector = PrototypeMethodCollector { proof };
+    collector.visit_program(program);
+    collector.proof
+}
+
+#[must_use]
 pub fn structurally_proven_prototype_method_assignments(
     program: &Program<'_>,
     scoping: &Scoping,
 ) -> Vec<ProvenPrototypeMethodAssignment> {
     let mut functions = FunctionCollector::new();
     functions.visit_program(program);
-    let proof = PrototypeMethodProof::new(scoping, &functions.by_symbol);
-    let mut collector = PrototypeMethodCollector { proof };
-    collector.visit_program(program);
-    let mut methods = collector.proof.methods.into_values().collect::<Vec<_>>();
+    let property_keys = collect_property_key_bindings(program, scoping);
+    let proof =
+        collect_prototype_method_proof(program, scoping, &functions.by_symbol, &property_keys);
+    let mut methods = proof.methods.into_values().collect::<Vec<_>>();
     methods.sort_by_key(|method| {
         (
             method.constructor_start,
@@ -999,6 +1176,47 @@ pub fn structurally_proven_prototype_method_assignments(
         )
     });
     methods
+}
+
+#[must_use]
+pub fn structurally_proven_prototype_method_lookup_targets(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenPrototypeMethodLookupTarget> {
+    let mut functions = FunctionCollector::new();
+    functions.visit_program(program);
+    let property_keys = collect_property_key_bindings(program, scoping);
+    let proof =
+        collect_prototype_method_proof(program, scoping, &functions.by_symbol, &property_keys);
+    let invalid = proof.lookup_invalid_constructors;
+    let mut targets = proof
+        .methods
+        .into_values()
+        .filter(|method| {
+            let owner = FunctionKey {
+                start: method.constructor_start,
+                end: method.constructor_end,
+            };
+            !invalid.contains(&owner)
+        })
+        .map(|method| ProvenPrototypeMethodLookupTarget {
+            constructor_start: method.constructor_start,
+            constructor_end: method.constructor_end,
+            property: method.property,
+            assignment_start: method.assignment_start,
+            assignment_end: method.assignment_end,
+            possible_functions: method.possible_functions,
+            standard_prototype_semantics_required: true,
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|target| {
+        (
+            target.constructor_start,
+            target.property.clone(),
+            target.assignment_start,
+        )
+    });
+    targets
 }
 
 fn direct_this(expression: &Expression<'_>) -> bool {
@@ -1249,6 +1467,7 @@ mod tests {
     use super::{
         structurally_proven_member_receiver_origins, structurally_proven_member_write_origins,
         structurally_proven_prototype_method_assignments,
+        structurally_proven_prototype_method_lookup_targets,
         structurally_proven_prototype_method_receiver_effects,
     };
     use oxc_allocator::Allocator;
@@ -1265,6 +1484,20 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         structurally_proven_prototype_method_assignments(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+    }
+
+    fn lookup_targets(source: &str) -> Vec<super::ProvenPrototypeMethodLookupTarget> {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        structurally_proven_prototype_method_lookup_targets(
             &parsed.program,
             semantic.semantic.scoping(),
         )
@@ -1405,6 +1638,73 @@ mod tests {
         let proven = method_assignments(source);
         assert_eq!(proven.len(), 1);
         assert_eq!(proven[0].property, "run");
+    }
+
+    #[test]
+    fn lookup_target_accepts_resolved_nonconflicting_empty_array_key() {
+        let source = r#"
+            const C = function() {};
+            const empty = [];
+            C.prototype.run = function() {};
+            C.prototype[empty] = 1;
+        "#;
+        let targets = lookup_targets(source);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].property, "run");
+    }
+
+    #[test]
+    fn lookup_target_rejects_unresolved_computed_prototype_write() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            C.prototype[key] = 1;
+        "#;
+        assert!(lookup_targets(source).is_empty());
+        assert_eq!(method_assignments(source).len(), 1);
+    }
+
+    #[test]
+    fn lookup_target_rejects_prototype_escape_to_unknown_call() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            unknown(C.prototype);
+        "#;
+        assert!(lookup_targets(source).is_empty());
+        assert_eq!(method_assignments(source).len(), 1);
+    }
+
+    #[test]
+    fn lookup_target_rejects_unknown_method_call_on_prototype_alias() {
+        let source = r#"
+            const C = function() {};
+            let p = C.prototype;
+            p.run = function() {};
+            p.touch();
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_rejects_unknown_computed_method_call_on_prototype_alias() {
+        let source = r#"
+            const C = function() {};
+            let p = C.prototype;
+            p.run = function() {};
+            p[key]();
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_rejects_nested_prototype_escape_to_unknown_call() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            unknown([C.prototype]);
+        "#;
+        assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
