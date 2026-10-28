@@ -6,8 +6,8 @@ use jsvm_lift::numeric::{eval_js_bitwise_i64, exact_i64, exact_u64, js_int32_fro
 use jsvm_safe_core::eval_static_primitive as eval_static;
 use oxc_ast::{
     ast::{
-        Argument, Expression, ForStatement, Function, FunctionBody, Statement, SwitchStatement,
-        WhileStatement,
+        Argument, Expression, ForStatement, Function, FunctionBody, Program, Statement,
+        SwitchStatement, WhileStatement,
     },
     AstKind,
 };
@@ -577,6 +577,65 @@ fn prove_machine_event_before_barriers(
     }
 
     !reached_unsafe
+}
+
+pub(crate) fn prove_detected_if_ladder_event_before_barriers(
+    program: &Program<'_>,
+    machine: &IfLadderStateMachineCandidate,
+    event: Span,
+    barriers: &[Span],
+) -> bool {
+    struct Harness<'m, 'b> {
+        machine: &'m IfLadderStateMachineCandidate,
+        event: Span,
+        barriers: &'b [Span],
+        result: Option<bool>,
+    }
+
+    impl<'a> Visit<'a> for Harness<'_, '_> {
+        fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+            if self.result.is_some() {
+                return;
+            }
+            if statement.span.start == self.machine.start && statement.span.end == self.machine.end
+            {
+                self.result = Some(prove_machine_event_before_barriers(
+                    self.machine,
+                    &statement.body,
+                    self.event,
+                    self.barriers,
+                ));
+                return;
+            }
+            walk::walk_for_statement(self, statement);
+        }
+
+        fn visit_while_statement(&mut self, statement: &WhileStatement<'a>) {
+            if self.result.is_some() {
+                return;
+            }
+            if statement.span.start == self.machine.start && statement.span.end == self.machine.end
+            {
+                self.result = Some(prove_machine_event_before_barriers(
+                    self.machine,
+                    &statement.body,
+                    self.event,
+                    self.barriers,
+                ));
+                return;
+            }
+            walk::walk_while_statement(self, statement);
+        }
+    }
+
+    let mut harness = Harness {
+        machine,
+        event,
+        barriers,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(false)
 }
 
 pub(crate) fn prove_if_ladder_event_before_barriers(
@@ -1995,6 +2054,57 @@ mod tests {
             }
         "#;
         assert!(prove_while_order(source, "target()", &["barrier()"]));
+    }
+
+    #[test]
+    fn proves_order_from_pre_detected_while_machine() {
+        let source = r#"
+            function flattened() {
+                let state = 0;
+                while (state !== 99) {
+                    if (state === 0) { target(); barrier(); state = 99; }
+                    else if (state === 1) { state = 99; }
+                    else if (state === 2) { state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        struct Finder<'m> {
+            source: &'m str,
+            machine: Option<IfLadderStateMachineCandidate>,
+        }
+        impl<'a> Visit<'a> for Finder<'_> {
+            fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+                for pair in body.statements.windows(2) {
+                    let [init, Statement::WhileStatement(statement)] = pair else {
+                        continue;
+                    };
+                    if let Some(machine) =
+                        detect_while_state_machine(self.source, "test", init, statement)
+                    {
+                        self.machine = Some(machine);
+                        return;
+                    }
+                }
+                walk::walk_function_body(self, body);
+            }
+        }
+        let mut finder = Finder {
+            source,
+            machine: None,
+        };
+        finder.visit_program(&parsed.program);
+        let machine = finder.machine.expect("machine");
+        let event_start = source.find("target()").expect("event") as u32;
+        let barrier_start = source.find("barrier()").expect("barrier") as u32;
+        assert!(prove_detected_if_ladder_event_before_barriers(
+            &parsed.program,
+            &machine,
+            Span::new(event_start, event_start + 8),
+            &[Span::new(barrier_start, barrier_start + 9)],
+        ));
     }
 
     #[test]
