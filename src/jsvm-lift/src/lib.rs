@@ -37,6 +37,8 @@ pub mod forwarding_alias;
 
 pub mod forwarding_semantics;
 
+pub mod receiver_identity;
+
 pub(crate) mod global_builtin;
 
 pub mod wasm_import_semantics;
