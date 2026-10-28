@@ -1,8 +1,13 @@
-use jsvm_safe_core::string_literal_value;
+use jsvm_safe_core::{
+    eval_static_primitive as eval_static, string_literal_value, StaticPrimitiveValue as Value,
+};
+use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, BindingPattern, CallExpression, Expression, Function,
 };
 use oxc_ast_visit::{walk, Visit};
+use oxc_span::SourceType;
+use rolldown_redox::ecmascript::parse_program;
 
 #[derive(Debug, Clone)]
 pub struct EmbeddedCodeCandidate {
@@ -11,6 +16,35 @@ pub struct EmbeddedCodeCandidate {
     pub kind: String,
     pub params: Vec<String>,
     pub body: String,
+}
+
+fn static_string_expression(expression: &Expression<'_>) -> Option<String> {
+    eval_static(expression)?.js_string()
+}
+
+fn static_join_element(element: &ArrayExpressionElement<'_>) -> Option<String> {
+    let Some(expression) = element.as_expression() else {
+        return matches!(element, ArrayExpressionElement::Elision(_)).then(String::new);
+    };
+    match eval_static(expression)? {
+        Value::Null | Value::Undefined => Some(String::new()),
+        value => value.js_string(),
+    }
+}
+
+fn static_join_separator(argument: Option<&Argument<'_>>) -> Option<String> {
+    let Some(argument) = argument else {
+        return Some(",".to_string());
+    };
+    match eval_static(argument.as_expression()?)? {
+        Value::Undefined => Some(",".to_string()),
+        value => value.js_string(),
+    }
+}
+
+fn parses_as_script(source: &str) -> bool {
+    let allocator = Allocator::default();
+    !parse_program(&allocator, source, SourceType::cjs()).fatal_error
 }
 
 fn function_expression<'a>(expr: &'a Expression<'a>) -> Option<&'a Function<'a>> {
@@ -279,8 +313,8 @@ pub fn detect_packer_eval(call: &CallExpression<'_>) -> Option<EmbeddedCodeCandi
     })
 }
 
-pub fn detect_literal_string_join(call: &CallExpression<'_>) -> Option<EmbeddedCodeCandidate> {
-    if call.optional || call.arguments.len() != 1 {
+pub fn detect_static_string_join(call: &CallExpression<'_>) -> Option<EmbeddedCodeCandidate> {
+    if call.optional || call.arguments.len() > 1 {
         return None;
     }
     let Expression::StaticMemberExpression(member) = &call.callee else {
@@ -292,39 +326,26 @@ pub fn detect_literal_string_join(call: &CallExpression<'_>) -> Option<EmbeddedC
     let Expression::ArrayExpression(array) = &member.object else {
         return None;
     };
-    let Argument::StringLiteral(separator) = &call.arguments[0] else {
-        return None;
-    };
 
-    let mut parts = Vec::with_capacity(array.elements.len());
-    for element in &array.elements {
-        let ArrayExpressionElement::StringLiteral(value) = element else {
-            return None;
-        };
-        parts.push(value.value.as_str()?);
-    }
+    let separator = static_join_separator(call.arguments.first())?;
+    let parts = array
+        .elements
+        .iter()
+        .map(static_join_element)
+        .collect::<Option<Vec<_>>>()?;
     if parts.len() < 2 {
         return None;
     }
 
-    let body = parts.join(separator.value.as_str()?);
-    if body.len() < 1024 || body.len() > 5_000_000 {
-        return None;
-    }
-    let looks_like_code = body.contains("function")
-        && (body.contains("for(")
-            || body.contains("for (")
-            || body.contains("switch(")
-            || body.contains("switch (")
-            || body.contains("=>"));
-    if !looks_like_code {
+    let body = parts.join(&separator);
+    if body.len() < 1024 || body.len() > 5_000_000 || !parses_as_script(&body) {
         return None;
     }
 
     Some(EmbeddedCodeCandidate {
         outer_start: call.span.start,
         outer_end: call.span.end,
-        kind: "literal Array.join".to_string(),
+        kind: "static Array.join".to_string(),
         params: Vec::new(),
         body,
     })
@@ -342,10 +363,7 @@ pub fn detect_function_constructor(
 
     let mut strings = Vec::with_capacity(args.len());
     for arg in args {
-        let Argument::StringLiteral(value) = arg else {
-            return None;
-        };
-        strings.push(string_literal_value(value)?);
+        strings.push(static_string_expression(arg.as_expression()?)?);
     }
 
     let body = strings.pop()?;
@@ -380,7 +398,7 @@ mod tests {
             if let Some(candidate) = detect_packer_eval(call) {
                 self.candidates.push(candidate);
             }
-            if let Some(candidate) = detect_literal_string_join(call) {
+            if let Some(candidate) = detect_static_string_join(call) {
                 self.candidates.push(candidate);
             }
             if matches!(&call.callee, Expression::Identifier(id) if id.name.as_str() == "Function")
@@ -425,8 +443,57 @@ mod tests {
         let source = format!("[{left:?}, {right:?}].join(\"\");");
         let candidates = detect(&source);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].kind, "literal Array.join");
+        assert_eq!(candidates[0].kind, "static Array.join");
         assert_eq!(candidates[0].body, body);
+    }
+
+    #[test]
+    fn recovers_static_join_with_pure_expressions_and_join_coercions() {
+        let body = "function vm(){for(;;){break;}}\n".repeat(40);
+        let split = body.len() / 2;
+        let (left, right) = body.split_at(split);
+        let source = format!("[{left:?}, null, void 0, {right:?} + \"\"].join(\"\" + \"\");");
+        let candidates = detect(&source);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].kind, "static Array.join");
+        assert_eq!(candidates[0].body, body);
+    }
+
+    #[test]
+    fn recovers_function_constructor_from_static_string_expressions() {
+        let body = "return value + 1;".repeat(10);
+        let split = body.len() / 2;
+        let (left, right) = body.split_at(split);
+        let source = format!("Function(\"val\" + \"ue\", {left:?} + {right:?});");
+        let candidates = detect(&source);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].kind, "Function");
+        assert_eq!(candidates[0].params, vec!["value"]);
+        assert_eq!(candidates[0].body, body);
+    }
+
+    #[test]
+    fn uses_default_join_separator_when_omitted() {
+        let left = format!("{:?}", "a".repeat(600));
+        let right = format!("{:?}", "b".repeat(600));
+        let source = format!("[{left:?}, {right:?}].join();");
+        let candidates = detect(&source);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].body, format!("{left},{right}"));
+    }
+
+    #[test]
+    fn rejects_large_static_join_that_is_not_javascript() {
+        let prose = "this is plain text without javascript syntax ! ".repeat(40);
+        let source = format!("[{prose:?}, {prose:?}].join(\"\n\");");
+        assert!(detect(&source).is_empty());
+    }
+
+    #[test]
+    fn rejects_dynamic_join_element() {
+        let literal = "function vm(){for(;;){break;}}".repeat(40);
+        let source = format!("[{literal:?}, runtimeValue].join(\"\");");
+        assert!(detect(&source).is_empty());
     }
 
     #[test]

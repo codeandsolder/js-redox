@@ -3,6 +3,7 @@ use crate::{
     source_text::preview,
 };
 use jsvm_lift::numeric::{eval_js_bitwise_i64, exact_i64, exact_u64, js_int32_from_i64};
+use jsvm_safe_core::eval_static_primitive as eval_static;
 use oxc_ast::{
     ast::{Argument, Expression, ForStatement, Function, FunctionBody, Statement, SwitchStatement},
     AstKind,
@@ -46,6 +47,16 @@ pub struct StateMachineCandidate {
     pub preview: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct IfLadderTransitionCandidate {
+    pub from_state: u64,
+    pub target_state: Option<u64>,
+    pub possible_target_states: Vec<u64>,
+    pub target_expression: String,
+    pub assignment_start: u32,
+    pub assignment_end: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct IfLadderStateMachineCandidate {
     pub function_id: String,
@@ -58,6 +69,7 @@ pub struct IfLadderStateMachineCandidate {
     pub state_assignments: usize,
     pub constant_state_assignments: usize,
     pub dynamic_state_assignments: usize,
+    pub transitions: Vec<IfLadderTransitionCandidate>,
     pub preview: String,
 }
 
@@ -67,19 +79,72 @@ pub struct DetectedStateMachines {
     pub if_ladder_machines: Vec<IfLadderStateMachineCandidate>,
 }
 
+fn static_u64(expr: &Expression<'_>) -> Option<u64> {
+    eval_static(expr).and_then(|value| exact_u64(value.number()?))
+}
+
+fn finite_static_state_targets(expr: &Expression<'_>) -> Option<BTreeSet<u64>> {
+    if let Some(value) = static_u64(expr) {
+        return Some(BTreeSet::from([value]));
+    }
+    match expr {
+        Expression::ParenthesizedExpression(paren) => {
+            finite_static_state_targets(&paren.expression)
+        }
+        Expression::SequenceExpression(sequence) => {
+            finite_static_state_targets(sequence.expressions.last()?)
+        }
+        Expression::ConditionalExpression(conditional) => {
+            let mut targets = finite_static_state_targets(&conditional.consequent)?;
+            targets.extend(finite_static_state_targets(&conditional.alternate)?);
+            Some(targets)
+        }
+        _ => None,
+    }
+}
+
+fn assignment_state_init(
+    assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+) -> Option<(String, u64)> {
+    if !assignment.operator.is_assign() {
+        return None;
+    }
+    let state_var = target_ident(&assignment.left)?.to_string();
+    Some((state_var, static_u64(&assignment.right)?))
+}
+
 fn for_state_init(for_stmt: &ForStatement<'_>) -> Option<(String, u64)> {
     let init = for_stmt.init.as_ref()?;
-    let oxc_ast::ast::ForStatementInit::VariableDeclaration(decl) = init else {
-        return None;
-    };
-    for declarator in &decl.declarations {
-        let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id else {
-            continue;
-        };
-        let value = declarator.init.as_ref().and_then(numeric_u64)?;
-        return Some((id.name.to_string(), value));
+    match init {
+        oxc_ast::ast::ForStatementInit::VariableDeclaration(decl) => {
+            for declarator in &decl.declarations {
+                let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id else {
+                    continue;
+                };
+                let value = declarator.init.as_ref().and_then(static_u64)?;
+                return Some((id.name.to_string(), value));
+            }
+            None
+        }
+        oxc_ast::ast::ForStatementInit::AssignmentExpression(assignment) => {
+            assignment_state_init(assignment)
+        }
+        oxc_ast::ast::ForStatementInit::SequenceExpression(sequence) => sequence
+            .expressions
+            .iter()
+            .rev()
+            .find_map(|expr| match expr {
+                Expression::AssignmentExpression(assignment) => assignment_state_init(assignment),
+                Expression::ParenthesizedExpression(paren) => match &paren.expression {
+                    Expression::AssignmentExpression(assignment) => {
+                        assignment_state_init(assignment)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }),
+        _ => None,
     }
-    None
 }
 
 fn shifted_state(expr: &Expression<'_>, state: &str) -> Option<u64> {
@@ -177,6 +242,133 @@ struct IfLadderEvidenceVisitor<'s> {
     evidence: IfLadderEvidence,
 }
 
+struct BranchAssignmentCollector<'s> {
+    source: &'s str,
+    state_var: &'s str,
+    from_state: u64,
+    transitions: Vec<IfLadderTransitionCandidate>,
+}
+
+impl<'a> Visit<'a> for BranchAssignmentCollector<'_> {
+    fn enter_node(&mut self, kind: AstKind<'a>) {
+        let AstKind::AssignmentExpression(assign) = kind else {
+            return;
+        };
+        if !assign.operator.is_assign() || target_ident(&assign.left) != Some(self.state_var) {
+            return;
+        }
+        let possible_target_states = finite_static_state_targets(&assign.right)
+            .map(|targets| targets.into_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let target_state = (possible_target_states.len() == 1).then(|| possible_target_states[0]);
+        self.transitions.push(IfLadderTransitionCandidate {
+            from_state: self.from_state,
+            target_state,
+            possible_target_states,
+            target_expression: slice(self.source, assign.right.span()),
+            assignment_start: assign.span.start,
+            assignment_end: assign.span.end,
+        });
+    }
+
+    fn visit_function(&mut self, _it: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+    }
+}
+
+fn collect_branch_statement_transitions(
+    source: &str,
+    statement: &Statement<'_>,
+    state_var: &str,
+    from_state: u64,
+    transitions: &mut Vec<IfLadderTransitionCandidate>,
+) {
+    let mut collector = BranchAssignmentCollector {
+        source,
+        state_var,
+        from_state,
+        transitions: Vec::new(),
+    };
+    collector.visit_statement(statement);
+    transitions.extend(collector.transitions);
+}
+
+fn collect_branch_expression_transitions(
+    source: &str,
+    expression: &Expression<'_>,
+    state_var: &str,
+    from_state: u64,
+    transitions: &mut Vec<IfLadderTransitionCandidate>,
+) {
+    let mut collector = BranchAssignmentCollector {
+        source,
+        state_var,
+        from_state,
+        transitions: Vec::new(),
+    };
+    collector.visit_expression(expression);
+    transitions.extend(collector.transitions);
+}
+
+struct BranchTransitionVisitor<'s> {
+    source: &'s str,
+    state_var: &'s str,
+    transitions: Vec<IfLadderTransitionCandidate>,
+}
+
+impl<'a> Visit<'a> for BranchTransitionVisitor<'_> {
+    fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
+        if let Expression::BinaryExpression(binary) = &statement.test {
+            if let Some(from_state) = binary_state_comparison_literal(binary, self.state_var) {
+                collect_branch_statement_transitions(
+                    self.source,
+                    &statement.consequent,
+                    self.state_var,
+                    from_state,
+                    &mut self.transitions,
+                );
+            }
+        }
+        walk::walk_if_statement(self, statement);
+    }
+
+    fn visit_conditional_expression(
+        &mut self,
+        expression: &oxc_ast::ast::ConditionalExpression<'a>,
+    ) {
+        if let Expression::BinaryExpression(binary) = &expression.test {
+            if let Some(from_state) = binary_state_comparison_literal(binary, self.state_var) {
+                collect_branch_expression_transitions(
+                    self.source,
+                    &expression.consequent,
+                    self.state_var,
+                    from_state,
+                    &mut self.transitions,
+                );
+            }
+        }
+        walk::walk_conditional_expression(self, expression);
+    }
+
+    fn visit_function(&mut self, _it: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+    }
+}
+
+fn collect_branch_ladder_transitions(
+    source: &str,
+    statement: &Statement<'_>,
+    state_var: &str,
+) -> Vec<IfLadderTransitionCandidate> {
+    let mut visitor = BranchTransitionVisitor {
+        source,
+        state_var,
+        transitions: Vec::new(),
+    };
+    visitor.visit_statement(statement);
+    visitor.transitions
+}
+
 impl<'a> Visit<'a> for IfLadderEvidenceVisitor<'_> {
     fn enter_node(&mut self, kind: AstKind<'a>) {
         match kind {
@@ -190,7 +382,7 @@ impl<'a> Visit<'a> for IfLadderEvidenceVisitor<'_> {
                     && target_ident(&assign.left) == Some(self.state_var) =>
             {
                 self.evidence.state_assignments += 1;
-                if numeric_u64(&assign.right).is_some() {
+                if static_u64(&assign.right).is_some() {
                     self.evidence.constant_state_assignments += 1;
                 } else {
                     self.evidence.dynamic_state_assignments += 1;
@@ -276,6 +468,16 @@ pub fn detect_for_state_machines(
             visitor.visit_statement(&for_stmt.body);
             let evidence = visitor.evidence;
             if evidence.compared_states.len() >= 4 && evidence.state_assignments >= 4 {
+                let mut transitions =
+                    collect_branch_ladder_transitions(source, &for_stmt.body, &state_var);
+                transitions.sort_by(|a, b| {
+                    (a.from_state, a.assignment_start, a.assignment_end).cmp(&(
+                        b.from_state,
+                        b.assignment_start,
+                        b.assignment_end,
+                    ))
+                });
+                transitions.dedup();
                 detected
                     .if_ladder_machines
                     .push(IfLadderStateMachineCandidate {
@@ -289,6 +491,7 @@ pub fn detect_for_state_machines(
                         state_assignments: evidence.state_assignments,
                         constant_state_assignments: evidence.constant_state_assignments,
                         dynamic_state_assignments: evidence.dynamic_state_assignments,
+                        transitions,
                         preview: preview(source, for_stmt.span.start, for_stmt.span.end, 180),
                     });
             }
@@ -1222,6 +1425,91 @@ mod tests {
         assert_eq!(machine.state_assignments, 4);
         assert_eq!(machine.constant_state_assignments, 4);
         assert_eq!(machine.dynamic_state_assignments, 0);
+    }
+
+    #[test]
+    fn detects_assignment_initialized_if_ladder_and_lifts_transitions() {
+        let detected = detect(
+            r"
+            function flattened(input) {
+                let state;
+                for (state = 4; state !== 90;) {
+                    if (state === 4) { state = 1 + 6; }
+                    else if (state === 7) { state = input ? 12 : 13; }
+                    else if (state === 12) { state = 20; }
+                    else if (state === 13) { state = 20; }
+                    else if (state === 20) { state = 90; }
+                }
+            }
+            ",
+        );
+
+        assert_eq!(detected.if_ladder_machines.len(), 1);
+        let machine = &detected.if_ladder_machines[0];
+        assert_eq!(machine.state_var, "state");
+        assert_eq!(machine.init_state, 4);
+        assert_eq!(machine.exit_state, 90);
+        assert_eq!(machine.constant_state_assignments, 4);
+        assert_eq!(machine.dynamic_state_assignments, 1);
+        assert!(machine.transitions.iter().any(|transition| {
+            transition.from_state == 4 && transition.target_state == Some(7)
+        }));
+        assert!(machine.transitions.iter().any(|transition| {
+            transition.from_state == 7
+                && transition.target_state.is_none()
+                && transition.possible_target_states == vec![12, 13]
+                && transition.target_expression.contains("input ? 12 : 13")
+        }));
+        assert!(machine.transitions.iter().any(|transition| {
+            transition.from_state == 20 && transition.target_state == Some(90)
+        }));
+    }
+
+    #[test]
+    fn lifts_nested_conditional_expression_ladder_transitions() {
+        let detected = detect(
+            r"
+            function flattened(input) {
+                let state;
+                for (state = 4; state !== 90;)
+                    state === 4 ? state = input ? 7 : 8
+                    : state === 7 ? state = 20
+                    : state === 8 ? state = 20
+                    : state === 20 ? state = 90
+                    : state = 90;
+            }
+            ",
+        );
+        assert_eq!(detected.if_ladder_machines.len(), 1);
+        let machine = &detected.if_ladder_machines[0];
+        assert!(machine.transitions.iter().any(|transition| {
+            transition.from_state == 4 && transition.possible_target_states == vec![7, 8]
+        }));
+        assert!(machine.transitions.iter().any(|transition| {
+            transition.from_state == 7 && transition.target_state == Some(20)
+        }));
+        assert!(machine.transitions.iter().any(|transition| {
+            transition.from_state == 20 && transition.target_state == Some(90)
+        }));
+    }
+
+    #[test]
+    fn detects_sequence_initialized_state_machine_using_last_numeric_assignment() {
+        let detected = detect(
+            r"
+            function flattened() {
+                let noise, state;
+                for (noise = call(), state = 3; state != 8;) {
+                    if (state == 3) state = 4;
+                    else if (state == 4) state = 5;
+                    else if (state == 5) state = 6;
+                    else if (state == 6) state = 8;
+                }
+            }
+            ",
+        );
+        assert_eq!(detected.if_ladder_machines.len(), 1);
+        assert_eq!(detected.if_ladder_machines[0].init_state, 3);
     }
 
     #[test]

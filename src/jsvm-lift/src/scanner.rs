@@ -10,7 +10,7 @@ use crate::{
         DirectSwitchMapCandidate, HandlerTableCandidate,
     },
     embedded::{
-        detect_function_constructor, detect_literal_string_join, detect_packer_eval,
+        detect_function_constructor, detect_packer_eval, detect_static_string_join,
         EmbeddedCodeCandidate,
     },
     function_analysis::{
@@ -389,7 +389,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
         if let Some(candidate) = detect_packer_eval(call) {
             self.embedded_code.push(candidate);
         }
-        if let Some(candidate) = detect_literal_string_join(call) {
+        if let Some(candidate) = detect_static_string_join(call) {
             self.embedded_code.push(candidate);
         }
         let is_function_ctor = matches!(
