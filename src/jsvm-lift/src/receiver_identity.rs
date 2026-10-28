@@ -1,7 +1,8 @@
 use jsvm_safe_core::{eval_static_primitive, string_literal_value};
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, BindingPattern, CallExpression, Expression, Function, FunctionBody,
-    NewExpression, Program, Statement, VariableDeclaration,
+    Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, CallExpression, Expression,
+    Function, FunctionBody, NewExpression, ObjectPropertyKind, Program, Statement,
+    VariableDeclaration,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
@@ -1048,43 +1049,6 @@ fn static_member_name<'a>(expression: &'a Expression<'a>) -> Option<(&'a Express
     }
 }
 
-struct PrototypeValueUseProbe<'c, 'f, 'a> {
-    scoping: &'c Scoping,
-    constructors: &'f HashMap<SymbolId, FunctionKey>,
-    aliases: &'a HashMap<SymbolId, FunctionKey>,
-    owners: HashSet<FunctionKey>,
-}
-
-impl<'a> Visit<'a> for PrototypeValueUseProbe<'_, '_, '_> {
-    fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
-        if let Some(symbol) = identifier
-            .reference_id
-            .get()
-            .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
-        {
-            if let Some(owner) = self.aliases.get(&symbol).copied() {
-                self.owners.insert(owner);
-            }
-        }
-    }
-
-    fn visit_static_member_expression(
-        &mut self,
-        member: &oxc_ast::ast::StaticMemberExpression<'a>,
-    ) {
-        if !member.optional && member.property.name.as_str() == "prototype" {
-            if let Some(symbol) = reference_symbol(self.scoping, &member.object) {
-                if symbol_binding_is_stable(self.scoping, symbol) {
-                    if let Some(owner) = self.constructors.get(&symbol).copied() {
-                        self.owners.insert(owner);
-                    }
-                }
-            }
-        }
-        walk::walk_static_member_expression(self, member);
-    }
-}
-
 struct PrototypeMethodProof<'c, 'f> {
     scoping: &'c Scoping,
     constructors: &'f HashMap<SymbolId, FunctionKey>,
@@ -1134,15 +1098,63 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
         self.aliases.get(&symbol).copied()
     }
 
-    fn prototype_owners_used_in(&self, expression: &Expression<'_>) -> HashSet<FunctionKey> {
-        let mut probe = PrototypeValueUseProbe {
-            scoping: self.scoping,
-            constructors: self.constructors,
-            aliases: &self.aliases,
-            owners: HashSet::new(),
-        };
-        probe.visit_expression(expression);
-        probe.owners
+    fn prototype_value_owners(&self, expression: &Expression<'_>) -> HashSet<FunctionKey> {
+        match expression {
+            Expression::ParenthesizedExpression(parenthesized) => {
+                self.prototype_value_owners(&parenthesized.expression)
+            }
+            Expression::SequenceExpression(sequence) => sequence
+                .expressions
+                .last()
+                .map_or_else(HashSet::new, |expression| {
+                    self.prototype_value_owners(expression)
+                }),
+            Expression::ConditionalExpression(conditional) => {
+                let mut owners = self.prototype_value_owners(&conditional.consequent);
+                owners.extend(self.prototype_value_owners(&conditional.alternate));
+                owners
+            }
+            Expression::LogicalExpression(logical) => {
+                let mut owners = self.prototype_value_owners(&logical.left);
+                owners.extend(self.prototype_value_owners(&logical.right));
+                owners
+            }
+            Expression::AssignmentExpression(assignment) if assignment.operator.is_assign() => {
+                self.prototype_value_owners(&assignment.right)
+            }
+            Expression::ArrayExpression(array) => {
+                let mut owners = HashSet::new();
+                for element in &array.elements {
+                    match element {
+                        ArrayExpressionElement::SpreadElement(spread) => {
+                            owners.extend(self.prototype_value_owners(&spread.argument));
+                        }
+                        ArrayExpressionElement::Elision(_) => {}
+                        element => {
+                            if let Some(expression) = element.as_expression() {
+                                owners.extend(self.prototype_value_owners(expression));
+                            }
+                        }
+                    }
+                }
+                owners
+            }
+            Expression::ObjectExpression(object) => {
+                let mut owners = HashSet::new();
+                for property in &object.properties {
+                    match property {
+                        ObjectPropertyKind::ObjectProperty(property) => {
+                            owners.extend(self.prototype_value_owners(&property.value));
+                        }
+                        ObjectPropertyKind::SpreadProperty(spread) => {
+                            owners.extend(self.prototype_value_owners(&spread.argument));
+                        }
+                    }
+                }
+                owners
+            }
+            _ => self.prototype_value(expression).into_iter().collect(),
+        }
     }
 
     fn member_receiver_owner(&self, expression: &Expression<'_>) -> Option<FunctionKey> {
@@ -1365,7 +1377,7 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                     .arguments
                     .iter()
                     .filter_map(Argument::as_expression)
-                    .flat_map(|argument| self.prototype_owners_used_in(argument))
+                    .flat_map(|argument| self.prototype_value_owners(argument))
                     .collect::<HashSet<_>>();
                 for owner in argument_owners {
                     self.invalidate_lookup(owner);
@@ -2145,6 +2157,38 @@ mod tests {
     }
 
     #[test]
+    fn prototype_property_value_argument_does_not_escape_prototype_object() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            sink(C.prototype.token);
+        "#;
+        let targets = lookup_targets(source);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].property, "run");
+    }
+
+    #[test]
+    fn direct_prototype_value_argument_invalidates_lookup() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            sink(C.prototype);
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn conditional_prototype_value_argument_invalidates_lookup() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            sink(flag ? C.prototype : {});
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
     fn proves_straight_line_prototype_alias_iife_method() {
         let source = r#"
             const C = function() {};
@@ -2254,6 +2298,16 @@ mod tests {
             const C = function() {};
             C.prototype.run = function() {};
             unknown([C.prototype]);
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_rejects_prototype_nested_in_object_value() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            unknown({ value: C.prototype });
         "#;
         assert!(lookup_targets(source).is_empty());
     }
