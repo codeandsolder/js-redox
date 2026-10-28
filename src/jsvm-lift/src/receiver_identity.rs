@@ -44,6 +44,21 @@ pub struct ProvenMemberReceiverOrigin {
     pub constructor_end: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenMemberWriteOrigin {
+    pub write_start: u32,
+    pub write_end: u32,
+    pub receiver_start: u32,
+    pub receiver_end: u32,
+    /// `None` means the receiver identity is exact but the computed key is not.
+    pub property: Option<String>,
+    pub allocation_start: u32,
+    pub allocation_end: u32,
+    pub constructor_start: u32,
+    pub constructor_end: u32,
+    pub operation: &'static str,
+}
+
 #[derive(Clone)]
 struct FunctionInfo {
     parameters: Vec<SymbolId>,
@@ -228,6 +243,7 @@ struct ContextProbe<'c, 'f> {
     parameter_origins: HashMap<SymbolId, ObjectOrigin>,
     discovered: Vec<FunctionContext>,
     member_calls: Vec<ProvenMemberReceiverOrigin>,
+    member_writes: Vec<ProvenMemberWriteOrigin>,
     target: FunctionKey,
     active: bool,
 }
@@ -254,6 +270,7 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
             parameter_origins,
             discovered: Vec::new(),
             member_calls: Vec::new(),
+            member_writes: Vec::new(),
             target: context.function,
             active: false,
         }
@@ -316,6 +333,49 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
         });
     }
 
+    fn record_member_write(
+        &mut self,
+        receiver: &Expression<'_>,
+        property: Option<String>,
+        span: oxc_span::Span,
+        operation: &'static str,
+    ) {
+        let Some(origin) = self.expression_origin(receiver) else {
+            return;
+        };
+        self.member_writes.push(ProvenMemberWriteOrigin {
+            write_start: span.start,
+            write_end: span.end,
+            receiver_start: receiver.span().start,
+            receiver_end: receiver.span().end,
+            property,
+            allocation_start: origin.allocation_start,
+            allocation_end: origin.allocation_end,
+            constructor_start: origin.constructor.start,
+            constructor_end: origin.constructor.end,
+            operation,
+        });
+    }
+
+    fn assignment_member<'e>(
+        &self,
+        target: &'e AssignmentTarget<'e>,
+    ) -> Option<(&'e Expression<'e>, Option<String>)> {
+        match target {
+            AssignmentTarget::StaticMemberExpression(member) if !member.optional => {
+                Some((&member.object, Some(member.property.name.to_string())))
+            }
+            AssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
+                let property = match last_sequence_expression(&member.expression) {
+                    Expression::StringLiteral(property) => string_literal_value(property),
+                    _ => None,
+                };
+                Some((&member.object, property))
+            }
+            _ => None,
+        }
+    }
+
     fn static_member<'e>(
         &self,
         expression: &'e Expression<'e>,
@@ -361,6 +421,67 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
         if !self.active {
             walk::walk_arrow_function_expression(self, function);
         }
+    }
+
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if self.active {
+            if let Some((receiver, property)) = self.assignment_member(&assignment.left) {
+                self.record_member_write(receiver, property, assignment.span, "assignment");
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+
+    fn visit_update_expression(&mut self, update: &oxc_ast::ast::UpdateExpression<'a>) {
+        if self.active {
+            match &update.argument {
+                oxc_ast::ast::SimpleAssignmentTarget::StaticMemberExpression(member)
+                    if !member.optional =>
+                {
+                    self.record_member_write(
+                        &member.object,
+                        Some(member.property.name.to_string()),
+                        update.span,
+                        "update",
+                    );
+                }
+                oxc_ast::ast::SimpleAssignmentTarget::ComputedMemberExpression(member)
+                    if !member.optional =>
+                {
+                    let property = match last_sequence_expression(&member.expression) {
+                        Expression::StringLiteral(property) => string_literal_value(property),
+                        _ => None,
+                    };
+                    self.record_member_write(&member.object, property, update.span, "update");
+                }
+                _ => {}
+            }
+        }
+        walk::walk_update_expression(self, update);
+    }
+
+    fn visit_unary_expression(&mut self, unary: &oxc_ast::ast::UnaryExpression<'a>) {
+        if self.active && unary.operator.as_str() == "delete" {
+            match last_sequence_expression(&unary.argument) {
+                Expression::StaticMemberExpression(member) if !member.optional => {
+                    self.record_member_write(
+                        &member.object,
+                        Some(member.property.name.to_string()),
+                        unary.span,
+                        "delete",
+                    );
+                }
+                Expression::ComputedMemberExpression(member) if !member.optional => {
+                    let property = match last_sequence_expression(&member.expression) {
+                        Expression::StringLiteral(property) => string_literal_value(property),
+                        _ => None,
+                    };
+                    self.record_member_write(&member.object, property, unary.span, "delete");
+                }
+                _ => {}
+            }
+        }
+        walk::walk_unary_expression(self, unary);
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
@@ -441,13 +562,71 @@ pub fn structurally_proven_member_receiver_origins(
     calls
 }
 
+#[must_use]
+pub fn structurally_proven_member_write_origins(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenMemberWriteOrigin> {
+    let mut functions = FunctionCollector::new();
+    functions.visit_program(program);
+
+    let mut allocations = AllocationCollector {
+        scoping,
+        functions: &functions.by_symbol,
+        contexts: Vec::new(),
+    };
+    allocations.visit_program(program);
+
+    let mut queue = VecDeque::from(allocations.contexts);
+    let mut seen = HashSet::new();
+    let mut writes = Vec::new();
+    while let Some(mut context) = queue.pop_front() {
+        let Some(info) = functions.by_key.get(&context.function) else {
+            continue;
+        };
+        if info.dynamic_scope {
+            continue;
+        }
+        if context.parameter_origins.len() < info.parameters.len() {
+            context
+                .parameter_origins
+                .resize(info.parameters.len(), None);
+        }
+        if !seen.insert(context.clone()) {
+            continue;
+        }
+        let mut probe = ContextProbe::new(
+            scoping,
+            &functions.by_symbol,
+            &functions.by_key,
+            &context,
+            info,
+        );
+        probe.visit_program(program);
+        queue.extend(probe.discovered);
+        writes.extend(probe.member_writes);
+    }
+
+    writes.sort_by_key(|write| (write.write_start, write.write_end, write.allocation_start));
+    writes.dedup();
+    writes
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenFunctionValue {
+    pub function_start: u32,
+    pub function_end: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenPrototypeMethodAssignment {
     pub constructor_start: u32,
     pub constructor_end: u32,
     pub property: String,
-    pub function_start: u32,
-    pub function_end: u32,
+    /// Every regular-function value the assignment can select from the supported
+    /// pure expression subset. Multiple entries preserve environment-dependent
+    /// conditionals without guessing which arm wins.
+    pub possible_functions: Vec<ProvenFunctionValue>,
     pub assignment_start: u32,
     pub assignment_end: u32,
     /// Resolving this assignment as an installed own prototype method requires ordinary
@@ -455,12 +634,51 @@ pub struct ProvenPrototypeMethodAssignment {
     pub standard_prototype_semantics_required: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenPrototypeMethodReceiverEffects {
+    pub constructor_start: u32,
+    pub constructor_end: u32,
+    pub property: String,
+    pub assignment_start: u32,
+    pub assignment_end: u32,
+    pub possible_functions: Vec<ProvenFunctionValue>,
+    /// Static own/inherited receiver properties read by at least one possible body.
+    /// A lookup consumer must separately prove these reads cannot invoke a hostile getter.
+    pub receiver_reads: Vec<String>,
+    /// Static methods called with the receiver as `this` by at least one possible body.
+    /// These are recursive effect obligations, not automatically safe calls.
+    pub receiver_calls: Vec<String>,
+    /// True when a possible body directly writes, updates, or deletes a receiver member.
+    pub mutates_receiver: bool,
+    /// True when a possible body exposes the receiver as a value (return/argument/alias/etc.).
+    pub exposes_receiver: bool,
+    /// True when a possible body performs a computed receiver access whose key is not a
+    /// supported static string literal.
+    pub dynamic_receiver_access: bool,
+}
+
 fn regular_function_key(function: &Function<'_>) -> Option<FunctionKey> {
     (!function.r#async && !function.generator).then(|| FunctionKey::of(function))
 }
 
-fn returned_regular_function(call: &CallExpression<'_>) -> Option<FunctionKey> {
-    if call.optional {
+fn possible_regular_functions(expression: &Expression<'_>) -> Option<Vec<FunctionKey>> {
+    let mut functions = match last_sequence_expression(expression) {
+        Expression::FunctionExpression(function) => vec![regular_function_key(function)?],
+        Expression::CallExpression(call) => returned_regular_functions(call)?,
+        Expression::ConditionalExpression(conditional) => {
+            let mut functions = possible_regular_functions(&conditional.consequent)?;
+            functions.extend(possible_regular_functions(&conditional.alternate)?);
+            functions
+        }
+        _ => return None,
+    };
+    functions.sort_by_key(|function| (function.start, function.end));
+    functions.dedup();
+    (!functions.is_empty()).then_some(functions)
+}
+
+fn returned_regular_functions(call: &CallExpression<'_>) -> Option<Vec<FunctionKey>> {
+    if call.optional || !call.arguments.is_empty() {
         return None;
     }
     let Expression::FunctionExpression(factory) = last_sequence_expression(&call.callee) else {
@@ -473,19 +691,7 @@ fn returned_regular_function(call: &CallExpression<'_>) -> Option<FunctionKey> {
     let [Statement::ReturnStatement(ret)] = body.statements.as_slice() else {
         return None;
     };
-    let Expression::FunctionExpression(function) = last_sequence_expression(ret.argument.as_ref()?)
-    else {
-        return None;
-    };
-    regular_function_key(function)
-}
-
-fn method_value_function(expression: &Expression<'_>) -> Option<FunctionKey> {
-    match last_sequence_expression(expression) {
-        Expression::FunctionExpression(function) => regular_function_key(function),
-        Expression::CallExpression(call) => returned_regular_function(call),
-        _ => None,
-    }
+    possible_regular_functions(ret.argument.as_ref()?)
 }
 
 fn static_member_name<'a>(expression: &'a Expression<'a>) -> Option<(&'a Expression<'a>, String)> {
@@ -559,7 +765,7 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
         &mut self,
         owner: FunctionKey,
         property: String,
-        function: FunctionKey,
+        functions: Vec<FunctionKey>,
         assignment_start: u32,
         assignment_end: u32,
     ) {
@@ -571,8 +777,13 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
             constructor_start: owner.start,
             constructor_end: owner.end,
             property,
-            function_start: function.start,
-            function_end: function.end,
+            possible_functions: functions
+                .into_iter()
+                .map(|function| ProvenFunctionValue {
+                    function_start: function.start,
+                    function_end: function.end,
+                })
+                .collect(),
             assignment_start,
             assignment_end,
             standard_prototype_semantics_required: true,
@@ -674,11 +885,11 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                             return;
                         }
                         if let Some(owner) = owner {
-                            if let Some(function) = method_value_function(&assignment.right) {
+                            if let Some(functions) = possible_regular_functions(&assignment.right) {
                                 self.record_method(
                                     owner,
                                     property,
-                                    function,
+                                    functions,
                                     assignment.span.start,
                                     assignment.span.end,
                                 );
@@ -698,11 +909,13 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                         self.process_expression(&assignment.right);
                         if let Some(owner) = owner {
                             if let Some(property) = property {
-                                if let Some(function) = method_value_function(&assignment.right) {
+                                if let Some(functions) =
+                                    possible_regular_functions(&assignment.right)
+                                {
                                     self.record_method(
                                         owner,
                                         property,
-                                        function,
+                                        functions,
                                         assignment.span.start,
                                         assignment.span.end,
                                     );
@@ -788,11 +1001,255 @@ pub fn structurally_proven_prototype_method_assignments(
     methods
 }
 
+fn direct_this(expression: &Expression<'_>) -> bool {
+    matches!(
+        last_sequence_expression(expression),
+        Expression::ThisExpression(_)
+    )
+}
+
+fn assignment_target_direct_this_member(target: &AssignmentTarget<'_>) -> bool {
+    match target {
+        AssignmentTarget::StaticMemberExpression(member) => direct_this(&member.object),
+        AssignmentTarget::ComputedMemberExpression(member) => direct_this(&member.object),
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct ReceiverEffectProbe {
+    reads: HashSet<String>,
+    calls: HashSet<String>,
+    mutates: bool,
+    exposes: bool,
+    dynamic_access: bool,
+}
+
+impl<'a> Visit<'a> for ReceiverEffectProbe {
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        // Arrow bodies capture the surrounding `this`. Treat any such closure as
+        // an exposure obligation instead of recursively pretending it executes now.
+        let mut nested = ReceiverEffectProbe::default();
+        walk::walk_arrow_function_expression(&mut nested, function);
+        if !nested.reads.is_empty()
+            || !nested.calls.is_empty()
+            || nested.mutates
+            || nested.exposes
+            || nested.dynamic_access
+        {
+            self.exposes = true;
+        }
+    }
+
+    fn visit_this_expression(&mut self, _expression: &oxc_ast::ast::ThisExpression) {
+        self.exposes = true;
+    }
+
+    fn visit_return_statement(&mut self, statement: &oxc_ast::ast::ReturnStatement<'a>) {
+        if let Some(argument) = statement.argument.as_ref() {
+            if direct_this(argument) {
+                self.exposes = true;
+                return;
+            }
+            self.visit_expression(argument);
+        }
+    }
+
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment_target_direct_this_member(&assignment.left) {
+            self.mutates = true;
+            self.visit_expression(&assignment.right);
+            return;
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+
+    fn visit_update_expression(&mut self, expression: &oxc_ast::ast::UpdateExpression<'a>) {
+        match &expression.argument {
+            oxc_ast::ast::SimpleAssignmentTarget::StaticMemberExpression(member)
+                if direct_this(&member.object) =>
+            {
+                self.mutates = true
+            }
+            oxc_ast::ast::SimpleAssignmentTarget::ComputedMemberExpression(member)
+                if direct_this(&member.object) =>
+            {
+                self.mutates = true
+            }
+            _ => walk::walk_update_expression(self, expression),
+        }
+    }
+
+    fn visit_unary_expression(&mut self, expression: &oxc_ast::ast::UnaryExpression<'a>) {
+        if expression.operator.as_str() == "delete" {
+            match last_sequence_expression(&expression.argument) {
+                Expression::StaticMemberExpression(member) if direct_this(&member.object) => {
+                    self.mutates = true;
+                    return;
+                }
+                Expression::ComputedMemberExpression(member) if direct_this(&member.object) => {
+                    self.mutates = true;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        walk::walk_unary_expression(self, expression);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if let Some((receiver, property)) = static_member_name(&call.callee) {
+            if direct_this(receiver) {
+                self.calls.insert(property);
+                for argument in &call.arguments {
+                    if let Some(argument) = argument.as_expression() {
+                        self.visit_expression(argument);
+                    } else {
+                        self.exposes = true;
+                    }
+                }
+                return;
+            }
+        }
+        for argument in &call.arguments {
+            if let Some(argument) = argument.as_expression() {
+                if direct_this(argument) {
+                    self.exposes = true;
+                } else {
+                    self.visit_expression(argument);
+                }
+            } else {
+                self.exposes = true;
+            }
+        }
+        self.visit_expression(&call.callee);
+    }
+
+    fn visit_static_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::StaticMemberExpression<'a>,
+    ) {
+        if direct_this(&member.object) {
+            self.reads.insert(member.property.name.to_string());
+            return;
+        }
+        walk::walk_static_member_expression(self, member);
+    }
+
+    fn visit_computed_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::ComputedMemberExpression<'a>,
+    ) {
+        if direct_this(&member.object) {
+            match last_sequence_expression(&member.expression) {
+                Expression::StringLiteral(property) => {
+                    if let Some(property) = string_literal_value(property) {
+                        self.reads.insert(property);
+                    } else {
+                        self.dynamic_access = true;
+                    }
+                }
+                _ => self.dynamic_access = true,
+            }
+            self.visit_expression(&member.expression);
+            return;
+        }
+        walk::walk_computed_member_expression(self, member);
+    }
+}
+
+struct FunctionEffectCollector<'e> {
+    targets: &'e HashSet<FunctionKey>,
+    effects: HashMap<FunctionKey, ReceiverEffectProbe>,
+}
+
+impl<'a> Visit<'a> for FunctionEffectCollector<'_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        let key = FunctionKey::of(function);
+        if self.targets.contains(&key) {
+            let mut effect = ReceiverEffectProbe::default();
+            if let Some(body) = &function.body {
+                effect.visit_function_body(body);
+            }
+            self.effects.insert(key, effect);
+            return;
+        }
+        walk::walk_function(self, function, flags);
+    }
+}
+
+#[must_use]
+pub fn structurally_proven_prototype_method_receiver_effects(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenPrototypeMethodReceiverEffects> {
+    let assignments = structurally_proven_prototype_method_assignments(program, scoping);
+    let targets = assignments
+        .iter()
+        .flat_map(|assignment| assignment.possible_functions.iter())
+        .map(|function| FunctionKey {
+            start: function.function_start,
+            end: function.function_end,
+        })
+        .collect::<HashSet<_>>();
+    let mut collector = FunctionEffectCollector {
+        targets: &targets,
+        effects: HashMap::new(),
+    };
+    collector.visit_program(program);
+
+    assignments
+        .into_iter()
+        .filter_map(|assignment| {
+            let mut reads = HashSet::new();
+            let mut calls = HashSet::new();
+            let mut mutates = false;
+            let mut exposes = false;
+            let mut dynamic_access = false;
+            for function in &assignment.possible_functions {
+                let key = FunctionKey {
+                    start: function.function_start,
+                    end: function.function_end,
+                };
+                let effect = collector.effects.get(&key)?;
+                reads.extend(effect.reads.iter().cloned());
+                calls.extend(effect.calls.iter().cloned());
+                mutates |= effect.mutates;
+                exposes |= effect.exposes;
+                dynamic_access |= effect.dynamic_access;
+            }
+            let mut receiver_reads = reads.into_iter().collect::<Vec<_>>();
+            receiver_reads.sort();
+            let mut receiver_calls = calls.into_iter().collect::<Vec<_>>();
+            receiver_calls.sort();
+            Some(ProvenPrototypeMethodReceiverEffects {
+                constructor_start: assignment.constructor_start,
+                constructor_end: assignment.constructor_end,
+                property: assignment.property,
+                assignment_start: assignment.assignment_start,
+                assignment_end: assignment.assignment_end,
+                possible_functions: assignment.possible_functions,
+                receiver_reads,
+                receiver_calls,
+                mutates_receiver: mutates,
+                exposes_receiver: exposes,
+                dynamic_receiver_access: dynamic_access,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        structurally_proven_member_receiver_origins,
+        structurally_proven_member_receiver_origins, structurally_proven_member_write_origins,
         structurally_proven_prototype_method_assignments,
+        structurally_proven_prototype_method_receiver_effects,
     };
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
@@ -822,6 +1279,17 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         structurally_proven_member_receiver_origins(&parsed.program, semantic.semantic.scoping())
+    }
+
+    fn writes(source: &str) -> Vec<super::ProvenMemberWriteOrigin> {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping())
     }
 
     #[test]
@@ -907,7 +1375,8 @@ mod tests {
         assert_eq!(proven[0].property, "run");
         assert!(proven[0].standard_prototype_semantics_required);
         assert!(
-            source[proven[0].function_start as usize..proven[0].function_end as usize]
+            source[proven[0].possible_functions[0].function_start as usize
+                ..proven[0].possible_functions[0].function_end as usize]
                 .starts_with("function(value)")
         );
     }
@@ -936,6 +1405,111 @@ mod tests {
         let proven = method_assignments(source);
         assert_eq!(proven.len(), 1);
         assert_eq!(proven[0].property, "run");
+    }
+
+    #[test]
+    fn proves_exact_origin_member_writes_through_direct_calls() {
+        let source = r#"
+            const C = function() { setup(this); };
+            function setup(state) {
+                state.ready = 1;
+                state[key] = 2;
+                state.count++;
+                delete state.old;
+            }
+            new C();
+        "#;
+        let proven = writes(source);
+        assert_eq!(proven.len(), 4);
+        assert_eq!(proven[0].property.as_deref(), Some("ready"));
+        assert_eq!(proven[1].property, None);
+        assert_eq!(proven[2].property.as_deref(), Some("count"));
+        assert_eq!(proven[3].property.as_deref(), Some("old"));
+        assert_eq!(proven[2].operation, "update");
+        assert_eq!(proven[3].operation, "delete");
+        assert!(proven
+            .windows(2)
+            .all(|pair| { pair[0].allocation_start == pair[1].allocation_start }));
+    }
+
+    #[test]
+    fn member_write_origin_does_not_enter_uninvoked_closure() {
+        let source = r#"
+            const C = function() { setup(this); };
+            function setup(state) {
+                function later() { state.shadow = 1; }
+            }
+            new C();
+        "#;
+        assert!(writes(source).is_empty());
+    }
+
+    #[test]
+    fn proves_finite_conditional_prototype_function_values() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.clock = flag
+                ? function() { return this.base + host.now(); }
+                : function() { return 0; };
+        "#;
+        let proven = method_assignments(source);
+        assert_eq!(proven.len(), 1);
+        assert_eq!(proven[0].property, "clock");
+        assert_eq!(proven[0].possible_functions.len(), 2);
+    }
+
+    #[test]
+    fn summarizes_receiver_requirements_across_all_possible_method_bodies() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.clock = flag
+                ? function() { return this.base + host.now(); }
+                : function() { return 0; };
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        let effects = structurally_proven_prototype_method_receiver_effects(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        );
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].receiver_reads, vec!["base"]);
+        assert!(effects[0].receiver_calls.is_empty());
+        assert!(!effects[0].mutates_receiver);
+        assert!(!effects[0].exposes_receiver);
+        assert!(!effects[0].dynamic_receiver_access);
+    }
+
+    #[test]
+    fn summarizes_receiver_mutation_call_and_exposure_obligations() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function(arg) {
+                this.count++;
+                this.step(arg);
+                unknown(this);
+                return this[key];
+            };
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        let effects = structurally_proven_prototype_method_receiver_effects(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        );
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].receiver_calls, vec!["step"]);
+        assert!(effects[0].mutates_receiver);
+        assert!(effects[0].exposes_receiver);
+        assert!(effects[0].dynamic_receiver_access);
     }
 
     #[test]
