@@ -31,8 +31,29 @@ struct ObjectOrigin {
     constructor: FunctionKey,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProvenOriginContext {
+    pub function_start: u32,
+    pub function_end: u32,
+    pub allocation_start: u32,
+    pub allocation_end: u32,
+    pub constructor_start: u32,
+    pub constructor_end: u32,
+    pub this_origin: bool,
+    pub parameter_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenOriginDirectCall {
+    pub call_start: u32,
+    pub call_end: u32,
+    pub caller: ProvenOriginContext,
+    pub callee: ProvenOriginContext,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenMemberReceiverOrigin {
+    pub context: ProvenOriginContext,
     pub call_start: u32,
     pub call_end: u32,
     pub receiver_start: u32,
@@ -46,6 +67,7 @@ pub struct ProvenMemberReceiverOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenMemberWriteOrigin {
+    pub context: ProvenOriginContext,
     pub write_start: u32,
     pub write_end: u32,
     pub receiver_start: u32,
@@ -206,6 +228,31 @@ struct FunctionContext {
     parameter_origins: Vec<Option<ObjectOrigin>>,
 }
 
+impl FunctionContext {
+    fn proven_origin_context(&self, origin: ObjectOrigin) -> Option<ProvenOriginContext> {
+        let parameter_indices = self
+            .parameter_origins
+            .iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| (*candidate == Some(origin)).then_some(index))
+            .collect::<Vec<_>>();
+        let this_origin = self.this_origin == Some(origin);
+        if !this_origin && parameter_indices.is_empty() {
+            return None;
+        }
+        Some(ProvenOriginContext {
+            function_start: self.function.start,
+            function_end: self.function.end,
+            allocation_start: origin.allocation_start,
+            allocation_end: origin.allocation_end,
+            constructor_start: origin.constructor.start,
+            constructor_end: origin.constructor.end,
+            this_origin,
+            parameter_indices,
+        })
+    }
+}
+
 struct AllocationCollector<'c, 'f> {
     scoping: &'c Scoping,
     functions: &'f HashMap<SymbolId, FunctionKey>,
@@ -244,6 +291,7 @@ struct ContextProbe<'c, 'f> {
     discovered: Vec<FunctionContext>,
     member_calls: Vec<ProvenMemberReceiverOrigin>,
     member_writes: Vec<ProvenMemberWriteOrigin>,
+    direct_calls: Vec<ProvenOriginDirectCall>,
     target: FunctionKey,
     active: bool,
 }
@@ -271,6 +319,7 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
             discovered: Vec::new(),
             member_calls: Vec::new(),
             member_writes: Vec::new(),
+            direct_calls: Vec::new(),
             target: context.function,
             active: false,
         }
@@ -326,11 +375,30 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
         if parameter_origins.iter().all(Option::is_none) {
             return;
         }
-        self.discovered.push(FunctionContext {
+        let child = FunctionContext {
             function: callee,
             this_origin: None,
             parameter_origins,
-        });
+        };
+        let origins = child
+            .parameter_origins
+            .iter()
+            .filter_map(|origin| *origin)
+            .collect::<HashSet<_>>();
+        for origin in origins {
+            if let (Some(caller), Some(callee)) = (
+                self.context.proven_origin_context(origin),
+                child.proven_origin_context(origin),
+            ) {
+                self.direct_calls.push(ProvenOriginDirectCall {
+                    call_start: call.span.start,
+                    call_end: call.span.end,
+                    caller,
+                    callee,
+                });
+            }
+        }
+        self.discovered.push(child);
     }
 
     fn record_member_write(
@@ -343,7 +411,11 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
         let Some(origin) = self.expression_origin(receiver) else {
             return;
         };
+        let Some(context) = self.context.proven_origin_context(origin) else {
+            return;
+        };
         self.member_writes.push(ProvenMemberWriteOrigin {
+            context,
             write_start: span.start,
             write_end: span.end,
             receiver_start: receiver.span().start,
@@ -494,7 +566,12 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
                 self.record_direct_call(call, callee);
             } else if let Some((receiver, property)) = self.static_member(&call.callee) {
                 if let Some(origin) = self.expression_origin(receiver) {
+                    let Some(context) = self.context.proven_origin_context(origin) else {
+                        walk::walk_call_expression(self, call);
+                        return;
+                    };
                     self.member_calls.push(ProvenMemberReceiverOrigin {
+                        context,
                         call_start: call.span.start,
                         call_end: call.span.end,
                         receiver_start: receiver.span().start,
@@ -512,11 +589,18 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProvenOriginFlow {
+    pub member_calls: Vec<ProvenMemberReceiverOrigin>,
+    pub member_writes: Vec<ProvenMemberWriteOrigin>,
+    pub direct_calls: Vec<ProvenOriginDirectCall>,
+}
+
 #[must_use]
-pub fn structurally_proven_member_receiver_origins(
+pub fn structurally_proven_origin_flow(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenMemberReceiverOrigin> {
+) -> ProvenOriginFlow {
     let mut functions = FunctionCollector::new();
     functions.visit_program(program);
 
@@ -529,7 +613,7 @@ pub fn structurally_proven_member_receiver_origins(
 
     let mut queue = VecDeque::from(allocations.contexts);
     let mut seen = HashSet::new();
-    let mut calls = Vec::new();
+    let mut flow = ProvenOriginFlow::default();
     while let Some(mut context) = queue.pop_front() {
         let Some(info) = functions.by_key.get(&context.function) else {
             continue;
@@ -554,12 +638,48 @@ pub fn structurally_proven_member_receiver_origins(
         );
         probe.visit_program(program);
         queue.extend(probe.discovered);
-        calls.extend(probe.member_calls);
+        flow.member_calls.extend(probe.member_calls);
+        flow.member_writes.extend(probe.member_writes);
+        flow.direct_calls.extend(probe.direct_calls);
     }
 
-    calls.sort_by_key(|call| (call.call_start, call.call_end, call.allocation_start));
-    calls.dedup();
-    calls
+    flow.member_calls.sort_by_key(|call| {
+        (
+            call.call_start,
+            call.call_end,
+            call.context.allocation_start,
+            call.context.function_start,
+        )
+    });
+    flow.member_calls.dedup();
+    flow.member_writes.sort_by_key(|write| {
+        (
+            write.write_start,
+            write.write_end,
+            write.context.allocation_start,
+            write.context.function_start,
+        )
+    });
+    flow.member_writes.dedup();
+    flow.direct_calls.sort_by_key(|call| {
+        (
+            call.call_start,
+            call.call_end,
+            call.caller.allocation_start,
+            call.caller.function_start,
+            call.callee.function_start,
+        )
+    });
+    flow.direct_calls.dedup();
+    flow
+}
+
+#[must_use]
+pub fn structurally_proven_member_receiver_origins(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenMemberReceiverOrigin> {
+    structurally_proven_origin_flow(program, scoping).member_calls
 }
 
 #[must_use]
@@ -567,49 +687,15 @@ pub fn structurally_proven_member_write_origins(
     program: &Program<'_>,
     scoping: &Scoping,
 ) -> Vec<ProvenMemberWriteOrigin> {
-    let mut functions = FunctionCollector::new();
-    functions.visit_program(program);
+    structurally_proven_origin_flow(program, scoping).member_writes
+}
 
-    let mut allocations = AllocationCollector {
-        scoping,
-        functions: &functions.by_symbol,
-        contexts: Vec::new(),
-    };
-    allocations.visit_program(program);
-
-    let mut queue = VecDeque::from(allocations.contexts);
-    let mut seen = HashSet::new();
-    let mut writes = Vec::new();
-    while let Some(mut context) = queue.pop_front() {
-        let Some(info) = functions.by_key.get(&context.function) else {
-            continue;
-        };
-        if info.dynamic_scope {
-            continue;
-        }
-        if context.parameter_origins.len() < info.parameters.len() {
-            context
-                .parameter_origins
-                .resize(info.parameters.len(), None);
-        }
-        if !seen.insert(context.clone()) {
-            continue;
-        }
-        let mut probe = ContextProbe::new(
-            scoping,
-            &functions.by_symbol,
-            &functions.by_key,
-            &context,
-            info,
-        );
-        probe.visit_program(program);
-        queue.extend(probe.discovered);
-        writes.extend(probe.member_writes);
-    }
-
-    writes.sort_by_key(|write| (write.write_start, write.write_end, write.allocation_start));
-    writes.dedup();
-    writes
+#[must_use]
+pub fn structurally_proven_origin_direct_calls(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenOriginDirectCall> {
+    structurally_proven_origin_flow(program, scoping).direct_calls
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1466,7 +1552,7 @@ pub fn structurally_proven_prototype_method_receiver_effects(
 mod tests {
     use super::{
         structurally_proven_member_receiver_origins, structurally_proven_member_write_origins,
-        structurally_proven_prototype_method_assignments,
+        structurally_proven_origin_direct_calls, structurally_proven_prototype_method_assignments,
         structurally_proven_prototype_method_lookup_targets,
         structurally_proven_prototype_method_receiver_effects,
     };
@@ -1474,6 +1560,7 @@ mod tests {
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
+    use std::collections::HashSet;
 
     fn method_assignments(source: &str) -> Vec<super::ProvenPrototypeMethodAssignment> {
         let allocator = Allocator::default();
@@ -1591,6 +1678,65 @@ mod tests {
             new C();
         "#;
         assert!(calls(source).is_empty());
+    }
+
+    #[test]
+    fn records_context_sensitive_origin_direct_call_chain() {
+        let source = r#"
+            const C = function() { setup(this); };
+            function setup(state) { schedule(state); }
+            function schedule(state) { state.run(); }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        let calls =
+            structurally_proven_origin_direct_calls(&parsed.program, semantic.semantic.scoping());
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].caller.this_origin);
+        assert!(calls[0].caller.parameter_indices.is_empty());
+        assert_eq!(calls[0].callee.parameter_indices, vec![0]);
+        assert_eq!(calls[1].caller.parameter_indices, vec![0]);
+        assert_eq!(calls[1].callee.parameter_indices, vec![0]);
+        assert_eq!(
+            calls[0].caller.allocation_start,
+            calls[1].caller.allocation_start
+        );
+    }
+
+    #[test]
+    fn keeps_multipurpose_helper_origin_positions_distinct() {
+        let source = r#"
+            const C = function() { setup(this); };
+            function setup(state) {
+                helper(state, other);
+                helper(other, state);
+            }
+            function helper(left, right) {
+                left.run();
+                right.run();
+            }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        let calls =
+            structurally_proven_origin_direct_calls(&parsed.program, semantic.semantic.scoping());
+        let helper_contexts = calls
+            .iter()
+            .filter(|call| call.callee.parameter_indices.len() == 1)
+            .map(|call| call.callee.parameter_indices.clone())
+            .collect::<HashSet<_>>();
+        assert!(helper_contexts.contains(&vec![0]));
+        assert!(helper_contexts.contains(&vec![1]));
     }
 
     #[test]
