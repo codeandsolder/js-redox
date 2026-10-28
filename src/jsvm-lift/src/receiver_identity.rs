@@ -1086,6 +1086,100 @@ impl<'a> Visit<'a> for PrototypeMentionProbe<'_, '_, '_> {
     }
 }
 
+struct ConstructorEscapeProbe<'c, 'f, 'k> {
+    scoping: &'c Scoping,
+    constructors: &'f HashMap<SymbolId, FunctionKey>,
+    property_keys: &'k HashMap<SymbolId, String>,
+    owners: HashSet<FunctionKey>,
+}
+
+impl ConstructorEscapeProbe<'_, '_, '_> {
+    fn constructor_value(&self, expression: &Expression<'_>) -> Option<FunctionKey> {
+        let symbol = reference_symbol(self.scoping, last_sequence_expression(expression))?;
+        symbol_binding_is_stable(self.scoping, symbol)
+            .then(|| self.constructors.get(&symbol).copied())
+            .flatten()
+    }
+}
+
+impl<'a> Visit<'a> for ConstructorEscapeProbe<'_, '_, '_> {
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+
+    fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
+        if let Some(symbol) = identifier
+            .reference_id
+            .get()
+            .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+        {
+            if let Some(owner) = self.constructors.get(&symbol).copied() {
+                self.owners.insert(owner);
+            }
+        }
+    }
+
+    fn visit_new_expression(&mut self, expression: &NewExpression<'a>) {
+        if self.constructor_value(&expression.callee).is_some() {
+            for argument in &expression.arguments {
+                if let Some(argument) = argument.as_expression() {
+                    self.visit_expression(argument);
+                } else {
+                    walk::walk_argument(self, argument);
+                }
+            }
+            return;
+        }
+        walk::walk_new_expression(self, expression);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if self.constructor_value(&call.callee).is_some() {
+            for argument in &call.arguments {
+                if let Some(argument) = argument.as_expression() {
+                    self.visit_expression(argument);
+                } else {
+                    walk::walk_argument(self, argument);
+                }
+            }
+            return;
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_static_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::StaticMemberExpression<'a>,
+    ) {
+        if self.constructor_value(&member.object).is_some() {
+            return;
+        }
+        walk::walk_static_member_expression(self, member);
+    }
+
+    fn visit_computed_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::ComputedMemberExpression<'a>,
+    ) {
+        if let Some(owner) = self.constructor_value(&member.object) {
+            let property = proof_property_key(&member.expression, self.scoping, self.property_keys);
+            if property
+                .as_deref()
+                .is_none_or(|property| property == "prototype")
+            {
+                self.owners.insert(owner);
+            }
+            self.visit_expression(&member.expression);
+            return;
+        }
+        walk::walk_computed_member_expression(self, member);
+    }
+}
+
 struct PrototypeMethodProof<'c, 'f> {
     scoping: &'c Scoping,
     constructors: &'f HashMap<SymbolId, FunctionKey>,
@@ -1133,6 +1227,72 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
         }
         let symbol = reference_symbol(self.scoping, expression)?;
         self.aliases.get(&symbol).copied()
+    }
+
+    fn constructor_value(&self, expression: &Expression<'_>) -> Option<FunctionKey> {
+        let symbol = reference_symbol(self.scoping, last_sequence_expression(expression))?;
+        symbol_binding_is_stable(self.scoping, symbol)
+            .then(|| self.constructors.get(&symbol).copied())
+            .flatten()
+    }
+
+    fn constructor_value_owners(&self, expression: &Expression<'_>) -> HashSet<FunctionKey> {
+        match expression {
+            Expression::ParenthesizedExpression(parenthesized) => {
+                self.constructor_value_owners(&parenthesized.expression)
+            }
+            Expression::SequenceExpression(sequence) => sequence
+                .expressions
+                .last()
+                .map_or_else(HashSet::new, |expression| {
+                    self.constructor_value_owners(expression)
+                }),
+            Expression::ConditionalExpression(conditional) => {
+                let mut owners = self.constructor_value_owners(&conditional.consequent);
+                owners.extend(self.constructor_value_owners(&conditional.alternate));
+                owners
+            }
+            Expression::LogicalExpression(logical) => {
+                let mut owners = self.constructor_value_owners(&logical.left);
+                owners.extend(self.constructor_value_owners(&logical.right));
+                owners
+            }
+            Expression::AssignmentExpression(assignment) if assignment.operator.is_assign() => {
+                self.constructor_value_owners(&assignment.right)
+            }
+            Expression::ArrayExpression(array) => {
+                let mut owners = HashSet::new();
+                for element in &array.elements {
+                    match element {
+                        ArrayExpressionElement::SpreadElement(spread) => {
+                            owners.extend(self.constructor_value_owners(&spread.argument));
+                        }
+                        ArrayExpressionElement::Elision(_) => {}
+                        element => {
+                            if let Some(expression) = element.as_expression() {
+                                owners.extend(self.constructor_value_owners(expression));
+                            }
+                        }
+                    }
+                }
+                owners
+            }
+            Expression::ObjectExpression(object) => {
+                let mut owners = HashSet::new();
+                for property in &object.properties {
+                    match property {
+                        ObjectPropertyKind::ObjectProperty(property) => {
+                            owners.extend(self.constructor_value_owners(&property.value));
+                        }
+                        ObjectPropertyKind::SpreadProperty(spread) => {
+                            owners.extend(self.constructor_value_owners(&spread.argument));
+                        }
+                    }
+                }
+                owners
+            }
+            _ => self.constructor_value(expression).into_iter().collect(),
+        }
     }
 
     fn prototype_value_owners(&self, expression: &Expression<'_>) -> HashSet<FunctionKey> {
@@ -1189,6 +1349,19 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                     }
                 }
                 owners
+            }
+            Expression::ComputedMemberExpression(member) if !member.optional => {
+                if let Some(owner) = self.constructor_value(&member.object) {
+                    let property =
+                        proof_property_key(&member.expression, self.scoping, self.property_keys);
+                    if property
+                        .as_deref()
+                        .is_none_or(|property| property == "prototype")
+                    {
+                        return [owner].into_iter().collect();
+                    }
+                }
+                self.prototype_value(expression).into_iter().collect()
             }
             _ => self.prototype_value(expression).into_iter().collect(),
         }
@@ -1266,6 +1439,9 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                             continue;
                         };
                         self.process_expression(init);
+                        if let Some(owner) = self.constructor_value(init) {
+                            self.invalidate_constructor(owner);
+                        }
                         let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
                             self.aliases.clear();
                             continue;
@@ -1297,6 +1473,16 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                     for owner in probe.owners {
                         self.invalidate_lookup(owner);
                     }
+                    let mut constructor_probe = ConstructorEscapeProbe {
+                        scoping: self.scoping,
+                        constructors: self.constructors,
+                        property_keys: self.property_keys,
+                        owners: HashSet::new(),
+                    };
+                    constructor_probe.visit_statement(statement);
+                    for owner in constructor_probe.owners {
+                        self.invalidate_constructor(owner);
+                    }
                     self.aliases.clear();
                 }
             }
@@ -1305,6 +1491,10 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
 
     fn invalidate_static_prototype_member(&mut self, object: &Expression<'_>, property: String) {
         if property == "prototype" {
+            if let Some(constructor) = self.constructor_value(object) {
+                self.invalidate_constructor(constructor);
+                return;
+            }
             if let Some(symbol) = reference_symbol(self.scoping, object) {
                 if let Some(constructor) = self.constructors.get(&symbol).copied() {
                     self.invalidate_constructor(constructor);
@@ -1322,10 +1512,20 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
         object: &Expression<'_>,
         property: &Expression<'_>,
     ) {
+        let property = proof_property_key(property, self.scoping, self.property_keys);
+        if let Some(constructor) = self.constructor_value(object) {
+            if property
+                .as_deref()
+                .is_none_or(|property| property == "prototype")
+            {
+                self.invalidate_constructor(constructor);
+                return;
+            }
+        }
         let Some(owner) = self.prototype_value(object) else {
             return;
         };
-        if let Some(property) = proof_property_key(property, self.scoping, self.property_keys) {
+        if let Some(property) = property {
             self.invalidate_property(owner, property);
         } else {
             self.invalidate_lookup(owner);
@@ -1374,6 +1574,9 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
 
                 if let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left {
                     self.process_expression(&assignment.right);
+                    if let Some(owner) = self.constructor_value(&assignment.right) {
+                        self.invalidate_constructor(owner);
+                    }
                     let Some(symbol) = identifier.reference_id.get().and_then(|reference_id| {
                         self.scoping.get_reference(reference_id).symbol_id()
                     }) else {
@@ -1429,6 +1632,14 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                             self.scoping,
                             self.property_keys,
                         );
+                        if let Some(constructor) = self.constructor_value(&member.object) {
+                            if property
+                                .as_deref()
+                                .is_none_or(|property| property == "prototype")
+                            {
+                                self.invalidate_constructor(constructor);
+                            }
+                        }
                         self.process_expression(&assignment.right);
                         if let Some(owner) = owner {
                             if let Some(property) = property {
@@ -1476,6 +1687,15 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                     .collect::<HashSet<_>>();
                 for owner in argument_owners {
                     self.invalidate_lookup(owner);
+                }
+                let constructor_owners = call
+                    .arguments
+                    .iter()
+                    .filter_map(Argument::as_expression)
+                    .flat_map(|argument| self.constructor_value_owners(argument))
+                    .collect::<HashSet<_>>();
+                for owner in constructor_owners {
+                    self.invalidate_constructor(owner);
                 }
                 self.process_expression(&call.callee);
                 for argument in &call.arguments {
@@ -2376,6 +2596,80 @@ mod tests {
             const empty = [];
             C.prototype.run = function() {};
             C.prototype[empty] = 1;
+        "#;
+        let targets = lookup_targets(source);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].property, "run");
+    }
+
+    #[test]
+    fn lookup_target_rejects_constructor_escape_to_unknown_call() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            unknown(C);
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_rejects_constructor_alias_creation() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            const Alias = C;
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_rejects_dynamic_constructor_property_write() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            C[key] = value;
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_rejects_dynamic_constructor_property_escape() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            unknown(C[key]);
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_keeps_static_constructor_property_value_escape_distinct() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            unknown(C.other);
+        "#;
+        let targets = lookup_targets(source);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].property, "run");
+    }
+
+    #[test]
+    fn lookup_target_rejects_conditional_constructor_escape() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            if (flag) unknown(C);
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_keeps_constructor_new_expression_distinct_from_escape() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            function make() { return new C(); }
         "#;
         let targets = lookup_targets(source);
         assert_eq!(targets.len(), 1);
