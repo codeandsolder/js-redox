@@ -81,6 +81,18 @@ pub struct ProvenMemberWriteOrigin {
     pub operation: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenOriginExposure {
+    pub context: ProvenOriginContext,
+    pub exposure_start: u32,
+    pub exposure_end: u32,
+    pub allocation_start: u32,
+    pub allocation_end: u32,
+    pub constructor_start: u32,
+    pub constructor_end: u32,
+    pub kind: &'static str,
+}
+
 #[derive(Clone)]
 struct FunctionInfo {
     parameters: Vec<SymbolId>,
@@ -288,9 +300,11 @@ struct ContextProbe<'c, 'f> {
     function_info: &'f HashMap<FunctionKey, FunctionInfo>,
     context: &'f FunctionContext,
     parameter_origins: HashMap<SymbolId, ObjectOrigin>,
+    local_origins: HashMap<SymbolId, ObjectOrigin>,
     discovered: Vec<FunctionContext>,
     member_calls: Vec<ProvenMemberReceiverOrigin>,
     member_writes: Vec<ProvenMemberWriteOrigin>,
+    exposures: Vec<ProvenOriginExposure>,
     direct_calls: Vec<ProvenOriginDirectCall>,
     target: FunctionKey,
     active: bool,
@@ -316,9 +330,11 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
             function_info,
             context,
             parameter_origins,
+            local_origins: HashMap::new(),
             discovered: Vec::new(),
             member_calls: Vec::new(),
             member_writes: Vec::new(),
+            exposures: Vec::new(),
             direct_calls: Vec::new(),
             target: context.function,
             active: false,
@@ -336,9 +352,13 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
                 .and_then(|expression| self.expression_origin(expression)),
             Expression::Identifier(_) => {
                 let symbol = reference_symbol(self.scoping, expression)?;
-                symbol_binding_is_stable(self.scoping, symbol)
-                    .then(|| self.parameter_origins.get(&symbol).copied())
-                    .flatten()
+                if !symbol_binding_is_stable(self.scoping, symbol) {
+                    return None;
+                }
+                self.parameter_origins
+                    .get(&symbol)
+                    .or_else(|| self.local_origins.get(&symbol))
+                    .copied()
             }
             Expression::ThisExpression(_) => self.context.this_origin,
             _ => None,
@@ -399,6 +419,30 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
             }
         }
         self.discovered.push(child);
+    }
+
+    fn record_exposure(
+        &mut self,
+        expression: &Expression<'_>,
+        span: oxc_span::Span,
+        kind: &'static str,
+    ) {
+        let Some(origin) = self.expression_origin(expression) else {
+            return;
+        };
+        let Some(context) = self.context.proven_origin_context(origin) else {
+            return;
+        };
+        self.exposures.push(ProvenOriginExposure {
+            context,
+            exposure_start: span.start,
+            exposure_end: span.end,
+            allocation_start: origin.allocation_start,
+            allocation_end: origin.allocation_end,
+            constructor_start: origin.constructor.start,
+            constructor_end: origin.constructor.end,
+            kind,
+        });
     }
 
     fn record_member_write(
@@ -495,10 +539,48 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
         }
     }
 
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        if self.active {
+            for declarator in &declaration.declarations {
+                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                    continue;
+                };
+                let Some(symbol) = identifier.symbol_id.get() else {
+                    continue;
+                };
+                if !symbol_binding_is_stable(self.scoping, symbol) {
+                    continue;
+                }
+                let Some(init) = declarator.init.as_ref() else {
+                    continue;
+                };
+                if let Some(origin) = self.expression_origin(init) {
+                    self.local_origins.insert(symbol, origin);
+                }
+            }
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+
+    fn visit_return_statement(&mut self, statement: &oxc_ast::ast::ReturnStatement<'a>) {
+        if self.active {
+            if let Some(argument) = statement.argument.as_ref() {
+                self.record_exposure(argument, statement.span, "return");
+            }
+        }
+        walk::walk_return_statement(self, statement);
+    }
+
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
         if self.active {
             if let Some((receiver, property)) = self.assignment_member(&assignment.left) {
                 self.record_member_write(receiver, property, assignment.span, "assignment");
+                self.record_exposure(&assignment.right, assignment.span, "store");
+            } else if !matches!(
+                assignment.left,
+                AssignmentTarget::AssignmentTargetIdentifier(_)
+            ) {
+                self.record_exposure(&assignment.right, assignment.span, "store");
             }
         }
         walk::walk_assignment_expression(self, assignment);
@@ -562,7 +644,8 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
             return;
         }
         if !call.optional {
-            if let Some(callee) = self.direct_callee(&call.callee) {
+            let direct_callee = self.direct_callee(&call.callee);
+            if let Some(callee) = direct_callee {
                 self.record_direct_call(call, callee);
             } else if let Some((receiver, property)) = self.static_member(&call.callee) {
                 if let Some(origin) = self.expression_origin(receiver) {
@@ -584,6 +667,19 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
                     });
                 }
             }
+
+            let proven_parameter_count = direct_callee
+                .and_then(|callee| self.function_info.get(&callee))
+                .filter(|info| !info.dynamic_scope)
+                .map_or(0, |info| info.parameters.len());
+            for (index, argument) in call.arguments.iter().enumerate() {
+                let Some(argument) = argument.as_expression() else {
+                    continue;
+                };
+                if direct_callee.is_none() || index >= proven_parameter_count {
+                    self.record_exposure(argument, argument.span(), "call_argument");
+                }
+            }
         }
         walk::walk_call_expression(self, call);
     }
@@ -593,6 +689,7 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
 pub struct ProvenOriginFlow {
     pub member_calls: Vec<ProvenMemberReceiverOrigin>,
     pub member_writes: Vec<ProvenMemberWriteOrigin>,
+    pub exposures: Vec<ProvenOriginExposure>,
     pub direct_calls: Vec<ProvenOriginDirectCall>,
 }
 
@@ -631,6 +728,7 @@ fn analyze_origin_contexts(
         queue.extend(probe.discovered);
         flow.member_calls.extend(probe.member_calls);
         flow.member_writes.extend(probe.member_writes);
+        flow.exposures.extend(probe.exposures);
         flow.direct_calls.extend(probe.direct_calls);
     }
 
@@ -652,6 +750,16 @@ fn analyze_origin_contexts(
         )
     });
     flow.member_writes.dedup();
+    flow.exposures.sort_by_key(|exposure| {
+        (
+            exposure.exposure_start,
+            exposure.exposure_end,
+            exposure.context.allocation_start,
+            exposure.context.function_start,
+            exposure.kind,
+        )
+    });
+    flow.exposures.dedup();
     flow.direct_calls.sort_by_key(|call| {
         (
             call.call_start,
@@ -748,6 +856,14 @@ pub fn structurally_proven_member_write_origins(
     scoping: &Scoping,
 ) -> Vec<ProvenMemberWriteOrigin> {
     structurally_proven_origin_flow(program, scoping).member_writes
+}
+
+#[must_use]
+pub fn structurally_proven_origin_exposures(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenOriginExposure> {
+    structurally_proven_origin_flow(program, scoping).exposures
 }
 
 #[must_use]
@@ -1693,7 +1809,8 @@ mod tests {
     use super::{
         propagate_proven_origin_contexts, structurally_matched_prototype_method_calls,
         structurally_proven_member_receiver_origins, structurally_proven_member_write_origins,
-        structurally_proven_origin_direct_calls, structurally_proven_prototype_method_assignments,
+        structurally_proven_origin_direct_calls, structurally_proven_origin_exposures,
+        structurally_proven_prototype_method_assignments,
         structurally_proven_prototype_method_lookup_targets,
         structurally_proven_prototype_method_receiver_effects,
     };
@@ -1849,6 +1966,55 @@ mod tests {
         assert_eq!(flow.member_calls.len(), 1);
         assert_eq!(flow.member_calls[0].property, "finish");
         assert_eq!(flow.member_calls[0].context.parameter_indices, vec![0]);
+    }
+
+    #[test]
+    fn tracks_stable_local_origin_aliases_without_exposing_them() {
+        let source = r#"
+            const C = function() { const alias = this; bridge(alias); };
+            function bridge(state) { state.run(); }
+            new C();
+        "#;
+        let proven = calls(source);
+        assert_eq!(proven.len(), 1);
+        assert_eq!(proven[0].property, "run");
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(
+            structurally_proven_origin_exposures(&parsed.program, semantic.semantic.scoping(),)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn records_origin_passed_to_unresolved_call_as_exposure() {
+        let source = r#"
+            const C = function() { unknown(this); };
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let exposures =
+            structurally_proven_origin_exposures(&parsed.program, semantic.semantic.scoping());
+        assert_eq!(exposures.len(), 1);
+        assert_eq!(exposures[0].kind, "call_argument");
+    }
+
+    #[test]
+    fn records_returned_origin_as_exposure() {
+        let source = r#"
+            const C = function() { return this; };
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let exposures =
+            structurally_proven_origin_exposures(&parsed.program, semantic.semantic.scoping());
+        assert_eq!(exposures.len(), 1);
+        assert_eq!(exposures[0].kind, "return");
     }
 
     #[test]
