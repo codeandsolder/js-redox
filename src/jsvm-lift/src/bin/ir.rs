@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
 use jsvm_lift::pipeline::{BindingInfo, NormalizedVm};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -71,7 +72,7 @@ struct PathIr {
 
 use jsvm_lift::semantic_ir::{classify_effect, IrOp};
 
-fn read_scan(path: &PathBuf) -> Result<HashMap<String, OpcodeProvenance>> {
+fn read_scan(path: &Path) -> Result<HashMap<String, OpcodeProvenance>> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut by_decoder: HashMap<String, OpcodeProvenance> = HashMap::new();
 
