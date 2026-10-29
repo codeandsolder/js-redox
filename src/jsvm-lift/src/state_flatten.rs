@@ -618,7 +618,15 @@ fn prove_machine_event_unreachable_with_integer_bindings(
 
         let before = env.get(&machine.state_var).copied();
         let mut semantic = Vec::new();
-        match exec_statement(body, "", &machine.state_var, &mut env, &mut semantic) {
+        let mut ambiguous_envs = Vec::new();
+        match exec_statement(
+            body,
+            "",
+            &machine.state_var,
+            &mut env,
+            &mut semantic,
+            &mut ambiguous_envs,
+        ) {
             ExecStatus::Return | ExecStatus::Throw => return true,
             ExecStatus::Break | ExecStatus::Normal => {}
         }
@@ -755,6 +763,461 @@ fn exact_integer_parameter_env(
     let mut probe = DynamicScalarProbe::default();
     probe.visit_function_body(function.body.as_deref()?);
     (!probe.dynamic_scope && !probe.arguments_object).then_some(env)
+}
+
+fn exact_call_parameter_env(
+    function: &Function<'_>,
+    scoping: &Scoping,
+    parameter_bindings: &BTreeMap<usize, i64>,
+    provided_argument_count: usize,
+) -> Option<HashMap<String, Scalar>> {
+    if function.params.rest.is_some() {
+        return None;
+    }
+    let mut env = exact_integer_parameter_env(function, scoping, parameter_bindings)?;
+    for (index, parameter) in function.params.items.iter().enumerate() {
+        if index < provided_argument_count || parameter_bindings.contains_key(&index) {
+            continue;
+        }
+        let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+            // A missing argument can trigger defaults/destructuring semantics.
+            return None;
+        };
+        env.insert(identifier.name.to_string(), Scalar::Undefined);
+    }
+    Some(env)
+}
+
+fn branch_state_variable_for_span(
+    block: &oxc_ast::ast::BlockStatement<'_>,
+    target: Span,
+) -> Option<(String, u64)> {
+    struct Probe {
+        target: Span,
+        best: Option<(u32, String, u64)>,
+    }
+    impl Probe {
+        fn consider(&mut self, binary: &oxc_ast::ast::BinaryExpression<'_>, span: Span) {
+            if !(span.start <= self.target.start && self.target.end <= span.end)
+                || !matches!(binary.operator.as_str(), "==" | "===")
+            {
+                return;
+            }
+            let pair = if let (Some(name), Some(value)) =
+                (expr_ident(&binary.left), numeric_u64(&binary.right))
+            {
+                Some((name.to_string(), value))
+            } else if let (Some(value), Some(name)) =
+                (numeric_u64(&binary.left), expr_ident(&binary.right))
+            {
+                Some((name.to_string(), value))
+            } else {
+                None
+            };
+            let Some((name, value)) = pair else {
+                return;
+            };
+            let width = span.end.saturating_sub(span.start);
+            if self.best.as_ref().is_none_or(|(best, _, _)| width < *best) {
+                self.best = Some((width, name, value));
+            }
+        }
+    }
+    impl<'a> Visit<'a> for Probe {
+        fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
+            if let Expression::BinaryExpression(binary) = &statement.test {
+                self.consider(binary, statement.consequent.span());
+            }
+            walk::walk_if_statement(self, statement);
+        }
+        fn visit_conditional_expression(
+            &mut self,
+            expression: &oxc_ast::ast::ConditionalExpression<'a>,
+        ) {
+            if let Expression::BinaryExpression(binary) = &expression.test {
+                self.consider(binary, expression.consequent.span());
+            }
+            walk::walk_conditional_expression(self, expression);
+        }
+        fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+        }
+    }
+    let mut probe = Probe { target, best: None };
+    probe.visit_block_statement(block);
+    probe.best.map(|(_, name, value)| (name, value))
+}
+
+fn control_test_is_effect_free(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::NumericLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::Identifier(_) => true,
+        Expression::ParenthesizedExpression(parenthesized) => {
+            control_test_is_effect_free(&parenthesized.expression)
+        }
+        Expression::SequenceExpression(sequence) => {
+            sequence.expressions.iter().all(control_test_is_effect_free)
+        }
+        Expression::UnaryExpression(unary) if unary.operator.as_str() != "delete" => {
+            control_test_is_effect_free(&unary.argument)
+        }
+        Expression::BinaryExpression(binary) => {
+            control_test_is_effect_free(&binary.left) && control_test_is_effect_free(&binary.right)
+        }
+        Expression::LogicalExpression(logical) => {
+            control_test_is_effect_free(&logical.left)
+                && control_test_is_effect_free(&logical.right)
+        }
+        Expression::ConditionalExpression(conditional) => {
+            control_test_is_effect_free(&conditional.test)
+                && control_test_is_effect_free(&conditional.consequent)
+                && control_test_is_effect_free(&conditional.alternate)
+        }
+        Expression::ArrayExpression(array) => array.elements.iter().all(|element| match element {
+            oxc_ast::ast::ArrayExpressionElement::Elision(_) => true,
+            oxc_ast::ast::ArrayExpressionElement::SpreadElement(_) => false,
+            element => element
+                .as_expression()
+                .is_some_and(control_test_is_effect_free),
+        }),
+        _ => false,
+    }
+}
+
+fn execute_scalar_prefix_to_while(
+    statements: &[Statement<'_>],
+    source: &str,
+    target_while_start: u32,
+    env: &mut HashMap<String, Scalar>,
+) -> Option<()> {
+    for statement in statements {
+        if statement.span().start == target_while_start
+            && matches!(statement, Statement::WhileStatement(_))
+        {
+            return Some(());
+        }
+        if statement.span().start < target_while_start && target_while_start < statement.span().end
+        {
+            let Statement::BlockStatement(block) = statement else {
+                return None;
+            };
+            return execute_scalar_prefix_to_while(&block.body, source, target_while_start, env);
+        }
+        if statement.span().end > target_while_start {
+            return None;
+        }
+        let mut semantic = Vec::new();
+        let mut ambiguous_envs = Vec::new();
+        if exec_statement(
+            statement,
+            source,
+            "",
+            env,
+            &mut semantic,
+            &mut ambiguous_envs,
+        ) != ExecStatus::Normal
+            || !semantic.is_empty()
+        {
+            return None;
+        }
+    }
+    None
+}
+
+/// Prove an event unreachable inside a protected flattened state loop of the
+/// form `while (...) try { if (state == ...) ... } catch (...) { ... }` for a
+/// concrete direct call.
+///
+/// The proof deliberately over-approximates the loop condition: it only needs
+/// the condition to be effect-free, then assumes the body may execute. Missing
+/// plain formal parameters are exact `undefined` values. Unsupported control,
+/// non-terminal ambiguous effects, dynamic scalar state, and recoverable
+/// exception paths all fail closed.
+#[must_use]
+pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    function_start: u32,
+    function_end: u32,
+    event: Span,
+    provided_argument_count: usize,
+    parameter_bindings: &BTreeMap<usize, i64>,
+) -> bool {
+    struct Harness<'s, 'b> {
+        source: &'s str,
+        scoping: &'b Scoping,
+        function_start: u32,
+        function_end: u32,
+        event: Span,
+        provided_argument_count: usize,
+        parameter_bindings: &'b BTreeMap<usize, i64>,
+        result: Option<bool>,
+    }
+
+    impl<'a> Visit<'a> for Harness<'_, '_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if self.result.is_some() {
+                return;
+            }
+            if function.span.start != self.function_start || function.span.end != self.function_end
+            {
+                walk::walk_function(self, function, flags);
+                return;
+            }
+            let Some(body) = function.body.as_deref() else {
+                self.result = Some(false);
+                return;
+            };
+            let Some(mut env) = exact_call_parameter_env(
+                function,
+                self.scoping,
+                self.parameter_bindings,
+                self.provided_argument_count,
+            ) else {
+                self.result = Some(false);
+                return;
+            };
+
+            struct LoopProbe {
+                event: Span,
+                loops: Vec<Span>,
+            }
+            impl<'a> Visit<'a> for LoopProbe {
+                fn visit_while_statement(&mut self, statement: &WhileStatement<'a>) {
+                    if statement.span.start <= self.event.start
+                        && self.event.end <= statement.span.end
+                    {
+                        self.loops.push(statement.span);
+                    }
+                    walk::walk_while_statement(self, statement);
+                }
+                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                }
+            }
+            let mut loops = LoopProbe {
+                event: self.event,
+                loops: Vec::new(),
+            };
+            loops.visit_function_body(body);
+            let [loop_span] = loops.loops.as_slice() else {
+                self.result = Some(false);
+                return;
+            };
+            if execute_scalar_prefix_to_while(
+                &body.statements,
+                self.source,
+                loop_span.start,
+                &mut env,
+            )
+            .is_none()
+            {
+                self.result = Some(false);
+                return;
+            }
+
+            struct Runner<'s> {
+                source: &'s str,
+                event: Span,
+                target: Span,
+                env: HashMap<String, Scalar>,
+                result: Option<bool>,
+            }
+            impl<'a> Visit<'a> for Runner<'_> {
+                fn visit_while_statement(&mut self, while_statement: &WhileStatement<'a>) {
+                    if self.result.is_some() {
+                        return;
+                    }
+                    if while_statement.span != self.target {
+                        walk::walk_while_statement(self, while_statement);
+                        return;
+                    }
+                    if !control_test_is_effect_free(&while_statement.test) {
+                        self.result = Some(false);
+                        return;
+                    }
+                    let Statement::TryStatement(try_statement) = &while_statement.body else {
+                        self.result = Some(false);
+                        return;
+                    };
+                    let (Some(handler), None) = (&try_statement.handler, &try_statement.finalizer)
+                    else {
+                        self.result = Some(false);
+                        return;
+                    };
+                    let Some((state_var, event_state)) =
+                        branch_state_variable_for_span(&try_statement.block, self.event)
+                    else {
+                        self.result = Some(false);
+                        return;
+                    };
+
+                    struct NestedStateReferenceProbe<'s> {
+                        state_var: &'s str,
+                        nested_depth: usize,
+                        found: bool,
+                    }
+                    impl<'a> Visit<'a> for NestedStateReferenceProbe<'_> {
+                        fn visit_identifier_reference(
+                            &mut self,
+                            identifier: &oxc_ast::ast::IdentifierReference<'a>,
+                        ) {
+                            if self.nested_depth > 0 && identifier.name.as_str() == self.state_var {
+                                self.found = true;
+                            }
+                        }
+                        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+                            self.nested_depth += 1;
+                            walk::walk_function(self, function, flags);
+                            self.nested_depth -= 1;
+                        }
+                        fn visit_arrow_function_expression(
+                            &mut self,
+                            function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                        ) {
+                            self.nested_depth += 1;
+                            walk::walk_arrow_function_expression(self, function);
+                            self.nested_depth -= 1;
+                        }
+                    }
+                    let mut nested_state = NestedStateReferenceProbe {
+                        state_var: &state_var,
+                        nested_depth: 0,
+                        found: false,
+                    };
+                    nested_state.visit_while_statement(while_statement);
+                    if nested_state.found {
+                        self.result = Some(false);
+                        return;
+                    }
+
+                    let mut evidence = IfLadderEvidenceVisitor {
+                        state_var: &state_var,
+                        evidence: IfLadderEvidence::default(),
+                    };
+                    evidence.visit_block_statement(&try_statement.block);
+                    if evidence.evidence.compared_states.len() < 4
+                        || evidence.evidence.state_assignments < 4
+                    {
+                        self.result = Some(false);
+                        return;
+                    }
+
+                    for _ in 0..256 {
+                        let Some(Scalar::Int(state)) = self.env.get(&state_var).copied() else {
+                            self.result = Some(false);
+                            return;
+                        };
+                        if u64::try_from(state).ok() == Some(event_state) {
+                            self.result = Some(false);
+                            return;
+                        }
+
+                        let mut semantic = Vec::new();
+                        let mut ambiguous_envs = Vec::new();
+                        match exec_statements(
+                            &try_statement.block.body,
+                            self.source,
+                            &state_var,
+                            &mut self.env,
+                            &mut semantic,
+                            &mut ambiguous_envs,
+                        ) {
+                            ExecStatus::Return | ExecStatus::Break => {
+                                self.result = Some(true);
+                                return;
+                            }
+                            ExecStatus::Throw => {
+                                let mut catch_semantic = Vec::new();
+                                let mut catch_ambiguous_envs = Vec::new();
+                                match exec_statements(
+                                    &handler.body.body,
+                                    self.source,
+                                    &state_var,
+                                    &mut self.env,
+                                    &mut catch_semantic,
+                                    &mut catch_ambiguous_envs,
+                                ) {
+                                    ExecStatus::Return | ExecStatus::Throw | ExecStatus::Break => {
+                                        self.result = Some(true);
+                                        return;
+                                    }
+                                    ExecStatus::Normal => {
+                                        if !catch_semantic.is_empty() {
+                                            self.result = Some(false);
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            ExecStatus::Normal => {
+                                for snapshot in ambiguous_envs {
+                                    let mut catch_env = snapshot;
+                                    let mut catch_semantic = Vec::new();
+                                    let mut catch_ambiguous_envs = Vec::new();
+                                    let catch_status = exec_statements(
+                                        &handler.body.body,
+                                        self.source,
+                                        &state_var,
+                                        &mut catch_env,
+                                        &mut catch_semantic,
+                                        &mut catch_ambiguous_envs,
+                                    );
+                                    if !matches!(
+                                        catch_status,
+                                        ExecStatus::Return | ExecStatus::Throw | ExecStatus::Break
+                                    ) {
+                                        self.result = Some(false);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.result = Some(false);
+                }
+                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                }
+            }
+
+            let mut runner = Runner {
+                source: self.source,
+                event: self.event,
+                target: *loop_span,
+                env,
+                result: None,
+            };
+            runner.visit_function_body(body);
+            self.result = Some(runner.result.unwrap_or(false));
+        }
+    }
+
+    let mut harness = Harness {
+        source,
+        scoping,
+        function_start,
+        function_end,
+        event,
+        provided_argument_count,
+        parameter_bindings,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(false)
 }
 
 /// Prove that an event inside a structured `switch` cannot execute for exact
@@ -1495,6 +1958,71 @@ fn eval_expr(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Option<Sca
     }
 }
 
+fn expression_definitely_throws(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> bool {
+    match expr {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            expression_definitely_throws(&parenthesized.expression, env)
+        }
+        Expression::SequenceExpression(sequence) => sequence
+            .expressions
+            .iter()
+            .any(|expression| expression_definitely_throws(expression, env)),
+        Expression::StaticMemberExpression(member) => {
+            expression_definitely_throws(&member.object, env)
+                || matches!(eval_expr(&member.object, env), Some(Scalar::Undefined))
+        }
+        Expression::ComputedMemberExpression(member) => {
+            expression_definitely_throws(&member.object, env)
+                || matches!(eval_expr(&member.object, env), Some(Scalar::Undefined))
+                || expression_definitely_throws(&member.expression, env)
+        }
+        Expression::UnaryExpression(unary) => expression_definitely_throws(&unary.argument, env),
+        Expression::BinaryExpression(binary) => {
+            expression_definitely_throws(&binary.left, env)
+                || expression_definitely_throws(&binary.right, env)
+        }
+        Expression::LogicalExpression(logical) => {
+            if expression_definitely_throws(&logical.left, env) {
+                return true;
+            }
+            let Some(lhs) = eval_expr(&logical.left, env) else {
+                return false;
+            };
+            match logical.operator.as_str() {
+                "&&" if lhs.truthy() => expression_definitely_throws(&logical.right, env),
+                "||" if !lhs.truthy() => expression_definitely_throws(&logical.right, env),
+                "&&" | "||" => false,
+                _ => false,
+            }
+        }
+        Expression::ConditionalExpression(conditional) => {
+            if expression_definitely_throws(&conditional.test, env) {
+                return true;
+            }
+            let Some(test) = eval_expr(&conditional.test, env) else {
+                return false;
+            };
+            if test.truthy() {
+                expression_definitely_throws(&conditional.consequent, env)
+            } else {
+                expression_definitely_throws(&conditional.alternate, env)
+            }
+        }
+        Expression::AssignmentExpression(assignment) => {
+            expression_definitely_throws(&assignment.right, env)
+        }
+        Expression::CallExpression(call) => {
+            expression_definitely_throws(&call.callee, env)
+                || call
+                    .arguments
+                    .iter()
+                    .filter_map(Argument::as_expression)
+                    .any(|argument| expression_definitely_throws(argument, env))
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecStatus {
     Normal,
@@ -1503,60 +2031,122 @@ enum ExecStatus {
     Throw,
 }
 
+fn record_ambiguous_effect(
+    source: &str,
+    span: Span,
+    env: &HashMap<String, Scalar>,
+    semantic: &mut Vec<String>,
+    ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
+) {
+    ambiguous_envs.push(env.clone());
+    semantic.push(slice(source, span));
+}
+
 fn exec_control_expr(
     expr: &Expression<'_>,
     source: &str,
     state_var: &str,
     env: &mut HashMap<String, Scalar>,
     semantic: &mut Vec<String>,
-) {
+    ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
+) -> ExecStatus {
     match expr {
-        Expression::ParenthesizedExpression(p) => {
-            exec_control_expr(&p.expression, source, state_var, env, semantic);
-        }
-        Expression::SequenceExpression(s) => {
-            for e in &s.expressions {
-                exec_control_expr(e, source, state_var, env, semantic);
+        Expression::ParenthesizedExpression(parenthesized) => exec_control_expr(
+            &parenthesized.expression,
+            source,
+            state_var,
+            env,
+            semantic,
+            ambiguous_envs,
+        ),
+        Expression::SequenceExpression(sequence) => {
+            for expression in &sequence.expressions {
+                let status =
+                    exec_control_expr(expression, source, state_var, env, semantic, ambiguous_envs);
+                if status != ExecStatus::Normal {
+                    return status;
+                }
             }
+            ExecStatus::Normal
         }
-        Expression::AssignmentExpression(a)
-            if a.operator.is_assign() && a.left.get_identifier_name() == Some(state_var) =>
-        {
-            if let Some(v) = eval_expr(&a.right, env) {
-                env.insert(state_var.to_string(), v);
-            } else {
-                semantic.push(slice(source, a.span));
-            }
-        }
-        Expression::ConditionalExpression(c) => {
-            if let Some(test) = eval_expr(&c.test, env) {
-                let branch = if test.truthy() {
-                    &c.consequent
+        Expression::AssignmentExpression(assignment) if assignment.operator.is_assign() => {
+            if let Some(target) = assignment.left.get_identifier_name() {
+                if let Some(value) = eval_expr(&assignment.right, env) {
+                    env.insert(target.to_string(), value);
+                } else if expression_definitely_throws(&assignment.right, env) {
+                    return ExecStatus::Throw;
                 } else {
-                    &c.alternate
-                };
-                exec_control_expr(branch, source, state_var, env, semantic);
+                    record_ambiguous_effect(source, assignment.span, env, semantic, ambiguous_envs);
+                    env.remove(target);
+                }
+                ExecStatus::Normal
+            } else if expression_definitely_throws(&assignment.right, env) {
+                ExecStatus::Throw
             } else {
-                semantic.push(slice(source, c.span));
+                record_ambiguous_effect(source, assignment.span, env, semantic, ambiguous_envs);
+                ExecStatus::Normal
             }
         }
-        Expression::LogicalExpression(l) => {
-            if let Some(lhs) = eval_expr(&l.left, env) {
-                match l.operator.as_str() {
-                    "&&" if lhs.truthy() => {
-                        exec_control_expr(&l.right, source, state_var, env, semantic);
+        Expression::ConditionalExpression(conditional) => {
+            if expression_definitely_throws(&conditional.test, env) {
+                return ExecStatus::Throw;
+            }
+            if let Some(test) = eval_expr(&conditional.test, env) {
+                let branch = if test.truthy() {
+                    &conditional.consequent
+                } else {
+                    &conditional.alternate
+                };
+                exec_control_expr(branch, source, state_var, env, semantic, ambiguous_envs)
+            } else {
+                record_ambiguous_effect(source, conditional.span, env, semantic, ambiguous_envs);
+                ExecStatus::Normal
+            }
+        }
+        Expression::LogicalExpression(logical) => {
+            if expression_definitely_throws(&logical.left, env) {
+                return ExecStatus::Throw;
+            }
+            if let Some(lhs) = eval_expr(&logical.left, env) {
+                match logical.operator.as_str() {
+                    "&&" if lhs.truthy() => exec_control_expr(
+                        &logical.right,
+                        source,
+                        state_var,
+                        env,
+                        semantic,
+                        ambiguous_envs,
+                    ),
+                    "||" if !lhs.truthy() => exec_control_expr(
+                        &logical.right,
+                        source,
+                        state_var,
+                        env,
+                        semantic,
+                        ambiguous_envs,
+                    ),
+                    "&&" | "||" => ExecStatus::Normal,
+                    _ => {
+                        record_ambiguous_effect(
+                            source,
+                            logical.span,
+                            env,
+                            semantic,
+                            ambiguous_envs,
+                        );
+                        ExecStatus::Normal
                     }
-                    "||" if !lhs.truthy() => {
-                        exec_control_expr(&l.right, source, state_var, env, semantic);
-                    }
-                    "&&" | "||" => {}
-                    _ => semantic.push(slice(source, l.span)),
                 }
             } else {
-                semantic.push(slice(source, l.span));
+                record_ambiguous_effect(source, logical.span, env, semantic, ambiguous_envs);
+                ExecStatus::Normal
             }
         }
-        _ => semantic.push(slice(source, expr.span())),
+        _ if expression_definitely_throws(expr, env) => ExecStatus::Throw,
+        _ => {
+            record_ambiguous_effect(source, expr.span(), env, semantic, ambiguous_envs);
+            ExecStatus::Normal
+        }
     }
 }
 
@@ -1566,9 +2156,10 @@ fn exec_statements(
     state_var: &str,
     env: &mut HashMap<String, Scalar>,
     semantic: &mut Vec<String>,
+    ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
 ) -> ExecStatus {
     for stmt in statements {
-        let status = exec_statement(stmt, source, state_var, env, semantic);
+        let status = exec_statement(stmt, source, state_var, env, semantic, ambiguous_envs);
         if status != ExecStatus::Normal {
             return status;
         }
@@ -1582,8 +2173,16 @@ fn exec_function_body(
     state_var: &str,
     env: &mut HashMap<String, Scalar>,
     semantic: &mut Vec<String>,
+    ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
 ) -> ExecStatus {
-    exec_statements(&body.statements, source, state_var, env, semantic)
+    exec_statements(
+        &body.statements,
+        source,
+        state_var,
+        env,
+        semantic,
+        ambiguous_envs,
+    )
 }
 
 fn expression_function_body<'a>(expr: &'a Expression<'a>) -> Option<&'a FunctionBody<'a>> {
@@ -1616,33 +2215,59 @@ fn exec_statement(
     state_var: &str,
     env: &mut HashMap<String, Scalar>,
     semantic: &mut Vec<String>,
+    ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
 ) -> ExecStatus {
     match stmt {
-        Statement::BlockStatement(b) => exec_statements(&b.body, source, state_var, env, semantic),
+        Statement::BlockStatement(b) => {
+            exec_statements(&b.body, source, state_var, env, semantic, ambiguous_envs)
+        }
         Statement::ExpressionStatement(e) => {
             if let Expression::CallExpression(call) = &e.expression {
                 if let Some(body) = call.arguments.first().and_then(argument_function_body) {
-                    return exec_function_body(body, source, state_var, env, semantic);
+                    return exec_function_body(
+                        body,
+                        source,
+                        state_var,
+                        env,
+                        semantic,
+                        ambiguous_envs,
+                    );
                 }
             }
-            exec_control_expr(&e.expression, source, state_var, env, semantic);
-            ExecStatus::Normal
+            exec_control_expr(
+                &e.expression,
+                source,
+                state_var,
+                env,
+                semantic,
+                ambiguous_envs,
+            )
         }
         Statement::IfStatement(i) => {
+            if expression_definitely_throws(&i.test, env) {
+                return ExecStatus::Throw;
+            }
             let Some(test) = eval_expr(&i.test, env) else {
-                semantic.push(slice(source, i.span));
+                record_ambiguous_effect(source, i.span, env, semantic, ambiguous_envs);
                 return ExecStatus::Normal;
             };
             if test.truthy() {
-                exec_statement(&i.consequent, source, state_var, env, semantic)
+                exec_statement(
+                    &i.consequent,
+                    source,
+                    state_var,
+                    env,
+                    semantic,
+                    ambiguous_envs,
+                )
             } else if let Some(alt) = &i.alternate {
-                exec_statement(alt, source, state_var, env, semantic)
+                exec_statement(alt, source, state_var, env, semantic, ambiguous_envs)
             } else {
                 ExecStatus::Normal
             }
         }
         Statement::TryStatement(t) => {
-            semantic.push(slice(source, t.span));
+            record_ambiguous_effect(source, t.span, env, semantic, ambiguous_envs);
             ExecStatus::Normal
         }
         Statement::ThrowStatement(t) => {
@@ -1655,7 +2280,7 @@ fn exec_statement(
         }
         Statement::BreakStatement(_) => ExecStatus::Break,
         _ => {
-            semantic.push(slice(source, stmt.span()));
+            record_ambiguous_effect(source, stmt.span(), env, semantic, ambiguous_envs);
             ExecStatus::Normal
         }
     }
@@ -1913,12 +2538,14 @@ impl LoopRunner<'_, '_> {
                 terminal = format!("missing-case-{low}");
                 break;
             };
+            let mut ambiguous_envs = Vec::new();
             match exec_statements(
                 statements,
                 self.source,
                 &self.machine.state_var,
                 &mut env,
                 &mut semantic,
+                &mut ambiguous_envs,
             ) {
                 ExecStatus::Return => {
                     terminal = "return".to_string();
@@ -2767,6 +3394,119 @@ mod tests {
                 &BTreeMap::from([(1, 46)]),
             )
         );
+    }
+
+    fn protected_call_proof(source: &str, provided: usize) -> bool {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+        struct FunctionSpan {
+            span: Option<Span>,
+        }
+        impl<'a> Visit<'a> for FunctionSpan {
+            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+                self.span = Some(function.span);
+            }
+        }
+        let mut function = FunctionSpan { span: None };
+        function.visit_program(&parsed.program);
+        let function = function.span.unwrap();
+        let start = u32::try_from(source.find("target()").unwrap()).unwrap();
+        prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
+            source,
+            &parsed.program,
+            semantic.semantic.scoping(),
+            function.start,
+            function.end,
+            Span::new(start, start + 8),
+            provided,
+            &BTreeMap::new(),
+        )
+    }
+
+    #[test]
+    fn protected_ladder_proves_omitted_plain_parameter_exception_terminal() {
+        let source = r#"
+            const y = function(J, Q, Y, L, v, U, H, S, q, R, l, u, r, n) {
+                r = 57;
+                {
+                    u = 46;
+                    while (![""] == 0) try {
+                        if (r == 57) r = 25;
+                        else if (r == 25) r = H.K.length ? 92 : 30;
+                        else if (r == 92) u = 92, target(), r = 90;
+                        else if (r == 90) u = 46, r = 30;
+                        else if (r == 30) return;
+                    } catch (m) {
+                        if (u == 46) throw m;
+                        u == 92 && (n = m, r = 28);
+                    }
+                }
+            };
+        "#;
+        assert!(protected_call_proof(source, 4));
+    }
+
+    #[test]
+    fn protected_ladder_fails_closed_for_supplied_unknown_parameter() {
+        let source = r#"
+            const y = function(J, Q, Y, L, v, U, H, S, q, R, l, u, r, n) {
+                r = 57;
+                {
+                    u = 46;
+                    while (true) try {
+                        if (r == 57) r = 25;
+                        else if (r == 25) r = H.K.length ? 92 : 30;
+                        else if (r == 92) u = 92, target(), r = 90;
+                        else if (r == 90) u = 46, r = 30;
+                        else if (r == 30) return;
+                    } catch (m) {
+                        if (u == 46) throw m;
+                        u == 92 && (n = m, r = 28);
+                    }
+                }
+            };
+        "#;
+        assert!(!protected_call_proof(source, 7));
+    }
+
+    #[test]
+    fn protected_ladder_rejects_nested_state_capture() {
+        let source = r#"
+            const y = function(J, Q, Y, L, v, U, H, S, q, R, l, u, r, n) {
+                r = 57;
+                while (true) try {
+                    if (r == 57) { unknown(function() { r = 92; }); r = 30; }
+                    else if (r == 25) r = 30;
+                    else if (r == 92) target(), r = 30;
+                    else if (r == 90) r = 30;
+                    else if (r == 30) return;
+                } catch (m) { throw m; }
+            };
+        "#;
+        assert!(!protected_call_proof(source, 4));
+    }
+
+    #[test]
+    fn protected_ladder_rejects_recoverable_exception_path_to_event() {
+        let source = r#"
+            const y = function(J, Q, Y, L, v, U, H, S, q, R, l, u, r, n) {
+                r = 57;
+                {
+                    u = 46;
+                    while (true) try {
+                        if (r == 57) r = 25;
+                        else if (r == 25) r = H.K.length ? 92 : 30;
+                        else if (r == 92) target(), r = 30;
+                        else if (r == 90) r = 30;
+                        else if (r == 30) return;
+                    } catch (m) {
+                        if (u == 46) r = 92;
+                    }
+                }
+            };
+        "#;
+        assert!(!protected_call_proof(source, 4));
     }
 
     #[test]
