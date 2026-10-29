@@ -1615,7 +1615,35 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
                 event: Span,
                 vars: Vec<String>,
             }
+            impl StateVarCollector<'_> {
+                fn scan_statement_list(&mut self, statements: &[Statement<'_>]) {
+                    for pair in statements.windows(2) {
+                        let [init, Statement::WhileStatement(while_statement)] = pair else {
+                            continue;
+                        };
+                        let Some(machine) = detect_while_state_machine(
+                            self.source,
+                            "bound-call",
+                            init,
+                            while_statement,
+                        ) else {
+                            continue;
+                        };
+                        if machine.start <= self.event.start && self.event.end <= machine.end {
+                            self.vars.push(machine.state_var);
+                        }
+                    }
+                }
+            }
             impl<'a> Visit<'a> for StateVarCollector<'_> {
+                fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+                    self.scan_statement_list(&body.statements);
+                    walk::walk_function_body(self, body);
+                }
+                fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+                    self.scan_statement_list(&block.body);
+                    walk::walk_block_statement(self, block);
+                }
                 fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
                     let detected = detect_for_state_machines(self.source, "bound-call", statement);
                     self.vars.extend(
@@ -1664,7 +1692,41 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
                 matches: usize,
                 result: bool,
             }
+            impl MachineCollector<'_, '_> {
+                fn scan_statement_list(&mut self, statements: &[Statement<'_>]) {
+                    for pair in statements.windows(2) {
+                        let [init, Statement::WhileStatement(while_statement)] = pair else {
+                            continue;
+                        };
+                        let Some(machine) = detect_while_state_machine(
+                            self.source,
+                            "bound-call",
+                            init,
+                            while_statement,
+                        ) else {
+                            continue;
+                        };
+                        if machine.start <= self.event.start && self.event.end <= machine.end {
+                            self.matches += 1;
+                            self.result = prove_machine_event_unreachable_with_integer_bindings(
+                                &machine,
+                                &while_statement.body,
+                                self.event,
+                                self.bindings,
+                            );
+                        }
+                    }
+                }
+            }
             impl<'a> Visit<'a> for MachineCollector<'_, '_> {
+                fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+                    self.scan_statement_list(&body.statements);
+                    walk::walk_function_body(self, body);
+                }
+                fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+                    self.scan_statement_list(&block.body);
+                    walk::walk_block_statement(self, block);
+                }
                 fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
                     let detected = detect_for_state_machines(self.source, "bound-call", statement);
                     for machine in detected.if_ladder_machines {
@@ -3491,6 +3553,58 @@ mod tests {
                 function.end,
                 event,
                 &BTreeMap::from([(1, 410)]),
+            )
+        );
+    }
+
+    #[test]
+    fn function_specializer_handles_preceding_init_while_machine() {
+        let source = r#"
+            const f = function(selector) {
+                state = 5;
+                while (state != 27) {
+                    if (state == 5) state = selector == 14 ? 61 : 80;
+                    else if (state == 61) { target(); state = 27; }
+                    else if (state == 80) state = 90;
+                    else if (state == 90) state = 27;
+                    else if (state == 44) state = 27;
+                }
+            };
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+        struct FunctionSpan(Option<Span>);
+        impl<'a> Visit<'a> for FunctionSpan {
+            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+                self.0 = Some(function.span);
+            }
+        }
+        let mut function = FunctionSpan(None);
+        function.visit_program(&parsed.program);
+        let function = function.0.unwrap();
+        let start = u32::try_from(source.find("target()").unwrap()).unwrap();
+        let event = Span::new(start, start + 8);
+        assert!(
+            prove_function_if_ladder_event_unreachable_with_integer_parameters(
+                source,
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                event,
+                &BTreeMap::from([(0, 15)]),
+            )
+        );
+        assert!(
+            !prove_function_if_ladder_event_unreachable_with_integer_parameters(
+                source,
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                event,
+                &BTreeMap::from([(0, 14)]),
             )
         );
     }
