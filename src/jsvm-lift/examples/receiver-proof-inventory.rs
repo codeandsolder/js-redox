@@ -1,15 +1,13 @@
 use anyhow::{Context, Result};
 use jsvm_lift::cfg_order::prove_event_before_barriers;
-use jsvm_lift::{
-    receiver_identity::{
-        structurally_matched_prototype_method_calls, structurally_proven_origin_flow,
-        structurally_proven_prototype_method_lookup_targets,
-        structurally_proven_prototype_method_receiver_effects,
-    },
-    state_flatten::{
-        prove_function_if_ladder_event_unreachable_with_integer_parameters,
-        prove_function_switch_event_unreachable_with_integer_parameters,
-    },
+use jsvm_lift::receiver_identity::{
+    proven_origin_direct_call_event_unreachable, proven_origin_direct_call_preserves_own_field,
+    structurally_matched_prototype_method_calls, structurally_proven_origin_flow,
+    structurally_proven_own_data_field_initializations,
+    structurally_proven_own_data_fields_at_member_calls,
+    structurally_proven_prototype_method_lookup_targets,
+    structurally_proven_prototype_method_receiver_effects,
+    structurally_proven_receiver_preserving_prototype_method_calls,
 };
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
@@ -53,6 +51,16 @@ fn main() -> Result<()> {
         structurally_proven_prototype_method_lookup_targets(&parsed.program, scoping);
     let receiver_effects =
         structurally_proven_prototype_method_receiver_effects(&parsed.program, scoping);
+    let own_data_fields =
+        structurally_proven_own_data_field_initializations(&parsed.program, scoping);
+    let own_data_fields_at_member_calls =
+        structurally_proven_own_data_fields_at_member_calls(&source, &parsed.program, scoping);
+    let receiver_preserving_method_calls =
+        structurally_proven_receiver_preserving_prototype_method_calls(
+            &source,
+            &parsed.program,
+            scoping,
+        );
 
     let direct_calls = flow
         .direct_calls
@@ -67,6 +75,7 @@ fn main() -> Result<()> {
                 "caller_context": {"this_origin": call.caller.this_origin, "parameter_indices": call.caller.parameter_indices},
                 "callee_function": [call.callee.function_start, call.callee.function_end],
                 "callee_context": {"this_origin": call.callee.this_origin, "parameter_indices": call.callee.parameter_indices},
+                "standard_function_call_semantics_required": call.standard_function_call_semantics_required,
                 "arguments": call.argument_spans.iter().zip(&call.exact_integer_arguments).map(|((start, end), exact_integer)| json!({"start": start, "end": end, "source": snippet(&source, *start, *end), "exact_integer": exact_integer})).collect::<Vec<_>>(),
                 "allocation": [call.caller.allocation_start, call.caller.allocation_end],
             })
@@ -134,6 +143,45 @@ fn main() -> Result<()> {
             })
         })
         .collect::<Vec<_>>();
+    let own_data_fields = own_data_fields
+        .iter()
+        .map(|field| {
+            json!({
+                "function": [field.context.function_start, field.context.function_end],
+                "context": {"this_origin": field.context.this_origin, "parameter_indices": field.context.parameter_indices},
+                "property": field.property,
+                "write": [field.write_start, field.write_end],
+                "evaluation_order": field.evaluation_order,
+                "allocation": [field.allocation_start, field.allocation_end],
+                "constructor": [field.constructor_start, field.constructor_end],
+                "standard_prototype_semantics_required": field.standard_prototype_semantics_required,
+            })
+        })
+        .collect::<Vec<_>>();
+    let own_data_fields_at_member_calls = own_data_fields_at_member_calls
+        .iter()
+        .map(|proof| {
+            json!({
+                "field": proof.initialization.property,
+                "initialization": [proof.initialization.write_start, proof.initialization.write_end],
+                "entry_call": [proof.entry_call.call_start, proof.entry_call.call_end],
+                "member_call": [proof.member_call.call_start, proof.member_call.call_end],
+                "member_property": proof.member_call.property,
+                "allocation": [proof.initialization.allocation_start, proof.initialization.allocation_end],
+            })
+        })
+        .collect::<Vec<_>>();
+    let receiver_preserving_method_calls = receiver_preserving_method_calls
+        .iter()
+        .map(|proof| {
+            json!({
+                "call": [proof.candidate.call.call_start, proof.candidate.call.call_end],
+                "property": proof.candidate.call.property,
+                "allocation": [proof.candidate.call.allocation_start, proof.candidate.call.allocation_end],
+                "own_data_reads": proof.own_data_reads.iter().map(|field| field.initialization.property.clone()).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
     let receiver_effects = receiver_effects
         .iter()
         .map(|effect| {
@@ -171,21 +219,12 @@ fn main() -> Result<()> {
                 "exposure_kind": exposure.kind,
                 "exact_integer_bindings": bindings,
                 "unreachable_under_exact_integer_bindings":
-                    prove_function_if_ladder_event_unreachable_with_integer_parameters(
+                    proven_origin_direct_call_event_unreachable(
                         &source,
                         &parsed.program,
                         scoping,
-                        call.callee.function_start,
-                        call.callee.function_end,
+                        call,
                         event,
-                        &bindings,
-                    ) || prove_function_switch_event_unreachable_with_integer_parameters(
-                        &parsed.program,
-                        scoping,
-                        call.callee.function_start,
-                        call.callee.function_end,
-                        event,
-                        &bindings,
                     ),
             }));
         }
@@ -207,21 +246,12 @@ fn main() -> Result<()> {
                 continue;
             }
             let event = oxc_span::Span::new(nested.call_start, nested.call_end);
-            let unreachable = prove_function_if_ladder_event_unreachable_with_integer_parameters(
+            let unreachable = proven_origin_direct_call_event_unreachable(
                 &source,
                 &parsed.program,
                 scoping,
-                parent.callee.function_start,
-                parent.callee.function_end,
+                parent,
                 event,
-                &bindings,
-            ) || prove_function_switch_event_unreachable_with_integer_parameters(
-                &parsed.program,
-                scoping,
-                parent.callee.function_start,
-                parent.callee.function_end,
-                event,
-                &bindings,
             );
             direct_call_nested_call_checks.push(json!({
                 "parent_call_start": parent.call_start,
@@ -325,6 +355,9 @@ fn main() -> Result<()> {
             "direct_call_exposure_checks": direct_call_exposure_checks,
             "direct_call_nested_call_checks": direct_call_nested_call_checks,
             "prototype_lookup_targets": lookup_targets,
+        "own_data_field_initializations": own_data_fields,
+        "own_data_fields_at_member_calls": own_data_fields_at_member_calls,
+        "receiver_preserving_method_calls": receiver_preserving_method_calls,
         "prototype_receiver_effects": receiver_effects,
         "prototype_method_call_candidates": candidates,
         }))?
