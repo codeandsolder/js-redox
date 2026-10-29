@@ -1220,6 +1220,158 @@ pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
     harness.result.unwrap_or(false)
 }
 
+/// Prove that an event is excluded by an enclosing exact structured branch
+/// (`if`, conditional expression, or the RHS of `&&`/`||`) for exact integer
+/// formal-parameter values.
+///
+/// Only the scalar evaluator's side-effect-free subset participates. Unknown
+/// tests, targets not contained by a recognized branch, and dynamic scalar
+/// bindings fail closed.
+#[must_use]
+pub fn prove_function_structured_branch_event_unreachable_with_integer_parameters(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    function_start: u32,
+    function_end: u32,
+    event: Span,
+    parameter_bindings: &BTreeMap<usize, i64>,
+) -> bool {
+    struct FunctionHarness<'b> {
+        scoping: &'b Scoping,
+        function_start: u32,
+        function_end: u32,
+        event: Span,
+        parameter_bindings: &'b BTreeMap<usize, i64>,
+        result: Option<bool>,
+    }
+
+    impl<'a> Visit<'a> for FunctionHarness<'_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if self.result.is_some() {
+                return;
+            }
+            if function.span.start != self.function_start || function.span.end != self.function_end
+            {
+                walk::walk_function(self, function, flags);
+                return;
+            }
+            let Some(env) =
+                exact_integer_parameter_env(function, self.scoping, self.parameter_bindings)
+            else {
+                self.result = Some(false);
+                return;
+            };
+            let Some(body) = function.body.as_deref() else {
+                self.result = Some(false);
+                return;
+            };
+
+            struct BranchProbe<'e> {
+                env: &'e HashMap<String, Scalar>,
+                event: Span,
+                excluded: bool,
+            }
+            impl BranchProbe<'_> {
+                fn contains(span: Span, event: Span) -> bool {
+                    span.start <= event.start && event.end <= span.end
+                }
+            }
+            impl<'a> Visit<'a> for BranchProbe<'_> {
+                fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
+                    if self.excluded {
+                        return;
+                    }
+                    let in_consequent = Self::contains(statement.consequent.span(), self.event);
+                    let in_alternate = statement
+                        .alternate
+                        .as_ref()
+                        .is_some_and(|alternate| Self::contains(alternate.span(), self.event));
+                    if in_consequent || in_alternate {
+                        if let Some(test) = eval_expr(&statement.test, self.env) {
+                            if (in_consequent && !test.truthy()) || (in_alternate && test.truthy())
+                            {
+                                self.excluded = true;
+                                return;
+                            }
+                        }
+                    }
+                    walk::walk_if_statement(self, statement);
+                }
+
+                fn visit_conditional_expression(
+                    &mut self,
+                    expression: &oxc_ast::ast::ConditionalExpression<'a>,
+                ) {
+                    if self.excluded {
+                        return;
+                    }
+                    let in_consequent = Self::contains(expression.consequent.span(), self.event);
+                    let in_alternate = Self::contains(expression.alternate.span(), self.event);
+                    if in_consequent || in_alternate {
+                        if let Some(test) = eval_expr(&expression.test, self.env) {
+                            if (in_consequent && !test.truthy()) || (in_alternate && test.truthy())
+                            {
+                                self.excluded = true;
+                                return;
+                            }
+                        }
+                    }
+                    walk::walk_conditional_expression(self, expression);
+                }
+
+                fn visit_logical_expression(
+                    &mut self,
+                    expression: &oxc_ast::ast::LogicalExpression<'a>,
+                ) {
+                    if self.excluded {
+                        return;
+                    }
+                    if Self::contains(expression.right.span(), self.event) {
+                        if let Some(lhs) = eval_expr(&expression.left, self.env) {
+                            let skips_right = match expression.operator.as_str() {
+                                "&&" => !lhs.truthy(),
+                                "||" => lhs.truthy(),
+                                _ => false,
+                            };
+                            if skips_right {
+                                self.excluded = true;
+                                return;
+                            }
+                        }
+                    }
+                    walk::walk_logical_expression(self, expression);
+                }
+
+                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                }
+            }
+
+            let mut probe = BranchProbe {
+                env: &env,
+                event: self.event,
+                excluded: false,
+            };
+            probe.visit_function_body(body);
+            self.result = Some(probe.excluded);
+        }
+    }
+
+    let mut harness = FunctionHarness {
+        scoping,
+        function_start,
+        function_end,
+        event,
+        parameter_bindings,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(false)
+}
+
 /// Prove that an event inside a structured `switch` cannot execute for exact
 /// integer formal-parameter values. The proof accepts only scalar-pure case
 /// selection and a selected case that either lies after the target or ends in
@@ -3339,6 +3491,49 @@ mod tests {
                 function.end,
                 event,
                 &BTreeMap::from([(1, 410)]),
+            )
+        );
+    }
+
+    #[test]
+    fn proves_structured_short_circuit_event_unreachable() {
+        let source = r#"
+            const f = function(selector) {
+                selector == 449 && target();
+            };
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+        struct FunctionSpan(Option<Span>);
+        impl<'a> Visit<'a> for FunctionSpan {
+            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+                self.0 = Some(function.span);
+            }
+        }
+        let mut function = FunctionSpan(None);
+        function.visit_program(&parsed.program);
+        let function = function.0.unwrap();
+        let start = u32::try_from(source.find("target()").unwrap()).unwrap();
+        let event = Span::new(start, start + 8);
+        assert!(
+            prove_function_structured_branch_event_unreachable_with_integer_parameters(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                event,
+                &BTreeMap::from([(0, 410)]),
+            )
+        );
+        assert!(
+            !prove_function_structured_branch_event_unreachable_with_integer_parameters(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                event,
+                &BTreeMap::from([(0, 449)]),
             )
         );
     }
