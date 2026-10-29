@@ -24,12 +24,17 @@ def rel(project: Path, path: Path) -> str:
 
 
 def run_static_byte_recovery(tool: Path, source: Path, output_dir: Path) -> dict | None:
-    cp = subprocess.run(
-        [str(tool), str(source), "--output-dir", str(output_dir)],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        cp = subprocess.run(
+            [str(tool), str(source), "--output-dir", str(output_dir)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"WASM static byte recovery timed out for {source}")
+        return None
     if cp.returncode:
         diagnostic = (cp.stderr or cp.stdout or f"exit {cp.returncode}").strip()
         if "JavaScript did not parse as unambiguous or CommonJS source" in diagnostic:
@@ -56,12 +61,16 @@ def run_analysis(
     command = [str(tool), str(binary), "--output-dir", str(output)]
     if skip_wax:
         command.append("--skip-wax")
-    cp = subprocess.run(
-        command,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        cp = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "wasm-redox timed out after 180 seconds"
     if cp.returncode:
         message = (cp.stderr or cp.stdout or f"exit {cp.returncode}").strip()
         return False, message

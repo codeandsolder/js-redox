@@ -626,6 +626,7 @@ async function main() {
   const browserOptions = {
     userDataDir: profileDir,
     headless: !opts.headed,
+    acceptDownloads: false,
     humanize: true,
     viewport: { width: 1440, height: 1000 },
     serviceWorkers: "allow",

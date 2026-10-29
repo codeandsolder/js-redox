@@ -68,13 +68,27 @@ def main() -> None:
             analyzed_units += 1
             continue
 
-        cp = subprocess.run(
-            [str(args.analyzer), str(source)],
-            cwd=ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            cp = subprocess.run(
+                [str(args.analyzer), str(source)],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            failures.append(
+                {
+                    "source_index_ordinal": source_index_ordinal,
+                    "resource_id": unit.get("resource_id"),
+                    "raw_path": raw_path,
+                    "analysis_path": analysis_path,
+                    "error": "API surface analyzer timed out after 120 seconds",
+                }
+            )
+            analyzed_units += 1
+            continue
         if cp.returncode:
             failures.append(
                 {

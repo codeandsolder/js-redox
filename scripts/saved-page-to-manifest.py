@@ -21,6 +21,7 @@ from browser_script_types import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SAVED_ORIGIN = "https://saved-page.invalid/"
+HELPER_TIMEOUT_SECONDS = 120
 SAVED_FROM_RE = re.compile(r"saved\s+from\s+url=\(\d+\)(.*?)\s*-->", re.IGNORECASE | re.DOTALL)
 CSS_SOURCE_REF_RE = re.compile(r"(?:\/\/[#@]|\/\*[#@])\s*(sourceMappingURL|sourceURL)\s*=\s*([^\s*]+)")
 CHARSET_RE = re.compile(r"(?:charset\s*=\s*[\"']?)([A-Za-z0-9._:-]+)", re.IGNORECASE)
@@ -106,6 +107,7 @@ def decode_html_with_browser(path: Path, browser_decode_bin: Path) -> tuple[str,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=HELPER_TIMEOUT_SECONDS,
         )
         if cp.returncode:
             raise SystemExit(f"browser HTML decode failed for {path}: {cp.stderr or cp.stdout}")
@@ -276,6 +278,7 @@ def js_source_references(text: str, base: str, extractor: Path) -> list[dict]:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        timeout=HELPER_TIMEOUT_SECONDS,
     )
     if cp.returncode:
         raise RuntimeError(
@@ -299,30 +302,23 @@ def infer_original_url(text: str) -> str | None:
     return candidate if urlsplit(candidate).scheme in {"http", "https"} else None
 
 
-def discover_assets_dir(page: Path, page_text: str) -> Path | None:
+def discover_assets_dir(page: Path, _page_text: str) -> Path | None:
+    # Auto-discovery deliberately accepts only browser-style companion names.
+    # Hostile HTML must not be able to nominate an arbitrary sibling directory
+    # for recursive ingestion; unusual layouts require explicit --assets-dir.
     candidates = [
         page.with_name(page.stem + "_files"),
         page.with_name(page.stem + ".files"),
         page.with_name(page.name + "_files"),
     ]
 
-    # Browsers/locales do not all use the same companion-directory suffix.
-    # Local references in the saved HTML are better evidence than guessing names.
-    base = canonical_url(Path(page.name))
-    for reference in html_references(page_text, base):
-        raw = reference.get("raw") or ""
-        parsed = urlsplit(raw)
-        if parsed.scheme or parsed.netloc or raw.startswith("/"):
-            continue
-        parts = Path(unquote(parsed.path)).parts
-        if not parts or parts[0] in {".", ".."}:
-            continue
-        candidates.append(page.parent / parts[0])
-
+    page_parent = page.parent.resolve()
     seen = set()
     for candidate in candidates:
+        if candidate.is_symlink():
+            continue
         candidate = candidate.resolve()
-        if candidate in seen:
+        if candidate.parent != page_parent or candidate in seen:
             continue
         seen.add(candidate)
         if candidate.is_dir():
@@ -366,6 +362,12 @@ def main():
     if output.exists():
         if not args.overwrite:
             raise SystemExit(f"output already exists: {output} (use --overwrite)")
+        existing = list(output.iterdir()) if output.is_dir() else [output]
+        if existing and not (output / MANIFEST_NAME).is_file():
+            raise SystemExit(
+                f"refusing to recursively replace non-project output: {output}; "
+                f"expected an empty directory or {MANIFEST_NAME}"
+            )
         shutil.rmtree(output)
     output.mkdir(parents=True)
 
@@ -377,7 +379,14 @@ def main():
 
     files: list[tuple[Path, Path]] = [(page, Path("saved-page") / page.name)]
     if assets:
-        for src in sorted(p for p in assets.rglob("*") if p.is_file()):
+        for src in sorted(
+            p for p in assets.rglob("*") if p.is_file() and not p.is_symlink()
+        ):
+            resolved = src.resolve()
+            try:
+                resolved.relative_to(assets)
+            except ValueError:
+                continue
             files.append((src, Path("saved-page") / assets.name / src.relative_to(assets)))
 
     resources = []
