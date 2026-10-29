@@ -1,4 +1,12 @@
-use crate::numeric::exact_i64;
+use crate::{
+    numeric::exact_i64,
+    state_flatten::{
+        prove_function_if_ladder_event_unreachable_with_integer_parameters,
+        prove_function_protected_if_ladder_event_unreachable_with_call_arguments,
+        prove_function_structured_branch_event_unreachable_with_integer_parameters,
+        prove_function_switch_event_unreachable_with_integer_parameters,
+    },
+};
 use jsvm_safe_core::{eval_static_primitive, string_literal_value};
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, CallExpression, Expression,
@@ -7,9 +15,9 @@ use oxc_ast::ast::{
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
-use oxc_span::GetSpan;
+use oxc_span::{GetSpan, Span};
 use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FunctionKey {
@@ -52,7 +60,12 @@ pub struct ProvenOriginDirectCall {
     pub evaluation_order: u64,
     pub caller: ProvenOriginContext,
     pub callee: ProvenOriginContext,
-    /// Source spans for call arguments in call-site order. These preserve the
+    /// True when this edge is a statically bound `function.call(thisArg, ...)`
+    /// invocation and therefore depends on ordinary Function.prototype.call semantics.
+    pub standard_function_call_semantics_required: bool,
+    /// Source spans for callee arguments in formal-parameter order. For
+    /// `function.call(thisArg, ...)`, the `thisArg` operand is intentionally
+    /// excluded so downstream parameter specialization stays index-correct.
     /// exact expressions used to establish parameter-origin mappings and let
     /// downstream proofs specialize callee control flow without textual search.
     pub argument_spans: Vec<(u32, u32)>,
@@ -174,6 +187,7 @@ fn exact_syntactic_integer(expression: &Expression<'_>) -> Option<i64> {
 struct DynamicScopeProbe {
     direct_eval: bool,
     with_statement: bool,
+    arguments_object: bool,
 }
 
 impl<'a> Visit<'a> for DynamicScopeProbe {
@@ -189,6 +203,12 @@ impl<'a> Visit<'a> for DynamicScopeProbe {
         self.with_statement = true;
     }
 
+    fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
+        if identifier.name.as_str() == "arguments" {
+            self.arguments_object = true;
+        }
+    }
+
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if let Expression::Identifier(identifier) = last_sequence_expression(&call.callee) {
             if identifier.name.as_str() == "eval" {
@@ -202,7 +222,7 @@ impl<'a> Visit<'a> for DynamicScopeProbe {
 fn has_dynamic_scope(body: &FunctionBody<'_>) -> bool {
     let mut probe = DynamicScopeProbe::default();
     probe.visit_function_body(body);
-    probe.direct_eval || probe.with_statement
+    probe.direct_eval || probe.with_statement || probe.arguments_object
 }
 
 struct FunctionCollector {
@@ -412,36 +432,48 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
         self.functions.get(&symbol).copied()
     }
 
-    fn record_direct_call(&mut self, call: &CallExpression<'_>, callee: FunctionKey) {
+    fn record_direct_call(
+        &mut self,
+        call: &CallExpression<'_>,
+        callee: FunctionKey,
+        argument_offset: usize,
+        this_origin: Option<ObjectOrigin>,
+        standard_function_call_semantics_required: bool,
+    ) {
         let Some(info) = self.function_info.get(&callee) else {
             return;
         };
         if info.dynamic_scope {
             return;
         }
+        let mapped_arguments = call
+            .arguments
+            .iter()
+            .skip(argument_offset)
+            .collect::<Vec<_>>();
         let parameter_origins = info
             .parameters
             .iter()
             .enumerate()
             .map(|(index, _)| {
-                call.arguments
+                mapped_arguments
                     .get(index)
-                    .and_then(Argument::as_expression)
+                    .and_then(|argument| argument.as_expression())
                     .and_then(|argument| self.expression_origin(argument))
             })
             .collect::<Vec<_>>();
-        if parameter_origins.iter().all(Option::is_none) {
+        if this_origin.is_none() && parameter_origins.iter().all(Option::is_none) {
             return;
         }
         let child = FunctionContext {
             function: callee,
-            this_origin: None,
+            this_origin,
             parameter_origins,
         };
         let origins = child
-            .parameter_origins
-            .iter()
-            .filter_map(|origin| *origin)
+            .this_origin
+            .into_iter()
+            .chain(child.parameter_origins.iter().filter_map(|origin| *origin))
             .collect::<HashSet<_>>();
         let evaluation_order = self.next_evaluation_order();
         for origin in origins {
@@ -455,13 +487,12 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
                     evaluation_order,
                     caller,
                     callee,
-                    argument_spans: call
-                        .arguments
+                    standard_function_call_semantics_required,
+                    argument_spans: mapped_arguments
                         .iter()
                         .map(|argument| (argument.span().start, argument.span().end))
                         .collect(),
-                    exact_integer_arguments: call
-                        .arguments
+                    exact_integer_arguments: mapped_arguments
                         .iter()
                         .map(|argument| {
                             let expression = argument.as_expression()?;
@@ -632,8 +663,14 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
         walk::walk_assignment_expression(self, assignment);
         if self.active {
             if let Some((receiver, property)) = self.assignment_member(&assignment.left) {
+                let internal_self_store = self
+                    .expression_origin(receiver)
+                    .zip(self.expression_origin(&assignment.right))
+                    .is_some_and(|(destination, value)| destination == value);
                 self.record_member_write(receiver, property, assignment.span, "assignment");
-                self.record_exposure(&assignment.right, assignment.span, "store");
+                if !internal_self_store {
+                    self.record_exposure(&assignment.right, assignment.span, "store");
+                }
             } else if !matches!(
                 assignment.left,
                 AssignmentTarget::AssignmentTargetIdentifier(_)
@@ -705,8 +742,37 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
             return;
         }
 
-        let direct_callee = self.direct_callee(&call.callee);
-        let member_receiver = if direct_callee.is_none() {
+        let ordinary_callee = self.direct_callee(&call.callee);
+        let function_call_callee = if ordinary_callee.is_none() {
+            match last_sequence_expression(&call.callee) {
+                Expression::StaticMemberExpression(member)
+                    if !member.optional && member.property.name.as_str() == "call" =>
+                {
+                    self.direct_callee(&member.object)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let invocation = ordinary_callee
+            .map(|callee| (callee, 0usize, None, false))
+            .or_else(|| {
+                let callee = function_call_callee?;
+                let this_origin = call
+                    .arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                    .and_then(|argument| self.expression_origin(argument));
+                Some((callee, 1usize, this_origin, true))
+            })
+            .filter(|(callee, _, _, _)| {
+                self.function_info
+                    .get(callee)
+                    .is_some_and(|info| !info.dynamic_scope)
+            });
+
+        let member_receiver = if invocation.is_none() {
             self.static_member(&call.callee)
                 .and_then(|(receiver, property)| {
                     self.expression_origin(receiver)
@@ -715,17 +781,17 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
         } else {
             None
         };
-        let proven_parameter_count = direct_callee
-            .and_then(|callee| self.function_info.get(&callee))
-            .filter(|info| !info.dynamic_scope)
+        let proven_parameter_count = invocation
+            .and_then(|(callee, _, _, _)| self.function_info.get(&callee))
             .map_or(0, |info| info.parameters.len());
+        let argument_offset = invocation.map_or(0, |(_, offset, _, _)| offset);
 
         // JavaScript evaluates callee/receiver and arguments before invocation.
         // Record nested effects first, then the invocation/exposure event.
         walk::walk_call_expression(self, call);
 
-        if let Some(callee) = direct_callee {
-            self.record_direct_call(call, callee);
+        if let Some((callee, offset, this_origin, standard_call)) = invocation {
+            self.record_direct_call(call, callee, offset, this_origin, standard_call);
         } else if let Some((receiver, property, origin)) = member_receiver {
             if let Some(context) = self.context.proven_origin_context(origin) {
                 let evaluation_order = self.next_evaluation_order();
@@ -749,7 +815,11 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
             let Some(argument) = argument.as_expression() else {
                 continue;
             };
-            if direct_callee.is_none() || index >= proven_parameter_count {
+            let consumed_as_this = invocation.is_some() && argument_offset == 1 && index == 0;
+            let mapped_index = index.checked_sub(argument_offset);
+            let consumed_as_parameter =
+                mapped_index.is_some_and(|index| index < proven_parameter_count);
+            if invocation.is_none() || (!consumed_as_this && !consumed_as_parameter) {
                 self.record_exposure(argument, argument.span(), "call_argument");
             }
         }
@@ -913,6 +983,449 @@ pub fn propagate_proven_origin_contexts(
     analyze_origin_contexts(program, scoping, &functions, initial_contexts)
 }
 
+fn origin_prefix_is_fresh(
+    flow: &ProvenOriginFlow,
+    context: &ProvenOriginContext,
+    before_order: u64,
+) -> bool {
+    !flow
+        .exposures
+        .iter()
+        .any(|exposure| &exposure.context == context && exposure.evaluation_order < before_order)
+        && !flow
+            .member_calls
+            .iter()
+            .any(|call| &call.context == context && call.evaluation_order < before_order)
+        && !flow
+            .direct_calls
+            .iter()
+            .any(|call| &call.caller == context && call.evaluation_order < before_order)
+        && !flow.member_writes.iter().any(|write| {
+            &write.context == context
+                && write.evaluation_order < before_order
+                && write
+                    .property
+                    .as_deref()
+                    .is_none_or(|property| property == "__proto__")
+        })
+}
+
+#[must_use]
+pub fn structurally_proven_own_data_field_initializations(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenOwnDataFieldInitialization> {
+    let flow = structurally_proven_origin_flow(program, scoping);
+    let stable = structurally_proven_stable_constructor_prototypes(program, scoping)
+        .into_iter()
+        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+        .collect::<HashSet<_>>();
+
+    let mut fresh_contexts = HashSet::new();
+    for context in flow
+        .member_calls
+        .iter()
+        .map(|call| &call.context)
+        .chain(flow.member_writes.iter().map(|write| &write.context))
+        .chain(flow.exposures.iter().map(|exposure| &exposure.context))
+        .chain(
+            flow.direct_calls
+                .iter()
+                .flat_map(|call| [&call.caller, &call.callee]),
+        )
+    {
+        if context.this_origin
+            && context.function_start == context.constructor_start
+            && context.function_end == context.constructor_end
+        {
+            fresh_contexts.insert(context.clone());
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for call in &flow.direct_calls {
+            if fresh_contexts.contains(&call.caller)
+                && !fresh_contexts.contains(&call.callee)
+                && origin_prefix_is_fresh(&flow, &call.caller, call.evaluation_order)
+            {
+                fresh_contexts.insert(call.callee.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut proven = flow
+        .member_writes
+        .iter()
+        .filter_map(|write| {
+            let property = write.property.as_ref()?;
+            if write.operation != "assignment"
+                || property == "__proto__"
+                || !fresh_contexts.contains(&write.context)
+                || !stable.contains(&(write.constructor_start, write.constructor_end))
+                || !origin_prefix_is_fresh(&flow, &write.context, write.evaluation_order)
+                || flow.member_writes.iter().any(|earlier| {
+                    earlier.context == write.context
+                        && earlier.evaluation_order < write.evaluation_order
+                        && earlier.property.as_deref() == Some(property.as_str())
+                })
+            {
+                return None;
+            }
+            Some(ProvenOwnDataFieldInitialization {
+                context: write.context.clone(),
+                property: property.clone(),
+                write_start: write.write_start,
+                write_end: write.write_end,
+                evaluation_order: write.evaluation_order,
+                allocation_start: write.allocation_start,
+                allocation_end: write.allocation_end,
+                constructor_start: write.constructor_start,
+                constructor_end: write.constructor_end,
+                standard_prototype_semantics_required: true,
+            })
+        })
+        .collect::<Vec<_>>();
+    proven.sort_by_key(|field| {
+        (
+            field.allocation_start,
+            field.context.function_start,
+            field.evaluation_order,
+            field.property.clone(),
+        )
+    });
+    proven.dedup();
+    proven
+}
+
+fn dangerous_field_write(write: &ProvenMemberWriteOrigin, property: &str) -> bool {
+    write
+        .property
+        .as_deref()
+        .is_none_or(|candidate| candidate == "__proto__" || candidate == property)
+}
+
+type PreservationKey = (u32, u32, ProvenOriginContext, ProvenOriginContext, String);
+
+fn direct_call_preserves_field(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    flow: &ProvenOriginFlow,
+    call: &ProvenOriginDirectCall,
+    property: &str,
+    memo: &mut HashMap<PreservationKey, bool>,
+    visiting: &mut HashSet<PreservationKey>,
+) -> bool {
+    let key = (
+        call.call_start,
+        call.call_end,
+        call.caller.clone(),
+        call.callee.clone(),
+        property.to_string(),
+    );
+    if let Some(result) = memo.get(&key) {
+        return *result;
+    }
+    if !visiting.insert(key.clone()) {
+        return false;
+    }
+
+    let unreachable = |start: u32, end: u32| {
+        proven_origin_direct_call_event_unreachable(
+            source,
+            program,
+            scoping,
+            call,
+            Span::new(start, end),
+        )
+    };
+
+    let mut result = true;
+    for exposure in flow
+        .exposures
+        .iter()
+        .filter(|event| event.context == call.callee)
+    {
+        if !unreachable(exposure.exposure_start, exposure.exposure_end) {
+            result = false;
+            break;
+        }
+    }
+    if result {
+        for write in flow
+            .member_writes
+            .iter()
+            .filter(|event| event.context == call.callee && dangerous_field_write(event, property))
+        {
+            if !unreachable(write.write_start, write.write_end) {
+                result = false;
+                break;
+            }
+        }
+    }
+    if result {
+        for member_call in flow
+            .member_calls
+            .iter()
+            .filter(|event| event.context == call.callee)
+        {
+            if !unreachable(member_call.call_start, member_call.call_end) {
+                result = false;
+                break;
+            }
+        }
+    }
+    if result {
+        for nested in flow
+            .direct_calls
+            .iter()
+            .filter(|nested| nested.caller == call.callee)
+        {
+            if unreachable(nested.call_start, nested.call_end) {
+                continue;
+            }
+            if !direct_call_preserves_field(
+                source, program, scoping, flow, nested, property, memo, visiting,
+            ) {
+                result = false;
+                break;
+            }
+        }
+    }
+
+    visiting.remove(&key);
+    memo.insert(key, result);
+    result
+}
+
+/// Prove that one exact-origin direct call preserves a named ordinary own-data
+/// field of the tracked receiver across all supported reachable effects.
+///
+/// Call-site-specialized unreachable effects are ignored only when independently
+/// proven unreachable; recursive cycles and unsupported reachable effects fail closed.
+#[must_use]
+pub fn proven_origin_direct_call_preserves_own_field(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    call: &ProvenOriginDirectCall,
+    property: &str,
+) -> bool {
+    let flow = structurally_proven_origin_flow(program, scoping);
+    direct_call_preserves_field(
+        source,
+        program,
+        scoping,
+        &flow,
+        call,
+        property,
+        &mut HashMap::new(),
+        &mut HashSet::new(),
+    )
+}
+
+fn root_context_segment_preserves_field(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    flow: &ProvenOriginFlow,
+    context: &ProvenOriginContext,
+    after_order: u64,
+    before_order: u64,
+    property: &str,
+    memo: &mut HashMap<PreservationKey, bool>,
+    visiting: &mut HashSet<PreservationKey>,
+) -> bool {
+    if flow.exposures.iter().any(|event| {
+        event.context == *context
+            && after_order < event.evaluation_order
+            && event.evaluation_order < before_order
+    }) || flow.member_calls.iter().any(|event| {
+        event.context == *context
+            && after_order < event.evaluation_order
+            && event.evaluation_order < before_order
+    }) || flow.member_writes.iter().any(|event| {
+        event.context == *context
+            && after_order < event.evaluation_order
+            && event.evaluation_order < before_order
+            && dangerous_field_write(event, property)
+    }) {
+        return false;
+    }
+
+    flow.direct_calls
+        .iter()
+        .filter(|nested| {
+            nested.caller == *context
+                && after_order < nested.evaluation_order
+                && nested.evaluation_order < before_order
+        })
+        .all(|nested| {
+            direct_call_preserves_field(
+                source, program, scoping, flow, nested, property, memo, visiting,
+            )
+        })
+}
+
+fn direct_call_prefix_preserves_field(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    flow: &ProvenOriginFlow,
+    entry: &ProvenOriginDirectCall,
+    before_order: u64,
+    property: &str,
+    memo: &mut HashMap<PreservationKey, bool>,
+    visiting: &mut HashSet<PreservationKey>,
+) -> bool {
+    for exposure in flow
+        .exposures
+        .iter()
+        .filter(|event| event.context == entry.callee && event.evaluation_order < before_order)
+    {
+        if !proven_origin_direct_call_event_unreachable(
+            source,
+            program,
+            scoping,
+            entry,
+            Span::new(exposure.exposure_start, exposure.exposure_end),
+        ) {
+            return false;
+        }
+    }
+    for write in flow.member_writes.iter().filter(|event| {
+        event.context == entry.callee
+            && event.evaluation_order < before_order
+            && dangerous_field_write(event, property)
+    }) {
+        if !proven_origin_direct_call_event_unreachable(
+            source,
+            program,
+            scoping,
+            entry,
+            Span::new(write.write_start, write.write_end),
+        ) {
+            return false;
+        }
+    }
+    for member_call in flow
+        .member_calls
+        .iter()
+        .filter(|event| event.context == entry.callee && event.evaluation_order < before_order)
+    {
+        if !proven_origin_direct_call_event_unreachable(
+            source,
+            program,
+            scoping,
+            entry,
+            Span::new(member_call.call_start, member_call.call_end),
+        ) {
+            return false;
+        }
+    }
+    for nested in flow
+        .direct_calls
+        .iter()
+        .filter(|nested| nested.caller == entry.callee && nested.evaluation_order < before_order)
+    {
+        if proven_origin_direct_call_event_unreachable(
+            source,
+            program,
+            scoping,
+            entry,
+            Span::new(nested.call_start, nested.call_end),
+        ) {
+            continue;
+        }
+        if !direct_call_preserves_field(
+            source, program, scoping, flow, nested, property, memo, visiting,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Prove that a freshly initialized ordinary own-data field survives from its
+/// initialization context through a concrete exact-origin direct call and up
+/// to a receiver member call in that callee.
+///
+/// This is intentionally a prefix theorem. Receiver method calls are barriers;
+/// nested direct calls are recursively summarized, and call-site-specialized
+/// unreachable events are ignored only when independently proven unreachable.
+#[must_use]
+pub fn structurally_proven_own_data_fields_at_member_calls(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenOwnDataFieldAtMemberCall> {
+    let flow = structurally_proven_origin_flow(program, scoping);
+    let initializations = structurally_proven_own_data_field_initializations(program, scoping);
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    let mut proven = Vec::new();
+
+    for initialization in &initializations {
+        for entry in flow.direct_calls.iter().filter(|call| {
+            call.caller == initialization.context
+                && initialization.evaluation_order < call.evaluation_order
+        }) {
+            if !root_context_segment_preserves_field(
+                source,
+                program,
+                scoping,
+                &flow,
+                &initialization.context,
+                initialization.evaluation_order,
+                entry.evaluation_order,
+                &initialization.property,
+                &mut memo,
+                &mut visiting,
+            ) {
+                continue;
+            }
+            for member_call in flow
+                .member_calls
+                .iter()
+                .filter(|member_call| member_call.context == entry.callee)
+            {
+                if direct_call_prefix_preserves_field(
+                    source,
+                    program,
+                    scoping,
+                    &flow,
+                    entry,
+                    member_call.evaluation_order,
+                    &initialization.property,
+                    &mut memo,
+                    &mut visiting,
+                ) {
+                    proven.push(ProvenOwnDataFieldAtMemberCall {
+                        initialization: initialization.clone(),
+                        entry_call: entry.clone(),
+                        member_call: member_call.clone(),
+                    });
+                }
+            }
+        }
+    }
+    proven.sort_by_key(|proof| {
+        (
+            proof.initialization.allocation_start,
+            proof.initialization.property.clone(),
+            proof.entry_call.call_start,
+            proof.member_call.call_start,
+        )
+    });
+    proven.dedup();
+    proven
+}
+
 #[must_use]
 pub fn structurally_proven_member_receiver_origins(
     program: &Program<'_>,
@@ -943,6 +1456,80 @@ pub fn structurally_proven_origin_direct_calls(
     scoping: &Scoping,
 ) -> Vec<ProvenOriginDirectCall> {
     structurally_proven_origin_flow(program, scoping).direct_calls
+}
+
+/// Prove that one event in the callee of an exact-origin direct call cannot
+/// execute for the call site's exact scalar facts. This composes the supported
+/// structured switch, ordinary flattened-ladder, and protected try/catch
+/// ladder theorems; unsupported control remains reachable/unknown.
+#[must_use]
+pub fn proven_origin_direct_call_event_unreachable(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    call: &ProvenOriginDirectCall,
+    event: Span,
+) -> bool {
+    let bindings = call
+        .exact_integer_arguments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| value.map(|value| (index, value)))
+        .collect::<BTreeMap<_, _>>();
+    prove_function_if_ladder_event_unreachable_with_integer_parameters(
+        source,
+        program,
+        scoping,
+        call.callee.function_start,
+        call.callee.function_end,
+        event,
+        &bindings,
+    ) || prove_function_switch_event_unreachable_with_integer_parameters(
+        program,
+        scoping,
+        call.callee.function_start,
+        call.callee.function_end,
+        event,
+        &bindings,
+    ) || prove_function_structured_branch_event_unreachable_with_integer_parameters(
+        program,
+        scoping,
+        call.callee.function_start,
+        call.callee.function_end,
+        event,
+        &bindings,
+    ) || prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
+        source,
+        program,
+        scoping,
+        call.callee.function_start,
+        call.callee.function_end,
+        event,
+        call.argument_spans.len(),
+        &bindings,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenOwnDataFieldInitialization {
+    pub context: ProvenOriginContext,
+    pub property: String,
+    pub write_start: u32,
+    pub write_end: u32,
+    pub evaluation_order: u64,
+    pub allocation_start: u32,
+    pub allocation_end: u32,
+    pub constructor_start: u32,
+    pub constructor_end: u32,
+    /// The proof relies on ordinary ECMAScript object/prototype semantics.
+    pub standard_prototype_semantics_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenOwnDataFieldAtMemberCall {
+    pub initialization: ProvenOwnDataFieldInitialization,
+    pub entry_call: ProvenOriginDirectCall,
+    pub member_call: ProvenMemberReceiverOrigin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -996,6 +1583,12 @@ pub struct PrototypeMethodCallCandidate {
     pub call: ProvenMemberReceiverOrigin,
     pub lookup_target: ProvenPrototypeMethodLookupTarget,
     pub receiver_effects: ProvenPrototypeMethodReceiverEffects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenReceiverPreservingPrototypeMethodCall {
+    pub candidate: PrototypeMethodCallCandidate,
+    pub own_data_reads: Vec<ProvenOwnDataFieldAtMemberCall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2292,6 +2885,60 @@ pub fn structurally_matched_prototype_method_calls(
     matched
 }
 
+/// Prove exact-origin prototype method calls that preserve receiver identity and
+/// shape on every normal-return path represented by the supported effect model.
+/// Static receiver reads must be discharged as ordinary own-data fields at the
+/// exact call site; mutation, receiver exposure, dynamic access, or recursive
+/// receiver-method calls remain barriers.
+#[must_use]
+pub fn structurally_proven_receiver_preserving_prototype_method_calls(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenReceiverPreservingPrototypeMethodCall> {
+    let fields = structurally_proven_own_data_fields_at_member_calls(source, program, scoping);
+    let mut proven = Vec::new();
+    for candidate in structurally_matched_prototype_method_calls(program, scoping) {
+        if candidate.receiver_effects.mutates_receiver
+            || candidate.receiver_effects.exposes_receiver
+            || candidate.receiver_effects.dynamic_receiver_access
+            || !candidate.receiver_effects.receiver_calls.is_empty()
+        {
+            continue;
+        }
+        let mut reads = Vec::new();
+        let mut all_reads_proven = true;
+        for property in &candidate.receiver_effects.receiver_reads {
+            let Some(field) = fields.iter().find(|field| {
+                field.initialization.allocation_start == candidate.call.allocation_start
+                    && field.initialization.allocation_end == candidate.call.allocation_end
+                    && field.member_call.call_start == candidate.call.call_start
+                    && field.member_call.call_end == candidate.call.call_end
+                    && field.initialization.property == *property
+            }) else {
+                all_reads_proven = false;
+                break;
+            };
+            reads.push(field.clone());
+        }
+        if all_reads_proven {
+            proven.push(ProvenReceiverPreservingPrototypeMethodCall {
+                candidate,
+                own_data_reads: reads,
+            });
+        }
+    }
+    proven.sort_by_key(|proof| {
+        (
+            proof.candidate.call.call_start,
+            proof.candidate.call.call_end,
+            proof.candidate.call.property.clone(),
+        )
+    });
+    proven.dedup();
+    proven
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2356,6 +3003,53 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping())
+    }
+
+    #[test]
+    fn proves_receiver_preserving_method_when_own_data_reads_are_live() {
+        let source = r#"
+            const C = function() { this.value = 1; use(this); };
+            C.prototype.read = function() { return this.value; };
+            function use(state) { state.read(); }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let calls = super::structurally_proven_receiver_preserving_prototype_method_calls(
+            source,
+            &parsed.program,
+            semantic.semantic.scoping(),
+        );
+        assert!(calls.iter().any(|call| {
+            call.candidate.call.property == "read"
+                && call
+                    .own_data_reads
+                    .iter()
+                    .any(|field| field.initialization.property == "value")
+        }));
+    }
+
+    #[test]
+    fn receiver_preserving_method_rejects_receiver_mutation() {
+        let source = r#"
+            const C = function() { this.value = 1; use(this); };
+            C.prototype.read = function() { this.value = 2; return this.value; };
+            function use(state) { state.read(); }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(
+            super::structurally_proven_receiver_preserving_prototype_method_calls(
+                source,
+                &parsed.program,
+                semantic.semantic.scoping(),
+            )
+            .iter()
+            .all(|call| call.candidate.call.property != "read")
+        );
     }
 
     #[test]
@@ -2476,6 +3170,128 @@ mod tests {
     }
 
     #[test]
+    fn proves_early_own_data_field_through_fresh_direct_parameter() {
+        let source = r#"
+            const C = function() { init(this); };
+            function init(state) {
+                state.other = 1;
+                state.field = 2;
+                later(state);
+                state.after = 4;
+            }
+            function later(state) { state.done = 3; }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let fields = super::structurally_proven_own_data_field_initializations(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        );
+        let names = fields
+            .iter()
+            .map(|field| field.property.as_str())
+            .collect::<HashSet<_>>();
+        assert!(names.contains("other"));
+        assert!(names.contains("field"));
+        assert!(names.contains("done"));
+        assert!(!names.contains("after"));
+    }
+
+    #[test]
+    fn proves_own_data_field_survives_known_call_prefix_to_member_call() {
+        let source = r#"
+            const C = function() { init(this); };
+            function init(state) {
+                state.field = 1;
+                helper(state);
+                use(state);
+            }
+            function helper(state) { state.other = 2; }
+            function use(state) { state.read(); }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let proofs = super::structurally_proven_own_data_fields_at_member_calls(
+            source,
+            &parsed.program,
+            semantic.semantic.scoping(),
+        );
+        assert!(proofs.iter().any(|proof| {
+            proof.initialization.property == "field" && proof.member_call.property == "read"
+        }));
+    }
+
+    #[test]
+    fn own_data_field_survival_rejects_nested_direct_call_exposure() {
+        let source = r#"
+            const C = function() { init(this); };
+            function init(state) {
+                state.field = 1;
+                helper(state);
+                use(state);
+            }
+            function helper(state) { unknown(state); }
+            function use(state) { state.read(); }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let proofs = super::structurally_proven_own_data_fields_at_member_calls(
+            source,
+            &parsed.program,
+            semantic.semantic.scoping(),
+        );
+        assert!(!proofs.iter().any(|proof| {
+            proof.initialization.property == "field" && proof.member_call.property == "read"
+        }));
+    }
+
+    #[test]
+    fn own_data_field_proof_rejects_prior_external_exposure() {
+        let source = r#"
+            const C = function() { init(this); };
+            function init(state) {
+                unknown(state);
+                state.field = 2;
+            }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_own_data_field_initializations(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .iter()
+        .all(|field| field.property != "field"));
+    }
+
+    #[test]
+    fn same_origin_self_store_is_not_an_exposure() {
+        let source = r#"
+            const C = function() { this.self = this; };
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(
+            structurally_proven_origin_exposures(&parsed.program, semantic.semantic.scoping())
+                .is_empty()
+        );
+        let writes =
+            structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping());
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].property.as_deref(), Some("self"));
+    }
+
+    #[test]
     fn records_origin_passed_to_unresolved_call_as_exposure() {
         let source = r#"
             const C = function() { unknown(this); };
@@ -2503,6 +3319,49 @@ mod tests {
             structurally_proven_origin_exposures(&parsed.program, semantic.semantic.scoping());
         assert_eq!(exposures.len(), 1);
         assert_eq!(exposures[0].kind, "return");
+    }
+
+    #[test]
+    fn propagates_exact_origin_through_function_prototype_call() {
+        let source = r#"
+            const C = function() { bridge.call(this, 7); };
+            function bridge(selector) { this.finish(); }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let edge = flow
+            .direct_calls
+            .iter()
+            .find(|call| call.standard_function_call_semantics_required)
+            .expect("Function.prototype.call edge");
+        assert!(edge.callee.this_origin);
+        assert_eq!(edge.callee.parameter_indices, Vec::<usize>::new());
+        assert_eq!(edge.exact_integer_arguments, vec![Some(7)]);
+        assert!(flow
+            .member_calls
+            .iter()
+            .any(|call| { call.context == edge.callee && call.property == "finish" }));
+        assert!(flow.exposures.is_empty());
+    }
+
+    #[test]
+    fn exact_origin_direct_call_rejects_arguments_object_aliasing() {
+        let source = r#"
+            const C = function() { helper(this); };
+            function helper(state) { unknown(arguments[0]); state.done(); }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(structurally_proven_origin_direct_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .is_empty());
     }
 
     #[test]
