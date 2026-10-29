@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
 use jsvm_lift::cfg_order::prove_event_before_barriers;
 use jsvm_lift::receiver_identity::{
-    proven_origin_direct_call_event_unreachable, proven_origin_direct_call_preserves_own_field,
-    structurally_matched_prototype_method_calls, structurally_proven_origin_flow,
-    structurally_proven_own_data_field_initializations,
+    proven_origin_direct_call_event_unreachable, structurally_matched_prototype_method_calls,
+    structurally_proven_origin_flow, structurally_proven_own_data_field_initializations,
     structurally_proven_own_data_fields_at_member_calls,
     structurally_proven_prototype_method_lookup_targets,
     structurally_proven_prototype_method_receiver_effects,
