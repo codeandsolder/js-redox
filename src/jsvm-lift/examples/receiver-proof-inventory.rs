@@ -57,7 +57,9 @@ fn main() -> Result<()> {
                 "call_end": call.call_end,
                 "call": snippet(&source, call.call_start, call.call_end),
                 "caller_function": [call.caller.function_start, call.caller.function_end],
+                "caller_context": {"this_origin": call.caller.this_origin, "parameter_indices": call.caller.parameter_indices},
                 "callee_function": [call.callee.function_start, call.callee.function_end],
+                "callee_context": {"this_origin": call.callee.this_origin, "parameter_indices": call.callee.parameter_indices},
                 "allocation": [call.caller.allocation_start, call.caller.allocation_end],
             })
         })
@@ -71,6 +73,7 @@ fn main() -> Result<()> {
                 "call_end": call.call_end,
                 "call": snippet(&source, call.call_start, call.call_end),
                 "function": [call.context.function_start, call.context.function_end],
+                "context": {"this_origin": call.context.this_origin, "parameter_indices": call.context.parameter_indices},
                 "property": call.property,
                 "allocation": [call.allocation_start, call.allocation_end],
                 "constructor": [call.constructor_start, call.constructor_end],
@@ -86,6 +89,7 @@ fn main() -> Result<()> {
                 "write_end": write.write_end,
                 "write": snippet(&source, write.write_start, write.write_end),
                 "function": [write.context.function_start, write.context.function_end],
+                "context": {"this_origin": write.context.this_origin, "parameter_indices": write.context.parameter_indices},
                 "property": write.property,
                 "operation": write.operation,
                 "allocation": [write.allocation_start, write.allocation_end],
@@ -101,6 +105,7 @@ fn main() -> Result<()> {
                 "end": exposure.exposure_end,
                 "expression": snippet(&source, exposure.exposure_start, exposure.exposure_end),
                 "function": [exposure.context.function_start, exposure.context.function_end],
+                "context": {"this_origin": exposure.context.this_origin, "parameter_indices": exposure.context.parameter_indices},
                 "kind": exposure.kind,
                 "allocation": [exposure.allocation_start, exposure.allocation_end],
             })
