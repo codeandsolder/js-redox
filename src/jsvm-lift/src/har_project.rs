@@ -23,6 +23,8 @@ pub struct HarProjectSummary {
     pub resources: usize,
     pub script_records: usize,
     pub counts: BTreeMap<String, usize>,
+    /// Non-fatal diagnostics produced while salvaging malformed HAR input.
+    pub parse_warnings: Vec<String>,
 }
 
 fn prepare_output(args: &HarProjectOptions) -> Result<()> {
@@ -42,8 +44,8 @@ fn prepare_output(args: &HarProjectOptions) -> Result<()> {
 /// Materialize a HAR capture as a canonical capture project.
 pub fn import_har_project(args: &HarProjectOptions) -> Result<HarProjectSummary> {
     prepare_output(args)?;
-    let (har, salvaged, parse_error) = read_har(&args.har)?;
-    materialize_project(args, har, salvaged, parse_error)
+    let (har, salvaged, parse_error, parse_warnings) = read_har(&args.har)?;
+    materialize_project(args, har, salvaged, parse_error, parse_warnings)
 }
 #[cfg(test)]
 mod tests {

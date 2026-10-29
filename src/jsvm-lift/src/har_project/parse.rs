@@ -97,7 +97,7 @@ pub(super) struct NameValue {
     pub(super) value: String,
 }
 
-fn salvage_har(raw: &[u8]) -> Result<Har> {
+fn salvage_har(raw: &[u8]) -> Result<(Har, Vec<String>)> {
     let text = std::str::from_utf8(raw).context("HAR is not valid UTF-8")?;
     let marker = text
         .find("\"entries\"")
@@ -109,6 +109,7 @@ fn salvage_har(raw: &[u8]) -> Result<Har> {
     let bytes = text.as_bytes();
 
     let mut entries = Vec::new();
+    let mut warnings = Vec::new();
     let mut in_string = false;
     let mut escaped = false;
     let mut object_depth = 0usize;
@@ -145,11 +146,9 @@ fn salvage_har(raw: &[u8]) -> Result<Har> {
                     if let Some(start) = entry_start.take() {
                         match serde_json::from_str::<HarEntry>(&text[start..=i]) {
                             Ok(entry) => entries.push(entry),
-                            Err(error) => {
-                                eprintln!(
-                                    "warning: skipping malformed salvaged HAR entry at bytes {start}..={i}: {error}"
-                                );
-                            }
+                            Err(error) => warnings.push(format!(
+                                "skipping malformed salvaged HAR entry at bytes {start}..={i}: {error}"
+                            )),
                         }
                     }
                 }
@@ -169,16 +168,19 @@ fn salvage_har(raw: &[u8]) -> Result<Har> {
         bail!("no complete HAR entries could be salvaged");
     }
 
-    Ok(Har {
-        log: HarLog {
-            version: "1.2-salvaged".into(),
-            pages: Vec::new(),
-            entries,
+    Ok((
+        Har {
+            log: HarLog {
+                version: "1.2-salvaged".into(),
+                pages: Vec::new(),
+                entries,
+            },
         },
-    })
+        warnings,
+    ))
 }
 
-pub(super) fn read_har(path: &Path) -> Result<(Har, bool, Option<String>)> {
+pub(super) fn read_har(path: &Path) -> Result<(Har, bool, Option<String>, Vec<String>)> {
     let raw = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let first = raw.iter().copied().find(|byte| !byte.is_ascii_whitespace());
     if first != Some(b'{') {
@@ -189,20 +191,32 @@ pub(super) fn read_har(path: &Path) -> Result<(Har, bool, Option<String>)> {
         );
     }
     let parsed = match serde_json::from_slice::<Har>(&raw) {
-        Ok(har) => (har, false, None),
+        Ok(har) => (har, false, None, Vec::new()),
         Err(error) => {
             let message = error.to_string();
-            eprintln!("warning: full HAR JSON parse failed; salvaging complete entries: {message}");
-            (
-                salvage_har(&raw)
-                    .with_context(|| format!("salvaging truncated HAR {}", path.display()))?,
-                true,
-                Some(message),
-            )
+            let (har, warnings) = salvage_har(&raw)
+                .with_context(|| format!("salvaging truncated HAR {}", path.display()))?;
+            (har, true, Some(message), warnings)
         }
     };
     if parsed.0.log.entries.is_empty() {
         bail!("HAR contains no log.entries");
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::salvage_har;
+
+    #[test]
+    fn salvage_reports_skipped_complete_entries() {
+        let raw =
+            br#"{"log":{"entries":[{"request":{},"response":{"content":{}}},{"request":{}}]}}"#;
+        let (har, warnings) = salvage_har(raw).expect("one valid HAR entry should be salvageable");
+
+        assert_eq!(har.log.entries.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("skipping malformed salvaged HAR entry"));
+    }
 }

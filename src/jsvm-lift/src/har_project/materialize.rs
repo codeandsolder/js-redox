@@ -112,6 +112,8 @@ struct CaptureSource {
     salvaged: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     parse_error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    parse_warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -365,6 +367,7 @@ fn build_manifest(
     har: Har,
     salvaged: bool,
     parse_error: Option<String>,
+    parse_warnings: Vec<String>,
 ) -> Result<ProjectManifest> {
     let pages = page_metadata(&har);
     let mut seen = HashMap::new();
@@ -393,6 +396,7 @@ fn build_manifest(
             har_version: har.log.version,
             salvaged,
             parse_error,
+            parse_warnings,
         },
         pages,
         resources,
@@ -431,12 +435,14 @@ pub(super) fn materialize_project(
     har: Har,
     salvaged: bool,
     parse_error: Option<String>,
+    parse_warnings: Vec<String>,
 ) -> Result<HarProjectSummary> {
-    let manifest = build_manifest(args, har, salvaged, parse_error)?;
+    let manifest = build_manifest(args, har, salvaged, parse_error, parse_warnings)?;
     write_project_metadata(args, &manifest)?;
     Ok(HarProjectSummary {
         resources: manifest.resources.len(),
         script_records: manifest.inline_scripts.len(),
+        parse_warnings: manifest.source.parse_warnings.clone(),
         counts: manifest.counts,
     })
 }
