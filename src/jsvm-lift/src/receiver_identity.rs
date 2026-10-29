@@ -2885,6 +2885,37 @@ pub fn structurally_matched_prototype_method_calls(
     matched
 }
 
+/// Propagate exact receiver origin into every finite possible method body of a
+/// structurally matched prototype call.
+///
+/// This does not upgrade the structural match into a call-time lookup theorem;
+/// callers must separately prove that the matched lookup is valid at the call.
+/// Given that premise, each possible regular method body receives the same
+/// concrete allocation as `this`, and ordinary exact-origin propagation applies.
+#[must_use]
+pub fn propagate_matched_prototype_method_call_origins(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    candidate: &PrototypeMethodCallCandidate,
+) -> ProvenOriginFlow {
+    let seeds = candidate
+        .lookup_target
+        .possible_functions
+        .iter()
+        .map(|function| ProvenOriginContext {
+            function_start: function.function_start,
+            function_end: function.function_end,
+            allocation_start: candidate.call.allocation_start,
+            allocation_end: candidate.call.allocation_end,
+            constructor_start: candidate.call.constructor_start,
+            constructor_end: candidate.call.constructor_end,
+            this_origin: true,
+            parameter_indices: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    propagate_proven_origin_contexts(program, scoping, &seeds)
+}
+
 /// Prove exact-origin prototype method calls that preserve receiver identity and
 /// shape on every normal-return path represented by the supported effect model.
 /// Static receiver reads must be discharged as ordinary own-data fields at the
@@ -3003,6 +3034,44 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping())
+    }
+
+    #[test]
+    fn propagates_matched_method_this_through_function_call() {
+        let source = r#"
+            const C = function() { use(this); };
+            C.prototype.run = function() { bridge.call(this, 7); };
+            function bridge(selector) { this.finish(); }
+            function use(state) { state.run(); }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let candidate = structurally_matched_prototype_method_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .into_iter()
+        .find(|candidate| candidate.call.property == "run")
+        .unwrap();
+        let flow = super::propagate_matched_prototype_method_call_origins(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &candidate,
+        );
+        let edge = flow
+            .direct_calls
+            .iter()
+            .find(|call| call.standard_function_call_semantics_required)
+            .expect(".call edge from method body");
+        assert!(edge.caller.this_origin);
+        assert!(edge.callee.this_origin);
+        assert_eq!(edge.exact_integer_arguments, vec![Some(7)]);
+        assert!(flow
+            .member_calls
+            .iter()
+            .any(|call| { call.context == edge.callee && call.property == "finish" }));
     }
 
     #[test]
