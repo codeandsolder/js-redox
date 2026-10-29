@@ -1,13 +1,10 @@
 use std::path::Path;
-mod ast_utils;
 mod bytecode;
 mod decoder;
 mod dispatch;
 mod embedded;
 mod function_analysis;
 mod scanner;
-mod source_text;
-mod state_flatten;
 mod table_vm;
 
 use anyhow::{Context, Result};
@@ -17,6 +14,7 @@ use decoder::DecoderCandidate;
 use dispatch::{DirectSwitchMapCandidate, HandlerTableCandidate};
 use embedded::EmbeddedCodeCandidate;
 use function_analysis::FunctionMetrics;
+use jsvm_lift::{ast_utils, source_text, state_flatten};
 use scanner::scan_source_core;
 use serde::Serialize;
 use state_flatten::{IfLadderStateMachineCandidate, OpcodeMapCandidate, StateMachineCandidate};

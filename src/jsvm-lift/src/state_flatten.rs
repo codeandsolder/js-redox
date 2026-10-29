@@ -1,17 +1,18 @@
+use crate::numeric::{eval_js_bitwise_i64, exact_i64, exact_u64, js_int32_from_i64};
 use crate::{
     ast_utils::{expr_ident, numeric_u64, target_ident},
     source_text::preview,
 };
-use jsvm_lift::numeric::{eval_js_bitwise_i64, exact_i64, exact_u64, js_int32_from_i64};
 use jsvm_safe_core::eval_static_primitive as eval_static;
 use oxc_ast::{
     ast::{
-        Argument, Expression, ForStatement, Function, FunctionBody, Program, Statement,
-        SwitchStatement, WhileStatement,
+        Argument, BindingPattern, Expression, ForStatement, Function, FunctionBody, Program,
+        Statement, SwitchStatement, WhileStatement,
     },
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
+use oxc_semantic::Scoping;
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::scope::ScopeFlags;
 use serde::Serialize;
@@ -579,7 +580,524 @@ fn prove_machine_event_before_barriers(
     !reached_unsafe
 }
 
-pub(crate) fn prove_detected_if_ladder_event_before_barriers(
+fn prove_machine_event_unreachable_with_integer_bindings(
+    machine: &IfLadderStateMachineCandidate,
+    body: &Statement<'_>,
+    event: Span,
+    bindings: &BTreeMap<String, i64>,
+) -> bool {
+    let Some(event_state) = branch_state_for_span(body, &machine.state_var, event) else {
+        return false;
+    };
+    let Ok(init_state) = i64::try_from(machine.init_state) else {
+        return false;
+    };
+    let mut env = bindings
+        .iter()
+        .map(|(name, value)| (name.clone(), Scalar::Int(*value)))
+        .collect::<HashMap<_, _>>();
+    env.insert(machine.state_var.clone(), Scalar::Int(init_state));
+    let mut seen = BTreeSet::new();
+
+    for _ in 0..256 {
+        let Some(Scalar::Int(state_i64)) = env.get(&machine.state_var).copied() else {
+            return false;
+        };
+        let Ok(state) = u64::try_from(state_i64) else {
+            return false;
+        };
+        if state == event_state {
+            return false;
+        }
+        if state == machine.exit_state {
+            return true;
+        }
+        if !seen.insert(state) {
+            return false;
+        }
+
+        let before = env.get(&machine.state_var).copied();
+        let mut semantic = Vec::new();
+        match exec_statement(body, "", &machine.state_var, &mut env, &mut semantic) {
+            ExecStatus::Return | ExecStatus::Throw => return true,
+            ExecStatus::Break | ExecStatus::Normal => {}
+        }
+        if env.get(&machine.state_var).copied() == before {
+            return false;
+        }
+    }
+    false
+}
+
+/// Prove that an event in a detected flattened if-ladder is unreachable when
+/// selected scalar identifiers have exact integer values at machine entry.
+///
+/// This executes only the already-supported scalar/control subset and fails
+/// closed on unsupported semantics, repeated states, or paths that do not
+/// deterministically reach a return/throw/exit without the event state.
+pub fn prove_detected_if_ladder_event_unreachable_with_integer_bindings(
+    program: &Program<'_>,
+    machine: &IfLadderStateMachineCandidate,
+    event: Span,
+    bindings: &BTreeMap<String, i64>,
+) -> bool {
+    struct Harness<'m, 'b> {
+        machine: &'m IfLadderStateMachineCandidate,
+        event: Span,
+        bindings: &'b BTreeMap<String, i64>,
+        result: Option<bool>,
+    }
+
+    impl<'a> Visit<'a> for Harness<'_, '_> {
+        fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+            if self.result.is_some() {
+                return;
+            }
+            if statement.span.start == self.machine.start && statement.span.end == self.machine.end
+            {
+                self.result = Some(prove_machine_event_unreachable_with_integer_bindings(
+                    self.machine,
+                    &statement.body,
+                    self.event,
+                    self.bindings,
+                ));
+                return;
+            }
+            walk::walk_for_statement(self, statement);
+        }
+
+        fn visit_while_statement(&mut self, statement: &WhileStatement<'a>) {
+            if self.result.is_some() {
+                return;
+            }
+            if statement.span.start == self.machine.start && statement.span.end == self.machine.end
+            {
+                self.result = Some(prove_machine_event_unreachable_with_integer_bindings(
+                    self.machine,
+                    &statement.body,
+                    self.event,
+                    self.bindings,
+                ));
+                return;
+            }
+            walk::walk_while_statement(self, statement);
+        }
+    }
+
+    let mut harness = Harness {
+        machine,
+        event,
+        bindings,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(false)
+}
+
+/// Prove a flattened if-ladder event unreachable for one exact function when
+/// selected formal parameters have exact integer values at call time.
+///
+/// Parameter bindings are keyed by formal-parameter index, so callers can join
+/// against symbol-resolved direct-call proofs without relying on source names.
+#[must_use]
+fn exact_integer_parameter_env(
+    function: &Function<'_>,
+    scoping: &Scoping,
+    parameter_bindings: &BTreeMap<usize, i64>,
+) -> Option<HashMap<String, Scalar>> {
+    let mut env = HashMap::new();
+    for (index, value) in parameter_bindings {
+        let parameter = function.params.items.get(*index)?;
+        let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+            return None;
+        };
+        let symbol = identifier.symbol_id.get()?;
+        if scoping
+            .get_resolved_reference_ids(symbol)
+            .iter()
+            .any(|reference_id| scoping.get_reference(*reference_id).is_write())
+        {
+            return None;
+        }
+        env.insert(identifier.name.to_string(), Scalar::Int(*value));
+    }
+
+    #[derive(Default)]
+    struct DynamicScalarProbe {
+        dynamic_scope: bool,
+        arguments_object: bool,
+    }
+    impl<'a> Visit<'a> for DynamicScalarProbe {
+        fn visit_with_statement(&mut self, _statement: &oxc_ast::ast::WithStatement<'a>) {
+            self.dynamic_scope = true;
+        }
+        fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+            if matches!(&call.callee, Expression::Identifier(id) if id.name.as_str() == "eval") {
+                self.dynamic_scope = true;
+            }
+            walk::walk_call_expression(self, call);
+        }
+        fn visit_identifier_reference(
+            &mut self,
+            identifier: &oxc_ast::ast::IdentifierReference<'a>,
+        ) {
+            if identifier.name.as_str() == "arguments" {
+                self.arguments_object = true;
+            }
+        }
+        fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+        }
+    }
+    let mut probe = DynamicScalarProbe::default();
+    probe.visit_function_body(function.body.as_deref()?);
+    (!probe.dynamic_scope && !probe.arguments_object).then_some(env)
+}
+
+/// Prove that an event inside a structured `switch` cannot execute for exact
+/// integer formal-parameter values. The proof accepts only scalar-pure case
+/// selection and a selected case that either lies after the target or ends in
+/// an unconditional top-level break/return/throw before any later target case.
+#[must_use]
+pub fn prove_function_switch_event_unreachable_with_integer_parameters(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    function_start: u32,
+    function_end: u32,
+    event: Span,
+    parameter_bindings: &BTreeMap<usize, i64>,
+) -> bool {
+    struct FunctionHarness<'b> {
+        scoping: &'b Scoping,
+        function_start: u32,
+        function_end: u32,
+        event: Span,
+        parameter_bindings: &'b BTreeMap<usize, i64>,
+        result: Option<bool>,
+    }
+
+    impl<'a> Visit<'a> for FunctionHarness<'_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if self.result.is_some() {
+                return;
+            }
+            if function.span.start != self.function_start || function.span.end != self.function_end
+            {
+                walk::walk_function(self, function, flags);
+                return;
+            }
+            let Some(env) =
+                exact_integer_parameter_env(function, self.scoping, self.parameter_bindings)
+            else {
+                self.result = Some(false);
+                return;
+            };
+            let Some(body) = function.body.as_deref() else {
+                self.result = Some(false);
+                return;
+            };
+
+            struct SwitchProbe<'e> {
+                env: &'e HashMap<String, Scalar>,
+                event: Span,
+                proofs: Vec<bool>,
+            }
+            impl<'a> Visit<'a> for SwitchProbe<'_> {
+                fn visit_switch_statement(&mut self, switch: &SwitchStatement<'a>) {
+                    if !(switch.span.start <= self.event.start && self.event.end <= switch.span.end)
+                    {
+                        walk::walk_switch_statement(self, switch);
+                        return;
+                    }
+                    let target = switch.cases.iter().position(|case| {
+                        case.span.start <= self.event.start && self.event.end <= case.span.end
+                    });
+                    let Some(target) = target else {
+                        walk::walk_switch_statement(self, switch);
+                        return;
+                    };
+                    let Some(discriminant) = eval_expr(&switch.discriminant, self.env) else {
+                        self.proofs.push(false);
+                        return;
+                    };
+                    let mut default = None;
+                    let mut selected = None;
+                    for (index, case) in switch.cases.iter().enumerate() {
+                        let Some(test) = case.test.as_ref() else {
+                            default = Some(index);
+                            continue;
+                        };
+                        let Some(value) = eval_expr(test, self.env) else {
+                            self.proofs.push(false);
+                            return;
+                        };
+                        if value == discriminant {
+                            selected = Some(index);
+                            break;
+                        }
+                    }
+                    let selected = selected.or(default);
+                    let proof = match selected {
+                        None => true,
+                        Some(selected) if selected > target => true,
+                        Some(selected) if selected == target => false,
+                        Some(selected) => {
+                            switch.cases[selected]
+                                .consequent
+                                .last()
+                                .is_some_and(|statement| {
+                                    matches!(
+                                        statement,
+                                        Statement::BreakStatement(_)
+                                            | Statement::ReturnStatement(_)
+                                            | Statement::ThrowStatement(_)
+                                    )
+                                })
+                        }
+                    };
+                    self.proofs.push(proof);
+                }
+                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                }
+            }
+            let mut probe = SwitchProbe {
+                env: &env,
+                event: self.event,
+                proofs: Vec::new(),
+            };
+            probe.visit_function_body(body);
+            self.result = Some(probe.proofs.into_iter().any(|proof| proof));
+        }
+    }
+
+    let mut harness = FunctionHarness {
+        scoping,
+        function_start,
+        function_end,
+        event,
+        parameter_bindings,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(false)
+}
+
+pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    function_start: u32,
+    function_end: u32,
+    event: Span,
+    parameter_bindings: &BTreeMap<usize, i64>,
+) -> bool {
+    struct FunctionHarness<'s, 'b> {
+        source: &'s str,
+        function_start: u32,
+        function_end: u32,
+        event: Span,
+        parameter_bindings: &'b BTreeMap<usize, i64>,
+        scoping: &'b Scoping,
+        result: Option<bool>,
+    }
+
+    impl<'a> Visit<'a> for FunctionHarness<'_, '_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if self.result.is_some() {
+                return;
+            }
+            if function.span.start != self.function_start || function.span.end != self.function_end
+            {
+                walk::walk_function(self, function, flags);
+                return;
+            }
+            let Some(body) = function.body.as_deref() else {
+                self.result = Some(false);
+                return;
+            };
+            let mut bindings = BTreeMap::new();
+            for (index, value) in self.parameter_bindings {
+                let Some(parameter) = function.params.items.get(*index) else {
+                    self.result = Some(false);
+                    return;
+                };
+                let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+                    self.result = Some(false);
+                    return;
+                };
+                let Some(symbol) = identifier.symbol_id.get() else {
+                    self.result = Some(false);
+                    return;
+                };
+                if self
+                    .scoping
+                    .get_resolved_reference_ids(symbol)
+                    .iter()
+                    .any(|reference_id| self.scoping.get_reference(*reference_id).is_write())
+                {
+                    self.result = Some(false);
+                    return;
+                }
+                bindings.insert(identifier.name.to_string(), *value);
+            }
+
+            #[derive(Default)]
+            struct ScalarControlSafetyProbe<'n> {
+                state_var: &'n str,
+                dynamic_scope: bool,
+                arguments_object: bool,
+                nested_state_reference: bool,
+                nested_depth: usize,
+            }
+            impl<'a> Visit<'a> for ScalarControlSafetyProbe<'_> {
+                fn visit_with_statement(&mut self, _statement: &oxc_ast::ast::WithStatement<'a>) {
+                    self.dynamic_scope = true;
+                }
+                fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+                    if matches!(&call.callee, Expression::Identifier(id) if id.name.as_str() == "eval")
+                    {
+                        self.dynamic_scope = true;
+                    }
+                    walk::walk_call_expression(self, call);
+                }
+                fn visit_identifier_reference(
+                    &mut self,
+                    identifier: &oxc_ast::ast::IdentifierReference<'a>,
+                ) {
+                    if identifier.name.as_str() == "arguments" && self.nested_depth == 0 {
+                        self.arguments_object = true;
+                    }
+                    if identifier.name.as_str() == self.state_var && self.nested_depth > 0 {
+                        self.nested_state_reference = true;
+                    }
+                }
+                fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+                    self.nested_depth += 1;
+                    walk::walk_function(self, function, flags);
+                    self.nested_depth -= 1;
+                }
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                    self.nested_depth += 1;
+                    walk::walk_arrow_function_expression(self, function);
+                    self.nested_depth -= 1;
+                }
+            }
+            // Unknown calls may mutate arbitrary objects or throw, but they
+            // cannot rewrite these lexical scalar controls unless the function
+            // itself opens one of the dynamic/aliasing routes below.
+            struct StateVarCollector<'s> {
+                source: &'s str,
+                event: Span,
+                vars: Vec<String>,
+            }
+            impl<'a> Visit<'a> for StateVarCollector<'_> {
+                fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+                    let detected = detect_for_state_machines(self.source, "bound-call", statement);
+                    self.vars.extend(
+                        detected
+                            .if_ladder_machines
+                            .into_iter()
+                            .filter(|machine| {
+                                machine.start <= self.event.start && self.event.end <= machine.end
+                            })
+                            .map(|machine| machine.state_var),
+                    );
+                    walk::walk_for_statement(self, statement);
+                }
+                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                }
+            }
+            let mut state_vars = StateVarCollector {
+                source: self.source,
+                event: self.event,
+                vars: Vec::new(),
+            };
+            state_vars.visit_function_body(body);
+            let [state_var] = state_vars.vars.as_slice() else {
+                self.result = Some(false);
+                return;
+            };
+            let state_var = state_var.clone();
+            let mut safety = ScalarControlSafetyProbe {
+                state_var: &state_var,
+                ..ScalarControlSafetyProbe::default()
+            };
+            safety.visit_function_body(body);
+            if safety.dynamic_scope || safety.arguments_object || safety.nested_state_reference {
+                self.result = Some(false);
+                return;
+            }
+
+            struct MachineCollector<'s, 'b> {
+                source: &'s str,
+                event: Span,
+                bindings: &'b BTreeMap<String, i64>,
+                matches: usize,
+                result: bool,
+            }
+            impl<'a> Visit<'a> for MachineCollector<'_, '_> {
+                fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+                    let detected = detect_for_state_machines(self.source, "bound-call", statement);
+                    for machine in detected.if_ladder_machines {
+                        if machine.start <= self.event.start && self.event.end <= machine.end {
+                            self.matches += 1;
+                            self.result = prove_machine_event_unreachable_with_integer_bindings(
+                                &machine,
+                                &statement.body,
+                                self.event,
+                                self.bindings,
+                            );
+                        }
+                    }
+                    walk::walk_for_statement(self, statement);
+                }
+                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                }
+            }
+            let mut collector = MachineCollector {
+                source: self.source,
+                event: self.event,
+                bindings: &bindings,
+                matches: 0,
+                result: false,
+            };
+            collector.visit_function_body(body);
+            self.result = Some(collector.matches == 1 && collector.result);
+        }
+    }
+
+    let mut harness = FunctionHarness {
+        source,
+        function_start,
+        function_end,
+        event,
+        parameter_bindings,
+        scoping,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(false)
+}
+
+pub fn prove_detected_if_ladder_event_before_barriers(
     program: &Program<'_>,
     machine: &IfLadderStateMachineCandidate,
     event: Span,
@@ -638,7 +1156,7 @@ pub(crate) fn prove_detected_if_ladder_event_before_barriers(
     harness.result.unwrap_or(false)
 }
 
-pub(crate) fn prove_if_ladder_event_before_barriers(
+pub fn prove_if_ladder_event_before_barriers(
     source: &str,
     for_stmt: &ForStatement<'_>,
     event: Span,
@@ -651,7 +1169,7 @@ pub(crate) fn prove_if_ladder_event_before_barriers(
     prove_machine_event_before_barriers(machine, &for_stmt.body, event, barriers)
 }
 
-pub(crate) fn prove_while_if_ladder_event_before_barriers(
+pub fn prove_while_if_ladder_event_before_barriers(
     source: &str,
     init_statement: &Statement<'_>,
     while_statement: &WhileStatement<'_>,
@@ -874,7 +1392,7 @@ fn slice(source: &str, span: Span) -> String {
         .join(" ")
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scalar {
     Int(i64),
     Undefined,
@@ -2105,6 +2623,150 @@ mod tests {
             Span::new(event_start, event_start + 8),
             &[Span::new(barrier_start, barrier_start + 9)],
         ));
+    }
+
+    #[test]
+    fn proves_selector_specialized_branch_unreachable() {
+        let source = r#"function f(Q) {
+            for (H = 28; H != 74;) {
+                if (H == 55) { sink(); H = 62; }
+                else if (H == 56) H = (Q & 62) == Q ? 55 : 62;
+                else if (H == 62) H = 12;
+                else if (H == 12) H = 41;
+                else if (H == 41) H = 89;
+                else if (H == 89) return;
+                else if (H == 28) H = 56;
+            }
+        }"#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let mut harness = DetectorHarness::default();
+        harness.source = source;
+        harness.visit_program(&parsed.program);
+        let machine = harness.detected.if_ladder_machines.first().unwrap();
+        let start = u32::try_from(source.find("sink()").unwrap()).unwrap();
+        let event = Span::new(start, start + 6);
+        let safe = BTreeMap::from([("Q".to_string(), 47)]);
+        let unsafe_binding = BTreeMap::from([("Q".to_string(), 46)]);
+        assert!(
+            prove_detected_if_ladder_event_unreachable_with_integer_bindings(
+                &parsed.program,
+                machine,
+                event,
+                &safe,
+            )
+        );
+        assert!(
+            !prove_detected_if_ladder_event_unreachable_with_integer_bindings(
+                &parsed.program,
+                machine,
+                event,
+                &unsafe_binding,
+            )
+        );
+    }
+
+    #[test]
+    fn proves_switch_event_unreachable_by_parameter_index() {
+        let source = r#"const x = function(J, Q, Y) {
+            switch (!(Q == 410 || Q == 387)) {
+                case true:
+                    J.T[Q] = Y;
+                    break;
+                case false:
+                    sink(Y);
+                    break;
+            }
+        };"#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+        struct FunctionSpan {
+            span: Option<Span>,
+        }
+        impl<'a> Visit<'a> for FunctionSpan {
+            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+                self.span = Some(function.span);
+            }
+        }
+        let mut function = FunctionSpan { span: None };
+        function.visit_program(&parsed.program);
+        let function = function.span.unwrap();
+        let start = u32::try_from(source.find("sink(Y)").unwrap()).unwrap();
+        let event = Span::new(start, start + 7);
+        assert!(
+            prove_function_switch_event_unreachable_with_integer_parameters(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                event,
+                &BTreeMap::from([(1, 333)]),
+            )
+        );
+        assert!(
+            !prove_function_switch_event_unreachable_with_integer_parameters(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                event,
+                &BTreeMap::from([(1, 410)]),
+            )
+        );
+    }
+
+    #[test]
+    fn proves_selector_specialization_by_parameter_index() {
+        let source = r#"const g = function(J, Q) {
+            for (H = 28; H != 74;) {
+                if (H == 55) { sink(J); H = 62; }
+                else if (H == 56) H = (Q & 62) == Q ? 55 : 62;
+                else if (H == 62) H = 12;
+                else if (H == 12) H = 41;
+                else if (H == 41) H = 89;
+                else if (H == 89) return;
+                else if (H == 28) H = 56;
+            }
+        };"#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+        struct FunctionSpan {
+            span: Option<Span>,
+        }
+        impl<'a> Visit<'a> for FunctionSpan {
+            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+                self.span = Some(function.span);
+            }
+        }
+        let mut function = FunctionSpan { span: None };
+        function.visit_program(&parsed.program);
+        let function = function.span.unwrap();
+        let start = u32::try_from(source.find("sink(J)").unwrap()).unwrap();
+        let event = Span::new(start, start + 7);
+        assert!(
+            prove_function_if_ladder_event_unreachable_with_integer_parameters(
+                source,
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                event,
+                &BTreeMap::from([(1, 47)]),
+            )
+        );
+        assert!(
+            !prove_function_if_ladder_event_unreachable_with_integer_parameters(
+                source,
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                event,
+                &BTreeMap::from([(1, 46)]),
+            )
+        );
     }
 
     #[test]

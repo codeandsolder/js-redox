@@ -1,3 +1,4 @@
+use crate::numeric::exact_i64;
 use jsvm_safe_core::{eval_static_primitive, string_literal_value};
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, CallExpression, Expression,
@@ -48,8 +49,18 @@ pub struct ProvenOriginContext {
 pub struct ProvenOriginDirectCall {
     pub call_start: u32,
     pub call_end: u32,
+    pub evaluation_order: u64,
     pub caller: ProvenOriginContext,
     pub callee: ProvenOriginContext,
+    /// Source spans for call arguments in call-site order. These preserve the
+    /// exact expressions used to establish parameter-origin mappings and let
+    /// downstream proofs specialize callee control flow without textual search.
+    pub argument_spans: Vec<(u32, u32)>,
+    /// Exact integer value of each argument when its value-producing final
+    /// expression is independently static. Earlier sequence operands may have
+    /// side effects; conditional on the call occurring they cannot change the
+    /// value of a static final operand.
+    pub exact_integer_arguments: Vec<Option<i64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +68,7 @@ pub struct ProvenMemberReceiverOrigin {
     pub context: ProvenOriginContext,
     pub call_start: u32,
     pub call_end: u32,
+    pub evaluation_order: u64,
     pub receiver_start: u32,
     pub receiver_end: u32,
     pub property: String,
@@ -71,6 +83,7 @@ pub struct ProvenMemberWriteOrigin {
     pub context: ProvenOriginContext,
     pub write_start: u32,
     pub write_end: u32,
+    pub evaluation_order: u64,
     pub receiver_start: u32,
     pub receiver_end: u32,
     /// `None` means the receiver identity is exact but the computed key is not.
@@ -87,6 +100,7 @@ pub struct ProvenOriginExposure {
     pub context: ProvenOriginContext,
     pub exposure_start: u32,
     pub exposure_end: u32,
+    pub evaluation_order: u64,
     pub allocation_start: u32,
     pub allocation_end: u32,
     pub constructor_start: u32,
@@ -138,6 +152,21 @@ fn last_sequence_expression<'a>(expression: &'a Expression<'a>) -> &'a Expressio
             .last()
             .map_or(expression, last_sequence_expression),
         _ => expression,
+    }
+}
+
+fn exact_syntactic_integer(expression: &Expression<'_>) -> Option<i64> {
+    match last_sequence_expression(expression) {
+        Expression::NumericLiteral(number) => exact_i64(number.value),
+        Expression::UnaryExpression(unary) => {
+            let value = exact_syntactic_integer(&unary.argument)?;
+            match unary.operator.as_str() {
+                "+" => Some(value),
+                "-" => value.checked_neg(),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -307,6 +336,7 @@ struct ContextProbe<'c, 'f> {
     member_writes: Vec<ProvenMemberWriteOrigin>,
     exposures: Vec<ProvenOriginExposure>,
     direct_calls: Vec<ProvenOriginDirectCall>,
+    evaluation_order: u64,
     target: FunctionKey,
     active: bool,
 }
@@ -337,9 +367,16 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
             member_writes: Vec::new(),
             exposures: Vec::new(),
             direct_calls: Vec::new(),
+            evaluation_order: 0,
             target: context.function,
             active: false,
         }
+    }
+
+    fn next_evaluation_order(&mut self) -> u64 {
+        let order = self.evaluation_order;
+        self.evaluation_order = self.evaluation_order.saturating_add(1);
+        order
     }
 
     fn expression_origin(&self, expression: &Expression<'_>) -> Option<ObjectOrigin> {
@@ -406,6 +443,7 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
             .iter()
             .filter_map(|origin| *origin)
             .collect::<HashSet<_>>();
+        let evaluation_order = self.next_evaluation_order();
         for origin in origins {
             if let (Some(caller), Some(callee)) = (
                 self.context.proven_origin_context(origin),
@@ -414,8 +452,22 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
                 self.direct_calls.push(ProvenOriginDirectCall {
                     call_start: call.span.start,
                     call_end: call.span.end,
+                    evaluation_order,
                     caller,
                     callee,
+                    argument_spans: call
+                        .arguments
+                        .iter()
+                        .map(|argument| (argument.span().start, argument.span().end))
+                        .collect(),
+                    exact_integer_arguments: call
+                        .arguments
+                        .iter()
+                        .map(|argument| {
+                            let expression = argument.as_expression()?;
+                            exact_syntactic_integer(expression)
+                        })
+                        .collect(),
                 });
             }
         }
@@ -434,10 +486,12 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
         let Some(context) = self.context.proven_origin_context(origin) else {
             return;
         };
+        let evaluation_order = self.next_evaluation_order();
         self.exposures.push(ProvenOriginExposure {
             context,
             exposure_start: span.start,
             exposure_end: span.end,
+            evaluation_order,
             allocation_start: origin.allocation_start,
             allocation_end: origin.allocation_end,
             constructor_start: origin.constructor.start,
@@ -459,10 +513,12 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
         let Some(context) = self.context.proven_origin_context(origin) else {
             return;
         };
+        let evaluation_order = self.next_evaluation_order();
         self.member_writes.push(ProvenMemberWriteOrigin {
             context,
             write_start: span.start,
             write_end: span.end,
+            evaluation_order,
             receiver_start: receiver.span().start,
             receiver_end: receiver.span().end,
             property,
@@ -564,15 +620,16 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
     }
 
     fn visit_return_statement(&mut self, statement: &oxc_ast::ast::ReturnStatement<'a>) {
+        walk::walk_return_statement(self, statement);
         if self.active {
             if let Some(argument) = statement.argument.as_ref() {
                 self.record_exposure(argument, statement.span, "return");
             }
         }
-        walk::walk_return_statement(self, statement);
     }
 
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        walk::walk_assignment_expression(self, assignment);
         if self.active {
             if let Some((receiver, property)) = self.assignment_member(&assignment.left) {
                 self.record_member_write(receiver, property, assignment.span, "assignment");
@@ -584,10 +641,10 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
                 self.record_exposure(&assignment.right, assignment.span, "store");
             }
         }
-        walk::walk_assignment_expression(self, assignment);
     }
 
     fn visit_update_expression(&mut self, update: &oxc_ast::ast::UpdateExpression<'a>) {
+        walk::walk_update_expression(self, update);
         if self.active {
             match &update.argument {
                 oxc_ast::ast::SimpleAssignmentTarget::StaticMemberExpression(member)
@@ -612,10 +669,10 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
                 _ => {}
             }
         }
-        walk::walk_update_expression(self, update);
     }
 
     fn visit_unary_expression(&mut self, unary: &oxc_ast::ast::UnaryExpression<'a>) {
+        walk::walk_unary_expression(self, unary);
         if self.active && unary.operator.as_str() == "delete" {
             match last_sequence_expression(&unary.argument) {
                 Expression::StaticMemberExpression(member) if !member.optional => {
@@ -636,7 +693,6 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
                 _ => {}
             }
         }
-        walk::walk_unary_expression(self, unary);
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
@@ -644,45 +700,59 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
             walk::walk_call_expression(self, call);
             return;
         }
-        if !call.optional {
-            let direct_callee = self.direct_callee(&call.callee);
-            if let Some(callee) = direct_callee {
-                self.record_direct_call(call, callee);
-            } else if let Some((receiver, property)) = self.static_member(&call.callee) {
-                if let Some(origin) = self.expression_origin(receiver) {
-                    let Some(context) = self.context.proven_origin_context(origin) else {
-                        walk::walk_call_expression(self, call);
-                        return;
-                    };
-                    self.member_calls.push(ProvenMemberReceiverOrigin {
-                        context,
-                        call_start: call.span.start,
-                        call_end: call.span.end,
-                        receiver_start: receiver.span().start,
-                        receiver_end: receiver.span().end,
-                        property,
-                        allocation_start: origin.allocation_start,
-                        allocation_end: origin.allocation_end,
-                        constructor_start: origin.constructor.start,
-                        constructor_end: origin.constructor.end,
-                    });
-                }
-            }
+        if call.optional {
+            walk::walk_call_expression(self, call);
+            return;
+        }
 
-            let proven_parameter_count = direct_callee
-                .and_then(|callee| self.function_info.get(&callee))
-                .filter(|info| !info.dynamic_scope)
-                .map_or(0, |info| info.parameters.len());
-            for (index, argument) in call.arguments.iter().enumerate() {
-                let Some(argument) = argument.as_expression() else {
-                    continue;
-                };
-                if direct_callee.is_none() || index >= proven_parameter_count {
-                    self.record_exposure(argument, argument.span(), "call_argument");
-                }
+        let direct_callee = self.direct_callee(&call.callee);
+        let member_receiver = if direct_callee.is_none() {
+            self.static_member(&call.callee)
+                .and_then(|(receiver, property)| {
+                    self.expression_origin(receiver)
+                        .map(|origin| (receiver, property, origin))
+                })
+        } else {
+            None
+        };
+        let proven_parameter_count = direct_callee
+            .and_then(|callee| self.function_info.get(&callee))
+            .filter(|info| !info.dynamic_scope)
+            .map_or(0, |info| info.parameters.len());
+
+        // JavaScript evaluates callee/receiver and arguments before invocation.
+        // Record nested effects first, then the invocation/exposure event.
+        walk::walk_call_expression(self, call);
+
+        if let Some(callee) = direct_callee {
+            self.record_direct_call(call, callee);
+        } else if let Some((receiver, property, origin)) = member_receiver {
+            if let Some(context) = self.context.proven_origin_context(origin) {
+                let evaluation_order = self.next_evaluation_order();
+                self.member_calls.push(ProvenMemberReceiverOrigin {
+                    context,
+                    call_start: call.span.start,
+                    call_end: call.span.end,
+                    evaluation_order,
+                    receiver_start: receiver.span().start,
+                    receiver_end: receiver.span().end,
+                    property,
+                    allocation_start: origin.allocation_start,
+                    allocation_end: origin.allocation_end,
+                    constructor_start: origin.constructor.start,
+                    constructor_end: origin.constructor.end,
+                });
             }
         }
-        walk::walk_call_expression(self, call);
+
+        for (index, argument) in call.arguments.iter().enumerate() {
+            let Some(argument) = argument.as_expression() else {
+                continue;
+            };
+            if direct_callee.is_none() || index >= proven_parameter_count {
+                self.record_exposure(argument, argument.span(), "call_argument");
+            }
+        }
     }
 }
 
@@ -894,6 +964,16 @@ pub struct ProvenPrototypeMethodAssignment {
     pub assignment_end: u32,
     /// Resolving this assignment as an installed own prototype method requires ordinary
     /// function-prototype / Object.prototype property semantics at runtime.
+    pub standard_prototype_semantics_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenStableConstructorPrototype {
+    pub constructor_start: u32,
+    pub constructor_end: u32,
+    /// The theorem depends on ordinary Function.prototype/Object.prototype
+    /// behavior. Constructor/prototype escape, dynamic writes and prototype
+    /// chain mutation invalidate this proof.
     pub standard_prototype_semantics_required: bool,
 }
 
@@ -1503,7 +1583,14 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
             return;
         }
         if let Some(owner) = self.prototype_value(object) {
-            self.invalidate_property(owner, property);
+            if property == "__proto__" {
+                // Under the theorem's ordinary Object.prototype semantics,
+                // assigning this inherited accessor changes the prototype
+                // chain rather than installing an ordinary own data property.
+                self.invalidate_constructor(owner);
+            } else {
+                self.invalidate_property(owner, property);
+            }
         }
     }
 
@@ -1610,7 +1697,11 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                             return;
                         }
                         if let Some(owner) = owner {
-                            if let Some(functions) = possible_regular_functions(&assignment.right) {
+                            if property == "__proto__" {
+                                self.invalidate_constructor(owner);
+                            } else if let Some(functions) =
+                                possible_regular_functions(&assignment.right)
+                            {
                                 self.record_method(
                                     owner,
                                     property,
@@ -1643,7 +1734,9 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                         self.process_expression(&assignment.right);
                         if let Some(owner) = owner {
                             if let Some(property) = property {
-                                if let Some(functions) =
+                                if property == "__proto__" {
+                                    self.invalidate_constructor(owner);
+                                } else if let Some(functions) =
                                     possible_regular_functions(&assignment.right)
                                 {
                                     self.record_method(
@@ -1811,6 +1904,35 @@ pub fn structurally_proven_prototype_method_assignments(
         )
     });
     methods
+}
+
+#[must_use]
+pub fn structurally_proven_stable_constructor_prototypes(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenStableConstructorPrototype> {
+    let mut functions = FunctionCollector::new();
+    functions.visit_program(program);
+    let property_keys = collect_property_key_bindings(program, scoping);
+    let proof =
+        collect_prototype_method_proof(program, scoping, &functions.by_symbol, &property_keys);
+    let invalid = proof.lookup_invalid_constructors;
+    let mut constructors = functions
+        .by_symbol
+        .values()
+        .copied()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter(|constructor| !invalid.contains(constructor))
+        .map(|constructor| ProvenStableConstructorPrototype {
+            constructor_start: constructor.start,
+            constructor_end: constructor.end,
+            standard_prototype_semantics_required: true,
+        })
+        .collect::<Vec<_>>();
+    constructors
+        .sort_by_key(|constructor| (constructor.constructor_start, constructor.constructor_end));
+    constructors
 }
 
 #[must_use]
@@ -2176,7 +2298,7 @@ mod tests {
         propagate_proven_origin_contexts, structurally_matched_prototype_method_calls,
         structurally_proven_member_receiver_origins, structurally_proven_member_write_origins,
         structurally_proven_origin_direct_calls, structurally_proven_origin_exposures,
-        structurally_proven_prototype_method_assignments,
+        structurally_proven_origin_flow, structurally_proven_prototype_method_assignments,
         structurally_proven_prototype_method_lookup_targets,
         structurally_proven_prototype_method_receiver_effects,
     };
@@ -2381,6 +2503,28 @@ mod tests {
             structurally_proven_origin_exposures(&parsed.program, semantic.semantic.scoping());
         assert_eq!(exposures.len(), 1);
         assert_eq!(exposures[0].kind, "return");
+    }
+
+    #[test]
+    fn direct_call_records_static_final_sequence_argument_value() {
+        let source = r#"
+            const C = function() { helper(this, (unknown(), 47), null, true); };
+            function helper(state, selector, nullable, flag) { state.done(); }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let calls =
+            structurally_proven_origin_direct_calls(&parsed.program, semantic.semantic.scoping());
+        let call = calls
+            .iter()
+            .find(|call| call.exact_integer_arguments.len() == 4)
+            .unwrap();
+        assert_eq!(
+            call.exact_integer_arguments,
+            vec![None, Some(47), None, None]
+        );
     }
 
     #[test]
@@ -2728,6 +2872,43 @@ mod tests {
     }
 
     #[test]
+    fn stable_constructor_prototype_rejects_proto_chain_mutation() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            C.prototype.__proto__ = {};
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let stable = super::structurally_proven_stable_constructor_prototypes(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        );
+        assert!(stable.is_empty());
+    }
+
+    #[test]
+    fn lookup_target_rejects_static_proto_chain_mutation() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            C.prototype.__proto__ = {};
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn lookup_target_rejects_computed_proto_chain_mutation() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.run = function() {};
+            C.prototype["__proto__"] = {};
+        "#;
+        assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
     fn lookup_target_rejects_unresolved_computed_prototype_write() {
         let source = r#"
             const C = function() {};
@@ -2789,6 +2970,38 @@ mod tests {
             unknown({ value: C.prototype });
         "#;
         assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn records_exact_origin_effects_in_evaluation_order() {
+        let source = r#"
+            const C = function() {
+                this.n0 = (this.T = [], 1);
+                unknown(this);
+            };
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let t = flow
+            .member_writes
+            .iter()
+            .find(|write| write.property.as_deref() == Some("T"))
+            .unwrap();
+        let n0 = flow
+            .member_writes
+            .iter()
+            .find(|write| write.property.as_deref() == Some("n0"))
+            .unwrap();
+        let exposure = flow
+            .exposures
+            .iter()
+            .find(|exposure| exposure.kind == "call_argument")
+            .unwrap();
+        assert!(t.evaluation_order < n0.evaluation_order);
+        assert!(n0.evaluation_order < exposure.evaluation_order);
     }
 
     #[test]

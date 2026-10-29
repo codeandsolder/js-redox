@@ -1,16 +1,22 @@
 use anyhow::{Context, Result};
 use jsvm_lift::cfg_order::prove_event_before_barriers;
-use jsvm_lift::receiver_identity::{
-    structurally_matched_prototype_method_calls, structurally_proven_origin_flow,
-    structurally_proven_prototype_method_lookup_targets,
-    structurally_proven_prototype_method_receiver_effects,
+use jsvm_lift::{
+    receiver_identity::{
+        structurally_matched_prototype_method_calls, structurally_proven_origin_flow,
+        structurally_proven_prototype_method_lookup_targets,
+        structurally_proven_prototype_method_receiver_effects,
+    },
+    state_flatten::{
+        prove_function_if_ladder_event_unreachable_with_integer_parameters,
+        prove_function_switch_event_unreachable_with_integer_parameters,
+    },
 };
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{SourceType, Span};
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::{json, Value};
-use std::{env, fs, path::PathBuf};
+use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 fn snippet(source: &str, start: u32, end: u32) -> String {
     source
@@ -55,11 +61,13 @@ fn main() -> Result<()> {
             json!({
                 "call_start": call.call_start,
                 "call_end": call.call_end,
+                "evaluation_order": call.evaluation_order,
                 "call": snippet(&source, call.call_start, call.call_end),
                 "caller_function": [call.caller.function_start, call.caller.function_end],
                 "caller_context": {"this_origin": call.caller.this_origin, "parameter_indices": call.caller.parameter_indices},
                 "callee_function": [call.callee.function_start, call.callee.function_end],
                 "callee_context": {"this_origin": call.callee.this_origin, "parameter_indices": call.callee.parameter_indices},
+                "arguments": call.argument_spans.iter().zip(&call.exact_integer_arguments).map(|((start, end), exact_integer)| json!({"start": start, "end": end, "source": snippet(&source, *start, *end), "exact_integer": exact_integer})).collect::<Vec<_>>(),
                 "allocation": [call.caller.allocation_start, call.caller.allocation_end],
             })
         })
@@ -71,6 +79,7 @@ fn main() -> Result<()> {
             json!({
                 "call_start": call.call_start,
                 "call_end": call.call_end,
+                "evaluation_order": call.evaluation_order,
                 "call": snippet(&source, call.call_start, call.call_end),
                 "function": [call.context.function_start, call.context.function_end],
                 "context": {"this_origin": call.context.this_origin, "parameter_indices": call.context.parameter_indices},
@@ -87,6 +96,7 @@ fn main() -> Result<()> {
             json!({
                 "write_start": write.write_start,
                 "write_end": write.write_end,
+                "evaluation_order": write.evaluation_order,
                 "write": snippet(&source, write.write_start, write.write_end),
                 "function": [write.context.function_start, write.context.function_end],
                 "context": {"this_origin": write.context.this_origin, "parameter_indices": write.context.parameter_indices},
@@ -103,6 +113,7 @@ fn main() -> Result<()> {
             json!({
                 "start": exposure.exposure_start,
                 "end": exposure.exposure_end,
+                "evaluation_order": exposure.evaluation_order,
                 "expression": snippet(&source, exposure.exposure_start, exposure.exposure_end),
                 "function": [exposure.context.function_start, exposure.context.function_end],
                 "context": {"this_origin": exposure.context.this_origin, "parameter_indices": exposure.context.parameter_indices},
@@ -139,6 +150,89 @@ fn main() -> Result<()> {
             })
         })
         .collect::<Vec<_>>();
+
+    let mut direct_call_exposure_checks = Vec::new();
+    for call in &flow.direct_calls {
+        let bindings = call
+            .exact_integer_arguments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.map(|value| (index, value)))
+            .collect::<BTreeMap<_, _>>();
+        for exposure in &flow.exposures {
+            if exposure.context != call.callee {
+                continue;
+            }
+            let event = oxc_span::Span::new(exposure.exposure_start, exposure.exposure_end);
+            direct_call_exposure_checks.push(json!({
+                "call_start": call.call_start,
+                "callee_function": [call.callee.function_start, call.callee.function_end],
+                "exposure_start": exposure.exposure_start,
+                "exposure_kind": exposure.kind,
+                "exact_integer_bindings": bindings,
+                "unreachable_under_exact_integer_bindings":
+                    prove_function_if_ladder_event_unreachable_with_integer_parameters(
+                        &source,
+                        &parsed.program,
+                        scoping,
+                        call.callee.function_start,
+                        call.callee.function_end,
+                        event,
+                        &bindings,
+                    ) || prove_function_switch_event_unreachable_with_integer_parameters(
+                        &parsed.program,
+                        scoping,
+                        call.callee.function_start,
+                        call.callee.function_end,
+                        event,
+                        &bindings,
+                    ),
+            }));
+        }
+    }
+
+    let mut direct_call_nested_call_checks = Vec::new();
+    for parent in &flow.direct_calls {
+        let bindings = parent
+            .exact_integer_arguments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.map(|value| (index, value)))
+            .collect::<BTreeMap<_, _>>();
+        if bindings.is_empty() {
+            continue;
+        }
+        for nested in &flow.direct_calls {
+            if nested.caller != parent.callee {
+                continue;
+            }
+            let event = oxc_span::Span::new(nested.call_start, nested.call_end);
+            let unreachable = prove_function_if_ladder_event_unreachable_with_integer_parameters(
+                &source,
+                &parsed.program,
+                scoping,
+                parent.callee.function_start,
+                parent.callee.function_end,
+                event,
+                &bindings,
+            ) || prove_function_switch_event_unreachable_with_integer_parameters(
+                &parsed.program,
+                scoping,
+                parent.callee.function_start,
+                parent.callee.function_end,
+                event,
+                &bindings,
+            );
+            direct_call_nested_call_checks.push(json!({
+                "parent_call_start": parent.call_start,
+                "parent_callee_function": [parent.callee.function_start, parent.callee.function_end],
+                "nested_call_start": nested.call_start,
+                "nested_callee_function": [nested.callee.function_start, nested.callee.function_end],
+                "exact_integer_bindings": bindings,
+                "unreachable_under_exact_integer_bindings": unreachable,
+            }));
+        }
+    }
 
     let candidates = matched
         .iter()
@@ -228,6 +322,8 @@ fn main() -> Result<()> {
             "member_calls": member_calls,
             "member_writes": member_writes,
             "exposures": exposures,
+            "direct_call_exposure_checks": direct_call_exposure_checks,
+            "direct_call_nested_call_checks": direct_call_nested_call_checks,
             "prototype_lookup_targets": lookup_targets,
         "prototype_receiver_effects": receiver_effects,
         "prototype_method_call_candidates": candidates,
