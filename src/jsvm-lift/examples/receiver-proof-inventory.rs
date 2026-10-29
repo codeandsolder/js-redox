@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use jsvm_lift::cfg_order::prove_event_before_barriers;
 use jsvm_lift::receiver_identity::{
-    proven_origin_direct_call_event_unreachable, structurally_matched_prototype_method_calls,
-    structurally_proven_origin_flow, structurally_proven_own_data_field_initializations,
+    propagate_matched_prototype_method_call_origins, proven_origin_direct_call_event_unreachable,
+    structurally_matched_prototype_method_calls, structurally_proven_origin_flow,
+    structurally_proven_own_data_field_initializations,
     structurally_proven_own_data_fields_at_member_calls,
     structurally_proven_prototype_method_lookup_targets,
     structurally_proven_prototype_method_receiver_effects,
@@ -60,6 +61,90 @@ fn main() -> Result<()> {
             &parsed.program,
             scoping,
         );
+    let matched_method_origin_flows = matched
+        .iter()
+        .map(|candidate| {
+            let seeded = propagate_matched_prototype_method_call_origins(
+                &parsed.program,
+                scoping,
+                candidate,
+            );
+            let direct_call_effect_checks = seeded
+                .direct_calls
+                .iter()
+                .map(|call| {
+                    let event_check = |start: u32, end: u32| {
+                        proven_origin_direct_call_event_unreachable(
+                            &source,
+                            &parsed.program,
+                            scoping,
+                            call,
+                            Span::new(start, end),
+                        )
+                    };
+                    json!({
+                        "call": [call.call_start, call.call_end],
+                        "callee_function": [call.callee.function_start, call.callee.function_end],
+                        "exact_integer_arguments": call.exact_integer_arguments,
+                        "member_calls": seeded.member_calls.iter().filter(|event| event.context == call.callee).map(|event| json!({
+                            "span": [event.call_start, event.call_end],
+                            "property": event.property,
+                            "unreachable": event_check(event.call_start, event.call_end),
+                        })).collect::<Vec<_>>(),
+                        "member_writes": seeded.member_writes.iter().filter(|event| event.context == call.callee).map(|event| json!({
+                            "span": [event.write_start, event.write_end],
+                            "property": event.property,
+                            "operation": event.operation,
+                            "unreachable": event_check(event.write_start, event.write_end),
+                        })).collect::<Vec<_>>(),
+                        "exposures": seeded.exposures.iter().filter(|event| event.context == call.callee).map(|event| json!({
+                            "span": [event.exposure_start, event.exposure_end],
+                            "kind": event.kind,
+                            "unreachable": event_check(event.exposure_start, event.exposure_end),
+                        })).collect::<Vec<_>>(),
+                        "nested_direct_calls": seeded.direct_calls.iter().filter(|event| event.caller == call.callee).map(|event| json!({
+                            "span": [event.call_start, event.call_end],
+                            "callee_function": [event.callee.function_start, event.callee.function_end],
+                            "unreachable": event_check(event.call_start, event.call_end),
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "call": [candidate.call.call_start, candidate.call.call_end],
+                "property": candidate.call.property,
+                "direct_call_effect_checks": direct_call_effect_checks,
+                "direct_calls": seeded.direct_calls.iter().map(|call| json!({
+                    "call": [call.call_start, call.call_end],
+                    "caller_function": [call.caller.function_start, call.caller.function_end],
+                    "caller_context": {"this_origin": call.caller.this_origin, "parameter_indices": call.caller.parameter_indices},
+                    "callee_function": [call.callee.function_start, call.callee.function_end],
+                    "callee_context": {"this_origin": call.callee.this_origin, "parameter_indices": call.callee.parameter_indices},
+                    "standard_function_call_semantics_required": call.standard_function_call_semantics_required,
+                    "exact_integer_arguments": call.exact_integer_arguments,
+                })).collect::<Vec<_>>(),
+                "member_calls": seeded.member_calls.iter().map(|call| json!({
+                    "call": [call.call_start, call.call_end],
+                    "function": [call.context.function_start, call.context.function_end],
+                    "context": {"this_origin": call.context.this_origin, "parameter_indices": call.context.parameter_indices},
+                    "property": call.property,
+                })).collect::<Vec<_>>(),
+                "member_writes": seeded.member_writes.iter().map(|write| json!({
+                    "write": [write.write_start, write.write_end],
+                    "function": [write.context.function_start, write.context.function_end],
+                    "context": {"this_origin": write.context.this_origin, "parameter_indices": write.context.parameter_indices},
+                    "property": write.property,
+                    "operation": write.operation,
+                })).collect::<Vec<_>>(),
+                "exposures": seeded.exposures.iter().map(|exposure| json!({
+                    "span": [exposure.exposure_start, exposure.exposure_end],
+                    "function": [exposure.context.function_start, exposure.context.function_end],
+                    "context": {"this_origin": exposure.context.this_origin, "parameter_indices": exposure.context.parameter_indices},
+                    "kind": exposure.kind,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
 
     let direct_calls = flow
         .direct_calls
@@ -357,6 +442,7 @@ fn main() -> Result<()> {
         "own_data_field_initializations": own_data_fields,
         "own_data_fields_at_member_calls": own_data_fields_at_member_calls,
         "receiver_preserving_method_calls": receiver_preserving_method_calls,
+        "matched_method_origin_flows": matched_method_origin_flows,
         "prototype_receiver_effects": receiver_effects,
         "prototype_method_call_candidates": candidates,
         }))?
