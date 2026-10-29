@@ -210,13 +210,14 @@ mod tests {
     use super::salvage_har;
 
     #[test]
-    fn salvage_reports_skipped_complete_entries() {
+    fn salvage_reports_skipped_complete_entries() -> anyhow::Result<()> {
         let raw =
             br#"{"log":{"entries":[{"request":{},"response":{"content":{}}},{"request":{}}]}}"#;
-        let (har, warnings) = salvage_har(raw).expect("one valid HAR entry should be salvageable");
+        let (har, warnings) = salvage_har(raw)?;
 
         assert_eq!(har.log.entries.len(), 1);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("skipping malformed salvaged HAR entry"));
+        Ok(())
     }
 }
