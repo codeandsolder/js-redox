@@ -86,15 +86,6 @@ struct ScanReport {
     embedded: Vec<EmbeddedScanReport>,
 }
 
-fn embedded_hash(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        h ^= u64::from(*byte);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
-}
-
 fn scan_embedded_candidate(
     candidate: EmbeddedCodeCandidate,
     depth: usize,
@@ -110,7 +101,7 @@ fn scan_embedded_candidate(
         if fs::create_dir_all(dir).is_err() {
             return None;
         }
-        let digest = embedded_hash(wrapper.as_bytes());
+        let digest = jsvm_lift::fnv1a64(wrapper.as_bytes());
         let path = dir.join(format!("embedded-{digest:016x}.js"));
         if !path.exists() && fs::write(&path, &wrapper).is_err() {
             return None;
