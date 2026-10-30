@@ -156,12 +156,22 @@ mod tests {
     use serde_json::json;
 
     fn valid_manifest() -> CaptureManifest {
-        serde_json::from_value(json!({
-            "schema": SCHEMA,
-            "source": {"kind": "har", "input": "/capture.har", "har_version": "1.2", "salvaged": false},
-            "pages": [], "resources": [], "inline_scripts": [], "counts": {}
-        }))
-        .expect("test fixture")
+        let mut source_extra = Map::new();
+        source_extra.insert("har_version".into(), Value::String("1.2".into()));
+        CaptureManifest {
+            schema: SCHEMA.into(),
+            source: CaptureSource {
+                kind: "har".into(),
+                input: "/capture.har".into(),
+                salvaged: false,
+                extra: source_extra,
+            },
+            pages: Vec::new(),
+            resources: Vec::new(),
+            inline_scripts: Vec::new(),
+            counts: BTreeMap::new(),
+            extra: Map::new(),
+        }
     }
 
     #[test]
