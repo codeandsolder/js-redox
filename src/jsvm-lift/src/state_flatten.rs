@@ -986,7 +986,11 @@ fn exact_integer_parameter_env(
             .iter()
             .any(|reference_id| scoping.get_reference(*reference_id).is_write())
         {
-            return None;
+            // A mutable exact call argument cannot be assumed to retain its
+            // entry value, but it also must not invalidate unrelated stable
+            // parameter facts. Omit it from the scalar environment; any branch
+            // that actually depends on it will then fail closed as unknown.
+            continue;
         }
         env.insert(identifier.name.to_string(), Scalar::Int(*value));
     }
@@ -5655,6 +5659,39 @@ mod tests {
                 function.end,
                 event,
                 &BTreeMap::from([(0, 14)]),
+            )
+        );
+    }
+
+    #[test]
+    fn structured_branch_keeps_unrelated_stable_exact_parameter() {
+        let source = r#"
+            function f(selector, scratch) {
+                if (selector === 99) target();
+                scratch = 1;
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+        struct FunctionSpan(Option<Span>);
+        impl<'a> Visit<'a> for FunctionSpan {
+            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+                self.0 = Some(function.span);
+            }
+        }
+        let mut function = FunctionSpan(None);
+        function.visit_program(&parsed.program);
+        let function = function.0.unwrap();
+        let start = u32::try_from(source.find("target()").unwrap()).unwrap();
+        assert!(
+            prove_function_structured_branch_event_unreachable_with_integer_parameters(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                Span::new(start, start + 8),
+                &BTreeMap::from([(0, 48), (1, 0)]),
             )
         );
     }
