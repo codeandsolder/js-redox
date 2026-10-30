@@ -87,7 +87,8 @@ pub fn validate_manifest(manifest: &CaptureManifest, label: &str) -> Result<()> 
         let Some(object) = resource.as_object() else {
             bail!("{label}: resources[{index}] must be an object");
         };
-        if object.get("id").and_then(Value::as_u64) != Some(index as u64) {
+        let expected_id = u64::try_from(index).context("resource index does not fit u64")?;
+        if object.get("id").and_then(Value::as_u64) != Some(expected_id) {
             bail!("{label}: resources[{index}].id must equal {index}");
         }
         validate_output_path(
@@ -101,7 +102,9 @@ pub fn validate_manifest(manifest: &CaptureManifest, label: &str) -> Result<()> 
             bail!("{label}: inline_scripts[{index}] must be an object");
         };
         let parent = object.get("parent_resource_id").and_then(Value::as_u64);
-        if parent.is_none_or(|parent| parent >= manifest.resources.len() as u64) {
+        let resource_count =
+            u64::try_from(manifest.resources.len()).context("resource count does not fit u64")?;
+        if parent.is_none_or(|parent| parent >= resource_count) {
             bail!("{label}: inline_scripts[{index}].parent_resource_id is out of range");
         }
         validate_output_path(
