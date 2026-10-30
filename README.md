@@ -37,14 +37,6 @@ scripts/build-jsvm-lift.sh
 
 It uses the machine-pinned Rust 1.99 toolchain, requires the distributed sccache build path, derives build parallelism from live farm capacity, and publishes durable executables under `.cargo-target-nodebug/`. The helper builds the scanner/tooling plus `sourcemap-compose`, `wasm-redox`, and the `fresh-eval` proof helper, and asks Cargo for the workspace target directory rather than assuming a member-local `target/` layout.
 
-## Regression
-
-```sh
-uv run python scripts/benchmark-jsvm-lift.py
-```
-
-The harness asserts structural VM detection for generated/real VM positives, zero confirmed dispatchers for negatives/CFF-only samples, and exact stdout equivalence for generated source/virtualized pairs.
-
 ## Suspicious-structure triage
 
 `sus-scan` is the cheap first-pass structural scanner used to rank code before deeper recovery. General AST-level obfuscation structures live in `src/jsvm-lift/src/bin/sus-scan/structures.rs` rather than being mixed into the scoring collector.
@@ -150,7 +142,7 @@ After a JSON scan:
 
 ```sh
 .cargo-target-nodebug/debug/debug-utils width-consensus work/scans/taobao.jsonl
-uv run python scripts/dump-linked-bytecode.py work/scans/taobao.jsonl
+.cargo-target-nodebug/debug/debug-utils dump-linked-bytecode work/scans/taobao.jsonl
 ```
 
 The bytecode dumper preserves unresolved constant-decoder calls symbolically rather than inventing values.

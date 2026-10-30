@@ -12,6 +12,7 @@ pub mod browser_decode;
 pub mod effect_shape;
 
 pub mod numeric;
+pub mod parse_int;
 
 pub mod pipeline;
 

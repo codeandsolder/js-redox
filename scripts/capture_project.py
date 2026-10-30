@@ -72,9 +72,16 @@ def validate_manifest(raw: object, *, path: Path | None = None) -> CaptureManife
     _require(isinstance(manifest.get("counts"), dict), f"{label}: counts must be an object")
 
     resources = manifest["resources"]
+    resource_ids: set[int] = set()
     for index, resource in enumerate(resources):
         _require(isinstance(resource, dict), f"{label}: resources[{index}] must be an object")
-        _require(resource.get("id") == index, f"{label}: resources[{index}].id must equal {index}")
+        resource_id = resource.get("id")
+        _require(
+            isinstance(resource_id, int) and not isinstance(resource_id, bool) and resource_id >= 0,
+            f"{label}: resources[{index}].id must be a non-negative integer",
+        )
+        _require(resource_id not in resource_ids, f"{label}: duplicate resource id {resource_id}")
+        resource_ids.add(resource_id)
         output_path = resource.get("output_path")
         if output_path is not None:
             parsed = _project_relative_path(output_path, f"{label}: resources[{index}].output_path")
@@ -83,7 +90,10 @@ def validate_manifest(raw: object, *, path: Path | None = None) -> CaptureManife
     for index, script in enumerate(manifest["inline_scripts"]):
         _require(isinstance(script, dict), f"{label}: inline_scripts[{index}] must be an object")
         parent = script.get("parent_resource_id")
-        _require(isinstance(parent, int) and not isinstance(parent, bool) and 0 <= parent < len(resources), f"{label}: inline_scripts[{index}].parent_resource_id is out of range")
+        _require(
+            isinstance(parent, int) and not isinstance(parent, bool) and parent in resource_ids,
+            f"{label}: inline_scripts[{index}].parent_resource_id does not name a resource",
+        )
         output_path = script.get("output_path")
         if output_path is not None:
             parsed = _project_relative_path(output_path, f"{label}: inline_scripts[{index}].output_path")

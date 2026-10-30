@@ -1,3 +1,6 @@
+#[path = "debug-utils/bytecode.rs"]
+mod bytecode;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use regex::Regex;
@@ -34,6 +37,28 @@ enum Command {
         batch_json: PathBuf,
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+    /// Inspect linked decoder streams in scanner JSON output.
+    DumpLinkedBytecode {
+        jsonl: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        instructions: usize,
+        #[arg(long)]
+        max_decoders: Option<usize>,
+        #[arg(long)]
+        builder_start: Option<u64>,
+        #[arg(long = "all")]
+        include_all: bool,
+    },
+    /// Extract normalized linked bytecode streams from a JavaScript source.
+    ExtractLinkedStreams {
+        file: PathBuf,
+        #[arg(long)]
+        scanner: Option<PathBuf>,
+        #[arg(long = "out")]
+        output: Option<PathBuf>,
+        #[arg(long, default_value_t = 12)]
+        preview: usize,
     },
 }
 
@@ -428,6 +453,27 @@ fn main() -> Result<()> {
         } => compare_opcode_maps(&rust_json, &decoder_id, &js_routes),
         Command::SemanticDictionary { batch_json, output } => {
             semantic_dictionary(&batch_json, output.as_deref())
+        }
+        Command::DumpLinkedBytecode {
+            jsonl,
+            instructions,
+            max_decoders,
+            builder_start,
+            include_all,
+        } => bytecode::dump_linked_bytecode(
+            &jsonl,
+            instructions,
+            max_decoders,
+            builder_start,
+            include_all,
+        ),
+        Command::ExtractLinkedStreams {
+            file,
+            scanner,
+            output,
+            preview,
+        } => {
+            bytecode::extract_linked_streams(&file, scanner.as_deref(), output.as_deref(), preview)
         }
     }
 }

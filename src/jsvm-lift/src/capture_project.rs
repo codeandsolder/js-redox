@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -83,13 +83,16 @@ pub fn validate_manifest(manifest: &CaptureManifest, label: &str) -> Result<()> 
         bail!("{label}: source.input must be a non-empty string");
     }
 
+    let mut resource_ids = BTreeSet::new();
     for (index, resource) in manifest.resources.iter().enumerate() {
         let Some(object) = resource.as_object() else {
             bail!("{label}: resources[{index}] must be an object");
         };
-        let expected_id = u64::try_from(index).context("resource index does not fit u64")?;
-        if object.get("id").and_then(Value::as_u64) != Some(expected_id) {
-            bail!("{label}: resources[{index}].id must equal {index}");
+        let Some(resource_id) = object.get("id").and_then(Value::as_u64) else {
+            bail!("{label}: resources[{index}].id must be a non-negative integer");
+        };
+        if !resource_ids.insert(resource_id) {
+            bail!("{label}: duplicate resource id {resource_id}");
         }
         validate_output_path(
             object.get("output_path"),
@@ -102,10 +105,8 @@ pub fn validate_manifest(manifest: &CaptureManifest, label: &str) -> Result<()> 
             bail!("{label}: inline_scripts[{index}] must be an object");
         };
         let parent = object.get("parent_resource_id").and_then(Value::as_u64);
-        let resource_count =
-            u64::try_from(manifest.resources.len()).context("resource count does not fit u64")?;
-        if parent.is_none_or(|parent| parent >= resource_count) {
-            bail!("{label}: inline_scripts[{index}].parent_resource_id is out of range");
+        if parent.is_none_or(|parent| !resource_ids.contains(&parent)) {
+            bail!("{label}: inline_scripts[{index}].parent_resource_id does not name a resource");
         }
         validate_output_path(
             object.get("output_path"),
@@ -194,17 +195,26 @@ mod tests {
         wrong_prefix.resources = vec![json!({"id": 0, "output_path": "src/outside.js"})];
         assert!(validate_manifest(&wrong_prefix, "test").is_err());
 
-        let mut wrong_id = valid_manifest();
-        wrong_id.resources = vec![json!({"id": 1, "output_path": "resources/a.js"})];
-        assert!(validate_manifest(&wrong_id, "test").is_err());
+        let mut sparse_id = valid_manifest();
+        sparse_id.resources = vec![json!({"id": 7, "output_path": "resources/a.js"})];
+        assert!(validate_manifest(&sparse_id, "test").is_ok());
+
+        let mut duplicate_id = valid_manifest();
+        duplicate_id.resources = vec![
+            json!({"id": 7, "output_path": "resources/a.js"}),
+            json!({"id": 7, "output_path": "resources/b.js"}),
+        ];
+        assert!(validate_manifest(&duplicate_id, "test").is_err());
     }
 
     #[test]
     fn rejects_inline_parent_outside_resource_range() {
         let mut manifest = valid_manifest();
-        manifest.resources = vec![json!({"id": 0, "output_path": "resources/a.js"})];
+        manifest.resources = vec![json!({"id": 7, "output_path": "resources/a.js"})];
         manifest.inline_scripts =
-            vec![json!({"parent_resource_id": 9, "output_path": "resources/inline.js"})];
+            vec![json!({"parent_resource_id": 7, "output_path": "resources/inline.js"})];
+        assert!(validate_manifest(&manifest, "test").is_ok());
+        manifest.inline_scripts[0]["parent_resource_id"] = json!(9);
         assert!(validate_manifest(&manifest, "test").is_err());
     }
 }
