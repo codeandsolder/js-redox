@@ -7,6 +7,7 @@ use jsvm_lift::{
         proven_origin_direct_call_event_unreachable, structurally_matched_prototype_method_calls,
         structurally_proven_origin_flow, structurally_proven_own_data_field_initializations,
         structurally_proven_own_data_fields_at_member_calls,
+        structurally_proven_prototype_method_calls_at_runtime,
         structurally_proven_prototype_method_lookup_targets,
         structurally_proven_prototype_method_receiver_effects,
         structurally_proven_receiver_preserving_prototype_method_calls,
@@ -29,10 +30,16 @@ fn snippet(source: &str, start: u32, end: u32) -> String {
 }
 
 fn main() -> Result<()> {
-    let path = env::args_os()
-        .nth(1)
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    let summary = args.iter().any(|arg| arg == "--summary");
+    let runtime_only = args.iter().any(|arg| arg == "--runtime-only");
+    let path = args
+        .iter()
+        .find(|arg| arg.as_os_str() != "--summary" && arg.as_os_str() != "--runtime-only")
         .map(PathBuf::from)
-        .context("usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js>")?;
+        .context(
+            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--runtime-only]",
+        )?;
     let source =
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let allocator = Allocator::default();
@@ -48,10 +55,40 @@ fn main() -> Result<()> {
         .build(&parsed.program);
     anyhow::ensure!(semantic.diagnostics.is_empty(), "semantic diagnostics");
     let scoping = semantic.semantic.scoping();
+    if runtime_only {
+        let runtime_method_calls = structurally_proven_prototype_method_calls_at_runtime(
+            &parsed.program,
+            &semantic.semantic,
+        )
+        .into_iter()
+        .map(|proof| {
+            let candidate = proof.candidate;
+            json!({
+                "call": [candidate.call.call_start, candidate.call.call_end],
+                "property": candidate.call.property,
+                "allocation": [candidate.call.allocation_start, candidate.call.allocation_end],
+                "constructor": [candidate.call.constructor_start, candidate.call.constructor_end],
+                "assignment": [candidate.lookup_target.assignment_start, candidate.lookup_target.assignment_end],
+                "method_functions": candidate.lookup_target.possible_functions.iter().map(|f| [f.function_start, f.function_end]).collect::<Vec<_>>(),
+                "standard_prototype_semantics_required": proof.standard_prototype_semantics_required,
+            })
+        })
+        .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "file": path,
+                "runtime_prototype_method_calls": runtime_method_calls,
+            }))?
+        );
+        return Ok(());
+    }
     let flow = structurally_proven_origin_flow(&parsed.program, scoping);
     let matched = structurally_matched_prototype_method_calls(&parsed.program, scoping);
     let lookup_targets =
         structurally_proven_prototype_method_lookup_targets(&parsed.program, scoping);
+    let runtime_method_calls =
+        structurally_proven_prototype_method_calls_at_runtime(&parsed.program, &semantic.semantic);
     let receiver_effects =
         structurally_proven_prototype_method_receiver_effects(&parsed.program, scoping);
     let own_data_fields =
@@ -67,7 +104,25 @@ fn main() -> Result<()> {
             &parsed.program,
             &semantic.semantic,
         );
-    let matched_method_origin_flows = matched
+    let runtime_method_calls = runtime_method_calls
+        .iter()
+        .map(|proof| {
+            let candidate = &proof.candidate;
+            json!({
+                "call": [candidate.call.call_start, candidate.call.call_end],
+                "property": candidate.call.property,
+                "allocation": [candidate.call.allocation_start, candidate.call.allocation_end],
+                "assignment": [candidate.lookup_target.assignment_start, candidate.lookup_target.assignment_end],
+                "method_functions": candidate.lookup_target.possible_functions.iter().map(|f| [f.function_start, f.function_end]).collect::<Vec<_>>(),
+                "standard_prototype_semantics_required": proof.standard_prototype_semantics_required,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let matched_method_origin_flows = if summary {
+        Vec::new()
+    } else {
+        matched
         .iter()
         .map(|candidate| {
             let seeded = propagate_matched_prototype_method_call_origins(
@@ -161,7 +216,8 @@ fn main() -> Result<()> {
                 })).collect::<Vec<_>>(),
             })
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+    };
 
     let mut own_data_field_entry_dominance = Vec::new();
     for field in &own_data_fields {
@@ -498,6 +554,7 @@ fn main() -> Result<()> {
         "own_data_field_entry_dominance": own_data_field_entry_dominance,
         "own_data_fields_at_member_calls": own_data_fields_at_member_calls,
         "receiver_preserving_method_calls": receiver_preserving_method_calls,
+        "runtime_prototype_method_calls": runtime_method_calls,
         "matched_method_origin_flows": matched_method_origin_flows,
         "prototype_receiver_effects": receiver_effects,
         "prototype_method_call_candidates": candidates,
