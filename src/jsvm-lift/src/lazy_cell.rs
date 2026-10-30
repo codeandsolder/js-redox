@@ -1,6 +1,17 @@
 use crate::{
     numeric::{eval_js_bitwise_i64, exact_i64},
-    receiver_identity::{proven_origin_direct_call_event_unreachable, ProvenOriginDirectCall},
+    receiver_identity::{
+        proven_exact_own_data_field_at_direct_call, proven_origin_direct_call_event_unreachable,
+        proven_prototype_string_at_allocation, proven_prototype_string_at_direct_calls,
+        ProvenExactOwnDataFieldAtDirectCall, ProvenOriginDirectCall,
+        ProvenPrototypeStringAtDirectCall,
+    },
+    state_flatten::{
+        prove_function_if_ladder_event_unreachable_with_integer_parameters,
+        prove_function_protected_if_ladder_event_unreachable_with_call_arguments,
+        prove_function_structured_branch_event_unreachable_with_integer_parameters,
+        prove_function_switch_event_unreachable_with_integer_parameters,
+    },
     symbolic_integer::{normalize_integer_polynomial, IntegerPolynomial},
 };
 use oxc_ast::{
@@ -14,7 +25,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, Semantic};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlowLazyCellFactoryShape {
@@ -54,6 +65,13 @@ pub struct ProvenSlowLazyCellFactoryCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenSlowLazyCellStateFields {
+    pub factory_call: ProvenSlowLazyCellFactoryCall,
+    pub prototype_field: ProvenExactOwnDataFieldAtDirectCall,
+    pub method_key: ProvenPrototypeStringAtDirectCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenSlowLazyCellUpdateState {
     pub factory_call: ProvenSlowLazyCellFactoryCall,
     pub initial_state_value: i64,
@@ -78,7 +96,11 @@ pub struct ProvenSlowLazyCellRegistryAssignment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenSlowLazyCellExactRegistryAssignment {
     pub assignment: ProvenSlowLazyCellRegistryAssignment,
+    /// Final direct call into the M-containing installer context.
     pub caller: ProvenOriginDirectCall,
+    /// Exact direct-call chain from the concrete-key root call through any
+    /// forwarding/delegating helpers to `caller`.
+    pub provenance_calls: Vec<ProvenOriginDirectCall>,
     pub exact_key_value: i64,
 }
 
@@ -1263,14 +1285,237 @@ pub fn proven_slow_lazy_cell_registry_assignment(
     Some(proven.clone())
 }
 
-/// Specialize one structural M-style registry assignment to the exact registry
-/// key supplied by each proven invocation of its enclosing installer.
+fn function_parameter_symbols_at(
+    program: &Program<'_>,
+    start: u32,
+    end: u32,
+) -> Option<Vec<SymbolId>> {
+    struct Probe<'o> {
+        start: u32,
+        end: u32,
+        output: &'o mut Option<Vec<SymbolId>>,
+    }
+    impl<'a> Visit<'a> for Probe<'_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if function.span.start == self.start && function.span.end == self.end {
+                *self.output = parameter_symbols(function);
+                return;
+            }
+            walk::walk_function(self, function, flags);
+        }
+    }
+
+    let mut output = None;
+    Probe {
+        start,
+        end,
+        output: &mut output,
+    }
+    .visit_program(program);
+    output
+}
+
+fn call_argument_symbol_at(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    call_start: u32,
+    call_end: u32,
+    argument_index: usize,
+) -> Option<SymbolId> {
+    struct Probe<'c, 'o> {
+        scoping: &'c Scoping,
+        call_start: u32,
+        call_end: u32,
+        argument_index: usize,
+        output: &'o mut Option<Option<SymbolId>>,
+    }
+    impl<'a> Visit<'a> for Probe<'_, '_> {
+        fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+            if self.output.is_some() {
+                return;
+            }
+            if call.span.start == self.call_start && call.span.end == self.call_end {
+                *self.output = Some(
+                    call.arguments
+                        .get(self.argument_index)
+                        .and_then(|argument| argument.as_expression())
+                        .and_then(|expression| reference_symbol(self.scoping, expression)),
+                );
+                return;
+            }
+            walk::walk_call_expression(self, call);
+        }
+    }
+
+    let mut output = None;
+    Probe {
+        scoping,
+        call_start,
+        call_end,
+        argument_index,
+        output: &mut output,
+    }
+    .visit_program(program);
+    output.flatten()
+}
+
+fn event_unreachable_with_integer_parameter(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    function_start: u32,
+    function_end: u32,
+    event: Span,
+    parameter_index: usize,
+    value: i64,
+    provided_argument_count: usize,
+) -> bool {
+    let bindings = BTreeMap::from([(parameter_index, value)]);
+    prove_function_if_ladder_event_unreachable_with_integer_parameters(
+        source,
+        program,
+        scoping,
+        function_start,
+        function_end,
+        event,
+        &bindings,
+    ) || prove_function_switch_event_unreachable_with_integer_parameters(
+        program,
+        scoping,
+        function_start,
+        function_end,
+        event,
+        &bindings,
+    ) || prove_function_structured_branch_event_unreachable_with_integer_parameters(
+        program,
+        scoping,
+        function_start,
+        function_end,
+        event,
+        &bindings,
+    ) || prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
+        source,
+        program,
+        scoping,
+        function_start,
+        function_end,
+        event,
+        provided_argument_count,
+        &bindings,
+    )
+}
+
+fn exact_integer_parameter_provenance(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    flow: &crate::receiver_identity::ProvenOriginFlow,
+    context: &crate::receiver_identity::ProvenOriginContext,
+    symbol: SymbolId,
+    event: Span,
+    visiting: &mut HashSet<(crate::receiver_identity::ProvenOriginContext, SymbolId)>,
+) -> Vec<(i64, Vec<ProvenOriginDirectCall>)> {
+    if !visiting.insert((context.clone(), symbol)) {
+        return Vec::new();
+    }
+    let Some(parameters) =
+        function_parameter_symbols_at(program, context.function_start, context.function_end)
+    else {
+        visiting.remove(&(context.clone(), symbol));
+        return Vec::new();
+    };
+    let indices = parameters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| (*candidate == symbol).then_some(index))
+        .collect::<Vec<_>>();
+    let [parameter_index] = indices.as_slice() else {
+        visiting.remove(&(context.clone(), symbol));
+        return Vec::new();
+    };
+    let function_span = Span::new(context.function_start, context.function_end);
+    let mut proven = Vec::new();
+
+    for incoming in flow
+        .direct_calls
+        .iter()
+        .filter(|call| call.callee == *context)
+    {
+        if proven_origin_direct_call_event_unreachable(
+            source,
+            program,
+            semantic.scoping(),
+            incoming,
+            event,
+        ) || !parameter_binding_preserved_before_event(
+            source,
+            program,
+            semantic,
+            incoming,
+            function_span,
+            symbol,
+            event,
+        ) {
+            continue;
+        }
+        if let Some(value) = incoming
+            .exact_integer_arguments
+            .get(*parameter_index)
+            .copied()
+            .flatten()
+        {
+            proven.push((value, vec![incoming.clone()]));
+            continue;
+        }
+        let Some(parent_symbol) = call_argument_symbol_at(
+            program,
+            semantic.scoping(),
+            incoming.call_start,
+            incoming.call_end,
+            *parameter_index,
+        ) else {
+            continue;
+        };
+        let parent_event = Span::new(incoming.call_start, incoming.call_end);
+        for (value, mut chain) in exact_integer_parameter_provenance(
+            source,
+            program,
+            semantic,
+            flow,
+            &incoming.caller,
+            parent_symbol,
+            parent_event,
+            visiting,
+        ) {
+            if event_unreachable_with_integer_parameter(
+                source,
+                program,
+                semantic.scoping(),
+                context.function_start,
+                context.function_end,
+                event,
+                *parameter_index,
+                value,
+                incoming.argument_spans.len(),
+            ) {
+                continue;
+            }
+            chain.push(incoming.clone());
+            proven.push((value, chain));
+        }
+    }
+
+    visiting.remove(&(context.clone(), symbol));
+    proven
+}
+
+/// Specialize one structural M-style registry assignment to exact registry keys
+/// carried through a proven direct-call parameter chain.
 ///
-/// The nested factory call may be shared by many installer calls with different
-/// keys, so caller-context equality alone is insufficient. This join maps the
-/// assignment key back to one installer parameter and proves that parameter has
-/// no reachable write before the nested factory call for each concrete incoming
-/// direct-call edge.
+/// This supports both direct installers and forwarding/delegating helpers. Each
+/// proof records the exact chain that carries the unchanged key into the
+/// enclosing M-style installer, so downstream handler provenance can use the
+/// same path rather than joining unrelated calls that happen to share a helper.
 #[must_use]
 pub fn proven_slow_lazy_cell_exact_registry_assignments(
     source: &str,
@@ -1280,28 +1525,11 @@ pub fn proven_slow_lazy_cell_exact_registry_assignments(
     assignment: &ProvenSlowLazyCellRegistryAssignment,
 ) -> Vec<ProvenSlowLazyCellExactRegistryAssignment> {
     let caller_context = &assignment.factory_call.call.caller;
-    let mut caller_parameters = None;
-    struct Parameters<'o> {
-        start: u32,
-        end: u32,
-        output: &'o mut Option<Vec<SymbolId>>,
-    }
-    impl<'a> Visit<'a> for Parameters<'_> {
-        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if function.span.start == self.start && function.span.end == self.end {
-                *self.output = parameter_symbols(function);
-                return;
-            }
-            walk::walk_function(self, function, flags);
-        }
-    }
-    Parameters {
-        start: caller_context.function_start,
-        end: caller_context.function_end,
-        output: &mut caller_parameters,
-    }
-    .visit_program(program);
-    let Some(caller_parameters) = caller_parameters else {
+    let Some(caller_parameters) = function_parameter_symbols_at(
+        program,
+        caller_context.function_start,
+        caller_context.function_end,
+    ) else {
         return Vec::new();
     };
     let key_indices = caller_parameters
@@ -1312,51 +1540,52 @@ pub fn proven_slow_lazy_cell_exact_registry_assignments(
     let [key_parameter_index] = key_indices.as_slice() else {
         return Vec::new();
     };
-    let function_span = Span::new(caller_context.function_start, caller_context.function_end);
     let event = Span::new(
         assignment.factory_call.call.call_start,
         assignment.factory_call.call.call_end,
     );
-
-    let mut proven = flow
-        .direct_calls
-        .iter()
-        .filter(|call| call.callee == *caller_context)
-        .filter_map(|call| {
-            let exact_key_value = call
-                .exact_integer_arguments
-                .get(*key_parameter_index)
-                .copied()
-                .flatten()?;
-            if proven_origin_direct_call_event_unreachable(
-                source,
-                program,
-                semantic.scoping(),
-                call,
-                event,
-            ) {
-                return None;
-            }
-            parameter_binding_preserved_before_event(
-                source,
-                program,
-                semantic,
-                call,
-                function_span,
-                assignment.registry_key_symbol,
-                event,
-            )
-            .then(|| ProvenSlowLazyCellExactRegistryAssignment {
-                assignment: assignment.clone(),
-                caller: call.clone(),
-                exact_key_value,
-            })
+    let mut visiting = HashSet::new();
+    let mut proven = exact_integer_parameter_provenance(
+        source,
+        program,
+        semantic,
+        flow,
+        caller_context,
+        assignment.registry_key_symbol,
+        event,
+        &mut visiting,
+    )
+    .into_iter()
+    .filter_map(|(exact_key_value, provenance_calls)| {
+        let caller = provenance_calls.last()?.clone();
+        if event_unreachable_with_integer_parameter(
+            source,
+            program,
+            semantic.scoping(),
+            caller_context.function_start,
+            caller_context.function_end,
+            event,
+            *key_parameter_index,
+            exact_key_value,
+            caller.argument_spans.len(),
+        ) {
+            return None;
+        }
+        Some(ProvenSlowLazyCellExactRegistryAssignment {
+            assignment: assignment.clone(),
+            caller,
+            provenance_calls,
+            exact_key_value,
         })
-        .collect::<Vec<_>>();
+    })
+    .collect::<Vec<_>>();
     proven.sort_by_key(|proof| {
         (
+            proof
+                .provenance_calls
+                .first()
+                .map_or(u32::MAX, |call| call.call_start),
             proof.caller.call_start,
-            proof.caller.call_end,
             proof.exact_key_value,
         )
     });
@@ -1383,9 +1612,10 @@ fn unique_argument_containing(
 /// Join one exact slow-cell registry assignment to the logical forwarding
 /// install whose original handler feeds the wrapper.
 ///
-/// This proves that the outer install's value parameter reaches the nested
-/// factory handler argument unchanged before the M-style capture event. It does
-/// not yet prove that a later registry read invokes the wrapper's resolver.
+/// Handler identity is carried along the exact same direct-call provenance
+/// chain that established the registry key. Every forwarding step must pass the
+/// current handler parameter directly and preserve that binding until the next
+/// edge; the final installer parameter must be the exact argument captured by M.
 #[must_use]
 pub fn proven_slow_lazy_cell_captured_handler_install(
     source: &str,
@@ -1394,46 +1624,88 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
     exact_assignment: &ProvenSlowLazyCellExactRegistryAssignment,
     install: &crate::registry_identity::ProvenOriginRegistryHandlerInstall,
 ) -> Option<ProvenSlowLazyCellCapturedHandlerInstall> {
-    let caller = &exact_assignment.caller;
-    if (caller.call_start, caller.call_end)
-        != (install.install.call_start, install.install.call_end)
+    let chain = &exact_assignment.provenance_calls;
+    let root = chain.first()?;
+    let final_call = chain.last()?;
+    if final_call != &exact_assignment.caller
+        || (root.call_start, root.call_end)
+            != (install.install.call_start, install.install.call_end)
         || exact_assignment.exact_key_value != install.exact_key
         || exact_assignment.assignment.registry_path != install.install.registry_path
-        || crate::registry_identity::ProvenRegistryObjectOrigin::from(&caller.callee)
+        || crate::registry_identity::ProvenRegistryObjectOrigin::from(&root.callee)
             != install.origin
     {
         return None;
     }
 
-    let handler_parameter_index = unique_argument_containing(
-        &caller.argument_spans,
+    let root_handler_parameter_index = unique_argument_containing(
+        &root.argument_spans,
         install.install.handler_start,
         install.install.handler_end,
     )?;
-    let caller_context = &exact_assignment.assignment.factory_call.call.caller;
-    if caller.callee != *caller_context {
+    let root_parameters = function_parameter_symbols_at(
+        program,
+        root.callee.function_start,
+        root.callee.function_end,
+    )?;
+    let mut current_symbol = *root_parameters.get(root_handler_parameter_index)?;
+    let mut current_context = root.callee.clone();
+    let mut incoming = root.clone();
+
+    for next in chain.iter().skip(1) {
+        if next.caller != current_context {
+            return None;
+        }
+        let event = Span::new(next.call_start, next.call_end);
+        if !parameter_binding_preserved_before_event(
+            source,
+            program,
+            semantic,
+            &incoming,
+            Span::new(current_context.function_start, current_context.function_end),
+            current_symbol,
+            event,
+        ) {
+            return None;
+        }
+        let matching_arguments = (0..next.argument_spans.len())
+            .filter(|index| {
+                call_argument_symbol_at(
+                    program,
+                    semantic.scoping(),
+                    next.call_start,
+                    next.call_end,
+                    *index,
+                ) == Some(current_symbol)
+            })
+            .collect::<Vec<_>>();
+        let [next_parameter_index] = matching_arguments.as_slice() else {
+            return None;
+        };
+        let next_parameters = function_parameter_symbols_at(
+            program,
+            next.callee.function_start,
+            next.callee.function_end,
+        )?;
+        current_symbol = *next_parameters.get(*next_parameter_index)?;
+        current_context = next.callee.clone();
+        incoming = next.clone();
+    }
+
+    let factory_caller = &exact_assignment.assignment.factory_call.call.caller;
+    if current_context != *factory_caller {
         return None;
     }
 
-    let mut caller_parameters = None;
     let mut nested_handler_symbol = None;
     struct Probe<'o> {
-        caller_start: u32,
-        caller_end: u32,
         nested_call_start: u32,
         nested_call_end: u32,
         nested_handler_index: usize,
         scoping: &'o Scoping,
-        caller_parameters: &'o mut Option<Vec<SymbolId>>,
         nested_handler_symbol: &'o mut Option<SymbolId>,
     }
     impl<'a> Visit<'a> for Probe<'_> {
-        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if function.span.start == self.caller_start && function.span.end == self.caller_end {
-                *self.caller_parameters = parameter_symbols(function);
-            }
-            walk::walk_function(self, function, flags);
-        }
         fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
             if call.span.start == self.nested_call_start && call.span.end == self.nested_call_end {
                 *self.nested_handler_symbol = call
@@ -1447,8 +1719,6 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
         }
     }
     Probe {
-        caller_start: caller_context.function_start,
-        caller_end: caller_context.function_end,
         nested_call_start: exact_assignment.assignment.factory_call.call.call_start,
         nested_call_end: exact_assignment.assignment.factory_call.call.call_end,
         nested_handler_index: exact_assignment
@@ -1457,17 +1727,13 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
             .shape
             .handler_parameter_index,
         scoping: semantic.scoping(),
-        caller_parameters: &mut caller_parameters,
         nested_handler_symbol: &mut nested_handler_symbol,
     }
     .visit_program(program);
-    let caller_parameters = caller_parameters?;
-    let caller_handler_symbol = *caller_parameters.get(handler_parameter_index)?;
-    if nested_handler_symbol != Some(caller_handler_symbol) {
+    if nested_handler_symbol != Some(current_symbol) {
         return None;
     }
 
-    let function_span = Span::new(caller_context.function_start, caller_context.function_end);
     let event = Span::new(
         exact_assignment.assignment.factory_call.call.call_start,
         exact_assignment.assignment.factory_call.call.call_end,
@@ -1476,9 +1742,9 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
         source,
         program,
         semantic,
-        caller,
-        function_span,
-        caller_handler_symbol,
+        &incoming,
+        Span::new(factory_caller.function_start, factory_caller.function_end),
+        current_symbol,
         event,
     ) {
         return None;
@@ -1487,8 +1753,8 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
     Some(ProvenSlowLazyCellCapturedHandlerInstall {
         exact_assignment: exact_assignment.clone(),
         install: install.clone(),
-        caller_handler_parameter_index: handler_parameter_index,
-        caller_handler_symbol,
+        caller_handler_parameter_index: root_handler_parameter_index,
+        caller_handler_symbol: current_symbol,
     })
 }
 
@@ -2086,6 +2352,68 @@ pub fn proven_slow_lazy_cell_resolver_index(
     harness.result.flatten()
 }
 
+/// Prove the two state-object facts consumed by slow-cell construction:
+/// the exact prototype-carrier own field is unchanged at this factory call,
+/// and the computed method-key field still has its exact inherited string value.
+///
+/// This theorem deliberately does not interpret the carrier object itself. A
+/// separate object-model proof must establish what the exact carrier value does
+/// when used as the prototype of the newly created cell.
+#[must_use]
+pub fn proven_slow_lazy_cell_state_fields(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    factory_call: &ProvenSlowLazyCellFactoryCall,
+) -> Option<ProvenSlowLazyCellStateFields> {
+    let call = &factory_call.call;
+    let shape = &factory_call.shape;
+    let allocation = Span::new(call.callee.allocation_start, call.callee.allocation_end);
+
+    let string_at_allocation = proven_prototype_string_at_allocation(
+        program,
+        semantic,
+        call.callee.constructor_start,
+        call.callee.constructor_end,
+        allocation,
+        &shape.method_key_field,
+    )?;
+    let mut method_keys =
+        proven_prototype_string_at_direct_calls(source, program, semantic, &string_at_allocation)
+            .into_iter()
+            .filter(|proof| proof.call == *call);
+    let method_key = method_keys.next()?;
+    if method_keys.next().is_some() {
+        return None;
+    }
+
+    let mut prototype_fields = proven_exact_own_data_field_at_direct_call(
+        source,
+        program,
+        semantic,
+        &shape.prototype_field,
+        call,
+    )
+    .into_iter()
+    .filter(|proof| {
+        proof.direct_call == *call
+            && proof.initialization.allocation_start == call.callee.allocation_start
+            && proof.initialization.allocation_end == call.callee.allocation_end
+            && proof.initialization.constructor_start == call.callee.constructor_start
+            && proof.initialization.constructor_end == call.callee.constructor_end
+    });
+    let prototype_field = prototype_fields.next()?;
+    if prototype_fields.next().is_some() {
+        return None;
+    }
+
+    Some(ProvenSlowLazyCellStateFields {
+        factory_call: factory_call.clone(),
+        prototype_field,
+        method_key,
+    })
+}
+
 #[must_use]
 pub fn structurally_proven_slow_lazy_cell_factory_shapes(
     program: &Program<'_>,
@@ -2121,8 +2449,8 @@ mod tests {
         proven_slow_lazy_cell_captured_handler_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
         proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_resolved_handler,
-        proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_update_state,
-        structurally_proven_slow_lazy_cell_factory_shapes,
+        proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_state_fields,
+        proven_slow_lazy_cell_update_state, structurally_proven_slow_lazy_cell_factory_shapes,
     };
     use crate::{
         receiver_identity::structurally_proven_origin_flow,
@@ -2241,6 +2569,60 @@ mod tests {
     }
 
     #[test]
+    fn proves_exact_state_fields_at_slow_cell_factory_call() {
+        let source = r#"
+            let outer_phase;
+            const C = function() {
+                this.base = {};
+                enter(this);
+            };
+            C.prototype.method = "create";
+            function enter(state) {
+                return make(48, 19, 49, state, 7, function handler() {}, 0, 0, 0, 0, 0);
+            }
+            function make(mode, q, y, state, key, handler, capture, s, phase, cell, out) {
+                return (mode | 48) == mode && (
+                    handler = [11, -39, 3, 4, 5, 6, handler, 87],
+                    s = 1,
+                    phase = outer_phase,
+                    cell = Maker[state.method](state.base),
+                    cell[state.method] = function(value) { s = value; },
+                    cell.resolve = function() { return handler[s]; },
+                    out = cell
+                ), out;
+            }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let start = source.find("make(48").expect("factory call") as u32;
+        let call = flow
+            .direct_calls
+            .iter()
+            .find(|call| call.call_start == start)
+            .expect("origin factory call");
+        let factory =
+            proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
+                .expect("slow-cell factory");
+        let fields = proven_slow_lazy_cell_state_fields(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &factory,
+        )
+        .expect("state fields");
+        assert_eq!(fields.method_key.string.assignment.value, "create");
+        assert_eq!(fields.prototype_field.initialization.property, "base");
+    }
+
+    #[test]
     fn proves_exact_slow_cell_update_state_and_selector_capture() {
         let source = r#"
             let outer_phase;
@@ -2312,6 +2694,9 @@ mod tests {
                 return install(state, 1000000, function largeHandler() {});
             }
             function install(state, incoming_key, incoming_handler) {
+                return write(state, incoming_key, incoming_handler);
+            }
+            function write(state, incoming_key, incoming_handler) {
                 return state.T[incoming_key] = make(
                     48, 19, 49, state, incoming_key,
                     incoming_handler, 0, 0, 0, 0, 0, 0

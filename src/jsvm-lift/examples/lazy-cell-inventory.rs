@@ -5,8 +5,8 @@ use jsvm_lift::{
         proven_slow_lazy_cell_captured_handler_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
         proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_resolved_handler,
-        proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_update_state,
-        structurally_proven_slow_lazy_cell_factory_shapes,
+        proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_state_fields,
+        proven_slow_lazy_cell_update_state, structurally_proven_slow_lazy_cell_factory_shapes,
     },
     receiver_identity::structurally_proven_origin_flow,
     registry_identity::proven_origin_registry_handler_installs,
@@ -124,6 +124,14 @@ fn main() -> Result<()> {
             let update = specialized.as_ref().and_then(|factory| {
                 proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, factory)
             });
+            let state_fields = specialized.as_ref().and_then(|factory| {
+                proven_slow_lazy_cell_state_fields(
+                    &source,
+                    &parsed.program,
+                    &semantic.semantic,
+                    factory,
+                )
+            });
             let registry = specialized.as_ref().and_then(|factory| {
                 proven_slow_lazy_cell_registry_assignment(
                     &parsed.program,
@@ -194,6 +202,15 @@ fn main() -> Result<()> {
                 "origin_parameter_indices": call.callee.parameter_indices,
                 "exact_integer_arguments": call.exact_integer_arguments,
                 "specialized": specialized.is_some(),
+                "state_fields": state_fields.as_ref().map(|fields| json!({
+                    "prototype_field": fields.prototype_field.initialization.property,
+                    "prototype_write": [
+                        fields.prototype_field.initialization.write_start,
+                        fields.prototype_field.initialization.write_end,
+                    ],
+                    "method_key_field": fields.method_key.string.assignment.property,
+                    "method_key_value": fields.method_key.string.assignment.value,
+                })),
                 "update": update.as_ref().map(|update| json!({
                     "initial_state_value": update.initial_state_value,
                     "post_update_state_value": update.post_update_state_value,
@@ -211,6 +228,9 @@ fn main() -> Result<()> {
                 })),
                 "exact_registry_assignments": exact_assignments.iter().map(|proof| json!({
                     "caller": [proof.caller.call_start, proof.caller.call_end],
+                    "provenance": proof.provenance_calls.iter().map(|call| {
+                        [call.call_start, call.call_end]
+                    }).collect::<Vec<_>>(),
                     "exact_key_value": proof.exact_key_value,
                 })).collect::<Vec<_>>(),
                 "captured_handlers": captured_handlers.iter().map(|proof| json!({
@@ -252,6 +272,10 @@ fn main() -> Result<()> {
         .filter(|call| call["specialized"] == true)
         .cloned()
         .collect::<Vec<_>>();
+    let state_field_proven_calls = candidate_calls
+        .iter()
+        .filter(|call| !call["state_fields"].is_null())
+        .count();
     let resolver_proven_calls = candidate_calls
         .iter()
         .map(|call| call["resolver_proofs"].as_array().map_or(0, Vec::len))
@@ -282,6 +306,7 @@ fn main() -> Result<()> {
             "candidate_calls": candidate_calls,
             "specialized_calls": specialized_calls,
             "origin_handler_installs": origin_installs.len(),
+            "state_field_proven_calls": state_field_proven_calls,
             "resolver_proven_calls": resolver_proven_calls,
             "resolved_handler_proofs": resolved_handler_proofs,
         }))?
