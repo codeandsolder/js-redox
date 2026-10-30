@@ -1201,6 +1201,18 @@ fn indexed_table_symbols_for_function(
         tables: Vec<SymbolId>,
     }
     impl<'a> Visit<'a> for Probe<'_> {
+        fn visit_function(&mut self, _function: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
+            // Reads inside nested functions do not execute as part of this decoder
+            // invocation and must not contaminate the candidate table set.
+        }
+
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+            // Same boundary as nested function expressions/declarations above.
+        }
+
         fn visit_computed_member_expression(
             &mut self,
             member: &oxc_ast::ast::ComputedMemberExpression<'a>,
