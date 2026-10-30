@@ -46,6 +46,20 @@ impl IntegerPolynomial {
         None
     }
 
+    /// Return the distinct symbol-resolved variables participating in this
+    /// polynomial, sorted by `SymbolId` for stable proof comparisons.
+    #[must_use]
+    pub fn variables(&self) -> Vec<SymbolId> {
+        let mut variables = self
+            .terms
+            .keys()
+            .flat_map(|monomial| monomial.iter().copied())
+            .collect::<Vec<_>>();
+        variables.sort_unstable();
+        variables.dedup();
+        variables
+    }
+
     fn negated(&self) -> Option<Self> {
         let mut terms = BTreeMap::new();
         for (monomial, coefficient) in &self.terms {

@@ -1,3 +1,4 @@
+use crate::symbolic_integer::{normalize_integer_polynomial, IntegerPolynomial};
 use jsvm_safe_core::{exact_u32, string_literal_value};
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, CallExpression, Expression,
@@ -39,6 +40,29 @@ pub struct ProvenRegistryReadCall {
     pub key_start: u32,
     pub key_end: u32,
     pub registry_path: Vec<String>,
+}
+
+/// Structural proof that a registry accessor routes the loaded cell through a
+/// truthiness probe, an update method, and a projected property on the same
+/// symbol. This intentionally does not assign semantics to those properties; a
+/// lazy-cell theorem must separately prove what the cell object does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenLazyRegistryReadCall {
+    pub read: ProvenRegistryReadCall,
+    pub accessor_function_start: u32,
+    pub accessor_function_end: u32,
+    pub cell_assignment_start: u32,
+    pub cell_assignment_end: u32,
+    pub probe_property: String,
+    pub update_property: String,
+    pub projection_property: String,
+    pub selector_start: u32,
+    pub selector_end: u32,
+    /// Key-parameter symbol in the accessor function's semantic scope.
+    pub selector_key_symbol: SymbolId,
+    /// Canonical selector polynomial. It is guaranteed to reference no symbol
+    /// other than `selector_key_symbol` (or none for a constant selector).
+    pub selector_polynomial: IntegerPolynomial,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1801,6 +1825,392 @@ fn registry_accessor_proof(
     .then_some(first)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LazyRegistryAccessorProof {
+    accessor: RegistryAccessorProof,
+    function_start: u32,
+    function_end: u32,
+    cell_assignment_start: u32,
+    cell_assignment_end: u32,
+    probe_property: String,
+    update_property: String,
+    projection_property: String,
+    selector_start: u32,
+    selector_end: u32,
+    selector_key_symbol: SymbolId,
+    selector_polynomial: IntegerPolynomial,
+}
+
+struct RegistryCellAssignmentProbe<'c, 'p> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    boxes: &'p HashSet<SymbolId>,
+    accessor: &'p RegistryAccessorProof,
+    matches: Vec<(SymbolId, u32, u32)>,
+}
+
+impl<'a> Visit<'a> for RegistryCellAssignmentProbe<'_, '_> {
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment.operator.is_assign() {
+            if let (
+                AssignmentTarget::AssignmentTargetIdentifier(target),
+                Expression::ComputedMemberExpression(member),
+            ) = (&assignment.left, &assignment.right)
+            {
+                if !member.optional {
+                    let receiver = parameter_member_path(
+                        self.scoping,
+                        &member.object,
+                        self.parameters,
+                        self.boxes,
+                    );
+                    let key = argument_index_expr(
+                        self.scoping,
+                        &member.expression,
+                        self.parameters,
+                        self.boxes,
+                    );
+                    if receiver.as_ref().is_some_and(|(argument, path)| {
+                        *argument == self.accessor.receiver_argument
+                            && *path == self.accessor.registry_path
+                    }) && key == Some(self.accessor.key_argument)
+                    {
+                        if let Some(symbol) = target.reference_id.get().and_then(|reference_id| {
+                            self.scoping.get_reference(reference_id).symbol_id()
+                        }) {
+                            self.matches
+                                .push((symbol, assignment.span.start, assignment.span.end));
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn static_member_on_symbol(
+    scoping: &Scoping,
+    expression: &Expression<'_>,
+    symbol: SymbolId,
+) -> Option<String> {
+    let Expression::StaticMemberExpression(member) = last_sequence_expression(expression) else {
+        return None;
+    };
+    if member.optional
+        || reference_symbol(scoping, last_sequence_expression(&member.object)) != Some(symbol)
+    {
+        return None;
+    }
+    Some(member.property.name.to_string())
+}
+
+fn static_method_call_on_symbol<'a>(
+    scoping: &Scoping,
+    expression: &'a Expression<'a>,
+    symbol: SymbolId,
+) -> Option<(String, &'a CallExpression<'a>)> {
+    let Expression::CallExpression(call) = last_sequence_expression(expression) else {
+        return None;
+    };
+    if call.optional {
+        return None;
+    }
+    let Expression::StaticMemberExpression(member) = last_sequence_expression(&call.callee) else {
+        return None;
+    };
+    if member.optional
+        || reference_symbol(scoping, last_sequence_expression(&member.object)) != Some(symbol)
+    {
+        return None;
+    }
+    Some((member.property.name.to_string(), call))
+}
+
+fn first_return_expression<'a>(statement: &'a Statement<'a>) -> Option<&'a Expression<'a>> {
+    match statement {
+        Statement::ReturnStatement(ret) => ret.argument.as_ref(),
+        Statement::BlockStatement(block) => {
+            let Statement::ReturnStatement(ret) = block.body.first()? else {
+                return None;
+            };
+            ret.argument.as_ref()
+        }
+        _ => None,
+    }
+}
+
+fn fast_cell_branch_parts(
+    scoping: &Scoping,
+    test: &Expression<'_>,
+    consequent: &Statement<'_>,
+    cell: SymbolId,
+) -> Option<(String, String)> {
+    let probe_property = static_member_on_symbol(scoping, test, cell)?;
+    let return_expression = first_return_expression(consequent)?;
+    let (update_property, call) = static_method_call_on_symbol(scoping, return_expression, cell)?;
+    call.arguments
+        .is_empty()
+        .then_some((probe_property, update_property))
+}
+
+fn one_effect_then_symbol<'a>(
+    scoping: &Scoping,
+    expression: &'a Expression<'a>,
+    symbol: SymbolId,
+) -> Option<&'a Expression<'a>> {
+    let expression = match expression {
+        Expression::ParenthesizedExpression(parenthesized) => &parenthesized.expression,
+        expression => expression,
+    };
+    let Expression::SequenceExpression(sequence) = expression else {
+        return None;
+    };
+    let [effect, value] = sequence.expressions.as_slice() else {
+        return None;
+    };
+    if reference_symbol(scoping, last_sequence_expression(value)) != Some(symbol) {
+        return None;
+    }
+    Some(effect)
+}
+
+fn slow_cell_projection<'a>(
+    scoping: &Scoping,
+    expression: &'a Expression<'a>,
+    cell: SymbolId,
+) -> Option<(String, String, &'a Expression<'a>)> {
+    let expression = match expression {
+        Expression::ParenthesizedExpression(parenthesized) => &parenthesized.expression,
+        expression => expression,
+    };
+    let Expression::StaticMemberExpression(projection) = expression else {
+        return None;
+    };
+    if projection.optional {
+        return None;
+    }
+    let effect = one_effect_then_symbol(scoping, &projection.object, cell)?;
+    let (update_property, call) = static_method_call_on_symbol(scoping, effect, cell)?;
+    let [argument] = call.arguments.as_slice() else {
+        return None;
+    };
+    let selector = argument.as_expression().map(last_sequence_expression)?;
+    Some((
+        update_property,
+        projection.property.name.to_string(),
+        selector,
+    ))
+}
+
+fn function_body_has_dynamic_scope(body: &FunctionBody<'_>) -> bool {
+    #[derive(Default)]
+    struct Probe {
+        dynamic: bool,
+    }
+    impl<'a> Visit<'a> for Probe {
+        fn visit_with_statement(&mut self, _statement: &oxc_ast::ast::WithStatement<'a>) {
+            self.dynamic = true;
+        }
+
+        fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+            if matches!(
+                last_sequence_expression(&call.callee),
+                Expression::Identifier(identifier) if identifier.name.as_str() == "eval"
+            ) {
+                self.dynamic = true;
+            }
+            walk::walk_call_expression(self, call);
+        }
+    }
+
+    let mut probe = Probe::default();
+    probe.visit_function_body(body);
+    probe.dynamic
+}
+
+#[derive(Debug, Clone)]
+struct LazyAccessorFastCandidate {
+    span_start: u32,
+    probe_property: String,
+    update_property: String,
+}
+
+#[derive(Debug, Clone)]
+struct LazyAccessorSlowCandidate {
+    span_start: u32,
+    update_property: String,
+    projection_property: String,
+    selector_start: u32,
+    selector_end: u32,
+    selector_polynomial: IntegerPolynomial,
+}
+
+struct LazyAccessorShapeCollector<'c> {
+    scoping: &'c Scoping,
+    cell: SymbolId,
+    key: SymbolId,
+    after: u32,
+    fast: Vec<LazyAccessorFastCandidate>,
+    slow: Vec<LazyAccessorSlowCandidate>,
+}
+
+impl<'a> Visit<'a> for LazyAccessorShapeCollector<'_> {
+    fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
+        if statement.span.start > self.after {
+            if let Some((probe_property, update_property)) = fast_cell_branch_parts(
+                self.scoping,
+                &statement.test,
+                &statement.consequent,
+                self.cell,
+            ) {
+                self.fast.push(LazyAccessorFastCandidate {
+                    span_start: statement.span.start,
+                    probe_property,
+                    update_property,
+                });
+            }
+        }
+        walk::walk_if_statement(self, statement);
+    }
+
+    fn visit_while_statement(&mut self, statement: &oxc_ast::ast::WhileStatement<'a>) {
+        if statement.span.start > self.after {
+            if let Some((probe_property, update_property)) =
+                fast_cell_branch_parts(self.scoping, &statement.test, &statement.body, self.cell)
+            {
+                self.fast.push(LazyAccessorFastCandidate {
+                    span_start: statement.span.start,
+                    probe_property,
+                    update_property,
+                });
+            }
+        }
+        walk::walk_while_statement(self, statement);
+    }
+
+    fn visit_return_statement(&mut self, statement: &oxc_ast::ast::ReturnStatement<'a>) {
+        if statement.span.start > self.after {
+            if let Some(argument) = statement.argument.as_ref() {
+                if let Some((update_property, projection_property, selector)) =
+                    slow_cell_projection(self.scoping, argument, self.cell)
+                {
+                    if let Some(selector_polynomial) = normalize_integer_polynomial(
+                        selector,
+                        self.scoping,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        &HashSet::new(),
+                    ) {
+                        if selector_polynomial
+                            .variables()
+                            .into_iter()
+                            .all(|symbol| symbol == self.key)
+                        {
+                            self.slow.push(LazyAccessorSlowCandidate {
+                                span_start: statement.span.start,
+                                update_property,
+                                projection_property,
+                                selector_start: selector.span().start,
+                                selector_end: selector.span().end,
+                                selector_polynomial,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_return_statement(self, statement);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn lazy_registry_accessor_proof(
+    scoping: &Scoping,
+    function: &Function<'_>,
+) -> Option<LazyRegistryAccessorProof> {
+    let accessor = registry_accessor_proof(scoping, function)?;
+    let (Some(body), Some(parameters)) = (&function.body, parameter_symbols(function)) else {
+        return None;
+    };
+    if function_body_has_dynamic_scope(body) {
+        return None;
+    }
+    let boxes = argument_boxes(body);
+    let mut assignments = RegistryCellAssignmentProbe {
+        scoping,
+        parameters: &parameters,
+        boxes: &boxes,
+        accessor: &accessor,
+        matches: Vec::new(),
+    };
+    assignments.visit_function_body(body);
+    let [(cell, cell_assignment_start, cell_assignment_end)] = assignments.matches.as_slice()
+    else {
+        return None;
+    };
+    let receiver_symbol = parameters.get(usize::try_from(accessor.receiver_argument).ok()?)?;
+    let key_symbol = parameters.get(usize::try_from(accessor.key_argument).ok()?)?;
+    if cell == receiver_symbol || cell == key_symbol || boxes.contains(cell) {
+        return None;
+    }
+    let write_count = scoping
+        .get_resolved_reference_ids(*cell)
+        .iter()
+        .filter(|reference_id| scoping.get_reference(**reference_id).is_write())
+        .count();
+    if write_count != 1 {
+        return None;
+    }
+
+    let selector_key_symbol = *key_symbol;
+    let mut shapes = LazyAccessorShapeCollector {
+        scoping,
+        cell: *cell,
+        key: selector_key_symbol,
+        after: *cell_assignment_end,
+        fast: Vec::new(),
+        slow: Vec::new(),
+    };
+    shapes.visit_function_body(body);
+    let [fast] = shapes.fast.as_slice() else {
+        return None;
+    };
+    let [slow] = shapes.slow.as_slice() else {
+        return None;
+    };
+    if fast.span_start >= slow.span_start || fast.update_property != slow.update_property {
+        return None;
+    }
+    Some(LazyRegistryAccessorProof {
+        accessor,
+        function_start: function.span.start,
+        function_end: function.span.end,
+        cell_assignment_start: *cell_assignment_start,
+        cell_assignment_end: *cell_assignment_end,
+        probe_property: fast.probe_property.clone(),
+        update_property: fast.update_property.clone(),
+        projection_property: slow.projection_property.clone(),
+        selector_start: slow.selector_start,
+        selector_end: slow.selector_end,
+        selector_key_symbol,
+        selector_polynomial: slow.selector_polynomial.clone(),
+    })
+}
+
 struct RegistryAccessorCollector<'c> {
     scoping: &'c Scoping,
     proofs: HashMap<SymbolId, RegistryAccessorProof>,
@@ -1909,6 +2319,137 @@ pub fn structurally_proven_registry_read_calls(
     calls
         .calls
         .dedup_by_key(|call| (call.call_start, call.call_end));
+    calls.calls
+}
+
+struct LazyRegistryAccessorCollector<'c> {
+    scoping: &'c Scoping,
+    proofs: HashMap<SymbolId, LazyRegistryAccessorProof>,
+}
+
+impl LazyRegistryAccessorCollector<'_> {
+    fn record(&mut self, symbol: SymbolId, function: &Function<'_>) {
+        if let Some(proof) = lazy_registry_accessor_proof(self.scoping, function) {
+            self.proofs.insert(symbol, proof);
+        }
+    }
+}
+
+impl<'a> Visit<'a> for LazyRegistryAccessorCollector<'_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some(symbol) = function
+            .id
+            .as_ref()
+            .and_then(|identifier| identifier.symbol_id.get())
+        {
+            self.record(symbol, function);
+        }
+        walk::walk_function(self, function, flags);
+    }
+
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            let Some(Expression::FunctionExpression(function)) = &declarator.init else {
+                continue;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+            self.record(symbol, function);
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
+struct LazyRegistryReadCallCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    proofs: &'p HashMap<SymbolId, LazyRegistryAccessorProof>,
+    calls: Vec<ProvenLazyRegistryReadCall>,
+}
+
+impl<'a> Visit<'a> for LazyRegistryReadCallCollector<'_, '_> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            if let Expression::Identifier(callee) = last_sequence_expression(&call.callee) {
+                if let Some(symbol) = callee
+                    .reference_id
+                    .get()
+                    .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                    .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
+                {
+                    if let Some(proof) = self.proofs.get(&symbol) {
+                        let receiver = usize::try_from(proof.accessor.receiver_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .and_then(|expression| {
+                                stable_receiver_expression(self.scoping, expression)
+                            });
+                        let key = usize::try_from(proof.accessor.key_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .map(last_sequence_expression);
+                        if let (Some(receiver), Some(key)) = (receiver, key) {
+                            self.calls.push(ProvenLazyRegistryReadCall {
+                                read: ProvenRegistryReadCall {
+                                    call_start: call.span.start,
+                                    call_end: call.span.end,
+                                    receiver_start: receiver.span().start,
+                                    receiver_end: receiver.span().end,
+                                    key_start: key.span().start,
+                                    key_end: key.span().end,
+                                    registry_path: proof.accessor.registry_path.clone(),
+                                },
+                                accessor_function_start: proof.function_start,
+                                accessor_function_end: proof.function_end,
+                                cell_assignment_start: proof.cell_assignment_start,
+                                cell_assignment_end: proof.cell_assignment_end,
+                                probe_property: proof.probe_property.clone(),
+                                update_property: proof.update_property.clone(),
+                                projection_property: proof.projection_property.clone(),
+                                selector_start: proof.selector_start,
+                                selector_end: proof.selector_end,
+                                selector_key_symbol: proof.selector_key_symbol,
+                                selector_polynomial: proof.selector_polynomial.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+/// Find call sites of registry accessors whose loaded cell follows one proven
+/// lazy-accessor shape. The returned selector span belongs to the accessor
+/// function body; callers may feed it into symbolic normalization separately.
+#[must_use]
+pub fn structurally_proven_lazy_registry_read_calls(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenLazyRegistryReadCall> {
+    let mut accessors = LazyRegistryAccessorCollector {
+        scoping,
+        proofs: HashMap::new(),
+    };
+    accessors.visit_program(program);
+    let mut calls = LazyRegistryReadCallCollector {
+        scoping,
+        proofs: &accessors.proofs,
+        calls: Vec::new(),
+    };
+    calls.visit_program(program);
+    calls
+        .calls
+        .sort_by_key(|call| (call.read.call_start, call.read.call_end));
+    calls
+        .calls
+        .dedup_by_key(|call| (call.read.call_start, call.read.call_end));
     calls.calls
 }
 
@@ -2225,6 +2766,142 @@ mod tests {
         );
         assert_eq!(reads.len(), 2);
         assert_eq!(reads[0].registry_path, vec!["handlers"]);
+    }
+
+    #[test]
+    fn proves_lazy_registry_accessor_shape() {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell) {
+                if (cell = receiver.handlers[key], cell === undefined) throw Error();
+                while (cell.value) { return cell.create(); }
+                return (cell.create(key * key + 3), cell).prototype;
+            }
+            get(state, opcode);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let proven = super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        );
+        assert_eq!(proven.len(), 1);
+        assert_eq!(proven[0].read.registry_path, vec!["handlers"]);
+        assert_eq!(proven[0].probe_property, "value");
+        assert_eq!(proven[0].update_property, "create");
+        assert_eq!(proven[0].projection_property, "prototype");
+        assert_eq!(
+            &source[proven[0].selector_start as usize..proven[0].selector_end as usize],
+            "key * key + 3"
+        );
+        assert_eq!(
+            proven[0].selector_polynomial.variables(),
+            vec![proven[0].selector_key_symbol]
+        );
+    }
+
+    #[test]
+    fn lazy_registry_accessor_rejects_selector_with_extra_symbol() {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell, salt) {
+                cell = receiver.handlers[key];
+                if (cell.value) return cell.create();
+                return (cell.create(key + salt), cell).prototype;
+            }
+            get(state, opcode, null, runtimeSalt);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn lazy_registry_accessor_rejects_multiple_slow_projections() {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell) {
+                cell = receiver.handlers[key];
+                if (cell.value) return cell.create();
+                if (flag) return (cell.create(key), cell).prototype;
+                return (cell.create(key + 1), cell).prototype;
+            }
+            get(state, opcode);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn lazy_registry_accessor_rejects_dynamic_scope() {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell) {
+                cell = receiver.handlers[key];
+                eval("cell = other");
+                if (cell.value) return cell.create();
+                return (cell.create(key), cell).prototype;
+            }
+            get(state, opcode);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn lazy_registry_accessor_rejects_mismatched_update_method() {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell) {
+                cell = receiver.handlers[key];
+                if (cell.value) return cell.fast();
+                return (cell.slow(key), cell).prototype;
+            }
+            get(state, opcode);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn lazy_registry_accessor_rejects_cell_reassignment() {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell) {
+                cell = receiver.handlers[key];
+                cell = other;
+                if (cell.value) return cell.create();
+                return (cell.create(key), cell).prototype;
+            }
+            get(state, opcode);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .is_empty());
     }
 
     #[test]
