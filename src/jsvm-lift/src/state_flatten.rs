@@ -841,6 +841,68 @@ fn prove_machine_states_before_event(
     })
 }
 
+fn prove_machine_states_before_event_with_integer_bindings(
+    machine: &IfLadderStateMachineCandidate,
+    body: &Statement<'_>,
+    required_states: &[u64],
+    event: Span,
+    bindings: &BTreeMap<String, i64>,
+) -> bool {
+    if required_states.is_empty() {
+        return false;
+    }
+    let Some(event_state) = branch_state_for_span(body, &machine.state_var, event) else {
+        return false;
+    };
+    let Ok(init_state) = i64::try_from(machine.init_state) else {
+        return false;
+    };
+    let mut env = bindings
+        .iter()
+        .map(|(name, value)| (name.clone(), Scalar::Int(*value)))
+        .collect::<HashMap<_, _>>();
+    env.insert(machine.state_var.clone(), Scalar::Int(init_state));
+    let mut seen = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+
+    for _ in 0..256 {
+        let Some(Scalar::Int(state_i64)) = env.get(&machine.state_var).copied() else {
+            return false;
+        };
+        let Ok(state) = u64::try_from(state_i64) else {
+            return false;
+        };
+        visited.insert(state);
+        if state == event_state {
+            return required_states
+                .iter()
+                .all(|required| visited.contains(required));
+        }
+        if state == machine.exit_state || !seen.insert(state) {
+            return false;
+        }
+
+        let before = env.get(&machine.state_var).copied();
+        let mut semantic = Vec::new();
+        let mut ambiguous_envs = Vec::new();
+        match exec_statement(
+            body,
+            "",
+            &machine.state_var,
+            &mut env,
+            &mut semantic,
+            &mut ambiguous_envs,
+        ) {
+            ExecStatus::Return | ExecStatus::Throw => return false,
+            ExecStatus::Break | ExecStatus::Normal => {}
+        }
+        if env.get(&machine.state_var).copied() == before {
+            return false;
+        }
+    }
+    false
+}
+
 fn prove_machine_event_unreachable_with_integer_bindings(
     machine: &IfLadderStateMachineCandidate,
     body: &Statement<'_>,
@@ -1776,17 +1838,71 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
     event: Span,
     parameter_bindings: &BTreeMap<usize, i64>,
 ) -> bool {
-    struct FunctionHarness<'s, 'b> {
+    prove_function_if_ladder_goal_with_integer_parameters(
+        source,
+        program,
+        scoping,
+        function_start,
+        function_end,
+        event,
+        parameter_bindings,
+        None,
+    )
+}
+
+/// Prove that exact flattened-machine states dominate `event` for one exact
+/// function invocation described by integer formal-parameter bindings.
+///
+/// Unlike the unconditional state-dominance theorem, this specializes dynamic
+/// state transitions with the supplied call facts. The scalar/control subset,
+/// lexical-safety checks, and fail-closed behavior are identical to the exact
+/// unreachable-event theorem above.
+#[must_use]
+pub fn prove_function_if_ladder_states_before_event_with_integer_parameters(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    function_start: u32,
+    function_end: u32,
+    required_states: &[u64],
+    event: Span,
+    parameter_bindings: &BTreeMap<usize, i64>,
+) -> bool {
+    !required_states.is_empty()
+        && prove_function_if_ladder_goal_with_integer_parameters(
+            source,
+            program,
+            scoping,
+            function_start,
+            function_end,
+            event,
+            parameter_bindings,
+            Some(required_states),
+        )
+}
+
+fn prove_function_if_ladder_goal_with_integer_parameters(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    function_start: u32,
+    function_end: u32,
+    event: Span,
+    parameter_bindings: &BTreeMap<usize, i64>,
+    required_states: Option<&[u64]>,
+) -> bool {
+    struct FunctionHarness<'s, 'b, 'r> {
         source: &'s str,
         function_start: u32,
         function_end: u32,
         event: Span,
         parameter_bindings: &'b BTreeMap<usize, i64>,
+        required_states: Option<&'r [u64]>,
         scoping: &'b Scoping,
         result: Option<bool>,
     }
 
-    impl<'a> Visit<'a> for FunctionHarness<'_, '_> {
+    impl<'a> Visit<'a> for FunctionHarness<'_, '_, '_> {
         fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
             if self.result.is_some() {
                 return;
@@ -1948,14 +2064,15 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
                 return;
             }
 
-            struct MachineCollector<'s, 'b> {
+            struct MachineCollector<'s, 'b, 'r> {
                 source: &'s str,
                 event: Span,
                 bindings: &'b BTreeMap<String, i64>,
+                required_states: Option<&'r [u64]>,
                 matches: usize,
                 result: bool,
             }
-            impl MachineCollector<'_, '_> {
+            impl MachineCollector<'_, '_, '_> {
                 fn scan_statement_list(&mut self, statements: &[Statement<'_>]) {
                     for pair in statements.windows(2) {
                         let [init, Statement::WhileStatement(while_statement)] = pair else {
@@ -1971,17 +2088,30 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
                         };
                         if machine.start <= self.event.start && self.event.end <= machine.end {
                             self.matches += 1;
-                            self.result = prove_machine_event_unreachable_with_integer_bindings(
-                                &machine,
-                                &while_statement.body,
-                                self.event,
-                                self.bindings,
+                            self.result = self.required_states.map_or_else(
+                                || {
+                                    prove_machine_event_unreachable_with_integer_bindings(
+                                        &machine,
+                                        &while_statement.body,
+                                        self.event,
+                                        self.bindings,
+                                    )
+                                },
+                                |required_states| {
+                                    prove_machine_states_before_event_with_integer_bindings(
+                                        &machine,
+                                        &while_statement.body,
+                                        required_states,
+                                        self.event,
+                                        self.bindings,
+                                    )
+                                },
                             );
                         }
                     }
                 }
             }
-            impl<'a> Visit<'a> for MachineCollector<'_, '_> {
+            impl<'a> Visit<'a> for MachineCollector<'_, '_, '_> {
                 fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
                     self.scan_statement_list(&body.statements);
                     walk::walk_function_body(self, body);
@@ -1995,11 +2125,24 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
                     for machine in detected.if_ladder_machines {
                         if machine.start <= self.event.start && self.event.end <= machine.end {
                             self.matches += 1;
-                            self.result = prove_machine_event_unreachable_with_integer_bindings(
-                                &machine,
-                                &statement.body,
-                                self.event,
-                                self.bindings,
+                            self.result = self.required_states.map_or_else(
+                                || {
+                                    prove_machine_event_unreachable_with_integer_bindings(
+                                        &machine,
+                                        &statement.body,
+                                        self.event,
+                                        self.bindings,
+                                    )
+                                },
+                                |required_states| {
+                                    prove_machine_states_before_event_with_integer_bindings(
+                                        &machine,
+                                        &statement.body,
+                                        required_states,
+                                        self.event,
+                                        self.bindings,
+                                    )
+                                },
                             );
                         }
                     }
@@ -2016,6 +2159,7 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
                 source: self.source,
                 event: self.event,
                 bindings: &bindings,
+                required_states: self.required_states,
                 matches: 0,
                 result: false,
             };
@@ -2030,6 +2174,7 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
         function_end,
         event,
         parameter_bindings,
+        required_states,
         scoping,
         result: None,
     };
@@ -5714,6 +5859,63 @@ mod tests {
                 function.span.end,
                 event,
                 &[(0usize, 14i64)].into_iter().collect(),
+            )
+        );
+    }
+
+    #[test]
+    fn exact_parameter_specializer_proves_required_state_before_event() {
+        let source = r#"
+            function helper(j, q) {
+                let out;
+                let state = 88;
+                while (state != 78) {
+                    if (state == 63) return out;
+                    else if (state == 88) state = j;
+                    else if (state == 0) state = q << 2 & 6 ? 80 : 59;
+                    else if (state == 59) state = 80;
+                    else if (state == 80) state = (q | 3) >> 3 >= 2 && (q | 2) >> 5 < 5 ? 48 : 63;
+                    else if (state == 48) { out = build(); state = 63; }
+                }
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let function = parsed
+            .program
+            .body
+            .iter()
+            .find_map(|statement| match statement {
+                Statement::FunctionDeclaration(function) => Some(function),
+                _ => None,
+            })
+            .expect("helper function");
+        let start = u32::try_from(source.find("return out").expect("return event")).unwrap();
+        let event = Span::new(start, start + u32::try_from("return out".len()).unwrap());
+
+        assert!(
+            super::prove_function_if_ladder_states_before_event_with_integer_parameters(
+                source,
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.span.start,
+                function.span.end,
+                &[48],
+                event,
+                &BTreeMap::from([(0, 0), (1, 17)]),
+            )
+        );
+        assert!(
+            !super::prove_function_if_ladder_states_before_event_with_integer_parameters(
+                source,
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.span.start,
+                function.span.end,
+                &[48],
+                event,
+                &BTreeMap::from([(0, 0), (1, 0)]),
             )
         );
     }

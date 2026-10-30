@@ -1,13 +1,16 @@
 use crate::{
+    forwarding_semantics::ProvenLazyRegistryReadCall,
     numeric::{eval_js_bitwise_i64, exact_i64},
     receiver_identity::{
         proven_exact_own_data_field_at_direct_call, proven_origin_direct_call_event_unreachable,
-        proven_prototype_string_at_allocation, proven_prototype_string_at_direct_calls,
-        ProvenExactOwnDataFieldAtDirectCall, ProvenOriginDirectCall,
-        ProvenPrototypeStringAtDirectCall,
+        proven_origin_direct_call_prefix_preserves_exact_property_before_direct_call,
+        proven_origin_direct_call_preserves_exact_property, proven_prototype_string_at_allocation,
+        proven_prototype_string_at_direct_calls, ProvenExactOwnDataFieldAtDirectCall,
+        ProvenOriginDirectCall, ProvenPrototypeStringAtDirectCall,
     },
     state_flatten::{
         prove_function_if_ladder_event_unreachable_with_integer_parameters,
+        prove_function_if_ladder_states_before_event_with_integer_parameters,
         prove_function_protected_if_ladder_event_unreachable_with_call_arguments,
         prove_function_structured_branch_event_unreachable_with_integer_parameters,
         prove_function_switch_event_unreachable_with_integer_parameters,
@@ -17,7 +20,7 @@ use crate::{
 use oxc_ast::{
     ast::{
         ArrayExpressionElement, AssignmentTarget, BindingPattern, Expression, FormalParameter,
-        Function, Program, Statement,
+        Function, ObjectPropertyKind, Program, PropertyKind, Statement,
     },
     AstKind,
 };
@@ -69,6 +72,27 @@ pub struct ProvenSlowLazyCellStateFields {
     pub factory_call: ProvenSlowLazyCellFactoryCall,
     pub prototype_field: ProvenExactOwnDataFieldAtDirectCall,
     pub method_key: ProvenPrototypeStringAtDirectCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenSlowLazyCellPrototypeCarrier {
+    pub state_fields: ProvenSlowLazyCellStateFields,
+    pub helper_function_start: u32,
+    pub helper_function_end: u32,
+    pub helper_call_start: u32,
+    pub helper_call_end: u32,
+    pub helper_create_start: u32,
+    pub helper_create_end: u32,
+    pub getter_function_start: u32,
+    pub getter_function_end: u32,
+    pub object_constructor_symbol: SymbolId,
+    pub method_name: String,
+    pub projection_property: String,
+    pub resolver_property: String,
+    /// Resolving `({}).constructor` to the intrinsic `Object`, interpreting
+    /// `Object.create`, inherited accessors, and getter `this` use ordinary,
+    /// untampered ECMAScript built-in/prototype semantics.
+    pub standard_object_prototype_semantics_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2414,6 +2438,963 @@ pub fn proven_slow_lazy_cell_state_fields(
     })
 }
 
+/// Prove the same slow-cell state facts along one concrete exact-assignment
+/// provenance chain instead of requiring a merged installer context to be
+/// valid for every incoming edge.
+///
+/// The exact `ST` value and inherited method-key string are established at the
+/// concrete root call, then every direct-call edge that carries the same exact
+/// allocation is required to preserve both properties. This is intentionally a
+/// path theorem: unrelated incoming edges to a shared installer do not weaken a
+/// proof for this concrete constructor path.
+#[must_use]
+pub fn proven_slow_lazy_cell_state_fields_for_exact_assignment(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    exact_assignment: &ProvenSlowLazyCellExactRegistryAssignment,
+) -> Option<ProvenSlowLazyCellStateFields> {
+    let factory_call = &exact_assignment.assignment.factory_call;
+    let shape = &factory_call.shape;
+    let chain = &exact_assignment.provenance_calls;
+    let root = chain.first()?;
+    if chain.last()? != &exact_assignment.caller
+        || exact_assignment.caller.callee != factory_call.call.caller
+        || crate::registry_identity::ProvenRegistryObjectOrigin::from(&root.callee)
+            != crate::registry_identity::ProvenRegistryObjectOrigin::from(&factory_call.call.callee)
+    {
+        return None;
+    }
+
+    let allocation = Span::new(root.callee.allocation_start, root.callee.allocation_end);
+    let string_at_allocation = proven_prototype_string_at_allocation(
+        program,
+        semantic,
+        root.callee.constructor_start,
+        root.callee.constructor_end,
+        allocation,
+        &shape.method_key_field,
+    )?;
+    let mut method_keys =
+        proven_prototype_string_at_direct_calls(source, program, semantic, &string_at_allocation)
+            .into_iter()
+            .filter(|proof| proof.call == *root);
+    let method_key = method_keys.next()?;
+    if method_keys.next().is_some() {
+        return None;
+    }
+
+    let mut prototype_fields = proven_exact_own_data_field_at_direct_call(
+        source,
+        program,
+        semantic,
+        &shape.prototype_field,
+        root,
+    )
+    .into_iter()
+    .filter(|proof| {
+        proof.direct_call == *root
+            && proof.initialization.allocation_start == root.callee.allocation_start
+            && proof.initialization.allocation_end == root.callee.allocation_end
+            && proof.initialization.constructor_start == root.callee.constructor_start
+            && proof.initialization.constructor_end == root.callee.constructor_end
+    });
+    let prototype_field = prototype_fields.next()?;
+    if prototype_fields.next().is_some() {
+        return None;
+    }
+
+    let preserves_until = |entry: &ProvenOriginDirectCall, before: &ProvenOriginDirectCall| {
+        proven_origin_direct_call_prefix_preserves_exact_property_before_direct_call(
+            source,
+            program,
+            semantic.scoping(),
+            entry,
+            before,
+            &shape.prototype_field,
+        ) && proven_origin_direct_call_prefix_preserves_exact_property_before_direct_call(
+            source,
+            program,
+            semantic.scoping(),
+            entry,
+            before,
+            &shape.method_key_field,
+        )
+    };
+    for pair in chain.windows(2) {
+        let [entry, before] = pair else {
+            return None;
+        };
+        if !preserves_until(entry, before) {
+            return None;
+        }
+    }
+    if !preserves_until(chain.last()?, &factory_call.call) {
+        return None;
+    }
+
+    Some(ProvenSlowLazyCellStateFields {
+        factory_call: factory_call.clone(),
+        prototype_field,
+        method_key,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct CarrierInitializerShape {
+    helper_symbol: SymbolId,
+    helper_call: Span,
+    exact_integer_arguments: BTreeMap<usize, i64>,
+    method_key_argument_index: usize,
+    getter_argument_index: usize,
+    getter_function: Span,
+}
+
+#[derive(Debug, Clone)]
+struct CarrierHelperShape {
+    function: Span,
+    create_assignment: Span,
+    return_event: Span,
+    create_state: u64,
+    object_constructor_symbol: SymbolId,
+    method_key_parameter_index: usize,
+    descriptor_parameter_index: usize,
+}
+
+fn symbol_binding_has_no_writes(scoping: &Scoping, symbol: SymbolId) -> bool {
+    scoping
+        .get_resolved_reference_ids(symbol)
+        .iter()
+        .all(|reference_id| !scoping.get_reference(*reference_id).is_write())
+}
+
+fn expression_is_empty_ordinary_object(expression: &Expression<'_>) -> bool {
+    matches!(last_sequence_expression(expression), Expression::ObjectExpression(object) if object.properties.is_empty())
+}
+
+fn variable_initializer_is_empty_ordinary_object(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    symbol: SymbolId,
+) -> bool {
+    if !symbol_binding_has_no_writes(scoping, symbol) {
+        return false;
+    }
+    struct Probe {
+        symbol: SymbolId,
+        matches: usize,
+        ordinary: bool,
+    }
+    impl<'a> Visit<'a> for Probe {
+        fn visit_variable_declaration(
+            &mut self,
+            declaration: &oxc_ast::ast::VariableDeclaration<'a>,
+        ) {
+            for declarator in &declaration.declarations {
+                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                    continue;
+                };
+                if identifier.symbol_id.get() != Some(self.symbol) {
+                    continue;
+                }
+                self.matches += 1;
+                self.ordinary = declarator
+                    .init
+                    .as_ref()
+                    .is_some_and(expression_is_empty_ordinary_object);
+            }
+            walk::walk_variable_declaration(self, declaration);
+        }
+    }
+    let mut probe = Probe {
+        symbol,
+        matches: 0,
+        ordinary: false,
+    };
+    probe.visit_program(program);
+    probe.matches == 1 && probe.ordinary
+}
+
+fn symbol_is_ordinary_object_constructor_alias(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    symbol: SymbolId,
+) -> bool {
+    if !symbol_binding_has_no_writes(scoping, symbol) {
+        return false;
+    }
+    struct Probe<'c> {
+        scoping: &'c Scoping,
+        symbol: SymbolId,
+        matches: usize,
+        object_symbol: Option<SymbolId>,
+        direct_object: bool,
+    }
+    impl<'a> Visit<'a> for Probe<'_> {
+        fn visit_variable_declaration(
+            &mut self,
+            declaration: &oxc_ast::ast::VariableDeclaration<'a>,
+        ) {
+            for declarator in &declaration.declarations {
+                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                    continue;
+                };
+                if identifier.symbol_id.get() != Some(self.symbol) {
+                    continue;
+                }
+                self.matches += 1;
+                let Some(Expression::StaticMemberExpression(member)) =
+                    declarator.init.as_ref().map(last_sequence_expression)
+                else {
+                    continue;
+                };
+                if member.optional || member.property.name.as_str() != "constructor" {
+                    continue;
+                }
+                let object = last_sequence_expression(&member.object);
+                if expression_is_empty_ordinary_object(object) {
+                    self.direct_object = true;
+                } else {
+                    self.object_symbol = reference_symbol(self.scoping, object);
+                }
+            }
+            walk::walk_variable_declaration(self, declaration);
+        }
+    }
+    let mut probe = Probe {
+        scoping,
+        symbol,
+        matches: 0,
+        object_symbol: None,
+        direct_object: false,
+    };
+    probe.visit_program(program);
+    probe.matches == 1
+        && (probe.direct_object
+            || probe.object_symbol.is_some_and(|object_symbol| {
+                variable_initializer_is_empty_ordinary_object(program, scoping, object_symbol)
+            }))
+}
+
+fn getter_descriptor_delegate(
+    object: &oxc_ast::ast::ObjectExpression<'_>,
+    resolver_property: &str,
+) -> Option<Span> {
+    let mut getter = None;
+    for item in &object.properties {
+        let ObjectPropertyKind::ObjectProperty(property) = item else {
+            return None;
+        };
+        let name = property.key.static_name()?;
+        if property.computed && property.key.static_name().is_none() {
+            return None;
+        }
+        if name != "get" {
+            continue;
+        }
+        if property.kind != PropertyKind::Init || property.method || property.shorthand {
+            return None;
+        }
+        let Expression::FunctionExpression(function) = last_sequence_expression(&property.value)
+        else {
+            return None;
+        };
+        if function.r#async || function.generator || !function.params.items.is_empty() {
+            return None;
+        }
+        let body = function.body.as_ref()?;
+        let [Statement::ReturnStatement(ret)] = body.statements.as_slice() else {
+            return None;
+        };
+        let Expression::CallExpression(call) =
+            ret.argument.as_ref().map(last_sequence_expression)?
+        else {
+            return None;
+        };
+        if call.optional || !call.arguments.is_empty() {
+            return None;
+        }
+        let Expression::StaticMemberExpression(member) = last_sequence_expression(&call.callee)
+        else {
+            return None;
+        };
+        if member.optional
+            || member.property.name.as_str() != resolver_property
+            || !matches!(
+                last_sequence_expression(&member.object),
+                Expression::ThisExpression(_)
+            )
+        {
+            return None;
+        }
+        if getter.replace(function.span).is_some() {
+            return None;
+        }
+    }
+    getter
+}
+
+fn carrier_initializer_shape(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    initialization: &crate::receiver_identity::ProvenOwnDataFieldInitialization,
+    method_key_field: &str,
+    resolver_property: &str,
+) -> Option<CarrierInitializerShape> {
+    struct Probe<'c, 'o> {
+        scoping: &'c Scoping,
+        span: Span,
+        property: &'o str,
+        method_key_field: &'o str,
+        resolver_property: &'o str,
+        matches: Vec<CarrierInitializerShape>,
+    }
+    impl<'a> Visit<'a> for Probe<'_, '_> {
+        fn visit_assignment_expression(
+            &mut self,
+            assignment: &oxc_ast::ast::AssignmentExpression<'a>,
+        ) {
+            if assignment.span != self.span || !assignment.operator.is_assign() {
+                walk::walk_assignment_expression(self, assignment);
+                return;
+            }
+            let AssignmentTarget::StaticMemberExpression(left) = &assignment.left else {
+                return;
+            };
+            if left.optional || left.property.name.as_str() != self.property {
+                return;
+            }
+            let Some(receiver_symbol) = reference_symbol(self.scoping, &left.object) else {
+                return;
+            };
+            let Expression::CallExpression(call) = last_sequence_expression(&assignment.right)
+            else {
+                return;
+            };
+            if call.optional {
+                return;
+            }
+            let Some(helper_symbol) = reference_symbol(self.scoping, &call.callee) else {
+                return;
+            };
+            let mut exact_integer_arguments = BTreeMap::new();
+            let mut method_keys = Vec::new();
+            let mut getters = Vec::new();
+            for (index, argument) in call.arguments.iter().enumerate() {
+                let Some(expression) = argument.as_expression() else {
+                    continue;
+                };
+                if let Some(value) = exact_static_safe_integer(last_sequence_expression(expression))
+                {
+                    exact_integer_arguments.insert(index, value);
+                }
+                if let Expression::StaticMemberExpression(member) =
+                    last_sequence_expression(expression)
+                {
+                    if !member.optional
+                        && member.property.name.as_str() == self.method_key_field
+                        && reference_symbol(self.scoping, &member.object) == Some(receiver_symbol)
+                    {
+                        method_keys.push(index);
+                    }
+                }
+                if let Expression::ObjectExpression(object) = last_sequence_expression(expression) {
+                    if let Some(getter) = getter_descriptor_delegate(object, self.resolver_property)
+                    {
+                        getters.push((index, getter));
+                    }
+                }
+            }
+            let [method_key_argument_index] = method_keys.as_slice() else {
+                return;
+            };
+            let [(getter_argument_index, getter_function)] = getters.as_slice() else {
+                return;
+            };
+            self.matches.push(CarrierInitializerShape {
+                helper_symbol,
+                helper_call: call.span,
+                exact_integer_arguments,
+                method_key_argument_index: *method_key_argument_index,
+                getter_argument_index: *getter_argument_index,
+                getter_function: *getter_function,
+            });
+        }
+    }
+    let mut probe = Probe {
+        scoping,
+        span: Span::new(initialization.write_start, initialization.write_end),
+        property: &initialization.property,
+        method_key_field,
+        resolver_property,
+        matches: Vec::new(),
+    };
+    probe.visit_program(program);
+    let [shape] = probe.matches.as_slice() else {
+        return None;
+    };
+    Some(shape.clone())
+}
+
+fn descriptor_parameter_for_projection(
+    object: &oxc_ast::ast::ObjectExpression<'_>,
+    scoping: &Scoping,
+    parameters: &[SymbolId],
+    projection_property: &str,
+) -> Option<usize> {
+    let mut matched = None;
+    for item in &object.properties {
+        let ObjectPropertyKind::ObjectProperty(property) = item else {
+            return None;
+        };
+        let Some(name) = property.key.static_name() else {
+            return None;
+        };
+        if property.computed && property.key.static_name().is_none() {
+            return None;
+        }
+        if name != projection_property {
+            continue;
+        }
+        if property.kind != PropertyKind::Init || property.method || property.shorthand {
+            return None;
+        }
+        let symbol = reference_symbol(scoping, &property.value)?;
+        let index = parameters
+            .iter()
+            .position(|parameter| *parameter == symbol)?;
+        if matched.replace(index).is_some() {
+            return None;
+        }
+    }
+    matched
+}
+
+fn helper_state_for_create_event(
+    source: &str,
+    function: &Function<'_>,
+    create: Span,
+    ret: Span,
+) -> Option<u64> {
+    fn equality_state(expression: &Expression<'_>, state_var: &str) -> Option<u64> {
+        let Expression::BinaryExpression(binary) = strip_parentheses(expression) else {
+            return None;
+        };
+        if !matches!(binary.operator.as_str(), "==" | "===") {
+            return None;
+        }
+        let parse = |id: &Expression<'_>, value: &Expression<'_>| {
+            let Expression::Identifier(identifier) = strip_parentheses(id) else {
+                return None;
+            };
+            if identifier.name.as_str() != state_var {
+                return None;
+            }
+            let Expression::NumericLiteral(number) = strip_parentheses(value) else {
+                return None;
+            };
+            u64::try_from(exact_i64(number.value)?).ok()
+        };
+        parse(&binary.left, &binary.right).or_else(|| parse(&binary.right, &binary.left))
+    }
+
+    struct MachineProbe<'s> {
+        source: &'s str,
+        create: Span,
+        ret: Span,
+        states: Vec<u64>,
+    }
+    impl MachineProbe<'_> {
+        fn inspect<'a>(&mut self, statements: &[Statement<'a>]) {
+            for pair in statements.windows(2) {
+                let [init, Statement::WhileStatement(while_statement)] = pair else {
+                    continue;
+                };
+                let Some(machine) = crate::state_flatten::detect_while_state_machine(
+                    self.source,
+                    "lazy-cell-carrier",
+                    init,
+                    while_statement,
+                ) else {
+                    continue;
+                };
+                if !(machine.start <= self.create.start
+                    && self.create.end <= machine.end
+                    && machine.start <= self.ret.start
+                    && self.ret.end <= machine.end)
+                {
+                    continue;
+                }
+                struct GuardProbe<'g> {
+                    state_var: &'g str,
+                    event: Span,
+                    states: Vec<u64>,
+                }
+                impl<'a> Visit<'a> for GuardProbe<'_> {
+                    fn visit_logical_expression(
+                        &mut self,
+                        expression: &oxc_ast::ast::LogicalExpression<'a>,
+                    ) {
+                        if expression.operator.as_str() == "&&"
+                            && expression.right.span().start <= self.event.start
+                            && self.event.end <= expression.right.span().end
+                        {
+                            if let Some(state) = equality_state(&expression.left, self.state_var) {
+                                self.states.push(state);
+                            }
+                        }
+                        walk::walk_logical_expression(self, expression);
+                    }
+                    fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
+                        if statement.consequent.span().start <= self.event.start
+                            && self.event.end <= statement.consequent.span().end
+                        {
+                            if let Some(state) = equality_state(&statement.test, self.state_var) {
+                                self.states.push(state);
+                            }
+                        }
+                        walk::walk_if_statement(self, statement);
+                    }
+                    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                    fn visit_arrow_function_expression(
+                        &mut self,
+                        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                    ) {
+                    }
+                }
+                let mut guard = GuardProbe {
+                    state_var: &machine.state_var,
+                    event: self.create,
+                    states: Vec::new(),
+                };
+                guard.visit_statement(&while_statement.body);
+                if let [state] = guard.states.as_slice() {
+                    self.states.push(*state);
+                }
+            }
+        }
+    }
+    impl<'a> Visit<'a> for MachineProbe<'_> {
+        fn visit_function_body(&mut self, body: &oxc_ast::ast::FunctionBody<'a>) {
+            self.inspect(&body.statements);
+            walk::walk_function_body(self, body);
+        }
+        fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+            self.inspect(&block.body);
+            walk::walk_block_statement(self, block);
+        }
+        fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+        }
+    }
+    let mut probe = MachineProbe {
+        source,
+        create,
+        ret,
+        states: Vec::new(),
+    };
+    if let Some(body) = function.body.as_ref() {
+        probe.visit_function_body(body);
+    }
+    let [state] = probe.states.as_slice() else {
+        return None;
+    };
+    Some(*state)
+}
+
+fn carrier_helper_shape(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    helper_symbol: SymbolId,
+    projection_property: &str,
+) -> Option<CarrierHelperShape> {
+    if !symbol_binding_has_no_writes(scoping, helper_symbol) {
+        return None;
+    }
+    struct Probe<'s, 'c, 'o> {
+        source: &'s str,
+        scoping: &'c Scoping,
+        helper_symbol: SymbolId,
+        projection_property: &'o str,
+        shapes: Vec<CarrierHelperShape>,
+    }
+    impl Probe<'_, '_, '_> {
+        fn analyze(&mut self, function: &Function<'_>) {
+            if function.r#async || function.generator {
+                return;
+            }
+            let Some(parameters) = parameter_symbols(function) else {
+                return;
+            };
+            let Some(body) = function.body.as_ref() else {
+                return;
+            };
+            let mut creates = Vec::new();
+            let mut returns = Vec::new();
+            struct BodyProbe<'c, 'p, 'o> {
+                scoping: &'c Scoping,
+                parameters: &'p [SymbolId],
+                projection_property: &'o str,
+                creates: Vec<(Span, SymbolId, SymbolId, usize, usize)>,
+                returns: Vec<(Span, SymbolId)>,
+            }
+            impl<'a> Visit<'a> for BodyProbe<'_, '_, '_> {
+                fn visit_assignment_expression(
+                    &mut self,
+                    assignment: &oxc_ast::ast::AssignmentExpression<'a>,
+                ) {
+                    if assignment.operator.is_assign() {
+                        if let Some(target) = assignment_symbol(self.scoping, &assignment.left) {
+                            if let Expression::CallExpression(call) =
+                                last_sequence_expression(&assignment.right)
+                            {
+                                if !call.optional && call.arguments.len() == 2 {
+                                    if let Expression::ComputedMemberExpression(callee) =
+                                        last_sequence_expression(&call.callee)
+                                    {
+                                        if !callee.optional {
+                                            if let (Some(constructor), Some(key_symbol)) = (
+                                                reference_symbol(self.scoping, &callee.object),
+                                                reference_symbol(self.scoping, &callee.expression),
+                                            ) {
+                                                if let Some(key_index) = self
+                                                    .parameters
+                                                    .iter()
+                                                    .position(|symbol| *symbol == key_symbol)
+                                                {
+                                                    let base_ok = call
+                                                        .arguments
+                                                        .first()
+                                                        .and_then(|argument| argument.as_expression())
+                                                        .is_some_and(|argument| {
+                                                            matches!(
+                                                                last_sequence_expression(argument),
+                                                                Expression::StaticMemberExpression(member)
+                                                                    if !member.optional
+                                                                        && member.property.name.as_str() == "prototype"
+                                                                        && reference_symbol(self.scoping, &member.object) == Some(constructor)
+                                                            )
+                                                        });
+                                                    let descriptor_index = call
+                                                        .arguments
+                                                        .get(1)
+                                                        .and_then(|argument| argument.as_expression())
+                                                        .and_then(|argument| match last_sequence_expression(argument) {
+                                                            Expression::ObjectExpression(object) => descriptor_parameter_for_projection(
+                                                                object,
+                                                                self.scoping,
+                                                                self.parameters,
+                                                                self.projection_property,
+                                                            ),
+                                                            _ => None,
+                                                        });
+                                                    if base_ok {
+                                                        if let Some(descriptor_index) =
+                                                            descriptor_index
+                                                        {
+                                                            self.creates.push((
+                                                                assignment.span,
+                                                                target,
+                                                                constructor,
+                                                                key_index,
+                                                                descriptor_index,
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    walk::walk_assignment_expression(self, assignment);
+                }
+                fn visit_return_statement(&mut self, ret: &oxc_ast::ast::ReturnStatement<'a>) {
+                    if let Some(symbol) = ret
+                        .argument
+                        .as_ref()
+                        .and_then(|argument| reference_symbol(self.scoping, argument))
+                    {
+                        self.returns.push((ret.span, symbol));
+                    }
+                    walk::walk_return_statement(self, ret);
+                }
+                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                }
+            }
+            let mut probe = BodyProbe {
+                scoping: self.scoping,
+                parameters: &parameters,
+                projection_property: self.projection_property,
+                creates: Vec::new(),
+                returns: Vec::new(),
+            };
+            probe.visit_function_body(body);
+            creates.append(&mut probe.creates);
+            returns.append(&mut probe.returns);
+            let [(create, result_symbol, constructor, key_index, descriptor_index)] =
+                creates.as_slice()
+            else {
+                return;
+            };
+            let return_events = returns
+                .iter()
+                .filter_map(|(span, symbol)| (*symbol == *result_symbol).then_some(*span))
+                .collect::<Vec<_>>();
+            let [return_event] = return_events.as_slice() else {
+                return;
+            };
+            let Some(create_state) =
+                helper_state_for_create_event(self.source, function, *create, *return_event)
+            else {
+                return;
+            };
+            self.shapes.push(CarrierHelperShape {
+                function: function.span,
+                create_assignment: *create,
+                return_event: *return_event,
+                create_state,
+                object_constructor_symbol: *constructor,
+                method_key_parameter_index: *key_index,
+                descriptor_parameter_index: *descriptor_index,
+            });
+        }
+    }
+    impl<'a> Visit<'a> for Probe<'_, '_, '_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if function
+                .id
+                .as_ref()
+                .and_then(|identifier| identifier.symbol_id.get())
+                == Some(self.helper_symbol)
+            {
+                self.analyze(function);
+            }
+            walk::walk_function(self, function, flags);
+        }
+        fn visit_variable_declaration(
+            &mut self,
+            declaration: &oxc_ast::ast::VariableDeclaration<'a>,
+        ) {
+            for declarator in &declaration.declarations {
+                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                    continue;
+                };
+                if identifier.symbol_id.get() != Some(self.helper_symbol) {
+                    continue;
+                }
+                if let Some(Expression::FunctionExpression(function)) = &declarator.init {
+                    self.analyze(function);
+                }
+            }
+            walk::walk_variable_declaration(self, declaration);
+        }
+    }
+    let mut probe = Probe {
+        source,
+        scoping,
+        helper_symbol,
+        projection_property,
+        shapes: Vec::new(),
+    };
+    probe.visit_program(program);
+    let [shape] = probe.shapes.as_slice() else {
+        return None;
+    };
+    Some(shape.clone())
+}
+
+fn slow_cell_object_constructor_symbol(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    factory_call: &ProvenSlowLazyCellFactoryCall,
+) -> Option<SymbolId> {
+    let span = Span::new(
+        factory_call.shape.cell_construction_start,
+        factory_call.shape.cell_construction_end,
+    );
+    let mut matches = Vec::new();
+    struct Probe<'c, 'o> {
+        scoping: &'c Scoping,
+        span: Span,
+        matches: &'o mut Vec<SymbolId>,
+    }
+    impl<'a> Visit<'a> for Probe<'_, '_> {
+        fn visit_assignment_expression(
+            &mut self,
+            assignment: &oxc_ast::ast::AssignmentExpression<'a>,
+        ) {
+            if assignment.span == self.span && assignment.operator.is_assign() {
+                if let Expression::CallExpression(call) =
+                    last_sequence_expression(&assignment.right)
+                {
+                    if let Expression::ComputedMemberExpression(callee) =
+                        last_sequence_expression(&call.callee)
+                    {
+                        if let Some(symbol) = reference_symbol(self.scoping, &callee.object) {
+                            self.matches.push(symbol);
+                        }
+                    }
+                }
+            }
+            walk::walk_assignment_expression(self, assignment);
+        }
+    }
+    Probe {
+        scoping,
+        span,
+        matches: &mut matches,
+    }
+    .visit_program(program);
+    let [symbol] = matches.as_slice() else {
+        return None;
+    };
+    Some(*symbol)
+}
+
+/// Prove that the exact slow-cell prototype carrier routes the lazy accessor's
+/// projected property through an inherited getter to the cell's resolver.
+///
+/// The theorem joins the constructor-time exact `ST` value and method-key
+/// string to the helper that creates `ST`, specializes that helper's flattened
+/// control flow with the exact integer arguments from the initializer, and
+/// requires the M-style factory to use the same Object-constructor alias when it
+/// creates the cell from `ST`. It deliberately records, rather than hides, the
+/// ordinary/untampered built-in Object + prototype + accessor semantics premise.
+#[must_use]
+pub fn proven_slow_lazy_cell_prototype_carrier(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    state_fields: &ProvenSlowLazyCellStateFields,
+    accessor: &ProvenLazyRegistryReadCall,
+) -> Option<ProvenSlowLazyCellPrototypeCarrier> {
+    let scoping = semantic.scoping();
+    let factory_call = &state_fields.factory_call;
+    let shape = &factory_call.shape;
+    let method_name = state_fields.method_key.string.assignment.value.clone();
+    if method_name != accessor.update_property
+        || state_fields.prototype_field.initialization.property != shape.prototype_field
+        || state_fields.method_key.string.assignment.property != shape.method_key_field
+    {
+        return None;
+    }
+    if !proven_origin_direct_call_preserves_exact_property(
+        source,
+        program,
+        scoping,
+        &factory_call.call,
+        &shape.prototype_field,
+    ) || !proven_origin_direct_call_preserves_exact_property(
+        source,
+        program,
+        scoping,
+        &factory_call.call,
+        &shape.method_key_field,
+    ) {
+        return None;
+    }
+
+    let initializer = carrier_initializer_shape(
+        program,
+        scoping,
+        &state_fields.prototype_field.initialization,
+        &shape.method_key_field,
+        &shape.resolver_property,
+    )?;
+    let helper = carrier_helper_shape(
+        source,
+        program,
+        scoping,
+        initializer.helper_symbol,
+        &accessor.projection_property,
+    )?;
+    if initializer.method_key_argument_index != helper.method_key_parameter_index
+        || initializer.getter_argument_index != helper.descriptor_parameter_index
+        || !symbol_binding_has_no_writes(
+            scoping,
+            parameter_symbols_for_span(program, helper.function)?
+                .get(helper.method_key_parameter_index)
+                .copied()?,
+        )
+        || !symbol_binding_has_no_writes(
+            scoping,
+            parameter_symbols_for_span(program, helper.function)?
+                .get(helper.descriptor_parameter_index)
+                .copied()?,
+        )
+        || !prove_function_if_ladder_states_before_event_with_integer_parameters(
+            source,
+            program,
+            scoping,
+            helper.function.start,
+            helper.function.end,
+            &[helper.create_state],
+            helper.return_event,
+            &initializer.exact_integer_arguments,
+        )
+    {
+        return None;
+    }
+
+    let cell_constructor = slow_cell_object_constructor_symbol(program, scoping, factory_call)?;
+    if cell_constructor != helper.object_constructor_symbol
+        || !symbol_is_ordinary_object_constructor_alias(program, scoping, cell_constructor)
+    {
+        return None;
+    }
+
+    Some(ProvenSlowLazyCellPrototypeCarrier {
+        state_fields: state_fields.clone(),
+        helper_function_start: helper.function.start,
+        helper_function_end: helper.function.end,
+        helper_call_start: initializer.helper_call.start,
+        helper_call_end: initializer.helper_call.end,
+        helper_create_start: helper.create_assignment.start,
+        helper_create_end: helper.create_assignment.end,
+        getter_function_start: initializer.getter_function.start,
+        getter_function_end: initializer.getter_function.end,
+        object_constructor_symbol: cell_constructor,
+        method_name,
+        projection_property: accessor.projection_property.clone(),
+        resolver_property: shape.resolver_property.clone(),
+        standard_object_prototype_semantics_required: true,
+    })
+}
+
+fn parameter_symbols_for_span(program: &Program<'_>, span: Span) -> Option<Vec<SymbolId>> {
+    let mut output = None;
+    struct Probe<'o> {
+        span: Span,
+        output: &'o mut Option<Vec<SymbolId>>,
+    }
+    impl<'a> Visit<'a> for Probe<'_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if function.span == self.span {
+                *self.output = parameter_symbols(function);
+                return;
+            }
+            walk::walk_function(self, function, flags);
+        }
+    }
+    Probe {
+        span,
+        output: &mut output,
+    }
+    .visit_program(program);
+    output
+}
+
 #[must_use]
 pub fn structurally_proven_slow_lazy_cell_factory_shapes(
     program: &Program<'_>,
@@ -2448,11 +3429,14 @@ mod tests {
     use super::{
         proven_slow_lazy_cell_captured_handler_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
-        proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_resolved_handler,
-        proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_state_fields,
+        proven_slow_lazy_cell_prototype_carrier, proven_slow_lazy_cell_registry_assignment,
+        proven_slow_lazy_cell_resolved_handler, proven_slow_lazy_cell_resolver_index,
+        proven_slow_lazy_cell_state_fields,
+        proven_slow_lazy_cell_state_fields_for_exact_assignment,
         proven_slow_lazy_cell_update_state, structurally_proven_slow_lazy_cell_factory_shapes,
     };
     use crate::{
+        forwarding_semantics::structurally_proven_lazy_registry_read_calls,
         receiver_identity::structurally_proven_origin_flow,
         registry_identity::proven_origin_registry_handler_installs,
     };
@@ -2620,6 +3604,203 @@ mod tests {
         .expect("state fields");
         assert_eq!(fields.method_key.string.assignment.value, "create");
         assert_eq!(fields.prototype_field.initialization.property, "base");
+    }
+
+    #[test]
+    fn proves_state_fields_along_concrete_forwarding_chain() {
+        let source = r#"
+            let outer_phase;
+            const C = function() {
+                this.base = {};
+                install(this, 7, function handler() {});
+            };
+            C.prototype.method = "create";
+            function install(state, key, handler) {
+                return write(state, key, handler);
+            }
+            function write(state, key, handler) {
+                return state.T[key] = make(
+                    48, 19, 49, state, key, handler, 0, 0, 0, 0, 0
+                );
+            }
+            function make(mode, q, y, state, key, handler, capture, s, phase, cell, out) {
+                return (mode | 48) == mode && (
+                    handler = [11, -39, 3, 4, 5, 6, handler, 87],
+                    s = 1,
+                    phase = outer_phase,
+                    cell = Maker[state.method](state.base),
+                    cell[state.method] = function(value) { s = value; },
+                    cell.resolve = function() { return handler[s]; },
+                    out = cell
+                ), out;
+            }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let start = source
+            .find("make(\n                    48")
+            .expect("factory call") as u32;
+        let call = flow
+            .direct_calls
+            .iter()
+            .find(|call| call.call_start == start)
+            .expect("origin factory call");
+        let factory =
+            proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
+                .expect("slow-cell factory");
+        let registry = proven_slow_lazy_cell_registry_assignment(
+            &parsed.program,
+            &semantic.semantic,
+            &factory,
+        )
+        .expect("registry assignment");
+        let exact = proven_slow_lazy_cell_exact_registry_assignments(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &flow,
+            &registry,
+        )
+        .into_iter()
+        .find(|proof| proof.exact_key_value == 7)
+        .expect("exact assignment");
+        assert_eq!(exact.provenance_calls.len(), 2);
+        let fields = proven_slow_lazy_cell_state_fields_for_exact_assignment(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &exact,
+        )
+        .expect("path state fields");
+        assert_eq!(fields.method_key.string.assignment.value, "create");
+        assert_eq!(fields.prototype_field.initialization.property, "base");
+    }
+
+    #[test]
+    fn proves_object_create_carrier_getter_delegation() {
+        let source = r#"
+            let outer_phase;
+            const Seed = {};
+            const Maker = Seed.constructor;
+            const C = function() {
+                this.base = carrier(0, 17, this.method, {
+                    get: function() { return this.resolve(); }
+                });
+                install(this, 7, function handler() {});
+                run(this);
+            };
+            C.prototype.method = "create";
+            function carrier(j, q, key, descriptor, out, state) {
+                state = 88;
+                while (state != 78) {
+                    if (state == 63) return out;
+                    else if (state == 88) state = j;
+                    else if (state == 0) state = q << 2 & 6 ? 80 : 59;
+                    else if (state == 59) state = 80;
+                    else if (state == 80) state = (q | 3) >> 3 >= 2 && (q | 2) >> 5 < 5 ? 48 : 63;
+                    else if (state == 48) {
+                        out = Maker[key](Maker.prototype, {
+                            stack: descriptor,
+                            prototype: descriptor
+                        });
+                        state = 63;
+                    }
+                }
+            }
+            function install(state, key, handler) {
+                return write(state, key, handler);
+            }
+            function write(state, key, handler) {
+                return state.T[key] = make(
+                    48, 19, 49, state, key, handler, 0, 0, 0, 0, 0
+                );
+            }
+            function make(mode, q, y, state, key, handler, capture, s, phase, cell, out) {
+                return (mode | 48) == mode && (
+                    handler = [11, -39, 3, 4, 5, 6, handler, 87],
+                    s = 1,
+                    phase = outer_phase,
+                    cell = Maker[state.method](state.base),
+                    cell[state.method] = function(value) { s = value; },
+                    cell.resolve = function() { return handler[s]; },
+                    out = cell
+                ), out;
+            }
+            function access(state, key) {
+                let cell;
+                cell = state.T[key];
+                if (cell.value) return cell.create();
+                return (cell.create(key * 5 * key + -39 * key + 23), cell).prototype;
+            }
+            function run(state) { return access(state, 7); }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let scoping = semantic.semantic.scoping();
+        let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+        let start = source
+            .find("make(\n                    48")
+            .expect("factory call") as u32;
+        let call = flow
+            .direct_calls
+            .iter()
+            .find(|call| call.call_start == start)
+            .expect("origin factory call");
+        let factory =
+            proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
+                .expect("slow-cell factory");
+        let registry = proven_slow_lazy_cell_registry_assignment(
+            &parsed.program,
+            &semantic.semantic,
+            &factory,
+        )
+        .expect("registry assignment");
+        let exact = proven_slow_lazy_cell_exact_registry_assignments(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &flow,
+            &registry,
+        )
+        .into_iter()
+        .find(|proof| proof.exact_key_value == 7)
+        .expect("exact assignment");
+        let fields = proven_slow_lazy_cell_state_fields_for_exact_assignment(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &exact,
+        )
+        .expect("path state fields");
+        let reads = structurally_proven_lazy_registry_read_calls(&parsed.program, scoping);
+        let accessor = reads.first().expect("lazy accessor");
+        let carrier = proven_slow_lazy_cell_prototype_carrier(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &fields,
+            accessor,
+        )
+        .expect("prototype carrier");
+        assert_eq!(carrier.method_name, "create");
+        assert_eq!(carrier.projection_property, "prototype");
+        assert_eq!(carrier.resolver_property, "resolve");
+        assert!(carrier.standard_object_prototype_semantics_required);
     }
 
     #[test]

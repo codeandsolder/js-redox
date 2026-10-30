@@ -1491,6 +1491,47 @@ pub fn proven_origin_direct_call_preserves_exact_property(
     )
 }
 
+/// Prove that an exact receiver property keeps its current value from one
+/// exact-origin direct-call entry up to a specific nested direct call.
+///
+/// Unlike the whole-call preservation theorem, effects after `before` are
+/// irrelevant. This is useful for concrete provenance chains through helpers
+/// that may legitimately mutate unrelated state later in the invocation.
+#[must_use]
+pub fn proven_origin_direct_call_prefix_preserves_exact_property_before_direct_call(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    entry: &ProvenOriginDirectCall,
+    before: &ProvenOriginDirectCall,
+    property: &str,
+) -> bool {
+    let flow = structurally_proven_origin_flow(program, scoping);
+    if !flow.direct_calls.contains(entry)
+        || !flow.direct_calls.contains(before)
+        || before.caller != entry.callee
+    {
+        return false;
+    }
+    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
+        .into_iter()
+        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+        .collect::<HashSet<_>>();
+    direct_call_prefix_preserves_field(
+        source,
+        program,
+        scoping,
+        &flow,
+        entry,
+        before.evaluation_order,
+        property,
+        &stable_prototypes,
+        true,
+        &mut HashMap::new(),
+        &mut HashSet::new(),
+    )
+}
+
 fn root_context_segment_preserves_field(
     source: &str,
     program: &Program<'_>,

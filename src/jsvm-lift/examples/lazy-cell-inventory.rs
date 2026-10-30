@@ -4,8 +4,10 @@ use jsvm_lift::{
     lazy_cell::{
         proven_slow_lazy_cell_captured_handler_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
-        proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_resolved_handler,
-        proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_state_fields,
+        proven_slow_lazy_cell_prototype_carrier, proven_slow_lazy_cell_registry_assignment,
+        proven_slow_lazy_cell_resolved_handler, proven_slow_lazy_cell_resolver_index,
+        proven_slow_lazy_cell_state_fields,
+        proven_slow_lazy_cell_state_fields_for_exact_assignment,
         proven_slow_lazy_cell_update_state, structurally_proven_slow_lazy_cell_factory_shapes,
     },
     receiver_identity::structurally_proven_origin_flow,
@@ -151,6 +153,35 @@ fn main() -> Result<()> {
                     )
                 })
                 .unwrap_or_default();
+            let path_state_fields = exact_assignments
+                .iter()
+                .filter_map(|exact_assignment| {
+                    proven_slow_lazy_cell_state_fields_for_exact_assignment(
+                        &source,
+                        &parsed.program,
+                        &semantic.semantic,
+                        exact_assignment,
+                    )
+                    .map(|fields| (exact_assignment.exact_key_value, fields))
+                })
+                .collect::<Vec<_>>();
+            let carrier_proofs = accessor
+                .map(|accessor| {
+                    path_state_fields
+                        .iter()
+                        .filter_map(|(key, fields)| {
+                            proven_slow_lazy_cell_prototype_carrier(
+                                &source,
+                                &parsed.program,
+                                &semantic.semantic,
+                                fields,
+                                accessor,
+                            )
+                            .map(|proof| (*key, proof))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             let mut captured_handlers = Vec::new();
             for exact_assignment in &exact_assignments {
                 for install in &origin_installs {
@@ -232,6 +263,21 @@ fn main() -> Result<()> {
                         [call.call_start, call.call_end]
                     }).collect::<Vec<_>>(),
                     "exact_key_value": proof.exact_key_value,
+                })).collect::<Vec<_>>(),
+                "path_state_fields": path_state_fields.iter().map(|(key, fields)| json!({
+                    "exact_key_value": key,
+                    "prototype_field": fields.prototype_field.initialization.property,
+                    "method_key_value": fields.method_key.string.assignment.value,
+                })).collect::<Vec<_>>(),
+                "carrier_proofs": carrier_proofs.iter().map(|(key, proof)| json!({
+                    "exact_key_value": key,
+                    "method_name": proof.method_name,
+                    "projection_property": proof.projection_property,
+                    "resolver_property": proof.resolver_property,
+                    "helper_call": [proof.helper_call_start, proof.helper_call_end],
+                    "helper_create": [proof.helper_create_start, proof.helper_create_end],
+                    "getter": [proof.getter_function_start, proof.getter_function_end],
+                    "standard_object_prototype_semantics_required": proof.standard_object_prototype_semantics_required,
                 })).collect::<Vec<_>>(),
                 "captured_handlers": captured_handlers.iter().map(|proof| json!({
                     "exact_key_value": proof.exact_assignment.exact_key_value,
