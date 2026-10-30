@@ -4,7 +4,7 @@ use jsvm_lift::{
     cfg_order::prove_events_before_event,
     receiver_identity::{
         propagate_matched_prototype_method_call_origins,
-        propagate_proven_prototype_method_call_origins,
+        propagate_proven_prototype_method_call_origins, proven_exact_own_data_field_at_direct_call,
         proven_origin_direct_call_event_unreachable, proven_own_data_field_at_runtime_method_call,
         proven_prototype_method_receiver_preservation_summary,
         proven_prototype_string_at_allocation, proven_prototype_string_at_direct_calls,
@@ -62,6 +62,12 @@ fn main() -> Result<()> {
             .parse::<u32>()
             .ok()
     });
+    let exact_field_call_start = args.iter().find_map(|arg| {
+        arg.to_str()?
+            .strip_prefix("--exact-field-call-start=")?
+            .parse::<u32>()
+            .ok()
+    });
     let registry_origin_call_start = args.iter().find_map(|arg| {
         arg.to_str()?
             .strip_prefix("--registry-origin-call-start=")?
@@ -76,7 +82,7 @@ fn main() -> Result<()> {
         .find(|arg| !arg.to_string_lossy().starts_with("--"))
         .map(PathBuf::from)
         .context(
-            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--runtime-only] [--preserve-call-start=N] [--fully-preserve-call-start=N] [--field-runtime-call-start=N --field=NAME] [--registry-origin-call-start=N]",
+            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--runtime-only] [--preserve-call-start=N] [--fully-preserve-call-start=N] [--field-runtime-call-start=N --field=NAME] [--exact-field-call-start=N --field=NAME] [--registry-origin-call-start=N]",
         )?;
     let source =
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -93,6 +99,43 @@ fn main() -> Result<()> {
         .build(&parsed.program);
     anyhow::ensure!(semantic.diagnostics.is_empty(), "semantic diagnostics");
     let scoping = semantic.semantic.scoping();
+    if let Some(call_start) = exact_field_call_start {
+        let property = field_property
+            .as_deref()
+            .context("--exact-field-call-start requires --field=NAME")?;
+        let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+        let mut targets = flow
+            .direct_calls
+            .iter()
+            .filter(|call| call.call_start == call_start);
+        let target = targets
+            .next()
+            .context("no exact-origin direct call at requested start")?;
+        anyhow::ensure!(targets.next().is_none(), "ambiguous direct call start");
+        let proofs = proven_exact_own_data_field_at_direct_call(
+            &source,
+            &parsed.program,
+            &semantic.semantic,
+            property,
+            target,
+        )
+        .into_iter()
+        .map(|proof| {
+            json!({
+                "field": proof.initialization.property,
+                "initialization": [proof.initialization.write_start, proof.initialization.write_end],
+                "entry_call": [proof.entry_call.call_start, proof.entry_call.call_end],
+                "entry_callee_function": [proof.entry_call.callee.function_start, proof.entry_call.callee.function_end],
+                "direct_call": [proof.direct_call.call_start, proof.direct_call.call_end],
+                "direct_call_source": snippet(&source, proof.direct_call.call_start, proof.direct_call.call_end),
+                "direct_callee_function": [proof.direct_call.callee.function_start, proof.direct_call.callee.function_end],
+                "allocation": [proof.initialization.allocation_start, proof.initialization.allocation_end],
+            })
+        })
+        .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&proofs)?);
+        return Ok(());
+    }
     if prototype_strings_only {
         let strings = structurally_proven_prototype_string_assignments(&parsed.program, scoping)
             .into_iter()

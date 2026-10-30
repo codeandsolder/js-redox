@@ -1753,6 +1753,102 @@ pub fn structurally_proven_own_data_fields_at_member_calls(
     proven
 }
 
+/// Prove that the exact value written by a fresh ordinary own-data field
+/// initialization is unchanged at one already-proven nested exact-origin
+/// direct call.
+///
+/// The target must itself occur in the structural exact-origin flow. The proof
+/// has two explicit segments:
+/// 1. initialization -> an incoming direct call in the initialization context;
+/// 2. that call's callee entry -> `target`.
+///
+/// Both segments use the same fail-closed exact-property preservation theorem.
+/// The initialization must dominate the incoming call in the semantic CFG.
+#[must_use]
+pub fn proven_exact_own_data_field_at_direct_call(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    property: &str,
+    target: &ProvenOriginDirectCall,
+) -> Vec<ProvenExactOwnDataFieldAtDirectCall> {
+    let scoping = semantic.scoping();
+    let flow = structurally_proven_origin_flow(program, scoping);
+    if !flow.direct_calls.contains(target) {
+        return Vec::new();
+    }
+    let initializations = structurally_proven_own_data_field_initializations(program, scoping);
+    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
+        .into_iter()
+        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+        .collect::<HashSet<_>>();
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    let mut proven = Vec::new();
+
+    for initialization in initializations
+        .iter()
+        .filter(|initialization| initialization.property == property)
+    {
+        for entry in flow.direct_calls.iter().filter(|call| {
+            call.caller == initialization.context
+                && call.callee == target.caller
+                && initialization.evaluation_order < call.evaluation_order
+                && prove_event_completion_before_event(
+                    semantic,
+                    Span::new(initialization.write_start, initialization.write_end),
+                    Span::new(call.call_start, call.call_end),
+                )
+        }) {
+            if !root_context_segment_preserves_field(
+                source,
+                program,
+                scoping,
+                &flow,
+                &initialization.context,
+                initialization.evaluation_order,
+                entry.evaluation_order,
+                &initialization.property,
+                &stable_prototypes,
+                true,
+                &mut memo,
+                &mut visiting,
+            ) {
+                continue;
+            }
+            if direct_call_prefix_preserves_field(
+                source,
+                program,
+                scoping,
+                &flow,
+                entry,
+                target.evaluation_order,
+                &initialization.property,
+                &stable_prototypes,
+                true,
+                &mut memo,
+                &mut visiting,
+            ) {
+                proven.push(ProvenExactOwnDataFieldAtDirectCall {
+                    initialization: initialization.clone(),
+                    entry_call: entry.clone(),
+                    direct_call: target.clone(),
+                });
+            }
+        }
+    }
+
+    proven.sort_by_key(|proof| {
+        (
+            proof.initialization.allocation_start,
+            proof.initialization.write_start,
+            proof.entry_call.call_start,
+        )
+    });
+    proven.dedup();
+    proven
+}
+
 fn collect_unique_direct_call_path(
     flow: &ProvenOriginFlow,
     root: &ProvenOriginContext,
@@ -2504,6 +2600,17 @@ pub struct ProvenOwnDataFieldAtMemberCall {
     pub initialization: ProvenOwnDataFieldInitialization,
     pub entry_call: ProvenOriginDirectCall,
     pub member_call: ProvenMemberReceiverOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenExactOwnDataFieldAtDirectCall {
+    pub initialization: ProvenOwnDataFieldInitialization,
+    /// First exact-origin direct call reached after the initialization in the
+    /// same context.
+    pub entry_call: ProvenOriginDirectCall,
+    /// Nested direct call in `entry_call`'s callee at which the exact field
+    /// value is still proven unchanged.
+    pub direct_call: ProvenOriginDirectCall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5358,6 +5465,107 @@ mod tests {
         );
         assert!(proofs.iter().any(|proof| {
             proof.initialization.property == "field" && proof.member_call.property == "read"
+        }));
+    }
+
+    #[test]
+    fn proves_exact_own_data_field_value_at_nested_direct_call() {
+        let source = r#"
+            const C = function() { init(this); };
+            function init(state) {
+                state.cell = {};
+                install(state);
+            }
+            function install(state) {
+                helper(state);
+            }
+            function helper(state) {}
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        let proofs = {
+            let flow = super::structurally_proven_origin_flow(
+                &parsed.program,
+                semantic.semantic.scoping(),
+            );
+            let target = flow
+                .direct_calls
+                .iter()
+                .find(|call| {
+                    source
+                        .get(call.call_start as usize..call.call_end as usize)
+                        .is_some_and(|call| call == "helper(state)")
+                })
+                .expect("helper call must be in exact-origin flow");
+            super::proven_exact_own_data_field_at_direct_call(
+                source,
+                &parsed.program,
+                &semantic.semantic,
+                "cell",
+                target,
+            )
+        };
+        assert!(proofs.iter().any(|proof| {
+            proof.initialization.property == "cell"
+                && source
+                    .get(proof.direct_call.call_start as usize..proof.direct_call.call_end as usize)
+                    .is_some_and(|call| call == "helper(state)")
+        }));
+    }
+
+    #[test]
+    fn exact_own_data_field_value_rejects_nested_prior_write() {
+        let source = r#"
+            const C = function() { init(this); };
+            function init(state) {
+                state.cell = {};
+                install(state);
+            }
+            function install(state) {
+                state.cell = {};
+                helper(state);
+            }
+            function helper(state) {}
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        let proofs = {
+            let flow = super::structurally_proven_origin_flow(
+                &parsed.program,
+                semantic.semantic.scoping(),
+            );
+            let target = flow
+                .direct_calls
+                .iter()
+                .find(|call| {
+                    source
+                        .get(call.call_start as usize..call.call_end as usize)
+                        .is_some_and(|call| call == "helper(state)")
+                })
+                .expect("helper call must be in exact-origin flow");
+            super::proven_exact_own_data_field_at_direct_call(
+                source,
+                &parsed.program,
+                &semantic.semantic,
+                "cell",
+                target,
+            )
+        };
+        assert!(!proofs.iter().any(|proof| {
+            proof.initialization.property == "cell"
+                && source
+                    .get(proof.direct_call.call_start as usize..proof.direct_call.call_end as usize)
+                    .is_some_and(|call| call == "helper(state)")
         }));
     }
 
