@@ -21,7 +21,14 @@ pub fn sha256_path(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(output)
 }
 
 #[must_use]
