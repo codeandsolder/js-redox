@@ -1,10 +1,15 @@
 use anyhow::{Context, Result};
 use jsvm_lift::{
+    forwarding_semantics::structurally_proven_lazy_registry_read_calls,
     lazy_cell::{
-        proven_slow_lazy_cell_factory_call, proven_slow_lazy_cell_update_state,
+        proven_slow_lazy_cell_captured_handler_install,
+        proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
+        proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_resolved_handler,
+        proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_update_state,
         structurally_proven_slow_lazy_cell_factory_shapes,
     },
     receiver_identity::structurally_proven_origin_flow,
+    registry_identity::proven_origin_registry_handler_installs,
 };
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
@@ -23,10 +28,20 @@ fn snippet(source: &str, start: u32, end: u32) -> String {
 }
 
 fn main() -> Result<()> {
-    let path = env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .context("usage: cargo run -p jsvm-lift --example lazy-cell-inventory -- <file.js>")?;
+    let mut args = env::args_os();
+    let _program = args.next();
+    let path = args.next().map(PathBuf::from).context(
+        "usage: cargo run -p jsvm-lift --example lazy-cell-inventory -- <file.js> [--phase-value=N]",
+    )?;
+    let mut phase_value = None;
+    for argument in args {
+        let argument = argument.to_string_lossy();
+        if let Some(value) = argument.strip_prefix("--phase-value=") {
+            phase_value = Some(value.parse::<i64>().context("invalid phase value")?);
+        } else {
+            anyhow::bail!("unknown argument: {argument}");
+        }
+    }
     let source =
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let allocator = Allocator::default();
@@ -39,6 +54,19 @@ fn main() -> Result<()> {
         .build(&parsed.program);
     anyhow::ensure!(semantic.diagnostics.is_empty(), "semantic diagnostics");
     let scoping = semantic.semantic.scoping();
+
+    let lazy_reads = structurally_proven_lazy_registry_read_calls(&parsed.program, scoping);
+    let accessor = lazy_reads.first().filter(|first| {
+        lazy_reads.iter().all(|read| {
+            read.accessor_function_start == first.accessor_function_start
+                && read.accessor_function_end == first.accessor_function_end
+                && read.read.registry_path.as_slice() == first.read.registry_path.as_slice()
+                && read.update_property == first.update_property
+                && read.projection_property == first.projection_property
+                && read.selector_key_symbol == first.selector_key_symbol
+                && read.selector_polynomial == first.selector_polynomial
+        })
+    });
 
     let shapes = structurally_proven_slow_lazy_cell_factory_shapes(&parsed.program, scoping);
     let shape_json = shapes
@@ -76,6 +104,7 @@ fn main() -> Result<()> {
         .collect::<Vec<_>>();
 
     let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+    let origin_installs = proven_origin_registry_handler_installs(&parsed.program, scoping, &flow);
     let candidate_calls = flow
         .direct_calls
         .iter()
@@ -95,6 +124,66 @@ fn main() -> Result<()> {
             let update = specialized.as_ref().and_then(|factory| {
                 proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, factory)
             });
+            let registry = specialized.as_ref().and_then(|factory| {
+                proven_slow_lazy_cell_registry_assignment(
+                    &parsed.program,
+                    &semantic.semantic,
+                    factory,
+                )
+            });
+            let exact_assignments = registry
+                .as_ref()
+                .map(|registry| {
+                    proven_slow_lazy_cell_exact_registry_assignments(
+                        &source,
+                        &parsed.program,
+                        &semantic.semantic,
+                        &flow,
+                        registry,
+                    )
+                })
+                .unwrap_or_default();
+            let mut captured_handlers = Vec::new();
+            for exact_assignment in &exact_assignments {
+                for install in &origin_installs {
+                    if let Some(proof) = proven_slow_lazy_cell_captured_handler_install(
+                        &source,
+                        &parsed.program,
+                        &semantic.semantic,
+                        exact_assignment,
+                        install,
+                    ) {
+                        captured_handlers.push(proof);
+                    }
+                }
+            }
+            let resolver_proofs = match (&update, accessor, phase_value) {
+                (Some(update), Some(accessor), Some(phase_value)) => exact_assignments
+                    .iter()
+                    .filter_map(|exact_assignment| {
+                        proven_slow_lazy_cell_resolver_index(
+                            &source,
+                            &parsed.program,
+                            &semantic.semantic,
+                            update,
+                            accessor.selector_start,
+                            accessor.selector_end,
+                            accessor.selector_key_symbol,
+                            exact_assignment,
+                            phase_value,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            let mut resolved_handlers = Vec::new();
+            for resolver in &resolver_proofs {
+                for captured in &captured_handlers {
+                    if let Some(proof) = proven_slow_lazy_cell_resolved_handler(resolver, captured) {
+                        resolved_handlers.push(proof);
+                    }
+                }
+            }
             json!({
                 "call": [call.call_start, call.call_end],
                 "call_source": snippet(&source, call.call_start, call.call_end),
@@ -111,6 +200,50 @@ fn main() -> Result<()> {
                     "selector_capture": scoping.symbol_name(update.selector_capture_symbol),
                     "update_parameter": scoping.symbol_name(update.update_parameter_symbol),
                 })),
+                "registry_assignment": registry.as_ref().map(|registry| json!({
+                    "path": registry.registry_path,
+                    "receiver": [registry.receiver_start, registry.receiver_end],
+                    "key": [registry.key_start, registry.key_end],
+                    "key_source": snippet(&source, registry.key_start, registry.key_end),
+                    "registry_key_symbol": scoping.symbol_name(registry.registry_key_symbol),
+                    "factory_key_parameter_index": registry.factory_key_parameter_index,
+                    "factory_key_symbol": scoping.symbol_name(registry.factory_key_symbol),
+                })),
+                "exact_registry_assignments": exact_assignments.iter().map(|proof| json!({
+                    "caller": [proof.caller.call_start, proof.caller.call_end],
+                    "exact_key_value": proof.exact_key_value,
+                })).collect::<Vec<_>>(),
+                "captured_handlers": captured_handlers.iter().map(|proof| json!({
+                    "exact_key_value": proof.exact_assignment.exact_key_value,
+                    "logical_install": [proof.install.install.call_start, proof.install.install.call_end],
+                    "handler": [proof.install.install.handler_start, proof.install.install.handler_end],
+                    "handler_source": snippet(
+                        &source,
+                        proof.install.install.handler_start,
+                        proof.install.install.handler_end,
+                    ),
+                    "caller_handler_parameter_index": proof.caller_handler_parameter_index,
+                    "caller_handler_symbol": scoping.symbol_name(proof.caller_handler_symbol),
+                })).collect::<Vec<_>>(),
+                "resolver_proofs": resolver_proofs.iter().map(|resolver| json!({
+                    "phase_value": resolver.phase_value,
+                    "exact_key_value": resolver.exact_key_value,
+                    "handler_slot": resolver.handler_slot,
+                    "index_assignment": [resolver.index_assignment_start, resolver.index_assignment_end],
+                    "index_assignment_source": snippet(
+                        &source,
+                        resolver.index_assignment_start,
+                        resolver.index_assignment_end,
+                    ),
+                })).collect::<Vec<_>>(),
+                "resolved_handlers": resolved_handlers.iter().map(|proof| json!({
+                    "exact_key_value": proof.resolver.exact_key_value,
+                    "handler_slot": proof.resolver.handler_slot,
+                    "logical_handler": [
+                        proof.captured_handler.install.install.handler_start,
+                        proof.captured_handler.install.install.handler_end,
+                    ],
+                })).collect::<Vec<_>>(),
             })
         })
         .collect::<Vec<_>>();
@@ -119,13 +252,38 @@ fn main() -> Result<()> {
         .filter(|call| call["specialized"] == true)
         .cloned()
         .collect::<Vec<_>>();
+    let resolver_proven_calls = candidate_calls
+        .iter()
+        .map(|call| call["resolver_proofs"].as_array().map_or(0, Vec::len))
+        .sum::<usize>();
+    let resolved_handler_proofs = candidate_calls
+        .iter()
+        .map(|call| call["resolved_handlers"].as_array().map_or(0, Vec::len))
+        .sum::<usize>();
+    let accessor_json = accessor.map(|accessor| {
+        json!({
+            "call_count": lazy_reads.len(),
+            "function": [accessor.accessor_function_start, accessor.accessor_function_end],
+            "registry_path": accessor.read.registry_path,
+            "update_property": accessor.update_property,
+            "projection_property": accessor.projection_property,
+            "selector": [accessor.selector_start, accessor.selector_end],
+            "selector_source": snippet(&source, accessor.selector_start, accessor.selector_end),
+            "selector_key_symbol": scoping.symbol_name(accessor.selector_key_symbol),
+        })
+    });
 
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
+            "phase_value": phase_value,
+            "lazy_accessor": accessor_json,
             "shapes": shape_json,
             "candidate_calls": candidate_calls,
             "specialized_calls": specialized_calls,
+            "origin_handler_installs": origin_installs.len(),
+            "resolver_proven_calls": resolver_proven_calls,
+            "resolved_handler_proofs": resolved_handler_proofs,
         }))?
     );
     Ok(())
