@@ -120,6 +120,8 @@ struct Report {
     safe_static_only: bool,
     presentation_formatted: bool,
     runtime_semantics_preserved_by_design: bool,
+    analysis_complete: bool,
+    source_recovery: Option<&'static str>,
 }
 
 fn main() -> Result<()> {
@@ -157,6 +159,10 @@ fn main() -> Result<()> {
         })
         .collect::<Vec<_>>();
     let iterations = result.iterations;
+    let analysis_complete = result.analysis_complete;
+    let source_recovery = result
+        .source_recovery
+        .map(jsvm_safe_core::SafeSourceRecovery::as_str);
     let analysis_source_sha256 = sha256(result.source.as_bytes());
     let static_alias_installer_calls =
         jsvm_lift::forwarding_alias::static_alias_installer_calls(&result.source)
@@ -217,6 +223,8 @@ fn main() -> Result<()> {
         safe_static_only: true,
         presentation_formatted: args.format_output,
         runtime_semantics_preserved_by_design: !args.format_output,
+        analysis_complete,
+        source_recovery,
     };
 
     if let Some(path) = &args.report {
