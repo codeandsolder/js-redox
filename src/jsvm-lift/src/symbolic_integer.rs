@@ -60,6 +60,27 @@ impl IntegerPolynomial {
         variables
     }
 
+    /// Substitute one symbolic variable with another polynomial and return the
+    /// canonically combined result. The same term/degree bounds as ordinary
+    /// normalization apply, so an expansion that would exceed them fails closed.
+    #[must_use]
+    pub fn substitute_variable(&self, symbol: SymbolId, replacement: &Self) -> Option<Self> {
+        let mut result = Self::constant(0);
+        for (monomial, coefficient) in &self.terms {
+            let mut term = Self::constant(*coefficient);
+            for variable in monomial {
+                let factor = if *variable == symbol {
+                    replacement.clone()
+                } else {
+                    Self::variable(*variable)
+                };
+                term = term.mul(&factor)?;
+            }
+            result = result.add(&term)?;
+        }
+        Some(result)
+    }
+
     fn negated(&self) -> Option<Self> {
         let mut terms = BTreeMap::new();
         for (monomial, coefficient) in &self.terms {
@@ -287,6 +308,26 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn substitutes_symbolic_polynomial_variable() {
+        let x = SymbolId::new(1);
+        let y = SymbolId::new(2);
+        let x_poly = IntegerPolynomial::variable(x);
+        let polynomial = x_poly
+            .mul(&x_poly)
+            .and_then(|value| value.add(&IntegerPolynomial::constant(2).mul(&x_poly)?))
+            .and_then(|value| value.add(&IntegerPolynomial::constant(1)))
+            .expect("polynomial");
+        let replacement = IntegerPolynomial::variable(y)
+            .add(&IntegerPolynomial::constant(1))
+            .expect("replacement");
+        let substituted = polynomial
+            .substitute_variable(x, &replacement)
+            .expect("substitution");
+        assert_eq!(substituted.variables(), vec![y]);
+        assert!(substituted.constant_value().is_none());
     }
 
     #[test]
