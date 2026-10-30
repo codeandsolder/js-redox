@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+import re
+from pathlib import Path, PurePosixPath
 from typing import Any, NotRequired, TypedDict, cast
 
 SCHEMA = "capture-project/v1"
 MANIFEST_NAME = "capture-manifest.json"
+_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 
 
 class CaptureSource(TypedDict):
@@ -40,6 +42,19 @@ def _require(condition: bool, message: str) -> None:
         raise CaptureManifestError(message)
 
 
+def _project_relative_path(value: object, label: str) -> PurePosixPath:
+    _require(isinstance(value, str) and bool(value), f"{label}: path must be a non-empty string")
+    assert isinstance(value, str)
+    _require("\x00" not in value, f"{label}: path contains NUL")
+    _require("\\" not in value, f"{label}: backslash paths are not allowed")
+    _require(not _WINDOWS_DRIVE.match(value), f"{label}: drive-qualified path is not allowed")
+    parts = value.split("/")
+    _require(all(part not in {"", ".", ".."} for part in parts), f"{label}: path must stay inside the capture project")
+    parsed = PurePosixPath(value)
+    _require(not parsed.is_absolute(), f"{label}: absolute path is not allowed")
+    return parsed
+
+
 def validate_manifest(raw: object, *, path: Path | None = None) -> CaptureManifest:
     label = str(path) if path is not None else "capture manifest"
     _require(isinstance(raw, dict), f"{label}: manifest root must be an object")
@@ -55,6 +70,24 @@ def validate_manifest(raw: object, *, path: Path | None = None) -> CaptureManife
     for key in ("pages", "resources", "inline_scripts"):
         _require(isinstance(manifest.get(key), list), f"{label}: {key} must be an array")
     _require(isinstance(manifest.get("counts"), dict), f"{label}: counts must be an object")
+
+    resources = manifest["resources"]
+    for index, resource in enumerate(resources):
+        _require(isinstance(resource, dict), f"{label}: resources[{index}] must be an object")
+        _require(resource.get("id") == index, f"{label}: resources[{index}].id must equal {index}")
+        output_path = resource.get("output_path")
+        if output_path is not None:
+            parsed = _project_relative_path(output_path, f"{label}: resources[{index}].output_path")
+            _require(parsed.parts[0] == "resources", f"{label}: resources[{index}].output_path must be under resources/")
+
+    for index, script in enumerate(manifest["inline_scripts"]):
+        _require(isinstance(script, dict), f"{label}: inline_scripts[{index}] must be an object")
+        parent = script.get("parent_resource_id")
+        _require(isinstance(parent, int) and not isinstance(parent, bool) and 0 <= parent < len(resources), f"{label}: inline_scripts[{index}].parent_resource_id is out of range")
+        output_path = script.get("output_path")
+        if output_path is not None:
+            parsed = _project_relative_path(output_path, f"{label}: inline_scripts[{index}].output_path")
+            _require(parsed.parts[0] == "resources", f"{label}: inline_scripts[{index}].output_path must be under resources/")
     return cast(CaptureManifest, manifest)
 
 

@@ -144,10 +144,10 @@ for(const report of reports){
     if(!observed.length)continue;
     const lo=Math.min(...observed), hi=Math.max(...observed);
 
-    const tmpBase=path.join(os.tmpdir(),'jsvm-'+process.pid+'-'+ds.toString(16));
-    const parentFile=tmpBase+'.js';
-    const pathFile=tmpBase+'.paths.json';
-    const normFile=tmpBase+'.norm.json';
+    const tmpBase=fs.mkdtempSync(path.join(os.tmpdir(),'jsvm-'));
+    const parentFile=path.join(tmpBase,'parent.js');
+    const pathFile=path.join(tmpBase,'paths.json');
+    const normFile=path.join(tmpBase,'norm.json');
     fs.writeFileSync(parentFile,'('+source.slice(parent.start,parent.end)+');\n');
 
     const flagSpec=masks.map(m=>flagMap[m]+'='+m).join(',');
@@ -157,10 +157,10 @@ for(const report of reports){
       '--flags',flagSpec,'--opcodes',lo+'-'+hi
     ];
     let pathsJson;
-    try{pathsJson=cp.execFileSync(process.execPath,recoverArgs,{encoding:'utf8',maxBuffer:20*1024*1024});}
+    try{pathsJson=cp.execFileSync(process.execPath,recoverArgs,{encoding:'utf8',maxBuffer:20*1024*1024,timeout:120000});}
     catch(e){
       output.push({file:report.file,decoder:dec.function_id,status:'recover-error',error:String(e.stderr||e)});
-      try{fs.unlinkSync(parentFile);}catch{}
+      try{fs.rmSync(tmpBase,{recursive:true,force:true});}catch{}
       continue;
     }
     fs.writeFileSync(pathFile,pathsJson);
@@ -176,9 +176,10 @@ for(const report of reports){
     try{
       normJson=cp.execFileSync(process.execPath,[
         path.join(__dirname,'normalize-handler-paths.cjs'),pathFile,'--map',mapping.join(',')
-      ],{encoding:'utf8',maxBuffer:30*1024*1024});
+      ],{encoding:'utf8',maxBuffer:30*1024*1024,timeout:120000});
     }catch(e){
       output.push({file:report.file,decoder:dec.function_id,status:'normalize-error',error:String(e.stderr||e)});
+      try{fs.rmSync(tmpBase,{recursive:true,force:true});}catch{}
       continue;
     }
     fs.writeFileSync(normFile,normJson);
@@ -200,7 +201,7 @@ for(const report of reports){
       handlers
     });
 
-    for(const f of [parentFile,pathFile,normFile])try{fs.unlinkSync(f)}catch{}
+    try{fs.rmSync(tmpBase,{recursive:true,force:true});}catch{}
   }
 }
 console.log(JSON.stringify(output,null,2));

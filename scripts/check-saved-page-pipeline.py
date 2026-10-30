@@ -33,6 +33,7 @@ def run(*args):
 def main():
     shutil.rmtree(WORK, ignore_errors=True)
     ASSETS.mkdir(parents=True)
+    execution_marker = WORK / "hostile-js-was-executed.txt"
 
     PAGE.write_bytes(
         b"<!-- saved from url=(0032)https://example.invalid/demo -->\n"
@@ -50,12 +51,16 @@ def main():
         + '\nnew Worker("./worker.js");\n'
         + 'const fakeSourceMap = "/*# sourceMappingURL=fake-string.js.map */";\n'
         + 'const fakeRuntimeMap = "/*# sourceMappingURL=data:application/json;base64," + globalThis.payload + " */";\n'
+        + f'if (typeof require === "function") require("node:fs").writeFileSync({json.dumps(execution_marker.as_posix())}, "executed");\n'
         + '//# sourceMappingURL=app.js.map\n'
     )
     (ASSETS / "app.js").write_text(app)
     (ASSETS / "worker.js").write_text('postMessage("ready");\n')
     (ASSETS / "inline-dep.js").write_text('export const dep = 42;\n')
     (ASSETS / "site.css").write_text('body { color: #123; }\n')
+    outside = WORK / "do-not-ingest.txt"
+    outside.write_text("local secret that a saved page must not pull into the project\n")
+    (ASSETS / "linked-secret.txt").symlink_to(outside)
 
     source_map = {
         "version": 3,
@@ -487,6 +492,8 @@ def main():
         and edge.get("module_id") == "40000"
         for edge in graph["edges"]
     )
+
+    assert not execution_marker.exists(), "hostile JavaScript was executed by the static pipeline"
 
     readme = (PROJECT / "README.md").read_text()
     assert "# Recovered source project" in readme

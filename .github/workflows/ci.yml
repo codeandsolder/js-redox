@@ -38,6 +38,8 @@ jobs:
         python3 scripts/check-analysis-artifact-contract.py
         node tools/cloak-recorder/check-nested-cdp-session.mjs
         cargo +1.99.1 build --locked --workspace --bins --target-dir .cargo-target-nodebug
+        python3 scripts/check-har-pipeline.py
+        python3 scripts/check-saved-page-pipeline.py
         python3 scripts/check-har-content-classification.py
         python3 scripts/check-safe-deobfuscate.py
         python3 scripts/check-deobfuscation-source-mode-pipeline.py

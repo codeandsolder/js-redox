@@ -18,6 +18,8 @@ from analysis_artifacts import SOURCEMAPS, write_artifact
 from capture_project import load_manifest
 
 MAX_CHAIN_DEPTH = 16
+MAX_SOURCE_MAP_BYTES = 64 * 1024 * 1024
+HELPER_TIMEOUT_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -64,9 +66,17 @@ def parse_data_url(raw: str) -> bytes:
     header, sep, data = raw.partition(",")
     if not sep:
         raise ValueError("malformed data URL")
+    # Reject before decoding so a sourceMappingURL cannot double memory use with
+    # an arbitrarily large decoded map. Base64 is at most 4/3 expansion.
+    if len(data) > MAX_SOURCE_MAP_BYTES * 2:
+        raise ValueError("inline source map exceeds size limit")
     if ";base64" in header.lower():
-        return base64.b64decode(data)
-    return unquote_to_bytes(data)
+        decoded = base64.b64decode(data)
+    else:
+        decoded = unquote_to_bytes(data)
+    if len(decoded) > MAX_SOURCE_MAP_BYTES:
+        raise ValueError("inline source map exceeds size limit")
+    return decoded
 
 
 def source_mapping_urls(extractor: Path, paths: list[Path]) -> dict[str, str]:
@@ -77,6 +87,7 @@ def source_mapping_urls(extractor: Path, paths: list[Path]) -> dict[str, str]:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        timeout=HELPER_TIMEOUT_SECONDS,
     )
     if cp.returncode:
         raise RuntimeError(
@@ -105,6 +116,7 @@ def source_mapping_url(extractor: Path, text: str) -> str | None:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        timeout=HELPER_TIMEOUT_SECONDS,
     )
     if cp.returncode:
         raise RuntimeError(
@@ -175,7 +187,22 @@ def load_map(
         if not linked or not linked.get("output_path"):
             return None, {"status": "missing_map_resource", "map_url": map_url}
         map_resource_id = linked["id"]
-        map_bytes = (project / linked["output_path"]).read_bytes()
+        map_path = project / linked["output_path"]
+        try:
+            if map_path.stat().st_size > MAX_SOURCE_MAP_BYTES:
+                return None, {
+                    "status": "map_too_large",
+                    "map_url": map_url,
+                    "map_resource_id": map_resource_id,
+                }
+            map_bytes = map_path.read_bytes()
+        except OSError as exc:
+            return None, {
+                "status": "map_read_error",
+                "map_url": map_url,
+                "map_resource_id": map_resource_id,
+                "error": str(exc),
+            }
         map_origin = "har_resource"
         base_url = map_url
 
@@ -258,6 +285,7 @@ def compose_documents(
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        timeout=HELPER_TIMEOUT_SECONDS,
     )
     if cp.returncode:
         raise RuntimeError((cp.stdout + cp.stderr).strip() or f"composer exited {cp.returncode}")

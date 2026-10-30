@@ -1223,6 +1223,7 @@ def main() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=180,
         )
         if cp.returncode:
             raise SystemExit(

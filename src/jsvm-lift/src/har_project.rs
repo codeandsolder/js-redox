@@ -35,6 +35,19 @@ fn prepare_output(args: &HarProjectOptions) -> Result<()> {
                 args.output.display()
             );
         }
+        if !args.output.is_dir() {
+            bail!(
+                "refusing to replace non-directory output: {}",
+                args.output.display()
+            );
+        }
+        let empty = fs::read_dir(&args.output)?.next().is_none();
+        if !empty && !args.output.join("capture-manifest.json").is_file() {
+            bail!(
+                "refusing to recursively replace non-project output: {}; expected an empty directory or capture-manifest.json",
+                args.output.display()
+            );
+        }
         fs::remove_dir_all(&args.output)?;
     }
     fs::create_dir_all(&args.output)?;

@@ -204,6 +204,50 @@ fn closed_direct_call_graph(
     true
 }
 
+fn closed_sequence_call_graph(
+    module: &Module<'_>,
+    function: Func,
+    visiting: &mut std::collections::BTreeSet<Func>,
+    proven: &mut std::collections::BTreeSet<Func>,
+) -> bool {
+    if proven.contains(&function) {
+        return true;
+    }
+    if !visiting.insert(function) {
+        // Recursive interpreter calls consume the Rust stack before the fuel
+        // budget becomes a useful bound. Keep the proof deliberately acyclic.
+        return false;
+    }
+    let Some(body) = module.funcs[function].body() else {
+        // Imported functions have no body. Waffle currently panics if the
+        // interpreter reaches one; reject them before interpretation instead.
+        visiting.remove(&function);
+        return false;
+    };
+    for (_, value) in body.values.entries() {
+        let ValueDef::Operator(operator, _, _) = value else {
+            continue;
+        };
+        match operator {
+            Operator::Call { function_index } => {
+                if !closed_sequence_call_graph(module, *function_index, visiting, proven) {
+                    visiting.remove(&function);
+                    return false;
+                }
+            }
+            Operator::CallIndirect { .. } => {
+                // We do not prove the complete contents of funcref tables here.
+                visiting.remove(&function);
+                return false;
+            }
+            _ => {}
+        }
+    }
+    visiting.remove(&function);
+    proven.insert(function);
+    true
+}
+
 pub fn evaluate_fresh_i32_sequence(
     bytes: &[u8],
     initial_table_grows: &[FreshTableGrowRequest],
@@ -344,6 +388,14 @@ fn evaluate_sequence_inner(
         let function = Func::new(call.function_index);
         if module.funcs[function].body().is_none() {
             return failed(FreshEvalOutcome::InvalidRequest, steps);
+        }
+        if !closed_sequence_call_graph(
+            &module,
+            function,
+            &mut std::collections::BTreeSet::new(),
+            &mut std::collections::BTreeSet::new(),
+        ) {
+            return failed(FreshEvalOutcome::UnsupportedOrPanicked, steps);
         }
         let signature = &module.signatures[module.funcs[function].sig()];
         let returns_i32 = signature.returns.as_slice() == [waffle::Type::I32];
@@ -661,6 +713,18 @@ mod tests {
         let report = evaluate_fresh_i32_call(&bytes, 1, &[1], Some(100));
         assert_eq!(report.outcome, FreshEvalOutcome::UnsupportedOrPanicked);
         assert_eq!(report.proven_result(), None);
+
+        let sequence = evaluate_fresh_i32_sequence(
+            &bytes,
+            &[],
+            &[FreshI32CallRequest {
+                function_index: 1,
+                i32_args: vec![FreshI32Arg::Literal { value: 1 }],
+            }],
+            Some(100),
+        );
+        assert_eq!(sequence.outcome, FreshEvalOutcome::UnsupportedOrPanicked);
+        assert!(sequence.steps.is_empty());
         Ok(())
     }
 
