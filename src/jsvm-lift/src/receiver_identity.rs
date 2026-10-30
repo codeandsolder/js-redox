@@ -10,6 +10,8 @@ use crate::{
         prove_function_protected_if_ladder_event_unreachable_with_call_arguments,
         prove_function_structured_branch_event_unreachable_with_integer_parameters,
         prove_function_switch_event_unreachable_with_integer_parameters,
+        structurally_proven_if_ladder_identifier_equalities_at_event,
+        ProvenIfLadderIdentifierEquality,
     },
 };
 use jsvm_safe_core::{eval_static_primitive, string_literal_value};
@@ -2628,6 +2630,42 @@ pub struct ProvenFunctionValue {
     pub function_end: u32,
 }
 
+/// Structural proof that one prototype method is the value returned by a
+/// zero-argument regular IIFE whose guaranteed return prefix installs a pure
+/// equality-based phase closure in a lexical binding.
+///
+/// This does not by itself prove that an arbitrary later read of
+/// `phase_binding_symbol` still observes this function. Consumers must prove
+/// binding/call ordering separately before using the closure at another site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenPrototypeMethodPhaseClosure {
+    pub constructor_start: u32,
+    pub constructor_end: u32,
+    pub property: String,
+    pub method_assignment_start: u32,
+    pub method_assignment_end: u32,
+    pub factory_start: u32,
+    pub factory_end: u32,
+    pub method_function_start: u32,
+    pub method_function_end: u32,
+    pub phase_assignment_start: u32,
+    pub phase_assignment_end: u32,
+    pub phase_function_start: u32,
+    pub phase_function_end: u32,
+    pub phase_binding_symbol: SymbolId,
+    pub left_symbol: SymbolId,
+    pub right_symbol: SymbolId,
+    pub equal_value: i64,
+    pub unequal_value: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenPrototypeMethodPhaseAtEvent {
+    pub closure: ProvenPrototypeMethodPhaseClosure,
+    pub equality: ProvenIfLadderIdentifierEquality,
+    pub value: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenPrototypeMethodAssignment {
     pub constructor_start: u32,
@@ -2779,6 +2817,321 @@ fn returned_regular_functions(call: &CallExpression<'_>) -> Option<Vec<FunctionK
         return None;
     };
     possible_regular_functions(ret.argument.as_ref()?)
+}
+
+fn guaranteed_return_prefix_assignments<'a>(
+    expression: &'a Expression<'a>,
+    assignments: &mut Vec<&'a oxc_ast::ast::AssignmentExpression<'a>>,
+) -> &'a Expression<'a> {
+    match expression {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            guaranteed_return_prefix_assignments(&parenthesized.expression, assignments)
+        }
+        Expression::SequenceExpression(sequence) if !sequence.expressions.is_empty() => {
+            let last = sequence.expressions.len() - 1;
+            for expression in &sequence.expressions[..last] {
+                collect_guaranteed_expression_assignments(expression, assignments);
+            }
+            guaranteed_return_prefix_assignments(&sequence.expressions[last], assignments)
+        }
+        _ => expression,
+    }
+}
+
+fn collect_guaranteed_expression_assignments<'a>(
+    expression: &'a Expression<'a>,
+    assignments: &mut Vec<&'a oxc_ast::ast::AssignmentExpression<'a>>,
+) {
+    match expression {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            collect_guaranteed_expression_assignments(&parenthesized.expression, assignments);
+        }
+        Expression::SequenceExpression(sequence) => {
+            for expression in &sequence.expressions {
+                collect_guaranteed_expression_assignments(expression, assignments);
+            }
+        }
+        Expression::AssignmentExpression(assignment) if assignment.operator.as_str() == "=" => {
+            // Assignment RHS evaluation is unconditional once the assignment
+            // expression itself is reached. Record nested guaranteed writes
+            // before the containing write to preserve evaluation order.
+            collect_guaranteed_expression_assignments(&assignment.right, assignments);
+            assignments.push(assignment);
+        }
+        _ => {}
+    }
+}
+
+fn pure_phase_function(
+    function: &Function<'_>,
+    scoping: &Scoping,
+) -> Option<(SymbolId, SymbolId, i64, i64)> {
+    if function.r#async
+        || function.generator
+        || function.params.rest.is_some()
+        || !function.params.items.is_empty()
+    {
+        return None;
+    }
+    let body = function.body.as_ref()?;
+    let [Statement::ReturnStatement(ret)] = body.statements.as_slice() else {
+        return None;
+    };
+    let Expression::ConditionalExpression(conditional) =
+        last_sequence_expression(ret.argument.as_ref()?)
+    else {
+        return None;
+    };
+    let Expression::BinaryExpression(test) = last_sequence_expression(&conditional.test) else {
+        return None;
+    };
+    let Expression::Identifier(left) = last_sequence_expression(&test.left) else {
+        return None;
+    };
+    let Expression::Identifier(right) = last_sequence_expression(&test.right) else {
+        return None;
+    };
+    let left_symbol = scoping
+        .get_reference(left.reference_id.get()?)
+        .symbol_id()?;
+    let right_symbol = scoping
+        .get_reference(right.reference_id.get()?)
+        .symbol_id()?;
+    if left_symbol == right_symbol
+        || !scoping.symbol_flags(left_symbol).is_variable()
+        || !scoping.symbol_flags(right_symbol).is_variable()
+    {
+        return None;
+    }
+    // Both operands must be captured from outside the phase function. This
+    // excludes accidental locals even if their source names happen to match.
+    let function_span = function.span;
+    if [left_symbol, right_symbol].into_iter().any(|symbol| {
+        let span = scoping.symbol_span(symbol);
+        function_span.start <= span.start && span.end <= function_span.end
+    }) {
+        return None;
+    }
+    let consequent = exact_syntactic_integer(&conditional.consequent)?;
+    let alternate = exact_syntactic_integer(&conditional.alternate)?;
+    let (equal_value, unequal_value) = match test.operator.as_str() {
+        "==" | "===" => (consequent, alternate),
+        "!=" | "!==" => (alternate, consequent),
+        _ => return None,
+    };
+    Some((left_symbol, right_symbol, equal_value, unequal_value))
+}
+
+fn phase_closure_for_method_assignment(
+    assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    method: &ProvenPrototypeMethodAssignment,
+    scoping: &Scoping,
+) -> Vec<ProvenPrototypeMethodPhaseClosure> {
+    let [method_function] = method.possible_functions.as_slice() else {
+        return Vec::new();
+    };
+    let Expression::CallExpression(call) = last_sequence_expression(&assignment.right) else {
+        return Vec::new();
+    };
+    if call.optional || !call.arguments.is_empty() {
+        return Vec::new();
+    }
+    let Expression::FunctionExpression(factory) = last_sequence_expression(&call.callee) else {
+        return Vec::new();
+    };
+    if factory.r#async || factory.generator {
+        return Vec::new();
+    }
+    let Some(body) = factory.body.as_ref() else {
+        return Vec::new();
+    };
+    if has_dynamic_scope(body) {
+        return Vec::new();
+    }
+    let [Statement::ReturnStatement(ret)] = body.statements.as_slice() else {
+        return Vec::new();
+    };
+    let Some(returned) = ret.argument.as_ref() else {
+        return Vec::new();
+    };
+    let mut prefix_assignments = Vec::new();
+    let returned_value = guaranteed_return_prefix_assignments(returned, &mut prefix_assignments);
+    let Expression::FunctionExpression(returned_function) =
+        last_sequence_expression(returned_value)
+    else {
+        return Vec::new();
+    };
+    if returned_function.span.start != method_function.function_start
+        || returned_function.span.end != method_function.function_end
+    {
+        return Vec::new();
+    }
+
+    let mut proven = Vec::new();
+    for phase_assignment in &prefix_assignments {
+        let AssignmentTarget::AssignmentTargetIdentifier(target) = &phase_assignment.left else {
+            continue;
+        };
+        let Some(phase_binding_symbol) = target
+            .reference_id
+            .get()
+            .and_then(|reference_id| scoping.get_reference(reference_id).symbol_id())
+        else {
+            continue;
+        };
+        let Expression::FunctionExpression(phase_function) =
+            last_sequence_expression(&phase_assignment.right)
+        else {
+            continue;
+        };
+        let Some((left_symbol, right_symbol, equal_value, unequal_value)) =
+            pure_phase_function(phase_function, scoping)
+        else {
+            continue;
+        };
+        let factory_span = factory.span;
+        let phase_binding_declaration = scoping.symbol_span(phase_binding_symbol);
+        let left_declaration = scoping.symbol_span(left_symbol);
+        let right_declaration = scoping.symbol_span(right_symbol);
+        if (factory_span.start <= phase_binding_declaration.start
+            && phase_binding_declaration.end <= factory_span.end)
+            || ![left_declaration, right_declaration]
+                .into_iter()
+                .all(|span| factory_span.start <= span.start && span.end <= factory_span.end)
+        {
+            continue;
+        }
+        let Some(phase_index) = prefix_assignments
+            .iter()
+            .position(|candidate| candidate.span == phase_assignment.span)
+        else {
+            continue;
+        };
+        if prefix_assignments[phase_index + 1..].iter().any(|later| {
+            let AssignmentTarget::AssignmentTargetIdentifier(later_target) = &later.left else {
+                return false;
+            };
+            later_target
+                .reference_id
+                .get()
+                .and_then(|reference_id| scoping.get_reference(reference_id).symbol_id())
+                == Some(phase_binding_symbol)
+        }) {
+            continue;
+        }
+        proven.push(ProvenPrototypeMethodPhaseClosure {
+            constructor_start: method.constructor_start,
+            constructor_end: method.constructor_end,
+            property: method.property.clone(),
+            method_assignment_start: method.assignment_start,
+            method_assignment_end: method.assignment_end,
+            factory_start: factory.span.start,
+            factory_end: factory.span.end,
+            method_function_start: method_function.function_start,
+            method_function_end: method_function.function_end,
+            phase_assignment_start: phase_assignment.span.start,
+            phase_assignment_end: phase_assignment.span.end,
+            phase_function_start: phase_function.span.start,
+            phase_function_end: phase_function.span.end,
+            phase_binding_symbol,
+            left_symbol,
+            right_symbol,
+            equal_value,
+            unequal_value,
+        });
+    }
+    proven
+}
+
+/// Find prototype methods whose exact method body and a pure captured phase
+/// closure are installed by the same guaranteed zero-argument IIFE return.
+#[must_use]
+pub fn structurally_proven_prototype_method_phase_closures(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenPrototypeMethodPhaseClosure> {
+    let methods = structurally_proven_prototype_method_assignments(program, scoping);
+    let by_span = methods
+        .into_iter()
+        .map(|method| ((method.assignment_start, method.assignment_end), method))
+        .collect::<HashMap<_, _>>();
+
+    struct Collector<'c, 'm> {
+        scoping: &'c Scoping,
+        methods: &'m HashMap<(u32, u32), ProvenPrototypeMethodAssignment>,
+        proven: Vec<ProvenPrototypeMethodPhaseClosure>,
+    }
+    impl<'a> Visit<'a> for Collector<'_, '_> {
+        fn visit_assignment_expression(
+            &mut self,
+            assignment: &oxc_ast::ast::AssignmentExpression<'a>,
+        ) {
+            if let Some(method) = self
+                .methods
+                .get(&(assignment.span.start, assignment.span.end))
+            {
+                self.proven.extend(phase_closure_for_method_assignment(
+                    assignment,
+                    method,
+                    self.scoping,
+                ));
+            }
+            walk::walk_assignment_expression(self, assignment);
+        }
+    }
+
+    let mut collector = Collector {
+        scoping,
+        methods: &by_span,
+        proven: Vec::new(),
+    };
+    collector.visit_program(program);
+    collector.proven.sort_by_key(|proof| {
+        (
+            proof.constructor_start,
+            proof.property.clone(),
+            proof.method_assignment_start,
+            proof.phase_assignment_start,
+        )
+    });
+    collector.proven.dedup();
+    collector.proven
+}
+
+/// Join a structural phase closure to an independently proven lexical equality
+/// at one event inside the exact returned method body.
+#[must_use]
+pub fn proven_prototype_method_phase_at_event(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    closure: &ProvenPrototypeMethodPhaseClosure,
+    event: Span,
+) -> Option<ProvenPrototypeMethodPhaseAtEvent> {
+    let mut equalities = structurally_proven_if_ladder_identifier_equalities_at_event(
+        source,
+        program,
+        semantic,
+        closure.method_function_start,
+        closure.method_function_end,
+        event,
+    )
+    .into_iter()
+    .filter(|equality| {
+        (equality.left_symbol == closure.left_symbol
+            && equality.right_symbol == closure.right_symbol)
+            || (equality.left_symbol == closure.right_symbol
+                && equality.right_symbol == closure.left_symbol)
+    });
+    let equality = equalities.next()?;
+    if equalities.next().is_some() {
+        return None;
+    }
+    Some(ProvenPrototypeMethodPhaseAtEvent {
+        closure: closure.clone(),
+        equality,
+        value: closure.equal_value,
+    })
 }
 
 fn proof_property_key(
@@ -6110,6 +6463,113 @@ mod tests {
             sink(flag ? C.prototype : {});
         "#;
         assert!(lookup_targets(source).is_empty());
+    }
+
+    #[test]
+    fn proves_iife_method_phase_closure_and_event_value() {
+        let source = r#"
+            const C = function() {};
+            let phase;
+            C.prototype.run = function(left, right) {
+                return left = (right = {}, phase = function() {
+                    return right == left ? 23 : 50;
+                }, {}), function() {
+                    for (let state = 0; state !== 99;) {
+                        if (state === 0) { right = left; event(); state = 99; }
+                        else if (state === 1) { state = 99; }
+                        else if (state === 2) { state = 99; }
+                        else if (state === 3) { state = 99; }
+                    }
+                };
+            }();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        let closures = super::structurally_proven_prototype_method_phase_closures(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        );
+        assert_eq!(closures.len(), 1);
+        assert_eq!(closures[0].property, "run");
+        assert_eq!(closures[0].equal_value, 23);
+        assert_eq!(closures[0].unequal_value, 50);
+        let event_start = source.find("event()").expect("event") as u32;
+        let phase = super::proven_prototype_method_phase_at_event(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &closures[0],
+            Span::new(event_start, event_start + 7),
+        )
+        .expect("phase at event");
+        assert_eq!(phase.value, 23);
+    }
+
+    #[test]
+    fn rejects_conditional_phase_assignment_in_iife_prefix() {
+        let source = r#"
+            const C = function() {};
+            let phase;
+            C.prototype.run = function(left, right) {
+                return (flag && (phase = function() { return left == right ? 1 : 2; }),
+                    function() {});
+            }();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_prototype_method_phase_closures(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn rejects_phase_closure_overwritten_later_in_iife_prefix() {
+        let source = r#"
+            const C = function() {};
+            let phase;
+            C.prototype.run = function(left, right) {
+                return (phase = function() { return left == right ? 1 : 2; },
+                    phase = function() { return left == right ? 3 : 4; },
+                    function() {});
+            }();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let closures = super::structurally_proven_prototype_method_phase_closures(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        );
+        assert_eq!(closures.len(), 1);
+        assert_eq!(closures[0].equal_value, 3);
+        assert_eq!(closures[0].unequal_value, 4);
+    }
+
+    #[test]
+    fn rejects_effectful_phase_function() {
+        let source = r#"
+            const C = function() {};
+            let phase;
+            C.prototype.run = function(left, right) {
+                return (phase = function() { sideEffect(); return left == right ? 1 : 2; },
+                    function() {});
+            }();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_prototype_method_phase_closures(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .is_empty());
     }
 
     #[test]

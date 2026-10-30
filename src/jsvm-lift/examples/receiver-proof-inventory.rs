@@ -6,6 +6,7 @@ use jsvm_lift::{
         propagate_matched_prototype_method_call_origins,
         propagate_proven_prototype_method_call_origins, proven_exact_own_data_field_at_direct_call,
         proven_origin_direct_call_event_unreachable, proven_own_data_field_at_runtime_method_call,
+        proven_prototype_method_phase_at_event,
         proven_prototype_method_receiver_preservation_summary,
         proven_prototype_string_at_allocation, proven_prototype_string_at_direct_calls,
         proven_receiver_preserving_prototype_method_call,
@@ -14,6 +15,7 @@ use jsvm_lift::{
         structurally_proven_own_data_fields_at_member_calls,
         structurally_proven_prototype_method_calls_at_runtime,
         structurally_proven_prototype_method_lookup_targets,
+        structurally_proven_prototype_method_phase_closures,
         structurally_proven_prototype_method_receiver_effects,
         structurally_proven_prototype_string_assignments,
         structurally_proven_receiver_preserving_prototype_method_calls,
@@ -25,7 +27,7 @@ use jsvm_lift::{
 };
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
-use oxc_span::{SourceType, Span};
+use oxc_span::{GetSpan, SourceType, Span};
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
@@ -44,6 +46,19 @@ fn main() -> Result<()> {
     let summary = args.iter().any(|arg| arg == "--summary");
     let runtime_only = args.iter().any(|arg| arg == "--runtime-only");
     let prototype_strings_only = args.iter().any(|arg| arg == "--prototype-strings");
+    let phase_closures_only = args.iter().any(|arg| arg == "--phase-closures");
+    let phase_event_start = args.iter().find_map(|arg| {
+        arg.to_str()?
+            .strip_prefix("--phase-event-start=")?
+            .parse::<u32>()
+            .ok()
+    });
+    let phase_event_end = args.iter().find_map(|arg| {
+        arg.to_str()?
+            .strip_prefix("--phase-event-end=")?
+            .parse::<u32>()
+            .ok()
+    });
     let preserve_call_start = args.iter().find_map(|arg| {
         arg.to_str()?
             .strip_prefix("--preserve-call-start=")?
@@ -82,7 +97,7 @@ fn main() -> Result<()> {
         .find(|arg| !arg.to_string_lossy().starts_with("--"))
         .map(PathBuf::from)
         .context(
-            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--runtime-only] [--preserve-call-start=N] [--fully-preserve-call-start=N] [--field-runtime-call-start=N --field=NAME] [--exact-field-call-start=N --field=NAME] [--registry-origin-call-start=N]",
+            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--runtime-only] [--phase-closures [--phase-event-start=N --phase-event-end=N]] [--preserve-call-start=N] [--fully-preserve-call-start=N] [--field-runtime-call-start=N --field=NAME] [--exact-field-call-start=N --field=NAME] [--registry-origin-call-start=N]",
         )?;
     let source =
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -99,6 +114,70 @@ fn main() -> Result<()> {
         .build(&parsed.program);
     anyhow::ensure!(semantic.diagnostics.is_empty(), "semantic diagnostics");
     let scoping = semantic.semantic.scoping();
+    if phase_closures_only {
+        anyhow::ensure!(
+            phase_event_start.is_some() == phase_event_end.is_some(),
+            "phase event requires both --phase-event-start and --phase-event-end"
+        );
+        let event = phase_event_start
+            .zip(phase_event_end)
+            .map(|(start, end)| Span::new(start, end));
+        let closures = structurally_proven_prototype_method_phase_closures(&parsed.program, scoping)
+            .into_iter()
+            .map(|closure| {
+                let phase = event.as_ref().and_then(|event| {
+                    proven_prototype_method_phase_at_event(
+                        &source,
+                        &parsed.program,
+                        &semantic.semantic,
+                        &closure,
+                        *event,
+                    )
+                });
+                let phase_binding = scoping.symbol_span(closure.phase_binding_symbol);
+                let left = scoping.symbol_span(closure.left_symbol);
+                let right = scoping.symbol_span(closure.right_symbol);
+                let phase_binding_writes = scoping
+                    .get_resolved_reference_ids(closure.phase_binding_symbol)
+                    .iter()
+                    .filter_map(|reference_id| {
+                        let reference = scoping.get_reference(*reference_id);
+                        reference.is_write().then(|| {
+                            let span = semantic
+                                .semantic
+                                .nodes()
+                                .get_node(reference.node_id())
+                                .kind()
+                                .span();
+                            [span.start, span.end]
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({
+                    "constructor": [closure.constructor_start, closure.constructor_end],
+                    "property": closure.property,
+                    "method_assignment": [closure.method_assignment_start, closure.method_assignment_end],
+                    "factory": [closure.factory_start, closure.factory_end],
+                    "method_function": [closure.method_function_start, closure.method_function_end],
+                    "phase_assignment": [closure.phase_assignment_start, closure.phase_assignment_end],
+                    "phase_function": [closure.phase_function_start, closure.phase_function_end],
+                    "phase_binding_declaration": [phase_binding.start, phase_binding.end],
+                    "phase_binding_writes": phase_binding_writes,
+                    "left_declaration": [left.start, left.end],
+                    "right_declaration": [right.start, right.end],
+                    "equal_value": closure.equal_value,
+                    "unequal_value": closure.unequal_value,
+                    "event_phase": phase.map(|phase| json!({
+                        "value": phase.value,
+                        "state": phase.equality.state,
+                        "assignment": [phase.equality.assignment_start, phase.equality.assignment_end],
+                    })),
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&closures)?);
+        return Ok(());
+    }
     if let Some(call_start) = exact_field_call_start {
         let property = field_property
             .as_deref()
