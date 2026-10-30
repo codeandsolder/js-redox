@@ -1360,6 +1360,38 @@ fn compile_regex(pattern: &str) -> Option<regex::Regex> {
     regex::Regex::new(pattern).ok()
 }
 
+fn contains_function_reassignment(body: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let identifier_byte =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$') || byte >= 0x80;
+    let mut search_from = 0usize;
+    while let Some(relative) = body[search_from..].find(name) {
+        let start = search_from + relative;
+        let after_name = start + name.len();
+        if start > 0 && identifier_byte(body.as_bytes()[start - 1]) {
+            search_from = after_name;
+            continue;
+        }
+        if after_name < body.len() && identifier_byte(body.as_bytes()[after_name]) {
+            search_from = after_name;
+            continue;
+        }
+        let tail = body[after_name..].trim_start_matches(char::is_whitespace);
+        if let Some(after_equals) = tail.strip_prefix("=") {
+            if after_equals
+                .trim_start_matches(char::is_whitespace)
+                .starts_with("function")
+            {
+                return true;
+            }
+        }
+        search_from = after_name;
+    }
+    false
+}
+
 static FIXED_BASE64_ALPHABET_RE: LazyLock<Option<regex::Regex>> =
     LazyLock::new(|| compile_regex(r#"["']([A-Za-z0-9+/=]{65})["']"#));
 static BASE64_SENTINEL_RE: LazyLock<Option<regex::Regex>> =
@@ -1367,6 +1399,8 @@ static BASE64_SENTINEL_RE: LazyLock<Option<regex::Regex>> =
 static RC4_CHAR_CODE_AT_RE: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
     compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*charCodeAt\s*\(([^)]*)\)")
 });
+static DIRECT_ARRAY_ACCESS_RE: LazyLock<Option<regex::Regex>> =
+    LazyLock::new(|| compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([^\s\]]+)\s*\]"));
 
 fn fixed_base64_alphabet(body: &str) -> Option<String> {
     if !body.contains("String.fromCharCode")
@@ -1581,14 +1615,12 @@ fn detect_sparse_direct_table_decoders(
             continue;
         };
         let body = fragment(source, function.span);
-        let Some(access) = compile_regex(&format!(
-            r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*{}\s*\]",
-            regex::escape(param)
-        )) else {
+        let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
             continue;
         };
         let mut matched = access
             .captures_iter(body)
+            .filter(|caps| caps.get(2).is_some_and(|capture| capture.as_str() == param))
             .filter_map(|caps| caps.get(1).map(|capture| capture.as_str()))
             .filter_map(|name| arrays_by_name.get(name))
             .flat_map(|candidates| candidates.iter().copied())
@@ -1772,14 +1804,12 @@ fn detect_direct_table_decoders(
             continue;
         };
         let body = fragment(source, function.span);
-        let Some(access) = compile_regex(&format!(
-            r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*{}\s*\]",
-            regex::escape(param)
-        )) else {
+        let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
             continue;
         };
         let mut matched = access
             .captures_iter(body)
+            .filter(|caps| caps.get(2).is_some_and(|capture| capture.as_str() == param))
             .filter_map(|caps| caps.get(1).map(|capture| capture.as_str()))
             .filter_map(|name| arrays_by_name.get(name))
             .filter(|candidates| candidates.len() == 1)
@@ -2956,6 +2986,13 @@ fn detect_fixed_rotated_direct_decoders(
     let arrays = all_static_arrays(program);
     let functions = variable_functions(program);
     let rotations = collect_rotation_iifes(source, program, scoping, reference_spans);
+    let mut arrays_by_name: HashMap<&str, Vec<&StaticArrayInfo>> = HashMap::new();
+    for array in &arrays {
+        arrays_by_name
+            .entry(array.name.as_str())
+            .or_default()
+            .push(array);
+    }
     let mut decoders = HashMap::new();
     let mut protected_spans = Vec::new();
     let mut replacements = Vec::new();
@@ -2969,7 +3006,28 @@ fn detect_fixed_rotated_direct_decoders(
             continue;
         }
 
-        for array in &arrays {
+        let Some(public_param) = function.params.first() else {
+            continue;
+        };
+        let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
+            continue;
+        };
+        let body = fragment(source, function.span);
+        let candidate_names = access
+            .captures_iter(body)
+            .filter(|captures| {
+                captures
+                    .get(2)
+                    .is_some_and(|capture| capture.as_str() == public_param)
+            })
+            .filter_map(|captures| captures.get(1).map(|capture| capture.as_str()))
+            .collect::<HashSet<_>>();
+
+        for array in candidate_names
+            .into_iter()
+            .filter_map(|name| arrays_by_name.get(name))
+            .flat_map(|candidates| candidates.iter().copied())
+        {
             let Some(offset) = simple_direct_decoder_offset(source, function, array) else {
                 continue;
             };
@@ -3333,6 +3391,65 @@ fn function_name_counts(functions: &[FnInfo]) -> HashMap<String, usize> {
     counts
 }
 
+fn compact_whitespace(source: &str) -> String {
+    source.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn inline_self_rewriting_provider_matches(
+    source: &str,
+    function: &FnInfo,
+    array_name: &str,
+    values: &LocalStaticArrayInfo,
+) -> bool {
+    let Ok(function_start) = usize::try_from(function.span.start) else {
+        return false;
+    };
+    let Ok(function_end) = usize::try_from(function.span.end) else {
+        return false;
+    };
+    let Ok(array_start) = usize::try_from(values.span.start) else {
+        return false;
+    };
+    let Ok(array_end) = usize::try_from(values.span.end) else {
+        return false;
+    };
+    if function_start > array_start || array_start > array_end || array_end > function_end {
+        return false;
+    }
+    let Some(prefix) = source.get(function_start..array_start) else {
+        return false;
+    };
+    let Some(suffix) = source.get(array_end..function_end) else {
+        return false;
+    };
+
+    // The old proof compiled the complete array literal into a regex. On large
+    // hostile bundles that can mean building a multi-megabyte Thompson NFA for
+    // source bytes whose exact span we already know. Compare the two small
+    // surrounding fragments instead; the array itself remains proven by its AST
+    // span and static-value analysis.
+    let prefix = compact_whitespace(prefix);
+    let prefix_matches = ["const", "let", "var"]
+        .into_iter()
+        .any(|kind| prefix == format!("function{}(){{{}{}=", function.name, kind, array_name));
+    if !prefix_matches {
+        return false;
+    }
+
+    let suffix = compact_whitespace(suffix);
+    [false, true].into_iter().any(|inner_semicolon| {
+        [false, true].into_iter().any(|outer_semicolon| {
+            let inner = if inner_semicolon { ";" } else { "" };
+            let outer = if outer_semicolon { ";" } else { "" };
+            suffix
+                == format!(
+                    ";return({}=function(){{return{}{inner}}})(){outer}}}",
+                    function.name, array_name
+                )
+        })
+    })
+}
+
 fn decoder_providers(
     source: &str,
     functions: &[FnInfo],
@@ -3347,19 +3464,13 @@ fn decoder_providers(
             continue;
         }
         let body = fragment(source, function.span);
-        let classic_self_rewrite = (body.contains(&format!("{} = function", function.name))
-            || body.contains(&format!("{}=function", function.name)))
-            && body.contains(&format!("return {}();", function.name));
+        if !contains_function_reassignment(body, &function.name) {
+            continue;
+        }
+        let classic_self_rewrite = body.contains(&format!("return {}();", function.name));
         for (array_name, values) in &function.static_arrays {
-            let inline_self_rewrite = compile_regex(&format!(
-                r"(?s)^\s*function\s+{}\s*\(\s*\)\s*\{{\s*(?:const|let|var)\s+{}\s*=\s*{}\s*;\s*return\s*\(\s*{}\s*=\s*function\s*\(\s*\)\s*\{{\s*return\s+{}\s*;?\s*\}}\s*\)\s*\(\s*\)\s*;?\s*\}}\s*$",
-                regex::escape(&function.name),
-                regex::escape(array_name),
-                regex::escape(fragment(source, values.span)),
-                regex::escape(&function.name),
-                regex::escape(array_name),
-            ))
-            .is_some_and(|pattern| pattern.is_match(body));
+            let inline_self_rewrite =
+                inline_self_rewriting_provider_matches(source, function, array_name, values);
             if (classic_self_rewrite && body.contains(&format!("return {array_name};")))
                 || inline_self_rewrite
             {
@@ -3417,6 +3528,17 @@ fn inline_self_rewriting_direct_decoder(
     if function.params.is_empty() || name_counts.get(&function.name).copied() != Some(1) {
         return None;
     }
+    let body = fragment(source, function.span);
+    // The exact self-rewriting shape below necessarily contains all three of
+    // these tokens. Most application functions contain none of them together;
+    // rejecting those before constructing the function-specific regex avoids
+    // compiling a large automaton for every ordinary named function.
+    if !body.contains("-=")
+        || !body.contains("return")
+        || !contains_function_reassignment(body, &function.name)
+    {
+        return None;
+    }
     let params = function
         .params
         .iter()
@@ -3425,7 +3547,6 @@ fn inline_self_rewriting_direct_decoder(
         .join(r"\s*,\s*");
     let first = regex::escape(function.params.first()?);
     let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
-    let body = fragment(source, function.span);
     let pattern = compile_regex(&format!(
         r"(?s)^\s*function\s+{}\s*\(\s*{}\s*\)\s*\{{\s*(?:const|let|var)\s+(?P<table>{identifier})\s*=\s*(?P<provider>{identifier})\s*\(\s*\)\s*;\s*return\s*\(\s*{}\s*=\s*function\s*\(\s*{}\s*\)\s*\{{\s*return\s+(?P<lookup>{identifier})\s*\[\s*{}\s*-=\s*(?P<offset>0[xX][0-9A-Fa-f]+|[0-9]+)\s*\]\s*;?\s*\}}\s*\)\s*\(\s*{}\s*\)\s*;?\s*\}}\s*$",
         regex::escape(&function.name),
@@ -3990,6 +4111,21 @@ fn collect_symbol_aliases(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn function_reassignment_probe_handles_spacing_without_suffix_matches() {
+        assert!(contains_function_reassignment("f=function(){}", "f"));
+        assert!(contains_function_reassignment(
+            "f   =
+ function(){}",
+            "f"
+        ));
+        assert!(!contains_function_reassignment(
+            "other_f = function(){}",
+            "f"
+        ));
+        assert!(!contains_function_reassignment("f == function(){}", "f"));
+    }
 
     #[test]
     fn rotation_decoder_alias_requires_proven_binding() {
