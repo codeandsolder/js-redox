@@ -1,4 +1,5 @@
 mod base91;
+mod browser_legacy;
 mod control_flow;
 mod decoder;
 mod decoder_encoding;
@@ -10,6 +11,10 @@ mod selector;
 mod string_exposure;
 mod value_eval;
 
+pub use browser_legacy::{
+    recover_browser_legacy_call_assignments, BrowserLegacyCallAssignmentRecovery,
+    BrowserLegacyOpaqueSpan,
+};
 use control_flow::{
     collect_dispatch_bindings, collect_reference_spans, detect_reference_identity_tables,
     reference_identity, ReferenceIdentityTable,
@@ -1149,6 +1154,20 @@ pub enum SafeSourceRejection {
     SemanticFailure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafeSourceRecovery {
+    BrowserLegacyCallAssignment,
+}
+
+impl SafeSourceRecovery {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BrowserLegacyCallAssignment => "browser-legacy-call-assignment",
+        }
+    }
+}
+
 impl SafeSourceRejection {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -1160,6 +1179,34 @@ impl SafeSourceRejection {
     }
 }
 
+fn source_type_candidates(mode: SafeSourceMode) -> [Option<SourceType>; 2] {
+    match mode {
+        SafeSourceMode::Auto => [Some(SourceType::unambiguous()), Some(SourceType::cjs())],
+        SafeSourceMode::Module => [Some(SourceType::mjs()), None],
+        SafeSourceMode::CommonJs => [Some(SourceType::cjs()), None],
+    }
+}
+
+fn browser_legacy_recovery_source_type(source: &str, mode: SafeSourceMode) -> Option<SourceType> {
+    for source_type in source_type_candidates(mode).into_iter().flatten() {
+        let Some(recovery) = recover_browser_legacy_call_assignments(source, source_type) else {
+            continue;
+        };
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, &recovery.source, source_type);
+        if !parsed.is_clean() {
+            continue;
+        }
+        let semantic_ret = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        if semantic_ret.diagnostics.is_empty() {
+            return Some(parsed.program.source_type);
+        }
+    }
+    None
+}
+
 fn validate_source_type(
     source: &str,
     mode: SafeSourceMode,
@@ -1169,11 +1216,7 @@ fn validate_source_type(
     // Program source type for every rewrite iteration. Explicit `.mjs`/`.cjs`
     // callers instead require the host-selected mode; falling back would change
     // the semantics of marker-free modules or CommonJS-only syntax.
-    let candidates = match mode {
-        SafeSourceMode::Auto => [Some(SourceType::unambiguous()), Some(SourceType::cjs())],
-        SafeSourceMode::Module => [Some(SourceType::mjs()), None],
-        SafeSourceMode::CommonJs => [Some(SourceType::cjs()), None],
-    };
+    let candidates = source_type_candidates(mode);
     let mut saw_with = false;
     let mut saw_semantic_failure = false;
     for source_type in candidates.into_iter().flatten() {
@@ -1208,7 +1251,15 @@ fn semantically_valid_source_type(source: &str, mode: SafeSourceMode) -> Option<
 
 #[must_use]
 pub fn safe_source_rejection(source: &str, mode: SafeSourceMode) -> Option<SafeSourceRejection> {
-    validate_source_type(source, mode).err()
+    match validate_source_type(source, mode) {
+        Ok(_) => None,
+        Err(SafeSourceRejection::ParseFailure)
+            if browser_legacy_recovery_source_type(source, mode).is_some() =>
+        {
+            None
+        }
+        Err(rejection) => Some(rejection),
+    }
 }
 
 fn transform_once(
@@ -1375,6 +1426,8 @@ pub struct SafeTransformResult {
     pub iterations: usize,
     pub transforms: BTreeMap<String, usize>,
     pub arithmetic_state_proofs: Vec<ArithmeticStateProof>,
+    pub analysis_complete: bool,
+    pub source_recovery: Option<SafeSourceRecovery>,
 }
 
 fn deobfuscate_with_mode(
@@ -1387,7 +1440,25 @@ fn deobfuscate_with_mode(
     // legacy browser scripts parse as modules but are invalid under module
     // strictness (for example duplicate top-level function declarations) while
     // remaining valid classic scripts/CommonJS. Preserve that distinction.
-    let source_type = semantically_valid_source_type(source, source_mode)?;
+    let source_type = match validate_source_type(source, source_mode) {
+        Ok(source_type) => source_type,
+        Err(SafeSourceRejection::ParseFailure)
+            if browser_legacy_recovery_source_type(source, source_mode).is_some() =>
+        {
+            // The masked recovery is analysis-only. Until the proof engine can
+            // model the legacy assignment target directly, preserving the exact
+            // original source is the only semantics-preserving transform.
+            return Some(SafeTransformResult {
+                source: source.to_string(),
+                iterations: 0,
+                transforms: BTreeMap::new(),
+                arithmetic_state_proofs: Vec::new(),
+                analysis_complete: false,
+                source_recovery: Some(SafeSourceRecovery::BrowserLegacyCallAssignment),
+            });
+        }
+        Err(_) => return None,
+    };
 
     let mut current = source.to_string();
     let mut counts = Counts::default();
@@ -1431,6 +1502,8 @@ fn deobfuscate_with_mode(
         iterations,
         transforms: counts.into_inner(),
         arithmetic_state_proofs,
+        analysis_complete: true,
+        source_recovery: None,
     })
 }
 
@@ -1467,7 +1540,7 @@ mod tests {
     use super::{
         deobfuscate, deobfuscate_with_source_mode, deobfuscate_with_standard_numeric_builtins,
         expose_static_strings, recover_static_decoders, safe_source_rejection,
-        ProvenConstantEnvironment, SafeSourceMode, SafeSourceRejection,
+        ProvenConstantEnvironment, SafeSourceMode, SafeSourceRecovery, SafeSourceRejection,
     };
     use oxc_allocator::Allocator;
     use oxc_ast::ast::{CallExpression, Expression};
@@ -2113,6 +2186,20 @@ console.log(d(0x10,"k"),d(0x11,"k"));
         assert_eq!(
             safe_source_rejection("const value = 1;", SafeSourceMode::CommonJs),
             None
+        );
+        let legacy = "function target() {} target() = 1;";
+        assert_eq!(
+            safe_source_rejection(legacy, SafeSourceMode::CommonJs),
+            None
+        );
+        let result = deobfuscate_with_source_mode(legacy, 16, SafeSourceMode::CommonJs)
+            .expect("legacy browser syntax should be preserved as an explicit pass-through");
+        assert_eq!(result.source, legacy);
+        assert_eq!(result.iterations, 0);
+        assert!(!result.analysis_complete);
+        assert_eq!(
+            result.source_recovery,
+            Some(SafeSourceRecovery::BrowserLegacyCallAssignment)
         );
     }
 

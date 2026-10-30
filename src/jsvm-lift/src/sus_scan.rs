@@ -1,7 +1,10 @@
 use crate::numeric::exact_u64;
 use anyhow::{ensure, Result};
 use base64::{engine::general_purpose, Engine as _};
-use jsvm_safe_core::{eval_static_primitive, string_literal_value, template_element_value};
+use jsvm_safe_core::{
+    eval_static_primitive, recover_browser_legacy_call_assignments, string_literal_value,
+    template_element_value,
+};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, BinaryExpression, CallExpression,
@@ -1283,92 +1286,6 @@ fn primary_source_type(path: &Path) -> SourceType {
     }
 }
 
-fn expression_is_call(source: &str) -> bool {
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, SourceType::cjs()).parse();
-    if parsed.fatal_error || !parsed.diagnostics.is_empty() || parsed.program.body.len() != 1 {
-        return false;
-    }
-    let Statement::ExpressionStatement(statement) = &parsed.program.body[0] else {
-        return false;
-    };
-    fn is_call(expression: &Expression<'_>) -> bool {
-        match expression {
-            Expression::CallExpression(_) => true,
-            Expression::ParenthesizedExpression(parenthesized) => {
-                is_call(&parenthesized.expression)
-            }
-            _ => false,
-        }
-    }
-    is_call(&statement.expression)
-}
-
-#[derive(Debug)]
-struct BrowserParseRecovery {
-    source: String,
-    opaque_spans: Vec<SusOpaqueParseSpan>,
-}
-
-fn recover_browser_legacy_call_assignments(
-    source: &str,
-    source_type: SourceType,
-) -> Option<BrowserParseRecovery> {
-    let mut masked = source.to_string();
-    let mut opaque_spans = Vec::new();
-
-    // Oxc intentionally models only spec-valid AssignmentTarget nodes. V8 also
-    // accepts a legacy web form such as `f() = value` and throws ReferenceError
-    // if execution reaches it. Recover an AST for scanning by masking only that
-    // invalid target, preserving byte offsets exactly. The original source is
-    // never rewritten or published from this recovery view.
-    for _ in 0..64 {
-        let allocator = Allocator::default();
-        let parsed = Parser::new(&allocator, &masked, source_type).parse();
-        if !parsed.fatal_error {
-            return (!opaque_spans.is_empty()).then_some(BrowserParseRecovery {
-                source: masked,
-                opaque_spans,
-            });
-        }
-        if parsed.diagnostics.len() != 1 {
-            return None;
-        }
-        let diagnostic = &parsed.diagnostics[0];
-        if diagnostic.message.as_ref() != "Cannot assign to this expression" {
-            return None;
-        }
-        let label = diagnostic.labels.first()?;
-        let start = usize::try_from(label.offset()).ok()?;
-        let len = usize::try_from(label.len()).ok()?;
-        let end = start.checked_add(len)?;
-        if len == 0
-            || end > source.len()
-            || !source.is_char_boundary(start)
-            || !source.is_char_boundary(end)
-        {
-            return None;
-        }
-        if opaque_spans.iter().any(|span| {
-            let span_start = span.start as usize;
-            let span_end = span.end as usize;
-            start < span_end && span_start < end
-        }) {
-            return None;
-        }
-        if !expression_is_call(&source[start..end]) {
-            return None;
-        }
-        masked.replace_range(start..end, &"_".repeat(len));
-        opaque_spans.push(SusOpaqueParseSpan {
-            start: u32::try_from(start).ok()?,
-            end: u32::try_from(end).ok()?,
-            kind: "browser_legacy_call_assignment_target".to_string(),
-        });
-    }
-    None
-}
-
 fn overlaps_opaque_span(signal: &RawSignal, opaque_spans: &[SusOpaqueParseSpan]) -> bool {
     opaque_spans
         .iter()
@@ -1544,7 +1461,15 @@ pub fn analyze_source(
                         fatal_error: false,
                         analysis_complete: false,
                         parse_recovery: Some("browser-legacy-call-assignment".to_string()),
-                        opaque_parse_spans: recovery.opaque_spans,
+                        opaque_parse_spans: recovery
+                            .opaque_spans
+                            .into_iter()
+                            .map(|span| SusOpaqueParseSpan {
+                                start: span.start,
+                                end: span.end,
+                                kind: "browser_legacy_call_assignment_target".to_string(),
+                            })
+                            .collect(),
                     },
                 );
             }
@@ -1564,7 +1489,15 @@ pub fn analyze_source(
                     fatal_error: false,
                     analysis_complete: false,
                     parse_recovery: Some("browser-legacy-call-assignment".to_string()),
-                    opaque_parse_spans: recovery.opaque_spans,
+                    opaque_parse_spans: recovery
+                        .opaque_spans
+                        .into_iter()
+                        .map(|span| SusOpaqueParseSpan {
+                            start: span.start,
+                            end: span.end,
+                            kind: "browser_legacy_call_assignment_target".to_string(),
+                        })
+                        .collect(),
                 },
             );
         }
