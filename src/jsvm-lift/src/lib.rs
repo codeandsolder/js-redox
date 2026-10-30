@@ -45,6 +45,10 @@ pub mod forwarding_semantics;
 
 pub mod receiver_identity;
 
+pub mod registry_identity;
+
+pub mod table_vm;
+
 pub(crate) mod global_builtin;
 
 pub mod wasm_import_semantics;

@@ -1,9 +1,14 @@
 use crate::ast_utils::target_ident;
-use jsvm_lift::forwarding_semantics::{
+use crate::forwarding_semantics::{
     structurally_proven_registry_forwarding_calls, structurally_proven_registry_read_calls,
     ProvenRegistryForwardingCall, ProvenRegistryReadCall,
 };
-use jsvm_lift::numeric::exact_u64;
+use crate::numeric::exact_u64;
+use crate::receiver_identity::ProvenOriginFlow;
+use crate::registry_identity::{
+    proven_origin_registry_handler_installs, proven_origin_registry_read_calls,
+    ProvenRegistryObjectOrigin,
+};
 use jsvm_safe_core::string_literal_value;
 use oxc_ast::{
     ast::{
@@ -153,6 +158,8 @@ struct Analyzer<'s> {
     registry_sources: HashMap<(u32, u32, String), String>,
     forwarded_registry_calls: HashMap<(u32, u32), ProvenRegistryForwardingCall>,
     registry_read_calls: HashMap<(u32, u32), ProvenRegistryReadCall>,
+    forwarded_registry_origins: HashMap<(u32, u32), ProvenRegistryObjectOrigin>,
+    registry_read_origins: HashMap<(u32, u32), ProvenRegistryObjectOrigin>,
     forwarded_registry_handlers: HashMap<(u32, u32, String), Vec<HandlerFunctionSlot>>,
     forwarded_registry_spans: HashMap<(u32, u32, String), (u32, u32)>,
     transducers: Vec<ByteTransducerCandidate>,
@@ -307,6 +314,8 @@ impl<'s> Analyzer<'s> {
         source: &'s str,
         forwarded_calls: Vec<ProvenRegistryForwardingCall>,
         read_calls: Vec<ProvenRegistryReadCall>,
+        forwarded_registry_origins: HashMap<(u32, u32), ProvenRegistryObjectOrigin>,
+        registry_read_origins: HashMap<(u32, u32), ProvenRegistryObjectOrigin>,
     ) -> Self {
         Self {
             source,
@@ -324,6 +333,8 @@ impl<'s> Analyzer<'s> {
                 .into_iter()
                 .map(|call| ((call.call_start, call.call_end), call))
                 .collect(),
+            forwarded_registry_origins,
+            registry_read_origins,
             forwarded_registry_handlers: HashMap::new(),
             forwarded_registry_spans: HashMap::new(),
             transducers: Vec::new(),
@@ -349,7 +360,10 @@ impl<'s> Analyzer<'s> {
     }
 
     fn registry_scope_key(&self, binding: String) -> (u32, u32, String) {
-        if binding.starts_with("this.") || binding.starts_with("this[") {
+        if binding.starts_with("this.")
+            || binding.starts_with("this[")
+            || binding.starts_with("origin@")
+        {
             return (
                 0,
                 u32::try_from(self.source.len()).unwrap_or(u32::MAX),
@@ -365,8 +379,20 @@ impl<'s> Analyzer<'s> {
         receiver_start: u32,
         receiver_end: u32,
         registry_path: &[String],
+        origin: Option<&ProvenRegistryObjectOrigin>,
     ) -> String {
-        let mut binding = fragment(self.source, Span::new(receiver_start, receiver_end));
+        let mut binding = origin.map_or_else(
+            || fragment(self.source, Span::new(receiver_start, receiver_end)),
+            |origin| {
+                format!(
+                    "origin@{}-{}:{}-{}",
+                    origin.allocation_start,
+                    origin.allocation_end,
+                    origin.constructor_start,
+                    origin.constructor_end
+                )
+            },
+        );
         for property in registry_path {
             let identifier = property.chars().enumerate().all(|(index, character)| {
                 character == '_'
@@ -394,10 +420,14 @@ impl<'s> Analyzer<'s> {
         else {
             return;
         };
+        let origin = self
+            .forwarded_registry_origins
+            .get(&(proof.call_start, proof.call_end));
         let binding = self.registry_binding(
             proof.receiver_start,
             proof.receiver_end,
             &proof.registry_path,
+            origin,
         );
         let key = fragment(self.source, Span::new(proof.key_start, proof.key_end));
         let scope_key = self.registry_scope_key(binding);
@@ -428,10 +458,14 @@ impl<'s> Analyzer<'s> {
         else {
             return;
         };
+        let origin = self
+            .registry_read_origins
+            .get(&(proof.call_start, proof.call_end));
         let table = self.registry_binding(
             proof.receiver_start,
             proof.receiver_end,
             &proof.registry_path,
+            origin,
         );
         let index = fragment(self.source, Span::new(proof.key_start, proof.key_end));
         if let Some(current) = self.current_mut() {
@@ -1209,17 +1243,113 @@ pub fn analyze(source: &str, program: &oxc_ast::ast::Program<'_>) -> TableVmAnal
     } else {
         (Vec::new(), Vec::new())
     };
-    let mut analyzer = Analyzer::new(source, forwarded_calls, read_calls);
+    let mut analyzer = Analyzer::new(
+        source,
+        forwarded_calls,
+        read_calls,
+        HashMap::new(),
+        HashMap::new(),
+    );
+    analyzer.visit_program(program);
+    analyzer.finish()
+}
+
+/// Analyze handler tables while canonicalizing proven registry receivers by
+/// exact allocation identity. Install and read flows may differ: constructor
+/// initialization typically proves installs, while a seeded runtime method flow
+/// proves later reads through helper parameters.
+pub fn analyze_with_registry_origins(
+    source: &str,
+    program: &oxc_ast::ast::Program<'_>,
+    install_flow: &ProvenOriginFlow,
+    read_flow: &ProvenOriginFlow,
+) -> TableVmAnalysis {
+    let semantic_ret = SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(program);
+    let (forwarded_calls, read_calls, forwarded_registry_origins, registry_read_origins) =
+        if semantic_ret.diagnostics.is_empty() {
+            let scoping = semantic_ret.semantic.scoping();
+            let forwarded_calls = structurally_proven_registry_forwarding_calls(program, scoping);
+            let read_calls = structurally_proven_registry_read_calls(program, scoping);
+            let forwarded_registry_origins =
+                proven_origin_registry_handler_installs(program, scoping, install_flow)
+                    .into_iter()
+                    .map(|proof| {
+                        (
+                            (proof.install.call_start, proof.install.call_end),
+                            proof.origin,
+                        )
+                    })
+                    .collect();
+            let registry_read_origins =
+                proven_origin_registry_read_calls(program, scoping, read_flow)
+                    .into_iter()
+                    .map(|proof| ((proof.read.call_start, proof.read.call_end), proof.origin))
+                    .collect();
+            (
+                forwarded_calls,
+                read_calls,
+                forwarded_registry_origins,
+                registry_read_origins,
+            )
+        } else {
+            (Vec::new(), Vec::new(), HashMap::new(), HashMap::new())
+        };
+    let mut analyzer = Analyzer::new(
+        source,
+        forwarded_calls,
+        read_calls,
+        forwarded_registry_origins,
+        registry_read_origins,
+    );
     analyzer.visit_program(program);
     analyzer.finish()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::analyze;
+    use super::{analyze, analyze_with_registry_origins};
     use oxc_allocator::Allocator;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
+
+    #[test]
+    fn origin_aware_registry_joins_install_and_dynamic_read() {
+        use crate::receiver_identity::structurally_proven_origin_flow;
+        use oxc_semantic::SemanticBuilder;
+
+        let source = r#"
+            const C = function(key) {
+                install(this, 1, function a() {});
+                install(this, 2, function b() {});
+                install(this, 3, function c() {});
+                install(this, 4, function d() {});
+                run(this, key);
+            };
+            function install(state, key, value) { state.T[key] = value; }
+            function read(state, key) { let value; value = state.T[key]; return value; }
+            function run(state, key) { return read(state, key); }
+            new C(window.dynamicKey);
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let analysis = analyze_with_registry_origins(source, &parsed.program, &flow, &flow);
+        let table = analysis
+            .handler_function_tables
+            .iter()
+            .find(|table| table.binding.starts_with("origin@"))
+            .expect("origin-canonical registry");
+        assert_eq!(table.entries, 4);
+        assert_eq!(table.function_values, 4);
+        assert_eq!(table.read_sites, 1);
+        assert_eq!(table.dynamic_read_sites, 1);
+        assert!(analysis.table_vms.is_empty());
+    }
 
     #[test]
     fn materializes_proven_forwarded_registry_calls() {
