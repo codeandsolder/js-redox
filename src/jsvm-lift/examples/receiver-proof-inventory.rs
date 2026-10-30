@@ -4,6 +4,7 @@ use jsvm_lift::{
     cfg_order::prove_events_before_event,
     receiver_identity::{
         propagate_matched_prototype_method_call_origins,
+        propagate_proven_prototype_method_call_origins,
         proven_origin_direct_call_event_unreachable, proven_own_data_field_at_runtime_method_call,
         proven_prototype_method_receiver_preservation_summary,
         proven_receiver_preserving_prototype_method_call,
@@ -15,6 +16,10 @@ use jsvm_lift::{
         structurally_proven_prototype_method_receiver_effects,
         structurally_proven_receiver_preserving_prototype_method_calls,
     },
+    registry_identity::{
+        proven_origin_registry_handler_installs, proven_origin_registry_read_calls,
+    },
+    table_vm,
 };
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
@@ -54,6 +59,12 @@ fn main() -> Result<()> {
             .parse::<u32>()
             .ok()
     });
+    let registry_origin_call_start = args.iter().find_map(|arg| {
+        arg.to_str()?
+            .strip_prefix("--registry-origin-call-start=")?
+            .parse::<u32>()
+            .ok()
+    });
     let field_property = args
         .iter()
         .find_map(|arg| arg.to_str()?.strip_prefix("--field=").map(str::to_owned));
@@ -62,7 +73,7 @@ fn main() -> Result<()> {
         .find(|arg| !arg.to_string_lossy().starts_with("--"))
         .map(PathBuf::from)
         .context(
-            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--runtime-only] [--preserve-call-start=N] [--fully-preserve-call-start=N] [--field-runtime-call-start=N --field=NAME]",
+            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--runtime-only] [--preserve-call-start=N] [--fully-preserve-call-start=N] [--field-runtime-call-start=N --field=NAME] [--registry-origin-call-start=N]",
         )?;
     let source =
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -79,6 +90,108 @@ fn main() -> Result<()> {
         .build(&parsed.program);
     anyhow::ensure!(semantic.diagnostics.is_empty(), "semantic diagnostics");
     let scoping = semantic.semantic.scoping();
+    if let Some(call_start) = registry_origin_call_start {
+        let mut targets = structurally_proven_prototype_method_calls_at_runtime(
+            &parsed.program,
+            &semantic.semantic,
+        )
+        .into_iter()
+        .filter(|proof| proof.candidate.call.call_start == call_start);
+        let target = targets
+            .next()
+            .context("no runtime-proven method call at requested start")?;
+        anyhow::ensure!(
+            targets.next().is_none(),
+            "ambiguous runtime method call start"
+        );
+        let seeded =
+            propagate_proven_prototype_method_call_origins(&parsed.program, scoping, &target);
+        let base = structurally_proven_origin_flow(&parsed.program, scoping);
+        let target_origin = (
+            target.candidate.call.allocation_start,
+            target.candidate.call.allocation_end,
+            target.candidate.call.constructor_start,
+            target.candidate.call.constructor_end,
+        );
+        let reads = proven_origin_registry_read_calls(&parsed.program, scoping, &seeded)
+            .into_iter()
+            .filter(|proof| {
+                (
+                    proof.origin.allocation_start,
+                    proof.origin.allocation_end,
+                    proof.origin.constructor_start,
+                    proof.origin.constructor_end,
+                ) == target_origin
+            })
+            .map(|proof| {
+                json!({
+                    "call": [proof.read.call_start, proof.read.call_end],
+                    "receiver": [proof.read.receiver_start, proof.read.receiver_end],
+                    "key_span": [proof.read.key_start, proof.read.key_end],
+                    "exact_key": proof.exact_key,
+                    "registry_path": proof.read.registry_path,
+                })
+            })
+            .collect::<Vec<_>>();
+        let table_analysis =
+            table_vm::analyze_with_registry_origins(&source, &parsed.program, &base, &seeded);
+        let origin_prefix = format!(
+            "origin@{}-{}:{}-{}",
+            target_origin.0, target_origin.1, target_origin.2, target_origin.3
+        );
+        let origin_tables = table_analysis
+            .handler_function_tables
+            .iter()
+            .filter(|table| table.binding.starts_with(&origin_prefix))
+            .map(|table| {
+                json!({
+                    "binding": table.binding,
+                    "entries": table.entries,
+                    "function_values": table.function_values,
+                    "read_sites": table.read_sites,
+                    "dynamic_read_sites": table.dynamic_read_sites,
+                    "dynamic_call_sites": table.dynamic_call_sites,
+                    "looped_dynamic_call_sites": table.looped_dynamic_call_sites,
+                })
+            })
+            .collect::<Vec<_>>();
+        let installs = proven_origin_registry_handler_installs(&parsed.program, scoping, &base)
+            .into_iter()
+            .filter(|proof| {
+                (
+                    proof.origin.allocation_start,
+                    proof.origin.allocation_end,
+                    proof.origin.constructor_start,
+                    proof.origin.constructor_end,
+                ) == target_origin
+            })
+            .map(|proof| {
+                json!({
+                    "call": [proof.install.call_start, proof.install.call_end],
+                    "receiver": [proof.install.receiver_start, proof.install.receiver_end],
+                    "key_span": [proof.install.key_start, proof.install.key_end],
+                    "exact_key": proof.exact_key,
+                    "registry_path": proof.install.registry_path,
+                    "handler": [proof.install.handler_start, proof.install.handler_end],
+                    "handler_params": proof.install.handler_params,
+                    "handler_async": proof.install.handler_async,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "call": [target.candidate.call.call_start, target.candidate.call.call_end],
+                "property": target.candidate.call.property,
+                "allocation": [target.candidate.call.allocation_start, target.candidate.call.allocation_end],
+                "registry_reads": reads,
+                "registry_installs": installs,
+                "origin_tables": origin_tables,
+                "table_vms": table_analysis.table_vms,
+            }))?
+        );
+        return Ok(());
+    }
     if let Some(call_start) = fully_preserve_call_start {
         let mut targets = structurally_proven_prototype_method_calls_at_runtime(
             &parsed.program,
