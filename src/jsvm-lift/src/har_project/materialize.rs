@@ -154,7 +154,7 @@ fn page_metadata(har: &Har) -> Vec<PageMeta> {
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "materialization keeps the per-resource context explicit at this boundary")]
 fn materialize_inline_scripts(
     parent_resource_id: usize,
     base_url: &str,
