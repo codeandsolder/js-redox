@@ -8,7 +8,7 @@ use jsvm_safe_core::{
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, BinaryExpression, CallExpression,
-    ComputedMemberExpression, Expression, Function, NewExpression, ObjectExpression, Statement,
+    ComputedMemberExpression, Expression, Function, NewExpression, ObjectExpression,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;

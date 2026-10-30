@@ -2192,8 +2192,12 @@ console.log(d(0x10,"k"),d(0x11,"k"));
             safe_source_rejection(legacy, SafeSourceMode::CommonJs),
             None
         );
-        let result = deobfuscate_with_source_mode(legacy, 16, SafeSourceMode::CommonJs)
-            .expect("legacy browser syntax should be preserved as an explicit pass-through");
+        let result = deobfuscate_with_source_mode(legacy, 16, SafeSourceMode::CommonJs);
+        assert!(
+            result.is_some(),
+            "legacy browser syntax should be preserved as an explicit pass-through"
+        );
+        let result = result.unwrap_or_else(|| unreachable!());
         assert_eq!(result.source, legacy);
         assert_eq!(result.iterations, 0);
         assert!(!result.analysis_complete);

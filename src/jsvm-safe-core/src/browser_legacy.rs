@@ -107,7 +107,12 @@ mod tests {
     #[test]
     fn recovers_only_call_assignment_targets_without_moving_offsets() {
         let source = "before(); target(1) = value; after();";
-        let recovery = recover_browser_legacy_call_assignments(source, SourceType::cjs()).unwrap();
+        let recovery = recover_browser_legacy_call_assignments(source, SourceType::cjs());
+        assert!(
+            recovery.is_some(),
+            "expected legacy call-assignment recovery"
+        );
+        let recovery = recovery.unwrap_or_else(|| unreachable!());
         assert_eq!(recovery.source.len(), source.len());
         assert_eq!(recovery.opaque_spans.len(), 1);
         let span = recovery.opaque_spans[0];
