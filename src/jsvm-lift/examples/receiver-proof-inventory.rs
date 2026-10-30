@@ -1,13 +1,16 @@
 use anyhow::{Context, Result};
 use jsvm_lift::cfg_order::prove_event_before_barriers;
-use jsvm_lift::receiver_identity::{
-    propagate_matched_prototype_method_call_origins, proven_origin_direct_call_event_unreachable,
-    structurally_matched_prototype_method_calls, structurally_proven_origin_flow,
-    structurally_proven_own_data_field_initializations,
-    structurally_proven_own_data_fields_at_member_calls,
-    structurally_proven_prototype_method_lookup_targets,
-    structurally_proven_prototype_method_receiver_effects,
-    structurally_proven_receiver_preserving_prototype_method_calls,
+use jsvm_lift::{
+    cfg_order::prove_events_before_event,
+    receiver_identity::{
+        propagate_matched_prototype_method_call_origins,
+        proven_origin_direct_call_event_unreachable, structurally_matched_prototype_method_calls,
+        structurally_proven_origin_flow, structurally_proven_own_data_field_initializations,
+        structurally_proven_own_data_fields_at_member_calls,
+        structurally_proven_prototype_method_lookup_targets,
+        structurally_proven_prototype_method_receiver_effects,
+        structurally_proven_receiver_preserving_prototype_method_calls,
+    },
 };
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
@@ -53,13 +56,16 @@ fn main() -> Result<()> {
         structurally_proven_prototype_method_receiver_effects(&parsed.program, scoping);
     let own_data_fields =
         structurally_proven_own_data_field_initializations(&parsed.program, scoping);
-    let own_data_fields_at_member_calls =
-        structurally_proven_own_data_fields_at_member_calls(&source, &parsed.program, scoping);
+    let own_data_fields_at_member_calls = structurally_proven_own_data_fields_at_member_calls(
+        &source,
+        &parsed.program,
+        &semantic.semantic,
+    );
     let receiver_preserving_method_calls =
         structurally_proven_receiver_preserving_prototype_method_calls(
             &source,
             &parsed.program,
-            scoping,
+            &semantic.semantic,
         );
     let matched_method_origin_flows = matched
         .iter()
@@ -90,6 +96,11 @@ fn main() -> Result<()> {
                             "span": [event.call_start, event.call_end],
                             "property": event.property,
                             "unreachable": event_check(event.call_start, event.call_end),
+                        })).collect::<Vec<_>>(),
+                        "member_reads": seeded.member_reads.iter().filter(|event| event.context == call.callee).map(|event| json!({
+                            "span": [event.read_start, event.read_end],
+                            "property": event.property,
+                            "unreachable": event_check(event.read_start, event.read_end),
                         })).collect::<Vec<_>>(),
                         "member_writes": seeded.member_writes.iter().filter(|event| event.context == call.callee).map(|event| json!({
                             "span": [event.write_start, event.write_end],
@@ -129,6 +140,12 @@ fn main() -> Result<()> {
                     "context": {"this_origin": call.context.this_origin, "parameter_indices": call.context.parameter_indices},
                     "property": call.property,
                 })).collect::<Vec<_>>(),
+                "member_reads": seeded.member_reads.iter().map(|read| json!({
+                    "read": [read.read_start, read.read_end],
+                    "function": [read.context.function_start, read.context.function_end],
+                    "context": {"this_origin": read.context.this_origin, "parameter_indices": read.context.parameter_indices},
+                    "property": read.property,
+                })).collect::<Vec<_>>(),
                 "member_writes": seeded.member_writes.iter().map(|write| json!({
                     "write": [write.write_start, write.write_end],
                     "function": [write.context.function_start, write.context.function_end],
@@ -146,6 +163,26 @@ fn main() -> Result<()> {
         })
         .collect::<Vec<_>>();
 
+    let mut own_data_field_entry_dominance = Vec::new();
+    for field in &own_data_fields {
+        for call in flow
+            .direct_calls
+            .iter()
+            .filter(|call| call.caller == field.context)
+        {
+            own_data_field_entry_dominance.push(json!({
+                "field": field.property,
+                "initialization": [field.write_start, field.write_end],
+                "entry_call": [call.call_start, call.call_end],
+                "caller_function": [call.caller.function_start, call.caller.function_end],
+                "dominates": prove_events_before_event(
+                    &semantic.semantic,
+                    &[Span::new(field.write_start, field.write_end)],
+                    Span::new(call.call_start, call.call_end),
+                ),
+            }));
+        }
+    }
     let direct_calls = flow
         .direct_calls
         .iter()
@@ -162,6 +199,23 @@ fn main() -> Result<()> {
                 "standard_function_call_semantics_required": call.standard_function_call_semantics_required,
                 "arguments": call.argument_spans.iter().zip(&call.exact_integer_arguments).map(|((start, end), exact_integer)| json!({"start": start, "end": end, "source": snippet(&source, *start, *end), "exact_integer": exact_integer})).collect::<Vec<_>>(),
                 "allocation": [call.caller.allocation_start, call.caller.allocation_end],
+            })
+        })
+        .collect::<Vec<_>>();
+    let member_reads = flow
+        .member_reads
+        .iter()
+        .map(|read| {
+            json!({
+                "read_start": read.read_start,
+                "read_end": read.read_end,
+                "evaluation_order": read.evaluation_order,
+                "read": snippet(&source, read.read_start, read.read_end),
+                "function": [read.context.function_start, read.context.function_end],
+                "context": {"this_origin": read.context.this_origin, "parameter_indices": read.context.parameter_indices},
+                "property": read.property,
+                "allocation": [read.allocation_start, read.allocation_end],
+                "constructor": [read.constructor_start, read.constructor_end],
             })
         })
         .collect::<Vec<_>>();
@@ -434,12 +488,14 @@ fn main() -> Result<()> {
             "file": path,
             "direct_calls": direct_calls,
             "member_calls": member_calls,
+            "member_reads": member_reads,
             "member_writes": member_writes,
             "exposures": exposures,
             "direct_call_exposure_checks": direct_call_exposure_checks,
             "direct_call_nested_call_checks": direct_call_nested_call_checks,
             "prototype_lookup_targets": lookup_targets,
         "own_data_field_initializations": own_data_fields,
+        "own_data_field_entry_dominance": own_data_field_entry_dominance,
         "own_data_fields_at_member_calls": own_data_fields_at_member_calls,
         "receiver_preserving_method_calls": receiver_preserving_method_calls,
         "matched_method_origin_flows": matched_method_origin_flows,
