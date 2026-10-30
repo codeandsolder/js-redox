@@ -4,8 +4,9 @@ use jsvm_lift::{
     cfg_order::prove_events_before_event,
     receiver_identity::{
         propagate_matched_prototype_method_call_origins,
-        proven_origin_direct_call_event_unreachable,
+        proven_origin_direct_call_event_unreachable, proven_own_data_field_at_runtime_method_call,
         proven_prototype_method_receiver_preservation_summary,
+        proven_receiver_preserving_prototype_method_call,
         structurally_matched_prototype_method_calls, structurally_proven_origin_flow,
         structurally_proven_own_data_field_initializations,
         structurally_proven_own_data_fields_at_member_calls,
@@ -41,12 +42,27 @@ fn main() -> Result<()> {
             .parse::<u32>()
             .ok()
     });
+    let fully_preserve_call_start = args.iter().find_map(|arg| {
+        arg.to_str()?
+            .strip_prefix("--fully-preserve-call-start=")?
+            .parse::<u32>()
+            .ok()
+    });
+    let field_runtime_call_start = args.iter().find_map(|arg| {
+        arg.to_str()?
+            .strip_prefix("--field-runtime-call-start=")?
+            .parse::<u32>()
+            .ok()
+    });
+    let field_property = args
+        .iter()
+        .find_map(|arg| arg.to_str()?.strip_prefix("--field=").map(str::to_owned));
     let path = args
         .iter()
         .find(|arg| !arg.to_string_lossy().starts_with("--"))
         .map(PathBuf::from)
         .context(
-            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--runtime-only] [--preserve-call-start=N]",
+            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--runtime-only] [--preserve-call-start=N] [--fully-preserve-call-start=N] [--field-runtime-call-start=N --field=NAME]",
         )?;
     let source =
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -63,6 +79,94 @@ fn main() -> Result<()> {
         .build(&parsed.program);
     anyhow::ensure!(semantic.diagnostics.is_empty(), "semantic diagnostics");
     let scoping = semantic.semantic.scoping();
+    if let Some(call_start) = fully_preserve_call_start {
+        let mut targets = structurally_proven_prototype_method_calls_at_runtime(
+            &parsed.program,
+            &semantic.semantic,
+        )
+        .into_iter()
+        .filter(|proof| proof.candidate.call.call_start == call_start);
+        let target = targets
+            .next()
+            .context("no runtime-proven method call at requested start")?;
+        anyhow::ensure!(
+            targets.next().is_none(),
+            "ambiguous runtime method call start"
+        );
+        let proof = proven_receiver_preserving_prototype_method_call(
+            &source,
+            &parsed.program,
+            &semantic.semantic,
+            &target,
+        )
+        .map(|proof| {
+            json!({
+                "call": [proof.candidate.call.call_start, proof.candidate.call.call_end],
+                "property": proof.candidate.call.property,
+                "allocation": [proof.candidate.call.allocation_start, proof.candidate.call.allocation_end],
+                "own_data_reads": proof.own_data_reads.iter().map(|field| json!({
+                    "field": field.initialization.property,
+                    "initialization": [field.initialization.write_start, field.initialization.write_end],
+                    "direct_call_path": field.direct_call_path.iter().map(|edge| [edge.call_start, edge.call_end]).collect::<Vec<_>>(),
+                    "discharged_preserving_method_calls": field.discharged_preserving_method_calls.iter().map(|call| json!({
+                        "call": [call.call_start, call.call_end],
+                        "property": call.property,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            })
+        });
+        println!("{}", serde_json::to_string_pretty(&proof)?);
+        return Ok(());
+    }
+    if let Some(call_start) = field_runtime_call_start {
+        let property = field_property
+            .as_deref()
+            .context("--field-runtime-call-start requires --field=NAME")?;
+        let mut targets = structurally_proven_prototype_method_calls_at_runtime(
+            &parsed.program,
+            &semantic.semantic,
+        )
+        .into_iter()
+        .filter(|proof| proof.candidate.call.call_start == call_start);
+        let target = targets
+            .next()
+            .context("no runtime-proven method call at requested start")?;
+        anyhow::ensure!(
+            targets.next().is_none(),
+            "ambiguous runtime method call start"
+        );
+        let proof = proven_own_data_field_at_runtime_method_call(
+            &source,
+            &parsed.program,
+            &semantic.semantic,
+            &target,
+            property,
+        )
+        .map(|proof| {
+            let call = &proof.call_target.candidate.call;
+            json!({
+                "field": proof.initialization.property,
+                "initialization": [proof.initialization.write_start, proof.initialization.write_end],
+                "call": [call.call_start, call.call_end],
+                "property": call.property,
+                "allocation": [call.allocation_start, call.allocation_end],
+                "direct_call_path": proof.direct_call_path.iter().map(|edge| json!({
+                    "call": [edge.call_start, edge.call_end],
+                    "caller": [edge.caller.function_start, edge.caller.function_end],
+                    "callee": [edge.callee.function_start, edge.callee.function_end],
+                    "standard_function_call_semantics_required": edge.standard_function_call_semantics_required,
+                })).collect::<Vec<_>>(),
+                "discharged_preserving_method_calls": proof.discharged_preserving_method_calls.iter().map(|crossed| json!({
+                    "call": [crossed.call_start, crossed.call_end],
+                    "property": crossed.property,
+                    "function": [crossed.context.function_start, crossed.context.function_end],
+                })).collect::<Vec<_>>(),
+                "standard_function_call_semantics_required": proof.standard_function_call_semantics_required,
+            })
+        });
+        println!("{}", serde_json::to_string_pretty(&proof)?);
+        return Ok(());
+    }
     if let Some(call_start) = preserve_call_start {
         let mut matches = structurally_proven_prototype_method_calls_at_runtime(
             &parsed.program,
