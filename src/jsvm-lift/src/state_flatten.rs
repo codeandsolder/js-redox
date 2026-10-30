@@ -1552,9 +1552,8 @@ pub fn prove_function_structured_branch_event_unreachable_with_integer_parameter
                         .as_ref()
                         .is_some_and(|alternate| Self::contains(alternate.span(), self.event));
                     if in_consequent || in_alternate {
-                        if let Some(test) = eval_expr(&statement.test, self.env) {
-                            if (in_consequent && !test.truthy()) || (in_alternate && test.truthy())
-                            {
+                        if let Some(test) = branch_truthiness(&statement.test, self.env) {
+                            if (in_consequent && !test) || (in_alternate && test) {
                                 self.excluded = true;
                                 return;
                             }
@@ -1573,9 +1572,8 @@ pub fn prove_function_structured_branch_event_unreachable_with_integer_parameter
                     let in_consequent = Self::contains(expression.consequent.span(), self.event);
                     let in_alternate = Self::contains(expression.alternate.span(), self.event);
                     if in_consequent || in_alternate {
-                        if let Some(test) = eval_expr(&expression.test, self.env) {
-                            if (in_consequent && !test.truthy()) || (in_alternate && test.truthy())
-                            {
+                        if let Some(test) = branch_truthiness(&expression.test, self.env) {
+                            if (in_consequent && !test) || (in_alternate && test) {
                                 self.excluded = true;
                                 return;
                             }
@@ -1592,10 +1590,10 @@ pub fn prove_function_structured_branch_event_unreachable_with_integer_parameter
                         return;
                     }
                     if Self::contains(expression.right.span(), self.event) {
-                        if let Some(lhs) = eval_expr(&expression.left, self.env) {
+                        if let Some(lhs) = branch_truthiness(&expression.left, self.env) {
                             let skips_right = match expression.operator.as_str() {
-                                "&&" => !lhs.truthy(),
-                                "||" => lhs.truthy(),
+                                "&&" => !lhs,
+                                "||" => lhs,
                                 _ => false,
                             };
                             if skips_right {
@@ -3824,6 +3822,115 @@ fn eval_expr(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Option<Sca
     }
 }
 
+/// Evaluate a scalar result on every normal completion for branch reachability.
+///
+/// This is intentionally weaker than `eval_expr`: side-effectful or opaque
+/// sequence prefixes may remain unknown, but they cannot change an exact scalar
+/// result established by the final expression. The scalar interpreter keeps
+/// using `eval_expr`; this relaxation is only for reachability proofs.
+///
+/// Callers provide `env` from `exact_integer_parameter_env`: every represented
+/// binding has no resolved writes in this function, and dynamic scope / the
+/// sloppy `arguments` alias are rejected. Therefore opaque sequence prefixes
+/// may throw or mutate unrelated state, but cannot change a scalar binding used
+/// by the final supported expression.
+fn branch_scalar_on_normal_completion(
+    expr: &Expression<'_>,
+    env: &HashMap<String, Scalar>,
+) -> Option<Scalar> {
+    if let Some(value) = eval_expr(expr, env) {
+        return Some(value);
+    }
+    match expr {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            branch_scalar_on_normal_completion(&parenthesized.expression, env)
+        }
+        Expression::SequenceExpression(sequence) => sequence
+            .expressions
+            .last()
+            .and_then(|expression| branch_scalar_on_normal_completion(expression, env)),
+        _ => None,
+    }
+}
+
+fn branch_truthiness(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Option<bool> {
+    if let Some(value) = branch_scalar_on_normal_completion(expr, env) {
+        return Some(value.truthy());
+    }
+    match expr {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            branch_truthiness(&parenthesized.expression, env)
+        }
+        Expression::SequenceExpression(sequence) => sequence
+            .expressions
+            .last()
+            .and_then(|expression| branch_truthiness(expression, env)),
+        Expression::UnaryExpression(unary) if unary.operator.as_str() == "!" => {
+            branch_truthiness(&unary.argument, env).map(|value| !value)
+        }
+        Expression::BinaryExpression(binary) => {
+            let left = branch_scalar_on_normal_completion(&binary.left, env)?;
+            let right = branch_scalar_on_normal_completion(&binary.right, env)?;
+            match binary.operator.as_str() {
+                "==" | "===" => Some(match (left, right) {
+                    (Scalar::Undefined, Scalar::Undefined) => true,
+                    (Scalar::Int(a), Scalar::Int(b)) => a == b,
+                    _ => false,
+                }),
+                "!=" | "!==" => Some(match (left, right) {
+                    (Scalar::Undefined, Scalar::Undefined) => false,
+                    (Scalar::Int(a), Scalar::Int(b)) => a != b,
+                    _ => true,
+                }),
+                "<" => Some(left.int()? < right.int()?),
+                "<=" => Some(left.int()? <= right.int()?),
+                ">" => Some(left.int()? > right.int()?),
+                ">=" => Some(left.int()? >= right.int()?),
+                _ => None,
+            }
+        }
+        Expression::LogicalExpression(logical) => {
+            let left = branch_truthiness(&logical.left, env);
+            let right = branch_truthiness(&logical.right, env);
+            match logical.operator.as_str() {
+                "&&" => match (left, right) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    (Some(true), other) => other,
+                    _ => None,
+                },
+                "||" => match (left, right) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    (Some(false), other) => other,
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        Expression::ConditionalExpression(conditional) => {
+            if let Some(test) = branch_truthiness(&conditional.test, env) {
+                return branch_truthiness(
+                    if test {
+                        &conditional.consequent
+                    } else {
+                        &conditional.alternate
+                    },
+                    env,
+                );
+            }
+            let consequent = branch_truthiness(&conditional.consequent, env);
+            let alternate = branch_truthiness(&conditional.alternate, env);
+            if consequent.is_some() && consequent == alternate {
+                consequent
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn expression_definitely_throws(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> bool {
     match expr {
         Expression::ParenthesizedExpression(parenthesized) => {
@@ -5692,6 +5799,117 @@ mod tests {
                 function.end,
                 Span::new(start, start + 8),
                 &BTreeMap::from([(0, 48), (1, 0)]),
+            )
+        );
+    }
+
+    #[test]
+    fn branch_truthiness_proves_real_m_style_guard_false() {
+        let source = r#"
+            J - 6 << 1 < J
+                && J + 9 >> 1 >= J
+                && (
+                    u = (
+                        U = (
+                            S = Y[L] << 24,
+                            v = Y[-2 - ~L - -2] << 16,
+                            2 * (S | Q) + ~S - (S | ~v)
+                        ),
+                        H = Y[2 * (L | 2) - 2 * ~(L & 2) + 2 * ~(L | 2) + (L ^ 2)] << 8,
+                        -1 - ~H + (U & ~H)
+                    ) | Y[(L | Q) + 3],
+                    J & 100
+                ) == J;
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let Statement::ExpressionStatement(statement) = parsed.program.body.first().unwrap() else {
+            panic!("expression");
+        };
+        let env = HashMap::from([
+            (String::from("J"), Scalar::Int(48)),
+            (String::from("Q"), Scalar::Int(19)),
+        ]);
+        assert_eq!(branch_truthiness(&statement.expression, &env), Some(false));
+    }
+
+    #[test]
+    fn branch_truthiness_proves_false_left_associated_guard() {
+        let source = r#"J - 6 << 1 < J && J + 9 >> 1 >= J && (u = 3, J & 100) == J;"#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let Statement::ExpressionStatement(statement) = parsed.program.body.first().unwrap() else {
+            panic!("expression");
+        };
+        let env = HashMap::from([(String::from("J"), Scalar::Int(48))]);
+        assert_eq!(branch_truthiness(&statement.expression, &env), Some(false));
+    }
+
+    #[test]
+    fn proves_nested_sequence_short_circuit_event_unreachable() {
+        let source = r#"
+            function f(J, Q, L, U, v) {
+                ((J & 100) == J && (
+                    U = 7,
+                    129 + (U & -129) + (~U ^ 128) && (U = (L = U & Q, v = 3)),
+                    U
+                ), 11);
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+        struct FunctionSpan(Option<Span>);
+        impl<'a> Visit<'a> for FunctionSpan {
+            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+                self.0 = Some(function.span);
+            }
+        }
+        let mut function = FunctionSpan(None);
+        function.visit_program(&parsed.program);
+        let function = function.0.unwrap();
+        let start = u32::try_from(source.find("L = U & Q").unwrap()).unwrap();
+        assert!(
+            prove_function_structured_branch_event_unreachable_with_integer_parameters(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                Span::new(start, start + 9),
+                &BTreeMap::from([(0, 48), (1, 19)]),
+            )
+        );
+    }
+
+    #[test]
+    fn proves_left_associated_short_circuit_with_opaque_prefix() {
+        let source = r#"
+            function f(selector, state) {
+                (opaque() && (selector & 100) == selector) && (state = 1);
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+        struct FunctionSpan(Option<Span>);
+        impl<'a> Visit<'a> for FunctionSpan {
+            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+                self.0 = Some(function.span);
+            }
+        }
+        let mut function = FunctionSpan(None);
+        function.visit_program(&parsed.program);
+        let function = function.0.unwrap();
+        let start = u32::try_from(source.find("state = 1").unwrap()).unwrap();
+        assert!(
+            prove_function_structured_branch_event_unreachable_with_integer_parameters(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                Span::new(start, start + 9),
+                &BTreeMap::from([(0, 48)]),
             )
         );
     }
