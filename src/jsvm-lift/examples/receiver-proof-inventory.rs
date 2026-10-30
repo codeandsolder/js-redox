@@ -7,13 +7,14 @@ use jsvm_lift::{
         propagate_proven_prototype_method_call_origins,
         proven_origin_direct_call_event_unreachable, proven_own_data_field_at_runtime_method_call,
         proven_prototype_method_receiver_preservation_summary,
-        proven_receiver_preserving_prototype_method_call,
+        proven_prototype_string_at_allocation, proven_receiver_preserving_prototype_method_call,
         structurally_matched_prototype_method_calls, structurally_proven_origin_flow,
         structurally_proven_own_data_field_initializations,
         structurally_proven_own_data_fields_at_member_calls,
         structurally_proven_prototype_method_calls_at_runtime,
         structurally_proven_prototype_method_lookup_targets,
         structurally_proven_prototype_method_receiver_effects,
+        structurally_proven_prototype_string_assignments,
         structurally_proven_receiver_preserving_prototype_method_calls,
     },
     registry_identity::{
@@ -41,6 +42,7 @@ fn main() -> Result<()> {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let summary = args.iter().any(|arg| arg == "--summary");
     let runtime_only = args.iter().any(|arg| arg == "--runtime-only");
+    let prototype_strings_only = args.iter().any(|arg| arg == "--prototype-strings");
     let preserve_call_start = args.iter().find_map(|arg| {
         arg.to_str()?
             .strip_prefix("--preserve-call-start=")?
@@ -90,6 +92,21 @@ fn main() -> Result<()> {
         .build(&parsed.program);
     anyhow::ensure!(semantic.diagnostics.is_empty(), "semantic diagnostics");
     let scoping = semantic.semantic.scoping();
+    if prototype_strings_only {
+        let strings = structurally_proven_prototype_string_assignments(&parsed.program, scoping)
+            .into_iter()
+            .map(|assignment| {
+                json!({
+                    "constructor": [assignment.constructor_start, assignment.constructor_end],
+                    "property": assignment.property,
+                    "value": assignment.value,
+                    "assignment": [assignment.assignment_start, assignment.assignment_end],
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string_pretty(&strings)?);
+        return Ok(());
+    }
     if let Some(call_start) = registry_origin_call_start {
         let mut targets = structurally_proven_prototype_method_calls_at_runtime(
             &parsed.program,
@@ -113,6 +130,33 @@ fn main() -> Result<()> {
             target.candidate.call.constructor_start,
             target.candidate.call.constructor_end,
         );
+        let prototype_strings_at_allocation = structurally_proven_prototype_string_assignments(
+            &parsed.program,
+            scoping,
+        )
+        .into_iter()
+        .filter(|assignment| {
+            assignment.constructor_start == target_origin.2
+                && assignment.constructor_end == target_origin.3
+        })
+        .filter_map(|assignment| {
+            proven_prototype_string_at_allocation(
+                &parsed.program,
+                &semantic.semantic,
+                target_origin.2,
+                target_origin.3,
+                Span::new(target_origin.0, target_origin.1),
+                &assignment.property,
+            )
+        })
+        .map(|proof| {
+            json!({
+                "property": proof.assignment.property,
+                "value": proof.assignment.value,
+                "assignment": [proof.assignment.assignment_start, proof.assignment.assignment_end],
+            })
+        })
+        .collect::<Vec<_>>();
         let reads = proven_origin_registry_read_calls(&parsed.program, scoping, &seeded)
             .into_iter()
             .filter(|proof| {
@@ -188,6 +232,7 @@ fn main() -> Result<()> {
                 "registry_installs": installs,
                 "origin_tables": origin_tables,
                 "table_vms": table_analysis.table_vms,
+                "prototype_strings_at_allocation": prototype_strings_at_allocation,
             }))?
         );
         return Ok(());
