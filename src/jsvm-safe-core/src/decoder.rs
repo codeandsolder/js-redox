@@ -6,8 +6,9 @@ use crate::rewrite::Replacement;
 use crate::value_eval::{eval, js_to_uint32, render_value_array, same_values, Value};
 use crate::{
     argument_integer, array_element, decoder_argument_integer, expression_integer, fragment,
-    reference_is_statically_resolved_read, statically_resolved_symbol, string_literal_value,
-    symbol_has_only_read_references, symbol_of, template_element_value,
+    reference_is_statically_resolved_read, statically_resolved_symbol,
+    statically_unresolved_global_reference, string_literal_value, symbol_has_only_read_references,
+    symbol_of, template_element_value,
 };
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -804,7 +805,7 @@ impl FixedAlphabetProbe<'_> {
         else {
             return;
         };
-        if is_base64_alphabet(&value) && !used_aliases.is_empty() {
+        if is_base64_alphabet(&value) {
             self.candidates.push((value, used_aliases));
         }
     }
@@ -848,6 +849,9 @@ fn fixed_alphabet_for_function(
     let [(alphabet, used_aliases)] = probe.candidates.as_slice() else {
         return None;
     };
+    if used_aliases.is_empty() {
+        return Some(alphabet.clone());
+    }
     let initialized_after = used_aliases
         .iter()
         .filter_map(|alias| aliases.get(alias))
@@ -1043,6 +1047,197 @@ fn fixed_decoder_iife_wrapper_proven(
     )
 }
 
+fn indexed_table_symbol(
+    expression: &Expression<'_>,
+    index_symbol: SymbolId,
+    scoping: &Scoping,
+) -> Option<SymbolId> {
+    let Expression::ComputedMemberExpression(member) = unparenthesized(expression) else {
+        return None;
+    };
+    if member.optional {
+        return None;
+    }
+    let Expression::Identifier(table) = unparenthesized(&member.object) else {
+        return None;
+    };
+    let Expression::Identifier(index) = unparenthesized(&member.expression) else {
+        return None;
+    };
+    if statically_resolved_symbol(scoping, index.reference_id.get()?) != Some(index_symbol) {
+        return None;
+    }
+    statically_resolved_symbol(scoping, table.reference_id.get()?)
+}
+
+fn unresolved_global_call_argument<'a>(
+    expression: &'a Expression<'a>,
+    name: &str,
+    scoping: &Scoping,
+) -> Option<&'a Expression<'a>> {
+    let Expression::CallExpression(call) = unparenthesized(expression) else {
+        return None;
+    };
+    if call.optional || call.arguments.len() != 1 || call.arguments[0].is_spread() {
+        return None;
+    }
+    let Expression::Identifier(callee) = unparenthesized(&call.callee) else {
+        return None;
+    };
+    if callee.name.as_str() != name
+        || !statically_unresolved_global_reference(scoping, callee.reference_id.get()?)
+    {
+        return None;
+    }
+    call.arguments[0].as_expression().map(unparenthesized)
+}
+
+fn expression_resolves_to_symbol(
+    expression: &Expression<'_>,
+    symbol: SymbolId,
+    scoping: &Scoping,
+) -> bool {
+    let Expression::Identifier(identifier) = unparenthesized(expression) else {
+        return false;
+    };
+    identifier
+        .reference_id
+        .get()
+        .and_then(|reference_id| statically_resolved_symbol(scoping, reference_id))
+        == Some(symbol)
+}
+
+fn standard_base64_table_for_function(
+    function: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+) -> Option<SymbolId> {
+    if function.r#async || function.generator || function.params.rest.is_some() {
+        return None;
+    }
+    let body = function.body.as_ref()?;
+    if !body.directives.is_empty() {
+        return None;
+    }
+    let first_param = function.params.items.first()?;
+    let BindingPattern::BindingIdentifier(first_param) = &first_param.pattern else {
+        return None;
+    };
+    let index_symbol = first_param.symbol_id.get()?;
+
+    let local_assignment = |expression: &Expression<'_>| -> Option<(SymbolId, SymbolId)> {
+        let (target, value) = assignment_identifier(expression)?;
+        let target_symbol = statically_resolved_symbol(scoping, target.reference_id.get()?)?;
+        let declaration = scoping.symbol_span(target_symbol);
+        if declaration.start < function.span.start || declaration.end > function.span.end {
+            return None;
+        }
+        Some((
+            target_symbol,
+            indexed_table_symbol(value, index_symbol, scoping)?,
+        ))
+    };
+
+    let atob_of_symbol = |expression: &Expression<'_>, symbol: SymbolId| -> bool {
+        unresolved_global_call_argument(expression, "atob", scoping)
+            .is_some_and(|argument| expression_resolves_to_symbol(argument, symbol, scoping))
+    };
+
+    match body.statements.as_slice() {
+        [Statement::ReturnStatement(ret)] => {
+            let argument = ret.argument.as_ref()?;
+            if let Some(table) = unresolved_global_call_argument(argument, "atob", scoping)
+                .and_then(|argument| indexed_table_symbol(argument, index_symbol, scoping))
+            {
+                return Some(table);
+            }
+            let Expression::SequenceExpression(sequence) = unparenthesized(argument) else {
+                return None;
+            };
+            let [assignment, decode] = sequence.expressions.as_slice() else {
+                return None;
+            };
+            let (alias, table) = local_assignment(assignment)?;
+            atob_of_symbol(decode, alias).then_some(table)
+        }
+        [Statement::ExpressionStatement(load), Statement::ReturnStatement(ret)] => {
+            let (alias, table) = local_assignment(&load.expression)?;
+            atob_of_symbol(ret.argument.as_ref()?, alias).then_some(table)
+        }
+        [Statement::VariableDeclaration(declaration), Statement::ReturnStatement(ret)] => {
+            let [declarator] = declaration.declarations.as_slice() else {
+                return None;
+            };
+            let BindingPattern::BindingIdentifier(alias) = &declarator.id else {
+                return None;
+            };
+            let alias_symbol = alias.symbol_id.get()?;
+            let table = indexed_table_symbol(declarator.init.as_ref()?, index_symbol, scoping)?;
+            atob_of_symbol(ret.argument.as_ref()?, alias_symbol).then_some(table)
+        }
+        _ => None,
+    }
+}
+
+fn indexed_table_symbols_for_function(
+    function: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+) -> Vec<SymbolId> {
+    let Some(first_param) = function.params.items.first() else {
+        return Vec::new();
+    };
+    let BindingPattern::BindingIdentifier(first_param) = &first_param.pattern else {
+        return Vec::new();
+    };
+    let Some(index_symbol) = first_param.symbol_id.get() else {
+        return Vec::new();
+    };
+    let Some(body) = function.body.as_ref() else {
+        return Vec::new();
+    };
+
+    struct Probe<'c> {
+        scoping: &'c Scoping,
+        index_symbol: SymbolId,
+        tables: Vec<SymbolId>,
+    }
+    impl<'a> Visit<'a> for Probe<'_> {
+        fn visit_computed_member_expression(
+            &mut self,
+            member: &oxc_ast::ast::ComputedMemberExpression<'a>,
+        ) {
+            if !member.optional {
+                if let Expression::Identifier(index) = unparenthesized(&member.expression) {
+                    if index.reference_id.get().is_some_and(|reference_id| {
+                        statically_resolved_symbol(self.scoping, reference_id)
+                            == Some(self.index_symbol)
+                    }) {
+                        if let Expression::Identifier(table) = unparenthesized(&member.object) {
+                            if let Some(reference_id) = table.reference_id.get() {
+                                if let Some(symbol) =
+                                    statically_resolved_symbol(self.scoping, reference_id)
+                                {
+                                    self.tables.push(symbol);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            walk::walk_computed_member_expression(self, member);
+        }
+    }
+
+    let mut probe = Probe {
+        scoping,
+        index_symbol,
+        tables: Vec::new(),
+    };
+    probe.visit_function_body(body);
+    probe.tables.sort();
+    probe.tables.dedup();
+    probe.tables
+}
+
 #[derive(Debug)]
 struct DirectFnInfo {
     symbol: SymbolId,
@@ -1050,6 +1245,8 @@ struct DirectFnInfo {
     span: Span,
     body_statement_count: usize,
     direct_call_count: usize,
+    indexed_table_symbols: Vec<SymbolId>,
+    standard_base64_table: Option<SymbolId>,
     fixed_decoder_control_shape: bool,
     fixed_decoder_iife_control_shape: bool,
     fixed_base64_alphabet: Option<String>,
@@ -1085,6 +1282,8 @@ impl<'a> Visit<'a> for DirectFnInfoCollector<'_> {
                         .body
                         .as_ref()
                         .map_or(0, |body| direct_body_call_count(body)),
+                    indexed_table_symbols: indexed_table_symbols_for_function(f, self.scoping),
+                    standard_base64_table: standard_base64_table_for_function(f, self.scoping),
                     fixed_decoder_control_shape: f
                         .body
                         .as_ref()
@@ -1394,8 +1593,6 @@ fn contains_function_reassignment(body: &str, name: &str) -> bool {
     false
 }
 
-static FIXED_BASE64_ALPHABET_RE: LazyLock<Option<regex::Regex>> =
-    LazyLock::new(|| compile_regex(r#"["']([A-Za-z0-9+/=]{65})["']"#));
 static BASE64_SENTINEL_RE: LazyLock<Option<regex::Regex>> =
     LazyLock::new(|| compile_regex(r"(?:64\s*!=|!=\s*64)"));
 static RC4_CHAR_CODE_AT_RE: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
@@ -1404,79 +1601,6 @@ static RC4_CHAR_CODE_AT_RE: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
 static DIRECT_ARRAY_ACCESS_RE: LazyLock<Option<regex::Regex>> =
     LazyLock::new(|| compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([^\s\]]+)\s*\]"));
 
-fn fixed_base64_alphabet(body: &str) -> Option<String> {
-    if !body.contains("String.fromCharCode")
-        || !body.contains(".indexOf")
-        || !body.contains(".charAt")
-    {
-        return None;
-    }
-    let re = FIXED_BASE64_ALPHABET_RE.as_ref()?;
-    let standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
-        .chars()
-        .collect::<HashSet<_>>();
-    let mut candidates = re
-        .captures_iter(body)
-        .filter_map(|caps| caps.get(1).map(|capture| capture.as_str().to_string()))
-        .filter(|candidate| candidate.chars().collect::<HashSet<_>>() == standard)
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
-    (candidates.len() == 1).then(|| candidates.remove(0))
-}
-
-fn function_inner_source(body: &str) -> Option<&str> {
-    let start = body.find('{')?.checked_add(1)?;
-    let end = body.rfind('}')?;
-    (start <= end).then(|| &body[start..end])
-}
-
-fn standard_base64_decoder_matches(body: &str, array: &str, param: &str) -> bool {
-    let Some(inner) = function_inner_source(body) else {
-        return false;
-    };
-
-    // Match the complete function body, not merely a decoder-looking
-    // expression somewhere inside it. Replacing a call removes the entire
-    // function execution, so accepting extra statements could silently drop
-    // observable side effects.
-    let Some(direct) = compile_regex(&format!(
-        r"(?s)^\s*return\s+atob\s*\(\s*{}\s*\[\s*{}\s*\]\s*\)\s*;?\s*$",
-        regex::escape(array),
-        regex::escape(param)
-    )) else {
-        return false;
-    };
-    if direct.is_match(inner) {
-        return true;
-    }
-
-    let Some(sequence) = compile_regex(&format!(
-        r"(?s)^\s*return\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*,\s*atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$",
-        regex::escape(array),
-        regex::escape(param)
-    )) else {
-        return false;
-    };
-    if sequence
-        .captures(inner)
-        .is_some_and(|caps| caps.get(1).map(|m| m.as_str()) == caps.get(2).map(|m| m.as_str()))
-    {
-        return true;
-    }
-
-    let Some(assignment) = compile_regex(&format!(
-        r"(?s)^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$",
-        regex::escape(array),
-        regex::escape(param)
-    )) else {
-        return false;
-    };
-    assignment
-        .captures(inner)
-        .is_some_and(|caps| caps.get(1).map(|m| m.as_str()) == caps.get(2).map(|m| m.as_str()))
-}
-
 fn fixed_base64_decoder_matches(
     body: &str,
     array: &str,
@@ -1484,7 +1608,7 @@ fn fixed_base64_decoder_matches(
     alphabet_hint: Option<&str>,
     iife_wrapper_proven: bool,
 ) -> Option<String> {
-    let alphabet = fixed_base64_alphabet(body).or_else(|| alphabet_hint.map(str::to_owned))?;
+    let alphabet = alphabet_hint?.to_owned();
     let guarded_load = compile_regex(&format!(
         r"typeof\s*\(?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*\)?",
         regex::escape(array),
@@ -1595,14 +1719,6 @@ fn detect_sparse_direct_table_decoders(
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> HashMap<SymbolId, SparseDirectDecoder> {
-    let mut arrays_by_name: HashMap<&str, Vec<&PartialStaticArrayInfo>> = HashMap::new();
-    for array in arrays {
-        arrays_by_name
-            .entry(array.name.as_str())
-            .or_default()
-            .push(array);
-    }
-
     let mut out = HashMap::new();
     for function in functions {
         if complete_decoders.contains_key(&function.symbol)
@@ -1617,29 +1733,32 @@ fn detect_sparse_direct_table_decoders(
             continue;
         };
         let body = fragment(source, function.span);
-        let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
-            continue;
-        };
-        let mut matched = access
-            .captures_iter(body)
-            .filter(|caps| caps.get(2).is_some_and(|capture| capture.as_str() == param))
-            .filter_map(|caps| caps.get(1).map(|capture| capture.as_str()))
-            .filter_map(|name| arrays_by_name.get(name))
-            .flat_map(|candidates| candidates.iter().copied())
-            .filter(|array| {
-                let references = scoping.get_resolved_reference_ids(array.symbol);
-                let [reference_id] = references else {
-                    return false;
-                };
-                reference_spans.get(reference_id).is_some_and(|span| {
-                    function.span.start <= span.start && span.end <= function.span.end
+        let array = if let Some(symbol) = function.standard_base64_table {
+            let Some(array) = arrays.iter().find(|array| array.symbol == symbol) else {
+                continue;
+            };
+            array
+        } else {
+            let mut matched = function
+                .indexed_table_symbols
+                .iter()
+                .filter_map(|symbol| arrays.iter().find(|array| array.symbol == *symbol))
+                .filter(|array| {
+                    let references = scoping.get_resolved_reference_ids(array.symbol);
+                    let [reference_id] = references else {
+                        return false;
+                    };
+                    reference_spans.get(reference_id).is_some_and(|span| {
+                        function.span.start <= span.start && span.end <= function.span.end
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        matched.sort_by_key(|array| array.symbol);
-        matched.dedup_by_key(|array| array.symbol);
-        let [array] = matched.as_slice() else {
-            continue;
+                .collect::<Vec<_>>();
+            matched.sort_by_key(|array| array.symbol);
+            matched.dedup_by_key(|array| array.symbol);
+            let [array] = matched.as_slice() else {
+                continue;
+            };
+            *array
         };
 
         // The table binding is immutable, and its only resolved read is the
@@ -1671,7 +1790,7 @@ fn detect_sparse_direct_table_decoders(
             continue;
         }
 
-        let transform = if standard_base64_decoder_matches(body, &array.name, param) {
+        let transform = if function.standard_base64_table == Some(array.symbol) {
             DecoderTransform::StandardBase64
         } else if ((function.body_statement_count == 3
             && function.fixed_decoder_control_shape
@@ -1785,14 +1904,6 @@ fn detect_direct_table_decoders(
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> HashMap<SymbolId, Decoder> {
-    let mut arrays_by_name: HashMap<&str, Vec<&StaticArrayInfo>> = HashMap::new();
-    for array in arrays {
-        arrays_by_name
-            .entry(array.name.as_str())
-            .or_default()
-            .push(array);
-    }
-
     let mut out = HashMap::new();
     for function in functions {
         if scoping
@@ -1806,23 +1917,24 @@ fn detect_direct_table_decoders(
             continue;
         };
         let body = fragment(source, function.span);
-        let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
-            continue;
+        let array = if let Some(symbol) = function.standard_base64_table {
+            let Some(array) = arrays.iter().find(|array| array.symbol == symbol) else {
+                continue;
+            };
+            array
+        } else {
+            let mut matched = function
+                .indexed_table_symbols
+                .iter()
+                .filter_map(|symbol| arrays.iter().find(|array| array.symbol == *symbol))
+                .collect::<Vec<_>>();
+            matched.sort_by_key(|array| array.symbol);
+            matched.dedup_by_key(|array| array.symbol);
+            let [array] = matched.as_slice() else {
+                continue;
+            };
+            *array
         };
-        let mut matched = access
-            .captures_iter(body)
-            .filter(|caps| caps.get(2).is_some_and(|capture| capture.as_str() == param))
-            .filter_map(|caps| caps.get(1).map(|capture| capture.as_str()))
-            .filter_map(|name| arrays_by_name.get(name))
-            .filter(|candidates| candidates.len() == 1)
-            .map(|candidates| candidates[0])
-            .collect::<Vec<_>>();
-        matched.sort_by_key(|array| array.symbol);
-        matched.dedup_by_key(|array| array.symbol);
-        if matched.len() != 1 {
-            continue;
-        }
-        let array = matched[0];
 
         // A direct literal-table decoder should have exactly one resolved
         // use of the table binding: the indexed load proved above. Requiring a
@@ -1856,7 +1968,7 @@ fn detect_direct_table_decoders(
             continue;
         }
 
-        let transform = if standard_base64_decoder_matches(body, &array.name, param) {
+        let transform = if function.standard_base64_table == Some(array.symbol) {
             DecoderTransform::StandardBase64
         } else if ((function.body_statement_count == 3
             && function.fixed_decoder_control_shape

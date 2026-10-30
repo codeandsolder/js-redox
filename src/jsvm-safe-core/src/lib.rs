@@ -2106,6 +2106,57 @@ use();
     }
 
     #[test]
+    fn standard_base64_decoder_uses_structural_local_effect_proof() {
+        let source = r#"
+const sequence_table = ["YQ=="];
+function sequence_decode(index, cached) {
+    return cached = sequence_table[(index)], (atob)((cached));
+}
+const declaration_table = ["Yg=="];
+function declaration_decode(index) {
+    const cached = declaration_table[index];
+    return atob(cached);
+}
+sink(sequence_decode(0), declaration_decode(0));
+"#;
+        let recovered = recover_static_decoders(source, 4);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert_eq!(recovered.transforms.get("string_array_decode"), Some(&2));
+        assert!(recovered.source.contains("sink(\"a\", \"b\")"));
+
+        for rejected_source in [
+            r#"
+const table = ["YQ=="];
+let escaped;
+function decode(index) {
+    escaped = table[index];
+    return atob(escaped);
+}
+sink(decode(0));
+"#,
+            r#"
+const table = ["YQ=="];
+function outer(atob) {
+    function decode(index) { return atob(table[index]); }
+    return decode(0);
+}
+sink(outer(identity));
+"#,
+            r#"
+const table = ["YQ=="];
+async function decode(index) { return atob(table[index]); }
+sink(decode(0));
+"#,
+        ] {
+            let rejected = recover_static_decoders(rejected_source, 4);
+            assert!(rejected.is_some());
+            let rejected = rejected.unwrap_or_else(|| unreachable!());
+            assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        }
+    }
+
+    #[test]
     fn decoder_only_recovery_handles_literal_key_rc4() {
         let source = r#"
 function p(){var table=["xSov","xCor"];p=function(){return table;};return p();}
