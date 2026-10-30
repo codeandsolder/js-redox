@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use jsvm_lift::{
     lazy_cell::{
-        proven_slow_lazy_cell_factory_call, structurally_proven_slow_lazy_cell_factory_shapes,
+        proven_slow_lazy_cell_factory_call, proven_slow_lazy_cell_update_state,
+        structurally_proven_slow_lazy_cell_factory_shapes,
     },
     receiver_identity::structurally_proven_origin_flow,
 };
@@ -44,6 +45,8 @@ fn main() -> Result<()> {
         .iter()
         .map(|shape| {
             let phase = scoping.symbol_span(shape.phase_binding_symbol);
+            let phase_local = scoping.symbol_span(shape.phase_local_symbol);
+            let index_state = scoping.symbol_span(shape.index_state_symbol);
             json!({
                 "function": [shape.function_start, shape.function_end],
                 "guard": [shape.guard_start, shape.guard_end],
@@ -54,8 +57,12 @@ fn main() -> Result<()> {
                 "handler_slot": shape.handler_slot,
                 "handler_capture": [shape.handler_capture_start, shape.handler_capture_end],
                 "handler_capture_source": snippet(&source, shape.handler_capture_start, shape.handler_capture_end),
+                "index_state_declaration": [index_state.start, index_state.end],
+                "index_state_initialization": [shape.index_state_initialization_start, shape.index_state_initialization_end],
+                "index_state_initialization_source": snippet(&source, shape.index_state_initialization_start, shape.index_state_initialization_end),
                 "prototype_field": shape.prototype_field,
                 "method_key_field": shape.method_key_field,
+                "phase_local_declaration": [phase_local.start, phase_local.end],
                 "phase_binding_declaration": [phase.start, phase.end],
                 "phase_capture": [shape.phase_capture_start, shape.phase_capture_end],
                 "phase_capture_source": snippet(&source, shape.phase_capture_start, shape.phase_capture_end),
@@ -85,6 +92,9 @@ fn main() -> Result<()> {
                 &semantic.semantic,
                 call,
             );
+            let update = specialized.as_ref().and_then(|factory| {
+                proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, factory)
+            });
             json!({
                 "call": [call.call_start, call.call_end],
                 "call_source": snippet(&source, call.call_start, call.call_end),
@@ -95,6 +105,12 @@ fn main() -> Result<()> {
                 "origin_parameter_indices": call.callee.parameter_indices,
                 "exact_integer_arguments": call.exact_integer_arguments,
                 "specialized": specialized.is_some(),
+                "update": update.as_ref().map(|update| json!({
+                    "initial_state_value": update.initial_state_value,
+                    "post_update_state_value": update.post_update_state_value,
+                    "selector_capture": scoping.symbol_name(update.selector_capture_symbol),
+                    "update_parameter": scoping.symbol_name(update.update_parameter_symbol),
+                })),
             })
         })
         .collect::<Vec<_>>();

@@ -1,4 +1,5 @@
 use crate::{
+    numeric::eval_js_bitwise_i64,
     receiver_identity::{proven_origin_direct_call_event_unreachable, ProvenOriginDirectCall},
     symbolic_integer::{normalize_integer_polynomial, IntegerPolynomial},
 };
@@ -28,8 +29,12 @@ pub struct SlowLazyCellFactoryShape {
     pub handler_slot: usize,
     pub handler_capture_start: u32,
     pub handler_capture_end: u32,
+    pub index_state_symbol: SymbolId,
+    pub index_state_initialization_start: u32,
+    pub index_state_initialization_end: u32,
     pub prototype_field: String,
     pub method_key_field: String,
+    pub phase_local_symbol: SymbolId,
     pub phase_binding_symbol: SymbolId,
     pub phase_capture_start: u32,
     pub phase_capture_end: u32,
@@ -46,6 +51,15 @@ pub struct SlowLazyCellFactoryShape {
 pub struct ProvenSlowLazyCellFactoryCall {
     pub shape: SlowLazyCellFactoryShape,
     pub call: ProvenOriginDirectCall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenSlowLazyCellUpdateState {
+    pub factory_call: ProvenSlowLazyCellFactoryCall,
+    pub initial_state_value: i64,
+    pub post_update_state_value: i64,
+    pub selector_capture_symbol: SymbolId,
+    pub update_parameter_symbol: SymbolId,
 }
 
 fn strip_parentheses<'a>(expression: &'a Expression<'a>) -> &'a Expression<'a> {
@@ -190,6 +204,7 @@ fn shape_for_function(
     };
 
     let mut handler = None;
+    let mut index_state = None;
     let mut phase = None;
     let mut cell = None;
     let mut update = None;
@@ -233,6 +248,20 @@ fn shape_for_function(
                     }
                     continue;
                 }
+            }
+
+            if !matches!(
+                last_sequence_expression(&assignment.right),
+                Expression::Identifier(_)
+            ) && pure_integer_expression(&assignment.right)
+            {
+                if index_state
+                    .replace((target_symbol, assignment.span))
+                    .is_some()
+                {
+                    return None;
+                }
+                continue;
             }
 
             if let Expression::CallExpression(call) = last_sequence_expression(&assignment.right) {
@@ -330,7 +359,8 @@ fn shape_for_function(
     }
 
     let (_, handler_parameter_index, handler_slot, handler_capture) = handler?;
-    let (_, phase_binding_symbol, phase_capture) = phase?;
+    let (index_state_symbol, index_state_initialization) = index_state?;
+    let (phase_local_symbol, phase_binding_symbol, phase_capture) = phase?;
     let (cell_symbol, state_parameter_index, prototype_field, method_key_field, cell_construction) =
         cell?;
     let update_function = update?;
@@ -354,8 +384,12 @@ fn shape_for_function(
         handler_slot,
         handler_capture_start: handler_capture.start,
         handler_capture_end: handler_capture.end,
+        index_state_symbol,
+        index_state_initialization_start: index_state_initialization.start,
+        index_state_initialization_end: index_state_initialization.end,
         prototype_field,
         method_key_field,
+        phase_local_symbol,
         phase_binding_symbol,
         phase_capture_start: phase_capture.start,
         phase_capture_end: phase_capture.end,
@@ -387,6 +421,23 @@ fn pure_integer_expression(expression: &Expression<'_>) -> bool {
     }
 }
 
+fn exact_integer_bindings(
+    parameters: &[SymbolId],
+    call: &ProvenOriginDirectCall,
+) -> HashMap<SymbolId, IntegerPolynomial> {
+    parameters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, symbol)| {
+            call.exact_integer_arguments
+                .get(index)
+                .copied()
+                .flatten()
+                .map(|value| (*symbol, IntegerPolynomial::constant(i128::from(value))))
+        })
+        .collect()
+}
+
 fn exact_guard_value(
     guard: &Expression<'_>,
     scoping: &Scoping,
@@ -402,17 +453,7 @@ fn exact_guard_value(
     {
         return None;
     }
-    let bindings = parameters
-        .iter()
-        .enumerate()
-        .filter_map(|(index, symbol)| {
-            call.exact_integer_arguments
-                .get(index)
-                .copied()
-                .flatten()
-                .map(|value| (*symbol, IntegerPolynomial::constant(i128::from(value))))
-        })
-        .collect::<HashMap<_, _>>();
+    let bindings = exact_integer_bindings(parameters, call);
     let left = normalize_integer_polynomial(
         &binary.left,
         scoping,
@@ -702,6 +743,295 @@ pub fn proven_slow_lazy_cell_factory_call(
     harness.result.flatten()
 }
 
+fn slow_sequence<'a>(
+    function: &'a Function<'a>,
+) -> Option<&'a oxc_ast::ast::SequenceExpression<'a>> {
+    let body = function.body.as_ref()?;
+    let mut returns = body
+        .statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Statement::ReturnStatement(ret) => Some(ret),
+            _ => None,
+        });
+    let ret = returns.next()?;
+    if returns.next().is_some() {
+        return None;
+    }
+    let Expression::SequenceExpression(return_sequence) = ret.argument.as_ref()? else {
+        return None;
+    };
+    let [guarded, _] = return_sequence.expressions.as_slice() else {
+        return None;
+    };
+    let Expression::LogicalExpression(logical) = last_sequence_expression(guarded) else {
+        return None;
+    };
+    if logical.operator.as_str() != "&&" {
+        return None;
+    }
+    let Expression::SequenceExpression(sequence) = strip_parentheses(&logical.right) else {
+        return None;
+    };
+    Some(sequence)
+}
+
+fn flatten_top_level_sequence<'a>(
+    expression: &'a Expression<'a>,
+    out: &mut Vec<&'a Expression<'a>>,
+) {
+    match strip_parentheses(expression) {
+        Expression::SequenceExpression(sequence) => {
+            for expression in &sequence.expressions {
+                flatten_top_level_sequence(expression, out);
+            }
+        }
+        expression => out.push(expression),
+    }
+}
+
+fn exact_integer_value(
+    expression: &Expression<'_>,
+    scoping: &Scoping,
+    bindings: &HashMap<SymbolId, IntegerPolynomial>,
+) -> Option<i64> {
+    let value = normalize_integer_polynomial(
+        expression,
+        scoping,
+        bindings,
+        &HashMap::new(),
+        &HashSet::new(),
+    )?
+    .constant_value()?;
+    i64::try_from(value).ok()
+}
+
+fn exact_js_integer_add(left: i64, right: i64) -> Option<i64> {
+    const MAX_SAFE_INTEGER: i128 = 9_007_199_254_740_991;
+    let value = i128::from(left).checked_add(i128::from(right))?;
+    (value.abs() <= MAX_SAFE_INTEGER)
+        .then(|| i64::try_from(value).ok())
+        .flatten()
+}
+
+fn update_selector_capture_symbol(
+    expression: &Expression<'_>,
+    scoping: &Scoping,
+    update_parameter: SymbolId,
+) -> Option<SymbolId> {
+    struct Probe<'s> {
+        scoping: &'s Scoping,
+        update_parameter: SymbolId,
+        targets: Vec<SymbolId>,
+    }
+    impl<'a> Visit<'a> for Probe<'_> {
+        fn visit_assignment_expression(
+            &mut self,
+            assignment: &oxc_ast::ast::AssignmentExpression<'a>,
+        ) {
+            if assignment.operator.is_assign()
+                && reference_symbol(self.scoping, &assignment.right) == Some(self.update_parameter)
+            {
+                if let Some(target) = assignment_symbol(self.scoping, &assignment.left) {
+                    self.targets.push(target);
+                }
+            }
+            walk::walk_assignment_expression(self, assignment);
+        }
+        fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+        }
+    }
+    let mut probe = Probe {
+        scoping,
+        update_parameter,
+        targets: Vec::new(),
+    };
+    probe.visit_expression(expression);
+    probe.targets.sort_unstable();
+    probe.targets.dedup();
+    let [target] = probe.targets.as_slice() else {
+        return None;
+    };
+    Some(*target)
+}
+
+fn analyze_slow_lazy_cell_update_state(
+    function: &Function<'_>,
+    semantic: &Semantic<'_>,
+    factory_call: &ProvenSlowLazyCellFactoryCall,
+) -> Option<ProvenSlowLazyCellUpdateState> {
+    let shape = &factory_call.shape;
+    let parameters = parameter_symbols(function)?;
+    let sequence = slow_sequence(function)?;
+    let initialization = sequence.expressions.iter().find_map(|expression| {
+        let assignment = assignment_expression(expression)?;
+        (assignment.span.start == shape.index_state_initialization_start
+            && assignment.span.end == shape.index_state_initialization_end)
+            .then_some(assignment)
+    })?;
+    if assignment_symbol(semantic.scoping(), &initialization.left) != Some(shape.index_state_symbol)
+    {
+        return None;
+    }
+
+    let mut bindings = exact_integer_bindings(&parameters, &factory_call.call);
+    let initial_state_value =
+        exact_integer_value(&initialization.right, semantic.scoping(), &bindings)?;
+    bindings.insert(
+        shape.index_state_symbol,
+        IntegerPolynomial::constant(i128::from(initial_state_value)),
+    );
+
+    let mut updates = sequence.expressions.iter().filter_map(|expression| {
+        let assignment = assignment_expression(expression)?;
+        let Expression::FunctionExpression(update) = last_sequence_expression(&assignment.right)
+        else {
+            return None;
+        };
+        (update.span.start == shape.update_function_start
+            && update.span.end == shape.update_function_end)
+            .then_some(update)
+    });
+    let update = updates.next()?;
+    if updates.next().is_some()
+        || update.r#async
+        || update.generator
+        || function_subtree_has_dynamic_scope(update)
+        || update
+            .body
+            .as_deref()
+            .is_none_or(function_body_uses_arguments)
+    {
+        return None;
+    }
+    let update_parameters = parameter_symbols(update)?;
+    let [update_parameter] = update_parameters.as_slice() else {
+        return None;
+    };
+    let body = update.body.as_ref()?;
+    let [Statement::ExpressionStatement(statement)] = body.statements.as_slice() else {
+        return None;
+    };
+    let mut items = Vec::new();
+    flatten_top_level_sequence(&statement.expression, &mut items);
+    let [first_expression, second_expression] = items.as_slice() else {
+        return None;
+    };
+    let Expression::AssignmentExpression(first) = strip_parentheses(first_expression) else {
+        return None;
+    };
+    let Expression::AssignmentExpression(second) = strip_parentheses(second_expression) else {
+        return None;
+    };
+    if first.operator.as_str() != "+="
+        || second.operator.as_str() != "&="
+        || assignment_symbol(semantic.scoping(), &first.left) != Some(shape.index_state_symbol)
+        || assignment_symbol(semantic.scoping(), &second.left) != Some(shape.index_state_symbol)
+    {
+        return None;
+    }
+
+    let expected_writes = HashSet::from([
+        (first.span.start, first.span.end),
+        (second.span.start, second.span.end),
+    ]);
+    let mut actual_writes = HashSet::new();
+    for reference_id in semantic
+        .scoping()
+        .get_resolved_reference_ids(shape.index_state_symbol)
+    {
+        let reference = semantic.scoping().get_reference(*reference_id);
+        if !reference.is_write()
+            || enclosing_function_span(semantic, reference.node_id()) != Some(update.span)
+        {
+            continue;
+        }
+        let span = enclosing_write_event_span(semantic, reference.node_id())?;
+        actual_writes.insert((span.start, span.end));
+    }
+    if actual_writes != expected_writes {
+        return None;
+    }
+
+    let selector_capture_symbol =
+        update_selector_capture_symbol(&first.right, semantic.scoping(), *update_parameter)?;
+    let declaration = semantic.scoping().symbol_span(selector_capture_symbol);
+    if !(function.span.start <= declaration.start
+        && declaration.end <= function.span.end
+        && !(update.span.start <= declaration.start && declaration.end <= update.span.end))
+    {
+        return None;
+    }
+
+    let delta = exact_integer_value(&first.right, semantic.scoping(), &bindings)?;
+    let after_add = exact_js_integer_add(initial_state_value, delta)?;
+    bindings.insert(
+        shape.index_state_symbol,
+        IntegerPolynomial::constant(i128::from(after_add)),
+    );
+    let mask = exact_integer_value(&second.right, semantic.scoping(), &bindings)?;
+    let post_update_state_value = eval_js_bitwise_i64("&", after_add, mask)?;
+
+    Some(ProvenSlowLazyCellUpdateState {
+        factory_call: factory_call.clone(),
+        initial_state_value,
+        post_update_state_value,
+        selector_capture_symbol,
+        update_parameter_symbol: *update_parameter,
+    })
+}
+
+/// Prove the exact scalar state established by the installed one-argument
+/// slow-cell update and identify the closure binding that receives its selector.
+///
+/// The supported update is deliberately narrow: two top-level writes to the
+/// factory's captured index state, first `+=` and then `&=`, with an exact
+/// integer result under the call's exact arguments. A direct assignment from
+/// the update parameter must occur inside the `+=` RHS, and no additional
+/// writes to the index-state binding are allowed in the update body.
+#[must_use]
+pub fn proven_slow_lazy_cell_update_state(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    factory_call: &ProvenSlowLazyCellFactoryCall,
+) -> Option<ProvenSlowLazyCellUpdateState> {
+    struct Harness<'m, 'c> {
+        semantic: &'m Semantic<'m>,
+        factory_call: &'c ProvenSlowLazyCellFactoryCall,
+        result: Option<Option<ProvenSlowLazyCellUpdateState>>,
+    }
+    impl<'a> Visit<'a> for Harness<'_, '_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if self.result.is_some() {
+                return;
+            }
+            let shape = &self.factory_call.shape;
+            if function.span.start == shape.function_start
+                && function.span.end == shape.function_end
+            {
+                self.result = Some(analyze_slow_lazy_cell_update_state(
+                    function,
+                    self.semantic,
+                    self.factory_call,
+                ));
+                return;
+            }
+            walk::walk_function(self, function, flags);
+        }
+    }
+    let mut harness = Harness {
+        semantic,
+        factory_call,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.flatten()
+}
+
 #[must_use]
 pub fn structurally_proven_slow_lazy_cell_factory_shapes(
     program: &Program<'_>,
@@ -734,7 +1064,8 @@ pub fn structurally_proven_slow_lazy_cell_factory_shapes(
 #[cfg(test)]
 mod tests {
     use super::{
-        proven_slow_lazy_cell_factory_call, structurally_proven_slow_lazy_cell_factory_shapes,
+        proven_slow_lazy_cell_factory_call, proven_slow_lazy_cell_update_state,
+        structurally_proven_slow_lazy_cell_factory_shapes,
     };
     use crate::receiver_identity::structurally_proven_origin_flow;
     use oxc_allocator::Allocator;
@@ -846,6 +1177,68 @@ mod tests {
             new C();
         "#;
         assert!(specialized_call(source, "make(48"));
+    }
+
+    #[test]
+    fn proves_exact_slow_cell_update_state_and_selector_capture() {
+        let source = r#"
+            let outer_phase;
+            const C = function() { enter(this); };
+            function enter(state) {
+                return make(48, 19, 49, state, 7, function handler() {}, 0, 0, 0, 0, 0);
+            }
+            function make(mode, q, y, state, key, handler, capture, s, phase, cell, out) {
+                return (mode | 48) == mode && (
+                    handler = [11, -39, 3, 4, 5, 6, handler, 87],
+                    s = -2 * ~(y & 7) + -8 + (y ^ 7) + (~y | 7),
+                    phase = outer_phase,
+                    cell = Maker[state.method](state.base),
+                    cell[state.method] = function(value) {
+                        s += 6 + 7 * (capture = value, y), s &= 7;
+                    },
+                    cell.resolve = function() { return handler[0]; },
+                    out = cell
+                ), out;
+            }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let start = source.find("make(48").expect("call") as u32;
+        let call = flow
+            .direct_calls
+            .iter()
+            .find(|call| call.call_start == start)
+            .expect("origin call");
+        let factory =
+            proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
+                .expect("factory proof");
+        let update =
+            proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, &factory)
+                .expect("update proof");
+        assert_eq!(update.initial_state_value, 1);
+        assert_eq!(update.post_update_state_value, 6);
+        assert_eq!(
+            semantic
+                .semantic
+                .scoping()
+                .symbol_name(update.selector_capture_symbol),
+            "capture"
+        );
+        assert_eq!(
+            semantic
+                .semantic
+                .scoping()
+                .symbol_name(update.update_parameter_symbol),
+            "value"
+        );
     }
 
     #[test]
