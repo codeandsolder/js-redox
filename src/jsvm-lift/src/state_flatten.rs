@@ -480,6 +480,17 @@ impl<'a> Visit<'a> for BranchStateForSpan<'_> {
         walk::walk_if_statement(self, statement);
     }
 
+    fn visit_logical_expression(&mut self, expression: &oxc_ast::ast::LogicalExpression<'a>) {
+        if expression.operator.as_str() == "&&" {
+            if let Expression::BinaryExpression(binary) = &expression.left {
+                if let Some(state) = binary_state_comparison_literal(binary, self.state_var) {
+                    self.consider(state, expression.right.span());
+                }
+            }
+        }
+        walk::walk_logical_expression(self, expression);
+    }
+
     fn visit_conditional_expression(
         &mut self,
         expression: &oxc_ast::ast::ConditionalExpression<'a>,
@@ -3007,6 +3018,7 @@ pub fn analyze_function(
 mod tests {
     use super::*;
     use oxc_allocator::Allocator;
+    use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
 
@@ -3553,6 +3565,64 @@ mod tests {
                 function.end,
                 event,
                 &BTreeMap::from([(1, 410)]),
+            )
+        );
+    }
+
+    #[test]
+    fn function_specializer_maps_logical_and_state_guard() {
+        let source = r#"
+            function target(selector) {
+                let state = 5;
+                while (state != 27) {
+                    if (state == 5) state = selector == 14 ? 32 : 92;
+                    else if (state == 32) state = 61;
+                    else if (state == 61) state = 85;
+                    else if (state == 85) return 1;
+                    else state == 92 && (sideEffect(), state = 27);
+                }
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let function = parsed
+            .program
+            .body
+            .iter()
+            .find_map(|statement| match statement {
+                Statement::FunctionDeclaration(function) => Some(function),
+                _ => None,
+            })
+            .expect("target function");
+        let body = function.body.as_ref().expect("function body");
+        let [init, Statement::WhileStatement(while_statement)] = body.statements.as_slice() else {
+            panic!("expected init + while");
+        };
+        let machine = detect_while_state_machine(source, "test", init, while_statement)
+            .expect("detected while machine");
+        let event_start = source.find("sideEffect()").unwrap() as u32;
+        let event = Span::new(event_start, event_start + "sideEffect()".len() as u32);
+        assert_eq!(
+            branch_state_for_span(&while_statement.body, "state", event),
+            Some(92)
+        );
+        assert!(prove_machine_event_unreachable_with_integer_bindings(
+            &machine,
+            &while_statement.body,
+            event,
+            &[(("selector").to_string(), 14i64)].into_iter().collect(),
+        ));
+        assert!(
+            super::prove_function_if_ladder_event_unreachable_with_integer_parameters(
+                source,
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.span.start,
+                function.span.end,
+                event,
+                &[(0usize, 14i64)].into_iter().collect(),
             )
         );
     }
