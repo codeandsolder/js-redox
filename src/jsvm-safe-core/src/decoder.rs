@@ -2986,6 +2986,13 @@ fn detect_fixed_rotated_direct_decoders(
     let arrays = all_static_arrays(program);
     let functions = variable_functions(program);
     let rotations = collect_rotation_iifes(source, program, scoping, reference_spans);
+    let mut arrays_by_name: HashMap<&str, Vec<&StaticArrayInfo>> = HashMap::new();
+    for array in &arrays {
+        arrays_by_name
+            .entry(array.name.as_str())
+            .or_default()
+            .push(array);
+    }
     let mut decoders = HashMap::new();
     let mut protected_spans = Vec::new();
     let mut replacements = Vec::new();
@@ -2999,7 +3006,28 @@ fn detect_fixed_rotated_direct_decoders(
             continue;
         }
 
-        for array in &arrays {
+        let Some(public_param) = function.params.first() else {
+            continue;
+        };
+        let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
+            continue;
+        };
+        let body = fragment(source, function.span);
+        let candidate_names = access
+            .captures_iter(body)
+            .filter(|captures| {
+                captures
+                    .get(2)
+                    .is_some_and(|capture| capture.as_str() == public_param)
+            })
+            .filter_map(|captures| captures.get(1).map(|capture| capture.as_str()))
+            .collect::<HashSet<_>>();
+
+        for array in candidate_names
+            .into_iter()
+            .filter_map(|name| arrays_by_name.get(name))
+            .flat_map(|candidates| candidates.iter().copied())
+        {
             let Some(offset) = simple_direct_decoder_offset(source, function, array) else {
                 continue;
             };
