@@ -1277,6 +1277,7 @@ fn member_write_preserves_field(
     write: &ProvenMemberWriteOrigin,
     property: &str,
     stable_prototypes: &HashSet<(u32, u32)>,
+    preserve_exact_value: bool,
 ) -> bool {
     let Some(candidate) = write.property.as_deref() else {
         return false;
@@ -1286,10 +1287,20 @@ fn member_write_preserves_field(
     {
         return false;
     }
-    !(write.operation == "delete" && candidate == property)
+    if candidate != property {
+        return true;
+    }
+    !preserve_exact_value && write.operation != "delete"
 }
 
-type PreservationKey = (u32, u32, ProvenOriginContext, ProvenOriginContext, String);
+type PreservationKey = (
+    u32,
+    u32,
+    ProvenOriginContext,
+    ProvenOriginContext,
+    String,
+    bool,
+);
 
 fn direct_call_preserves_field(
     source: &str,
@@ -1299,6 +1310,7 @@ fn direct_call_preserves_field(
     call: &ProvenOriginDirectCall,
     property: &str,
     stable_prototypes: &HashSet<(u32, u32)>,
+    preserve_exact_value: bool,
     memo: &mut HashMap<PreservationKey, bool>,
     visiting: &mut HashSet<PreservationKey>,
 ) -> bool {
@@ -1308,6 +1320,7 @@ fn direct_call_preserves_field(
         call.caller.clone(),
         call.callee.clone(),
         property.to_string(),
+        preserve_exact_value,
     );
     if let Some(result) = memo.get(&key) {
         return *result;
@@ -1358,7 +1371,12 @@ fn direct_call_preserves_field(
             .filter(|event| event.context == call.callee)
         {
             if !unreachable(write.write_start, write.write_end)
-                && !member_write_preserves_field(write, property, stable_prototypes)
+                && !member_write_preserves_field(
+                    write,
+                    property,
+                    stable_prototypes,
+                    preserve_exact_value,
+                )
             {
                 result = false;
                 break;
@@ -1394,6 +1412,7 @@ fn direct_call_preserves_field(
                 nested,
                 property,
                 stable_prototypes,
+                preserve_exact_value,
                 memo,
                 visiting,
             ) {
@@ -1434,6 +1453,37 @@ pub fn proven_origin_direct_call_preserves_own_field(
         call,
         property,
         &stable_prototypes,
+        false,
+        &mut HashMap::new(),
+        &mut HashSet::new(),
+    )
+}
+
+/// Prove that one exact-origin direct call preserves the exact current value of
+/// a named receiver property. Any reachable write, update, or delete of that
+/// property invalidates the theorem.
+#[must_use]
+pub fn proven_origin_direct_call_preserves_exact_property(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    call: &ProvenOriginDirectCall,
+    property: &str,
+) -> bool {
+    let flow = structurally_proven_origin_flow(program, scoping);
+    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
+        .into_iter()
+        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+        .collect::<HashSet<_>>();
+    direct_call_preserves_field(
+        source,
+        program,
+        scoping,
+        &flow,
+        call,
+        property,
+        &stable_prototypes,
+        true,
         &mut HashMap::new(),
         &mut HashSet::new(),
     )
@@ -1449,6 +1499,7 @@ fn root_context_segment_preserves_field(
     before_order: u64,
     property: &str,
     stable_prototypes: &HashSet<(u32, u32)>,
+    preserve_exact_value: bool,
     memo: &mut HashMap<PreservationKey, bool>,
     visiting: &mut HashSet<PreservationKey>,
 ) -> bool {
@@ -1469,7 +1520,12 @@ fn root_context_segment_preserves_field(
         event.context == *context
             && after_order < event.evaluation_order
             && event.evaluation_order < before_order
-            && !member_write_preserves_field(event, property, stable_prototypes)
+            && !member_write_preserves_field(
+                event,
+                property,
+                stable_prototypes,
+                preserve_exact_value,
+            )
     }) {
         return false;
     }
@@ -1490,6 +1546,7 @@ fn root_context_segment_preserves_field(
                 nested,
                 property,
                 stable_prototypes,
+                preserve_exact_value,
                 memo,
                 visiting,
             )
@@ -1505,6 +1562,7 @@ fn direct_call_prefix_preserves_field(
     before_order: u64,
     property: &str,
     stable_prototypes: &HashSet<(u32, u32)>,
+    preserve_exact_value: bool,
     memo: &mut HashMap<PreservationKey, bool>,
     visiting: &mut HashSet<PreservationKey>,
 ) -> bool {
@@ -1550,8 +1608,12 @@ fn direct_call_prefix_preserves_field(
             scoping,
             entry,
             Span::new(write.write_start, write.write_end),
-        ) && !member_write_preserves_field(write, property, stable_prototypes)
-        {
+        ) && !member_write_preserves_field(
+            write,
+            property,
+            stable_prototypes,
+            preserve_exact_value,
+        ) {
             return false;
         }
     }
@@ -1592,6 +1654,7 @@ fn direct_call_prefix_preserves_field(
             nested,
             property,
             stable_prototypes,
+            preserve_exact_value,
             memo,
             visiting,
         ) {
@@ -1645,6 +1708,7 @@ pub fn structurally_proven_own_data_fields_at_member_calls(
                 entry.evaluation_order,
                 &initialization.property,
                 &stable_prototypes,
+                false,
                 &mut memo,
                 &mut visiting,
             ) {
@@ -1664,6 +1728,7 @@ pub fn structurally_proven_own_data_fields_at_member_calls(
                     member_call.evaluation_order,
                     &initialization.property,
                     &stable_prototypes,
+                    false,
                     &mut memo,
                     &mut visiting,
                 ) {
@@ -1803,7 +1868,7 @@ fn context_field_prefix_before_event(
         .filter(|candidate| candidate.context == *context)
     {
         if !unreachable(write.write_start, write.write_end)
-            && !member_write_preserves_field(write, property, stable_prototypes)
+            && !member_write_preserves_field(write, property, stable_prototypes, false)
         {
             barriers.push(Span::new(write.write_start, write.write_end));
         }
@@ -1867,6 +1932,7 @@ fn context_field_prefix_before_event(
             direct,
             property,
             stable_prototypes,
+            false,
             &mut HashMap::new(),
             &mut HashSet::new(),
         ) {
@@ -1931,6 +1997,7 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
             call.evaluation_order,
             &initialization.property,
             stable_prototypes,
+            false,
             &mut HashMap::new(),
             &mut HashSet::new(),
         ) {
@@ -1955,6 +2022,7 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
                 first.evaluation_order,
                 &initialization.property,
                 stable_prototypes,
+                false,
                 &mut HashMap::new(),
                 &mut HashSet::new(),
             )
@@ -2110,6 +2178,214 @@ pub fn structurally_proven_own_data_fields_at_runtime_method_calls(
             proof.initialization.allocation_start,
             proof.initialization.property.clone(),
             proof.call_target.candidate.call.call_start,
+        )
+    });
+    proven.dedup();
+    proven
+}
+
+fn context_prefix_preserves_exact_property(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    flow: &ProvenOriginFlow,
+    context: &ProvenOriginContext,
+    before_order: u64,
+    property: &str,
+    stable_prototypes: &HashSet<(u32, u32)>,
+    memo: &mut HashMap<PreservationKey, bool>,
+    visiting: &mut HashSet<PreservationKey>,
+) -> bool {
+    if flow
+        .exposures
+        .iter()
+        .any(|event| event.context == *context && event.evaluation_order < before_order)
+        || flow
+            .member_calls
+            .iter()
+            .any(|event| event.context == *context && event.evaluation_order < before_order)
+        || flow.member_reads.iter().any(|event| {
+            event.context == *context
+                && event.evaluation_order < before_order
+                && !static_member_read_is_getter_free(event, stable_prototypes)
+        })
+        || flow.member_writes.iter().any(|event| {
+            event.context == *context
+                && event.evaluation_order < before_order
+                && !member_write_preserves_field(event, property, stable_prototypes, true)
+        })
+    {
+        return false;
+    }
+
+    flow.direct_calls
+        .iter()
+        .filter(|nested| nested.caller == *context && nested.evaluation_order < before_order)
+        .all(|nested| {
+            direct_call_preserves_field(
+                source,
+                program,
+                scoping,
+                flow,
+                nested,
+                property,
+                stable_prototypes,
+                true,
+                memo,
+                visiting,
+            )
+        })
+}
+
+/// Prove direct calls reached from one concrete allocation while an inherited
+/// string-valued prototype property still has its exact value.
+///
+/// This is a must-analysis over the exact-origin context graph: a merged helper
+/// context is admitted only when every reachable incoming edge is itself proven
+/// from a valid context and its caller prefix preserves the exact property
+/// value. Cycles that cannot be established from already-proven predecessors
+/// remain unproven.
+#[must_use]
+pub fn proven_prototype_string_at_direct_calls(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    string: &ProvenPrototypeStringAtAllocation,
+) -> Vec<ProvenPrototypeStringAtDirectCall> {
+    let scoping = semantic.scoping();
+    let flow = structurally_proven_origin_flow(program, scoping);
+    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
+        .into_iter()
+        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+        .collect::<HashSet<_>>();
+    let same_origin = |context: &ProvenOriginContext| {
+        context.allocation_start == string.allocation_start
+            && context.allocation_end == string.allocation_end
+            && context.constructor_start == string.assignment.constructor_start
+            && context.constructor_end == string.assignment.constructor_end
+    };
+    let roots = flow
+        .direct_calls
+        .iter()
+        .flat_map(|call| [&call.caller, &call.callee])
+        .filter(|context| {
+            same_origin(context)
+                && context.this_origin
+                && context.function_start == string.assignment.constructor_start
+                && context.function_end == string.assignment.constructor_end
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
+    if roots.is_empty() {
+        return Vec::new();
+    }
+
+    let calls = flow
+        .direct_calls
+        .iter()
+        .filter(|call| same_origin(&call.caller) && same_origin(&call.callee))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut reachable = roots.clone();
+    loop {
+        let mut changed = false;
+        for call in &calls {
+            if reachable.contains(&call.caller) && reachable.insert(call.callee.clone()) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut valid = roots;
+    let mut valid_edges = HashSet::<(u32, u32, ProvenOriginContext, ProvenOriginContext)>::new();
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    loop {
+        let mut changed = false;
+        for call in &calls {
+            if !valid.contains(&call.caller) {
+                continue;
+            }
+            let edge_key = (
+                call.call_start,
+                call.call_end,
+                call.caller.clone(),
+                call.callee.clone(),
+            );
+            if valid_edges.contains(&edge_key) {
+                continue;
+            }
+            if context_prefix_preserves_exact_property(
+                source,
+                program,
+                scoping,
+                &flow,
+                &call.caller,
+                call.evaluation_order,
+                &string.assignment.property,
+                &stable_prototypes,
+                &mut memo,
+                &mut visiting,
+            ) {
+                valid_edges.insert(edge_key);
+                changed = true;
+            }
+        }
+
+        for context in &reachable {
+            if valid.contains(context) {
+                continue;
+            }
+            let incoming = calls
+                .iter()
+                .filter(|call| call.callee == *context && reachable.contains(&call.caller))
+                .collect::<Vec<_>>();
+            if incoming.is_empty() {
+                continue;
+            }
+            if incoming.iter().all(|call| {
+                valid.contains(&call.caller)
+                    && valid_edges.contains(&(
+                        call.call_start,
+                        call.call_end,
+                        call.caller.clone(),
+                        call.callee.clone(),
+                    ))
+            }) {
+                valid.insert(context.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut proven = calls
+        .into_iter()
+        .filter(|call| {
+            valid.contains(&call.caller)
+                && valid_edges.contains(&(
+                    call.call_start,
+                    call.call_end,
+                    call.caller.clone(),
+                    call.callee.clone(),
+                ))
+        })
+        .map(|call| ProvenPrototypeStringAtDirectCall {
+            string: string.clone(),
+            call,
+        })
+        .collect::<Vec<_>>();
+    proven.sort_by_key(|proof| {
+        (
+            proof.call.call_start,
+            proof.call.call_end,
+            proof.call.caller.function_start,
+            proof.call.caller.parameter_indices.clone(),
         )
     });
     proven.dedup();
@@ -2277,6 +2553,12 @@ pub struct ProvenPrototypeStringAtAllocation {
     pub assignment: ProvenPrototypeStringAssignment,
     pub allocation_start: u32,
     pub allocation_end: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenPrototypeStringAtDirectCall {
+    pub string: ProvenPrototypeStringAtAllocation,
+    pub call: ProvenOriginDirectCall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4258,10 +4540,12 @@ pub fn structurally_proven_receiver_preserving_prototype_method_calls(
 #[cfg(test)]
 mod tests {
     use super::{
-        propagate_proven_origin_contexts, proven_prototype_string_at_allocation,
-        structurally_matched_prototype_method_calls, structurally_proven_member_receiver_origins,
-        structurally_proven_member_write_origins, structurally_proven_origin_direct_calls,
-        structurally_proven_origin_exposures, structurally_proven_origin_flow,
+        propagate_proven_origin_contexts, proven_origin_direct_call_preserves_exact_property,
+        proven_origin_direct_call_preserves_own_field, proven_prototype_string_at_allocation,
+        proven_prototype_string_at_direct_calls, structurally_matched_prototype_method_calls,
+        structurally_proven_member_receiver_origins, structurally_proven_member_write_origins,
+        structurally_proven_origin_direct_calls, structurally_proven_origin_exposures,
+        structurally_proven_origin_flow,
         structurally_proven_own_data_fields_at_runtime_method_calls,
         structurally_proven_prototype_method_assignments,
         structurally_proven_prototype_method_calls_at_runtime,
@@ -5392,6 +5676,141 @@ mod tests {
             new C();
         "#;
         assert!(calls(source).is_empty());
+    }
+
+    #[test]
+    fn propagates_exact_prototype_string_through_all_incoming_edges() {
+        let source = r#"
+            const C = function() { first(this); second(this); };
+            C.prototype.factory = "create";
+            function first(state) { shared(state); }
+            function second(state) { shared(state); }
+            function shared(state) { sink(state); }
+            function sink(state) { state.other = 1; }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        let assignment = prototype_strings(source).pop().expect("prototype string");
+        let allocation_start = source.find("new C()").expect("allocation") as u32;
+        let string = proven_prototype_string_at_allocation(
+            &parsed.program,
+            &semantic.semantic,
+            assignment.constructor_start,
+            assignment.constructor_end,
+            Span::new(allocation_start, allocation_start + 7),
+            "factory",
+        )
+        .expect("runtime string");
+        let calls = proven_prototype_string_at_direct_calls(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &string,
+        );
+        assert!(calls.iter().any(|proof| {
+            source[proof.call.call_start as usize..proof.call.call_end as usize]
+                .starts_with("sink(")
+        }));
+    }
+
+    #[test]
+    fn exact_prototype_string_join_rejects_one_mutating_incoming_path() {
+        let source = r#"
+            const C = function() { clean(this); dirty(this); };
+            C.prototype.factory = "create";
+            function clean(state) { shared(state); }
+            function dirty(state) { state.factory = "changed"; shared(state); }
+            function shared(state) { sink(state); }
+            function sink(state) {}
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        let assignment = prototype_strings(source).pop().expect("prototype string");
+        let allocation_start = source.find("new C()").expect("allocation") as u32;
+        let string = proven_prototype_string_at_allocation(
+            &parsed.program,
+            &semantic.semantic,
+            assignment.constructor_start,
+            assignment.constructor_end,
+            Span::new(allocation_start, allocation_start + 7),
+            "factory",
+        )
+        .expect("runtime string");
+        let calls = proven_prototype_string_at_direct_calls(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &string,
+        );
+        assert!(!calls.iter().any(|proof| {
+            source[proof.call.call_start as usize..proof.call.call_end as usize]
+                .starts_with("sink(")
+        }));
+    }
+
+    #[test]
+    fn exact_property_preservation_allows_other_static_writes() {
+        let source = r#"
+            const C = function() { helper(this); };
+            function helper(state) { state.other = 2; }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let call =
+            structurally_proven_origin_direct_calls(&parsed.program, semantic.semantic.scoping())
+                .into_iter()
+                .next()
+                .expect("direct origin call");
+        assert!(proven_origin_direct_call_preserves_exact_property(
+            source,
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &call,
+            "token",
+        ));
+    }
+
+    #[test]
+    fn exact_property_preservation_rejects_same_property_assignment() {
+        let source = r#"
+            const C = function() { helper(this); };
+            function helper(state) { state.token = "changed"; }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let call =
+            structurally_proven_origin_direct_calls(&parsed.program, semantic.semantic.scoping())
+                .into_iter()
+                .next()
+                .expect("direct origin call");
+        assert!(proven_origin_direct_call_preserves_own_field(
+            source,
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &call,
+            "token",
+        ));
+        assert!(!proven_origin_direct_call_preserves_exact_property(
+            source,
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &call,
+            "token",
+        ));
     }
 
     #[test]
