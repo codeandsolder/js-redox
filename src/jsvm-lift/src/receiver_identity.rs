@@ -2262,6 +2262,24 @@ pub struct ProvenPrototypeMethodAssignment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenPrototypeStringAssignment {
+    pub constructor_start: u32,
+    pub constructor_end: u32,
+    pub property: String,
+    pub value: String,
+    pub assignment_start: u32,
+    pub assignment_end: u32,
+    pub standard_prototype_semantics_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenPrototypeStringAtAllocation {
+    pub assignment: ProvenPrototypeStringAssignment,
+    pub allocation_start: u32,
+    pub allocation_end: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenStableConstructorPrototype {
     pub constructor_start: u32,
     pub constructor_end: u32,
@@ -2582,6 +2600,7 @@ struct PrototypeMethodProof<'c, 'f> {
     property_keys: &'f HashMap<SymbolId, String>,
     aliases: HashMap<SymbolId, FunctionKey>,
     methods: HashMap<(FunctionKey, String), ProvenPrototypeMethodAssignment>,
+    strings: HashMap<(FunctionKey, String), ProvenPrototypeStringAssignment>,
     conflicts: HashSet<(FunctionKey, String)>,
     invalid_constructors: HashSet<FunctionKey>,
     lookup_invalid_constructors: HashSet<FunctionKey>,
@@ -2599,6 +2618,7 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
             property_keys,
             aliases: HashMap::new(),
             methods: HashMap::new(),
+            strings: HashMap::new(),
             conflicts: HashSet::new(),
             invalid_constructors: HashSet::new(),
             lookup_invalid_constructors: HashSet::new(),
@@ -2777,13 +2797,15 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
 
     fn invalidate_property(&mut self, owner: FunctionKey, property: String) {
         self.conflicts.insert((owner, property.clone()));
-        self.methods.remove(&(owner, property));
+        self.methods.remove(&(owner, property.clone()));
+        self.strings.remove(&(owner, property));
     }
 
     fn invalidate_constructor(&mut self, owner: FunctionKey) {
         self.invalid_constructors.insert(owner);
         self.lookup_invalid_constructors.insert(owner);
         self.methods.retain(|(candidate, _), _| *candidate != owner);
+        self.strings.retain(|(candidate, _), _| *candidate != owner);
     }
 
     fn invalidate_lookup(&mut self, owner: FunctionKey) {
@@ -2818,6 +2840,32 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
             standard_prototype_semantics_required: true,
         };
         if self.methods.insert(key.clone(), method).is_some() {
+            self.invalidate_property(owner, key.1);
+        }
+    }
+
+    fn record_string(
+        &mut self,
+        owner: FunctionKey,
+        property: String,
+        value: String,
+        assignment_start: u32,
+        assignment_end: u32,
+    ) {
+        let key = (owner, property.clone());
+        if self.invalid_constructors.contains(&owner) || self.conflicts.contains(&key) {
+            return;
+        }
+        let assignment = ProvenPrototypeStringAssignment {
+            constructor_start: owner.start,
+            constructor_end: owner.end,
+            property,
+            value,
+            assignment_start,
+            assignment_end,
+            standard_prototype_semantics_required: true,
+        };
+        if self.strings.insert(key.clone(), assignment).is_some() {
             self.invalidate_property(owner, key.1);
         }
     }
@@ -3025,6 +3073,20 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                                     assignment.span.start,
                                     assignment.span.end,
                                 );
+                            } else if let Expression::StringLiteral(value) =
+                                last_sequence_expression(&assignment.right)
+                            {
+                                if let Some(value) = string_literal_value(value) {
+                                    self.record_string(
+                                        owner,
+                                        property,
+                                        value,
+                                        assignment.span.start,
+                                        assignment.span.end,
+                                    );
+                                } else {
+                                    self.invalidate_property(owner, property);
+                                }
                             } else {
                                 self.invalidate_property(owner, property);
                             }
@@ -3062,6 +3124,20 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                                         assignment.span.start,
                                         assignment.span.end,
                                     );
+                                } else if let Expression::StringLiteral(value) =
+                                    last_sequence_expression(&assignment.right)
+                                {
+                                    if let Some(value) = string_literal_value(value) {
+                                        self.record_string(
+                                            owner,
+                                            property,
+                                            value,
+                                            assignment.span.start,
+                                            assignment.span.end,
+                                        );
+                                    } else {
+                                        self.invalidate_property(owner, property);
+                                    }
                                 } else {
                                     self.invalidate_property(owner, property);
                                 }
@@ -3220,6 +3296,61 @@ pub fn structurally_proven_prototype_method_assignments(
         )
     });
     methods
+}
+
+#[must_use]
+pub fn structurally_proven_prototype_string_assignments(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenPrototypeStringAssignment> {
+    let mut functions = FunctionCollector::new();
+    functions.visit_program(program);
+    let property_keys = collect_property_key_bindings(program, scoping);
+    let proof =
+        collect_prototype_method_proof(program, scoping, &functions.by_symbol, &property_keys);
+    let mut strings = proof.strings.into_values().collect::<Vec<_>>();
+    strings.sort_by_key(|assignment| {
+        (
+            assignment.constructor_start,
+            assignment.property.clone(),
+            assignment.assignment_start,
+        )
+    });
+    strings
+}
+
+#[must_use]
+pub fn proven_prototype_string_at_allocation(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    constructor_start: u32,
+    constructor_end: u32,
+    allocation: Span,
+    property: &str,
+) -> Option<ProvenPrototypeStringAtAllocation> {
+    let mut assignments =
+        structurally_proven_prototype_string_assignments(program, semantic.scoping())
+            .into_iter()
+            .filter(|assignment| {
+                assignment.constructor_start == constructor_start
+                    && assignment.constructor_end == constructor_end
+                    && assignment.property == property
+            });
+    let assignment = assignments.next()?;
+    if assignments.next().is_some()
+        || !prove_event_completion_before_nested_event(
+            semantic,
+            Span::new(assignment.assignment_start, assignment.assignment_end),
+            allocation,
+        )
+    {
+        return None;
+    }
+    Some(ProvenPrototypeStringAtAllocation {
+        assignment,
+        allocation_start: allocation.start,
+        allocation_end: allocation.end,
+    })
 }
 
 #[must_use]
@@ -4127,10 +4258,10 @@ pub fn structurally_proven_receiver_preserving_prototype_method_calls(
 #[cfg(test)]
 mod tests {
     use super::{
-        propagate_proven_origin_contexts, structurally_matched_prototype_method_calls,
-        structurally_proven_member_receiver_origins, structurally_proven_member_write_origins,
-        structurally_proven_origin_direct_calls, structurally_proven_origin_exposures,
-        structurally_proven_origin_flow,
+        propagate_proven_origin_contexts, proven_prototype_string_at_allocation,
+        structurally_matched_prototype_method_calls, structurally_proven_member_receiver_origins,
+        structurally_proven_member_write_origins, structurally_proven_origin_direct_calls,
+        structurally_proven_origin_exposures, structurally_proven_origin_flow,
         structurally_proven_own_data_fields_at_runtime_method_calls,
         structurally_proven_prototype_method_assignments,
         structurally_proven_prototype_method_calls_at_runtime,
@@ -4138,12 +4269,25 @@ mod tests {
         structurally_proven_prototype_method_lookup_targets,
         structurally_proven_prototype_method_receiver_effects,
         structurally_proven_prototype_method_receiver_preservation_summaries,
+        structurally_proven_prototype_string_assignments,
     };
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
-    use oxc_span::SourceType;
+    use oxc_span::{SourceType, Span};
     use rolldown_redox::ecmascript::parse_program;
     use std::collections::HashSet;
+
+    fn prototype_strings(source: &str) -> Vec<super::ProvenPrototypeStringAssignment> {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        structurally_proven_prototype_string_assignments(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+    }
 
     fn method_assignments(source: &str) -> Vec<super::ProvenPrototypeMethodAssignment> {
         let allocator = Allocator::default();
@@ -4332,6 +4476,64 @@ mod tests {
         )
         .iter()
         .all(|proof| proof.candidate.call.property != "run"));
+    }
+
+    #[test]
+    fn proves_stable_prototype_string_assignment() {
+        let strings = prototype_strings(
+            r#"
+                const C = function() {};
+                const p = C.prototype;
+                p.factory = "create";
+                new C();
+            "#,
+        );
+        assert_eq!(strings.len(), 1);
+        assert_eq!(strings[0].property, "factory");
+        assert_eq!(strings[0].value, "create");
+    }
+
+    #[test]
+    fn proves_prototype_string_before_nested_allocation() {
+        let source = r#"
+            const C = function() {};
+            C.prototype.factory = "create";
+            const build = function() { return new C(); };
+            use(build);
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        let assignment = prototype_strings(source).pop().expect("prototype string");
+        let allocation_start = source.find("new C()").expect("allocation") as u32;
+        let allocation_end = allocation_start + u32::try_from("new C()".len()).unwrap();
+        let proof = proven_prototype_string_at_allocation(
+            &parsed.program,
+            &semantic.semantic,
+            assignment.constructor_start,
+            assignment.constructor_end,
+            Span::new(allocation_start, allocation_end),
+            "factory",
+        )
+        .expect("runtime prototype string");
+        assert_eq!(proof.assignment.value, "create");
+    }
+
+    #[test]
+    fn rejects_conflicting_prototype_string_assignment() {
+        assert!(prototype_strings(
+            r#"
+                const C = function() {};
+                C.prototype.factory = "create";
+                C.prototype.factory = "other";
+                new C();
+            "#,
+        )
+        .is_empty());
     }
 
     #[test]
