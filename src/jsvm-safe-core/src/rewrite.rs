@@ -52,11 +52,35 @@ fn select_replacements(mut replacements: Vec<Replacement>) -> Vec<Replacement> {
     });
 
     let mut selected: Vec<Replacement> = Vec::new();
-    'next: for candidate in replacements {
-        for existing in &selected {
-            if candidate.start < existing.end && existing.start < candidate.end {
-                continue 'next;
+    let mut occupied = BTreeMap::<usize, usize>::new();
+    for candidate in replacements {
+        // Selected non-empty intervals never overlap, so the selected interval
+        // with the greatest start before candidate.end is the only one that can
+        // overlap this candidate. This preserves the largest-span greedy policy
+        // without the previous quadratic scan over every selected replacement.
+        if candidate.start < candidate.end {
+            if occupied
+                .range(..candidate.end)
+                .next_back()
+                .is_some_and(|(_, end)| *end > candidate.start)
+            {
+                continue;
             }
+            occupied.insert(candidate.start, candidate.end);
+            selected.push(candidate);
+            continue;
+        }
+
+        // Zero-width candidates sort after every non-empty interval. The old
+        // overlap predicate rejects a point strictly inside a selected span,
+        // while allowing points on either boundary and multiple points at the
+        // same offset.
+        if occupied
+            .range(..candidate.start)
+            .next_back()
+            .is_some_and(|(_, end)| *end > candidate.start)
+        {
+            continue;
         }
         selected.push(candidate);
     }
@@ -225,6 +249,60 @@ mod tests {
             ),
             "foo bar"
         );
+    }
+
+    fn quadratic_select_reference(mut replacements: Vec<Replacement>) -> Vec<Replacement> {
+        replacements.sort_by(|a, b| {
+            (b.end - b.start)
+                .cmp(&(a.end - a.start))
+                .then_with(|| a.start.cmp(&b.start))
+        });
+
+        let mut selected: Vec<Replacement> = Vec::new();
+        'next: for candidate in replacements {
+            for existing in &selected {
+                if candidate.start < existing.end && existing.start < candidate.end {
+                    continue 'next;
+                }
+            }
+            selected.push(candidate);
+        }
+        selected.sort_by_key(|replacement| replacement.start);
+        selected
+    }
+
+    fn selection_shape(replacements: Vec<Replacement>) -> Vec<(usize, usize, String)> {
+        replacements
+            .into_iter()
+            .map(|replacement| (replacement.start, replacement.end, replacement.text))
+            .collect()
+    }
+
+    #[test]
+    fn indexed_selection_matches_quadratic_policy() {
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        let mut replacements = Vec::new();
+        for index in 0..2_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let start = match usize::try_from(state % 5_000) {
+                Ok(value) => value,
+                Err(_) => unreachable!(),
+            };
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let width = match usize::try_from(state % 80) {
+                Ok(value) => value,
+                Err(_) => unreachable!(),
+            };
+            replacements.push(replacement(start, start + width, &format!("r{index}")));
+        }
+
+        let expected = selection_shape(quadratic_select_reference(replacements.clone()));
+        let actual = selection_shape(select_replacements(replacements));
+        assert_eq!(actual, expected);
     }
 
     #[test]

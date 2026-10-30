@@ -1367,6 +1367,8 @@ static BASE64_SENTINEL_RE: LazyLock<Option<regex::Regex>> =
 static RC4_CHAR_CODE_AT_RE: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
     compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*charCodeAt\s*\(([^)]*)\)")
 });
+static DIRECT_ARRAY_ACCESS_RE: LazyLock<Option<regex::Regex>> =
+    LazyLock::new(|| compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([^\s\]]+)\s*\]"));
 
 fn fixed_base64_alphabet(body: &str) -> Option<String> {
     if !body.contains("String.fromCharCode")
@@ -1581,14 +1583,12 @@ fn detect_sparse_direct_table_decoders(
             continue;
         };
         let body = fragment(source, function.span);
-        let Some(access) = compile_regex(&format!(
-            r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*{}\s*\]",
-            regex::escape(param)
-        )) else {
+        let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
             continue;
         };
         let mut matched = access
             .captures_iter(body)
+            .filter(|caps| caps.get(2).is_some_and(|capture| capture.as_str() == param))
             .filter_map(|caps| caps.get(1).map(|capture| capture.as_str()))
             .filter_map(|name| arrays_by_name.get(name))
             .flat_map(|candidates| candidates.iter().copied())
@@ -1772,14 +1772,12 @@ fn detect_direct_table_decoders(
             continue;
         };
         let body = fragment(source, function.span);
-        let Some(access) = compile_regex(&format!(
-            r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*{}\s*\]",
-            regex::escape(param)
-        )) else {
+        let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
             continue;
         };
         let mut matched = access
             .captures_iter(body)
+            .filter(|caps| caps.get(2).is_some_and(|capture| capture.as_str() == param))
             .filter_map(|caps| caps.get(1).map(|capture| capture.as_str()))
             .filter_map(|name| arrays_by_name.get(name))
             .filter(|candidates| candidates.len() == 1)
@@ -3347,9 +3345,12 @@ fn decoder_providers(
             continue;
         }
         let body = fragment(source, function.span);
-        let classic_self_rewrite = (body.contains(&format!("{} = function", function.name))
-            || body.contains(&format!("{}=function", function.name)))
-            && body.contains(&format!("return {}();", function.name));
+        let self_rewrite_assignment = body.contains(&format!("{} = function", function.name))
+            || body.contains(&format!("{}=function", function.name));
+        if !self_rewrite_assignment {
+            continue;
+        }
+        let classic_self_rewrite = body.contains(&format!("return {}();", function.name));
         for (array_name, values) in &function.static_arrays {
             let inline_self_rewrite = compile_regex(&format!(
                 r"(?s)^\s*function\s+{}\s*\(\s*\)\s*\{{\s*(?:const|let|var)\s+{}\s*=\s*{}\s*;\s*return\s*\(\s*{}\s*=\s*function\s*\(\s*\)\s*\{{\s*return\s+{}\s*;?\s*\}}\s*\)\s*\(\s*\)\s*;?\s*\}}\s*$",
@@ -3417,6 +3418,14 @@ fn inline_self_rewriting_direct_decoder(
     if function.params.is_empty() || name_counts.get(&function.name).copied() != Some(1) {
         return None;
     }
+    let body = fragment(source, function.span);
+    // The exact self-rewriting shape below necessarily contains all three of
+    // these tokens. Most application functions contain none of them together;
+    // rejecting those before constructing the function-specific regex avoids
+    // compiling a large automaton for every ordinary named function.
+    if !body.contains("-=") || !body.contains("return") || !body.contains("function") {
+        return None;
+    }
     let params = function
         .params
         .iter()
@@ -3425,7 +3434,6 @@ fn inline_self_rewriting_direct_decoder(
         .join(r"\s*,\s*");
     let first = regex::escape(function.params.first()?);
     let identifier = r"[A-Za-z_$][A-Za-z0-9_$]*";
-    let body = fragment(source, function.span);
     let pattern = compile_regex(&format!(
         r"(?s)^\s*function\s+{}\s*\(\s*{}\s*\)\s*\{{\s*(?:const|let|var)\s+(?P<table>{identifier})\s*=\s*(?P<provider>{identifier})\s*\(\s*\)\s*;\s*return\s*\(\s*{}\s*=\s*function\s*\(\s*{}\s*\)\s*\{{\s*return\s+(?P<lookup>{identifier})\s*\[\s*{}\s*-=\s*(?P<offset>0[xX][0-9A-Fa-f]+|[0-9]+)\s*\]\s*;?\s*\}}\s*\)\s*\(\s*{}\s*\)\s*;?\s*\}}\s*$",
         regex::escape(&function.name),
