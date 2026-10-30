@@ -7,7 +7,8 @@ use jsvm_lift::{
         propagate_proven_prototype_method_call_origins,
         proven_origin_direct_call_event_unreachable, proven_own_data_field_at_runtime_method_call,
         proven_prototype_method_receiver_preservation_summary,
-        proven_prototype_string_at_allocation, proven_receiver_preserving_prototype_method_call,
+        proven_prototype_string_at_allocation, proven_prototype_string_at_direct_calls,
+        proven_receiver_preserving_prototype_method_call,
         structurally_matched_prototype_method_calls, structurally_proven_origin_flow,
         structurally_proven_own_data_field_initializations,
         structurally_proven_own_data_fields_at_member_calls,
@@ -157,6 +158,43 @@ fn main() -> Result<()> {
             })
         })
         .collect::<Vec<_>>();
+        let prototype_string_direct_calls =
+            structurally_proven_prototype_string_assignments(&parsed.program, scoping)
+                .into_iter()
+                .filter(|assignment| {
+                    assignment.constructor_start == target_origin.2
+                        && assignment.constructor_end == target_origin.3
+                })
+                .filter_map(|assignment| {
+                    proven_prototype_string_at_allocation(
+                        &parsed.program,
+                        &semantic.semantic,
+                        target_origin.2,
+                        target_origin.3,
+                        Span::new(target_origin.0, target_origin.1),
+                        &assignment.property,
+                    )
+                })
+                .flat_map(|string| {
+                    proven_prototype_string_at_direct_calls(
+                &source,
+                &parsed.program,
+                &semantic.semantic,
+                &string,
+            )
+            .into_iter()
+            .map(move |proof| {
+                json!({
+                    "property": proof.string.assignment.property,
+                    "value": proof.string.assignment.value,
+                    "call": [proof.call.call_start, proof.call.call_end],
+                    "caller": [proof.call.caller.function_start, proof.call.caller.function_end],
+                    "callee": [proof.call.callee.function_start, proof.call.callee.function_end],
+                    "exact_integer_arguments": proof.call.exact_integer_arguments,
+                })
+            })
+                })
+                .collect::<Vec<_>>();
         let reads = proven_origin_registry_read_calls(&parsed.program, scoping, &seeded)
             .into_iter()
             .filter(|proof| {
@@ -233,6 +271,7 @@ fn main() -> Result<()> {
                 "origin_tables": origin_tables,
                 "table_vms": table_analysis.table_vms,
                 "prototype_strings_at_allocation": prototype_strings_at_allocation,
+                "prototype_string_direct_calls": prototype_string_direct_calls,
             }))?
         );
         return Ok(());
