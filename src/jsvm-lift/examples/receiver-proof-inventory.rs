@@ -4,8 +4,10 @@ use jsvm_lift::{
     cfg_order::prove_events_before_event,
     receiver_identity::{
         propagate_matched_prototype_method_call_origins,
-        proven_origin_direct_call_event_unreachable, structurally_matched_prototype_method_calls,
-        structurally_proven_origin_flow, structurally_proven_own_data_field_initializations,
+        proven_origin_direct_call_event_unreachable,
+        proven_prototype_method_receiver_preservation_summary,
+        structurally_matched_prototype_method_calls, structurally_proven_origin_flow,
+        structurally_proven_own_data_field_initializations,
         structurally_proven_own_data_fields_at_member_calls,
         structurally_proven_prototype_method_calls_at_runtime,
         structurally_proven_prototype_method_lookup_targets,
@@ -33,12 +35,18 @@ fn main() -> Result<()> {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let summary = args.iter().any(|arg| arg == "--summary");
     let runtime_only = args.iter().any(|arg| arg == "--runtime-only");
+    let preserve_call_start = args.iter().find_map(|arg| {
+        arg.to_str()?
+            .strip_prefix("--preserve-call-start=")?
+            .parse::<u32>()
+            .ok()
+    });
     let path = args
         .iter()
-        .find(|arg| arg.as_os_str() != "--summary" && arg.as_os_str() != "--runtime-only")
+        .find(|arg| !arg.to_string_lossy().starts_with("--"))
         .map(PathBuf::from)
         .context(
-            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--runtime-only]",
+            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--runtime-only] [--preserve-call-start=N]",
         )?;
     let source =
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -55,6 +63,41 @@ fn main() -> Result<()> {
         .build(&parsed.program);
     anyhow::ensure!(semantic.diagnostics.is_empty(), "semantic diagnostics");
     let scoping = semantic.semantic.scoping();
+    if let Some(call_start) = preserve_call_start {
+        let mut matches = structurally_proven_prototype_method_calls_at_runtime(
+            &parsed.program,
+            &semantic.semantic,
+        )
+        .into_iter()
+        .filter(|proof| proof.candidate.call.call_start == call_start);
+        let target = matches
+            .next()
+            .context("no runtime-proven method call at requested start")?;
+        anyhow::ensure!(
+            matches.next().is_none(),
+            "ambiguous runtime method call start"
+        );
+        let summary = proven_prototype_method_receiver_preservation_summary(
+            &source,
+            &parsed.program,
+            &semantic.semantic,
+            &target,
+        )
+        .map(|summary| {
+            let candidate = &summary.call_target.candidate;
+            json!({
+                "call": [candidate.call.call_start, candidate.call.call_end],
+                "property": candidate.call.property,
+                "allocation": [candidate.call.allocation_start, candidate.call.allocation_end],
+                "assignment": [candidate.lookup_target.assignment_start, candidate.lookup_target.assignment_end],
+                "required_own_data_fields": summary.required_own_data_fields,
+                "standard_function_call_semantics_required": summary.standard_function_call_semantics_required,
+                "standard_prototype_semantics_required": summary.call_target.standard_prototype_semantics_required,
+            })
+        });
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
     if runtime_only {
         let runtime_method_calls = structurally_proven_prototype_method_calls_at_runtime(
             &parsed.program,
