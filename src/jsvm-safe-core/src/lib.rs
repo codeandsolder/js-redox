@@ -953,11 +953,16 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                     }
                 }
                 if valid_property(&property) {
-                    self.push(
-                        it.span,
-                        format!("{}.{}", fragment(self.source, it.object.span()), property),
-                        "computed_property",
-                    );
+                    let object = fragment(self.source, it.object.span());
+                    let text = if matches!(&it.object, Expression::NumericLiteral(_)) {
+                        // `1["x"]` cannot become `1.x`: the dot is consumed as
+                        // part of the numeric literal. Parenthesizing preserves
+                        // the receiver while making the member access lexical.
+                        format!("({object}).{property}")
+                    } else {
+                        format!("{object}.{property}")
+                    };
+                    self.push(it.span, text, "computed_property");
                     walk::walk_computed_member_expression(self, it);
                     return;
                 }
@@ -1405,6 +1410,22 @@ fn deobfuscate_with_mode(
         current = next;
     }
 
+    // Every ordinary fixed-point exit has already validated `current` at the
+    // start of its final no-op iteration. If every allowed iteration changed
+    // the source, however, there is no next iteration to validate the final
+    // rewrite. Revalidate only that budget-exhaustion case so callers can never
+    // receive syntactically or semantically invalid transformed source.
+    if max_iterations > 0 && iterations == max_iterations {
+        let allocator = Allocator::default();
+        let program = parse_as(&allocator, &current, source_type)?;
+        let semantic_ret = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&program);
+        if !semantic_ret.diagnostics.is_empty() {
+            return None;
+        }
+    }
+
     Some(SafeTransformResult {
         source: current,
         iterations,
@@ -1549,6 +1570,20 @@ mod tests {
             assert_eq!(result.source, source);
             assert!(result.transforms.is_empty());
         }
+    }
+
+    #[test]
+    fn computed_property_rewrite_parenthesizes_numeric_receiver() {
+        let source = r#"sink(1["fetchLater"], 1.5["toString"]);"#;
+        let result = deobfuscate(source, 2);
+        assert!(result.is_some());
+        let result = result.unwrap_or_else(|| unreachable!());
+        assert_eq!(result.source, r#"sink((1).fetchLater, (1.5).toString);"#);
+        assert_eq!(result.transforms.get("computed_property"), Some(&2));
+        assert_eq!(
+            safe_source_rejection(&result.source, SafeSourceMode::Auto),
+            None
+        );
     }
 
     #[test]
