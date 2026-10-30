@@ -1844,6 +1844,150 @@ pub fn prove_detected_if_ladder_event_before_barriers(
     harness.result.unwrap_or(false)
 }
 
+/// Prove event-before-barriers inside the unique detected flattened if-ladder
+/// machine containing `event` in one exact function.
+///
+/// This is a loop-aware fallback for consumers that already tried ordinary CFG
+/// ordering. Every supplied barrier must lie inside the same machine; barriers
+/// outside it fail closed rather than being silently ignored.
+pub fn prove_function_if_ladder_event_before_barriers(
+    source: &str,
+    program: &Program<'_>,
+    function_start: u32,
+    function_end: u32,
+    event: Span,
+    barriers: &[Span],
+) -> bool {
+    struct FunctionHarness<'s, 'b> {
+        source: &'s str,
+        function_start: u32,
+        function_end: u32,
+        event: Span,
+        barriers: &'b [Span],
+        result: Option<bool>,
+    }
+
+    impl FunctionHarness<'_, '_> {
+        fn prove_body(&self, body: &FunctionBody<'_>) -> bool {
+            struct Collector<'s, 'b> {
+                source: &'s str,
+                event: Span,
+                barriers: &'b [Span],
+                matches: usize,
+                result: bool,
+            }
+
+            impl Collector<'_, '_> {
+                fn barriers_inside(&self, start: u32, end: u32) -> bool {
+                    self.barriers
+                        .iter()
+                        .all(|barrier| start <= barrier.start && barrier.end <= end)
+                }
+
+                fn scan_statement_list(&mut self, statements: &[Statement<'_>]) {
+                    for pair in statements.windows(2) {
+                        let [init, Statement::WhileStatement(while_statement)] = pair else {
+                            continue;
+                        };
+                        let Some(machine) = detect_while_state_machine(
+                            self.source,
+                            "ordered-call",
+                            init,
+                            while_statement,
+                        ) else {
+                            continue;
+                        };
+                        if machine.start <= self.event.start && self.event.end <= machine.end {
+                            self.matches += 1;
+                            self.result = self.barriers_inside(machine.start, machine.end)
+                                && prove_machine_event_before_barriers(
+                                    &machine,
+                                    &while_statement.body,
+                                    self.event,
+                                    self.barriers,
+                                );
+                        }
+                    }
+                }
+            }
+
+            impl<'a> Visit<'a> for Collector<'_, '_> {
+                fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+                    self.scan_statement_list(&body.statements);
+                    walk::walk_function_body(self, body);
+                }
+                fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+                    self.scan_statement_list(&block.body);
+                    walk::walk_block_statement(self, block);
+                }
+                fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+                    let detected =
+                        detect_for_state_machines(self.source, "ordered-call", statement);
+                    for machine in detected.if_ladder_machines {
+                        if machine.start <= self.event.start && self.event.end <= machine.end {
+                            self.matches += 1;
+                            self.result = self.barriers_inside(machine.start, machine.end)
+                                && prove_machine_event_before_barriers(
+                                    &machine,
+                                    &statement.body,
+                                    self.event,
+                                    self.barriers,
+                                );
+                        }
+                    }
+                    walk::walk_for_statement(self, statement);
+                }
+                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                }
+            }
+
+            let mut collector = Collector {
+                source: self.source,
+                event: self.event,
+                barriers: self.barriers,
+                matches: 0,
+                result: false,
+            };
+            collector.visit_function_body(body);
+            collector.matches == 1 && collector.result
+        }
+    }
+
+    impl<'a> Visit<'a> for FunctionHarness<'_, '_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if self.result.is_some() {
+                return;
+            }
+            if function.span.start == self.function_start && function.span.end == self.function_end
+            {
+                self.result = Some(
+                    function
+                        .body
+                        .as_ref()
+                        .is_some_and(|body| self.prove_body(body)),
+                );
+                return;
+            }
+            walk::walk_function(self, function, flags);
+        }
+    }
+
+    let mut harness = FunctionHarness {
+        source,
+        function_start,
+        function_end,
+        event,
+        barriers,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(false)
+}
+
 pub fn prove_if_ladder_event_before_barriers(
     source: &str,
     for_stmt: &ForStatement<'_>,
@@ -3567,6 +3711,46 @@ mod tests {
                 &BTreeMap::from([(1, 410)]),
             )
         );
+    }
+
+    #[test]
+    fn function_ordering_falls_back_to_detected_while_machine() {
+        let source = r#"
+            function target() {
+                let state = 5;
+                while (state != 27) {
+                    if (state == 5) state = 32;
+                    else if (state == 32) event(), state = 61;
+                    else if (state == 61) barrier(), state = 85;
+                    else if (state == 85) state = 27;
+                }
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let function = parsed
+            .program
+            .body
+            .iter()
+            .find_map(|statement| match statement {
+                Statement::FunctionDeclaration(function) => Some(function),
+                _ => None,
+            })
+            .expect("target function");
+        let event_start = source.find("event()").unwrap() as u32;
+        let barrier_start = source.find("barrier()").unwrap() as u32;
+        assert!(prove_function_if_ladder_event_before_barriers(
+            source,
+            &parsed.program,
+            function.span.start,
+            function.span.end,
+            Span::new(event_start, event_start + "event()".len() as u32),
+            &[Span::new(
+                barrier_start,
+                barrier_start + "barrier()".len() as u32,
+            )],
+        ));
     }
 
     #[test]
