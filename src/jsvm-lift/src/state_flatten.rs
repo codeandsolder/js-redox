@@ -6,15 +6,15 @@ use crate::{
 use jsvm_safe_core::eval_static_primitive as eval_static;
 use oxc_ast::{
     ast::{
-        Argument, BindingPattern, Expression, ForStatement, Function, FunctionBody, Program,
-        Statement, SwitchStatement, WhileStatement,
+        Argument, AssignmentTarget, BindingPattern, Expression, ForStatement, Function,
+        FunctionBody, Program, Statement, SwitchStatement, WhileStatement,
     },
     AstKind,
 };
 use oxc_ast_visit::{walk, Visit};
-use oxc_semantic::Scoping;
+use oxc_semantic::{Scoping, Semantic};
 use oxc_span::{GetSpan, Span};
-use oxc_syntax::scope::ScopeFlags;
+use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -2035,6 +2035,1044 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
     harness.result.unwrap_or(false)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenIfLadderIdentifierEquality {
+    pub function_start: u32,
+    pub function_end: u32,
+    pub event_start: u32,
+    pub event_end: u32,
+    pub state: u64,
+    pub assignment_start: u32,
+    pub assignment_end: u32,
+    pub left_symbol: SymbolId,
+    pub right_symbol: SymbolId,
+}
+
+#[derive(Debug, Clone)]
+struct DirectIdentifierCopy {
+    state: u64,
+    assignment: Span,
+    target: Span,
+    left_symbol: SymbolId,
+    right_symbol: SymbolId,
+}
+
+fn resolved_reference_symbol(
+    scoping: &Scoping,
+    reference_id: Option<oxc_syntax::reference::ReferenceId>,
+) -> Option<SymbolId> {
+    scoping.get_reference(reference_id?).symbol_id()
+}
+
+fn local_variable_binding(scoping: &Scoping, symbol: SymbolId) -> bool {
+    scoping.symbol_flags(symbol).is_variable()
+}
+
+enum SafeLexicalAssignment {
+    Other,
+    Copy {
+        target: Span,
+        left_symbol: SymbolId,
+        right_symbol: SymbolId,
+    },
+}
+
+fn safe_lexical_assignment(
+    expression: &Expression<'_>,
+    scoping: &Scoping,
+) -> Option<(Span, SafeLexicalAssignment)> {
+    let Expression::AssignmentExpression(assignment) = expression else {
+        return None;
+    };
+    if assignment.operator.as_str() != "=" {
+        return None;
+    }
+    let AssignmentTarget::AssignmentTargetIdentifier(target) = &assignment.left else {
+        return None;
+    };
+    let left_symbol = resolved_reference_symbol(scoping, target.reference_id.get())?;
+    if !local_variable_binding(scoping, left_symbol) {
+        return None;
+    }
+    let assignment_span = assignment.span;
+    match &assignment.right {
+        Expression::Identifier(right) => {
+            let right_symbol = resolved_reference_symbol(scoping, right.reference_id.get())?;
+            local_variable_binding(scoping, right_symbol).then_some((
+                assignment_span,
+                SafeLexicalAssignment::Copy {
+                    target: target.span,
+                    left_symbol,
+                    right_symbol,
+                },
+            ))
+        }
+        Expression::NumericLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::NullLiteral(_) => Some((assignment_span, SafeLexicalAssignment::Other)),
+        _ => None,
+    }
+}
+
+fn collect_safe_copy_prefix(
+    expression: &Expression<'_>,
+    state: u64,
+    scoping: &Scoping,
+    copies: &mut Vec<DirectIdentifierCopy>,
+) -> bool {
+    let expressions: &[Expression<'_>] = match expression {
+        Expression::SequenceExpression(sequence) => sequence.expressions.as_slice(),
+        _ => std::slice::from_ref(expression),
+    };
+    for expression in expressions {
+        let Some((assignment, effect)) = safe_lexical_assignment(expression, scoping) else {
+            return false;
+        };
+        if let SafeLexicalAssignment::Copy {
+            target,
+            left_symbol,
+            right_symbol,
+        } = effect
+        {
+            copies.push(DirectIdentifierCopy {
+                state,
+                assignment,
+                target,
+                left_symbol,
+                right_symbol,
+            });
+        }
+    }
+    true
+}
+
+fn collect_direct_state_copies(
+    statement: &Statement<'_>,
+    state: u64,
+    scoping: &Scoping,
+    copies: &mut Vec<DirectIdentifierCopy>,
+) {
+    match statement {
+        Statement::ExpressionStatement(statement) => {
+            let _ = collect_safe_copy_prefix(&statement.expression, state, scoping, copies);
+        }
+        Statement::BlockStatement(block) => {
+            for statement in &block.body {
+                let Statement::ExpressionStatement(statement) = statement else {
+                    break;
+                };
+                if !collect_safe_copy_prefix(&statement.expression, state, scoping, copies) {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+struct DirectStateCopyCollector<'c, 's> {
+    state_var: &'s str,
+    scoping: &'c Scoping,
+    copies: Vec<DirectIdentifierCopy>,
+}
+
+impl<'a> Visit<'a> for DirectStateCopyCollector<'_, '_> {
+    fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
+        let state = match &statement.test {
+            Expression::BinaryExpression(binary) => {
+                binary_state_comparison_literal(binary, self.state_var)
+            }
+            _ => None,
+        };
+        if let Some(state) = state {
+            collect_direct_state_copies(
+                &statement.consequent,
+                state,
+                self.scoping,
+                &mut self.copies,
+            );
+            if let Some(alternate) = statement.alternate.as_ref() {
+                self.visit_statement(alternate);
+            }
+            return;
+        }
+        walk::walk_if_statement(self, statement);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn enclosing_function_span(semantic: &Semantic<'_>, node_id: oxc_semantic::NodeId) -> Option<Span> {
+    semantic
+        .nodes()
+        .ancestors(node_id)
+        .find_map(|node| match node.kind() {
+            AstKind::Function(function) => Some(function.span),
+            AstKind::ArrowFunctionExpression(function) => Some(function.span),
+            _ => None,
+        })
+}
+
+fn declaring_function_span(semantic: &Semantic<'_>, symbol: SymbolId) -> Option<Span> {
+    enclosing_function_span(semantic, semantic.scoping().symbol_declaration(symbol))
+}
+
+fn function_subtree_has_dynamic_scope(program: &Program<'_>, function_span: Span) -> bool {
+    // A dedicated harness starts the probe at the exact function body, so all
+    // nested closures are included conservatively.
+    struct Harness {
+        function_span: Span,
+        result: Option<bool>,
+    }
+    impl<'a> Visit<'a> for Harness {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if self.result.is_some() {
+                return;
+            }
+            if function.span == self.function_span {
+                let mut probe = DynamicScopeBodyProbe { dynamic: false };
+                if let Some(body) = function.body.as_deref() {
+                    probe.visit_function_body(body);
+                }
+                self.result = Some(probe.dynamic);
+                return;
+            }
+            walk::walk_function(self, function, flags);
+        }
+    }
+    struct DynamicScopeBodyProbe {
+        dynamic: bool,
+    }
+    impl<'a> Visit<'a> for DynamicScopeBodyProbe {
+        fn visit_with_statement(&mut self, _statement: &oxc_ast::ast::WithStatement<'a>) {
+            self.dynamic = true;
+        }
+        fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+            if matches!(&call.callee, Expression::Identifier(identifier) if identifier.name.as_str() == "eval")
+            {
+                self.dynamic = true;
+            }
+            walk::walk_call_expression(self, call);
+        }
+    }
+
+    // Keep this function local and fail closed if the exact function cannot be found.
+    let mut harness = Harness {
+        function_span,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(true)
+}
+
+fn symbol_write_barriers(
+    semantic: &Semantic<'_>,
+    function_span: Span,
+    machine_span: Span,
+    establishment_target: Span,
+    left_symbol: SymbolId,
+    right_symbol: SymbolId,
+) -> Option<Vec<Span>> {
+    let left_declaring_function = declaring_function_span(semantic, left_symbol)?;
+    let right_declaring_function = declaring_function_span(semantic, right_symbol)?;
+    if left_declaring_function != right_declaring_function {
+        return None;
+    }
+
+    let scoping = semantic.scoping();
+    let mut barriers = Vec::new();
+    for symbol in [left_symbol, right_symbol] {
+        for reference_id in scoping.get_resolved_reference_ids(symbol) {
+            let reference = scoping.get_reference(*reference_id);
+            if !reference.is_write() {
+                continue;
+            }
+            let node = semantic.nodes().get_node(reference.node_id());
+            let span = node.kind().span();
+            let enclosing = enclosing_function_span(semantic, reference.node_id())?;
+            if enclosing == function_span {
+                if span == establishment_target {
+                    continue;
+                }
+                if machine_span.start <= span.start && span.end <= machine_span.end {
+                    barriers.push(span);
+                }
+                continue;
+            }
+            if enclosing != left_declaring_function {
+                // A sibling/nested closure can mutate the captured relation later.
+                return None;
+            }
+        }
+    }
+    barriers.sort_by_key(|span| (span.start, span.end));
+    barriers.dedup();
+    Some(barriers)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectedScalarValue {
+    Known(Scalar),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectedExecStatus {
+    Normal,
+    Break,
+    Return,
+    Throw,
+    Unsupported,
+}
+
+fn protected_identifier_symbol(
+    semantic: &Semantic<'_>,
+    identifier: &oxc_ast::ast::IdentifierReference<'_>,
+) -> Option<SymbolId> {
+    resolved_reference_symbol(semantic.scoping(), identifier.reference_id.get())
+}
+
+fn protected_assignment_symbol(
+    semantic: &Semantic<'_>,
+    target: &AssignmentTarget<'_>,
+) -> Option<SymbolId> {
+    let AssignmentTarget::AssignmentTargetIdentifier(identifier) = target else {
+        return None;
+    };
+    resolved_reference_symbol(semantic.scoping(), identifier.reference_id.get())
+}
+
+fn eval_protected_scalar_expression(
+    expression: &Expression<'_>,
+    semantic: &Semantic<'_>,
+    env: &mut HashMap<SymbolId, Scalar>,
+) -> Option<ProtectedScalarValue> {
+    match expression {
+        Expression::NumericLiteral(number) => exact_i64(number.value)
+            .map(Scalar::Int)
+            .map(ProtectedScalarValue::Known),
+        Expression::BooleanLiteral(boolean) => Some(ProtectedScalarValue::Known(Scalar::Int(
+            i64::from(boolean.value),
+        ))),
+        Expression::Identifier(identifier) => {
+            if identifier.name.as_str() == "undefined" {
+                return Some(ProtectedScalarValue::Known(Scalar::Undefined));
+            }
+            let symbol = protected_identifier_symbol(semantic, identifier)?;
+            Some(
+                env.get(&symbol)
+                    .copied()
+                    .map_or(ProtectedScalarValue::Unknown, ProtectedScalarValue::Known),
+            )
+        }
+        Expression::ParenthesizedExpression(parenthesized) => {
+            eval_protected_scalar_expression(&parenthesized.expression, semantic, env)
+        }
+        Expression::SequenceExpression(sequence) => {
+            let mut result = ProtectedScalarValue::Known(Scalar::Undefined);
+            for expression in &sequence.expressions {
+                result = eval_protected_scalar_expression(expression, semantic, env)?;
+            }
+            Some(result)
+        }
+        Expression::AssignmentExpression(assignment) if assignment.operator.as_str() == "=" => {
+            let symbol = protected_assignment_symbol(semantic, &assignment.left)?;
+            let value = eval_protected_scalar_expression(&assignment.right, semantic, env)?;
+            match value {
+                ProtectedScalarValue::Known(value) => {
+                    env.insert(symbol, value);
+                }
+                ProtectedScalarValue::Unknown => {
+                    env.remove(&symbol);
+                }
+            }
+            Some(value)
+        }
+        Expression::UnaryExpression(unary) => {
+            if unary.operator.as_str() == "void" {
+                let _ = eval_protected_scalar_expression(&unary.argument, semantic, env)?;
+                return Some(ProtectedScalarValue::Known(Scalar::Undefined));
+            }
+            let ProtectedScalarValue::Known(value) =
+                eval_protected_scalar_expression(&unary.argument, semantic, env)?
+            else {
+                return Some(ProtectedScalarValue::Unknown);
+            };
+            match unary.operator.as_str() {
+                "!" => Some(ProtectedScalarValue::Known(Scalar::Int(i64::from(
+                    !value.truthy(),
+                )))),
+                "+" => Some(ProtectedScalarValue::Known(Scalar::Int(value.int()?))),
+                "-" => Some(ProtectedScalarValue::Known(Scalar::Int(-value.int()?))),
+                _ => None,
+            }
+        }
+        Expression::BinaryExpression(binary) => {
+            let left = eval_protected_scalar_expression(&binary.left, semantic, env)?;
+            let right = eval_protected_scalar_expression(&binary.right, semantic, env)?;
+            let (ProtectedScalarValue::Known(left), ProtectedScalarValue::Known(right)) =
+                (left, right)
+            else {
+                return Some(ProtectedScalarValue::Unknown);
+            };
+            let value = match binary.operator.as_str() {
+                "==" | "===" => i64::from(match (left, right) {
+                    (Scalar::Undefined, Scalar::Undefined) => true,
+                    (Scalar::Int(left), Scalar::Int(right)) => left == right,
+                    _ => false,
+                }),
+                "!=" | "!==" => i64::from(match (left, right) {
+                    (Scalar::Undefined, Scalar::Undefined) => false,
+                    (Scalar::Int(left), Scalar::Int(right)) => left != right,
+                    _ => true,
+                }),
+                _ => return None,
+            };
+            Some(ProtectedScalarValue::Known(Scalar::Int(value)))
+        }
+        Expression::ConditionalExpression(conditional) => {
+            let ProtectedScalarValue::Known(test) =
+                eval_protected_scalar_expression(&conditional.test, semantic, env)?
+            else {
+                return None;
+            };
+            if test.truthy() {
+                eval_protected_scalar_expression(&conditional.consequent, semantic, env)
+            } else {
+                eval_protected_scalar_expression(&conditional.alternate, semantic, env)
+            }
+        }
+        Expression::LogicalExpression(logical) => {
+            let ProtectedScalarValue::Known(left) =
+                eval_protected_scalar_expression(&logical.left, semantic, env)?
+            else {
+                return None;
+            };
+            match logical.operator.as_str() {
+                "&&" if left.truthy() => {
+                    eval_protected_scalar_expression(&logical.right, semantic, env)
+                }
+                "||" if !left.truthy() => {
+                    eval_protected_scalar_expression(&logical.right, semantic, env)
+                }
+                "&&" | "||" => Some(ProtectedScalarValue::Known(left)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn exec_protected_scalar_statement(
+    statement: &Statement<'_>,
+    semantic: &Semantic<'_>,
+    env: &mut HashMap<SymbolId, Scalar>,
+) -> ProtectedExecStatus {
+    match statement {
+        Statement::BlockStatement(block) => {
+            exec_protected_scalar_statements(&block.body, semantic, env)
+        }
+        Statement::ExpressionStatement(statement) => {
+            if eval_protected_scalar_expression(&statement.expression, semantic, env).is_some() {
+                ProtectedExecStatus::Normal
+            } else {
+                ProtectedExecStatus::Unsupported
+            }
+        }
+        Statement::IfStatement(statement) => {
+            let Some(ProtectedScalarValue::Known(test)) =
+                eval_protected_scalar_expression(&statement.test, semantic, env)
+            else {
+                return ProtectedExecStatus::Unsupported;
+            };
+            if test.truthy() {
+                exec_protected_scalar_statement(&statement.consequent, semantic, env)
+            } else if let Some(alternate) = &statement.alternate {
+                exec_protected_scalar_statement(alternate, semantic, env)
+            } else {
+                ProtectedExecStatus::Normal
+            }
+        }
+        Statement::BreakStatement(statement) if statement.label.is_none() => {
+            ProtectedExecStatus::Break
+        }
+        Statement::ReturnStatement(statement) => {
+            if statement.argument.as_ref().is_some_and(|argument| {
+                eval_protected_scalar_expression(argument, semantic, env).is_none()
+            }) {
+                ProtectedExecStatus::Unsupported
+            } else {
+                ProtectedExecStatus::Return
+            }
+        }
+        Statement::ThrowStatement(statement) => {
+            if eval_protected_scalar_expression(&statement.argument, semantic, env).is_some() {
+                ProtectedExecStatus::Throw
+            } else {
+                ProtectedExecStatus::Unsupported
+            }
+        }
+        _ => ProtectedExecStatus::Unsupported,
+    }
+}
+
+fn exec_protected_scalar_statements(
+    statements: &[Statement<'_>],
+    semantic: &Semantic<'_>,
+    env: &mut HashMap<SymbolId, Scalar>,
+) -> ProtectedExecStatus {
+    for statement in statements {
+        let status = exec_protected_scalar_statement(statement, semantic, env);
+        if status != ProtectedExecStatus::Normal {
+            return status;
+        }
+    }
+    ProtectedExecStatus::Normal
+}
+
+fn static_protected_scalar(expression: &Expression<'_>) -> Option<Scalar> {
+    match expression {
+        Expression::NumericLiteral(number) => exact_i64(number.value).map(Scalar::Int),
+        Expression::BooleanLiteral(boolean) => Some(Scalar::Int(i64::from(boolean.value))),
+        Expression::Identifier(identifier) if identifier.name.as_str() == "undefined" => {
+            Some(Scalar::Undefined)
+        }
+        Expression::UnaryExpression(unary) if unary.operator.as_str() == "void" => {
+            Some(Scalar::Undefined)
+        }
+        Expression::ParenthesizedExpression(parenthesized) => {
+            static_protected_scalar(&parenthesized.expression)
+        }
+        _ => None,
+    }
+}
+
+fn finite_machine_scalar_domain(
+    semantic: &Semantic<'_>,
+    function_span: Span,
+    machine_span: Span,
+    body_span: Span,
+    symbol: SymbolId,
+) -> Option<Vec<Scalar>> {
+    if declaring_function_span(semantic, symbol)? != function_span
+        || !local_variable_binding(semantic.scoping(), symbol)
+    {
+        return None;
+    }
+    let mut seeded = false;
+    let mut values = Vec::new();
+    for reference_id in semantic.scoping().get_resolved_reference_ids(symbol) {
+        let reference = semantic.scoping().get_reference(*reference_id);
+        if !reference.is_write() {
+            continue;
+        }
+        if enclosing_function_span(semantic, reference.node_id())? != function_span {
+            return None;
+        }
+        let reference_span = semantic.nodes().get_node(reference.node_id()).kind().span();
+        if reference_span.start < machine_span.start || reference_span.end > machine_span.end {
+            continue;
+        }
+        let parent = semantic.nodes().parent_id(reference.node_id());
+        let AstKind::AssignmentExpression(assignment) = semantic.nodes().kind(parent) else {
+            return None;
+        };
+        if assignment.operator.as_str() != "=" {
+            return None;
+        }
+        let value = static_protected_scalar(&assignment.right)?;
+        if assignment.span.start < body_span.start {
+            seeded = true;
+        }
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    (seeded && !values.is_empty()).then_some(values)
+}
+
+fn exact_assignment_by_span<'a>(
+    semantic: &'a Semantic<'a>,
+    start: u32,
+    end: u32,
+) -> Option<&'a oxc_ast::ast::AssignmentExpression<'a>> {
+    semantic.nodes().iter().find_map(|node| match node.kind() {
+        AstKind::AssignmentExpression(assignment)
+            if assignment.span.start == start && assignment.span.end == end =>
+        {
+            Some(assignment)
+        }
+        _ => None,
+    })
+}
+
+fn machine_state_symbol(
+    semantic: &Semantic<'_>,
+    machine: &IfLadderStateMachineCandidate,
+) -> Option<SymbolId> {
+    let mut found = None;
+    for node in semantic.nodes().iter() {
+        let AstKind::IdentifierReference(identifier) = node.kind() else {
+            continue;
+        };
+        if identifier.span.start < machine.start
+            || identifier.span.end > machine.end
+            || identifier.name.as_str() != machine.state_var
+        {
+            continue;
+        }
+        let symbol = protected_identifier_symbol(semantic, identifier)?;
+        if found.is_some_and(|existing| existing != symbol) {
+            return None;
+        }
+        found = Some(symbol);
+    }
+    found
+}
+
+fn protected_unresolved_scalar_domains(
+    semantic: &Semantic<'_>,
+    function_span: Span,
+    machine: &IfLadderStateMachineCandidate,
+    body_span: Span,
+) -> Option<Vec<(SymbolId, Vec<Scalar>)>> {
+    let mut domains = Vec::new();
+    for transition in &machine.transitions {
+        if !transition.possible_target_states.is_empty() {
+            continue;
+        }
+        let assignment = exact_assignment_by_span(
+            semantic,
+            transition.assignment_start,
+            transition.assignment_end,
+        )?;
+        let Expression::Identifier(identifier) = &assignment.right else {
+            return None;
+        };
+        let symbol = protected_identifier_symbol(semantic, identifier)?;
+        if domains.iter().any(|(existing, _)| *existing == symbol) {
+            continue;
+        }
+        let values = finite_machine_scalar_domain(
+            semantic,
+            function_span,
+            Span::new(machine.start, machine.end),
+            body_span,
+            symbol,
+        )?;
+        domains.push((symbol, values));
+    }
+    Some(domains)
+}
+
+fn protected_domain_environments(
+    domains: &[(SymbolId, Vec<Scalar>)],
+) -> Option<Vec<HashMap<SymbolId, Scalar>>> {
+    let mut environments = vec![HashMap::new()];
+    for (symbol, values) in domains {
+        let mut next = Vec::new();
+        for environment in &environments {
+            for value in values {
+                let mut environment = environment.clone();
+                environment.insert(*symbol, *value);
+                next.push(environment);
+                if next.len() > 128 {
+                    return None;
+                }
+            }
+        }
+        environments = next;
+    }
+    Some(environments)
+}
+
+/// Prove that `event` cannot execute after entering `start_state` in a
+/// protected `for (;;)` flattened machine. The suffix must be exactly
+/// scalar-executable; unsupported operations fail closed. Unresolved state
+/// transitions are permitted only through function-local symbols whose writes
+/// inside the machine are all finite scalar constants and which are seeded in
+/// the loop initializer.
+fn prove_protected_machine_event_unreachable_after_state(
+    semantic: &Semantic<'_>,
+    function_span: Span,
+    machine: &IfLadderStateMachineCandidate,
+    body: &Statement<'_>,
+    start_state: u64,
+    event: Span,
+) -> bool {
+    let Statement::TryStatement(try_statement) = body else {
+        return false;
+    };
+    let (Some(handler), None) = (&try_statement.handler, &try_statement.finalizer) else {
+        return false;
+    };
+    let Some(event_state) = branch_state_for_span(body, &machine.state_var, event) else {
+        return false;
+    };
+    if event_state == start_state {
+        return false;
+    }
+    let Some(state_symbol) = machine_state_symbol(semantic, machine) else {
+        return false;
+    };
+    let Some(domains) = protected_unresolved_scalar_domains(
+        semantic,
+        function_span,
+        machine,
+        try_statement.block.span,
+    ) else {
+        return false;
+    };
+    let Some(mut environments) = protected_domain_environments(&domains) else {
+        return false;
+    };
+    if environments.is_empty() {
+        environments.push(HashMap::new());
+    }
+    let Ok(start_state) = i64::try_from(start_state) else {
+        return false;
+    };
+
+    for mut env in environments {
+        env.insert(state_symbol, Scalar::Int(start_state));
+        let mut terminated = false;
+        for _ in 0..256 {
+            let Some(Scalar::Int(state)) = env.get(&state_symbol).copied() else {
+                return false;
+            };
+            if u64::try_from(state).ok() == Some(event_state) {
+                return false;
+            }
+            match exec_protected_scalar_statements(&try_statement.block.body, semantic, &mut env) {
+                ProtectedExecStatus::Normal => {}
+                ProtectedExecStatus::Break | ProtectedExecStatus::Return => {
+                    terminated = true;
+                    break;
+                }
+                ProtectedExecStatus::Throw => {
+                    match exec_protected_scalar_statements(&handler.body.body, semantic, &mut env) {
+                        ProtectedExecStatus::Normal => {}
+                        ProtectedExecStatus::Break
+                        | ProtectedExecStatus::Return
+                        | ProtectedExecStatus::Throw => {
+                            terminated = true;
+                            break;
+                        }
+                        ProtectedExecStatus::Unsupported => return false,
+                    }
+                }
+                ProtectedExecStatus::Unsupported => return false,
+            }
+        }
+        if !terminated {
+            return false;
+        }
+    }
+    true
+}
+
+/// Prove that an event inside one exact protected unconditional flattened
+/// machine cannot execute after entering `start_state`.
+///
+/// The unique machine containing `event` must use a `try` body with one catch
+/// handler and no finalizer. Unsupported scalar effects and non-finite
+/// unresolved state transitions fail closed.
+#[must_use]
+pub fn prove_function_protected_if_ladder_event_unreachable_after_state(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    function_start: u32,
+    function_end: u32,
+    start_state: u64,
+    event: Span,
+) -> bool {
+    struct Harness<'s, 'm> {
+        source: &'s str,
+        semantic: &'m Semantic<'m>,
+        function_span: Span,
+        start_state: u64,
+        event: Span,
+        result: Option<bool>,
+    }
+
+    impl Harness<'_, '_> {
+        fn inspect_body(&self, body: &FunctionBody<'_>) -> bool {
+            struct Collector<'s, 'm> {
+                source: &'s str,
+                semantic: &'m Semantic<'m>,
+                function_span: Span,
+                start_state: u64,
+                event: Span,
+                matches: usize,
+                proven: bool,
+            }
+            impl<'a> Visit<'a> for Collector<'_, '_> {
+                fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+                    for machine in
+                        detect_for_state_machines(self.source, "protected-after-state", statement)
+                            .if_ladder_machines
+                    {
+                        if machine.start <= self.event.start && self.event.end <= machine.end {
+                            self.matches += 1;
+                            self.proven = prove_protected_machine_event_unreachable_after_state(
+                                self.semantic,
+                                self.function_span,
+                                &machine,
+                                &statement.body,
+                                self.start_state,
+                                self.event,
+                            );
+                        }
+                    }
+                    walk::walk_for_statement(self, statement);
+                }
+                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                }
+            }
+            let mut collector = Collector {
+                source: self.source,
+                semantic: self.semantic,
+                function_span: self.function_span,
+                start_state: self.start_state,
+                event: self.event,
+                matches: 0,
+                proven: false,
+            };
+            collector.visit_function_body(body);
+            collector.matches == 1 && collector.proven
+        }
+    }
+
+    impl<'a> Visit<'a> for Harness<'_, '_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if self.result.is_some() {
+                return;
+            }
+            if function.span == self.function_span {
+                self.result = Some(
+                    function
+                        .body
+                        .as_deref()
+                        .is_some_and(|body| self.inspect_body(body)),
+                );
+                return;
+            }
+            walk::walk_function(self, function, flags);
+        }
+    }
+
+    let mut harness = Harness {
+        source,
+        semantic,
+        function_span: Span::new(function_start, function_end),
+        start_state,
+        event,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(false)
+}
+
+fn prove_identifier_equalities_in_machine(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    function_span: Span,
+    machine: &IfLadderStateMachineCandidate,
+    body: &Statement<'_>,
+    event: Span,
+) -> Vec<ProvenIfLadderIdentifierEquality> {
+    let mut collector = DirectStateCopyCollector {
+        state_var: &machine.state_var,
+        scoping: semantic.scoping(),
+        copies: Vec::new(),
+    };
+    collector.visit_statement(body);
+
+    let direct_copies = collector.copies.clone();
+    let mut proven = Vec::new();
+    for copy in collector.copies {
+        if !prove_machine_states_before_event(machine, body, &[copy.state], event) {
+            continue;
+        }
+        let Some(declaring_span) = declaring_function_span(semantic, copy.left_symbol) else {
+            continue;
+        };
+        if function_subtree_has_dynamic_scope(program, declaring_span) {
+            continue;
+        }
+        let Some(barriers) = symbol_write_barriers(
+            semantic,
+            function_span,
+            Span::new(machine.start, machine.end),
+            copy.target,
+            copy.left_symbol,
+            copy.right_symbol,
+        ) else {
+            continue;
+        };
+        let barriers_are_after_event = if matches!(body, Statement::TryStatement(_)) {
+            barriers.iter().all(|barrier| {
+                direct_copies
+                    .iter()
+                    .find(|candidate| candidate.target == *barrier)
+                    .is_some_and(|barrier_copy| {
+                        prove_protected_machine_event_unreachable_after_state(
+                            semantic,
+                            function_span,
+                            machine,
+                            body,
+                            barrier_copy.state,
+                            event,
+                        )
+                    })
+            })
+        } else {
+            prove_machine_event_before_barriers(machine, body, event, &barriers)
+        };
+        if !barriers_are_after_event {
+            continue;
+        }
+        proven.push(ProvenIfLadderIdentifierEquality {
+            function_start: function_span.start,
+            function_end: function_span.end,
+            event_start: event.start,
+            event_end: event.end,
+            state: copy.state,
+            assignment_start: copy.assignment.start,
+            assignment_end: copy.assignment.end,
+            left_symbol: copy.left_symbol,
+            right_symbol: copy.right_symbol,
+        });
+    }
+    proven.sort_by_key(|proof| (proof.assignment_start, proof.assignment_end));
+    proven.dedup();
+    proven
+}
+
+/// Prove lexical identifier equalities that are established by a dominating
+/// flattened-machine state and remain unchanged until `event`.
+///
+/// Only direct non-throwing identifier-copy prefixes are accepted. Resolved
+/// writes in sibling/nested closures and dynamic scope (`eval`/`with`) fail
+/// closed. Direct writes in the declaring factory are allowed because the
+/// returned inner function cannot execute until that factory invocation has
+/// completed.
+#[must_use]
+pub fn structurally_proven_if_ladder_identifier_equalities_at_event(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    function_start: u32,
+    function_end: u32,
+    event: Span,
+) -> Vec<ProvenIfLadderIdentifierEquality> {
+    struct FunctionHarness<'s, 'p, 'm> {
+        source: &'s str,
+        program: &'p Program<'p>,
+        semantic: &'m Semantic<'m>,
+        function_span: Span,
+        event: Span,
+        result: Option<Vec<ProvenIfLadderIdentifierEquality>>,
+    }
+
+    impl FunctionHarness<'_, '_, '_> {
+        fn analyze_body(&self, body: &FunctionBody<'_>) -> Vec<ProvenIfLadderIdentifierEquality> {
+            struct MachineCollector<'s, 'p, 'm> {
+                source: &'s str,
+                program: &'p Program<'p>,
+                semantic: &'m Semantic<'m>,
+                function_span: Span,
+                event: Span,
+                matches: usize,
+                proven: Vec<ProvenIfLadderIdentifierEquality>,
+            }
+            impl<'a> Visit<'a> for MachineCollector<'_, '_, '_> {
+                fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+                    for machine in
+                        detect_for_state_machines(self.source, "identifier-equality", statement)
+                            .if_ladder_machines
+                    {
+                        if machine.start <= self.event.start && self.event.end <= machine.end {
+                            self.matches += 1;
+                            self.proven.extend(prove_identifier_equalities_in_machine(
+                                self.program,
+                                self.semantic,
+                                self.function_span,
+                                &machine,
+                                &statement.body,
+                                self.event,
+                            ));
+                        }
+                    }
+                    walk::walk_for_statement(self, statement);
+                }
+                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                }
+            }
+
+            let mut collector = MachineCollector {
+                source: self.source,
+                program: self.program,
+                semantic: self.semantic,
+                function_span: self.function_span,
+                event: self.event,
+                matches: 0,
+                proven: Vec::new(),
+            };
+            collector.visit_function_body(body);
+            if collector.matches == 1 {
+                collector.proven
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    impl<'a> Visit<'a> for FunctionHarness<'_, '_, '_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if self.result.is_some() {
+                return;
+            }
+            if function.span == self.function_span {
+                self.result = Some(
+                    function
+                        .body
+                        .as_deref()
+                        .map_or_else(Vec::new, |body| self.analyze_body(body)),
+                );
+                return;
+            }
+            walk::walk_function(self, function, flags);
+        }
+    }
+
+    let mut harness = FunctionHarness {
+        source,
+        program,
+        semantic,
+        function_span: Span::new(function_start, function_end),
+        event,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or_default()
+}
+
 /// Prove required flattened-machine states dominate an event in one already
 /// detected machine.
 #[must_use]
@@ -3890,6 +4928,166 @@ mod tests {
         assert!(machine.transitions.iter().any(|transition| {
             transition.from_state == 17 && transition.target_state == Some(4)
         }));
+    }
+
+    #[test]
+    fn proves_identifier_equality_live_at_event() {
+        let source = r#"
+            function flattened(left, right, flag) {
+                let state;
+                for (state = 0; state !== 99;) {
+                    if (state === 0) { left = right, state = 1; }
+                    else if (state === 1) { target(), state = 2; }
+                    else if (state === 2) { left = other, state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        let target_start = source.find("target()").unwrap() as u32;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .build(&parsed.program);
+        let proven = structurally_proven_if_ladder_identifier_equalities_at_event(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            source.find("function flattened").unwrap() as u32,
+            source.rfind('}').unwrap() as u32 + 1,
+            Span::new(target_start, target_start + 8),
+        );
+        assert!(proven.iter().any(|proof| proof.state == 0));
+    }
+
+    #[test]
+    fn proves_identifier_equality_inside_nested_alternate_dispatch_chunk() {
+        let source = r#"
+            function flattened(left, right, other) {
+                let state;
+                for (state = 0; state !== 99;) {
+                    if (state === 0) state = 1;
+                    else {
+                        if (state === 1) { left = right, state = 2; }
+                        else if (state === 2) { target(), state = 3; }
+                        else if (state === 3) { left = other, state = 99; }
+                        else if (state === 4) { state = 99; }
+                    }
+                }
+            }
+        "#;
+        let target_start = source.find("target()").unwrap() as u32;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .build(&parsed.program);
+        let proven = structurally_proven_if_ladder_identifier_equalities_at_event(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            source.find("function flattened").unwrap() as u32,
+            source.rfind('}').unwrap() as u32 + 1,
+            Span::new(target_start, target_start + 8),
+        );
+        assert!(proven.iter().any(|proof| proof.state == 1));
+    }
+
+    #[test]
+    fn rejects_identifier_equality_invalidated_before_event() {
+        let source = r#"
+            function flattened(left, right, flag) {
+                let state;
+                for (state = 0; state !== 99;) {
+                    if (state === 0) { left = right, state = 1; }
+                    else if (state === 1) { left = other, state = 2; }
+                    else if (state === 2) { target(), state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        let target_start = source.find("target()").unwrap() as u32;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .build(&parsed.program);
+        let proven = structurally_proven_if_ladder_identifier_equalities_at_event(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            source.find("function flattened").unwrap() as u32,
+            source.rfind('}').unwrap() as u32 + 1,
+            Span::new(target_start, target_start + 8),
+        );
+        assert!(!proven.iter().any(|proof| proof.state == 0));
+    }
+
+    #[test]
+    fn proves_protected_identifier_equality_when_barrier_suffix_cannot_return_to_event() {
+        let source = r#"
+            function flattened(left, right, other) {
+                let outer, state, phase;
+                for (outer = (state = 0, phase = undefined, 0);;) try {
+                    if (state === 99) break;
+                    else if (state === 0) left = right, state = 1;
+                    else if (state === 1) target(), state = 2;
+                    else if (state === 2) left = other, phase = 4, state = 3;
+                    else if (state === 3) state = phase;
+                    else if (state === 4) return 0;
+                } catch (error) {
+                    throw error;
+                }
+            }
+        "#;
+        let target_start = source.find("target()").unwrap() as u32;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .build(&parsed.program);
+        let proven = structurally_proven_if_ladder_identifier_equalities_at_event(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            source.find("function flattened").unwrap() as u32,
+            source.rfind('}').unwrap() as u32 + 1,
+            Span::new(target_start, target_start + 8),
+        );
+        assert!(proven.iter().any(|proof| proof.state == 0));
+    }
+
+    #[test]
+    fn rejects_protected_identifier_equality_when_barrier_suffix_returns_to_event() {
+        let source = r#"
+            function flattened(left, right, other) {
+                let state;
+                for (state = 0;;) try {
+                    if (state === 99) break;
+                    else if (state === 0) left = right, state = 1;
+                    else if (state === 1) target(), state = 2;
+                    else if (state === 2) left = other, state = 1;
+                    else if (state === 3) state = 99;
+                } catch (error) {
+                    throw error;
+                }
+            }
+        "#;
+        let target_start = source.find("target()").unwrap() as u32;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .build(&parsed.program);
+        let proven = structurally_proven_if_ladder_identifier_equalities_at_event(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            source.find("function flattened").unwrap() as u32,
+            source.rfind('}').unwrap() as u32 + 1,
+            Span::new(target_start, target_start + 8),
+        );
+        assert!(!proven.iter().any(|proof| proof.state == 0));
     }
 
     #[test]
