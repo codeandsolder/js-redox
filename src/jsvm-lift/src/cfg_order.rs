@@ -178,11 +178,10 @@ fn prove_required_before_event(
             if !usable_edge(edge.weight()) {
                 continue;
             }
-            if matches!(edge.weight(), EdgeType::Backedge)
-                && event_reachable_from(semantic, edge.target(), event_block)
-            {
-                return false;
-            }
+            // Cycles are safe here: the visited state includes whether the
+            // required event has already been crossed. A path that reaches the
+            // target before the requirement remains distinguishable from later
+            // loop iterations and therefore fails the proof naturally.
             queue.push_back((edge.target(), crossed_required));
         }
     }
@@ -270,6 +269,28 @@ mod tests {
         let init = call_span(&semantic, source, "init()");
         let target = call_span(&semantic, source, "target()");
         assert!(prove_events_before_event(&semantic, &[init], target));
+    }
+
+    #[test]
+    fn proves_required_event_before_target_inside_loop() {
+        let source = "function f(flag) { while (flag) { init(); target(); } }";
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = semantic(&parsed.program);
+        let init = call_span(&semantic, source, "init()");
+        let target = call_span(&semantic, source, "target()");
+        assert!(prove_events_before_event(&semantic, &[init], target));
+    }
+
+    #[test]
+    fn rejects_target_before_required_event_inside_loop() {
+        let source = "function f(flag) { while (flag) { target(); init(); } }";
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = semantic(&parsed.program);
+        let init = call_span(&semantic, source, "init()");
+        let target = call_span(&semantic, source, "target()");
+        assert!(!prove_events_before_event(&semantic, &[init], target));
     }
 
     #[test]
