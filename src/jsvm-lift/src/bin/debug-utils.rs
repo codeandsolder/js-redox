@@ -195,7 +195,7 @@ fn compare_opcode_maps(rust_json: &Path, decoder_id: &str, js_routes: &Path) -> 
     };
     let best = maps
         .iter()
-        .max_by_key(|map| score(*map))
+        .max_by_key(|map| score(map))
         .context("failed to choose Rust opcode map")?;
     let handlers = best
         .get("handlers")
