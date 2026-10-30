@@ -1,7 +1,11 @@
 use crate::{
-    cfg_order::{prove_event_completion_before_event, prove_event_completion_before_nested_event},
+    cfg_order::{
+        prove_event_before_barriers, prove_event_completion_before_event,
+        prove_event_completion_before_nested_event,
+    },
     numeric::exact_i64,
     state_flatten::{
+        prove_function_if_ladder_event_before_barriers,
         prove_function_if_ladder_event_unreachable_with_integer_parameters,
         prove_function_protected_if_ladder_event_unreachable_with_call_arguments,
         prove_function_structured_branch_event_unreachable_with_integer_parameters,
@@ -1684,6 +1688,434 @@ pub fn structurally_proven_own_data_fields_at_member_calls(
     proven
 }
 
+fn collect_unique_direct_call_path(
+    flow: &ProvenOriginFlow,
+    root: &ProvenOriginContext,
+    target: &ProvenOriginContext,
+) -> Option<Vec<ProvenOriginDirectCall>> {
+    fn visit(
+        flow: &ProvenOriginFlow,
+        current: &ProvenOriginContext,
+        target: &ProvenOriginContext,
+        visiting: &mut HashSet<ProvenOriginContext>,
+        path: &mut Vec<ProvenOriginDirectCall>,
+        matches: &mut Vec<Vec<ProvenOriginDirectCall>>,
+    ) {
+        if matches.len() > 1 {
+            return;
+        }
+        if current == target {
+            matches.push(path.clone());
+            return;
+        }
+        if !visiting.insert(current.clone()) {
+            return;
+        }
+        for call in flow
+            .direct_calls
+            .iter()
+            .filter(|call| call.caller == *current)
+        {
+            path.push(call.clone());
+            visit(flow, &call.callee, target, visiting, path, matches);
+            path.pop();
+            if matches.len() > 1 {
+                break;
+            }
+        }
+        visiting.remove(current);
+    }
+
+    let mut matches = Vec::new();
+    visit(
+        flow,
+        root,
+        target,
+        &mut HashSet::new(),
+        &mut Vec::new(),
+        &mut matches,
+    );
+    let [path] = matches.as_slice() else {
+        return None;
+    };
+    Some(path.clone())
+}
+
+fn context_field_prefix_before_event(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    flow: &ProvenOriginFlow,
+    stable_prototypes: &HashSet<(u32, u32)>,
+    runtime_calls: &[ProvenPrototypeMethodCallTarget],
+    context: &ProvenOriginContext,
+    entry: &ProvenOriginDirectCall,
+    event: Span,
+    event_direct_call: Option<&ProvenOriginDirectCall>,
+    event_member_call: Option<&ProvenMemberReceiverOrigin>,
+    property: &str,
+    discharged_preserving_method_calls: &mut Vec<ProvenMemberReceiverOrigin>,
+    standard_function_call_semantics_required: &mut bool,
+) -> bool {
+    if proven_origin_direct_call_event_unreachable(
+        source,
+        program,
+        semantic.scoping(),
+        entry,
+        event,
+    ) {
+        return false;
+    }
+    let unreachable = |start, end| {
+        proven_origin_direct_call_event_unreachable(
+            source,
+            program,
+            semantic.scoping(),
+            entry,
+            Span::new(start, end),
+        )
+    };
+    let mut barriers = Vec::new();
+
+    for exposure in flow
+        .exposures
+        .iter()
+        .filter(|candidate| candidate.context == *context)
+    {
+        if !unreachable(exposure.exposure_start, exposure.exposure_end) {
+            barriers.push(Span::new(exposure.exposure_start, exposure.exposure_end));
+        }
+    }
+    for read in flow
+        .member_reads
+        .iter()
+        .filter(|candidate| candidate.context == *context)
+    {
+        if !unreachable(read.read_start, read.read_end)
+            && !static_member_read_is_getter_free(read, stable_prototypes)
+        {
+            barriers.push(Span::new(read.read_start, read.read_end));
+        }
+    }
+    for write in flow
+        .member_writes
+        .iter()
+        .filter(|candidate| candidate.context == *context)
+    {
+        if !unreachable(write.write_start, write.write_end)
+            && !member_write_preserves_field(write, property, stable_prototypes)
+        {
+            barriers.push(Span::new(write.write_start, write.write_end));
+        }
+    }
+
+    for member_call in flow
+        .member_calls
+        .iter()
+        .filter(|candidate| candidate.context == *context)
+    {
+        if event_member_call.is_some_and(|target| target == member_call)
+            || unreachable(member_call.call_start, member_call.call_end)
+        {
+            continue;
+        }
+        let mut targets = runtime_calls
+            .iter()
+            .filter(|target| target.candidate.call == *member_call);
+        let Some(target) = targets.next() else {
+            barriers.push(Span::new(member_call.call_start, member_call.call_end));
+            continue;
+        };
+        if targets.next().is_some() {
+            barriers.push(Span::new(member_call.call_start, member_call.call_end));
+            continue;
+        }
+        let Some(summary) = proven_prototype_method_receiver_preservation_summary(
+            source, program, semantic, target,
+        ) else {
+            barriers.push(Span::new(member_call.call_start, member_call.call_end));
+            continue;
+        };
+        if summary
+            .required_own_data_fields
+            .iter()
+            .all(|required| required == property)
+        {
+            *standard_function_call_semantics_required |=
+                summary.standard_function_call_semantics_required;
+            discharged_preserving_method_calls.push(member_call.clone());
+        } else {
+            barriers.push(Span::new(member_call.call_start, member_call.call_end));
+        }
+    }
+
+    for direct in flow
+        .direct_calls
+        .iter()
+        .filter(|candidate| candidate.caller == *context)
+    {
+        if event_direct_call.is_some_and(|target| target == direct)
+            || unreachable(direct.call_start, direct.call_end)
+        {
+            continue;
+        }
+        if !direct_call_preserves_field(
+            source,
+            program,
+            semantic.scoping(),
+            flow,
+            direct,
+            property,
+            stable_prototypes,
+            &mut HashMap::new(),
+            &mut HashSet::new(),
+        ) {
+            barriers.push(Span::new(direct.call_start, direct.call_end));
+        } else {
+            *standard_function_call_semantics_required |=
+                direct.standard_function_call_semantics_required;
+        }
+    }
+
+    barriers.sort_by_key(|barrier| (barrier.start, barrier.end));
+    barriers.dedup();
+    if barriers.is_empty() {
+        return true;
+    }
+    prove_event_before_barriers(semantic, event, &barriers)
+        || prove_function_if_ladder_event_before_barriers(
+            source,
+            program,
+            context.function_start,
+            context.function_end,
+            event,
+            &barriers,
+        )
+}
+
+fn prove_own_data_field_at_runtime_method_call_with_facts(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    flow: &ProvenOriginFlow,
+    stable_prototypes: &HashSet<(u32, u32)>,
+    runtime_calls: &[ProvenPrototypeMethodCallTarget],
+    initialization: &ProvenOwnDataFieldInitialization,
+    target: &ProvenPrototypeMethodCallTarget,
+) -> Option<ProvenOwnDataFieldAtRuntimeMethodCall> {
+    let scoping = semantic.scoping();
+    let call = &target.candidate.call;
+    if initialization.allocation_start != call.allocation_start
+        || initialization.allocation_end != call.allocation_end
+        || initialization.constructor_start != call.constructor_start
+        || initialization.constructor_end != call.constructor_end
+    {
+        return None;
+    }
+    let path = collect_unique_direct_call_path(flow, &initialization.context, &call.context)?;
+    let mut discharged_preserving_method_calls = Vec::new();
+    let mut standard_function_call_semantics_required = false;
+
+    if path.is_empty() {
+        if !prove_event_completion_before_event(
+            semantic,
+            Span::new(initialization.write_start, initialization.write_end),
+            Span::new(call.call_start, call.call_end),
+        ) || !root_context_segment_preserves_field(
+            source,
+            program,
+            scoping,
+            flow,
+            &initialization.context,
+            initialization.evaluation_order,
+            call.evaluation_order,
+            &initialization.property,
+            stable_prototypes,
+            &mut HashMap::new(),
+            &mut HashSet::new(),
+        ) {
+            return None;
+        }
+    } else {
+        let first = &path[0];
+        if first.caller != initialization.context
+            || initialization.evaluation_order >= first.evaluation_order
+            || !prove_event_completion_before_event(
+                semantic,
+                Span::new(initialization.write_start, initialization.write_end),
+                Span::new(first.call_start, first.call_end),
+            )
+            || !root_context_segment_preserves_field(
+                source,
+                program,
+                scoping,
+                flow,
+                &initialization.context,
+                initialization.evaluation_order,
+                first.evaluation_order,
+                &initialization.property,
+                stable_prototypes,
+                &mut HashMap::new(),
+                &mut HashSet::new(),
+            )
+        {
+            return None;
+        }
+        standard_function_call_semantics_required |=
+            first.standard_function_call_semantics_required;
+
+        for (index, entry) in path.iter().enumerate() {
+            let context = &entry.callee;
+            let (event, event_direct_call, event_member_call) =
+                if let Some(next) = path.get(index + 1) {
+                    if next.caller != *context {
+                        return None;
+                    }
+                    (Span::new(next.call_start, next.call_end), Some(next), None)
+                } else {
+                    if call.context != *context {
+                        return None;
+                    }
+                    (Span::new(call.call_start, call.call_end), None, Some(call))
+                };
+            if !context_field_prefix_before_event(
+                source,
+                program,
+                semantic,
+                flow,
+                stable_prototypes,
+                runtime_calls,
+                context,
+                entry,
+                event,
+                event_direct_call,
+                event_member_call,
+                &initialization.property,
+                &mut discharged_preserving_method_calls,
+                &mut standard_function_call_semantics_required,
+            ) {
+                return None;
+            }
+            if let Some(next) = path.get(index + 1) {
+                standard_function_call_semantics_required |=
+                    next.standard_function_call_semantics_required;
+            }
+        }
+    }
+
+    discharged_preserving_method_calls
+        .sort_by_key(|call| (call.call_start, call.call_end, call.property.clone()));
+    discharged_preserving_method_calls.dedup();
+    Some(ProvenOwnDataFieldAtRuntimeMethodCall {
+        initialization: initialization.clone(),
+        call_target: target.clone(),
+        direct_call_path: path,
+        discharged_preserving_method_calls,
+        standard_function_call_semantics_required,
+    })
+}
+
+/// Prove one named ordinary own-data field live at one already runtime-proven
+/// prototype method call.
+///
+/// This focused form requires exactly one matching initialization fact for the
+/// concrete allocation and constructor. Ambiguous initialization histories fail
+/// closed rather than selecting by source order.
+#[must_use]
+pub fn proven_own_data_field_at_runtime_method_call(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    target: &ProvenPrototypeMethodCallTarget,
+    property: &str,
+) -> Option<ProvenOwnDataFieldAtRuntimeMethodCall> {
+    let scoping = semantic.scoping();
+    let flow = structurally_proven_origin_flow(program, scoping);
+    let mut initializations = structurally_proven_own_data_field_initializations(program, scoping)
+        .into_iter()
+        .filter(|initialization| {
+            let call = &target.candidate.call;
+            initialization.property == property
+                && initialization.allocation_start == call.allocation_start
+                && initialization.allocation_end == call.allocation_end
+                && initialization.constructor_start == call.constructor_start
+                && initialization.constructor_end == call.constructor_end
+        });
+    let initialization = initializations.next()?;
+    if initializations.next().is_some() {
+        return None;
+    }
+    let runtime_calls = structurally_proven_prototype_method_calls_at_runtime(program, semantic);
+    if !runtime_calls.iter().any(|candidate| candidate == target) {
+        return None;
+    }
+    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
+        .into_iter()
+        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+        .collect::<HashSet<_>>();
+    prove_own_data_field_at_runtime_method_call_with_facts(
+        source,
+        program,
+        semantic,
+        &flow,
+        &stable_prototypes,
+        &runtime_calls,
+        &initialization,
+        target,
+    )
+}
+
+/// Prove ordinary own-data field liveness at runtime-proven prototype method
+/// calls reachable through a unique exact-origin direct-call path.
+///
+/// Each call-path prefix is checked against all field-invalidating effects in
+/// that exact origin context. Already-proven receiver-preserving prototype calls
+/// may be crossed when all their own-data requirements are the field currently
+/// being tracked. Ambiguous call paths, dynamic property effects and unresolved
+/// barriers fail closed.
+#[must_use]
+pub fn structurally_proven_own_data_fields_at_runtime_method_calls(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+) -> Vec<ProvenOwnDataFieldAtRuntimeMethodCall> {
+    let scoping = semantic.scoping();
+    let flow = structurally_proven_origin_flow(program, scoping);
+    let initializations = structurally_proven_own_data_field_initializations(program, scoping);
+    let runtime_calls = structurally_proven_prototype_method_calls_at_runtime(program, semantic);
+    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
+        .into_iter()
+        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+        .collect::<HashSet<_>>();
+    let mut proven = Vec::new();
+
+    for initialization in &initializations {
+        for target in &runtime_calls {
+            if let Some(proof) = prove_own_data_field_at_runtime_method_call_with_facts(
+                source,
+                program,
+                semantic,
+                &flow,
+                &stable_prototypes,
+                &runtime_calls,
+                initialization,
+                target,
+            ) {
+                proven.push(proof);
+            }
+        }
+    }
+    proven.sort_by_key(|proof| {
+        (
+            proof.initialization.allocation_start,
+            proof.initialization.property.clone(),
+            proof.call_target.candidate.call.call_start,
+        )
+    });
+    proven.dedup();
+    proven
+}
+
 #[must_use]
 pub fn structurally_proven_member_receiver_origins(
     program: &Program<'_>,
@@ -1799,6 +2231,15 @@ pub struct ProvenOwnDataFieldAtMemberCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenOwnDataFieldAtRuntimeMethodCall {
+    pub initialization: ProvenOwnDataFieldInitialization,
+    pub call_target: ProvenPrototypeMethodCallTarget,
+    pub direct_call_path: Vec<ProvenOriginDirectCall>,
+    pub discharged_preserving_method_calls: Vec<ProvenMemberReceiverOrigin>,
+    pub standard_function_call_semantics_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenFunctionValue {
     pub function_start: u32,
     pub function_end: u32,
@@ -1870,7 +2311,7 @@ pub struct ProvenPrototypeMethodReceiverPreservationSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenReceiverPreservingPrototypeMethodCall {
     pub candidate: PrototypeMethodCallCandidate,
-    pub own_data_reads: Vec<ProvenOwnDataFieldAtMemberCall>,
+    pub own_data_reads: Vec<ProvenOwnDataFieldAtRuntimeMethodCall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3587,36 +4028,87 @@ pub fn structurally_proven_prototype_method_receiver_preservation_summaries(
 /// Static receiver reads must be discharged as ordinary own-data fields at the
 /// exact call site; mutation, receiver exposure, dynamic access, or recursive
 /// receiver-method calls remain barriers.
+/// Prove one runtime-targeted prototype method call fully receiver-preserving,
+/// including liveness of every ordinary own-data field required by its
+/// transitive preservation summary.
+#[must_use]
+pub fn proven_receiver_preserving_prototype_method_call(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    target: &ProvenPrototypeMethodCallTarget,
+) -> Option<ProvenReceiverPreservingPrototypeMethodCall> {
+    let summary =
+        proven_prototype_method_receiver_preservation_summary(source, program, semantic, target)?;
+    let mut reads = Vec::new();
+    for property in &summary.required_own_data_fields {
+        reads.push(proven_own_data_field_at_runtime_method_call(
+            source, program, semantic, target, property,
+        )?);
+    }
+    Some(ProvenReceiverPreservingPrototypeMethodCall {
+        candidate: target.candidate.clone(),
+        own_data_reads: reads,
+    })
+}
+
 #[must_use]
 pub fn structurally_proven_receiver_preserving_prototype_method_calls(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
 ) -> Vec<ProvenReceiverPreservingPrototypeMethodCall> {
-    let fields = structurally_proven_own_data_fields_at_member_calls(source, program, semantic);
+    let scoping = semantic.scoping();
+    let flow = structurally_proven_origin_flow(program, scoping);
+    let initializations = structurally_proven_own_data_field_initializations(program, scoping);
+    let runtime_calls = structurally_proven_prototype_method_calls_at_runtime(program, semantic);
+    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
+        .into_iter()
+        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+        .collect::<HashSet<_>>();
     let mut proven = Vec::new();
+
     for summary in structurally_proven_prototype_method_receiver_preservation_summaries(
         source, program, semantic,
     ) {
-        let candidate = summary.call_target.candidate;
+        let target = summary.call_target;
+        let call = &target.candidate.call;
         let mut reads = Vec::new();
         let mut all_reads_proven = true;
         for property in &summary.required_own_data_fields {
-            let Some(field) = fields.iter().find(|field| {
-                field.initialization.allocation_start == candidate.call.allocation_start
-                    && field.initialization.allocation_end == candidate.call.allocation_end
-                    && field.member_call.call_start == candidate.call.call_start
-                    && field.member_call.call_end == candidate.call.call_end
-                    && field.initialization.property == *property
-            }) else {
+            let mut matching = initializations.iter().filter(|initialization| {
+                initialization.property == *property
+                    && initialization.allocation_start == call.allocation_start
+                    && initialization.allocation_end == call.allocation_end
+                    && initialization.constructor_start == call.constructor_start
+                    && initialization.constructor_end == call.constructor_end
+            });
+            let Some(initialization) = matching.next() else {
                 all_reads_proven = false;
                 break;
             };
-            reads.push(field.clone());
+            if matching.next().is_some() {
+                all_reads_proven = false;
+                break;
+            }
+            let Some(field) = prove_own_data_field_at_runtime_method_call_with_facts(
+                source,
+                program,
+                semantic,
+                &flow,
+                &stable_prototypes,
+                &runtime_calls,
+                initialization,
+                &target,
+            ) else {
+                all_reads_proven = false;
+                break;
+            };
+            reads.push(field);
         }
         if all_reads_proven {
             proven.push(ProvenReceiverPreservingPrototypeMethodCall {
-                candidate,
+                candidate: target.candidate,
                 own_data_reads: reads,
             });
         }
@@ -3638,7 +4130,9 @@ mod tests {
         propagate_proven_origin_contexts, structurally_matched_prototype_method_calls,
         structurally_proven_member_receiver_origins, structurally_proven_member_write_origins,
         structurally_proven_origin_direct_calls, structurally_proven_origin_exposures,
-        structurally_proven_origin_flow, structurally_proven_prototype_method_assignments,
+        structurally_proven_origin_flow,
+        structurally_proven_own_data_fields_at_runtime_method_calls,
+        structurally_proven_prototype_method_assignments,
         structurally_proven_prototype_method_calls_at_runtime,
         structurally_proven_prototype_method_calls_at_runtime_in_flow,
         structurally_proven_prototype_method_lookup_targets,
@@ -3879,6 +4373,117 @@ mod tests {
     }
 
     #[test]
+    fn proves_own_field_across_unique_direct_path_and_preserving_method() {
+        let source = r#"
+            (function() {
+                const C = function() {
+                    this.value = 1;
+                    first(this);
+                };
+                function first(state) {
+                    state.read();
+                    second(state);
+                }
+                function second(state) { state.target(); }
+                C.prototype.read = function() { return this.value; };
+                C.prototype.target = function() { return this.value; };
+                api.make = function() { return new C(); };
+            })();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        let proofs = structurally_proven_own_data_fields_at_runtime_method_calls(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+        );
+        let proof = proofs
+            .iter()
+            .find(|proof| {
+                proof.initialization.property == "value"
+                    && proof.call_target.candidate.call.property == "target"
+            })
+            .expect("value live at target call");
+        assert_eq!(proof.direct_call_path.len(), 2);
+        assert!(proof
+            .discharged_preserving_method_calls
+            .iter()
+            .any(|call| call.property == "read"));
+    }
+
+    #[test]
+    fn own_field_runtime_call_rejects_ambiguous_direct_path() {
+        let source = r#"
+            (function() {
+                const C = function(flag) {
+                    this.value = 1;
+                    if (flag) first(this); else alternate(this);
+                };
+                function first(state) { second(state); }
+                function alternate(state) { second(state); }
+                function second(state) { state.target(); }
+                C.prototype.target = function() { return this.value; };
+                api.make = function(flag) { return new C(flag); };
+            })();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(structurally_proven_own_data_fields_at_runtime_method_calls(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+        )
+        .iter()
+        .all(|proof| {
+            proof.initialization.property != "value"
+                || proof.call_target.candidate.call.property != "target"
+        }));
+    }
+
+    #[test]
+    fn own_field_runtime_call_rejects_unresolved_receiver_barrier() {
+        let source = r#"
+            (function() {
+                const C = function() {
+                    this.value = 1;
+                    first(this);
+                };
+                function first(state) {
+                    state.unknown();
+                    second(state);
+                }
+                function second(state) { state.target(); }
+                C.prototype.target = function() { return this.value; };
+                api.make = function() { return new C(); };
+            })();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(structurally_proven_own_data_fields_at_runtime_method_calls(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+        )
+        .iter()
+        .all(|proof| {
+            proof.initialization.property != "value"
+                || proof.call_target.candidate.call.property != "target"
+        }));
+    }
+
+    #[test]
     fn summarizes_transitive_receiver_preservation_requirements() {
         let source = r#"
             (function() {
@@ -3910,7 +4515,6 @@ mod tests {
             &parsed.program,
             &semantic.semantic,
         );
-        eprintln!("summaries={:?}", summaries);
         let outer = summaries
             .iter()
             .find(|summary| summary.call_target.candidate.call.property == "outer")
