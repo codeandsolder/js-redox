@@ -2,7 +2,7 @@ use super::materialize::Reference;
 use crate::{
     browser_script_types::{
         inline_script_extension as shared_inline_script_extension, is_executable_script,
-        is_json_script, normalize_script_type,
+        is_json_script, script_type_essence,
     },
     source_directive::source_directives,
 };
@@ -117,7 +117,7 @@ pub(super) fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
 }
 
 pub(super) fn script_type(attrs: &HashMap<String, String>) -> String {
-    normalize_script_type(attrs.get("type").map(String::as_str))
+    script_type_essence(attrs.get("type").map(String::as_str))
 }
 
 pub(super) fn is_executable_script_type(ty: &str) -> bool {

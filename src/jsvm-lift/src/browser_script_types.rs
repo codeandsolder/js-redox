@@ -29,7 +29,7 @@ fn is_standard_executable_script_type(ty: &str) -> bool {
 }
 
 #[must_use]
-pub fn normalize_script_type(value: Option<&str>) -> String {
+pub fn script_type_essence(value: Option<&str>) -> String {
     let mut ty = value
         .unwrap_or("text/javascript")
         .trim()
@@ -40,6 +40,12 @@ pub fn normalize_script_type(value: Option<&str>) -> String {
     if ty.is_empty() {
         ty = "text/javascript".into();
     }
+    ty
+}
+
+#[must_use]
+pub fn normalize_script_type(value: Option<&str>) -> String {
+    let ty = script_type_essence(value);
     if let Some((prefix, suffix)) = ty.split_once('-') {
         if prefix.len() >= 16
             && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
