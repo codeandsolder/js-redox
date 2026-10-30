@@ -1,5 +1,11 @@
 use super::materialize::Reference;
-use crate::source_directive::source_directives;
+use crate::{
+    browser_script_types::{
+        inline_script_extension as shared_inline_script_extension, is_executable_script,
+        is_json_script, normalize_script_type,
+    },
+    source_directive::source_directives,
+};
 use std::collections::HashMap;
 use url::Url;
 
@@ -111,65 +117,19 @@ pub(super) fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
 }
 
 pub(super) fn script_type(attrs: &HashMap<String, String>) -> String {
-    attrs
-        .get("type")
-        .map(|s| {
-            s.split_once(';')
-                .map_or(s.as_str(), |(essence, _)| essence)
-                .trim()
-                .to_ascii_lowercase()
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "text/javascript".into())
-}
-
-fn is_standard_executable_script_type(ty: &str) -> bool {
-    matches!(
-        ty,
-        "module"
-            | "text/javascript"
-            | "application/javascript"
-            | "application/ecmascript"
-            | "text/ecmascript"
-            | "application/x-ecmascript"
-            | "application/x-javascript"
-            | "text/javascript1.0"
-            | "text/javascript1.1"
-            | "text/javascript1.2"
-            | "text/javascript1.3"
-            | "text/javascript1.4"
-            | "text/javascript1.5"
-            | "text/jscript"
-            | "text/livescript"
-            | "text/x-ecmascript"
-            | "text/x-javascript"
-    )
+    normalize_script_type(attrs.get("type").map(String::as_str))
 }
 
 pub(super) fn is_executable_script_type(ty: &str) -> bool {
-    if is_standard_executable_script_type(ty) {
-        return true;
-    }
-    let Some((prefix, suffix)) = ty.split_once('-') else {
-        return false;
-    };
-    prefix.len() >= 16
-        && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && is_standard_executable_script_type(suffix)
+    is_executable_script(Some(ty))
 }
 
 pub(super) fn is_json_script_type(ty: &str) -> bool {
-    matches!(ty, "importmap" | "speculationrules") || ty.contains("json")
+    is_json_script(Some(ty))
 }
 
 pub(super) fn inline_script_extension(ty: &str) -> &'static str {
-    if is_executable_script_type(ty) {
-        "js"
-    } else if is_json_script_type(ty) {
-        "json"
-    } else {
-        "txt"
-    }
+    shared_inline_script_extension(Some(ty))
 }
 
 pub(super) fn resolve_ref(base: &str, raw: &str) -> Option<String> {

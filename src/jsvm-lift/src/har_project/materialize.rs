@@ -406,9 +406,11 @@ fn build_manifest(
 }
 
 fn write_project_metadata(args: &HarProjectOptions, manifest: &ProjectManifest) -> Result<()> {
+    let manifest_value = serde_json::to_value(manifest)?;
+    crate::capture_project::validate_manifest_value(&manifest_value, "HAR capture manifest")?;
     fs::write(
-        args.output.join("capture-manifest.json"),
-        format!("{}\n", serde_json::to_string_pretty(manifest)?),
+        args.output.join(crate::capture_project::MANIFEST_NAME),
+        format!("{}\n", serde_json::to_string_pretty(&manifest_value)?),
     )?;
     fs::create_dir_all(args.output.join(".vscode"))?;
     fs::write(

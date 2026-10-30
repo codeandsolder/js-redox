@@ -149,7 +149,7 @@ Deep semantic returns and runtime boundaries carry raw structured expression IR 
 After a JSON scan:
 
 ```sh
-uv run python scripts/width-consensus.py work/scans/taobao.jsonl
+.cargo-target-nodebug/debug/debug-utils width-consensus work/scans/taobao.jsonl
 uv run python scripts/dump-linked-bytecode.py work/scans/taobao.jsonl
 ```
 
