@@ -9,13 +9,15 @@ use crate::{
     reference_is_statically_resolved_read, statically_resolved_symbol, string_literal_value,
     symbol_has_only_read_references, symbol_of, template_element_value,
 };
+use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, BindingPattern, CallExpression, Expression, ExpressionStatement, Statement,
     VariableDeclarationKind,
 };
 use oxc_ast_visit::{walk, Visit};
+use oxc_parser::Parser;
 use oxc_semantic::{ReferenceId, Scoping};
-use oxc_span::{GetSpan, Span};
+use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::{
     scope::{ScopeFlags, ScopeId},
     symbol::SymbolId,
@@ -1937,341 +1939,143 @@ pub(super) fn js_parse_int(text: &str, radix: u32) -> Option<f64> {
     Some(if negative { -value } else { value })
 }
 
-struct RotationExprParser<'a, 'd> {
-    source: &'a str,
-    pos: usize,
-    alias: &'a str,
-    decoder: &'d Decoder,
-    numeric_members: &'d HashMap<(String, String), i64>,
-    rotation: usize,
+fn rotation_static_integer(
+    expression: &Expression<'_>,
+    numeric_members: &HashMap<(String, String), i64>,
+) -> Option<i64> {
+    let expression = unparenthesized(expression);
+    if let Some(value) = expression_integer(expression) {
+        return Some(value);
+    }
+    let Expression::StaticMemberExpression(member) = expression else {
+        return None;
+    };
+    let Expression::Identifier(object) = unparenthesized(&member.object) else {
+        return None;
+    };
+    numeric_members
+        .get(&(object.name.to_string(), member.property.name.to_string()))
+        .copied()
 }
 
-impl RotationExprParser<'_, '_> {
-    fn rest(&self) -> &str {
-        &self.source[self.pos..]
-    }
-
-    fn skip_ws(&mut self) {
-        while let Some(ch) = self.rest().chars().next() {
-            if !ch.is_whitespace() {
-                break;
-            }
-            self.pos += ch.len_utf8();
+fn rotation_literal_integer(expression: &Expression<'_>) -> Option<i64> {
+    let expression = unparenthesized(expression);
+    match expression {
+        Expression::NumericLiteral(_) => expression_integer(expression),
+        Expression::UnaryExpression(unary)
+            if matches!(unary.operator.as_str(), "+" | "-")
+                && matches!(
+                    unparenthesized(&unary.argument),
+                    Expression::NumericLiteral(_)
+                ) =>
+        {
+            expression_integer(expression)
         }
+        _ => None,
     }
+}
 
-    fn eat(&mut self, text: &str) -> bool {
-        self.skip_ws();
-        if self.rest().starts_with(text) {
-            self.pos += text.len();
-            true
-        } else {
-            false
-        }
+fn rotation_decoder_call(
+    call: &CallExpression<'_>,
+    alias: &str,
+    decoder: &Decoder,
+    numeric_members: &HashMap<(String, String), i64>,
+    rotation: usize,
+) -> Option<String> {
+    if call.optional
+        || !(1..=2).contains(&call.arguments.len())
+        || call.arguments.iter().any(Argument::is_spread)
+    {
+        return None;
     }
-
-    fn ident(&mut self) -> Option<String> {
-        self.skip_ws();
-        let rest = self.rest();
-        let mut len = 0usize;
-        for (i, ch) in rest.char_indices() {
-            let valid = if i == 0 {
-                ch == '_' || ch == '$' || ch.is_ascii_alphabetic()
-            } else {
-                ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
+    let Expression::Identifier(callee) = unparenthesized(&call.callee) else {
+        return None;
+    };
+    if callee.name.as_str() != alias {
+        return None;
+    }
+    let raw = rotation_static_integer(call.arguments.first()?.as_expression()?, numeric_members)?;
+    let key = match call.arguments.get(1) {
+        Some(argument) => {
+            let Expression::StringLiteral(literal) = unparenthesized(argument.as_expression()?)
+            else {
+                return None;
             };
-            if !valid {
-                break;
-            }
-            len = i + ch.len_utf8();
+            Some(string_literal_value(literal)?)
         }
-        if len == 0 {
-            return None;
-        }
-        let value = rest[..len].to_string();
-        self.pos += len;
-        Some(value)
-    }
+        None => None,
+    };
+    decoder
+        .value_for_raw_rotated_with_key(raw, rotation, key.as_deref())?
+        .js_string()
+}
 
-    fn number(&mut self) -> Option<f64> {
-        self.skip_ws();
-        let rest = self.rest();
-        if rest.starts_with("0x") || rest.starts_with("0X") {
-            let digits = rest[2..].bytes().take_while(u8::is_ascii_hexdigit).count();
-            if digits == 0 {
+fn eval_rotation_expression(
+    expression: &Expression<'_>,
+    alias: &str,
+    decoder: &Decoder,
+    numeric_members: &HashMap<(String, String), i64>,
+    rotation: usize,
+) -> Option<f64> {
+    match unparenthesized(expression) {
+        Expression::NumericLiteral(number) => Some(number.value),
+        Expression::StaticMemberExpression(_) => {
+            rotation_static_integer(expression, numeric_members).map(js_number_from_i64)
+        }
+        Expression::UnaryExpression(unary) => {
+            let value = eval_rotation_expression(
+                &unary.argument,
+                alias,
+                decoder,
+                numeric_members,
+                rotation,
+            )?;
+            match unary.operator.as_str() {
+                "+" => Some(value),
+                "-" => Some(-value),
+                _ => None,
+            }
+        }
+        Expression::BinaryExpression(binary) => {
+            let left =
+                eval_rotation_expression(&binary.left, alias, decoder, numeric_members, rotation)?;
+            let right =
+                eval_rotation_expression(&binary.right, alias, decoder, numeric_members, rotation)?;
+            match binary.operator.as_str() {
+                "+" => Some(left + right),
+                "-" => Some(left - right),
+                "*" => Some(left * right),
+                "/" => Some(left / right),
+                "%" => Some(left % right),
+                _ => None,
+            }
+        }
+        Expression::CallExpression(call) => {
+            if call.optional || !(1..=2).contains(&call.arguments.len()) {
                 return None;
             }
-            let len = 2 + digits;
-            let value = js_number_from_i64(i64::from_str_radix(&rest[2..len], 16).ok()?);
-            self.pos += len;
-            return Some(value);
-        }
-
-        let bytes = rest.as_bytes();
-        let mut len = 0usize;
-        while len < bytes.len() && bytes[len].is_ascii_digit() {
-            len += 1;
-        }
-        if len < bytes.len() && bytes[len] == b'.' {
-            len += 1;
-            while len < bytes.len() && bytes[len].is_ascii_digit() {
-                len += 1;
-            }
-        }
-        if len < bytes.len() && matches!(bytes[len], b'e' | b'E') {
-            let exp_start = len;
-            len += 1;
-            if len < bytes.len() && matches!(bytes[len], b'+' | b'-') {
-                len += 1;
-            }
-            let digits_start = len;
-            while len < bytes.len() && bytes[len].is_ascii_digit() {
-                len += 1;
-            }
-            if digits_start == len {
-                len = exp_start;
-            }
-        }
-        if len == 0 {
-            return None;
-        }
-        let value = rest[..len].parse().ok()?;
-        self.pos += len;
-        Some(value)
-    }
-
-    fn signed_integer(&mut self) -> Option<i64> {
-        self.skip_ws();
-        let start = self.pos;
-        if self.eat("-") || self.eat("+") {
-            self.skip_ws();
-        }
-        let rest = self.rest();
-        let len = if rest.starts_with("0x") || rest.starts_with("0X") {
-            let digits = rest[2..].bytes().take_while(u8::is_ascii_hexdigit).count();
-            if digits == 0 {
-                self.pos = start;
+            let Expression::Identifier(callee) = unparenthesized(&call.callee) else {
+                return None;
+            };
+            if callee.name.as_str() != "parseInt" {
                 return None;
             }
-            2 + digits
-        } else {
-            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-            if digits == 0 {
-                self.pos = start;
+            let decoded_call = call.arguments.first()?.as_expression()?;
+            let Expression::CallExpression(decoded_call) = unparenthesized(decoded_call) else {
                 return None;
-            }
-            digits
-        };
-        self.pos += len;
-        parse_i64_literal(&self.source[start..self.pos].replace(char::is_whitespace, ""))
-    }
-
-    fn numeric_member(&mut self) -> Option<i64> {
-        self.skip_ws();
-        let start = self.pos;
-        let object = self.ident()?;
-        if !self.eat(".") {
-            self.pos = start;
-            return None;
-        }
-        let property = self.ident()?;
-        let Some(value) = self.numeric_members.get(&(object, property)).copied() else {
-            self.pos = start;
-            return None;
-        };
-        Some(value)
-    }
-
-    fn integer_atom(&mut self) -> Option<i64> {
-        let start = self.pos;
-        if let Some(value) = self.signed_integer() {
-            return Some(value);
-        }
-        self.pos = start;
-        self.numeric_member()
-    }
-
-    fn string_literal(&mut self) -> Option<String> {
-        self.skip_ws();
-        let quote = self.rest().chars().next()?;
-        if !matches!(quote, '\'' | '"') {
-            return None;
-        }
-        self.pos += quote.len_utf8();
-        let mut units = Vec::<u16>::new();
-        loop {
-            let ch = self.rest().chars().next()?;
-            if ch == quote {
-                self.pos += ch.len_utf8();
-                return String::from_utf16(&units).ok();
-            }
-            if matches!(ch, '\n' | '\r') {
-                return None;
-            }
-            if ch != '\\' {
-                let mut buf = [0u16; 2];
-                units.extend_from_slice(ch.encode_utf16(&mut buf));
-                self.pos += ch.len_utf8();
-                continue;
-            }
-
-            self.pos += ch.len_utf8();
-            let escape = self.rest().chars().next()?;
-            self.pos += escape.len_utf8();
-            match escape {
-                '\\' | '\'' | '"' | '/' => units.push(u16::try_from(u32::from(escape)).ok()?),
-                'b' => units.push(0x08),
-                'f' => units.push(0x0c),
-                'n' => units.push(u16::from(b'\n')),
-                'r' => units.push(u16::from(b'\r')),
-                't' => units.push(u16::from(b'\t')),
-                'v' => units.push(0x0b),
-                '0' => {
-                    if self
-                        .rest()
-                        .chars()
-                        .next()
-                        .is_some_and(|next| next.is_ascii_digit())
-                    {
-                        return None;
-                    }
-                    units.push(0);
-                }
-                'x' => {
-                    let digits = self.rest().get(..2)?;
-                    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                        return None;
-                    }
-                    units.push(u16::from_str_radix(digits, 16).ok()?);
-                    self.pos += 2;
-                }
-                'u' => {
-                    if self.rest().starts_with('{') {
-                        self.pos += 1;
-                        let end = self.rest().find('}')?;
-                        let digits = self.rest().get(..end)?;
-                        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
-                        {
-                            return None;
-                        }
-                        let scalar = u32::from_str_radix(digits, 16).ok()?;
-                        let value = char::from_u32(scalar)?;
-                        let mut buf = [0u16; 2];
-                        units.extend_from_slice(value.encode_utf16(&mut buf));
-                        self.pos += end + 1;
-                    } else {
-                        let digits = self.rest().get(..4)?;
-                        if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                            return None;
-                        }
-                        units.push(u16::from_str_radix(digits, 16).ok()?);
-                        self.pos += 4;
-                    }
-                }
-                '\n' => {}
-                '\r' => {
-                    if self.rest().starts_with('\n') {
-                        self.pos += 1;
-                    }
-                }
-                other => {
-                    let mut buf = [0u16; 2];
-                    units.extend_from_slice(other.encode_utf16(&mut buf));
-                }
-            }
-        }
-    }
-
-    fn decoder_call(&mut self) -> Option<String> {
-        let name = self.ident()?;
-        if name != self.alias || !self.eat("(") {
-            return None;
-        }
-        let raw = self.integer_atom()?;
-        let key = if self.eat(",") {
-            Some(self.string_literal()?)
-        } else {
-            None
-        };
-        if !self.eat(")") {
-            return None;
-        }
-        let value =
-            self.decoder
-                .value_for_raw_rotated_with_key(raw, self.rotation, key.as_deref())?;
-        match value {
-            Value::String(value) => Some(value),
-            value => value.js_string(),
-        }
-    }
-
-    fn factor(&mut self) -> Option<f64> {
-        self.skip_ws();
-        if self.eat("(") {
-            let value = self.expr()?;
-            if !self.eat(")") {
-                return None;
-            }
-            return Some(value);
-        }
-        if self.eat("+") {
-            return self.factor();
-        }
-        if self.eat("-") {
-            return self.factor().map(|value| -value);
-        }
-
-        let before = self.pos;
-        if let Some(name) = self.ident() {
-            if name == "parseInt" && self.eat("(") {
-                let decoded = self.decoder_call()?;
-                let radix = if self.eat(",") {
-                    let radix = self.signed_integer()?;
+            };
+            let decoded =
+                rotation_decoder_call(decoded_call, alias, decoder, numeric_members, rotation)?;
+            let radix = match call.arguments.get(1) {
+                Some(argument) => {
+                    let radix = rotation_literal_integer(argument.as_expression()?)?;
                     u32::try_from(radix).ok()?
-                } else {
-                    10
-                };
-                if !self.eat(")") {
-                    return None;
                 }
-                return js_parse_int(&decoded, radix);
-            }
-            self.pos = before;
+                None => 10,
+            };
+            js_parse_int(&decoded, radix)
         }
-        if let Some(value) = self.numeric_member() {
-            return Some(js_number_from_i64(value));
-        }
-        self.number()
-    }
-
-    fn term(&mut self) -> Option<f64> {
-        let mut value = self.factor()?;
-        loop {
-            if self.eat("*") {
-                value *= self.factor()?;
-            } else if self.eat("/") {
-                value /= self.factor()?;
-            } else if self.eat("%") {
-                value %= self.factor()?;
-            } else {
-                break;
-            }
-        }
-        Some(value)
-    }
-
-    fn expr(&mut self) -> Option<f64> {
-        let mut value = self.term()?;
-        loop {
-            if self.eat("+") {
-                value += self.term()?;
-            } else if self.eat("-") {
-                value -= self.term()?;
-            } else {
-                break;
-            }
-        }
-        Some(value)
+        _ => None,
     }
 }
 
@@ -2282,17 +2086,22 @@ fn eval_rotation_checksum(
     numeric_members: &HashMap<(String, String), i64>,
     rotation: usize,
 ) -> Option<f64> {
-    let mut parser = RotationExprParser {
-        source: expression,
-        pos: 0,
+    let wrapped = format!("({expression});");
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, &wrapped, SourceType::cjs()).parse();
+    if parsed.fatal_error || !parsed.diagnostics.is_empty() || parsed.program.body.len() != 1 {
+        return None;
+    }
+    let Statement::ExpressionStatement(statement) = &parsed.program.body[0] else {
+        return None;
+    };
+    eval_rotation_expression(
+        &statement.expression,
         alias,
         decoder,
         numeric_members,
         rotation,
-    };
-    let value = parser.expr()?;
-    parser.skip_ws();
-    (parser.pos == expression.len()).then_some(value)
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -4179,7 +3988,27 @@ mod tests {
         );
         assert_eq!(
             eval_rotation_checksum(
+                "parseInt(G(/* static index */ 0x0f + 1, '\\u006b')) * 10 + parseInt(G(0x11, 'k'))",
+                "G",
+                &decoder,
+                &HashMap::new(),
+                3,
+            ),
+            Some(193.0)
+        );
+        assert_eq!(
+            eval_rotation_checksum(
                 "parseInt(G(0x10, dynamic))",
+                "G",
+                &decoder,
+                &HashMap::new(),
+                3,
+            ),
+            None
+        );
+        assert_eq!(
+            eval_rotation_checksum(
+                "parseInt(G(sideEffect(), 'k'))",
                 "G",
                 &decoder,
                 &HashMap::new(),
