@@ -1,5 +1,6 @@
 use crate::value_eval::{
-    eval_binary, js_to_int32, string_literal_value, template_element_value, Value,
+    eval_binary, eval_logical_left, eval_unary_value, string_literal_value, template_element_value,
+    LogicalStep, Value,
 };
 use oxc_ast::ast::{BindingPattern, Expression, Statement, VariableDeclarationKind};
 use oxc_ast_visit::{walk, Visit};
@@ -64,27 +65,7 @@ impl PureExpr {
                 Some(value)
             }
             Self::Unary { operator, argument } => {
-                let value = argument.eval(params)?;
-                match operator.as_str() {
-                    "!" => Some(Value::Bool(!value.truthy())),
-                    "+" => value.number().map(Value::Number),
-                    "-" => value.number().map(|n| Value::Number(-n)),
-                    "~" => value
-                        .number()
-                        .map(|n| Value::Number(f64::from(!js_to_int32(n)))),
-                    "void" => Some(Value::Undefined),
-                    "typeof" => Some(Value::String(
-                        match value {
-                            Value::String(_) => "string",
-                            Value::Number(_) => "number",
-                            Value::Bool(_) => "boolean",
-                            Value::Null => "object",
-                            Value::Undefined => "undefined",
-                        }
-                        .to_string(),
-                    )),
-                    _ => None,
-                }
+                eval_unary_value(operator, argument.eval(params)?)
             }
             Self::Binary {
                 operator,
@@ -99,33 +80,10 @@ impl PureExpr {
                 operator,
                 left,
                 right,
-            } => {
-                let left = left.eval(params)?;
-                match operator.as_str() {
-                    "&&" => {
-                        if left.truthy() {
-                            right.eval(params)
-                        } else {
-                            Some(left)
-                        }
-                    }
-                    "||" => {
-                        if left.truthy() {
-                            Some(left)
-                        } else {
-                            right.eval(params)
-                        }
-                    }
-                    "??" => {
-                        if matches!(left, Value::Null | Value::Undefined) {
-                            right.eval(params)
-                        } else {
-                            Some(left)
-                        }
-                    }
-                    _ => None,
-                }
-            }
+            } => match eval_logical_left(operator, left.eval(params)?)? {
+                LogicalStep::Value(value) => Some(value),
+                LogicalStep::EvaluateRight => right.eval(params),
+            },
             Self::Conditional {
                 test,
                 consequent,

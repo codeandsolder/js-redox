@@ -177,25 +177,15 @@ pub fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
     eval_unary_with_resolver(v, &|_| None)
 }
 
-fn eval_unary_with_resolver<'a, F>(v: &UnaryExpression<'a>, resolve: &F) -> Option<Value>
-where
-    F: Fn(&IdentifierReference<'a>) -> Option<Value>,
-{
-    let op = v.operator.as_str();
-    if op == "!" {
-        return known_bool_with_resolver(&v.argument, resolve).map(|x| Value::Bool(!x));
-    }
-    if op == "void" {
-        eval_with_resolver(&v.argument, resolve)?;
-        return Some(Value::Undefined);
-    }
-    let value = eval_with_resolver(&v.argument, resolve)?;
+pub(crate) fn eval_unary_value(op: &str, value: Value) -> Option<Value> {
     match op {
+        "!" => Some(Value::Bool(!value.truthy())),
         "+" => value.number().map(Value::Number),
         "-" => value.number().map(|x| Value::Number(-x)),
         "~" => value
             .number()
             .map(|x| Value::Number(f64::from(!js_to_int32(x)))),
+        "void" => Some(Value::Undefined),
         "typeof" => Some(Value::String(
             match value {
                 Value::String(_) => "string",
@@ -208,6 +198,18 @@ where
         )),
         _ => None,
     }
+}
+
+fn eval_unary_with_resolver<'a, F>(v: &UnaryExpression<'a>, resolve: &F) -> Option<Value>
+where
+    F: Fn(&IdentifierReference<'a>) -> Option<Value>,
+{
+    let op = v.operator.as_str();
+    if op == "!" {
+        return known_bool_with_resolver(&v.argument, resolve).map(|x| Value::Bool(!x));
+    }
+    let value = eval_with_resolver(&v.argument, resolve)?;
+    eval_unary_value(op, value)
 }
 
 #[inline]
@@ -308,33 +310,30 @@ pub fn eval_logical(v: &LogicalExpression<'_>) -> Option<Value> {
     eval_logical_with_resolver(v, &|_| None)
 }
 
+pub(crate) enum LogicalStep {
+    Value(Value),
+    EvaluateRight,
+}
+
+pub(crate) fn eval_logical_left(op: &str, left: Value) -> Option<LogicalStep> {
+    match op {
+        "&&" if left.truthy() => Some(LogicalStep::EvaluateRight),
+        "&&" => Some(LogicalStep::Value(left)),
+        "||" if left.truthy() => Some(LogicalStep::Value(left)),
+        "||" => Some(LogicalStep::EvaluateRight),
+        "??" if matches!(left, Value::Null | Value::Undefined) => Some(LogicalStep::EvaluateRight),
+        "??" => Some(LogicalStep::Value(left)),
+        _ => None,
+    }
+}
+
 fn eval_logical_with_resolver<'a, F>(v: &LogicalExpression<'a>, resolve: &F) -> Option<Value>
 where
     F: Fn(&IdentifierReference<'a>) -> Option<Value>,
 {
     let left = eval_with_resolver(&v.left, resolve)?;
-    match v.operator.as_str() {
-        "&&" => {
-            if left.truthy() {
-                eval_with_resolver(&v.right, resolve)
-            } else {
-                Some(left)
-            }
-        }
-        "||" => {
-            if left.truthy() {
-                Some(left)
-            } else {
-                eval_with_resolver(&v.right, resolve)
-            }
-        }
-        "??" => {
-            if matches!(left, Value::Null | Value::Undefined) {
-                eval_with_resolver(&v.right, resolve)
-            } else {
-                Some(left)
-            }
-        }
-        _ => None,
+    match eval_logical_left(v.operator.as_str(), left)? {
+        LogicalStep::Value(value) => Some(value),
+        LogicalStep::EvaluateRight => eval_with_resolver(&v.right, resolve),
     }
 }

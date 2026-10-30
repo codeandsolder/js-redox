@@ -8,8 +8,8 @@
 
 use crate::numeric::exact_u32;
 use crate::value_eval::{
-    eval, eval_binary, js_to_int32, js_to_uint32, known_bool, same_value, string_literal_value,
-    template_element_value, Value,
+    eval, eval_binary, eval_logical_left, eval_unary_value, js_to_uint32, known_bool, same_value,
+    string_literal_value, template_element_value, LogicalStep, Value,
 };
 use crate::{
     array_element, direct_identifier_name, fragment, js_parse_int, symbol_has_only_read_references,
@@ -889,33 +889,7 @@ fn eval_with_env(expr: &Expression<'_>, env: &HashMap<String, Value>) -> Option<
                 .cloned()
         }
         Expression::UnaryExpression(v) => {
-            let op = v.operator.as_str();
-            if op == "!" {
-                return eval_with_env(&v.argument, env).map(|value| Value::Bool(!value.truthy()));
-            }
-            if op == "void" {
-                eval_with_env(&v.argument, env)?;
-                return Some(Value::Undefined);
-            }
-            let value = eval_with_env(&v.argument, env)?;
-            match op {
-                "+" => value.number().map(Value::Number),
-                "-" => value.number().map(|number| Value::Number(-number)),
-                "~" => value
-                    .number()
-                    .map(|number| Value::Number(f64::from(!js_to_int32(number)))),
-                "typeof" => Some(Value::String(
-                    match value {
-                        Value::String(_) => "string",
-                        Value::Number(_) => "number",
-                        Value::Bool(_) => "boolean",
-                        Value::Null => "object",
-                        Value::Undefined => "undefined",
-                    }
-                    .to_string(),
-                )),
-                _ => None,
-            }
+            eval_unary_value(v.operator.as_str(), eval_with_env(&v.argument, env)?)
         }
         Expression::BinaryExpression(v) => eval_binary(
             v.operator.as_str(),
@@ -923,17 +897,9 @@ fn eval_with_env(expr: &Expression<'_>, env: &HashMap<String, Value>) -> Option<
             eval_with_env(&v.right, env)?,
         ),
         Expression::LogicalExpression(v) => {
-            let left = eval_with_env(&v.left, env)?;
-            match v.operator.as_str() {
-                "&&" if left.truthy() => eval_with_env(&v.right, env),
-                "&&" => Some(left),
-                "||" if left.truthy() => Some(left),
-                "||" => eval_with_env(&v.right, env),
-                "??" if matches!(left, Value::Null | Value::Undefined) => {
-                    eval_with_env(&v.right, env)
-                }
-                "??" => Some(left),
-                _ => None,
+            match eval_logical_left(v.operator.as_str(), eval_with_env(&v.left, env)?)? {
+                LogicalStep::Value(value) => Some(value),
+                LogicalStep::EvaluateRight => eval_with_env(&v.right, env),
             }
         }
         Expression::ConditionalExpression(v) => {
@@ -1789,55 +1755,22 @@ impl Collector<'_, '_> {
             Expression::ParenthesizedExpression(value) => {
                 self.reference_state_eval(&value.expression, env)
             }
-            Expression::UnaryExpression(unary) => {
-                if unary.operator.as_str() == "!" {
-                    return self
-                        .reference_state_eval(&unary.argument, env)
-                        .map(|value| Value::Bool(!value.truthy()));
-                }
-                if unary.operator.as_str() == "void" {
-                    self.reference_state_eval(&unary.argument, env)?;
-                    return Some(Value::Undefined);
-                }
-                let value = self.reference_state_eval(&unary.argument, env)?;
-                match unary.operator.as_str() {
-                    "+" => value.number().map(Value::Number),
-                    "-" => value.number().map(|number| Value::Number(-number)),
-                    "~" => value
-                        .number()
-                        .map(|number| Value::Number(f64::from(!js_to_int32(number)))),
-                    "typeof" => Some(Value::String(
-                        match value {
-                            Value::String(_) => "string",
-                            Value::Number(_) => "number",
-                            Value::Bool(_) => "boolean",
-                            Value::Null => "object",
-                            Value::Undefined => "undefined",
-                        }
-                        .to_string(),
-                    )),
-                    _ => None,
-                }
-            }
+            Expression::UnaryExpression(unary) => eval_unary_value(
+                unary.operator.as_str(),
+                self.reference_state_eval(&unary.argument, env)?,
+            ),
             Expression::BinaryExpression(value) => eval_binary(
                 value.operator.as_str(),
                 self.reference_state_eval(&value.left, env)?,
                 self.reference_state_eval(&value.right, env)?,
             ),
-            Expression::LogicalExpression(value) => {
-                let left = self.reference_state_eval(&value.left, env)?;
-                match value.operator.as_str() {
-                    "&&" if left.truthy() => self.reference_state_eval(&value.right, env),
-                    "&&" => Some(left),
-                    "||" if left.truthy() => Some(left),
-                    "||" => self.reference_state_eval(&value.right, env),
-                    "??" if matches!(left, Value::Null | Value::Undefined) => {
-                        self.reference_state_eval(&value.right, env)
-                    }
-                    "??" => Some(left),
-                    _ => None,
-                }
-            }
+            Expression::LogicalExpression(value) => match eval_logical_left(
+                value.operator.as_str(),
+                self.reference_state_eval(&value.left, env)?,
+            )? {
+                LogicalStep::Value(result) => Some(result),
+                LogicalStep::EvaluateRight => self.reference_state_eval(&value.right, env),
+            },
             Expression::ConditionalExpression(value) => {
                 let test = self.reference_state_eval(&value.test, env)?.truthy();
                 self.reference_state_eval(
