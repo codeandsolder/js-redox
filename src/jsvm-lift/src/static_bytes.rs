@@ -804,7 +804,8 @@ fn exact_byte_array(array: &oxc_ast::ast::ArrayExpression<'_>) -> Option<Vec<u8>
                     && value.value.fract() == 0.0
                     && value.value <= f64::from(u8::MAX) =>
             {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                #[expect(clippy::cast_possible_truncation, reason = "the preceding finite, integer, and u8-range guards make this cast lossless")]
+                #[expect(clippy::cast_sign_loss, reason = "the preceding finite, integer, and u8-range guards make this cast non-negative")]
                 Some(value.value as u8)
             }
             _ => None,
