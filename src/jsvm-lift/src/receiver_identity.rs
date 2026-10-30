@@ -1,5 +1,5 @@
 use crate::{
-    cfg_order::prove_events_before_event,
+    cfg_order::{prove_event_completion_before_event, prove_event_completion_before_nested_event},
     numeric::exact_i64,
     state_flatten::{
         prove_function_if_ladder_event_unreachable_with_integer_parameters,
@@ -1625,12 +1625,9 @@ pub fn structurally_proven_own_data_fields_at_member_calls(
         for entry in flow.direct_calls.iter().filter(|call| {
             call.caller == initialization.context
                 && initialization.evaluation_order < call.evaluation_order
-                && prove_events_before_event(
+                && prove_event_completion_before_event(
                     semantic,
-                    &[Span::new(
-                        initialization.write_start,
-                        initialization.write_end,
-                    )],
+                    Span::new(initialization.write_start, initialization.write_end),
                     Span::new(call.call_start, call.call_end),
                 )
         }) {
@@ -1852,6 +1849,13 @@ pub struct PrototypeMethodCallCandidate {
     pub call: ProvenMemberReceiverOrigin,
     pub lookup_target: ProvenPrototypeMethodLookupTarget,
     pub receiver_effects: ProvenPrototypeMethodReceiverEffects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenPrototypeMethodCallTarget {
+    pub candidate: PrototypeMethodCallCandidate,
+    /// This proof depends on ordinary ECMAScript prototype/property semantics.
+    pub standard_prototype_semantics_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3154,6 +3158,50 @@ pub fn structurally_matched_prototype_method_calls(
     matched
 }
 
+/// Upgrade structural prototype-call matches to runtime lookup targets for a
+/// concrete allocation.
+///
+/// The prototype assignment must have completed before that allocation could
+/// execute. Stable-prototype evidence from the structural candidate then keeps
+/// the installed target valid through the later member call. The ordering proof
+/// supports same-function allocations and allocations inside later-created
+/// function expressions/arrows; unsupported interprocedural timing fails closed.
+#[must_use]
+pub fn structurally_proven_prototype_method_calls_at_runtime(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+) -> Vec<ProvenPrototypeMethodCallTarget> {
+    let mut proven = structurally_matched_prototype_method_calls(program, semantic.scoping())
+        .into_iter()
+        .filter_map(|candidate| {
+            prove_event_completion_before_nested_event(
+                semantic,
+                Span::new(
+                    candidate.lookup_target.assignment_start,
+                    candidate.lookup_target.assignment_end,
+                ),
+                Span::new(
+                    candidate.call.allocation_start,
+                    candidate.call.allocation_end,
+                ),
+            )
+            .then_some(ProvenPrototypeMethodCallTarget {
+                candidate,
+                standard_prototype_semantics_required: true,
+            })
+        })
+        .collect::<Vec<_>>();
+    proven.sort_by_key(|proof| {
+        (
+            proof.candidate.call.call_start,
+            proof.candidate.call.call_end,
+            proof.candidate.call.property.clone(),
+        )
+    });
+    proven.dedup();
+    proven
+}
+
 /// Propagate exact receiver origin into every finite possible method body of a
 /// structurally matched prototype call.
 ///
@@ -3185,6 +3233,16 @@ pub fn propagate_matched_prototype_method_call_origins(
     propagate_proven_origin_contexts(program, scoping, &seeds)
 }
 
+/// Propagate exact receiver origin from a runtime-proven prototype method call.
+#[must_use]
+pub fn propagate_proven_prototype_method_call_origins(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    proof: &ProvenPrototypeMethodCallTarget,
+) -> ProvenOriginFlow {
+    propagate_matched_prototype_method_call_origins(program, scoping, &proof.candidate)
+}
+
 /// Prove exact-origin prototype method calls that preserve receiver identity and
 /// shape on every normal-return path represented by the supported effect model.
 /// Static receiver reads must be discharged as ordinary own-data fields at the
@@ -3196,10 +3254,10 @@ pub fn structurally_proven_receiver_preserving_prototype_method_calls(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
 ) -> Vec<ProvenReceiverPreservingPrototypeMethodCall> {
-    let scoping = semantic.scoping();
     let fields = structurally_proven_own_data_fields_at_member_calls(source, program, semantic);
     let mut proven = Vec::new();
-    for candidate in structurally_matched_prototype_method_calls(program, scoping) {
+    for call_target in structurally_proven_prototype_method_calls_at_runtime(program, semantic) {
+        let candidate = call_target.candidate;
         if candidate.receiver_effects.mutates_receiver
             || candidate.receiver_effects.exposes_receiver
             || candidate.receiver_effects.dynamic_receiver_access
@@ -3247,6 +3305,7 @@ mod tests {
         structurally_proven_member_receiver_origins, structurally_proven_member_write_origins,
         structurally_proven_origin_direct_calls, structurally_proven_origin_exposures,
         structurally_proven_origin_flow, structurally_proven_prototype_method_assignments,
+        structurally_proven_prototype_method_calls_at_runtime,
         structurally_proven_prototype_method_lookup_targets,
         structurally_proven_prototype_method_receiver_effects,
     };
@@ -3304,6 +3363,105 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping())
+    }
+
+    #[test]
+    fn proves_runtime_method_install_before_direct_allocation() {
+        let source = r#"
+            (function() {
+                const C = function() { launch(this); };
+                function launch(state) { state.run(); }
+                C.prototype.run = function() { return 1; };
+                new C();
+            })();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        let proven = structurally_proven_prototype_method_calls_at_runtime(
+            &parsed.program,
+            &semantic.semantic,
+        );
+        assert!(proven
+            .iter()
+            .any(|proof| proof.candidate.call.property == "run"));
+    }
+
+    #[test]
+    fn proves_runtime_method_install_before_nested_allocation_factory() {
+        let source = r#"
+            (function() {
+                const C = function() { launch(this); };
+                function launch(state) { state.run(); }
+                C.prototype.run = function() { return 1; };
+                api.make = function() { return new C(); };
+            })();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        let proven = structurally_proven_prototype_method_calls_at_runtime(
+            &parsed.program,
+            &semantic.semantic,
+        );
+        assert!(proven
+            .iter()
+            .any(|proof| proof.candidate.call.property == "run"));
+    }
+
+    #[test]
+    fn runtime_method_install_rejects_factory_created_before_assignment() {
+        let source = r#"
+            (function() {
+                const C = function() { launch(this); };
+                function launch(state) { state.run(); }
+                api.make = function() { return new C(); };
+                C.prototype.run = function() { return 1; };
+            })();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(structurally_proven_prototype_method_calls_at_runtime(
+            &parsed.program,
+            &semantic.semantic,
+        )
+        .iter()
+        .all(|proof| proof.candidate.call.property != "run"));
+    }
+
+    #[test]
+    fn runtime_method_install_rejects_function_declaration_factory() {
+        let source = r#"
+            (function() {
+                const C = function() { launch(this); };
+                function launch(state) { state.run(); }
+                C.prototype.run = function() { return 1; };
+                function make() { return new C(); }
+                api.make = make;
+            })();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(structurally_proven_prototype_method_calls_at_runtime(
+            &parsed.program,
+            &semantic.semantic,
+        )
+        .iter()
+        .all(|proof| proof.candidate.call.property != "run"));
     }
 
     #[test]
