@@ -1859,6 +1859,15 @@ pub struct ProvenPrototypeMethodCallTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenPrototypeMethodReceiverPreservationSummary {
+    pub call_target: ProvenPrototypeMethodCallTarget,
+    /// Ordinary own-data receiver fields that must already exist at method entry.
+    pub required_own_data_fields: Vec<String>,
+    /// At least one exact direct edge used ordinary `Function.prototype.call` semantics.
+    pub standard_function_call_semantics_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenReceiverPreservingPrototypeMethodCall {
     pub candidate: PrototypeMethodCallCandidate,
     pub own_data_reads: Vec<ProvenOwnDataFieldAtMemberCall>,
@@ -3091,14 +3100,13 @@ pub fn structurally_proven_prototype_method_receiver_effects(
 /// This is intentionally not a call-time lookup proof. It only joins the
 /// structural facts needed by a later ordering/barrier theorem. Ambiguous
 /// lookup targets or effect summaries fail closed.
-#[must_use]
-pub fn structurally_matched_prototype_method_calls(
+fn match_prototype_method_calls(
     program: &Program<'_>,
     scoping: &Scoping,
+    calls: impl IntoIterator<Item = ProvenMemberReceiverOrigin>,
 ) -> Vec<PrototypeMethodCallCandidate> {
     type MethodKey = (u32, u32, String);
 
-    let calls = structurally_proven_member_receiver_origins(program, scoping);
     let mut targets = HashMap::<MethodKey, Vec<ProvenPrototypeMethodLookupTarget>>::new();
     for target in structurally_proven_prototype_method_lookup_targets(program, scoping) {
         targets
@@ -3158,20 +3166,35 @@ pub fn structurally_matched_prototype_method_calls(
     matched
 }
 
-/// Upgrade structural prototype-call matches to runtime lookup targets for a
-/// concrete allocation.
-///
-/// The prototype assignment must have completed before that allocation could
-/// execute. Stable-prototype evidence from the structural candidate then keeps
-/// the installed target valid through the later member call. The ordering proof
-/// supports same-function allocations and allocations inside later-created
-/// function expressions/arrows; unsupported interprocedural timing fails closed.
 #[must_use]
-pub fn structurally_proven_prototype_method_calls_at_runtime(
+pub fn structurally_matched_prototype_method_calls(
     program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<PrototypeMethodCallCandidate> {
+    match_prototype_method_calls(
+        program,
+        scoping,
+        structurally_proven_member_receiver_origins(program, scoping),
+    )
+}
+
+/// Match prototype method calls found in an independently seeded exact-origin
+/// flow. This reuses the same constructor/property identity and ambiguity rules
+/// as the global origin flow; the caller is responsible only for the seed proof.
+#[must_use]
+pub fn structurally_matched_prototype_method_calls_in_flow(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    flow: &ProvenOriginFlow,
+) -> Vec<PrototypeMethodCallCandidate> {
+    match_prototype_method_calls(program, scoping, flow.member_calls.iter().cloned())
+}
+
+fn prove_runtime_prototype_method_call_targets(
     semantic: &Semantic<'_>,
+    candidates: impl IntoIterator<Item = PrototypeMethodCallCandidate>,
 ) -> Vec<ProvenPrototypeMethodCallTarget> {
-    let mut proven = structurally_matched_prototype_method_calls(program, semantic.scoping())
+    let mut proven = candidates
         .into_iter()
         .filter_map(|candidate| {
             prove_event_completion_before_nested_event(
@@ -3200,6 +3223,39 @@ pub fn structurally_proven_prototype_method_calls_at_runtime(
     });
     proven.dedup();
     proven
+}
+
+/// Upgrade structural prototype-call matches to runtime lookup targets for a
+/// concrete allocation.
+///
+/// The prototype assignment must have completed before that allocation could
+/// execute. Stable-prototype evidence from the structural candidate then keeps
+/// the installed target valid through the later member call. The ordering proof
+/// supports same-function allocations and allocations inside later-created
+/// function expressions/arrows; unsupported interprocedural timing fails closed.
+#[must_use]
+pub fn structurally_proven_prototype_method_calls_at_runtime(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+) -> Vec<ProvenPrototypeMethodCallTarget> {
+    prove_runtime_prototype_method_call_targets(
+        semantic,
+        structurally_matched_prototype_method_calls(program, semantic.scoping()),
+    )
+}
+
+/// Upgrade prototype calls from an independently seeded exact-origin flow to
+/// runtime lookup targets for the same concrete allocation.
+#[must_use]
+pub fn structurally_proven_prototype_method_calls_at_runtime_in_flow(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    flow: &ProvenOriginFlow,
+) -> Vec<ProvenPrototypeMethodCallTarget> {
+    prove_runtime_prototype_method_call_targets(
+        semantic,
+        structurally_matched_prototype_method_calls_in_flow(program, semantic.scoping(), flow),
+    )
 }
 
 /// Propagate exact receiver origin into every finite possible method body of a
@@ -3243,6 +3299,289 @@ pub fn propagate_proven_prototype_method_call_origins(
     propagate_matched_prototype_method_call_origins(program, scoping, &proof.candidate)
 }
 
+#[derive(Clone, Default)]
+struct ReceiverPreservationRequirements {
+    own_data_fields: HashSet<String>,
+    standard_function_call_semantics_required: bool,
+}
+
+impl ReceiverPreservationRequirements {
+    fn merge(&mut self, other: Self) {
+        self.own_data_fields.extend(other.own_data_fields);
+        self.standard_function_call_semantics_required |=
+            other.standard_function_call_semantics_required;
+    }
+}
+
+type MethodPreservationKey = (u32, u32, u32, u32, String);
+type ContextPreservationKey = (ProvenOriginContext, Option<(u32, u32)>);
+
+fn direct_call_event_unreachable_if_specialized(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    entry: Option<&ProvenOriginDirectCall>,
+    start: u32,
+    end: u32,
+) -> bool {
+    entry.is_some_and(|call| {
+        proven_origin_direct_call_event_unreachable(
+            source,
+            program,
+            scoping,
+            call,
+            Span::new(start, end),
+        )
+    })
+}
+
+fn summarize_receiver_context(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    flow: &ProvenOriginFlow,
+    runtime_calls: &[ProvenPrototypeMethodCallTarget],
+    context: &ProvenOriginContext,
+    entry: Option<&ProvenOriginDirectCall>,
+    method_memo: &mut HashMap<MethodPreservationKey, Option<ReceiverPreservationRequirements>>,
+    method_visiting: &mut HashSet<MethodPreservationKey>,
+    context_visiting: &mut HashSet<ContextPreservationKey>,
+) -> Option<ReceiverPreservationRequirements> {
+    let key = (
+        context.clone(),
+        entry.map(|call| (call.call_start, call.call_end)),
+    );
+    if !context_visiting.insert(key.clone()) {
+        return None;
+    }
+    let scoping = semantic.scoping();
+    let unreachable = |start, end| {
+        direct_call_event_unreachable_if_specialized(source, program, scoping, entry, start, end)
+    };
+    let mut requirements = ReceiverPreservationRequirements::default();
+
+    if flow.exposures.iter().any(|event| {
+        event.context == *context && !unreachable(event.exposure_start, event.exposure_end)
+    }) || flow
+        .member_writes
+        .iter()
+        .any(|event| event.context == *context && !unreachable(event.write_start, event.write_end))
+    {
+        context_visiting.remove(&key);
+        return None;
+    }
+
+    for read in flow
+        .member_reads
+        .iter()
+        .filter(|event| event.context == *context)
+    {
+        if unreachable(read.read_start, read.read_end) {
+            continue;
+        }
+        let property = read.property.as_ref()?;
+        if property == "__proto__" {
+            context_visiting.remove(&key);
+            return None;
+        }
+        requirements.own_data_fields.insert(property.clone());
+    }
+
+    for member_call in flow
+        .member_calls
+        .iter()
+        .filter(|event| event.context == *context)
+    {
+        if unreachable(member_call.call_start, member_call.call_end) {
+            continue;
+        }
+        let mut matches = runtime_calls
+            .iter()
+            .filter(|proof| proof.candidate.call == *member_call);
+        let nested = matches.next()?;
+        if matches.next().is_some() {
+            context_visiting.remove(&key);
+            return None;
+        }
+        let nested_requirements = summarize_runtime_prototype_method_preservation(
+            source,
+            program,
+            semantic,
+            nested,
+            method_memo,
+            method_visiting,
+        )?;
+        requirements.merge(nested_requirements);
+    }
+
+    for direct in flow
+        .direct_calls
+        .iter()
+        .filter(|call| call.caller == *context)
+    {
+        if unreachable(direct.call_start, direct.call_end) {
+            continue;
+        }
+        requirements.standard_function_call_semantics_required |=
+            direct.standard_function_call_semantics_required;
+        let nested = summarize_receiver_context(
+            source,
+            program,
+            semantic,
+            flow,
+            runtime_calls,
+            &direct.callee,
+            Some(direct),
+            method_memo,
+            method_visiting,
+            context_visiting,
+        )?;
+        requirements.merge(nested);
+    }
+
+    context_visiting.remove(&key);
+    Some(requirements)
+}
+
+fn summarize_runtime_prototype_method_preservation(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    target: &ProvenPrototypeMethodCallTarget,
+    memo: &mut HashMap<MethodPreservationKey, Option<ReceiverPreservationRequirements>>,
+    visiting: &mut HashSet<MethodPreservationKey>,
+) -> Option<ReceiverPreservationRequirements> {
+    let candidate = &target.candidate;
+    let key = (
+        candidate.call.call_start,
+        candidate.call.call_end,
+        candidate.call.allocation_start,
+        candidate.call.allocation_end,
+        candidate.call.property.clone(),
+    );
+    if let Some(cached) = memo.get(&key) {
+        return cached.clone();
+    }
+    if !visiting.insert(key.clone()) {
+        return None;
+    }
+
+    let flow = propagate_proven_prototype_method_call_origins(program, semantic.scoping(), target);
+    let runtime_calls =
+        structurally_proven_prototype_method_calls_at_runtime_in_flow(program, semantic, &flow);
+    let mut requirements = ReceiverPreservationRequirements::default();
+    let mut context_visiting = HashSet::new();
+    let mut success = true;
+    for function in &candidate.lookup_target.possible_functions {
+        let context = ProvenOriginContext {
+            function_start: function.function_start,
+            function_end: function.function_end,
+            allocation_start: candidate.call.allocation_start,
+            allocation_end: candidate.call.allocation_end,
+            constructor_start: candidate.call.constructor_start,
+            constructor_end: candidate.call.constructor_end,
+            this_origin: true,
+            parameter_indices: Vec::new(),
+        };
+        let Some(summary) = summarize_receiver_context(
+            source,
+            program,
+            semantic,
+            &flow,
+            &runtime_calls,
+            &context,
+            None,
+            memo,
+            visiting,
+            &mut context_visiting,
+        ) else {
+            success = false;
+            break;
+        };
+        requirements.merge(summary);
+    }
+    visiting.remove(&key);
+    let result = success.then_some(requirements);
+    memo.insert(key, result.clone());
+    result
+}
+
+/// Summarize one already runtime-proven prototype method call.
+///
+/// The result is conditional on the listed ordinary own-data fields existing
+/// at method entry. This focused form is useful to consumers that already hold
+/// the exact call target and avoids recomputing summaries for unrelated calls.
+#[must_use]
+pub fn proven_prototype_method_receiver_preservation_summary(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    target: &ProvenPrototypeMethodCallTarget,
+) -> Option<ProvenPrototypeMethodReceiverPreservationSummary> {
+    let requirements = summarize_runtime_prototype_method_preservation(
+        source,
+        program,
+        semantic,
+        target,
+        &mut HashMap::new(),
+        &mut HashSet::new(),
+    )?;
+    let mut required_own_data_fields = requirements.own_data_fields.into_iter().collect::<Vec<_>>();
+    required_own_data_fields.sort();
+    Some(ProvenPrototypeMethodReceiverPreservationSummary {
+        call_target: target.clone(),
+        required_own_data_fields,
+        standard_function_call_semantics_required: requirements
+            .standard_function_call_semantics_required,
+    })
+}
+
+/// Prove runtime-targeted prototype methods that preserve receiver identity and
+/// member shape, conditional only on a finite set of ordinary own-data fields
+/// already existing at method entry. Exact direct-call scalar facts discharge
+/// unreachable effects; nested runtime-proven prototype calls are summarized
+/// recursively. Cycles and unresolved receiver effects fail closed.
+#[must_use]
+pub fn structurally_proven_prototype_method_receiver_preservation_summaries(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+) -> Vec<ProvenPrototypeMethodReceiverPreservationSummary> {
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    let mut proven = Vec::new();
+    for target in structurally_proven_prototype_method_calls_at_runtime(program, semantic) {
+        let Some(requirements) = summarize_runtime_prototype_method_preservation(
+            source,
+            program,
+            semantic,
+            &target,
+            &mut memo,
+            &mut visiting,
+        ) else {
+            continue;
+        };
+        let mut required_own_data_fields =
+            requirements.own_data_fields.into_iter().collect::<Vec<_>>();
+        required_own_data_fields.sort();
+        proven.push(ProvenPrototypeMethodReceiverPreservationSummary {
+            call_target: target,
+            required_own_data_fields,
+            standard_function_call_semantics_required: requirements
+                .standard_function_call_semantics_required,
+        });
+    }
+    proven.sort_by_key(|proof| {
+        (
+            proof.call_target.candidate.call.call_start,
+            proof.call_target.candidate.call.call_end,
+            proof.call_target.candidate.call.property.clone(),
+        )
+    });
+    proven.dedup();
+    proven
+}
+
 /// Prove exact-origin prototype method calls that preserve receiver identity and
 /// shape on every normal-return path represented by the supported effect model.
 /// Static receiver reads must be discharged as ordinary own-data fields at the
@@ -3256,18 +3595,13 @@ pub fn structurally_proven_receiver_preserving_prototype_method_calls(
 ) -> Vec<ProvenReceiverPreservingPrototypeMethodCall> {
     let fields = structurally_proven_own_data_fields_at_member_calls(source, program, semantic);
     let mut proven = Vec::new();
-    for call_target in structurally_proven_prototype_method_calls_at_runtime(program, semantic) {
-        let candidate = call_target.candidate;
-        if candidate.receiver_effects.mutates_receiver
-            || candidate.receiver_effects.exposes_receiver
-            || candidate.receiver_effects.dynamic_receiver_access
-            || !candidate.receiver_effects.receiver_calls.is_empty()
-        {
-            continue;
-        }
+    for summary in structurally_proven_prototype_method_receiver_preservation_summaries(
+        source, program, semantic,
+    ) {
+        let candidate = summary.call_target.candidate;
         let mut reads = Vec::new();
         let mut all_reads_proven = true;
-        for property in &candidate.receiver_effects.receiver_reads {
+        for property in &summary.required_own_data_fields {
             let Some(field) = fields.iter().find(|field| {
                 field.initialization.allocation_start == candidate.call.allocation_start
                     && field.initialization.allocation_end == candidate.call.allocation_end
@@ -3306,8 +3640,10 @@ mod tests {
         structurally_proven_origin_direct_calls, structurally_proven_origin_exposures,
         structurally_proven_origin_flow, structurally_proven_prototype_method_assignments,
         structurally_proven_prototype_method_calls_at_runtime,
+        structurally_proven_prototype_method_calls_at_runtime_in_flow,
         structurally_proven_prototype_method_lookup_targets,
         structurally_proven_prototype_method_receiver_effects,
+        structurally_proven_prototype_method_receiver_preservation_summaries,
     };
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
@@ -3363,6 +3699,46 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping())
+    }
+
+    #[test]
+    fn proves_seeded_nested_method_call_runtime_target() {
+        let source = r#"
+            (function() {
+                const C = function() { use(this); };
+                function helper() { this.read(); }
+                C.prototype.outer = function() { helper.call(this); };
+                C.prototype.read = function() { return 1; };
+                function use(state) { state.outer(); }
+                api.make = function() { return new C(); };
+            })();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        let outer = structurally_proven_prototype_method_calls_at_runtime(
+            &parsed.program,
+            &semantic.semantic,
+        )
+        .into_iter()
+        .find(|proof| proof.candidate.call.property == "outer")
+        .expect("runtime outer call");
+        let seeded = super::propagate_proven_prototype_method_call_origins(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &outer,
+        );
+        let nested = structurally_proven_prototype_method_calls_at_runtime_in_flow(
+            &parsed.program,
+            &semantic.semantic,
+            &seeded,
+        );
+        assert!(nested
+            .iter()
+            .any(|proof| proof.candidate.call.property == "read"));
     }
 
     #[test]
@@ -3500,6 +3876,110 @@ mod tests {
             .member_calls
             .iter()
             .any(|call| { call.context == edge.callee && call.property == "finish" }));
+    }
+
+    #[test]
+    fn summarizes_transitive_receiver_preservation_requirements() {
+        let source = r#"
+            (function() {
+                const C = function() { this.value = 1; use(this); };
+                function helper(selector) {
+                    let state = 5;
+                    while (state != 27) {
+                        if (state == 5) state = selector == 14 ? 32 : 92;
+                        else if (state == 32) state = 61;
+                        else if (state == 61) this.read(), state = 85;
+                        else if (state == 85) return;
+                        else if (state == 92) this.bad = 1, state = 27;
+                    }
+                }
+                C.prototype.outer = function() { helper.call(this, 14); };
+                C.prototype.read = function() { return this.value; };
+                function use(state) { state.outer(); }
+                api.make = function() { return new C(); };
+            })();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        let summaries = structurally_proven_prototype_method_receiver_preservation_summaries(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+        );
+        eprintln!("summaries={:?}", summaries);
+        let outer = summaries
+            .iter()
+            .find(|summary| summary.call_target.candidate.call.property == "outer")
+            .expect("preserving outer summary");
+        assert_eq!(outer.required_own_data_fields, vec!["value"]);
+        assert!(outer.standard_function_call_semantics_required);
+    }
+
+    #[test]
+    fn transitive_receiver_preservation_rejects_reachable_mutation() {
+        let source = r#"
+            (function() {
+                const C = function() { use(this); };
+                function helper(selector) {
+                    let state = 5;
+                    while (state != 27) {
+                        if (state == 5) state = selector == 14 ? 32 : 92;
+                        else if (state == 32) state = 85;
+                        else if (state == 85) return;
+                        else if (state == 92) this.bad = 1, state = 27;
+                    }
+                }
+                C.prototype.outer = function() { helper.call(this, 15); };
+                function use(state) { state.outer(); }
+                api.make = function() { return new C(); };
+            })();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(
+            structurally_proven_prototype_method_receiver_preservation_summaries(
+                source,
+                &parsed.program,
+                &semantic.semantic,
+            )
+            .iter()
+            .all(|summary| summary.call_target.candidate.call.property != "outer")
+        );
+    }
+
+    #[test]
+    fn transitive_receiver_preservation_rejects_method_cycle() {
+        let source = r#"
+            (function() {
+                const C = function() { use(this); };
+                C.prototype.loop = function() { this.loop(); };
+                function use(state) { state.loop(); }
+                api.make = function() { return new C(); };
+            })();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(
+            structurally_proven_prototype_method_receiver_preservation_summaries(
+                source,
+                &parsed.program,
+                &semantic.semantic,
+            )
+            .iter()
+            .all(|summary| summary.call_target.candidate.call.property != "loop")
+        );
     }
 
     #[test]
