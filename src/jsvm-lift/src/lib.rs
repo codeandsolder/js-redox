@@ -2,6 +2,8 @@ pub mod ast_utils;
 pub mod source_text;
 pub mod state_flatten;
 
+pub mod symbolic_integer;
+
 pub mod har_project;
 
 pub mod bundle_unpack;

@@ -237,6 +237,26 @@ fn main() -> Result<()> {
                 })
             })
             .collect::<Vec<_>>();
+        let seeded_installs =
+            proven_origin_registry_handler_installs(&parsed.program, scoping, &seeded)
+                .into_iter()
+                .filter(|proof| {
+                    (
+                        proof.origin.allocation_start,
+                        proof.origin.allocation_end,
+                        proof.origin.constructor_start,
+                        proof.origin.constructor_end,
+                    ) == target_origin
+                })
+                .map(|proof| {
+                    json!({
+                        "call": [proof.install.call_start, proof.install.call_end],
+                        "exact_key": proof.exact_key,
+                        "registry_path": proof.install.registry_path,
+                        "handler": [proof.install.handler_start, proof.install.handler_end],
+                    })
+                })
+                .collect::<Vec<_>>();
         let installs = proven_origin_registry_handler_installs(&parsed.program, scoping, &base)
             .into_iter()
             .filter(|proof| {
@@ -268,6 +288,7 @@ fn main() -> Result<()> {
                 "allocation": [target.candidate.call.allocation_start, target.candidate.call.allocation_end],
                 "registry_reads": reads,
                 "registry_installs": installs,
+                "seeded_registry_installs": seeded_installs,
                 "origin_tables": origin_tables,
                 "table_vms": table_analysis.table_vms,
                 "prototype_strings_at_allocation": prototype_strings_at_allocation,
