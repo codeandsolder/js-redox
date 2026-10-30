@@ -277,6 +277,187 @@ fn binary_state_comparison_literal(
     None
 }
 
+fn binary_comparison_ident_literal(
+    binary: &oxc_ast::ast::BinaryExpression<'_>,
+) -> Option<(String, u64)> {
+    if !matches!(binary.operator.as_str(), "==" | "===") {
+        return None;
+    }
+    if let (Some(state_var), Some(state)) = (expr_ident(&binary.left), numeric_u64(&binary.right)) {
+        return Some((state_var.to_string(), state));
+    }
+    if let (Some(state), Some(state_var)) = (numeric_u64(&binary.left), expr_ident(&binary.right)) {
+        return Some((state_var.to_string(), state));
+    }
+    None
+}
+
+fn assignment_expression_state_init(
+    assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+    state_var: &str,
+) -> Option<u64> {
+    if !assignment.operator.is_assign() {
+        return None;
+    }
+    if target_ident(&assignment.left) == Some(state_var) {
+        static_u64(&assignment.right)
+    } else {
+        expression_state_init(&assignment.right, state_var)
+    }
+}
+
+fn expression_state_init(expression: &Expression<'_>, state_var: &str) -> Option<u64> {
+    match expression {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            expression_state_init(&parenthesized.expression, state_var)
+        }
+        Expression::SequenceExpression(sequence) => sequence
+            .expressions
+            .iter()
+            .filter_map(|expression| expression_state_init(expression, state_var))
+            .last(),
+        Expression::AssignmentExpression(assignment) => {
+            assignment_expression_state_init(assignment, state_var)
+        }
+        _ => None,
+    }
+}
+
+fn for_state_init_for_var(for_stmt: &ForStatement<'_>, state_var: &str) -> Option<u64> {
+    match for_stmt.init.as_ref()? {
+        oxc_ast::ast::ForStatementInit::VariableDeclaration(declaration) => {
+            declaration.declarations.iter().find_map(|declarator| {
+                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                    return None;
+                };
+                (identifier.name == state_var)
+                    .then(|| declarator.init.as_ref().and_then(static_u64))
+                    .flatten()
+            })
+        }
+        oxc_ast::ast::ForStatementInit::AssignmentExpression(assignment) => {
+            assignment_expression_state_init(assignment, state_var)
+        }
+        oxc_ast::ast::ForStatementInit::SequenceExpression(sequence) => sequence
+            .expressions
+            .iter()
+            .filter_map(|expression| expression_state_init(expression, state_var))
+            .last(),
+        _ => None,
+    }
+}
+
+struct UnconditionalLoopStateEvidence {
+    comparisons: HashMap<String, BTreeSet<u64>>,
+}
+
+impl<'a> Visit<'a> for UnconditionalLoopStateEvidence {
+    fn visit_binary_expression(&mut self, binary: &oxc_ast::ast::BinaryExpression<'a>) {
+        if let Some((state_var, state)) = binary_comparison_ident_literal(binary) {
+            self.comparisons.entry(state_var).or_default().insert(state);
+        }
+        walk::walk_binary_expression(self, binary);
+    }
+
+    fn visit_for_statement(&mut self, _statement: &ForStatement<'a>) {}
+    fn visit_while_statement(&mut self, _statement: &WhileStatement<'a>) {}
+    fn visit_do_while_statement(&mut self, _statement: &oxc_ast::ast::DoWhileStatement<'a>) {}
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn directly_breaks_loop(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::BreakStatement(statement) => statement.label.is_none(),
+        Statement::BlockStatement(block) => {
+            matches!(block.body.as_slice(), [Statement::BreakStatement(statement)] if statement.label.is_none())
+        }
+        _ => false,
+    }
+}
+
+struct GuardedBreakCollector<'s> {
+    state_var: &'s str,
+    exit_states: BTreeSet<u64>,
+}
+
+impl<'a> Visit<'a> for GuardedBreakCollector<'_> {
+    fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
+        if let Expression::BinaryExpression(binary) = &statement.test {
+            if let Some(state) = binary_state_comparison_literal(binary, self.state_var) {
+                if directly_breaks_loop(&statement.consequent) {
+                    self.exit_states.insert(state);
+                }
+            }
+        }
+        walk::walk_if_statement(self, statement);
+    }
+
+    fn visit_for_statement(&mut self, _statement: &ForStatement<'a>) {}
+    fn visit_while_statement(&mut self, _statement: &WhileStatement<'a>) {}
+    fn visit_do_while_statement(&mut self, _statement: &oxc_ast::ast::DoWhileStatement<'a>) {}
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn unconditional_for_if_ladder_candidates(
+    source: &str,
+    function_id: &str,
+    for_stmt: &ForStatement<'_>,
+) -> Vec<IfLadderStateMachineCandidate> {
+    if for_stmt.test.is_some() || for_stmt.update.is_some() {
+        return Vec::new();
+    }
+
+    let mut evidence = UnconditionalLoopStateEvidence {
+        comparisons: HashMap::new(),
+    };
+    evidence.visit_statement(&for_stmt.body);
+
+    let mut candidates = Vec::new();
+    for (state_var, compared_states) in evidence.comparisons {
+        if compared_states.len() < 4 {
+            continue;
+        }
+        let Some(init_state) = for_state_init_for_var(for_stmt, &state_var) else {
+            continue;
+        };
+        let mut breaks = GuardedBreakCollector {
+            state_var: &state_var,
+            exit_states: BTreeSet::new(),
+        };
+        breaks.visit_statement(&for_stmt.body);
+        let mut exit_states = breaks.exit_states.into_iter();
+        let Some(exit_state) = exit_states.next() else {
+            continue;
+        };
+        if exit_states.next().is_some() {
+            continue;
+        }
+        if let Some(machine) = detect_if_ladder_candidate(
+            source,
+            function_id,
+            for_stmt.span.start,
+            for_stmt.span.end,
+            &for_stmt.body,
+            state_var,
+            init_state,
+            exit_state,
+        ) {
+            candidates.push(machine);
+        }
+    }
+    candidates
+}
+
 fn state_exit_literal(expr: &Expression<'_>, state_var: &str) -> Option<u64> {
     let Expression::BinaryExpression(binary) = expr else {
         return None;
@@ -589,6 +770,75 @@ fn prove_machine_event_before_barriers(
     }
 
     !reached_unsafe
+}
+
+/// Prove that every listed machine state must have been visited before `event`
+/// on every statically known path from the machine's initial state that reaches
+/// the event.
+///
+/// This theorem is intentionally about state visitation, not arbitrary AST
+/// effects inside the state's branch. Consumers must independently prove that
+/// any required side effect is unconditional once that state is entered.
+/// Finite transition sets are treated as nondeterministic edges. An unresolved
+/// transition before the required state fails closed; after that state it is
+/// harmless because state visitation is monotonic. Paths that exit without
+/// reaching the event are irrelevant.
+fn prove_machine_states_before_event(
+    machine: &IfLadderStateMachineCandidate,
+    body: &Statement<'_>,
+    required_states: &[u64],
+    event: Span,
+) -> bool {
+    if required_states.is_empty() {
+        return false;
+    }
+    let Some(event_state) = branch_state_for_span(body, &machine.state_var, event) else {
+        return false;
+    };
+
+    let mut edges: HashMap<u64, BTreeSet<u64>> = HashMap::new();
+    let mut unresolved = BTreeSet::new();
+    for transition in &machine.transitions {
+        if transition.possible_target_states.is_empty() {
+            unresolved.insert(transition.from_state);
+            continue;
+        }
+        edges
+            .entry(transition.from_state)
+            .or_default()
+            .extend(transition.possible_target_states.iter().copied());
+    }
+
+    required_states.iter().copied().all(|required_state| {
+        let mut queue = VecDeque::from([(machine.init_state, false)]);
+        let mut seen = BTreeSet::new();
+        let mut reached_event = false;
+        while let Some((state, already_visited_required)) = queue.pop_front() {
+            if !seen.insert((state, already_visited_required)) {
+                continue;
+            }
+
+            let visited_required = already_visited_required || state == required_state;
+            if state == event_state {
+                reached_event = true;
+                if !visited_required {
+                    return false;
+                }
+                continue;
+            }
+
+            if unresolved.contains(&state) {
+                if !visited_required {
+                    return false;
+                }
+                continue;
+            }
+            if let Some(targets) = edges.get(&state) {
+                queue.extend(targets.iter().map(|target| (*target, visited_required)));
+            }
+        }
+        reached_event
+    })
 }
 
 fn prove_machine_event_unreachable_with_integer_bindings(
@@ -1785,6 +2035,68 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
     harness.result.unwrap_or(false)
 }
 
+/// Prove required flattened-machine states dominate an event in one already
+/// detected machine.
+#[must_use]
+pub fn prove_detected_if_ladder_states_before_event(
+    program: &Program<'_>,
+    machine: &IfLadderStateMachineCandidate,
+    required_states: &[u64],
+    event: Span,
+) -> bool {
+    struct Harness<'m, 'r> {
+        machine: &'m IfLadderStateMachineCandidate,
+        required_states: &'r [u64],
+        event: Span,
+        result: Option<bool>,
+    }
+
+    impl<'a> Visit<'a> for Harness<'_, '_> {
+        fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+            if self.result.is_some() {
+                return;
+            }
+            if statement.span.start == self.machine.start && statement.span.end == self.machine.end
+            {
+                self.result = Some(prove_machine_states_before_event(
+                    self.machine,
+                    &statement.body,
+                    self.required_states,
+                    self.event,
+                ));
+                return;
+            }
+            walk::walk_for_statement(self, statement);
+        }
+
+        fn visit_while_statement(&mut self, statement: &WhileStatement<'a>) {
+            if self.result.is_some() {
+                return;
+            }
+            if statement.span.start == self.machine.start && statement.span.end == self.machine.end
+            {
+                self.result = Some(prove_machine_states_before_event(
+                    self.machine,
+                    &statement.body,
+                    self.required_states,
+                    self.event,
+                ));
+                return;
+            }
+            walk::walk_while_statement(self, statement);
+        }
+    }
+
+    let mut harness = Harness {
+        machine,
+        required_states,
+        event,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(false)
+}
+
 pub fn prove_detected_if_ladder_event_before_barriers(
     program: &Program<'_>,
     machine: &IfLadderStateMachineCandidate,
@@ -1838,6 +2150,139 @@ pub fn prove_detected_if_ladder_event_before_barriers(
         machine,
         event,
         barriers,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(false)
+}
+
+/// Prove required state visitation inside the unique detected flattened
+/// if-ladder machine containing `event` in one exact function.
+#[must_use]
+pub fn prove_function_if_ladder_states_before_event(
+    source: &str,
+    program: &Program<'_>,
+    function_start: u32,
+    function_end: u32,
+    required_states: &[u64],
+    event: Span,
+) -> bool {
+    struct FunctionHarness<'s, 'r> {
+        source: &'s str,
+        function_start: u32,
+        function_end: u32,
+        required_states: &'r [u64],
+        event: Span,
+        result: Option<bool>,
+    }
+
+    impl FunctionHarness<'_, '_> {
+        fn prove_body(&self, body: &FunctionBody<'_>) -> bool {
+            struct Collector<'s, 'r> {
+                source: &'s str,
+                required_states: &'r [u64],
+                event: Span,
+                matches: usize,
+                result: bool,
+            }
+
+            impl Collector<'_, '_> {
+                fn scan_statement_list(&mut self, statements: &[Statement<'_>]) {
+                    for pair in statements.windows(2) {
+                        let [init, Statement::WhileStatement(while_statement)] = pair else {
+                            continue;
+                        };
+                        let Some(machine) = detect_while_state_machine(
+                            self.source,
+                            "required-state-order",
+                            init,
+                            while_statement,
+                        ) else {
+                            continue;
+                        };
+                        if machine.start <= self.event.start && self.event.end <= machine.end {
+                            self.matches += 1;
+                            self.result = prove_machine_states_before_event(
+                                &machine,
+                                &while_statement.body,
+                                self.required_states,
+                                self.event,
+                            );
+                        }
+                    }
+                }
+            }
+
+            impl<'a> Visit<'a> for Collector<'_, '_> {
+                fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+                    self.scan_statement_list(&body.statements);
+                    walk::walk_function_body(self, body);
+                }
+                fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+                    self.scan_statement_list(&block.body);
+                    walk::walk_block_statement(self, block);
+                }
+                fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+                    let detected =
+                        detect_for_state_machines(self.source, "required-state-order", statement);
+                    for machine in detected.if_ladder_machines {
+                        if machine.start <= self.event.start && self.event.end <= machine.end {
+                            self.matches += 1;
+                            self.result = prove_machine_states_before_event(
+                                &machine,
+                                &statement.body,
+                                self.required_states,
+                                self.event,
+                            );
+                        }
+                    }
+                    walk::walk_for_statement(self, statement);
+                }
+                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                }
+            }
+
+            let mut collector = Collector {
+                source: self.source,
+                required_states: self.required_states,
+                event: self.event,
+                matches: 0,
+                result: false,
+            };
+            collector.visit_function_body(body);
+            collector.matches == 1 && collector.result
+        }
+    }
+
+    impl<'a> Visit<'a> for FunctionHarness<'_, '_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if self.result.is_some() {
+                return;
+            }
+            if function.span.start == self.function_start && function.span.end == self.function_end
+            {
+                self.result = Some(
+                    function
+                        .body
+                        .as_ref()
+                        .is_some_and(|body| self.prove_body(body)),
+                );
+                return;
+            }
+            walk::walk_function(self, function, flags);
+        }
+    }
+
+    let mut harness = FunctionHarness {
+        source,
+        function_start,
+        function_end,
+        required_states,
+        event,
         result: None,
     };
     harness.visit_program(program);
@@ -2114,12 +2559,22 @@ pub fn detect_for_state_machines(
     for_stmt: &ForStatement<'_>,
 ) -> DetectedStateMachines {
     let mut detected = DetectedStateMachines::default();
-    let Some((state_var, init_state)) = for_state_init(for_stmt) else {
-        return detected;
-    };
     if for_stmt.update.is_some() {
         return detected;
     }
+    if for_stmt.test.is_none() {
+        detected
+            .if_ladder_machines
+            .extend(unconditional_for_if_ladder_candidates(
+                source,
+                function_id,
+                for_stmt,
+            ));
+        return detected;
+    }
+    let Some((state_var, init_state)) = for_state_init(for_stmt) else {
+        return detected;
+    };
     if let Some(test) = for_stmt.test.as_ref() {
         let test_preview = preview(source, test.span().start, test.span().end, 180);
         if test_preview.contains(&state_var)
@@ -3409,6 +3864,149 @@ mod tests {
         };
         harness.visit_program(&parsed.program);
         harness.result.unwrap_or(false)
+    }
+
+    #[test]
+    fn detects_unconditional_for_if_ladder_with_guarded_break_exit() {
+        let detected = detect(
+            r#"
+            function flattened() {
+                let outer, noise, state;
+                for (outer = (state = 17, noise = side(), 0);;) {
+                    if (state == 33) break;
+                    else if (state == 17) state = 4;
+                    else if (state == 4) state = 79;
+                    else if (state == 79) target(), state = 44;
+                    else if (state == 44) state = 33;
+                }
+            }
+            "#,
+        );
+        assert_eq!(detected.if_ladder_machines.len(), 1);
+        let machine = &detected.if_ladder_machines[0];
+        assert_eq!(machine.state_var, "state");
+        assert_eq!(machine.init_state, 17);
+        assert_eq!(machine.exit_state, 33);
+        assert!(machine.transitions.iter().any(|transition| {
+            transition.from_state == 17 && transition.target_state == Some(4)
+        }));
+    }
+
+    #[test]
+    fn proves_required_state_before_event() {
+        let source = r#"
+            function flattened() {
+                let state;
+                for (state = 0; state !== 99;) {
+                    if (state === 0) { state = 1; }
+                    else if (state === 1) { required(); state = 2; }
+                    else if (state === 2) { target(); state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        let target_start = source.find("target()").unwrap() as u32;
+        let target = Span::new(target_start, target_start + 8);
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let function_start = source.find("function flattened").unwrap() as u32;
+        let function_end = source.rfind('}').unwrap() as u32 + 1;
+        assert!(prove_function_if_ladder_states_before_event(
+            source,
+            &parsed.program,
+            function_start,
+            function_end,
+            &[1],
+            target,
+        ));
+    }
+
+    #[test]
+    fn allows_unresolved_transition_after_required_state() {
+        let source = r#"
+            function flattened(flag, unknown) {
+                let state;
+                for (state = 0; state !== 99;) {
+                    if (state === 0) { state = 1; }
+                    else if (state === 1) { required(); state = 2; }
+                    else if (state === 2) { state = flag ? 3 : 4; }
+                    else if (state === 3) { target(); state = 99; }
+                    else if (state === 4) { state = unknown; }
+                }
+            }
+        "#;
+        let target_start = source.find("target()").unwrap() as u32;
+        let target = Span::new(target_start, target_start + 8);
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let function_start = source.find("function flattened").unwrap() as u32;
+        let function_end = source.rfind('}').unwrap() as u32 + 1;
+        assert!(prove_function_if_ladder_states_before_event(
+            source,
+            &parsed.program,
+            function_start,
+            function_end,
+            &[1],
+            target,
+        ));
+    }
+
+    #[test]
+    fn rejects_unresolved_transition_before_required_state() {
+        let source = r#"
+            function flattened(flag, unknown) {
+                let state;
+                for (state = 0; state !== 99;) {
+                    if (state === 0) { state = flag ? 1 : 4; }
+                    else if (state === 1) { required(); state = 2; }
+                    else if (state === 2) { target(); state = 99; }
+                    else if (state === 4) { state = unknown; }
+                }
+            }
+        "#;
+        let target_start = source.find("target()").unwrap() as u32;
+        let target = Span::new(target_start, target_start + 8);
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let function_start = source.find("function flattened").unwrap() as u32;
+        let function_end = source.rfind('}').unwrap() as u32 + 1;
+        assert!(!prove_function_if_ladder_states_before_event(
+            source,
+            &parsed.program,
+            function_start,
+            function_end,
+            &[1],
+            target,
+        ));
+    }
+
+    #[test]
+    fn rejects_required_state_bypassed_on_path_to_event() {
+        let source = r#"
+            function flattened(flag) {
+                let state;
+                for (state = 0; state !== 99;) {
+                    if (state === 0) { state = flag ? 1 : 2; }
+                    else if (state === 1) { required(); state = 2; }
+                    else if (state === 2) { target(); state = 99; }
+                    else if (state === 3) { state = 99; }
+                }
+            }
+        "#;
+        let target_start = source.find("target()").unwrap() as u32;
+        let target = Span::new(target_start, target_start + 8);
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let function_start = source.find("function flattened").unwrap() as u32;
+        let function_end = source.rfind('}').unwrap() as u32 + 1;
+        assert!(!prove_function_if_ladder_states_before_event(
+            source,
+            &parsed.program,
+            function_start,
+            function_end,
+            &[1],
+            target,
+        ));
     }
 
     #[test]
