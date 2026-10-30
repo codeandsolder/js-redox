@@ -1,4 +1,4 @@
-use oxc_ast::AstKind;
+use oxc_ast::{ast::FunctionType, AstKind};
 use oxc_cfg::{
     graph::{visit::EdgeRef, Direction},
     BlockNodeId, EdgeType,
@@ -25,6 +25,19 @@ fn enclosing_function(semantic: &Semantic<'_>, node_id: NodeId) -> Option<NodeId
             matches!(
                 node.kind(),
                 AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+            )
+            .then_some(ancestor_id)
+        })
+}
+
+fn enclosing_execution_context(semantic: &Semantic<'_>, node_id: NodeId) -> Option<NodeId> {
+    semantic
+        .nodes()
+        .ancestors_enumerated(node_id)
+        .find_map(|(ancestor_id, node)| {
+            matches!(
+                node.kind(),
+                AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) | AstKind::Program(_)
             )
             .then_some(ancestor_id)
         })
@@ -132,10 +145,10 @@ pub fn prove_event_before_barriers(
     reached_event
 }
 
-fn prove_required_before_event(
+fn prove_required_before_node(
     semantic: &Semantic<'_>,
-    function_node: NodeId,
-    event_block: BlockNodeId,
+    execution_context: NodeId,
+    event_node: NodeId,
     event: Span,
     required: Span,
 ) -> bool {
@@ -143,14 +156,15 @@ fn prove_required_before_event(
         return false;
     };
     let nodes = semantic.nodes();
+    let event_block = nodes.cfg_id(event_node);
     let Some(required_node) = deepest_exact_span_node(semantic, required) else {
         return false;
     };
-    if enclosing_function(semantic, required_node) != Some(function_node) {
+    if enclosing_execution_context(semantic, required_node) != Some(execution_context) {
         return false;
     }
     let required_block = nodes.cfg_id(required_node);
-    let function_entry = nodes.cfg_id(function_node);
+    let function_entry = nodes.cfg_id(execution_context);
     let mut queue = VecDeque::from([(function_entry, false)]);
     let mut seen = HashSet::new();
     let mut reached_event = false;
@@ -189,36 +203,156 @@ fn prove_required_before_event(
     reached_event
 }
 
-/// Prove that every supplied `required` event executes before `event` on every
-/// acyclic path that reaches `event` in the same function invocation.
+/// Prove that every supplied `required` AST evaluation begins before `event`
+/// on every path that reaches `event` in the same execution context.
 ///
-/// This is a conditional dominance-style proof over Oxc's CFG. It fails closed
-/// on cross-function requirements, unresolved spans, or relevant loop
-/// backedges.
+/// This is a conditional dominance-style proof over Oxc's CFG. Cycles are
+/// handled by carrying whether the requirement has been crossed as part of the
+/// traversal state. Cross-function requirements and unresolved spans fail closed.
 pub fn prove_events_before_event(semantic: &Semantic<'_>, required: &[Span], event: Span) -> bool {
     let Some(event_node) = deepest_exact_span_node(semantic, event) else {
         return false;
     };
-    let Some(function_node) = enclosing_function(semantic, event_node) else {
+    let Some(execution_context) = enclosing_execution_context(semantic, event_node) else {
         return false;
     };
-    let event_block = semantic.nodes().cfg_id(event_node);
     !required.is_empty()
         && required.iter().all(|required| {
             *required != event
-                && prove_required_before_event(
+                && prove_required_before_node(
                     semantic,
-                    function_node,
-                    event_block,
+                    execution_context,
+                    event_node,
                     event,
                     *required,
                 )
         })
 }
 
+fn has_enclosing_try_before_execution_context(
+    semantic: &Semantic<'_>,
+    node_id: NodeId,
+    execution_context: NodeId,
+) -> bool {
+    semantic
+        .nodes()
+        .ancestors_enumerated(node_id)
+        .take_while(|(ancestor_id, _)| *ancestor_id != execution_context)
+        .any(|(_, node)| matches!(node.kind(), AstKind::TryStatement(_)))
+}
+
+/// Prove that a required operation which takes effect on normal completion of
+/// its AST node has completed before `event` in the same execution context.
+///
+/// Oxc associates expression nodes with the CFG block where their evaluation
+/// begins. A throw before the operation's completion could therefore otherwise
+/// make entry dominance look like effect dominance. We fail closed when the
+/// required node is enclosed by `try`; without a local catcher, any abrupt
+/// completion leaves the execution context and cannot reach the later event.
+pub fn prove_event_completion_before_event(
+    semantic: &Semantic<'_>,
+    required: Span,
+    event: Span,
+) -> bool {
+    let Some(required_node) = deepest_exact_span_node(semantic, required) else {
+        return false;
+    };
+    let Some(event_node) = deepest_exact_span_node(semantic, event) else {
+        return false;
+    };
+    let Some(execution_context) = enclosing_execution_context(semantic, event_node) else {
+        return false;
+    };
+    if enclosing_execution_context(semantic, required_node) != Some(execution_context)
+        || has_enclosing_try_before_execution_context(semantic, required_node, execution_context)
+    {
+        return false;
+    }
+    required != event
+        && prove_required_before_node(semantic, execution_context, event_node, event, required)
+}
+
+fn function_value_is_runtime_expression(kind: AstKind<'_>) -> bool {
+    matches!(kind, AstKind::Function(function) if function.r#type == FunctionType::FunctionExpression)
+        || matches!(kind, AstKind::ArrowFunctionExpression(_))
+}
+
+/// Prove that a required operation has completed before execution of an event
+/// inside a later-created nested function value.
+///
+/// The proof is deliberately narrower than general interprocedural ordering:
+/// the directly nested bridge must be a function expression or arrow. Function
+/// declarations fail closed because hoisting decouples body availability from
+/// source evaluation order. For function values, the nearest outer parent
+/// expression begins before the function object can be created, so proving the
+/// required operation complete before that parent is a sufficient premise for
+/// every later execution of the nested body.
+pub fn prove_event_completion_before_nested_event(
+    semantic: &Semantic<'_>,
+    required: Span,
+    nested_event: Span,
+) -> bool {
+    let Some(required_node) = deepest_exact_span_node(semantic, required) else {
+        return false;
+    };
+    let Some(nested_event_node) = deepest_exact_span_node(semantic, nested_event) else {
+        return false;
+    };
+    let Some(required_context) = enclosing_execution_context(semantic, required_node) else {
+        return false;
+    };
+    let Some(nested_context) = enclosing_execution_context(semantic, nested_event_node) else {
+        return false;
+    };
+    if nested_context == required_context {
+        return prove_event_completion_before_event(semantic, required, nested_event);
+    }
+
+    let mut bridge_function = nested_context;
+    loop {
+        if !matches!(
+            semantic.nodes().kind(bridge_function),
+            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+        ) {
+            return false;
+        }
+        let Some(parent_context) = enclosing_execution_context(semantic, bridge_function) else {
+            return false;
+        };
+        if parent_context == required_context {
+            break;
+        }
+        bridge_function = parent_context;
+    }
+
+    let nodes = semantic.nodes();
+    if !function_value_is_runtime_expression(nodes.kind(bridge_function)) {
+        return false;
+    }
+    let creation_anchor = nodes.parent_id(bridge_function);
+    if enclosing_execution_context(semantic, creation_anchor) != Some(required_context) {
+        return false;
+    }
+    let anchor_span = nodes.kind(creation_anchor).span();
+    if has_enclosing_try_before_execution_context(semantic, required_node, required_context) {
+        return false;
+    }
+    required != anchor_span
+        && prove_required_before_node(
+            semantic,
+            required_context,
+            creation_anchor,
+            anchor_span,
+            required,
+        )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{prove_event_before_barriers, prove_events_before_event};
+    use super::{
+        prove_event_before_barriers, prove_event_completion_before_event,
+        prove_event_completion_before_nested_event, prove_events_before_event,
+    };
     use oxc_allocator::Allocator;
     use oxc_ast::{ast::Program, AstKind};
     use oxc_semantic::{Semantic, SemanticBuilder};
@@ -247,6 +381,18 @@ mod tests {
             .unwrap_or_else(|| panic!("missing call {needle}"))
     }
 
+    fn assignment_span(semantic: &Semantic<'_>, source: &str, needle: &str) -> Span {
+        semantic
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                AstKind::AssignmentExpression(assignment) => Some(assignment.span),
+                _ => None,
+            })
+            .find(|span| &source[span.start as usize..span.end as usize] == needle)
+            .unwrap_or_else(|| panic!("missing assignment {needle}"))
+    }
+
     fn prove(source: &str, event: &str, barriers: &[&str]) -> bool {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -258,6 +404,74 @@ mod tests {
             .map(|barrier| call_span(&semantic, source, barrier))
             .collect::<Vec<_>>();
         prove_event_before_barriers(&semantic, event, &barriers)
+    }
+
+    #[test]
+    fn proves_completed_assignment_before_later_event() {
+        let source = "function f() { state.value = 1; target(); }";
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = semantic(&parsed.program);
+        let assignment = assignment_span(&semantic, source, "state.value = 1");
+        let target = call_span(&semantic, source, "target()");
+        assert!(prove_event_completion_before_event(
+            &semantic, assignment, target
+        ));
+    }
+
+    #[test]
+    fn completed_event_rejects_enclosing_try() {
+        let source = "function f() { try { state.value = explode(); } catch (_) {} target(); }";
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = semantic(&parsed.program);
+        let assignment = assignment_span(&semantic, source, "state.value = explode()");
+        let target = call_span(&semantic, source, "target()");
+        assert!(!prove_event_completion_before_event(
+            &semantic, assignment, target
+        ));
+    }
+
+    #[test]
+    fn proves_completed_event_before_nested_function_expression_execution() {
+        let source =
+            "function outer() { proto.run = function() {}; holder.f = function() { target(); }; }";
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = semantic(&parsed.program);
+        let install = assignment_span(&semantic, source, "proto.run = function() {}");
+        let target = call_span(&semantic, source, "target()");
+        assert!(prove_event_completion_before_nested_event(
+            &semantic, install, target
+        ));
+    }
+
+    #[test]
+    fn nested_completion_rejects_function_declaration_bridge() {
+        let source =
+            "function outer() { proto.run = function() {}; function later() { target(); } }";
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = semantic(&parsed.program);
+        let install = assignment_span(&semantic, source, "proto.run = function() {}");
+        let target = call_span(&semantic, source, "target()");
+        assert!(!prove_event_completion_before_nested_event(
+            &semantic, install, target
+        ));
+    }
+
+    #[test]
+    fn nested_completion_rejects_function_value_created_before_required_event() {
+        let source =
+            "function outer() { holder.f = function() { target(); }; proto.run = function() {}; }";
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = semantic(&parsed.program);
+        let install = assignment_span(&semantic, source, "proto.run = function() {}");
+        let target = call_span(&semantic, source, "target()");
+        assert!(!prove_event_completion_before_nested_event(
+            &semantic, install, target
+        ));
     }
 
     #[test]
