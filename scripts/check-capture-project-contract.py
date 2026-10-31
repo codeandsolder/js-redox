@@ -76,16 +76,31 @@ def main() -> None:
         wrong_prefix["resources"] = [{"id": 0, "output_path": "src/outside.js"}]
         rejects(path, wrong_prefix, "must be under resources/")
 
-        wrong_id = valid_manifest()
-        wrong_id["resources"] = [{"id": 1, "output_path": "resources/a.js"}]
-        rejects(path, wrong_id, ".id must equal 0")
+        sparse_id = valid_manifest()
+        sparse_id["resources"] = [{"id": 7, "output_path": "resources/a.js"}]
+        sparse_id["inline_scripts"] = [
+            {"parent_resource_id": 7, "output_path": "resources/inline.js"}
+        ]
+        write(path, sparse_id)
+        assert read_manifest(path) == sparse_id
+
+        duplicate_id = valid_manifest()
+        duplicate_id["resources"] = [
+            {"id": 7, "output_path": "resources/a.js"},
+            {"id": 7, "output_path": "resources/b.js"},
+        ]
+        rejects(path, duplicate_id, "duplicate resource id 7")
+
+        invalid_id = valid_manifest()
+        invalid_id["resources"] = [{"id": -1, "output_path": "resources/a.js"}]
+        rejects(path, invalid_id, ".id must be a non-negative integer")
 
         bad_inline_parent = valid_manifest()
-        bad_inline_parent["resources"] = [{"id": 0, "output_path": "resources/a.js"}]
+        bad_inline_parent["resources"] = [{"id": 7, "output_path": "resources/a.js"}]
         bad_inline_parent["inline_scripts"] = [
             {"parent_resource_id": 9, "output_path": "resources/inline.js"}
         ]
-        rejects(path, bad_inline_parent, "parent_resource_id is out of range")
+        rejects(path, bad_inline_parent, "parent_resource_id does not name a resource")
 
     print("capture-project contract: ok")
 
