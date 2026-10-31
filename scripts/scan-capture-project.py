@@ -8,11 +8,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from analysis_artifacts import BUNDLES, DEOBFUSCATION, GENERATED_RECOVERY, JSVM_INDEX, load_artifact, write_artifact
+from analysis_artifacts import BUNDLES, DEOBFUSCATION, GENERATED_RECOVERY, JSVM_INDEX, SOURCE_INDEX, load_artifact, write_artifact
 
-from browser_script_types import is_executable_script
 from content_dedup import link_or_copy, sha256_path
-from capture_project import load_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STRING_RECOVERER = ROOT / "scripts/recover-js-obfuscator-strings.py"
@@ -318,7 +316,7 @@ def main():
     args = ap.parse_args()
 
     project = args.project.resolve()
-    manifest = load_manifest(project)
+    source_index = load_artifact(project, SOURCE_INDEX)
     deob = load_artifact(project, DEOBFUSCATION, optional=True) or {"units": []}
     deob_by_raw = {
         unit.get("raw_path"): unit
@@ -353,45 +351,27 @@ def main():
         code_units.append(unit)
         return len(code_units) - 1
 
-    for resource in manifest.get("resources", []):
-        raw_path = resource.get("output_path")
-        if resource.get("kind") != "javascript" or not raw_path:
+    for source_unit in source_index.get("units", []):
+        if source_unit.get("kind") not in {"javascript", "javascript_unparsed"}:
+            continue
+        raw_path = source_unit.get("raw_path")
+        if not raw_path:
             continue
         derived = deob_by_raw.get(raw_path)
         scan_path = derived.get("output_path") if derived else raw_path
-        queue(
-            {
-                "origin": "resource",
-                "resource_id": resource["id"],
-                "url": resource["url"],
-                "raw_path": raw_path,
-                "path": scan_path,
-                "analysis_origin": "safe_deobfuscation" if derived else "captured_source",
-                "deobfuscation_ordinal": derived.get("ordinal") if derived else None,
-                "generated_depth": 0,
-            }
-        )
-
-    for script in manifest.get("inline_scripts", []):
-        raw_path = script.get("output_path")
-        if not raw_path or not is_executable_script(script.get("script_type")):
-            continue
-        parent = manifest["resources"][script["parent_resource_id"]]
-        derived = deob_by_raw.get(raw_path)
-        scan_path = derived.get("output_path") if derived else raw_path
-        queue(
-            {
-                "origin": "inline_script",
-                "resource_id": script["parent_resource_id"],
-                "url": parent["url"],
-                "ordinal": script["ordinal"],
-                "raw_path": raw_path,
-                "path": scan_path,
-                "analysis_origin": "safe_deobfuscation" if derived else "captured_source",
-                "deobfuscation_ordinal": derived.get("ordinal") if derived else None,
-                "generated_depth": 0,
-            }
-        )
+        unit = {
+            "origin": source_unit.get("origin") or "resource",
+            "resource_id": source_unit.get("resource_id"),
+            "url": source_unit.get("url"),
+            "raw_path": raw_path,
+            "path": scan_path,
+            "analysis_origin": "safe_deobfuscation" if derived else "captured_source",
+            "deobfuscation_ordinal": derived.get("ordinal") if derived else None,
+            "generated_depth": 0,
+        }
+        if source_unit.get("ordinal") is not None:
+            unit["ordinal"] = source_unit["ordinal"]
+        queue(unit)
 
     rows = []
     dynamic_units = []

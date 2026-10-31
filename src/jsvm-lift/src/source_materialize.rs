@@ -30,6 +30,8 @@ struct Unit {
     kind: String,
     captured_kind: String,
     transport_kind: String,
+    origin: &'static str,
+    ordinal: Option<u64>,
     raw_path: String,
     resource_id: u64,
     url: String,
@@ -286,6 +288,8 @@ pub fn materialize_capture_source(
                 kind: "incomplete".into(),
                 captured_kind: kind,
                 transport_kind,
+                origin: "resource",
+                ordinal: None,
                 raw_path,
                 resource_id,
                 url,
@@ -297,6 +301,8 @@ pub fn materialize_capture_source(
             kind: kind.clone(),
             captured_kind: kind,
             transport_kind,
+            origin: "resource",
+            ordinal: None,
             raw_path,
             resource_id,
             url,
@@ -325,6 +331,8 @@ pub fn materialize_capture_source(
             kind: kind.into(),
             captured_kind: kind.into(),
             transport_kind: "inline_script".into(),
+            origin: "inline_script",
+            ordinal: Some(object_u64(script, "ordinal")?),
             raw_path,
             resource_id: parent_id,
             url: object_string(parent, "url").unwrap_or_default(),
@@ -338,7 +346,8 @@ pub fn materialize_capture_source(
         if unit.kind == "incomplete" {
             rows.push(json!({
                 "kind": "incomplete", "captured_kind": unit.captured_kind,
-                "transport_kind": unit.transport_kind, "raw_path": unit.raw_path,
+                "transport_kind": unit.transport_kind, "origin": unit.origin, "ordinal": unit.ordinal,
+                "raw_path": unit.raw_path,
                 "source_path": Value::Null, "resource_id": unit.resource_id, "url": unit.url,
                 "transform": "skipped_incomplete_network_response", "formatted": false,
             }));
@@ -349,7 +358,8 @@ pub fn materialize_capture_source(
         let dest = project.join(&dest_rel);
         let mut row = json!({
             "kind": unit.kind, "captured_kind": unit.captured_kind,
-            "transport_kind": unit.transport_kind, "raw_path": unit.raw_path,
+            "transport_kind": unit.transport_kind, "origin": unit.origin, "ordinal": unit.ordinal,
+            "raw_path": unit.raw_path,
             "resource_id": unit.resource_id, "url": unit.url, "source_path": dest_rel,
         });
         let row_index = rows.len();
@@ -555,7 +565,7 @@ mod tests {
                     {"id": 5, "kind": "json", "url": "https://x/data", "output_path": "resources/data.json"},
                     {"id": 99, "kind": "javascript", "url": "https://x/incomplete.js", "output_path": "resources/missing.js", "body_complete": false}
                 ],
-                "inline_scripts": [{"parent_resource_id": 42, "output_path": "resources/inline.json", "script_type": "application/json"}],
+                "inline_scripts": [{"parent_resource_id": 42, "ordinal": 3, "output_path": "resources/inline.json", "script_type": "application/json"}],
                 "counts": {}
             });
             let manifest = validate_manifest_value(&raw, "test")?;
@@ -595,6 +605,9 @@ mod tests {
                 .context("inline row missing")?;
             assert_eq!(inline["kind"], "json");
             assert_eq!(inline["resource_id"], 42);
+            assert_eq!(inline["origin"], "inline_script");
+            assert_eq!(inline["ordinal"], 3);
+            assert_eq!(legacy["origin"], "resource");
             let latin1 = rows
                 .iter()
                 .find(|row| row["resource_id"] == 92)
