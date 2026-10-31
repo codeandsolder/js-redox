@@ -1910,6 +1910,24 @@ sink(decode(0x10), decode(0x11));
         assert!(recovered.source.contains("sink(\"34\", \"56\")"));
         assert!(recovered.source.contains("void 0"));
 
+        let shadowed_parse_int = source.replace(
+            "function(provider_arg, target, indices, alias, table, sum) {",
+            "function(provider_arg, target, indices, alias, table, sum) { function parseInt() { return 36; }",
+        );
+        assert_ne!(shadowed_parse_int, source);
+        let rejected = recover_static_decoders(&shadowed_parse_int, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        assert_eq!(
+            rejected.transforms.get("materialize_decoder_rotation"),
+            None
+        );
+        assert_eq!(
+            rejected.transforms.get("remove_decoder_rotation_iife"),
+            None
+        );
+
         let bad = source.replace("provider, 396", "provider, 397");
         let rejected = recover_static_decoders(&bad, 8);
         assert!(rejected.is_some());
@@ -2103,6 +2121,149 @@ use();
         assert!(rejected.is_some());
         let rejected = rejected.unwrap_or_else(|| unreachable!());
         assert_eq!(rejected.transforms.get("string_array_decode"), None);
+    }
+
+    #[test]
+    fn standard_base64_decoder_uses_structural_local_effect_proof() {
+        let source = r#"
+const sequence_table = ["YQ=="];
+function sequence_decode(index, cached) {
+    return cached = sequence_table[(index)], (atob)((cached));
+}
+const declaration_table = ["Yg=="];
+function declaration_decode(index) {
+    "use strict";
+    const cached = declaration_table[index];
+    return atob(cached);
+}
+const rest_table = ["Yw=="];
+function rest_decode(index, ...unused) {
+    return atob(rest_table[index]);
+}
+sink(sequence_decode(0), declaration_decode(0), rest_decode(0));
+"#;
+        let recovered = recover_static_decoders(source, 4);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert_eq!(recovered.transforms.get("string_array_decode"), Some(&3));
+        assert!(recovered.source.contains("sink(\"a\", \"b\", \"c\")"));
+
+        for rejected_source in [
+            r#"
+const table = ["YQ=="];
+let escaped;
+function decode(index) {
+    escaped = table[index];
+    return atob(escaped);
+}
+sink(decode(0));
+"#,
+            r#"
+const table = ["YQ=="];
+function outer(atob) {
+    function decode(index) { return atob(table[index]); }
+    return decode(0);
+}
+sink(outer(identity));
+"#,
+            r#"
+const table = ["YQ=="];
+async function decode(index) { return atob(table[index]); }
+sink(decode(0));
+"#,
+            r#"
+const table = ["YQ=="];
+function decode(index, ignored = sideEffect()) { return atob(table[index]); }
+sink(decode(0));
+"#,
+        ] {
+            let rejected = recover_static_decoders(rejected_source, 4);
+            assert!(rejected.is_some());
+            let rejected = rejected.unwrap_or_else(|| unreachable!());
+            assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        }
+    }
+
+    #[test]
+    fn fixed_base64_decoder_proves_dataflow_instead_of_operation_counts() {
+        let source = r#"
+const table = ["us49uStFKk5Z"];
+function decode(index, value) {
+    if ("string" != typeof (value = table[index])) return value;
+    for (
+        var byte0, sextet0, sextet3, sextet2, sextet1, byte1, output = void 0,
+            alphabet = "318mC4sQfF7VWJ/h5AiBOtzHogbKun2jvxwlp6NkXD=eUraRTy9+GcS0qYEIdLMPZ",
+            cursor = 0,
+            input = (input = value).replace(/[^A-Za-z0-9\+\/\=]/g, output = "");
+        cursor < input.length;
+    )
+        sextet0 = alphabet.indexOf(input.charAt(cursor++)),
+        byte1 = (15 & (sextet1 = alphabet.indexOf(input.charAt(cursor++)))) << 4 | (sextet2 = alphabet.indexOf(input.charAt(cursor++))) >> 2,
+        byte0 = (3 & sextet2) << 6 | (sextet3 = alphabet.indexOf(input.charAt(cursor++))),
+        output += String.fromCharCode(sextet0 << 2 | sextet1 >> 4),
+        64 != sextet2 && (output += String.fromCharCode(byte1)),
+        64 != sextet3 && (output += String.fromCharCode(byte0));
+    return output;
+}
+sink(decode(0));
+"#;
+        let recovered = recover_static_decoders(source, 4);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert_eq!(recovered.transforms.get("string_array_decode"), Some(&1));
+
+        let equivalent_filter = source.replace(r"\+\/\=", r"+\/=");
+        let equivalent = recover_static_decoders(&equivalent_filter, 4);
+        assert!(equivalent.is_some());
+        let equivalent = equivalent.unwrap_or_else(|| unreachable!());
+        assert_eq!(equivalent.transforms.get("string_array_decode"), Some(&1));
+
+        let dead_short_circuit_setup =
+            source.replace("cursor = 0,", "cursor = 1, hidden = false && (cursor = 0),");
+        assert_ne!(dead_short_circuit_setup, source);
+
+        let deferred_setup = source.replace(
+            r#"output = void 0,
+            alphabet = "318mC4sQfF7VWJ/h5AiBOtzHogbKun2jvxwlp6NkXD=eUraRTy9+GcS0qYEIdLMPZ",
+            cursor = 0,
+            input = (input = value).replace(/[^A-Za-z0-9\+\/\=]/g, output = "")"#,
+            r#"output, alphabet, cursor, input,
+            hidden = () => (
+                alphabet = "318mC4sQfF7VWJ/h5AiBOtzHogbKun2jvxwlp6NkXD=eUraRTy9+GcS0qYEIdLMPZ",
+                cursor = 0,
+                input = (input = value).replace(/[^A-Za-z0-9\+\/\=]/g, output = "")
+            )"#,
+        );
+        assert_ne!(deferred_setup, source);
+
+        for rejected_source in [
+            source.replace("sextet1 >> 4", "sextet1 >> 3"),
+            source.replace("64 != sextet2", "64 != sextet1"),
+            source.replace("var byte0,", "var hidden = sideEffect(), byte0,"),
+            dead_short_circuit_setup,
+            deferred_setup,
+        ] {
+            let rejected = recover_static_decoders(&rejected_source, 4);
+            assert!(rejected.is_some());
+            let rejected = rejected.unwrap_or_else(|| unreachable!());
+            assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        }
+    }
+
+    #[test]
+    fn fixed_base64_iife_rejects_effectful_setup_reads() {
+        let source =
+            include_str!("../../../corpus/generated/reversible-obfuscation/sparse-direct-table.js");
+        let recovered = recover_static_decoders(source, 8);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert!(!recovered.source.contains("INested(0)"));
+
+        let effectful = source.replace("var r, c, u, x,", "var hidden = n.x, r, c, u, x,");
+        let rejected = recover_static_decoders(&effectful, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert!(rejected.source.contains("INested(0)"));
     }
 
     #[test]

@@ -147,12 +147,7 @@ impl<'a> Visit<'a> for ShapeVisitor {
 
 #[must_use]
 pub fn hash_shape_text(text: &str) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in text.as_bytes() {
-        h ^= u64::from(*byte);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
+    crate::fnv1a64(text.as_bytes())
 }
 
 #[must_use]
