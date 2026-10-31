@@ -55,6 +55,7 @@ class Toolchain:
     bundle_materializer: Path = TOOL_ROOT / "bundle-materialize"
     sourcemap_composer: Path = TOOL_ROOT / "sourcemap-compose"
     wasm_materializer: Path = TOOL_ROOT / "wasm-materialize"
+    wasm_resource_provenance: Path = TOOL_ROOT / "wasm-resource-provenance"
     wasm_import_semantics: Path = TOOL_ROOT / "wasm-import-semantics"
     project_readme: Path = TOOL_ROOT / "project-readme"
 
@@ -235,13 +236,7 @@ def run_capture_pipeline(
     if options.wasm_analysis:
         run_checked([tools.wasm_materializer, output])
         if kind == "recorder":
-            run_checked(
-                [
-                    sys.executable,
-                    ROOT / "scripts/correlate-wasm-resource-provenance.py",
-                    output,
-                ]
-            )
+            run_checked([tools.wasm_resource_provenance, output])
 
     run_checked(
         [

@@ -34,6 +34,7 @@ def main() -> None:
     ap.add_argument("--bundle-materializer", type=Path, default=defaults.bundle_materializer)
     ap.add_argument("--sourcemap-composer", type=Path, default=defaults.sourcemap_composer)
     ap.add_argument("--wasm-materializer", type=Path, default=defaults.wasm_materializer)
+    ap.add_argument("--wasm-resource-provenance", type=Path, default=defaults.wasm_resource_provenance)
     ap.add_argument("--wasm-import-semantics", type=Path, default=defaults.wasm_import_semantics)
     ap.add_argument("--project-readme", type=Path, default=defaults.project_readme)
     ap.add_argument("--jobs", type=int, help="parallel workers for content-only analysis stages")
@@ -59,6 +60,7 @@ def main() -> None:
         bundle_materializer=args.bundle_materializer,
         sourcemap_composer=args.sourcemap_composer,
         wasm_materializer=args.wasm_materializer,
+        wasm_resource_provenance=args.wasm_resource_provenance,
         wasm_import_semantics=args.wasm_import_semantics,
         project_readme=args.project_readme,
     )
