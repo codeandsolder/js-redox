@@ -25,6 +25,10 @@ pub struct ProvenRegistryForwardingCall {
     pub key_start: u32,
     pub key_end: u32,
     pub registry_path: Vec<String>,
+    /// Every direct access to this registry path in the proven forwarder chain
+    /// is indexed by the forwarded key; the registry object is not otherwise
+    /// exposed by those forwarder bodies.
+    pub registry_key_confined: bool,
     pub handler_start: u32,
     pub handler_end: u32,
     pub handler_params: usize,
@@ -45,6 +49,10 @@ pub struct ProvenRegistryForwardingValueCall {
     pub value_start: u32,
     pub value_end: u32,
     pub registry_path: Vec<String>,
+    /// Every direct access to this registry path in the proven forwarder chain
+    /// is indexed by the forwarded key; the registry object is not otherwise
+    /// exposed by those forwarder bodies.
+    pub registry_key_confined: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +95,7 @@ struct RegistryForwarderProof {
     key_argument: u32,
     value_argument: u32,
     registry_path: Vec<String>,
+    registry_key_confined: bool,
 }
 
 fn reference_symbol(scoping: &Scoping, expression: &Expression<'_>) -> Option<SymbolId> {
@@ -1502,6 +1511,7 @@ impl<'a> Visit<'a> for RegistryWriteCollector<'_, '_> {
                                         key_argument,
                                         value_argument,
                                         registry_path,
+                                        registry_key_confined: false,
                                     });
                                 }
                             }
@@ -1518,6 +1528,120 @@ impl<'a> Visit<'a> for RegistryWriteCollector<'_, '_> {
         _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
     ) {
     }
+}
+
+fn registry_key_confined_in_body(
+    scoping: &Scoping,
+    body: &FunctionBody<'_>,
+    parameters: &[SymbolId],
+    boxes: &HashSet<SymbolId>,
+    proof: &RegistryForwarderProof,
+) -> bool {
+    if proof.registry_path.is_empty() {
+        return false;
+    }
+
+    #[derive(Default)]
+    struct Probe {
+        allowed_path_uses: HashSet<(u32, u32)>,
+        path_uses: HashSet<(u32, u32)>,
+        invalid_index: bool,
+    }
+
+    struct Walker<'c, 'p, 'b> {
+        scoping: &'c Scoping,
+        parameters: &'p [SymbolId],
+        boxes: &'b HashSet<SymbolId>,
+        receiver_argument: u32,
+        key_argument: u32,
+        registry_path: &'p [String],
+        probe: Probe,
+    }
+
+    impl Walker<'_, '_, '_> {
+        fn record_extended_path(
+            &mut self,
+            object: &Expression<'_>,
+            property: Option<String>,
+            span: oxc_span::Span,
+        ) {
+            let Some(property) = property else {
+                return;
+            };
+            let Some((receiver, mut path)) =
+                parameter_member_path(self.scoping, object, self.parameters, self.boxes)
+            else {
+                return;
+            };
+            path.push(property);
+            if receiver == self.receiver_argument && path == self.registry_path {
+                self.probe.path_uses.insert((span.start, span.end));
+            }
+        }
+    }
+
+    impl<'a> Visit<'a> for Walker<'_, '_, '_> {
+        fn visit_static_member_expression(
+            &mut self,
+            member: &oxc_ast::ast::StaticMemberExpression<'a>,
+        ) {
+            self.record_extended_path(
+                &member.object,
+                Some(member.property.name.to_string()),
+                member.span,
+            );
+            walk::walk_static_member_expression(self, member);
+        }
+
+        fn visit_computed_member_expression(
+            &mut self,
+            member: &oxc_ast::ast::ComputedMemberExpression<'a>,
+        ) {
+            if parameter_member_path(self.scoping, &member.object, self.parameters, self.boxes)
+                .is_some_and(|(receiver, path)| {
+                    receiver == self.receiver_argument && path == self.registry_path
+                })
+            {
+                let object_span = member.object.span();
+                self.probe
+                    .allowed_path_uses
+                    .insert((object_span.start, object_span.end));
+                if member.optional
+                    || argument_index_expr(
+                        self.scoping,
+                        &member.expression,
+                        self.parameters,
+                        self.boxes,
+                    ) != Some(self.key_argument)
+                {
+                    self.probe.invalid_index = true;
+                }
+            }
+            let property = match &member.expression {
+                Expression::StringLiteral(value) => string_literal_value(value),
+                _ => None,
+            };
+            self.record_extended_path(&member.object, property, member.span);
+            walk::walk_computed_member_expression(self, member);
+        }
+    }
+
+    let mut walker = Walker {
+        scoping,
+        parameters,
+        boxes,
+        receiver_argument: proof.receiver_argument,
+        key_argument: proof.key_argument,
+        registry_path: &proof.registry_path,
+        probe: Probe::default(),
+    };
+    walker.visit_function_body(body);
+    !walker.probe.invalid_index
+        && walker
+            .probe
+            .path_uses
+            .iter()
+            .all(|span| walker.probe.allowed_path_uses.contains(span))
 }
 
 fn registry_forwarder_proof(
@@ -1541,10 +1665,12 @@ fn registry_forwarder_proof(
         proofs: Vec::new(),
     };
     collector.visit_function_body(body);
-    let first = collector.proofs.first()?.clone();
+    let mut first = collector.proofs.first()?.clone();
     if !collector.proofs.iter().all(|proof| proof == &first) {
         return None;
     }
+    first.registry_key_confined =
+        registry_key_confined_in_body(scoping, body, &parameters, &boxes, &first);
     selected_argument_roles_are_stable(
         scoping,
         body,
@@ -1647,6 +1773,7 @@ impl<'a> Visit<'a> for RegistryDelegateProbe<'_, '_, '_> {
                                     key_argument,
                                     value_argument,
                                     registry_path: delegate.registry_path.clone(),
+                                    registry_key_confined: delegate.registry_key_confined,
                                 });
                             }
                         }
@@ -1688,10 +1815,17 @@ fn registry_delegate_proof(
         proofs: Vec::new(),
     };
     probe.visit_function_body(body);
-    let first = probe.proofs.first()?.clone();
-    if !probe.proofs.iter().all(|proof| proof == &first) {
+    let mut first = probe.proofs.first()?.clone();
+    if !probe.proofs.iter().all(|proof| {
+        proof.receiver_argument == first.receiver_argument
+            && proof.key_argument == first.key_argument
+            && proof.value_argument == first.value_argument
+            && proof.registry_path == first.registry_path
+    }) {
         return None;
     }
+    first.registry_key_confined = probe.proofs.iter().all(|proof| proof.registry_key_confined)
+        && registry_key_confined_in_body(scoping, body, &parameters, &boxes, &first);
     selected_argument_roles_are_stable(
         scoping,
         body,
@@ -2538,6 +2672,7 @@ impl<'a> Visit<'a> for RegistryForwardingValueCallCollector<'_, '_> {
                                 value_start: value.span().start,
                                 value_end: value.span().end,
                                 registry_path: proof.registry_path.clone(),
+                                registry_key_confined: proof.registry_key_confined,
                             });
                         }
                     }
@@ -2635,6 +2770,7 @@ impl<'a> Visit<'a> for RegistryForwardingCallCollector<'_, '_> {
                                     key_start: key.span().start,
                                     key_end: key.span().end,
                                     registry_path: proof.registry_path.clone(),
+                                    registry_key_confined: proof.registry_key_confined,
                                     handler_start,
                                     handler_end,
                                     handler_params,
@@ -2755,6 +2891,7 @@ mod tests {
             })
             .expect("outer literal value");
         assert_eq!(root.registry_path, vec!["handlers"]);
+        assert!(root.registry_key_confined);
         assert!(structurally_proven_registry_forwarding_calls(
             &parsed.program,
             semantic.semantic.scoping(),
@@ -2777,6 +2914,93 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].registry_path, vec!["handlers"]);
         assert_eq!(calls[0].handler_params, 1);
+        assert!(calls[0].registry_key_confined);
+    }
+
+    #[test]
+    fn registry_key_confinement_allows_same_key_reads_and_writes() {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                const previous = receiver.handlers[key];
+                receiver.handlers[key] = wrap(receiver, key, value, previous);
+            }
+            install(state, 7, function(a) { return a + 1; });
+        "#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].registry_key_confined);
+    }
+
+    #[test]
+    fn registry_key_confinement_rejects_other_key_access() {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                const other = receiver.handlers[0];
+                receiver.handlers[key] = wrap(receiver, key, value, other);
+            }
+            install(state, 7, function(a) { return a + 1; });
+        "#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].registry_key_confined);
+    }
+
+    #[test]
+    fn registry_key_confinement_rejects_registry_object_escape() {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                observe(receiver.handlers);
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            install(state, 7, function(a) { return a + 1; });
+        "#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].registry_key_confined);
+    }
+
+    #[test]
+    fn registry_key_confinement_rejects_nested_cross_key_capture() {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                later(function() { return receiver.handlers[0]; });
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            install(state, 7, function(a) { return a + 1; });
+        "#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].registry_key_confined);
+    }
+
+    #[test]
+    fn registry_delegate_preserves_forwarding_when_only_some_targets_are_confined() {
+        let calls = registry_calls(
+            r#"
+            function good(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            function bad(receiver, key, value) {
+                observe(receiver.handlers);
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            function install(receiver, key, value, choose_good) {
+                if (choose_good) good(receiver, key, value);
+                else bad(receiver, key, value);
+            }
+            install(state, 7, function(a) { return a + 1; }, flag);
+        "#,
+        );
+        let outer = calls
+            .iter()
+            .find(|call| call.call_start > 0 && call.handler_params == 1)
+            .expect("outer forwarding call");
+        assert_eq!(outer.registry_path, vec!["handlers"]);
+        assert!(!outer.registry_key_confined);
     }
 
     #[test]

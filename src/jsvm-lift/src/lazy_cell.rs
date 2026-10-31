@@ -1975,6 +1975,44 @@ pub fn proven_slow_lazy_cell_captured_value_install(
     })
 }
 
+/// Specialize an already-proven arbitrary captured value to the function-valued
+/// handler view without replaying the provenance proof.
+///
+/// The handler install must be the exact same structural install already joined
+/// by `captured_value`: same call, receiver, key, value span, registry path,
+/// object origin, and exact key. This is therefore only a lossless view change;
+/// it adds independently proven function-literal metadata and no new flow
+/// assumption.
+#[must_use]
+pub fn proven_slow_lazy_cell_captured_handler_from_value(
+    captured_value: &ProvenSlowLazyCellCapturedValueInstall,
+    install: &crate::registry_identity::ProvenOriginRegistryHandlerInstall,
+) -> Option<ProvenSlowLazyCellCapturedHandlerInstall> {
+    let value = &captured_value.install;
+    let value_call = &value.install;
+    let handler_call = &install.install;
+    if value.origin != install.origin
+        || value.exact_key != install.exact_key
+        || value_call.call_start != handler_call.call_start
+        || value_call.call_end != handler_call.call_end
+        || value_call.receiver_start != handler_call.receiver_start
+        || value_call.receiver_end != handler_call.receiver_end
+        || value_call.key_start != handler_call.key_start
+        || value_call.key_end != handler_call.key_end
+        || value_call.value_start != handler_call.handler_start
+        || value_call.value_end != handler_call.handler_end
+        || value_call.registry_path != handler_call.registry_path
+    {
+        return None;
+    }
+    Some(ProvenSlowLazyCellCapturedHandlerInstall {
+        exact_assignment: captured_value.exact_assignment.clone(),
+        install: install.clone(),
+        caller_handler_parameter_index: captured_value.caller_value_parameter_index,
+        caller_handler_symbol: captured_value.caller_value_symbol,
+    })
+}
+
 /// Join one exact slow-cell registry assignment to the logical forwarding
 /// install whose original handler feeds the wrapper.
 ///
@@ -3698,6 +3736,7 @@ pub fn structurally_proven_slow_lazy_cell_factory_shapes(
 #[cfg(test)]
 mod tests {
     use super::{
+        proven_slow_lazy_cell_captured_handler_from_value,
         proven_slow_lazy_cell_captured_handler_install,
         proven_slow_lazy_cell_captured_value_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
@@ -4135,6 +4174,29 @@ mod tests {
             install,
         )
         .expect("captured handler");
+        let values = proven_origin_registry_value_installs(&parsed.program, scoping, &flow);
+        let value = values
+            .iter()
+            .find(|value| {
+                value.exact_key == install.exact_key
+                    && value.install.call_start == install.install.call_start
+                    && value.install.call_end == install.install.call_end
+                    && value.install.value_start == install.install.handler_start
+                    && value.install.value_end == install.install.handler_end
+            })
+            .expect("same generic value install");
+        let captured_value = proven_slow_lazy_cell_captured_value_install(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &exact,
+            value,
+        )
+        .expect("captured generic handler value");
+        let specialized =
+            proven_slow_lazy_cell_captured_handler_from_value(&captured_value, install)
+                .expect("handler specialization");
+        assert_eq!(specialized, captured);
         let resolver = proven_slow_lazy_cell_resolver_index(
             source,
             &parsed.program,

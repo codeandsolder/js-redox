@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use jsvm_lift::{
     forwarding_semantics::structurally_proven_lazy_registry_read_calls,
     lazy_cell::{
-        proven_slow_lazy_cell_captured_handler_install,
+        proven_slow_lazy_cell_captured_handler_from_value,
         proven_slow_lazy_cell_captured_value_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
         proven_slow_lazy_cell_prototype_carrier, proven_slow_lazy_cell_read_result,
@@ -185,20 +185,6 @@ fn main() -> Result<()> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let mut captured_handlers = Vec::new();
-            for exact_assignment in &exact_assignments {
-                for install in &origin_installs {
-                    if let Some(proof) = proven_slow_lazy_cell_captured_handler_install(
-                        &source,
-                        &parsed.program,
-                        &semantic.semantic,
-                        exact_assignment,
-                        install,
-                    ) {
-                        captured_handlers.push(proof);
-                    }
-                }
-            }
             let mut captured_values = Vec::new();
             for exact_assignment in &exact_assignments {
                 for install in &origin_value_installs {
@@ -213,6 +199,14 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            let captured_handlers = captured_values
+                .iter()
+                .flat_map(|captured| {
+                    origin_installs.iter().filter_map(|install| {
+                        proven_slow_lazy_cell_captured_handler_from_value(captured, install)
+                    })
+                })
+                .collect::<Vec<_>>();
             let resolver_proofs = match (&update, accessor, phase_value) {
                 (Some(update), Some(accessor), Some(phase_value)) => exact_assignments
                     .iter()
