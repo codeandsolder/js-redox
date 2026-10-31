@@ -2114,16 +2114,21 @@ function sequence_decode(index, cached) {
 }
 const declaration_table = ["Yg=="];
 function declaration_decode(index) {
+    "use strict";
     const cached = declaration_table[index];
     return atob(cached);
 }
-sink(sequence_decode(0), declaration_decode(0));
+const rest_table = ["Yw=="];
+function rest_decode(index, ...unused) {
+    return atob(rest_table[index]);
+}
+sink(sequence_decode(0), declaration_decode(0), rest_decode(0));
 "#;
         let recovered = recover_static_decoders(source, 4);
         assert!(recovered.is_some());
         let recovered = recovered.unwrap_or_else(|| unreachable!());
-        assert_eq!(recovered.transforms.get("string_array_decode"), Some(&2));
-        assert!(recovered.source.contains("sink(\"a\", \"b\")"));
+        assert_eq!(recovered.transforms.get("string_array_decode"), Some(&3));
+        assert!(recovered.source.contains("sink(\"a\", \"b\", \"c\")"));
 
         for rejected_source in [
             r#"
@@ -2146,6 +2151,11 @@ sink(outer(identity));
             r#"
 const table = ["YQ=="];
 async function decode(index) { return atob(table[index]); }
+sink(decode(0));
+"#,
+            r#"
+const table = ["YQ=="];
+function decode(index, ignored = sideEffect()) { return atob(table[index]); }
 sink(decode(0));
 "#,
         ] {

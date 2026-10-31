@@ -1107,17 +1107,28 @@ fn expression_resolves_to_symbol(
         == Some(symbol)
 }
 
+fn function_parameters_have_no_runtime_effects(function: &oxc_ast::ast::Function<'_>) -> bool {
+    function.params.items.iter().all(|parameter| {
+        parameter.initializer.is_none()
+            && matches!(parameter.pattern, BindingPattern::BindingIdentifier(_))
+    }) && function
+        .params
+        .rest
+        .as_ref()
+        .is_none_or(|rest| matches!(rest.rest.argument, BindingPattern::BindingIdentifier(_)))
+}
+
 fn standard_base64_table_for_function(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
 ) -> Option<SymbolId> {
-    if function.r#async || function.generator || function.params.rest.is_some() {
+    if function.r#async
+        || function.generator
+        || !function_parameters_have_no_runtime_effects(function)
+    {
         return None;
     }
     let body = function.body.as_ref()?;
-    if !body.directives.is_empty() {
-        return None;
-    }
     let first_param = function.params.items.first()?;
     let BindingPattern::BindingIdentifier(first_param) = &first_param.pattern else {
         return None;
