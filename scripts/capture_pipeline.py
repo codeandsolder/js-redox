@@ -32,7 +32,7 @@ from analysis_artifacts import (
     load_artifact,
 )
 
-from capture_project import MANIFEST_NAME
+from capture_project import MANIFEST_NAME, read_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL_ROOT = ROOT / ".cargo-target-nodebug/debug"
