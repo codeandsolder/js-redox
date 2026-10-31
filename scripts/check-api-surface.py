@@ -138,13 +138,7 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             )
         )
 
-        run(
-            sys.executable,
-            ROOT / "scripts/analyze-api-surface.py",
-            project,
-            "--analyzer",
-            ANALYZER,
-        )
+        run(ANALYZER, "--project", project)
         artifact = load_artifact(project, API_SURFACE)
         assert artifact["summary"] == {
             "units": 2,

@@ -335,15 +335,7 @@ def run_capture_pipeline(
         )
         run_checked([sys.executable, ROOT / "scripts/materialize-switch-ir.py", output])
 
-    run_checked(
-        [
-            sys.executable,
-            ROOT / "scripts/analyze-api-surface.py",
-            output,
-            "--analyzer",
-            tools.api_surface,
-        ]
-    )
+    run_checked([tools.api_surface, "--project", output])
     run_checked([sys.executable, ROOT / "scripts/build-source-graph.py", output])
     run_checked([sys.executable, ROOT / "scripts/refresh-project-readme.py", output])
 

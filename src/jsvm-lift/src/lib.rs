@@ -13,6 +13,7 @@ pub mod effect_shape;
 
 pub mod numeric;
 pub mod parse_int;
+pub mod project_api_surface;
 
 pub mod pipeline;
 
