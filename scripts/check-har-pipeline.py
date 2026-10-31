@@ -19,7 +19,7 @@ TRUNCATED_PROJECT = WORK / "project-truncated"
 BUNDLE_FIXTURE = ROOT / "corpus/generated/reversible-obfuscation/bundle-module-tables.js"
 SAFE_MATERIALIZER = ROOT / "scripts/materialize-safe-deobfuscation.py"
 GENERATED_CHILD_FIXTURE = ROOT / "corpus/generated/reversible-obfuscation/generated-child-safe.js"
-HAR_PROJECT = TOOL_ROOT / "har-project"
+CAPTURE_IMPORT = TOOL_ROOT / "capture-import"
 
 
 def run(*args):
@@ -192,8 +192,8 @@ def main():
         "scripts/capture-to-project.py",
         HAR,
         PROJECT,
-        "--har-project-bin",
-        TOOL_ROOT / "har-project",
+        "--capture-import",
+        TOOL_ROOT / "capture-import",
         "--scanner",
         TOOL_ROOT / "jsvm-lift",
         "--formatter",
@@ -204,8 +204,8 @@ def main():
         TOOL_ROOT / "js-refs",
         "--deobfuscator",
         TOOL_ROOT / "deobfuscate-safe",
-        "--bundle-inventory",
-        TOOL_ROOT / "bundle-unpack",
+        "--bundle-materializer",
+        TOOL_ROOT / "bundle-materialize",
         "--sourcemap-composer",
         TOOL_ROOT / "sourcemap-compose",
     )
@@ -697,7 +697,7 @@ def main():
     assert "## VM analysis" in readme
     assert "## Provenance graph" in readme
 
-    run(HAR_PROJECT, TRUNCATED_HAR, "--output", TRUNCATED_PROJECT)
+    run(CAPTURE_IMPORT, TRUNCATED_HAR, "--output", TRUNCATED_PROJECT)
     truncated_manifest = json.loads(
         (TRUNCATED_PROJECT / "capture-manifest.json").read_text()
     )

@@ -32,7 +32,7 @@ from analysis_artifacts import (
     load_artifact,
 )
 
-from capture_project import MANIFEST_NAME, read_manifest, write_manifest
+from capture_project import MANIFEST_NAME, read_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL_ROOT = ROOT / ".cargo-target-nodebug/debug"
@@ -40,20 +40,24 @@ TOOL_ROOT = ROOT / ".cargo-target-nodebug/debug"
 
 @dataclass(frozen=True)
 class Toolchain:
-    har_project: Path = TOOL_ROOT / "har-project"
+    capture_import: Path = TOOL_ROOT / "capture-import"
     scanner: Path = TOOL_ROOT / "jsvm-lift"
     formatter: Path = TOOL_ROOT / "js-format"
+    source_materializer: Path = TOOL_ROOT / "source-materialize"
     switch_ir: Path = TOOL_ROOT / "switch-ir"
     table_ir: Path = TOOL_ROOT / "table-ir"
+    vm_materializer: Path = TOOL_ROOT / "vm-materialize"
     js_refs: Path = TOOL_ROOT / "js-refs"
     source_directives: Path = TOOL_ROOT / "source-directives"
     api_surface: Path = TOOL_ROOT / "api-surface"
     deobfuscator: Path = TOOL_ROOT / "deobfuscate-safe"
     string_recoverer: Path = ROOT / "scripts/recover-js-obfuscator-strings.py"
-    bundle_inventory: Path = TOOL_ROOT / "bundle-unpack"
+    bundle_materializer: Path = TOOL_ROOT / "bundle-materialize"
     sourcemap_composer: Path = TOOL_ROOT / "sourcemap-compose"
-    wasm_redox: Path = TOOL_ROOT / "wasm-redox"
+    wasm_materializer: Path = TOOL_ROOT / "wasm-materialize"
+    wasm_resource_provenance: Path = TOOL_ROOT / "wasm-resource-provenance"
     wasm_import_semantics: Path = TOOL_ROOT / "wasm-import-semantics"
+    project_readme: Path = TOOL_ROOT / "project-readme"
 
 
 @dataclass(frozen=True)
@@ -163,21 +167,9 @@ def _import_capture(
     tools: Toolchain,
     options: PipelineOptions,
 ) -> Path:
-    if kind in {"har", "recorder"}:
-        har_input = capture / "capture.har" if kind == "recorder" else capture
-        importer: list[object] = [tools.har_project, har_input, "--output", output]
-    else:
-        importer = [
-            sys.executable,
-            ROOT / "scripts/saved-page-to-manifest.py",
-            capture,
-            "--output",
-            output,
-            "--source-directives",
-            tools.source_directives,
-        ]
-        if options.assets_dir:
-            importer.extend(["--assets-dir", options.assets_dir])
+    importer: list[object] = [tools.capture_import, capture, "--output", output]
+    if kind == "saved_page" and options.assets_dir:
+        importer.extend(["--assets-dir", options.assets_dir])
     if options.overwrite:
         importer.append("--overwrite")
     run_checked(importer)
@@ -185,13 +177,6 @@ def _import_capture(
     manifest_path = output / MANIFEST_NAME
     if not manifest_path.is_file():
         raise SystemExit(f"capture importer did not create {manifest_path}")
-    if kind == "recorder":
-        manifest = read_manifest(manifest_path)
-        source = manifest["source"]
-        source["kind"] = "recorder"
-        source["input"] = str(capture)
-        source["har_input"] = str(capture / "capture.har")
-        write_manifest(manifest_path, manifest)
     return manifest_path
 
 
@@ -211,45 +196,18 @@ def run_capture_pipeline(
 
     kind = detect_capture(capture)
     manifest_path = _import_capture(capture, output, kind, tools, options)
-    if kind == "recorder":
-        run_checked(
-            [
-                sys.executable,
-                ROOT / "scripts/analyze-runtime-scripts.py",
-                capture,
-                "--output",
-                artifact_path(output, RUNTIME_SCRIPTS),
-            ]
-        )
 
     run_checked(
         [
-            sys.executable,
-            ROOT / "scripts/materialize-capture-source.py",
+            tools.source_materializer,
             output,
-            "--formatter",
-            tools.formatter,
             *_parallel_args(options.jobs),
         ]
     )
     if options.wasm_analysis:
-        run_checked(
-            [
-                sys.executable,
-                ROOT / "scripts/materialize-wasm.py",
-                output,
-                "--wasm-redox",
-                tools.wasm_redox,
-            ]
-        )
+        run_checked([tools.wasm_materializer, output])
         if kind == "recorder":
-            run_checked(
-                [
-                    sys.executable,
-                    ROOT / "scripts/correlate-wasm-resource-provenance.py",
-                    output,
-                ]
-            )
+            run_checked([tools.wasm_resource_provenance, output])
 
     run_checked(
         [
@@ -264,11 +222,9 @@ def run_capture_pipeline(
     )
     run_checked(
         [
-            sys.executable,
-            ROOT / "scripts/scan-js-references.py",
-            output,
-            "--extractor",
             tools.js_refs,
+            "--project",
+            output,
             *_parallel_args(options.jobs),
         ]
     )
@@ -291,13 +247,8 @@ def run_capture_pipeline(
         if options.bundle_unpack:
             run_checked(
                 [
-                    sys.executable,
-                    ROOT / "scripts/materialize-bundle-modules.py",
+                    tools.bundle_materializer,
                     output,
-                    "--inventory",
-                    tools.bundle_inventory,
-                    "--formatter",
-                    tools.formatter,
                     *_parallel_args(options.jobs),
                 ]
             )
@@ -333,19 +284,11 @@ def run_capture_pipeline(
                 tools.string_recoverer,
             ]
         )
-        run_checked([sys.executable, ROOT / "scripts/materialize-switch-ir.py", output])
+        run_checked([tools.vm_materializer, output])
 
-    run_checked(
-        [
-            sys.executable,
-            ROOT / "scripts/analyze-api-surface.py",
-            output,
-            "--analyzer",
-            tools.api_surface,
-        ]
-    )
+    run_checked([tools.api_surface, "--project", output])
     run_checked([sys.executable, ROOT / "scripts/build-source-graph.py", output])
-    run_checked([sys.executable, ROOT / "scripts/refresh-project-readme.py", output])
+    run_checked([tools.project_readme, output])
 
     return load_project_summary(
         output,

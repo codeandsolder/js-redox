@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "work" / "wasm-resource-provenance-regression"
 CAPTURE = WORK / "capture"
 PROJECT = WORK / "project"
-CORRELATOR = ROOT / "scripts" / "correlate-wasm-resource-provenance.py"
+CORRELATOR = ROOT / ".cargo-target-nodebug" / "debug" / "wasm-resource-provenance"
 GRAPH = ROOT / "scripts" / "build-source-graph.py"
 
 JS_URL = "https://cdn.example.test/loader.js"
@@ -204,7 +204,7 @@ def main() -> None:
     }
     (PROJECT / "analysis" / "runtime-scripts.json").write_text(json.dumps(runtime_artifact))
 
-    subprocess.run([sys.executable, str(CORRELATOR), str(PROJECT)], cwd=ROOT, check=True)
+    subprocess.run([str(CORRELATOR), str(PROJECT)], cwd=ROOT, check=True)
     provenance = json.loads((PROJECT / "analysis" / "wasm-resource-provenance.json").read_text())
     assert provenance["summary"]["observations"] == 2, provenance
     assert provenance["summary"]["runtime_script_identities"] == 2, provenance
@@ -290,7 +290,7 @@ def main() -> None:
         }
     )
     (PROJECT / "analysis" / "runtime-scripts.json").write_text(json.dumps(runtime_artifact))
-    subprocess.run([sys.executable, str(CORRELATOR), str(PROJECT)], cwd=ROOT, check=True)
+    subprocess.run([str(CORRELATOR), str(PROJECT)], cwd=ROOT, check=True)
     conflicted = json.loads((PROJECT / "analysis" / "wasm-resource-provenance.json").read_text())
     assert conflicted["summary"]["observations"] == 2, conflicted
     assert conflicted["summary"]["runtime_script_identities"] == 0, conflicted
@@ -304,7 +304,7 @@ def main() -> None:
     ), conflict_graph["edges"]
 
     (CAPTURE / "cdp-streams.json").unlink()
-    subprocess.run([sys.executable, str(CORRELATOR), str(PROJECT)], cwd=ROOT, check=True)
+    subprocess.run([str(CORRELATOR), str(PROJECT)], cwd=ROOT, check=True)
     unavailable = json.loads((PROJECT / "analysis" / "wasm-resource-provenance.json").read_text())
     assert unavailable["summary"]["applicable"] is False, unavailable
     assert unavailable["summary"]["unavailable_reason"] == "missing_cdp_stream", unavailable

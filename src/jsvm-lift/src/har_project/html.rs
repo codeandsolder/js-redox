@@ -1,15 +1,22 @@
 use super::materialize::Reference;
-use crate::source_directive::source_directives;
+use crate::{
+    browser_script_types::{
+        inline_script_extension as shared_inline_script_extension, is_executable_script,
+        is_json_script, script_type_essence,
+    },
+    source_directive::source_directives,
+};
+use html_escape::decode_html_entities;
 use std::collections::HashMap;
 use url::Url;
 
 #[derive(Debug)]
-pub(super) struct ScriptTag {
-    pub(super) attrs: HashMap<String, String>,
-    pub(super) body: String,
+pub(crate) struct ScriptTag {
+    pub(crate) attrs: HashMap<String, String>,
+    pub(crate) body: String,
 }
 
-const fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
+pub(crate) const fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
     let mut quote = None;
     while i < bytes.len() {
         let b = bytes[i];
@@ -27,10 +34,16 @@ const fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
     None
 }
 
-fn parse_attrs(tag: &str) -> HashMap<String, String> {
+pub(crate) fn parse_attrs(tag: &str) -> HashMap<String, String> {
     let bytes = tag.as_bytes();
     let mut out = HashMap::new();
-    let mut i = tag.to_ascii_lowercase().find("script").map_or(0, |x| x + 6);
+    let mut i = 0usize;
+    while i < bytes.len() && (bytes[i].is_ascii_whitespace() || matches!(bytes[i], b'<' | b'/')) {
+        i += 1;
+    }
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'>' | b'/') {
+        i += 1;
+    }
     while i < bytes.len() {
         while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
             i += 1;
@@ -59,32 +72,34 @@ fn parse_attrs(tag: &str) -> HashMap<String, String> {
             while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
-            if i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b'"') {
+            let (value_start, value_end) = if i < bytes.len() && matches!(bytes[i], b'\'' | b'"') {
                 let quote = bytes[i];
                 i += 1;
-                let vstart = i;
+                let value_start = i;
                 while i < bytes.len() && bytes[i] != quote {
                     i += 1;
                 }
-                value = tag[vstart..i.min(bytes.len())].to_string();
+                let value_end = i;
                 i += usize::from(i < bytes.len());
+                (value_start, value_end)
             } else {
-                let vstart = i;
+                let value_start = i;
                 while i < bytes.len()
                     && !bytes[i].is_ascii_whitespace()
                     && !matches!(bytes[i], b'>' | b'/')
                 {
                     i += 1;
                 }
-                value = tag[vstart..i].to_string();
-            }
+                (value_start, i)
+            };
+            value = decode_html_entities(&tag[value_start..value_end]).into_owned();
         }
         out.insert(key, value);
     }
     out
 }
 
-pub(super) fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
+pub(crate) fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
     let lower = html.to_ascii_lowercase();
     let bytes = html.as_bytes();
     let mut out = Vec::new();
@@ -110,66 +125,20 @@ pub(super) fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
     out
 }
 
-pub(super) fn script_type(attrs: &HashMap<String, String>) -> String {
-    attrs
-        .get("type")
-        .map(|s| {
-            s.split_once(';')
-                .map_or(s.as_str(), |(essence, _)| essence)
-                .trim()
-                .to_ascii_lowercase()
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "text/javascript".into())
-}
-
-fn is_standard_executable_script_type(ty: &str) -> bool {
-    matches!(
-        ty,
-        "module"
-            | "text/javascript"
-            | "application/javascript"
-            | "application/ecmascript"
-            | "text/ecmascript"
-            | "application/x-ecmascript"
-            | "application/x-javascript"
-            | "text/javascript1.0"
-            | "text/javascript1.1"
-            | "text/javascript1.2"
-            | "text/javascript1.3"
-            | "text/javascript1.4"
-            | "text/javascript1.5"
-            | "text/jscript"
-            | "text/livescript"
-            | "text/x-ecmascript"
-            | "text/x-javascript"
-    )
+pub(crate) fn script_type(attrs: &HashMap<String, String>) -> String {
+    script_type_essence(attrs.get("type").map(String::as_str))
 }
 
 pub(super) fn is_executable_script_type(ty: &str) -> bool {
-    if is_standard_executable_script_type(ty) {
-        return true;
-    }
-    let Some((prefix, suffix)) = ty.split_once('-') else {
-        return false;
-    };
-    prefix.len() >= 16
-        && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && is_standard_executable_script_type(suffix)
+    is_executable_script(Some(ty))
 }
 
 pub(super) fn is_json_script_type(ty: &str) -> bool {
-    matches!(ty, "importmap" | "speculationrules") || ty.contains("json")
+    is_json_script(Some(ty))
 }
 
 pub(super) fn inline_script_extension(ty: &str) -> &'static str {
-    if is_executable_script_type(ty) {
-        "js"
-    } else if is_json_script_type(ty) {
-        "json"
-    } else {
-        "txt"
-    }
+    shared_inline_script_extension(Some(ty))
 }
 
 pub(super) fn resolve_ref(base: &str, raw: &str) -> Option<String> {

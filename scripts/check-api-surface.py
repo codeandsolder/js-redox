@@ -13,6 +13,7 @@ from analysis_artifacts import API_SURFACE, SOURCE_GRAPH, load_artifact
 
 ROOT = Path(__file__).resolve().parents[1]
 ANALYZER = ROOT / ".cargo-target-nodebug/debug/api-surface"
+PROJECT_README = ROOT / ".cargo-target-nodebug/debug/project-readme"
 
 
 def run(*args: object) -> None:
@@ -138,13 +139,7 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             )
         )
 
-        run(
-            sys.executable,
-            ROOT / "scripts/analyze-api-surface.py",
-            project,
-            "--analyzer",
-            ANALYZER,
-        )
+        run(ANALYZER, "--project", project)
         artifact = load_artifact(project, API_SURFACE)
         assert artifact["summary"] == {
             "units": 2,
@@ -211,7 +206,7 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             if node["type"] == "external_url"
         )
 
-        run(sys.executable, ROOT / "scripts/refresh-project-readme.py", project)
+        run(PROJECT_README, project)
         readme = (project / "README.md").read_text()
         assert "[analysis/api-surface.json](analysis/api-surface.json)" in readme, readme
         assert "Static browser API callsites: **8**" in readme, readme

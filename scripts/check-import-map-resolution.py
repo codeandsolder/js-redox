@@ -6,8 +6,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "work/import-map-regression"
-HAR_PROJECT = ROOT / ".cargo-target-nodebug/debug/har-project"
-FORMATTER = ROOT / ".cargo-target-nodebug/debug/js-format"
+CAPTURE_IMPORT = ROOT / ".cargo-target-nodebug/debug/capture-import"
+SOURCE_MATERIALIZER = ROOT / ".cargo-target-nodebug/debug/source-materialize"
 JS_REFS = ROOT / ".cargo-target-nodebug/debug/js-refs"
 
 
@@ -60,26 +60,8 @@ def har_entry(url: str, mime: str, text: str):
 
 
 def stages(project: Path):
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/materialize-capture-source.py",
-        project,
-        "--formatter",
-        FORMATTER,
-    )
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/scan-js-references.py",
-        project,
-        "--extractor",
-        JS_REFS,
-    )
+    run(SOURCE_MATERIALIZER, project)
+    run(JS_REFS, "--project", project)
     run(
         "uv",
         "run",
@@ -227,7 +209,7 @@ def check_har():
     }
     har_path = work / "fixture.har"
     har_path.write_text(json.dumps(har))
-    run(HAR_PROJECT, har_path, "--output", project)
+    run(CAPTURE_IMPORT, har_path, "--output", project)
     stages(project)
 
     assert_common(
@@ -296,16 +278,7 @@ def check_saved_page():
     (assets / "lib/util.js").write_text("export const util = 1;\n")
     (assets / "extra.js").write_text("export const extra = 1;\n")
 
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/saved-page-to-manifest.py",
-        page,
-        "--output",
-        project,
-    )
+    run(CAPTURE_IMPORT, page, "--output", project)
     stages(project)
 
     base = "https://saved-page.invalid/saved-page/Saved_files/"

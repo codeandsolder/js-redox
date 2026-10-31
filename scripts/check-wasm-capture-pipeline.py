@@ -129,22 +129,13 @@ def main():
     }
     HAR.write_text(json.dumps(fixture))
 
-    run(TOOL_ROOT / "har-project", HAR, "--output", PROJECT)
+    run(TOOL_ROOT / "capture-import", HAR, "--output", PROJECT)
     manifest = json.loads((PROJECT / "capture-manifest.json").read_text())
     wasm_resource = next(row for row in manifest["resources"] if row["kind"] == "wasm")
     assert wasm_resource["output_path"].endswith(".wasm")
     assert (PROJECT / wasm_resource["output_path"]).read_bytes() == WASM
 
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/materialize-capture-source.py",
-        PROJECT,
-        "--formatter",
-        TOOL_ROOT / "js-format",
-    )
+    run(TOOL_ROOT / "source-materialize", PROJECT)
     run(
         "uv",
         "run",
@@ -161,16 +152,7 @@ def main():
         "--jobs",
         1,
     )
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/materialize-wasm.py",
-        PROJECT,
-        "--wasm-redox",
-        TOOL_ROOT / "wasm-redox",
-    )
+    run(TOOL_ROOT / "wasm-materialize", PROJECT)
 
     index = json.loads((PROJECT / "analysis/wasm/index.json").read_text())
     assert index["summary"] == {
