@@ -1,8 +1,8 @@
+use crate::numeric::{eval_js_bitwise_i64, exact_i64, exact_u64, js_int32_from_i64};
 use crate::{
     ast_utils::{expr_ident, numeric_u64, target_ident},
     source_text::preview,
 };
-use jsvm_lift::numeric::{eval_js_bitwise_i64, exact_i64, exact_u64, js_int32_from_i64};
 use oxc_ast::{
     ast::{Argument, Expression, ForStatement, Function, FunctionBody, Statement, SwitchStatement},
     AstKind,

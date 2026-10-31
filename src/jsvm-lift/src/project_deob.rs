@@ -2,6 +2,7 @@ use crate::{
     analysis_artifacts::{
         load_artifact, write_artifact, DEOBFUSCATION, SOURCE_INDEX, STRING_RECOVERY,
     },
+    bounded_process::{command_error, run_command_with_timeout},
     content_dedup::{default_jobs, link_or_copy},
     js_format::format_source,
     safe_deob::{deobfuscate_source, SafeDeobReport, SourceMode},
@@ -10,17 +11,14 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use rayon::{prelude::*, ThreadPoolBuilder};
 use serde_json::{json, Map, Value};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     time::Duration,
 };
 use tempfile::Builder as TempDirBuilder;
-use wait_timeout::ChildExt;
 
 #[derive(Debug, Clone)]
 pub struct ProjectDeobOptions {
@@ -102,96 +100,6 @@ fn derived_path(raw_path: &str, root: &str) -> PathBuf {
         None => {}
     }
     output
-}
-
-fn tail(text: &[u8], limit: usize) -> String {
-    let start = text.len().saturating_sub(limit);
-    String::from_utf8_lossy(&text[start..]).into_owned()
-}
-
-#[derive(Debug)]
-struct CommandResult {
-    code: i32,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-fn run_command_with_timeout(
-    command: &mut Command,
-    work: &Path,
-    timeout: Duration,
-) -> Result<CommandResult> {
-    fs::create_dir_all(work).with_context(|| format!("creating {}", work.display()))?;
-    let stdout_path = work.join("stdout.log");
-    let stderr_path = work.join("stderr.log");
-    let stdout = fs::File::create(&stdout_path)
-        .with_context(|| format!("creating {}", stdout_path.display()))?;
-    let stderr = fs::File::create(&stderr_path)
-        .with_context(|| format!("creating {}", stderr_path.display()))?;
-    let rendered = format!("{command:?}");
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .with_context(|| format!("launching {rendered}"))?;
-    let status = match child
-        .wait_timeout(timeout)
-        .with_context(|| format!("waiting for {rendered}"))?
-    {
-        Some(status) => (status, false),
-        None => {
-            #[cfg(unix)]
-            {
-                // The helper gets its own process group above. Kill the group so
-                // a timed-out `uv` wrapper cannot leave its Python child behind.
-                let group = format!("-{}", child.id());
-                let killed_group = Command::new("kill")
-                    .arg("-KILL")
-                    .arg("--")
-                    .arg(group)
-                    .status()
-                    .is_ok_and(|status| status.success());
-                if !killed_group && child.try_wait()?.is_none() {
-                    child
-                        .kill()
-                        .with_context(|| format!("killing timed-out {rendered}"))?;
-                }
-            }
-            #[cfg(not(unix))]
-            child
-                .kill()
-                .with_context(|| format!("killing timed-out {rendered}"))?;
-            let status = child
-                .wait()
-                .with_context(|| format!("reaping timed-out {rendered}"))?;
-            (status, true)
-        }
-    };
-    let mut stdout =
-        fs::read(&stdout_path).with_context(|| format!("reading {}", stdout_path.display()))?;
-    let mut stderr =
-        fs::read(&stderr_path).with_context(|| format!("reading {}", stderr_path.display()))?;
-    if status.1 {
-        stderr.extend_from_slice(format!("\ntimed out after {}s", timeout.as_secs()).as_bytes());
-    }
-    Ok(CommandResult {
-        code: if status.1 {
-            124
-        } else {
-            status.0.code().unwrap_or(1)
-        },
-        stdout: std::mem::take(&mut stdout),
-        stderr: std::mem::take(&mut stderr),
-    })
-}
-
-fn command_error(output: &CommandResult) -> String {
-    let mut bytes = Vec::with_capacity(output.stdout.len() + output.stderr.len());
-    bytes.extend_from_slice(&output.stdout);
-    bytes.extend_from_slice(&output.stderr);
-    tail(&bytes, 3000)
 }
 
 fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {

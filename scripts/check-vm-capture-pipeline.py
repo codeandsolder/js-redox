@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+TOOL_ROOT = Path(os.environ.get("JSVM_TOOL_ROOT", ROOT / ".cargo-target-nodebug/debug"))
 WORK = ROOT / "work/vm-capture-pipeline-regression"
 
 CASES = {

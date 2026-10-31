@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::{fs, path::Path};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EmbeddedScanReport {
     pub outer_start: u32,
     pub outer_end: u32,
@@ -36,7 +36,7 @@ pub struct EmbeddedScanReport {
     pub embedded: Vec<Self>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ScanReport {
     pub file: String,
     pub bytes: usize,

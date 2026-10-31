@@ -1,5 +1,5 @@
 use crate::ast_utils::target_ident;
-use jsvm_lift::numeric::exact_u64;
+use crate::numeric::exact_u64;
 use jsvm_safe_core::string_literal_value;
 use oxc_ast::{
     ast::{

@@ -1,4 +1,4 @@
-use jsvm_lift::numeric::exact_u64;
+use crate::numeric::exact_u64;
 use oxc_ast::ast::{AssignmentTarget, Expression};
 
 pub fn expr_ident<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {

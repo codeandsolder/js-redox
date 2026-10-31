@@ -7,6 +7,7 @@ use jsvm_lift::{
         WASM_INDEX, WASM_JS_BOUNDARY, WASM_RESOURCE_PROVENANCE,
     },
     capture_project::{read_manifest, MANIFEST_NAME},
+    project_scan::{scan_project, ProjectScanOptions},
     tool_environment::{repository_root, tool_dir},
 };
 use serde_json::Value;
@@ -375,26 +376,25 @@ fn main() -> Result<()> {
     }
 
     if vm_scan {
-        let string_recoverer = repo.join("scripts/recover-js-obfuscator-strings.py");
-        run_python(
-            &repo,
-            "scan-capture-project.py",
-            [
-                output.as_os_str(),
-                OsStr::new("--scanner"),
-                tool(&tool_root, "jsvm-lift").as_os_str(),
-                OsStr::new("--formatter"),
-                tool(&tool_root, "js-format").as_os_str(),
-                OsStr::new("--switch-ir"),
-                tool(&tool_root, "switch-ir").as_os_str(),
-                OsStr::new("--table-ir"),
-                tool(&tool_root, "table-ir").as_os_str(),
-                OsStr::new("--deobfuscator"),
-                tool(&tool_root, "deobfuscate-safe").as_os_str(),
-                OsStr::new("--string-recoverer"),
-                string_recoverer.as_os_str(),
-            ],
+        let summary = scan_project(
+            &output,
+            &ProjectScanOptions::with_defaults(
+                repo.clone(),
+                repo.join("scripts/recover-js-obfuscator-strings.py"),
+                tool(&tool_root, "switch-ir"),
+                tool(&tool_root, "table-ir"),
+            ),
         )?;
+        println!(
+            "VM scan: {} units; {} scanner invocations / {} exact-hash reuses; {} generated units; {} confirmed VM units; {} handler-table candidates; {} failures",
+            summary.code_units,
+            summary.scanner_invocations,
+            summary.deduplicated_scans,
+            summary.dynamic_units,
+            summary.confirmed_vm_units,
+            summary.handler_table_candidates,
+            summary.failures,
+        );
         run_tool(&tool_root, &repo, "vm-materialize", [&output])?;
     }
 

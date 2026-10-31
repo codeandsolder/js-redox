@@ -1,5 +1,6 @@
 pub mod analysis_artifacts;
 pub mod ast_utils;
+mod bounded_process;
 pub mod browser_script_types;
 pub mod bytecode;
 pub mod capture_import;
@@ -32,6 +33,7 @@ pub mod project_api_surface;
 pub mod project_deob;
 pub mod project_js_refs;
 pub mod project_readme;
+pub mod project_scan;
 pub mod project_sourcemaps;
 pub mod safe_deob;
 pub mod source_graph;
