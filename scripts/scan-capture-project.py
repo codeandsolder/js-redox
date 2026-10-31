@@ -319,6 +319,7 @@ def main():
 
     project = args.project.resolve()
     manifest = load_manifest(project)
+    resources_by_id = {resource["id"]: resource for resource in manifest["resources"]}
     deob = load_artifact(project, DEOBFUSCATION, optional=True) or {"units": []}
     deob_by_raw = {
         unit.get("raw_path"): unit
@@ -376,7 +377,7 @@ def main():
         raw_path = script.get("output_path")
         if not raw_path or not is_executable_script(script.get("script_type")):
             continue
-        parent = manifest["resources"][script["parent_resource_id"]]
+        parent = resources_by_id[script["parent_resource_id"]]
         derived = deob_by_raw.get(raw_path)
         scan_path = derived.get("output_path") if derived else raw_path
         queue(

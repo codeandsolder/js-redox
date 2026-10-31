@@ -160,6 +160,8 @@ def main():
     project = args.project.resolve()
     manifest = load_manifest(project)
 
+    resources_by_id = {resource["id"]: resource for resource in manifest["resources"]}
+
     units = []
     seen = set()
     for resource in manifest["resources"]:
@@ -201,7 +203,7 @@ def main():
         if raw and raw not in seen:
             seen.add(raw)
             kind = inline_script_kind(script.get("script_type"))
-            parent = manifest["resources"][script["parent_resource_id"]]
+            parent = resources_by_id[script["parent_resource_id"]]
             units.append(
                 {
                     "kind": kind,
