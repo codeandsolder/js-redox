@@ -9,6 +9,7 @@ use jsvm_lift::{
     capture_project::{read_manifest, MANIFEST_NAME},
     project_scan::{scan_project, ProjectScanOptions},
     tool_environment::{repository_root, tool_dir},
+    wasm_js_boundary::correlate_project as correlate_wasm_js_boundary,
 };
 use serde_json::Value;
 use std::{
@@ -76,21 +77,6 @@ where
 {
     let mut command = Command::new(tool(tool_root, name));
     command.args(args);
-    run(&mut command, repo)
-}
-
-fn run_python<I, S>(repo: &Path, script: &str, args: I) -> Result<()>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let mut command = Command::new("uv");
-    command
-        .arg("run")
-        .arg("--no-project")
-        .arg("python")
-        .arg(repo.join("scripts").join(script))
-        .args(args);
     run(&mut command, repo)
 }
 
@@ -364,15 +350,16 @@ fn main() -> Result<()> {
     }
 
     if wasm_analysis && safe_deob {
-        run_python(
-            &repo,
-            "correlate-wasm-js-boundary.py",
-            [
-                output.as_os_str(),
-                OsStr::new("--analyzer"),
-                tool(&tool_root, "wasm-import-semantics").as_os_str(),
-            ],
-        )?;
+        let summary = correlate_wasm_js_boundary(&output)?;
+        println!(
+            "WASM/JS boundary: {}/{} host-effect pair(s) have proven JS DataView.setUint32 shapes; {}/{} copied-input candidate(s) have proven JS Uint32Array constructor/set semantics; {} copied-input candidate(s) have proven exact module-memory identity; {} copied-input candidate(s) have proven source-word load interpretation",
+            summary.proven_js_set_u32_shapes,
+            summary.host_effect_pairs,
+            summary.proven_js_typed_array_copy_semantics,
+            summary.copied_input_candidates,
+            summary.proven_module_memory_identities,
+            summary.proven_destination_load_interpretations,
+        );
     }
 
     if vm_scan {

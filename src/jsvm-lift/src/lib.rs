@@ -67,6 +67,7 @@ pub mod forwarding_semantics;
 pub(crate) mod global_builtin;
 
 pub mod wasm_import_semantics;
+pub mod wasm_js_boundary;
 
 pub mod source_directive;
 

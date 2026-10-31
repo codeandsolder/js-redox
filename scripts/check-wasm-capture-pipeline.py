@@ -129,15 +129,19 @@ def main():
     }
     HAR.write_text(json.dumps(fixture))
 
-    run(TOOL_ROOT / "capture-import", HAR, "--output", PROJECT)
+    run(
+        TOOL_ROOT / "capture-project",
+        HAR,
+        PROJECT,
+        "--skip-vm-scan",
+        "--skip-bundle-unpack",
+        "--jobs",
+        1,
+    )
     manifest = json.loads((PROJECT / "capture-manifest.json").read_text())
     wasm_resource = next(row for row in manifest["resources"] if row["kind"] == "wasm")
     assert wasm_resource["output_path"].endswith(".wasm")
     assert (PROJECT / wasm_resource["output_path"]).read_bytes() == WASM
-
-    run(TOOL_ROOT / "source-materialize", PROJECT)
-    run(TOOL_ROOT / "deobfuscate-safe", "project", PROJECT, "--jobs", 1)
-    run(TOOL_ROOT / "wasm-materialize", PROJECT)
 
     index = json.loads((PROJECT / "analysis/wasm/index.json").read_text())
     assert index["summary"] == {
@@ -169,16 +173,6 @@ def main():
     ]
     assert sorted(pair["offset"] for pair in pairs) == [3536, 56708], pairs
 
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/correlate-wasm-js-boundary.py",
-        PROJECT,
-        "--analyzer",
-        TOOL_ROOT / "wasm-import-semantics",
-   )
     boundary = json.loads((PROJECT / "analysis/wasm-js-boundary.json").read_text())
     assert boundary["schema"] == "wasm-js-boundary-correlation/v6", boundary
     assert boundary["summary"]["host_effect_pairs"] == 2, boundary

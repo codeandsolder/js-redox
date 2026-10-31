@@ -2,7 +2,6 @@
 import base64
 import json
 import os
-import runpy
 import shutil
 import subprocess
 from pathlib import Path
@@ -144,15 +143,14 @@ def write_fixture(path: Path, title: str, js: str) -> None:
 
 
 def materialize_and_correlate(har: Path, project: Path) -> None:
-    run(TOOL_ROOT / "capture-import", har, "--output", project)
-    run(TOOL_ROOT / "source-materialize", project)
-    run(TOOL_ROOT / "deobfuscate-safe", "project", project, "--jobs", 1)
-    run(TOOL_ROOT / "wasm-materialize", project)
     run(
-        "uv", "run", "--no-project", "python",
-        "scripts/correlate-wasm-js-boundary.py", project,
-        "--analyzer", TOOL_ROOT / "wasm-import-semantics",
-        "--fresh-evaluator", TOOL_ROOT / "fresh-eval",
+        TOOL_ROOT / "capture-project",
+        har,
+        project,
+        "--skip-vm-scan",
+        "--skip-bundle-unpack",
+        "--jobs",
+        1,
     )
 
 
@@ -199,134 +197,6 @@ def cleanup_fixture_js(wasm_b64: str) -> str:
     )
 
 
-def check_transitive_runtime_dependency_overlay() -> None:
-    correlation = runpy.run_path(ROOT / "scripts/correlate-wasm-js-boundary.py")
-    overlay = correlation["source_word_semantic_overlay"]
-    analysis = {
-        "runtime_bindings": [
-            {
-                "value": 10,
-                "name": "$runtime0",
-                "expression": "i32load<memory0, align=2, offset=8>($arg0)",
-                "semantic_ir": {
-                    "kind": "operation",
-                    "value": 10,
-                    "operator": "i32load<memory0, align=2, offset=8>",
-                    "arguments": [{"kind": "argument", "index": 0}],
-                },
-                "runtime_dependencies": [],
-            },
-            {
-                "value": 20,
-                "name": "$runtime1",
-                "expression": "host.transform($runtime0)",
-                "semantic_ir": {
-                    "kind": "operation",
-                    "value": 20,
-                    "operator": "host.transform",
-                    "arguments": [{"kind": "runtime", "value": 10, "name": "$runtime0"}],
-                },
-                "runtime_dependencies": [10],
-            },
-        ],
-        "returns": [
-            {
-                "value": 30,
-                "expression": "$runtime1",
-                "semantic_ir": {"kind": "runtime", "value": 20, "name": "$runtime1"},
-                "runtime_dependencies": [20],
-            }
-        ],
-    }
-    for binding in analysis["runtime_bindings"]:
-        binding["normalized_semantic_ir"] = json.loads(json.dumps(binding["semantic_ir"]))
-    for report in analysis["returns"]:
-        report["normalized_semantic_ir"] = json.loads(json.dumps(report["semantic_ir"]))
-
-    interpretations = [
-        {
-            "load_value": 10,
-            "source_parameter": 0,
-            "source_element_index": 2,
-            "source_conversion": "ToUint32",
-        }
-    ]
-    bindings, returns, graph_proven = overlay(analysis, interpretations)
-    assert graph_proven is True, (bindings, returns)
-    assert [binding["load_value"] for binding in bindings] == [10], bindings
-    [semantic_return] = returns
-    assert semantic_return["runtime_dependencies"] == [20], semantic_return
-    assert semantic_return["transitive_runtime_dependencies"] == [10, 20], semantic_return
-    assert [
-        dependency["source_element_index"]
-        for dependency in semantic_return["source_word_dependencies"]
-    ] == [2], semantic_return
-    # Presentation rewriting cannot see through runtime1. The structured DAG and
-    # source-aware IR can: runtime1 remains a runtime leaf but carries the exact
-    # copied source word reachable through runtime1 -> runtime0.
-    assert semantic_return["raw_source_word_expression"] == "$runtime1", semantic_return
-    assert semantic_return["source_word_expression"] == "$runtime1", semantic_return
-    assert semantic_return["source_word_semantic_ir"] == {
-        "kind": "runtime",
-        "value": 20,
-        "name": "$runtime1",
-        "source_word_dependencies": [
-            {
-                "load_value": 10,
-                "runtime_binding": "$runtime0",
-                "source_parameter": 0,
-                "source_element_index": 2,
-                "source_conversion": "ToUint32",
-            }
-        ],
-    }, semantic_return
-
-    inconsistent = json.loads(json.dumps(analysis))
-    inconsistent["returns"][0]["semantic_ir"] = {
-        "kind": "runtime",
-        "value": 10,
-        "name": "$runtime0",
-    }
-    bad_bindings, bad_returns, bad_graph = overlay(inconsistent, interpretations)
-    assert bad_graph is False, (bad_bindings, bad_returns)
-    assert bad_bindings == [] and bad_returns == [], (bad_bindings, bad_returns)
-
-    normalization_mismatch = json.loads(json.dumps(analysis))
-    normalization_mismatch["returns"][0]["normalized_semantic_ir"] = {
-        "kind": "runtime",
-        "value": 10,
-        "name": "$runtime0",
-    }
-    norm_bindings, norm_returns, norm_graph = overlay(
-        normalization_mismatch, interpretations
-    )
-    assert norm_graph is False, (norm_bindings, norm_returns)
-    assert norm_bindings == [] and norm_returns == [], (norm_bindings, norm_returns)
-
-    cyclic = json.loads(json.dumps(analysis))
-    cyclic["runtime_bindings"][0]["runtime_dependencies"] = [20]
-    cyclic["runtime_bindings"][0]["semantic_ir"] = {
-        "kind": "runtime",
-        "value": 20,
-        "name": "$runtime1",
-    }
-    cyclic["runtime_bindings"][0]["normalized_semantic_ir"] = json.loads(
-        json.dumps(cyclic["runtime_bindings"][0]["semantic_ir"])
-    )
-    cyclic["runtime_bindings"][1]["runtime_dependencies"] = [10]
-    cyclic["runtime_bindings"][1]["semantic_ir"] = {
-        "kind": "runtime",
-        "value": 10,
-        "name": "$runtime0",
-    }
-    cyclic["runtime_bindings"][1]["normalized_semantic_ir"] = json.loads(
-        json.dumps(cyclic["runtime_bindings"][1]["semantic_ir"])
-    )
-    cycle_bindings, cycle_returns, cycle_graph = overlay(cyclic, interpretations)
-    assert cycle_graph is False, (cycle_bindings, cycle_returns)
-    assert cycle_bindings == [] and cycle_returns == [], (cycle_bindings, cycle_returns)
-
-
 def source_word_ir_indices(expression: dict) -> list[int]:
     if expression.get("kind") == "source_word":
         return [expression["source_element_index"]]
@@ -340,7 +210,6 @@ def source_word_ir_indices(expression: dict) -> list[int]:
 
 
 def main() -> None:
-    check_transitive_runtime_dependency_overlay()
     shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(parents=True)
     js = (
