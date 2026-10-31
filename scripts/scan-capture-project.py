@@ -180,6 +180,7 @@ def recover_generated_unit(
     deob_cp = run_tool(
         [
             args.deobfuscator,
+            "source",
             selected,
             safe_dest,
             "--report",

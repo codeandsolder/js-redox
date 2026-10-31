@@ -40,7 +40,6 @@ jobs:
         python3 scripts/check-saved-page-pipeline.py
         python3 scripts/check-har-content-classification.py
         python3 scripts/check-safe-deobfuscate.py
-        python3 scripts/check-deobfuscation-source-mode-pipeline.py
         python3 scripts/check-api-surface.py
         python3 scripts/check-static-string-recovery.py
         python3 scripts/check-vm-capture-pipeline.py

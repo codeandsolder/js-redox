@@ -146,14 +146,7 @@ def write_fixture(path: Path, title: str, js: str) -> None:
 def materialize_and_correlate(har: Path, project: Path) -> None:
     run(TOOL_ROOT / "capture-import", har, "--output", project)
     run(TOOL_ROOT / "source-materialize", project)
-    run(
-        "uv", "run", "--no-project", "python",
-        "scripts/materialize-safe-deobfuscation.py", project,
-        "--deobfuscator", TOOL_ROOT / "deobfuscate-safe",
-        "--string-recoverer", ROOT / "scripts/recover-js-obfuscator-strings.py",
-        "--formatter", TOOL_ROOT / "js-format",
-        "--jobs", 1,
-    )
+    run(TOOL_ROOT / "deobfuscate-safe", "project", project, "--jobs", 1)
     run(TOOL_ROOT / "wasm-materialize", project)
     run(
         "uv", "run", "--no-project", "python",

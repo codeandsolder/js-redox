@@ -136,22 +136,7 @@ def main():
     assert (PROJECT / wasm_resource["output_path"]).read_bytes() == WASM
 
     run(TOOL_ROOT / "source-materialize", PROJECT)
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/materialize-safe-deobfuscation.py",
-        PROJECT,
-        "--deobfuscator",
-        TOOL_ROOT / "deobfuscate-safe",
-        "--string-recoverer",
-        ROOT / "scripts/recover-js-obfuscator-strings.py",
-        "--formatter",
-        TOOL_ROOT / "js-format",
-        "--jobs",
-        1,
-    )
+    run(TOOL_ROOT / "deobfuscate-safe", "project", PROJECT, "--jobs", 1)
     run(TOOL_ROOT / "wasm-materialize", PROJECT)
 
     index = json.loads((PROJECT / "analysis/wasm/index.json").read_text())

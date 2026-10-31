@@ -204,7 +204,7 @@ def main():
             report = td / f"{name}.json"
             before = node_stdout(source)
             cp = subprocess.run(
-                [str(BIN), str(source), str(out), "--report", str(report)],
+                [str(BIN), "source", str(source), str(out), "--report", str(report)],
                 cwd=ROOT,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -384,7 +384,7 @@ def main():
         alias_formatted_report = td / "static-alias-installer-calls-formatted.json"
         cp = subprocess.run(
             [
-                str(BIN),
+                str(BIN), "source",
                 str(alias_source),
                 str(alias_formatted_out),
                 "--report",
@@ -412,7 +412,7 @@ def main():
         classic_report = td / "classic-script-redeclaration.json"
         before = node_stdout(classic_source)
         cp = subprocess.run(
-            [str(BIN), str(classic_source), str(classic_out), "--report", str(classic_report)],
+            [str(BIN), "source", str(classic_source), str(classic_out), "--report", str(classic_report)],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -435,7 +435,7 @@ def main():
             "const scope = { x: 1 }; with (scope) { console.log(x, 1 + 2); }\n"
         )
         cp = subprocess.run(
-            [str(BIN), str(with_source), str(with_out), "--report", str(with_report)],
+            [str(BIN), "source", str(with_source), str(with_out), "--report", str(with_report)],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -458,7 +458,7 @@ def main():
         )
         before = node_stdout(rotated_source)
         cp = subprocess.run(
-            [str(BIN), str(rotated_source), str(rotated_out), "--report", str(rotated_report)],
+            [str(BIN), "source", str(rotated_source), str(rotated_out), "--report", str(rotated_report)],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -481,7 +481,7 @@ def main():
         duplicate_report = td / "duplicate-scope-decoder-negative.json"
         before = node_stdout(duplicate_source)
         cp = subprocess.run(
-            [str(BIN), str(duplicate_source), str(duplicate_out), "--report", str(duplicate_report)],
+            [str(BIN), "source", str(duplicate_source), str(duplicate_out), "--report", str(duplicate_report)],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -502,7 +502,7 @@ def main():
         eval_prune_report = td / "proven-helper-prune-eval-safety.json"
         before = node_stdout(eval_prune_source)
         cp = subprocess.run(
-            [str(BIN), str(eval_prune_source), str(eval_prune_out), "--report", str(eval_prune_report)],
+            [str(BIN), "source", str(eval_prune_source), str(eval_prune_out), "--report", str(eval_prune_report)],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -525,7 +525,7 @@ def main():
         mutable_alias_report = td / "mutable-decoder-alias-safety.json"
         before = node_stdout(mutable_alias_source)
         cp = subprocess.run(
-            [str(BIN), str(mutable_alias_source), str(mutable_alias_out), "--report", str(mutable_alias_report)],
+            [str(BIN), "source", str(mutable_alias_source), str(mutable_alias_out), "--report", str(mutable_alias_report)],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -546,7 +546,7 @@ def main():
         guarded_report = td / "source-sensitive-base64-negative.json"
         before = node_stdout(guarded_source)
         cp = subprocess.run(
-            [str(BIN), str(guarded_source), str(guarded_out), "--report", str(guarded_report)],
+            [str(BIN), "source", str(guarded_source), str(guarded_out), "--report", str(guarded_report)],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -567,7 +567,7 @@ def main():
         safety_report = td / "proxy-safety.json"
         before = node_stdout(safety_source)
         cp = subprocess.run(
-            [str(BIN), str(safety_source), str(safety_out), "--report", str(safety_report)],
+            [str(BIN), "source", str(safety_source), str(safety_out), "--report", str(safety_report)],
             cwd=ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -590,7 +590,7 @@ def main():
         ordered_safety_report = td / "ordered-switch-safety.json"
         before = node_stdout(ordered_safety_source)
         cp = subprocess.run(
-            [str(BIN), str(ordered_safety_source), str(ordered_safety_out), "--report", str(ordered_safety_report)],
+            [str(BIN), "source", str(ordered_safety_source), str(ordered_safety_out), "--report", str(ordered_safety_report)],
             cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
         )
         if cp.returncode:
@@ -605,7 +605,7 @@ def main():
         ordered_for_safety_report = td / "ordered-switch-for-safety.json"
         before = node_stdout(ordered_for_safety_source)
         cp = subprocess.run(
-            [str(BIN), str(ordered_for_safety_source), str(ordered_for_safety_out), "--report", str(ordered_for_safety_report)],
+            [str(BIN), "source", str(ordered_for_safety_source), str(ordered_for_safety_out), "--report", str(ordered_for_safety_report)],
             cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
         )
         if cp.returncode:
@@ -620,7 +620,7 @@ def main():
         arithmetic_safety_report = td / "arithmetic-state-safety.json"
         before = node_stdout(arithmetic_safety_source)
         cp = subprocess.run(
-            [str(BIN), str(arithmetic_safety_source), str(arithmetic_safety_out), "--report", str(arithmetic_safety_report)],
+            [str(BIN), "source", str(arithmetic_safety_source), str(arithmetic_safety_out), "--report", str(arithmetic_safety_report)],
             cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
         )
         if cp.returncode:
@@ -642,7 +642,7 @@ def main():
         arithmetic_external_safety_report = td / "arithmetic-state-external-safety.json"
         before = node_stdout(arithmetic_external_safety_source)
         cp = subprocess.run(
-            [str(BIN), str(arithmetic_external_safety_source), str(arithmetic_external_safety_out), "--report", str(arithmetic_external_safety_report)],
+            [str(BIN), "source", str(arithmetic_external_safety_source), str(arithmetic_external_safety_out), "--report", str(arithmetic_external_safety_report)],
             cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
         )
         if cp.returncode:
@@ -658,7 +658,7 @@ def main():
         arithmetic_register_safety_report = td / "arithmetic-state-registers-safety.json"
         before = node_stdout(arithmetic_register_safety_source)
         cp = subprocess.run(
-            [str(BIN), str(arithmetic_register_safety_source), str(arithmetic_register_safety_out), "--report", str(arithmetic_register_safety_report)],
+            [str(BIN), "source", str(arithmetic_register_safety_source), str(arithmetic_register_safety_out), "--report", str(arithmetic_register_safety_report)],
             cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
         )
         if cp.returncode:
@@ -677,7 +677,7 @@ def main():
         arithmetic_try_safety_report = td / "arithmetic-state-try-safety.json"
         before = node_stdout(arithmetic_try_safety_source)
         cp = subprocess.run(
-            [str(BIN), str(arithmetic_try_safety_source), str(arithmetic_try_safety_out), "--report", str(arithmetic_try_safety_report)],
+            [str(BIN), "source", str(arithmetic_try_safety_source), str(arithmetic_try_safety_out), "--report", str(arithmetic_try_safety_report)],
             cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
         )
         if cp.returncode:
@@ -693,7 +693,7 @@ def main():
         arithmetic_conditional_safety_report = td / "arithmetic-state-conditional-safety.json"
         before = node_stdout(arithmetic_conditional_safety_source)
         cp = subprocess.run(
-            [str(BIN), str(arithmetic_conditional_safety_source), str(arithmetic_conditional_safety_out), "--report", str(arithmetic_conditional_safety_report)],
+            [str(BIN), "source", str(arithmetic_conditional_safety_source), str(arithmetic_conditional_safety_out), "--report", str(arithmetic_conditional_safety_report)],
             cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
         )
         if cp.returncode:
@@ -709,7 +709,7 @@ def main():
         arithmetic_iife_safety_report = td / "arithmetic-state-iife-safety.json"
         before = node_stdout(arithmetic_iife_safety_source)
         cp = subprocess.run(
-            [str(BIN), str(arithmetic_iife_safety_source), str(arithmetic_iife_safety_out), "--report", str(arithmetic_iife_safety_report)],
+            [str(BIN), "source", str(arithmetic_iife_safety_source), str(arithmetic_iife_safety_out), "--report", str(arithmetic_iife_safety_report)],
             cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
         )
         if cp.returncode:
@@ -729,7 +729,7 @@ def main():
             real_positive_out = td / "normal-et-real.js"
             real_positive_report = td / "normal-et-real.json"
             cp = subprocess.run(
-                [str(BIN), str(real_positive), str(real_positive_out), "--report", str(real_positive_report)],
+                [str(BIN), "source", str(real_positive), str(real_positive_out), "--report", str(real_positive_report)],
                 cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
             )
             if cp.returncode:
@@ -744,7 +744,7 @@ def main():
             real_negative_out = td / "captcha-et-real.js"
             real_negative_report = td / "captcha-et-real.json"
             cp = subprocess.run(
-                [str(BIN), str(real_negative), str(real_negative_out), "--report", str(real_negative_report)],
+                [str(BIN), "source", str(real_negative), str(real_negative_out), "--report", str(real_negative_report)],
                 cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
             )
             if cp.returncode:

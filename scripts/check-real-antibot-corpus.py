@@ -188,7 +188,7 @@ def main():
         run([FORMATTER, path, pretty])
         run(["node", "--check", pretty], timeout=60)
 
-        run([DEOB, path, deob, "--report", report_path], timeout=300)
+        run([DEOB, "source", path, deob, "--report", report_path], timeout=300)
         run(["node", "--check", deob], timeout=60)
         deob_report = json.loads(report_path.read_text())
         assert deob_report["safe_static_only"] is True

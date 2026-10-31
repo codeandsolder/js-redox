@@ -105,7 +105,7 @@ def main():
 
         # Safe deobfuscation must preserve source formatting except for proven
         # span rewrites. Never execute these production adtech samples.
-        run([DEOB, raw, deob, "--report", deob_report_path], timeout=360)
+        run([DEOB, "source", raw, deob, "--report", deob_report_path], timeout=360)
         run(["node", "--check", deob], timeout=90)
         meta = json.loads(deob_report_path.read_text())
         assert meta["safe_static_only"] is True, sample["id"]

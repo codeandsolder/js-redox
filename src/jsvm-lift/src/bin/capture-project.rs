@@ -7,6 +7,7 @@ use jsvm_lift::{
         WASM_INDEX, WASM_JS_BOUNDARY, WASM_RESOURCE_PROVENANCE,
     },
     capture_project::{read_manifest, MANIFEST_NAME},
+    tool_environment::{repository_root, tool_dir},
 };
 use serde_json::Value;
 use std::{
@@ -35,31 +36,6 @@ struct Args {
     skip_vm_scan: bool,
     #[arg(long)]
     skip_wasm_analysis: bool,
-}
-
-fn repo_root() -> Result<PathBuf> {
-    let current = env::current_dir().context("reading current directory")?;
-    let executable = env::current_exe().context("locating capture-project executable")?;
-    let candidates = current
-        .ancestors()
-        .chain(executable.ancestors())
-        .map(Path::to_path_buf);
-    for candidate in candidates {
-        if candidate.join("Cargo.toml").is_file()
-            && candidate.join("src/jsvm-lift/Cargo.toml").is_file()
-        {
-            return Ok(candidate);
-        }
-    }
-    bail!("could not locate js-redox repository root from cwd or executable path")
-}
-
-fn tool_dir() -> Result<PathBuf> {
-    let executable = env::current_exe().context("locating capture-project executable")?;
-    executable
-        .parent()
-        .map(Path::to_path_buf)
-        .context("capture-project executable has no parent directory")
 }
 
 fn tool(root: &Path, name: &str) -> PathBuf {
@@ -300,7 +276,7 @@ fn print_summary(
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let repo = repo_root()?;
+    let repo = repository_root()?;
     let tool_root = tool_dir()?;
     let capture = args
         .capture
@@ -373,22 +349,11 @@ fn main() -> Result<()> {
     push_jobs(&mut refs, args.jobs);
     run(&mut refs, &repo)?;
 
-    let string_recoverer = repo.join("scripts/recover-js-obfuscator-strings.py");
     if safe_deob {
-        let mut deob_args = vec![
-            output.as_os_str().to_owned(),
-            OsStr::new("--deobfuscator").to_owned(),
-            tool(&tool_root, "deobfuscate-safe").into_os_string(),
-            OsStr::new("--string-recoverer").to_owned(),
-            string_recoverer.as_os_str().to_owned(),
-            OsStr::new("--formatter").to_owned(),
-            tool(&tool_root, "js-format").into_os_string(),
-        ];
-        if let Some(jobs) = args.jobs {
-            deob_args.push(OsStr::new("--jobs").to_owned());
-            deob_args.push(jobs.to_string().into());
-        }
-        run_python(&repo, "materialize-safe-deobfuscation.py", deob_args)?;
+        let mut deob = Command::new(tool(&tool_root, "deobfuscate-safe"));
+        deob.arg("project").arg(&output);
+        push_jobs(&mut deob, args.jobs);
+        run(&mut deob, &repo)?;
         if bundle_unpack {
             let mut bundle = Command::new(tool(&tool_root, "bundle-materialize"));
             bundle.arg(&output);
@@ -410,6 +375,7 @@ fn main() -> Result<()> {
     }
 
     if vm_scan {
+        let string_recoverer = repo.join("scripts/recover-js-obfuscator-strings.py");
         run_python(
             &repo,
             "scan-capture-project.py",

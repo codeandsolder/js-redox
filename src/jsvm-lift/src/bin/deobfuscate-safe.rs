@@ -1,22 +1,32 @@
 use anyhow::{Context, Result};
-use clap::{Parser as ClapParser, ValueEnum};
-use oxc_allocator::Allocator;
-use oxc_codegen::Codegen;
-use oxc_span::SourceType;
-use rolldown_redox::ecmascript::parse_program;
-use serde::Serialize;
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use jsvm_lift::{
+    project_deob::{materialize_project_deobfuscation, ProjectDeobOptions},
+    safe_deob::{deobfuscate_source, SourceMode},
+    tool_environment::{repository_root, sibling_tool},
 };
+use std::{fs, path::PathBuf};
 
-#[derive(ClapParser, Debug)]
+#[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Conservative static JS deobfuscation; never executes sample code"
+    about = "Proof-oriented static JavaScript deobfuscation; never executes sample code"
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Deobfuscate one source file and optionally emit a proof report.
+    Source(SourceArgs),
+    /// Materialize safe source recovery/deobfuscation for a normalized capture project.
+    Project(ProjectArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct SourceArgs {
     input: PathBuf,
     output: PathBuf,
     #[arg(long)]
@@ -32,6 +42,19 @@ struct Args {
     format_output: bool,
 }
 
+#[derive(ClapArgs, Debug)]
+struct ProjectArgs {
+    project: PathBuf,
+    #[arg(long)]
+    string_recoverer: Option<PathBuf>,
+    #[arg(long)]
+    decoder_recoverer: Option<PathBuf>,
+    #[arg(long)]
+    jobs: Option<usize>,
+    #[arg(long, default_value_t = 16)]
+    max_iterations: usize,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum SourceModeArg {
     Auto,
@@ -39,211 +62,95 @@ enum SourceModeArg {
     Commonjs,
 }
 
-fn canonicalize(source: &str) -> Option<String> {
-    for source_type in [SourceType::mjs(), SourceType::cjs()] {
-        let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, source, source_type);
-        if !parsed.is_clean() {
-            continue;
+impl From<SourceModeArg> for SourceMode {
+    fn from(value: SourceModeArg) -> Self {
+        match value {
+            SourceModeArg::Auto => Self::Auto,
+            SourceModeArg::Module => Self::Module,
+            SourceModeArg::Commonjs => Self::CommonJs,
         }
-        return Some(Codegen::new().build(&parsed.program).code);
-    }
-    None
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    jsvm_lift::sha256_hex(bytes)
-}
-
-fn source_mode(
-    path: &Path,
-    requested: Option<SourceModeArg>,
-) -> (jsvm_safe_core::SafeSourceMode, &'static str) {
-    match requested {
-        Some(SourceModeArg::Auto) => (jsvm_safe_core::SafeSourceMode::Auto, "auto"),
-        Some(SourceModeArg::Module) => (jsvm_safe_core::SafeSourceMode::Module, "module"),
-        Some(SourceModeArg::Commonjs) => (jsvm_safe_core::SafeSourceMode::CommonJs, "commonjs"),
-        None => match path.extension().and_then(|extension| extension.to_str()) {
-            Some(extension) if extension.eq_ignore_ascii_case("mjs") => {
-                (jsvm_safe_core::SafeSourceMode::Module, "module")
-            }
-            Some(extension) if extension.eq_ignore_ascii_case("cjs") => {
-                (jsvm_safe_core::SafeSourceMode::CommonJs, "commonjs")
-            }
-            _ => (jsvm_safe_core::SafeSourceMode::Auto, "auto"),
-        },
     }
 }
 
-#[derive(Serialize)]
-struct ArithmeticStateProofReport {
-    iteration: usize,
-    input_start: usize,
-    input_end: usize,
-    state_var: String,
-    state_path: Vec<String>,
-    termination: String,
-    register_reads_rewritten: usize,
-    branch_test: Option<String>,
-    branch_paths: Vec<Vec<String>>,
-    branch_terminations: Vec<String>,
+fn source_mode(args: &SourceArgs) -> SourceMode {
+    args.source_mode
+        .map(SourceMode::from)
+        .unwrap_or_else(|| SourceMode::for_path(&args.input))
 }
 
-#[derive(Serialize)]
-struct StaticAliasInstallerCallReport {
-    start: u32,
-    end: u32,
-    installer: String,
-    resolver: String,
-    resolver_member: Option<String>,
-    source_property: String,
-    target_selector: u8,
-    target_hint: Option<String>,
-    alias_property: String,
-    forwarding_installer_proven: bool,
-    semantics_proven: bool,
-}
-
-#[derive(Serialize)]
-struct Report {
-    schema: &'static str,
-    source_mode: &'static str,
-    input: String,
-    input_sha256: String,
-    output_sha256: String,
-    changed: bool,
-    iterations: usize,
-    transforms: BTreeMap<String, usize>,
-    arithmetic_state_proofs: Vec<ArithmeticStateProofReport>,
-    analysis_source_sha256: String,
-    static_alias_installer_calls: Vec<StaticAliasInstallerCallReport>,
-    safe_static_only: bool,
-    presentation_formatted: bool,
-    runtime_semantics_preserved_by_design: bool,
-    analysis_complete: bool,
-    source_recovery: Option<&'static str>,
-}
-
-fn main() -> Result<()> {
-    let args = Args::parse();
+fn run_source(args: SourceArgs) -> Result<()> {
     let original = fs::read_to_string(&args.input)
         .with_context(|| format!("reading {}", args.input.display()))?;
-
-    // Feed the exact source bytes to the proof-oriented engine. Canonicalizing
-    // first is observably unsafe for Function#toString/self-defending code.
-    let (source_mode, source_mode_label) = source_mode(&args.input, args.source_mode);
-    let result =
-        jsvm_safe_core::deobfuscate_with_source_mode(&original, args.max_iterations, source_mode)
-            .ok_or_else(|| {
-            let reason = jsvm_safe_core::safe_source_rejection(&original, source_mode).map_or(
-                "rewrite-validation-failure",
-                jsvm_safe_core::SafeSourceRejection::as_str,
-            );
-            anyhow::anyhow!("source rejected by safe deobfuscation: {reason}")
-        })?;
-
-    let arithmetic_state_proofs = result
-        .arithmetic_state_proofs
-        .iter()
-        .map(|proof| ArithmeticStateProofReport {
-            iteration: proof.iteration,
-            input_start: proof.input_start,
-            input_end: proof.input_end,
-            state_var: proof.state_var.clone(),
-            state_path: proof.state_path.clone(),
-            termination: proof.termination.clone(),
-            register_reads_rewritten: proof.register_reads_rewritten,
-            branch_test: proof.branch_test.clone(),
-            branch_paths: proof.branch_paths.clone(),
-            branch_terminations: proof.branch_terminations.clone(),
-        })
-        .collect::<Vec<_>>();
-    let iterations = result.iterations;
-    let analysis_complete = result.analysis_complete;
-    let source_recovery = result
-        .source_recovery
-        .map(jsvm_safe_core::SafeSourceRecovery::as_str);
-    let analysis_source_sha256 = sha256(result.source.as_bytes());
-    let static_alias_installer_calls =
-        jsvm_lift::forwarding_alias::static_alias_installer_calls(&result.source)
-            .into_iter()
-            .map(|call| {
-                let target_hint = match (&call.resolver_member, call.target_selector) {
-                    (Some(member), 0) => Some(member.clone()),
-                    (Some(member), 1) => Some(format!("{member}.prototype")),
-                    (None, _) => None,
-                    _ => None,
-                };
-                StaticAliasInstallerCallReport {
-                    start: call.start,
-                    end: call.end,
-                    installer: call.installer,
-                    resolver: call.resolver,
-                    resolver_member: call.resolver_member,
-                    source_property: call.source_property,
-                    target_selector: call.target_selector,
-                    target_hint,
-                    alias_property: call.alias_property,
-                    forwarding_installer_proven: call.forwarding_installer_proven,
-                    semantics_proven: call.semantics_proven,
-                }
-            })
-            .collect::<Vec<_>>();
-
-    let mut transforms = result.transforms;
-    let source = if args.format_output {
-        let formatted = canonicalize(&result.source)
-            .ok_or_else(|| anyhow::anyhow!("Oxc could not format transformed source"))?;
-        if formatted != result.source {
-            *transforms.entry("presentation_codegen".into()).or_default() += 1;
-        }
-        formatted
-    } else {
-        result.source
-    };
+    let outcome = deobfuscate_source(
+        &original,
+        args.input.display().to_string(),
+        source_mode(&args),
+        args.max_iterations,
+        args.format_output,
+    )?;
 
     if let Some(parent) = args.output.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&args.output, &source)
+    fs::write(&args.output, outcome.source.as_bytes())
         .with_context(|| format!("writing {}", args.output.display()))?;
-
-    let report = Report {
-        schema: "js-safe-deobfuscate/v1",
-        source_mode: source_mode_label,
-        input: args.input.display().to_string(),
-        input_sha256: sha256(original.as_bytes()),
-        output_sha256: sha256(source.as_bytes()),
-        changed: source != original,
-        iterations,
-        transforms,
-        arithmetic_state_proofs,
-        analysis_source_sha256,
-        static_alias_installer_calls,
-        safe_static_only: true,
-        presentation_formatted: args.format_output,
-        runtime_semantics_preserved_by_design: !args.format_output,
-        analysis_complete,
-        source_recovery,
-    };
 
     if let Some(path) = &args.report {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(
-            path,
-            format!(
-                "{}
-",
-                serde_json::to_string_pretty(&report)?
-            ),
-        )?;
+        let mut encoded = serde_json::to_string_pretty(&outcome.report)?;
+        encoded.push('\n');
+        fs::write(path, encoded).with_context(|| format!("writing {}", path.display()))?;
     }
 
     println!(
         "safe deobfuscation changed={} iterations={} transforms={:?}",
-        report.changed, report.iterations, report.transforms
+        outcome.report.changed, outcome.report.iterations, outcome.report.transforms
     );
     Ok(())
+}
+
+fn run_project(args: ProjectArgs) -> Result<()> {
+    let repo_root = repository_root()?;
+    let project = args
+        .project
+        .canonicalize()
+        .with_context(|| format!("project does not exist: {}", args.project.display()))?;
+    let string_recoverer = args
+        .string_recoverer
+        .unwrap_or_else(|| repo_root.join("scripts/recover-js-obfuscator-strings.py"));
+    let decoder_recoverer = match args.decoder_recoverer {
+        Some(path) => path,
+        None => sibling_tool("static-string-recover")?,
+    };
+    let summary = materialize_project_deobfuscation(
+        &project,
+        &ProjectDeobOptions {
+            repo_root,
+            string_recoverer,
+            decoder_recoverer,
+            jobs: args.jobs,
+            max_iterations: args.max_iterations,
+        },
+    )?;
+    println!(
+        "safe source recovery: {} JS occurrences / {} unique raw / {} unique pre-deob / {} unique safe outputs; {} changed, {} deob failures; string recovery={} units/{} replacements",
+        summary.javascript_units,
+        summary.unique_raw_inputs,
+        summary.unique_pre_deob_inputs,
+        summary.unique_deob_outputs,
+        summary.changed_units,
+        summary.failed_units,
+        summary.string_recovery_changed_units,
+        summary.string_recovery_replacements,
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    match Args::parse().command {
+        Command::Source(args) => run_source(args),
+        Command::Project(args) => run_project(args),
+    }
 }
