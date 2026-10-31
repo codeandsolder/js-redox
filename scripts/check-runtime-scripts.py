@@ -13,10 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "work/runtime-script-regression"
-ANALYZER = ROOT / "scripts/analyze-runtime-scripts.py"
 CAPTURE_TO_PROJECT = ROOT / "scripts/capture-to-project.py"
-sys.path.insert(0, str(ROOT / "scripts"))
-from capture_pipeline import detect_capture  # noqa: E402
 
 
 def digest(source: str) -> str:
@@ -165,14 +162,25 @@ def main() -> None:
     }
     (capture / "runtime-scripts.json").write_text(json.dumps(events))
 
-    assert detect_capture(capture) == "recorder"
-    report_path = WORK / "runtime-analysis.json"
+    project = WORK / "project"
     subprocess.run(
-        [sys.executable, str(ANALYZER), str(capture), "--output", str(report_path)],
+        [
+            sys.executable,
+            str(CAPTURE_TO_PROJECT),
+            str(capture),
+            str(project),
+            "--overwrite",
+            "--jobs",
+            "2",
+            "--skip-safe-deobfuscation",
+            "--skip-bundle-unpack",
+            "--skip-vm-scan",
+            "--skip-wasm-analysis",
+        ],
         cwd=ROOT,
         check=True,
     )
-    report = json.loads(report_path.read_text())
+    report = json.loads((project / "analysis/runtime-scripts.json").read_text())
     summary = report["summary"]
     assert summary["script_parsed_events"] == 10, summary
     assert summary["unique_javascript_sources"] == 10, summary
@@ -197,24 +205,6 @@ def main() -> None:
     }
     assert mappings == {"exact", "x-model-setter", "x-for-rhs"}, mappings
 
-    project = WORK / "project"
-    subprocess.run(
-        [
-            sys.executable,
-            str(CAPTURE_TO_PROJECT),
-            str(capture),
-            str(project),
-            "--overwrite",
-            "--jobs",
-            "2",
-            "--skip-safe-deobfuscation",
-            "--skip-bundle-unpack",
-            "--skip-vm-scan",
-            "--skip-wasm-analysis",
-        ],
-        cwd=ROOT,
-        check=True,
-    )
     graph = json.loads((project / "analysis/source-graph.json").read_text())
     node_types = Counter(node["type"] for node in graph["nodes"])
     edge_kinds = Counter(edge["kind"] for edge in graph["edges"])

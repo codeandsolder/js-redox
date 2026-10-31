@@ -196,16 +196,6 @@ def run_capture_pipeline(
 
     kind = detect_capture(capture)
     manifest_path = _import_capture(capture, output, kind, tools, options)
-    if kind == "recorder":
-        run_checked(
-            [
-                sys.executable,
-                ROOT / "scripts/analyze-runtime-scripts.py",
-                capture,
-                "--output",
-                artifact_path(output, RUNTIME_SCRIPTS),
-            ]
-        )
 
     run_checked(
         [

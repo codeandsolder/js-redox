@@ -1,3 +1,4 @@
+mod runtime_scripts;
 mod saved_page;
 
 use crate::{
@@ -5,6 +6,7 @@ use crate::{
     har_project::{import_har_project, HarProjectOptions},
 };
 use anyhow::{bail, Context, Result};
+use runtime_scripts::analyze_recorder_runtime_scripts;
 use saved_page::{import_saved_page, SavedPageOptions};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -112,6 +114,7 @@ pub fn import_capture_project(options: &CaptureImportOptions) -> Result<CaptureI
                     .extra
                     .insert("har_input".into(), Value::String(har.display().to_string()));
                 write_manifest(&options.output.join("capture-manifest.json"), &manifest)?;
+                analyze_recorder_runtime_scripts(&input, &options.output, &manifest)?;
             }
             Ok(CaptureImportSummary {
                 kind,
