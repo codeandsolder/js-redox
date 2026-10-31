@@ -48,12 +48,11 @@ class Toolchain:
     table_ir: Path = TOOL_ROOT / "table-ir"
     vm_materializer: Path = TOOL_ROOT / "vm-materialize"
     js_refs: Path = TOOL_ROOT / "js-refs"
-    source_directives: Path = TOOL_ROOT / "source-directives"
     api_surface: Path = TOOL_ROOT / "api-surface"
     deobfuscator: Path = TOOL_ROOT / "deobfuscate-safe"
     string_recoverer: Path = ROOT / "scripts/recover-js-obfuscator-strings.py"
     bundle_materializer: Path = TOOL_ROOT / "bundle-materialize"
-    sourcemap_composer: Path = TOOL_ROOT / "sourcemap-compose"
+    sourcemaps: Path = TOOL_ROOT / "sourcemaps"
     wasm_materializer: Path = TOOL_ROOT / "wasm-materialize"
     wasm_resource_provenance: Path = TOOL_ROOT / "wasm-resource-provenance"
     wasm_import_semantics: Path = TOOL_ROOT / "wasm-import-semantics"
@@ -209,17 +208,7 @@ def run_capture_pipeline(
         if kind == "recorder":
             run_checked([tools.wasm_resource_provenance, output])
 
-    run_checked(
-        [
-            sys.executable,
-            ROOT / "scripts/recover-sourcemaps.py",
-            output,
-            "--composer",
-            tools.sourcemap_composer,
-            "--source-directives",
-            tools.source_directives,
-        ]
-    )
+    run_checked([tools.sourcemaps, "project", output])
     run_checked(
         [
             tools.js_refs,

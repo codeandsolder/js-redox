@@ -94,8 +94,8 @@ def main():
         TOOL_ROOT / "deobfuscate-safe",
         "--bundle-materializer",
         TOOL_ROOT / "bundle-materialize",
-        "--sourcemap-composer",
-        TOOL_ROOT / "sourcemap-compose",
+        "--sourcemaps",
+        TOOL_ROOT / "sourcemaps",
     )
 
     manifest = json.loads((PROJECT / "capture-manifest.json").read_text())

@@ -26,7 +26,7 @@ oxc_span.workspace = true
 oxc_syntax.workspace = true
 rayon.workspace = true
 regex.workspace = true
-rolldown_redox = { workspace = true, features = ["ecmascript"] }
+rolldown_redox = { workspace = true, features = ["ecmascript", "sourcemap"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

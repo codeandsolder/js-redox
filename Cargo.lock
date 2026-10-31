@@ -1246,7 +1246,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "rolldown_redox",
+ "jsvm-lift",
 ]
 
 [[package]]

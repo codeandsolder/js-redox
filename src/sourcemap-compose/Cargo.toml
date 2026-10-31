@@ -10,4 +10,8 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-rolldown_redox = { workspace = true, features = ["sourcemap"] }
+jsvm-lift = { path = "../jsvm-lift" }
+
+[[bin]]
+name = "sourcemaps"
+path = "src/main.rs"

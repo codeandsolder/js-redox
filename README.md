@@ -10,7 +10,7 @@ Provenance-preserving static recovery for hostile browser JavaScript and embedde
 - `corpus/manifest.json` — asserted positive/negative regression corpus.
 - `src/jsvm-safe-core/` — proof-gated semantics-preserving JavaScript rewrites.
 - `src/jsvm-lift/` — capture/project analysis, structural scanning, VM recovery and bundle/module tooling.
-- `src/sourcemap-compose/` — isolated source-map chain composition.
+- `src/sourcemap-compose/` — `sourcemaps compose|project`, backed by the shared Rust source-map recovery implementation.
 - `src/wasm-redox/` — WASM validation/readability, deep CFG/state-machine recovery and JavaScript/WASM boundary proofs.
 - `scripts/` — capture pipeline, proof correlation, build, benchmark and regression helpers.
 - Large unpinned-corpus acquisition, grading, catalog, and review tooling lives in [`codeandsolder/js-redox-corpus`](https://github.com/codeandsolder/js-redox-corpus); this repository keeps only engine-facing and pinned-regression tooling.
@@ -35,7 +35,7 @@ For normal executable builds, use the project helper rather than raw `cargo`:
 scripts/build-jsvm-lift.sh
 ```
 
-It uses the machine-pinned Rust 1.99 toolchain, requires the distributed sccache build path, derives build parallelism from live farm capacity, and publishes durable executables under `.cargo-target-nodebug/`. The helper builds the scanner/tooling plus `sourcemap-compose`, `wasm-redox`, and the `fresh-eval` proof helper, and asks Cargo for the workspace target directory rather than assuming a member-local `target/` layout.
+It uses the machine-pinned Rust 1.99 toolchain, requires the distributed sccache build path, derives build parallelism from live farm capacity, and publishes durable executables under `.cargo-target-nodebug/`. The helper builds the scanner/tooling plus `sourcemaps`, `wasm-redox`, and the `fresh-eval` proof helper, and asks Cargo for the workspace target directory rather than assuming a member-local `target/` layout.
 
 ## Suspicious-structure triage
 

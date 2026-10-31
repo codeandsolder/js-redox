@@ -27,12 +27,11 @@ def main() -> None:
     ap.add_argument("--table-ir", type=Path, default=defaults.table_ir)
     ap.add_argument("--vm-materializer", type=Path, default=defaults.vm_materializer)
     ap.add_argument("--js-refs", type=Path, default=defaults.js_refs)
-    ap.add_argument("--source-directives", type=Path, default=defaults.source_directives)
     ap.add_argument("--api-surface", type=Path, default=defaults.api_surface)
     ap.add_argument("--deobfuscator", type=Path, default=defaults.deobfuscator)
     ap.add_argument("--string-recoverer", type=Path, default=defaults.string_recoverer)
     ap.add_argument("--bundle-materializer", type=Path, default=defaults.bundle_materializer)
-    ap.add_argument("--sourcemap-composer", type=Path, default=defaults.sourcemap_composer)
+    ap.add_argument("--sourcemaps", type=Path, default=defaults.sourcemaps)
     ap.add_argument("--wasm-materializer", type=Path, default=defaults.wasm_materializer)
     ap.add_argument("--wasm-resource-provenance", type=Path, default=defaults.wasm_resource_provenance)
     ap.add_argument("--wasm-import-semantics", type=Path, default=defaults.wasm_import_semantics)
@@ -53,12 +52,11 @@ def main() -> None:
         table_ir=args.table_ir,
         vm_materializer=args.vm_materializer,
         js_refs=args.js_refs,
-        source_directives=args.source_directives,
         api_surface=args.api_surface,
         deobfuscator=args.deobfuscator,
         string_recoverer=args.string_recoverer,
         bundle_materializer=args.bundle_materializer,
-        sourcemap_composer=args.sourcemap_composer,
+        sourcemaps=args.sourcemaps,
         wasm_materializer=args.wasm_materializer,
         wasm_resource_provenance=args.wasm_resource_provenance,
         wasm_import_semantics=args.wasm_import_semantics,

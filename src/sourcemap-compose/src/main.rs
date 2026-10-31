@@ -1,34 +1,57 @@
 use anyhow::{Context, Result};
-use clap::Parser as ClapParser;
-use rolldown_redox::sourcemap::{compose_sourcemap_source, OwnedSourceMap};
+use clap::{Parser, Subcommand};
+use jsvm_lift::project_sourcemaps::{compose_sourcemap_json, recover_project_sourcemaps};
 use std::{fs, path::PathBuf};
 
-#[derive(ClapParser)]
+#[derive(Parser, Debug)]
+#[command(about = "Compose source maps or recover source-map chains for a capture project")]
 struct Args {
-    downstream: PathBuf,
-    upstream: PathBuf,
-    #[arg(long)]
-    source_id: u32,
-    #[arg(long)]
-    output: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    Compose {
+        downstream: PathBuf,
+        upstream: PathBuf,
+        #[arg(long)]
+        source_id: u32,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    Project {
+        project: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
-    let downstream_json = fs::read_to_string(&args.downstream)
-        .with_context(|| format!("reading {}", args.downstream.display()))?;
-    let upstream_json = fs::read_to_string(&args.upstream)
-        .with_context(|| format!("reading {}", args.upstream.display()))?;
-    let downstream = OwnedSourceMap::from_json_string(&downstream_json)
-        .with_context(|| format!("parsing {}", args.downstream.display()))?;
-    let upstream = OwnedSourceMap::from_json_string(&upstream_json)
-        .with_context(|| format!("parsing {}", args.upstream.display()))?;
-    let composed = compose_sourcemap_source(
-        downstream.as_source_map(),
-        args.source_id,
-        upstream.as_source_map(),
-    );
-    fs::write(&args.output, composed.to_json_string())
-        .with_context(|| format!("writing {}", args.output.display()))?;
+    match Args::parse().command {
+        Command::Compose {
+            downstream,
+            upstream,
+            source_id,
+            output,
+        } => {
+            let downstream_json = fs::read_to_string(&downstream)
+                .with_context(|| format!("reading {}", downstream.display()))?;
+            let upstream_json = fs::read_to_string(&upstream)
+                .with_context(|| format!("reading {}", upstream.display()))?;
+            let composed = compose_sourcemap_json(&downstream_json, &upstream_json, source_id)?;
+            fs::write(&output, composed)
+                .with_context(|| format!("writing {}", output.display()))?;
+        }
+        Command::Project { project } => {
+            let summary = recover_project_sourcemaps(&project)?;
+            println!(
+                "source maps: {} referenced; {} direct source files recovered; {} nested map link(s) composed; {} final source files recovered; {} missing map resources",
+                summary.referenced,
+                summary.direct_recovered,
+                summary.composed_links,
+                summary.final_recovered,
+                summary.missing_resources,
+            );
+        }
+    }
     Ok(())
 }
