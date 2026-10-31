@@ -1,7 +1,9 @@
 use crate::{
     forwarding_semantics::{
-        structurally_proven_registry_forwarding_calls, structurally_proven_registry_read_calls,
-        ProvenRegistryForwardingCall, ProvenRegistryReadCall,
+        structurally_proven_registry_forwarding_calls,
+        structurally_proven_registry_forwarding_value_calls,
+        structurally_proven_registry_read_calls, ProvenRegistryForwardingCall,
+        ProvenRegistryForwardingValueCall, ProvenRegistryReadCall,
     },
     receiver_identity::{ProvenOriginContext, ProvenOriginFlow},
 };
@@ -37,6 +39,13 @@ pub struct ProvenOriginRegistryReadCall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenOriginRegistryHandlerInstall {
     pub install: ProvenRegistryForwardingCall,
+    pub origin: ProvenRegistryObjectOrigin,
+    pub exact_key: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenOriginRegistryValueInstall {
+    pub install: ProvenRegistryForwardingValueCall,
     pub origin: ProvenRegistryObjectOrigin,
     pub exact_key: i64,
 }
@@ -118,6 +127,43 @@ pub fn proven_origin_registry_read_calls(
 }
 
 #[must_use]
+pub fn proven_origin_registry_value_installs(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    flow: &ProvenOriginFlow,
+) -> Vec<ProvenOriginRegistryValueInstall> {
+    let mut proven = structurally_proven_registry_forwarding_value_calls(program, scoping)
+        .into_iter()
+        .filter_map(|install| {
+            let (origin, exact_key) = joined_origin_and_key(
+                flow,
+                install.call_start,
+                install.call_end,
+                install.receiver_start,
+                install.receiver_end,
+                install.key_start,
+                install.key_end,
+            )?;
+            Some(ProvenOriginRegistryValueInstall {
+                install,
+                origin,
+                exact_key: exact_key?,
+            })
+        })
+        .collect::<Vec<_>>();
+    proven.sort_by_key(|proof| {
+        (
+            proof.install.call_start,
+            proof.install.call_end,
+            proof.exact_key,
+            proof.install.value_start,
+        )
+    });
+    proven.dedup();
+    proven
+}
+
+#[must_use]
 pub fn proven_origin_registry_handler_installs(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -156,7 +202,10 @@ pub fn proven_origin_registry_handler_installs(
 
 #[cfg(test)]
 mod tests {
-    use super::{proven_origin_registry_handler_installs, proven_origin_registry_read_calls};
+    use super::{
+        proven_origin_registry_handler_installs, proven_origin_registry_read_calls,
+        proven_origin_registry_value_installs,
+    };
     use crate::receiver_identity::structurally_proven_origin_flow;
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
@@ -193,6 +242,38 @@ mod tests {
             installs[0].install.registry_path,
             reads[0].read.registry_path
         );
+    }
+
+    #[test]
+    fn joins_non_function_registry_values_by_exact_origin_and_key() {
+        let source = r#"
+            const C = function() {
+                install(this, 7, "payload");
+            };
+            function write(state, key, value) { state.T[key] = value; }
+            function install(state, key, value) { write(state, key, value); }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let scoping = semantic.semantic.scoping();
+        let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+        let values = proven_origin_registry_value_installs(&parsed.program, scoping, &flow);
+        let handlers = proven_origin_registry_handler_installs(&parsed.program, scoping, &flow);
+        assert_eq!(values.len(), 1);
+        let root = values
+            .iter()
+            .find(|proof| {
+                &source[proof.install.value_start as usize..proof.install.value_end as usize]
+                    == "\"payload\""
+            })
+            .expect("outer literal value");
+        assert_eq!(root.exact_key, 7);
+        assert_eq!(root.install.registry_path, vec!["T"]);
+        assert!(handlers.is_empty());
     }
 
     #[test]

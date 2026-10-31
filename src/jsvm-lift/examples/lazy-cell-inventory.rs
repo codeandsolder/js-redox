@@ -3,6 +3,7 @@ use jsvm_lift::{
     forwarding_semantics::structurally_proven_lazy_registry_read_calls,
     lazy_cell::{
         proven_slow_lazy_cell_captured_handler_install,
+        proven_slow_lazy_cell_captured_value_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
         proven_slow_lazy_cell_prototype_carrier, proven_slow_lazy_cell_read_result,
         proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_resolved_handler,
@@ -11,7 +12,9 @@ use jsvm_lift::{
         proven_slow_lazy_cell_update_state, structurally_proven_slow_lazy_cell_factory_shapes,
     },
     receiver_identity::structurally_proven_origin_flow,
-    registry_identity::proven_origin_registry_handler_installs,
+    registry_identity::{
+        proven_origin_registry_handler_installs, proven_origin_registry_value_installs,
+    },
 };
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
@@ -107,6 +110,8 @@ fn main() -> Result<()> {
 
     let flow = structurally_proven_origin_flow(&parsed.program, scoping);
     let origin_installs = proven_origin_registry_handler_installs(&parsed.program, scoping, &flow);
+    let origin_value_installs =
+        proven_origin_registry_value_installs(&parsed.program, scoping, &flow);
     let candidate_calls = flow
         .direct_calls
         .iter()
@@ -191,6 +196,20 @@ fn main() -> Result<()> {
                         install,
                     ) {
                         captured_handlers.push(proof);
+                    }
+                }
+            }
+            let mut captured_values = Vec::new();
+            for exact_assignment in &exact_assignments {
+                for install in &origin_value_installs {
+                    if let Some(proof) = proven_slow_lazy_cell_captured_value_install(
+                        &source,
+                        &parsed.program,
+                        &semantic.semantic,
+                        exact_assignment,
+                        install,
+                    ) {
+                        captured_values.push(proof);
                     }
                 }
             }
@@ -297,6 +316,18 @@ fn main() -> Result<()> {
                     "caller_handler_parameter_index": proof.caller_handler_parameter_index,
                     "caller_handler_symbol": scoping.symbol_name(proof.caller_handler_symbol),
                 })).collect::<Vec<_>>(),
+                "captured_values": captured_values.iter().map(|proof| json!({
+                    "exact_key_value": proof.exact_assignment.exact_key_value,
+                    "logical_install": [proof.install.install.call_start, proof.install.install.call_end],
+                    "value": [proof.install.install.value_start, proof.install.install.value_end],
+                    "value_source": snippet(
+                        &source,
+                        proof.install.install.value_start,
+                        proof.install.install.value_end,
+                    ),
+                    "caller_value_parameter_index": proof.caller_value_parameter_index,
+                    "caller_value_symbol": scoping.symbol_name(proof.caller_value_symbol),
+                })).collect::<Vec<_>>(),
                 "resolver_proofs": resolver_proofs.iter().map(|resolver| json!({
                     "phase_value": resolver.phase_value,
                     "exact_key_value": resolver.exact_key_value,
@@ -336,6 +367,10 @@ fn main() -> Result<()> {
         .iter()
         .filter(|call| !call["state_fields"].is_null())
         .count();
+    let captured_value_proofs = candidate_calls
+        .iter()
+        .map(|call| call["captured_values"].as_array().map_or(0, Vec::len))
+        .sum::<usize>();
     let resolver_proven_calls = candidate_calls
         .iter()
         .map(|call| call["resolver_proofs"].as_array().map_or(0, Vec::len))
@@ -370,6 +405,8 @@ fn main() -> Result<()> {
             "candidate_calls": candidate_calls,
             "specialized_calls": specialized_calls,
             "origin_handler_installs": origin_installs.len(),
+            "origin_value_installs": origin_value_installs.len(),
+            "captured_value_proofs": captured_value_proofs,
             "state_field_proven_calls": state_field_proven_calls,
             "resolver_proven_calls": resolver_proven_calls,
             "resolved_handler_proofs": resolved_handler_proofs,

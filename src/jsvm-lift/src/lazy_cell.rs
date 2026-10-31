@@ -153,6 +153,14 @@ pub struct ProvenSlowLazyCellResolverIndex {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenSlowLazyCellCapturedValueInstall {
+    pub exact_assignment: ProvenSlowLazyCellExactRegistryAssignment,
+    pub install: crate::registry_identity::ProvenOriginRegistryValueInstall,
+    pub caller_value_parameter_index: usize,
+    pub caller_value_symbol: SymbolId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenSlowLazyCellCapturedHandlerInstall {
     pub exact_assignment: ProvenSlowLazyCellExactRegistryAssignment,
     pub install: crate::registry_identity::ProvenOriginRegistryHandlerInstall,
@@ -1736,54 +1744,44 @@ fn unique_argument_containing(
     matches.next().is_none().then_some(first)
 }
 
-/// Join one exact slow-cell registry assignment to the logical forwarding
-/// install whose original handler feeds the wrapper.
-///
-/// Handler identity is carried along the exact same direct-call provenance
-/// chain that established the registry key. Every forwarding step must pass the
-/// current handler parameter directly, preserve that binding, and be proven by
-/// CFG ordering to occur before any other use of the handler in that invocation.
-/// The final installer parameter must likewise reach M's exact capture before
-/// any other use. This proves forwarding itself cannot invoke or expose the
-/// original handler before M captures it.
-#[must_use]
-pub fn proven_slow_lazy_cell_captured_handler_install(
+fn proven_slow_lazy_cell_captured_value_path(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     exact_assignment: &ProvenSlowLazyCellExactRegistryAssignment,
-    install: &crate::registry_identity::ProvenOriginRegistryHandlerInstall,
-) -> Option<ProvenSlowLazyCellCapturedHandlerInstall> {
+    install_call_start: u32,
+    install_call_end: u32,
+    install_key_start: u32,
+    install_key_end: u32,
+    install_value_start: u32,
+    install_value_end: u32,
+    install_registry_path: &[String],
+    install_origin: &crate::registry_identity::ProvenRegistryObjectOrigin,
+    install_exact_key: i64,
+) -> Option<(usize, SymbolId)> {
     let chain = &exact_assignment.provenance_calls;
     let root = chain.first()?;
     let final_call = chain.last()?;
     if final_call != &exact_assignment.caller
-        || (root.call_start, root.call_end)
-            != (install.install.call_start, install.install.call_end)
-        || exact_assignment.exact_key_value != install.exact_key
-        || exact_assignment.assignment.registry_path != install.install.registry_path
+        || (root.call_start, root.call_end) != (install_call_start, install_call_end)
+        || exact_assignment.exact_key_value != install_exact_key
+        || exact_assignment.assignment.registry_path != install_registry_path
         || crate::registry_identity::ProvenRegistryObjectOrigin::from(&root.callee)
-            != install.origin
+            != *install_origin
     {
         return None;
     }
 
-    let root_handler_parameter_index = unique_argument_containing(
-        &root.argument_spans,
-        install.install.handler_start,
-        install.install.handler_end,
-    )?;
-    let root_key_parameter_index = unique_argument_containing(
-        &root.argument_spans,
-        install.install.key_start,
-        install.install.key_end,
-    )?;
+    let root_value_parameter_index =
+        unique_argument_containing(&root.argument_spans, install_value_start, install_value_end)?;
+    let root_key_parameter_index =
+        unique_argument_containing(&root.argument_spans, install_key_start, install_key_end)?;
     let root_parameters = function_parameter_symbols_at(
         program,
         root.callee.function_start,
         root.callee.function_end,
     )?;
-    let mut current_symbol = *root_parameters.get(root_handler_parameter_index)?;
+    let mut current_symbol = *root_parameters.get(root_value_parameter_index)?;
     let mut current_key_parameter_index = root_key_parameter_index;
     let mut current_key_symbol = *root_parameters.get(root_key_parameter_index)?;
     let mut current_context = root.callee.clone();
@@ -1866,20 +1864,20 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
         return None;
     }
 
-    let mut nested_handler_symbol = None;
+    let mut nested_value_symbol = None;
     struct Probe<'o> {
         nested_call_start: u32,
         nested_call_end: u32,
-        nested_handler_index: usize,
+        nested_value_index: usize,
         scoping: &'o Scoping,
-        nested_handler_symbol: &'o mut Option<SymbolId>,
+        nested_value_symbol: &'o mut Option<SymbolId>,
     }
     impl<'a> Visit<'a> for Probe<'_> {
         fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
             if call.span.start == self.nested_call_start && call.span.end == self.nested_call_end {
-                *self.nested_handler_symbol = call
+                *self.nested_value_symbol = call
                     .arguments
-                    .get(self.nested_handler_index)
+                    .get(self.nested_value_index)
                     .and_then(|argument| argument.as_expression())
                     .and_then(|expression| reference_symbol(self.scoping, expression));
                 return;
@@ -1890,16 +1888,16 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
     Probe {
         nested_call_start: exact_assignment.assignment.factory_call.call.call_start,
         nested_call_end: exact_assignment.assignment.factory_call.call.call_end,
-        nested_handler_index: exact_assignment
+        nested_value_index: exact_assignment
             .assignment
             .factory_call
             .shape
             .handler_parameter_index,
         scoping: semantic.scoping(),
-        nested_handler_symbol: &mut nested_handler_symbol,
+        nested_value_symbol: &mut nested_value_symbol,
     }
     .visit_program(program);
-    if nested_handler_symbol != Some(current_symbol)
+    if nested_value_symbol != Some(current_symbol)
         || !symbol_only_forwarded_at_direct_call(
             source,
             program,
@@ -1938,11 +1936,79 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
         return None;
     }
 
+    Some((root_value_parameter_index, current_symbol))
+}
+
+/// Join one exact slow-cell registry assignment to any logical forwarding
+/// install whose original value feeds the wrapper. The same exact object-origin,
+/// key-provenance, binding-preservation, and no-use-before-forwarding barriers
+/// used for logical function handlers are required for arbitrary values.
+#[must_use]
+pub fn proven_slow_lazy_cell_captured_value_install(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    exact_assignment: &ProvenSlowLazyCellExactRegistryAssignment,
+    install: &crate::registry_identity::ProvenOriginRegistryValueInstall,
+) -> Option<ProvenSlowLazyCellCapturedValueInstall> {
+    let (caller_value_parameter_index, caller_value_symbol) =
+        proven_slow_lazy_cell_captured_value_path(
+            source,
+            program,
+            semantic,
+            exact_assignment,
+            install.install.call_start,
+            install.install.call_end,
+            install.install.key_start,
+            install.install.key_end,
+            install.install.value_start,
+            install.install.value_end,
+            &install.install.registry_path,
+            &install.origin,
+            install.exact_key,
+        )?;
+    Some(ProvenSlowLazyCellCapturedValueInstall {
+        exact_assignment: exact_assignment.clone(),
+        install: install.clone(),
+        caller_value_parameter_index,
+        caller_value_symbol,
+    })
+}
+
+/// Join one exact slow-cell registry assignment to the logical forwarding
+/// install whose original handler feeds the wrapper.
+///
+/// This is the function-valued specialization of the generic captured-value
+/// theorem above; it intentionally preserves the old handler-only API.
+#[must_use]
+pub fn proven_slow_lazy_cell_captured_handler_install(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    exact_assignment: &ProvenSlowLazyCellExactRegistryAssignment,
+    install: &crate::registry_identity::ProvenOriginRegistryHandlerInstall,
+) -> Option<ProvenSlowLazyCellCapturedHandlerInstall> {
+    let (caller_handler_parameter_index, caller_handler_symbol) =
+        proven_slow_lazy_cell_captured_value_path(
+            source,
+            program,
+            semantic,
+            exact_assignment,
+            install.install.call_start,
+            install.install.call_end,
+            install.install.key_start,
+            install.install.key_end,
+            install.install.handler_start,
+            install.install.handler_end,
+            &install.install.registry_path,
+            &install.origin,
+            install.exact_key,
+        )?;
     Some(ProvenSlowLazyCellCapturedHandlerInstall {
         exact_assignment: exact_assignment.clone(),
         install: install.clone(),
-        caller_handler_parameter_index: root_handler_parameter_index,
-        caller_handler_symbol: current_symbol,
+        caller_handler_parameter_index,
+        caller_handler_symbol,
     })
 }
 
@@ -3633,6 +3699,7 @@ pub fn structurally_proven_slow_lazy_cell_factory_shapes(
 mod tests {
     use super::{
         proven_slow_lazy_cell_captured_handler_install,
+        proven_slow_lazy_cell_captured_value_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
         proven_slow_lazy_cell_prototype_carrier, proven_slow_lazy_cell_read_result,
         proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_resolved_handler,
@@ -3643,7 +3710,9 @@ mod tests {
     use crate::{
         forwarding_semantics::structurally_proven_lazy_registry_read_calls,
         receiver_identity::structurally_proven_origin_flow,
-        registry_identity::proven_origin_registry_handler_installs,
+        registry_identity::{
+            proven_origin_registry_handler_installs, proven_origin_registry_value_installs,
+        },
     };
     use oxc_allocator::Allocator;
     use oxc_ast::ast::{BindingPattern, Statement};
@@ -3817,7 +3886,7 @@ mod tests {
             let outer_phase;
             const C = function() {
                 this.base = {};
-                install(this, 7, function handler() {});
+                install(this, 7, "payload");
             };
             C.prototype.method = "create";
             function install(state, key, handler) {
@@ -3890,6 +3959,28 @@ mod tests {
             fields.fields.prototype_field.initialization.property,
             "base"
         );
+        let values = proven_origin_registry_value_installs(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &flow,
+        );
+        let value = values
+            .iter()
+            .find(|proof| {
+                proof.exact_key == 7
+                    && &source[proof.install.value_start as usize..proof.install.value_end as usize]
+                        == "\"payload\""
+            })
+            .expect("logical value install");
+        let captured = proven_slow_lazy_cell_captured_value_install(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &exact,
+            value,
+        )
+        .expect("captured non-function value");
+        assert_eq!(captured.exact_assignment.exact_key_value, 7);
     }
 
     #[test]

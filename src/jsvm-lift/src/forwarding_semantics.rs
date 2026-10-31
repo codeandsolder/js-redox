@@ -31,6 +31,22 @@ pub struct ProvenRegistryForwardingCall {
     pub handler_async: bool,
 }
 
+/// Structural proof that a call feeds one evaluated value through a proven
+/// registry forwarder. Unlike [`ProvenRegistryForwardingCall`], this does not
+/// require the value expression itself to be a function literal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenRegistryForwardingValueCall {
+    pub call_start: u32,
+    pub call_end: u32,
+    pub receiver_start: u32,
+    pub receiver_end: u32,
+    pub key_start: u32,
+    pub key_end: u32,
+    pub value_start: u32,
+    pub value_end: u32,
+    pub registry_path: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenRegistryReadCall {
     pub call_start: u32,
@@ -2453,6 +2469,108 @@ pub fn structurally_proven_lazy_registry_read_calls(
     calls.calls
 }
 
+fn registry_forwarder_proofs(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> HashMap<SymbolId, RegistryForwarderProof> {
+    let mut forwarders = RegistryForwarderCollector {
+        scoping,
+        proofs: HashMap::new(),
+    };
+    forwarders.visit_program(program);
+    loop {
+        let mut delegates = RegistryDelegateCollector {
+            scoping,
+            known: &forwarders.proofs,
+            proofs: HashMap::new(),
+        };
+        delegates.visit_program(program);
+        if delegates.proofs.is_empty() {
+            break;
+        }
+        forwarders.proofs.extend(delegates.proofs);
+    }
+    forwarders.proofs
+}
+
+struct RegistryForwardingValueCallCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    proofs: &'p HashMap<SymbolId, RegistryForwarderProof>,
+    calls: Vec<ProvenRegistryForwardingValueCall>,
+}
+
+impl<'a> Visit<'a> for RegistryForwardingValueCallCollector<'_, '_> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            if let Expression::Identifier(callee) = last_sequence_expression(&call.callee) {
+                if let Some(symbol) = callee
+                    .reference_id
+                    .get()
+                    .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                    .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
+                {
+                    if let Some(proof) = self.proofs.get(&symbol) {
+                        let receiver = usize::try_from(proof.receiver_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .and_then(|expression| {
+                                stable_receiver_expression(self.scoping, expression)
+                            });
+                        let key = usize::try_from(proof.key_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .map(last_sequence_expression);
+                        let value = usize::try_from(proof.value_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .map(last_sequence_expression);
+                        if let (Some(receiver), Some(key), Some(value)) = (receiver, key, value) {
+                            self.calls.push(ProvenRegistryForwardingValueCall {
+                                call_start: call.span.start,
+                                call_end: call.span.end,
+                                receiver_start: receiver.span().start,
+                                receiver_end: receiver.span().end,
+                                key_start: key.span().start,
+                                key_end: key.span().end,
+                                value_start: value.span().start,
+                                value_end: value.span().end,
+                                registry_path: proof.registry_path.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+/// Find all calls through structurally proven registry forwarders, preserving
+/// the exact source span of the evaluated value that enters the forwarder.
+#[must_use]
+pub fn structurally_proven_registry_forwarding_value_calls(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<ProvenRegistryForwardingValueCall> {
+    let proofs = registry_forwarder_proofs(program, scoping);
+    let mut calls = RegistryForwardingValueCallCollector {
+        scoping,
+        proofs: &proofs,
+        calls: Vec::new(),
+    };
+    calls.visit_program(program);
+    calls
+        .calls
+        .sort_by_key(|call| (call.call_start, call.call_end));
+    calls
+        .calls
+        .dedup_by_key(|call| (call.call_start, call.call_end));
+    calls.calls
+}
+
 struct RegistryForwardingCallCollector<'c, 'p> {
     scoping: &'c Scoping,
     proofs: &'p HashMap<SymbolId, RegistryForwarderProof>,
@@ -2537,26 +2655,10 @@ pub fn structurally_proven_registry_forwarding_calls(
     program: &Program<'_>,
     scoping: &Scoping,
 ) -> Vec<ProvenRegistryForwardingCall> {
-    let mut forwarders = RegistryForwarderCollector {
-        scoping,
-        proofs: HashMap::new(),
-    };
-    forwarders.visit_program(program);
-    loop {
-        let mut delegates = RegistryDelegateCollector {
-            scoping,
-            known: &forwarders.proofs,
-            proofs: HashMap::new(),
-        };
-        delegates.visit_program(program);
-        if delegates.proofs.is_empty() {
-            break;
-        }
-        forwarders.proofs.extend(delegates.proofs);
-    }
+    let proofs = registry_forwarder_proofs(program, scoping);
     let mut calls = RegistryForwardingCallCollector {
         scoping,
-        proofs: &forwarders.proofs,
+        proofs: &proofs,
         calls: Vec::new(),
     };
     calls.visit_program(program);
@@ -2592,6 +2694,7 @@ pub fn structurally_proven_forwarding_installers(
 mod tests {
     use super::{
         structurally_proven_forwarding_installers, structurally_proven_registry_forwarding_calls,
+        structurally_proven_registry_forwarding_value_calls,
         structurally_proven_registry_read_calls,
     };
     use oxc_allocator::Allocator;
@@ -2623,6 +2726,40 @@ mod tests {
             &parsed.program,
             semantic_ret.semantic.scoping(),
         )
+    }
+
+    #[test]
+    fn proves_non_function_registry_value_forwarding() {
+        let allocator = Allocator::default();
+        let source = r#"
+            function write(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            function install(receiver, key, value) {
+                write(receiver, key, value);
+            }
+            install(state, 7, "payload");
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let proven = structurally_proven_registry_forwarding_value_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        );
+        assert_eq!(proven.len(), 2);
+        let root = proven
+            .iter()
+            .find(|proof| {
+                &source[proof.value_start as usize..proof.value_end as usize] == "\"payload\""
+            })
+            .expect("outer literal value");
+        assert_eq!(root.registry_path, vec!["handlers"]);
+        assert!(structurally_proven_registry_forwarding_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .is_empty());
     }
 
     #[test]
