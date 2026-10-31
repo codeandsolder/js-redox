@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "work/import-map-regression"
 HAR_PROJECT = ROOT / ".cargo-target-nodebug/debug/har-project"
-FORMATTER = ROOT / ".cargo-target-nodebug/debug/js-format"
+SOURCE_MATERIALIZER = ROOT / ".cargo-target-nodebug/debug/source-materialize"
 JS_REFS = ROOT / ".cargo-target-nodebug/debug/js-refs"
 
 
@@ -60,26 +60,8 @@ def har_entry(url: str, mime: str, text: str):
 
 
 def stages(project: Path):
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/materialize-capture-source.py",
-        project,
-        "--formatter",
-        FORMATTER,
-    )
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/scan-js-references.py",
-        project,
-        "--extractor",
-        JS_REFS,
-    )
+    run(SOURCE_MATERIALIZER, project)
+    run(JS_REFS, "--project", project)
     run(
         "uv",
         "run",

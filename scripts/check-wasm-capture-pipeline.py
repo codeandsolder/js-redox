@@ -135,16 +135,7 @@ def main():
     assert wasm_resource["output_path"].endswith(".wasm")
     assert (PROJECT / wasm_resource["output_path"]).read_bytes() == WASM
 
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/materialize-capture-source.py",
-        PROJECT,
-        "--formatter",
-        TOOL_ROOT / "js-format",
-    )
+    run(TOOL_ROOT / "source-materialize", PROJECT)
     run(
         "uv",
         "run",

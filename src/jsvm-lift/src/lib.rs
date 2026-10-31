@@ -4,7 +4,10 @@ pub mod capture_project;
 pub mod content_dedup;
 
 pub mod har_project;
+pub mod js_format;
+pub mod js_refs;
 
+pub mod bundle_materialize;
 pub mod bundle_unpack;
 
 pub mod browser_decode;
@@ -14,6 +17,9 @@ pub mod effect_shape;
 pub mod numeric;
 pub mod parse_int;
 pub mod project_api_surface;
+pub mod project_js_refs;
+pub mod source_materialize;
+pub mod vm_materialize;
 
 pub mod pipeline;
 

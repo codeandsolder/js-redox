@@ -179,18 +179,7 @@ def main():
     HAR.write_text(json.dumps(fixture), encoding="utf-8")
 
     run(TOOL_ROOT / "har-project", HAR, "--output", PROJECT)
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/materialize-capture-source.py",
-        PROJECT,
-        "--formatter",
-        TOOL_ROOT / "js-format",
-        "--jobs",
-        "4",
-    )
+    run(TOOL_ROOT / "source-materialize", PROJECT, "--jobs", "4")
 
     manifest = json.loads((PROJECT / "capture-manifest.json").read_text())
     resources = {row["url"]: row for row in manifest["resources"]}

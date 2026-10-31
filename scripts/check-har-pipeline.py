@@ -204,8 +204,8 @@ def main():
         TOOL_ROOT / "js-refs",
         "--deobfuscator",
         TOOL_ROOT / "deobfuscate-safe",
-        "--bundle-inventory",
-        TOOL_ROOT / "bundle-unpack",
+        "--bundle-materializer",
+        TOOL_ROOT / "bundle-materialize",
         "--sourcemap-composer",
         TOOL_ROOT / "sourcemap-compose",
     )

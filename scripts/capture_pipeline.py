@@ -43,14 +43,16 @@ class Toolchain:
     har_project: Path = TOOL_ROOT / "har-project"
     scanner: Path = TOOL_ROOT / "jsvm-lift"
     formatter: Path = TOOL_ROOT / "js-format"
+    source_materializer: Path = TOOL_ROOT / "source-materialize"
     switch_ir: Path = TOOL_ROOT / "switch-ir"
     table_ir: Path = TOOL_ROOT / "table-ir"
+    vm_materializer: Path = TOOL_ROOT / "vm-materialize"
     js_refs: Path = TOOL_ROOT / "js-refs"
     source_directives: Path = TOOL_ROOT / "source-directives"
     api_surface: Path = TOOL_ROOT / "api-surface"
     deobfuscator: Path = TOOL_ROOT / "deobfuscate-safe"
     string_recoverer: Path = ROOT / "scripts/recover-js-obfuscator-strings.py"
-    bundle_inventory: Path = TOOL_ROOT / "bundle-unpack"
+    bundle_materializer: Path = TOOL_ROOT / "bundle-materialize"
     sourcemap_composer: Path = TOOL_ROOT / "sourcemap-compose"
     wasm_redox: Path = TOOL_ROOT / "wasm-redox"
     wasm_import_semantics: Path = TOOL_ROOT / "wasm-import-semantics"
@@ -224,11 +226,8 @@ def run_capture_pipeline(
 
     run_checked(
         [
-            sys.executable,
-            ROOT / "scripts/materialize-capture-source.py",
+            tools.source_materializer,
             output,
-            "--formatter",
-            tools.formatter,
             *_parallel_args(options.jobs),
         ]
     )
@@ -264,11 +263,9 @@ def run_capture_pipeline(
     )
     run_checked(
         [
-            sys.executable,
-            ROOT / "scripts/scan-js-references.py",
-            output,
-            "--extractor",
             tools.js_refs,
+            "--project",
+            output,
             *_parallel_args(options.jobs),
         ]
     )
@@ -291,13 +288,8 @@ def run_capture_pipeline(
         if options.bundle_unpack:
             run_checked(
                 [
-                    sys.executable,
-                    ROOT / "scripts/materialize-bundle-modules.py",
+                    tools.bundle_materializer,
                     output,
-                    "--inventory",
-                    tools.bundle_inventory,
-                    "--formatter",
-                    tools.formatter,
                     *_parallel_args(options.jobs),
                 ]
             )
@@ -333,7 +325,7 @@ def run_capture_pipeline(
                 tools.string_recoverer,
             ]
         )
-        run_checked([sys.executable, ROOT / "scripts/materialize-switch-ir.py", output])
+        run_checked([tools.vm_materializer, output])
 
     run_checked([tools.api_surface, "--project", output])
     run_checked([sys.executable, ROOT / "scripts/build-source-graph.py", output])
