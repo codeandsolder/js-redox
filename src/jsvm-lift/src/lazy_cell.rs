@@ -1422,6 +1422,7 @@ fn symbol_only_forwarded_at_direct_call(
     symbol: SymbolId,
     function_span: Span,
     incoming: &ProvenOriginDirectCall,
+    exact_integer_parameter: (usize, i64),
     call: &ProvenOriginDirectCall,
     argument_index: usize,
 ) -> bool {
@@ -1431,6 +1432,17 @@ fn symbol_only_forwarded_at_direct_call(
     };
     let argument = Span::new(argument_start, argument_end);
     let call_span = Span::new(call.call_start, call.call_end);
+    let mut specialized_incoming = incoming.clone();
+    let Some(argument_value) = specialized_incoming
+        .exact_integer_arguments
+        .get_mut(exact_integer_parameter.0)
+    else {
+        return false;
+    };
+    match *argument_value {
+        Some(existing) if existing != exact_integer_parameter.1 => return false,
+        _ => *argument_value = Some(exact_integer_parameter.1),
+    }
     let mut allowed_references = 0usize;
     let mut barriers = Vec::new();
 
@@ -1455,7 +1467,7 @@ fn symbol_only_forwarded_at_direct_call(
             source,
             program,
             semantic.scoping(),
-            incoming,
+            &specialized_incoming,
             span,
         ) {
             barriers.push(span);
@@ -1761,12 +1773,19 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
         install.install.handler_start,
         install.install.handler_end,
     )?;
+    let root_key_parameter_index = unique_argument_containing(
+        &root.argument_spans,
+        install.install.key_start,
+        install.install.key_end,
+    )?;
     let root_parameters = function_parameter_symbols_at(
         program,
         root.callee.function_start,
         root.callee.function_end,
     )?;
     let mut current_symbol = *root_parameters.get(root_handler_parameter_index)?;
+    let mut current_key_parameter_index = root_key_parameter_index;
+    let mut current_key_symbol = *root_parameters.get(root_key_parameter_index)?;
     let mut current_context = root.callee.clone();
     let mut incoming = root.clone();
 
@@ -1807,17 +1826,37 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
             current_symbol,
             Span::new(current_context.function_start, current_context.function_end),
             &incoming,
+            (
+                current_key_parameter_index,
+                exact_assignment.exact_key_value,
+            ),
             next,
             *next_parameter_index,
         ) {
             return None;
         }
+        let matching_key_arguments = (0..next.argument_spans.len())
+            .filter(|index| {
+                call_argument_symbol_at(
+                    program,
+                    semantic.scoping(),
+                    next.call_start,
+                    next.call_end,
+                    *index,
+                ) == Some(current_key_symbol)
+            })
+            .collect::<Vec<_>>();
+        let [next_key_parameter_index] = matching_key_arguments.as_slice() else {
+            return None;
+        };
         let next_parameters = function_parameter_symbols_at(
             program,
             next.callee.function_start,
             next.callee.function_end,
         )?;
         current_symbol = *next_parameters.get(*next_parameter_index)?;
+        current_key_symbol = *next_parameters.get(*next_key_parameter_index)?;
+        current_key_parameter_index = *next_key_parameter_index;
         current_context = next.callee.clone();
         incoming = next.clone();
     }
@@ -1868,6 +1907,10 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
             current_symbol,
             Span::new(factory_caller.function_start, factory_caller.function_end),
             &incoming,
+            (
+                current_key_parameter_index,
+                exact_assignment.exact_key_value,
+            ),
             &exact_assignment.assignment.factory_call.call,
             exact_assignment
                 .assignment
@@ -4324,6 +4367,64 @@ mod tests {
             handler,
             oxc_span::Span::new(call.caller.function_start, call.caller.function_end),
             incoming,
+            (1, 7),
+            call,
+            2,
+        ));
+    }
+
+    #[test]
+    fn forwarding_order_uses_recovered_key_across_delegate_edge() {
+        let source = r#"
+            const C = function() { install(this, 7, function handler() {}); };
+            function install(state, key, handler) {
+                return write(state, key, handler);
+            }
+            function write(state, key, handler) {
+                if (key === 7) {
+                    return sink(state, key, handler);
+                } else {
+                    handler();
+                }
+            }
+            function sink(state, key, handler) { state.T[key] = handler; }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let call_start = source.find("sink(state, key, handler)").expect("sink call") as u32;
+        let call = flow
+            .direct_calls
+            .iter()
+            .find(|call| call.call_start == call_start)
+            .expect("inner forwarding call");
+        let incoming = flow
+            .direct_calls
+            .iter()
+            .find(|edge| edge.callee == call.caller)
+            .expect("delegate entry");
+        assert_eq!(incoming.exact_integer_arguments, vec![None, None, None]);
+        let parameters = super::function_parameter_symbols_at(
+            &parsed.program,
+            call.caller.function_start,
+            call.caller.function_end,
+        )
+        .expect("write parameters");
+        assert!(super::symbol_only_forwarded_at_direct_call(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            parameters[2],
+            oxc_span::Span::new(call.caller.function_start, call.caller.function_end),
+            incoming,
+            (1, 7),
             call,
             2,
         ));
@@ -4376,6 +4477,7 @@ mod tests {
             handler,
             oxc_span::Span::new(call.caller.function_start, call.caller.function_end),
             incoming,
+            (1, 7),
             call,
             2,
         ));
