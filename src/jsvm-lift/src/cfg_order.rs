@@ -1,4 +1,7 @@
-use oxc_ast::{ast::FunctionType, AstKind};
+use oxc_ast::{
+    ast::{Expression, FunctionType},
+    AstKind,
+};
 use oxc_cfg::{
     graph::{visit::EdgeRef, Direction},
     BlockNodeId, EdgeType,
@@ -47,6 +50,46 @@ fn usable_edge(edge: &EdgeType) -> bool {
     !matches!(edge, EdgeType::NewFunction | EdgeType::Unreachable)
 }
 
+fn expression_is_direct_event(expression: &Expression<'_>, event: Span) -> bool {
+    if expression.span() == event {
+        return true;
+    }
+    match expression {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            expression_is_direct_event(&parenthesized.expression, event)
+        }
+        _ => false,
+    }
+}
+
+/// Prove a local JavaScript evaluation-order fact that remains valid across
+/// loops and try/catch: if `event` is a complete earlier item of the same
+/// sequence expression containing `barrier`, every execution of the later
+/// item necessarily follows normal completion of the event item in that very
+/// sequence evaluation.
+fn sequence_event_completion_precedes_barrier(
+    semantic: &Semantic<'_>,
+    event_node: NodeId,
+    event: Span,
+    barrier: Span,
+) -> bool {
+    let nodes = semantic.nodes();
+    nodes.ancestors_enumerated(event_node).any(|(_, ancestor)| {
+        let AstKind::SequenceExpression(sequence) = ancestor.kind() else {
+            return false;
+        };
+        let event_index = sequence
+            .expressions
+            .iter()
+            .position(|expression| expression_is_direct_event(expression, event));
+        let barrier_index = sequence.expressions.iter().position(|expression| {
+            let span = expression.span();
+            span.start <= barrier.start && barrier.end <= span.end
+        });
+        matches!((event_index, barrier_index), (Some(event_index), Some(barrier_index)) if event_index < barrier_index)
+    })
+}
+
 fn event_reachable_from(semantic: &Semantic<'_>, from: BlockNodeId, event: BlockNodeId) -> bool {
     semantic
         .cfg()
@@ -92,6 +135,9 @@ pub fn prove_event_before_barriers(
         if enclosing_function(semantic, barrier_node) != Some(function_node) {
             return false;
         }
+        if sequence_event_completion_precedes_barrier(semantic, event_node, event, *barrier) {
+            continue;
+        }
         barriers_by_block
             .entry(nodes.cfg_id(barrier_node))
             .or_default()
@@ -100,6 +146,9 @@ pub fn prove_event_before_barriers(
 
     if !event_reachable_from(semantic, function_entry, event_block) {
         return false;
+    }
+    if barriers_by_block.is_empty() {
+        return true;
     }
 
     let mut queue = VecDeque::from([(function_entry, false)]);
@@ -404,6 +453,24 @@ mod tests {
             .map(|barrier| call_span(&semantic, source, barrier))
             .collect::<Vec<_>>();
         prove_event_before_barriers(&semantic, event, &barriers)
+    }
+
+    #[test]
+    fn sequence_completion_orders_later_barrier_across_loop_backedge() {
+        let source = "function f() { for (;;) { event(), barrier(); if (stop) break; } }";
+        assert!(prove(source, "event()", &["barrier()"]));
+    }
+
+    #[test]
+    fn sequence_completion_rejects_earlier_barrier() {
+        let source = "function f() { for (;;) { barrier(), event(); if (stop) break; } }";
+        assert!(!prove(source, "event()", &["barrier()"]));
+    }
+
+    #[test]
+    fn sequence_completion_rejects_conditionally_skipped_event_item() {
+        let source = "function f() { for (;;) { (flag && event()), barrier(); if (stop) break; } }";
+        assert!(!prove(source, "event()", &["barrier()"]));
     }
 
     #[test]

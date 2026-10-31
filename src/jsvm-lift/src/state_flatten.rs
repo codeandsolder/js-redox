@@ -1763,6 +1763,44 @@ pub fn prove_function_switch_event_unreachable_with_integer_parameters(
                         self.proofs.push(false);
                         return;
                     };
+
+                    // A target case whose own label is definitely unequal to the
+                    // already-evaluated discriminant cannot be selected directly.
+                    // It can then only be reached by fallthrough from an earlier
+                    // selected/default case. If every earlier case unconditionally
+                    // terminates, opaque earlier case labels are irrelevant: match,
+                    // non-match, or throw all prevent the target consequent.
+                    let target_case = &switch.cases[target];
+                    let event_in_target_consequent =
+                        target_case.consequent.iter().any(|statement| {
+                            statement.span().start <= self.event.start
+                                && self.event.end <= statement.span().end
+                        });
+                    let target_mismatches = target_case.test.as_ref().is_some_and(|test| {
+                        eval_expr(test, self.env).is_some_and(|value| value != discriminant)
+                            || match (
+                                boolean_result_on_normal_completion(&switch.discriminant, self.env),
+                                boolean_result_on_normal_completion(test, self.env),
+                            ) {
+                                (Some(left), Some(right)) => left != right,
+                                _ => false,
+                            }
+                    });
+                    let prior_cases_terminate = switch.cases[..target].iter().all(|case| {
+                        case.consequent.last().is_some_and(|statement| {
+                            matches!(
+                                statement,
+                                Statement::BreakStatement(_)
+                                    | Statement::ReturnStatement(_)
+                                    | Statement::ThrowStatement(_)
+                            )
+                        })
+                    });
+                    if event_in_target_consequent && target_mismatches && prior_cases_terminate {
+                        self.proofs.push(true);
+                        return;
+                    }
+
                     let mut default = None;
                     let mut selected = None;
                     for (index, case) in switch.cases.iter().enumerate() {
@@ -4072,8 +4110,42 @@ fn branch_truthiness(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Op
                 None
             }
         }
+        // An empty array literal is effect-free and truthy. Do not generalize
+        // this to populated arrays/objects: their element/property evaluation
+        // can mutate tracked bindings before normal completion.
+        Expression::ArrayExpression(array) if array.elements.is_empty() => Some(true),
         _ => None,
     }
+}
+
+fn expression_has_boolean_result(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            expression_has_boolean_result(&parenthesized.expression)
+        }
+        Expression::SequenceExpression(sequence) => sequence
+            .expressions
+            .last()
+            .is_some_and(expression_has_boolean_result),
+        Expression::BooleanLiteral(_) => true,
+        Expression::UnaryExpression(unary) => unary.operator.as_str() == "!",
+        Expression::BinaryExpression(binary) => matches!(
+            binary.operator.as_str(),
+            "==" | "!=" | "===" | "!==" | "<" | "<=" | ">" | ">=" | "in" | "instanceof"
+        ),
+        Expression::ConditionalExpression(conditional) => {
+            expression_has_boolean_result(&conditional.consequent)
+                && expression_has_boolean_result(&conditional.alternate)
+        }
+        _ => false,
+    }
+}
+
+fn boolean_result_on_normal_completion(
+    expression: &Expression<'_>,
+    env: &HashMap<String, Scalar>,
+) -> Option<bool> {
+    expression_has_boolean_result(expression).then(|| branch_truthiness(expression, env))?
 }
 
 fn expression_definitely_throws(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> bool {
@@ -5761,6 +5833,85 @@ mod tests {
                 function.end,
                 event,
                 &BTreeMap::from([(1, 410)]),
+            )
+        );
+    }
+
+    #[test]
+    fn proves_switch_target_mismatch_past_opaque_terminating_case() {
+        let source = r#"const x = function(Q, Y) {
+            switch (!(Q == 410 || Q == 387)) {
+                case opaque():
+                    first(Y);
+                    break;
+                case ![]:
+                    sink(Y);
+                    break;
+            }
+        };"#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+        struct FunctionSpan {
+            span: Option<Span>,
+        }
+        impl<'a> Visit<'a> for FunctionSpan {
+            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+                self.span = Some(function.span);
+            }
+        }
+        let mut function = FunctionSpan { span: None };
+        function.visit_program(&parsed.program);
+        let function = function.span.unwrap();
+        let start = u32::try_from(source.find("sink(Y)").unwrap()).unwrap();
+        let event = Span::new(start, start + 7);
+        assert!(
+            prove_function_switch_event_unreachable_with_integer_parameters(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                event,
+                &BTreeMap::from([(0, 294)]),
+            )
+        );
+    }
+
+    #[test]
+    fn switch_target_mismatch_rejects_possible_prior_fallthrough() {
+        let source = r#"const x = function(Q, Y) {
+            switch (!(Q == 410 || Q == 387)) {
+                case opaque():
+                    first(Y);
+                case ![]:
+                    sink(Y);
+                    break;
+            }
+        };"#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+        struct FunctionSpan {
+            span: Option<Span>,
+        }
+        impl<'a> Visit<'a> for FunctionSpan {
+            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+                self.span = Some(function.span);
+            }
+        }
+        let mut function = FunctionSpan { span: None };
+        function.visit_program(&parsed.program);
+        let function = function.span.unwrap();
+        let start = u32::try_from(source.find("sink(Y)").unwrap()).unwrap();
+        let event = Span::new(start, start + 7);
+        assert!(
+            !prove_function_switch_event_unreachable_with_integer_parameters(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                event,
+                &BTreeMap::from([(0, 294)]),
             )
         );
     }
