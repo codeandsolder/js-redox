@@ -1910,6 +1910,24 @@ sink(decode(0x10), decode(0x11));
         assert!(recovered.source.contains("sink(\"34\", \"56\")"));
         assert!(recovered.source.contains("void 0"));
 
+        let shadowed_parse_int = source.replace(
+            "function(provider_arg, target, indices, alias, table, sum) {",
+            "function(provider_arg, target, indices, alias, table, sum) { function parseInt() { return 36; }",
+        );
+        assert_ne!(shadowed_parse_int, source);
+        let rejected = recover_static_decoders(&shadowed_parse_int, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        assert_eq!(
+            rejected.transforms.get("materialize_decoder_rotation"),
+            None
+        );
+        assert_eq!(
+            rejected.transforms.get("remove_decoder_rotation_iife"),
+            None
+        );
+
         let bad = source.replace("provider, 396", "provider, 397");
         let rejected = recover_static_decoders(&bad, 8);
         assert!(rejected.is_some());
@@ -2200,10 +2218,30 @@ sink(decode(0));
         let equivalent = equivalent.unwrap_or_else(|| unreachable!());
         assert_eq!(equivalent.transforms.get("string_array_decode"), Some(&1));
 
+        let dead_short_circuit_setup =
+            source.replace("cursor = 0,", "cursor = 1, hidden = false && (cursor = 0),");
+        assert_ne!(dead_short_circuit_setup, source);
+
+        let deferred_setup = source.replace(
+            r#"output = void 0,
+            alphabet = "318mC4sQfF7VWJ/h5AiBOtzHogbKun2jvxwlp6NkXD=eUraRTy9+GcS0qYEIdLMPZ",
+            cursor = 0,
+            input = (input = value).replace(/[^A-Za-z0-9\+\/\=]/g, output = "")"#,
+            r#"output, alphabet, cursor, input,
+            hidden = () => (
+                alphabet = "318mC4sQfF7VWJ/h5AiBOtzHogbKun2jvxwlp6NkXD=eUraRTy9+GcS0qYEIdLMPZ",
+                cursor = 0,
+                input = (input = value).replace(/[^A-Za-z0-9\+\/\=]/g, output = "")
+            )"#,
+        );
+        assert_ne!(deferred_setup, source);
+
         for rejected_source in [
             source.replace("sextet1 >> 4", "sextet1 >> 3"),
             source.replace("64 != sextet2", "64 != sextet1"),
             source.replace("var byte0,", "var hidden = sideEffect(), byte0,"),
+            dead_short_circuit_setup,
+            deferred_setup,
         ] {
             let rejected = recover_static_decoders(&rejected_source, 4);
             assert!(rejected.is_some());

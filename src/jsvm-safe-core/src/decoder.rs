@@ -790,6 +790,16 @@ impl FixedAlphabetProbe<'_> {
 }
 
 impl<'a> Visit<'a> for FixedAlphabetProbe<'_> {
+    fn visit_function(&mut self, _function: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        // Alphabets assigned inside deferred nested functions do not
+        // exist at the point the decoder body executes.
+    }
+
     fn visit_variable_declarator(&mut self, declarator: &oxc_ast::ast::VariableDeclarator<'a>) {
         if let Some(initializer) = &declarator.init {
             self.consider(initializer);
@@ -2238,6 +2248,48 @@ fn rotation_has_dynamic_scope(function: &oxc_ast::ast::Function<'_>) -> bool {
     probe.found
 }
 
+fn rotation_parse_int_references_are_global(
+    function: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+) -> bool {
+    let Some(body) = &function.body else {
+        return false;
+    };
+
+    struct Probe<'c> {
+        scoping: &'c Scoping,
+        valid: bool,
+    }
+
+    impl<'a> Visit<'a> for Probe<'_> {
+        fn visit_identifier_reference(
+            &mut self,
+            identifier: &oxc_ast::ast::IdentifierReference<'a>,
+        ) {
+            if identifier.name.as_str() == "parseInt" {
+                self.valid &= identifier.reference_id.get().is_some_and(|reference_id| {
+                    statically_unresolved_global_reference(self.scoping, reference_id)
+                });
+            }
+        }
+
+        fn visit_function(&mut self, _function: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {}
+
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+        }
+    }
+
+    let mut probe = Probe {
+        scoping,
+        valid: true,
+    };
+    probe.visit_function_body(body);
+    probe.valid
+}
+
 fn stable_rotation_alias(
     alias_symbol: SymbolId,
     alias_name: &str,
@@ -2700,6 +2752,7 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
                             .is_some_and(|params| params.len() >= 2)
                         && provider_is_function
                         && rotation_parameter_names_unshadowed(function, self.scoping)
+                        && rotation_parse_int_references_are_global(function, self.scoping)
                         && !rotation_has_dynamic_scope(function);
                     let local_params = local_params.unwrap_or_default();
                     let array_param = local_params.first().cloned().unwrap_or_default();

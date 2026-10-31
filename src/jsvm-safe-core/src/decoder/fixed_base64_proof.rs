@@ -762,6 +762,32 @@ fn fixed_base64_setup_proven(
         }
 
         fn visit_function(&mut self, _function: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {}
+
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+            // Deferred arrow bodies are not part of the executed setup path.
+        }
+
+        fn visit_logical_expression(&mut self, logical: &oxc_ast::ast::LogicalExpression<'a>) {
+            // Only the left operand is unconditionally evaluated. The right
+            // may be short-circuited, so writes there cannot prove setup state.
+            self.visit_expression(&logical.left);
+        }
+
+        fn visit_conditional_expression(
+            &mut self,
+            conditional: &oxc_ast::ast::ConditionalExpression<'a>,
+        ) {
+            // The test always executes, but neither branch is unconditional.
+            self.visit_expression(&conditional.test);
+        }
+
+        fn visit_chain_expression(&mut self, _chain: &oxc_ast::ast::ChainExpression<'a>) {
+            // Optional chains can skip member/call subexpressions. None of
+            // their descendant writes can establish unconditional setup state.
+        }
     }
 
     let mut probe = Probe {
