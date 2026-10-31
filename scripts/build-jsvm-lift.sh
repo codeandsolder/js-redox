@@ -73,7 +73,7 @@ mkdir -p "$canonical"
 bins=(
   jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir
   switch-ir deobfuscate-safe capture-import capture-project js-format js-refs bundle-unpack
-  source-materialize bundle-materialize vm-materialize wasm-materialize wasm-resource-provenance project-readme
+  source-materialize source-graph bundle-materialize vm-materialize wasm-materialize wasm-resource-provenance project-readme
   sourcemaps sus-scan wasm-redox fresh-eval wasm-import-semantics
   api-surface static-string-recover static-byte-artifacts
 )

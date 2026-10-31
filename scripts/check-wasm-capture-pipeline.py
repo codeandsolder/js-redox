@@ -197,7 +197,7 @@ def main():
         for row in by_offset.values()
     ), by_offset
 
-    run("uv", "run", "--no-project", "python", "scripts/build-source-graph.py", PROJECT)
+    run(TOOL_ROOT / "source-graph", PROJECT)
     graph = json.loads((PROJECT / "analysis/source-graph.json").read_text())
     wasm_nodes = [node for node in graph["nodes"] if node["type"] == "wasm_module"]
     assert len(wasm_nodes) == 1

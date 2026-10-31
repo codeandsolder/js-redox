@@ -404,7 +404,7 @@ fn main() -> Result<()> {
         "api-surface",
         [OsStr::new("--project"), output.as_os_str()],
     )?;
-    run_python(&repo, "build-source-graph.py", [&output])?;
+    run_tool(&tool_root, &repo, "source-graph", [&output])?;
     run_tool(&tool_root, &repo, "project-readme", [&output])?;
 
     print_summary(&output, wasm_analysis, safe_deob, bundle_unpack, vm_scan)

@@ -9,6 +9,7 @@ WORK = ROOT / "work/import-map-regression"
 CAPTURE_IMPORT = ROOT / ".cargo-target-nodebug/debug/capture-import"
 SOURCE_MATERIALIZER = ROOT / ".cargo-target-nodebug/debug/source-materialize"
 JS_REFS = ROOT / ".cargo-target-nodebug/debug/js-refs"
+SOURCE_GRAPH = ROOT / ".cargo-target-nodebug/debug/source-graph"
 
 
 def run(*args):
@@ -62,14 +63,7 @@ def har_entry(url: str, mime: str, text: str):
 def stages(project: Path):
     run(SOURCE_MATERIALIZER, project)
     run(JS_REFS, "--project", project)
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/build-source-graph.py",
-        project,
-    )
+    run(SOURCE_GRAPH, project)
 
 
 def ref_map(row):

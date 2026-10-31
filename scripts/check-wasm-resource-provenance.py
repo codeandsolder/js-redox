@@ -15,7 +15,7 @@ WORK = ROOT / "work" / "wasm-resource-provenance-regression"
 CAPTURE = WORK / "capture"
 PROJECT = WORK / "project"
 CORRELATOR = ROOT / ".cargo-target-nodebug" / "debug" / "wasm-resource-provenance"
-GRAPH = ROOT / "scripts" / "build-source-graph.py"
+GRAPH = ROOT / ".cargo-target-nodebug" / "debug" / "source-graph"
 
 JS_URL = "https://cdn.example.test/loader.js"
 INITIATOR_URL = "https://cdn.example.test/loader"
@@ -227,7 +227,7 @@ def main() -> None:
     assert bridge_observation["response_identity_basis"] == "unique_url_body_and_request_cardinality", bridge_observation
     assert provenance["unmatched"][0]["request_id"] == "req-bad", provenance
 
-    subprocess.run([sys.executable, str(GRAPH), str(PROJECT)], cwd=ROOT, check=True)
+    subprocess.run([str(GRAPH), str(PROJECT)], cwd=ROOT, check=True)
     graph = json.loads((PROJECT / "analysis" / "source-graph.json").read_text())
     observation_nodes = [n for n in graph["nodes"] if n["type"] == "runtime_wasm_request"]
     assert len(observation_nodes) == 2, observation_nodes
@@ -295,7 +295,7 @@ def main() -> None:
     assert conflicted["summary"]["observations"] == 2, conflicted
     assert conflicted["summary"]["runtime_script_identities"] == 0, conflicted
     assert all(row["initiator_runtime_sha256"] is None for row in conflicted["observations"]), conflicted
-    subprocess.run([sys.executable, str(GRAPH), str(PROJECT)], cwd=ROOT, check=True)
+    subprocess.run([str(GRAPH), str(PROJECT)], cwd=ROOT, check=True)
     conflict_graph = json.loads((PROJECT / "analysis" / "source-graph.json").read_text())
     runtime_nodes = {f"runtime:{js_sha[:20]}", f"runtime:{conflict_sha[:20]}"}
     assert not any(

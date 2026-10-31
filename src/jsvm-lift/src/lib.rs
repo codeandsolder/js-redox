@@ -23,6 +23,7 @@ pub mod project_js_refs;
 pub mod project_readme;
 pub mod project_sourcemaps;
 pub mod safe_deob;
+pub mod source_graph;
 pub mod source_materialize;
 pub mod tool_environment;
 pub mod vm_materialize;

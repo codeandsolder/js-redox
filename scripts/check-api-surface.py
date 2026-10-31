@@ -14,6 +14,7 @@ from analysis_artifacts import API_SURFACE, SOURCE_GRAPH, load_artifact
 ROOT = Path(__file__).resolve().parents[1]
 ANALYZER = ROOT / ".cargo-target-nodebug/debug/api-surface"
 PROJECT_README = ROOT / ".cargo-target-nodebug/debug/project-readme"
+SOURCE_GRAPH_BIN = ROOT / ".cargo-target-nodebug/debug/source-graph"
 
 
 def run(*args: object) -> None:
@@ -187,7 +188,7 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         assert forbidden.get("method_expression") == '"trace"', forbidden
         assert forbidden.get("method_status") == "invalid", forbidden
 
-        run(sys.executable, ROOT / "scripts/build-source-graph.py", project)
+        run(SOURCE_GRAPH_BIN, project)
         graph = load_artifact(project, SOURCE_GRAPH)
         api_nodes = [node for node in graph["nodes"] if node["type"] == "api_callsite"]
         assert len(api_nodes) == 8, api_nodes
