@@ -33,7 +33,7 @@ fn mime_base(mime: &str) -> &str {
     mime.split(';').next().unwrap_or(mime).trim()
 }
 
-pub(super) fn resource_kind(url: &str, mime: &str) -> &'static str {
+pub(crate) fn resource_kind(url: &str, mime: &str) -> &'static str {
     let m = mime_base(mime).to_ascii_lowercase();
     let path = Url::parse(url)
         .ok()

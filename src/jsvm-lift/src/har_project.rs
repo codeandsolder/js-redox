@@ -1,17 +1,18 @@
-use anyhow::{bail, Result};
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use crate::capture_project::prepare_project_output;
+use anyhow::Result;
+use std::path::PathBuf;
 
-mod html;
+pub(crate) mod html;
 mod materialize;
 mod parse;
-mod resource;
+pub(crate) mod resource;
 
 use materialize::materialize_project;
 use parse::read_har;
 
 /// Inputs controlling one HAR-to-capture-project import.
 #[derive(Debug)]
-pub struct HarProjectOptions {
+pub(crate) struct HarProjectOptions {
     pub har: PathBuf,
     pub output: PathBuf,
     pub overwrite: bool,
@@ -19,44 +20,14 @@ pub struct HarProjectOptions {
 
 /// Small import result for callers that need counts without decoding the manifest again.
 #[derive(Debug)]
-pub struct HarProjectSummary {
-    pub resources: usize,
-    pub script_records: usize,
-    pub counts: BTreeMap<String, usize>,
-    /// Non-fatal diagnostics produced while salvaging malformed HAR input.
-    pub parse_warnings: Vec<String>,
-}
-
-fn prepare_output(args: &HarProjectOptions) -> Result<()> {
-    if args.output.exists() {
-        if !args.overwrite {
-            bail!(
-                "output directory already exists: {} (use --overwrite)",
-                args.output.display()
-            );
-        }
-        if !args.output.is_dir() {
-            bail!(
-                "refusing to replace non-directory output: {}",
-                args.output.display()
-            );
-        }
-        let empty = fs::read_dir(&args.output)?.next().is_none();
-        if !empty && !args.output.join("capture-manifest.json").is_file() {
-            bail!(
-                "refusing to recursively replace non-project output: {}; expected an empty directory or capture-manifest.json",
-                args.output.display()
-            );
-        }
-        fs::remove_dir_all(&args.output)?;
-    }
-    fs::create_dir_all(&args.output)?;
-    Ok(())
+pub(crate) struct HarProjectSummary {
+    pub(crate) resources: usize,
+    pub(crate) script_records: usize,
 }
 
 /// Materialize a HAR capture as a canonical capture project.
-pub fn import_har_project(args: &HarProjectOptions) -> Result<HarProjectSummary> {
-    prepare_output(args)?;
+pub(crate) fn import_har_project(args: &HarProjectOptions) -> Result<HarProjectSummary> {
+    prepare_project_output(&args.output, args.overwrite)?;
     let (har, salvaged, parse_error, parse_warnings) = read_har(&args.har)?;
     materialize_project(args, har, salvaged, parse_error, parse_warnings)
 }

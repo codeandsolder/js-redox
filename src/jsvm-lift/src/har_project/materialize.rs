@@ -444,8 +444,6 @@ pub(super) fn materialize_project(
     Ok(HarProjectSummary {
         resources: manifest.resources.len(),
         script_records: manifest.inline_scripts.len(),
-        parse_warnings: manifest.source.parse_warnings.clone(),
-        counts: manifest.counts,
     })
 }
 

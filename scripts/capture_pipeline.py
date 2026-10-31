@@ -32,7 +32,7 @@ from analysis_artifacts import (
     load_artifact,
 )
 
-from capture_project import MANIFEST_NAME, read_manifest, write_manifest
+from capture_project import MANIFEST_NAME
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL_ROOT = ROOT / ".cargo-target-nodebug/debug"
@@ -40,7 +40,7 @@ TOOL_ROOT = ROOT / ".cargo-target-nodebug/debug"
 
 @dataclass(frozen=True)
 class Toolchain:
-    har_project: Path = TOOL_ROOT / "har-project"
+    capture_import: Path = TOOL_ROOT / "capture-import"
     scanner: Path = TOOL_ROOT / "jsvm-lift"
     formatter: Path = TOOL_ROOT / "js-format"
     source_materializer: Path = TOOL_ROOT / "source-materialize"
@@ -167,21 +167,9 @@ def _import_capture(
     tools: Toolchain,
     options: PipelineOptions,
 ) -> Path:
-    if kind in {"har", "recorder"}:
-        har_input = capture / "capture.har" if kind == "recorder" else capture
-        importer: list[object] = [tools.har_project, har_input, "--output", output]
-    else:
-        importer = [
-            sys.executable,
-            ROOT / "scripts/saved-page-to-manifest.py",
-            capture,
-            "--output",
-            output,
-            "--source-directives",
-            tools.source_directives,
-        ]
-        if options.assets_dir:
-            importer.extend(["--assets-dir", options.assets_dir])
+    importer: list[object] = [tools.capture_import, capture, "--output", output]
+    if kind == "saved_page" and options.assets_dir:
+        importer.extend(["--assets-dir", options.assets_dir])
     if options.overwrite:
         importer.append("--overwrite")
     run_checked(importer)
@@ -189,13 +177,6 @@ def _import_capture(
     manifest_path = output / MANIFEST_NAME
     if not manifest_path.is_file():
         raise SystemExit(f"capture importer did not create {manifest_path}")
-    if kind == "recorder":
-        manifest = read_manifest(manifest_path)
-        source = manifest["source"]
-        source["kind"] = "recorder"
-        source["input"] = str(capture)
-        source["har_input"] = str(capture / "capture.har")
-        write_manifest(manifest_path, manifest)
     return manifest_path
 
 

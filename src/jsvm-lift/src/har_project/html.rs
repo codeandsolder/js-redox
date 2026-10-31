@@ -6,16 +6,17 @@ use crate::{
     },
     source_directive::source_directives,
 };
+use html_escape::decode_html_entities;
 use std::collections::HashMap;
 use url::Url;
 
 #[derive(Debug)]
-pub(super) struct ScriptTag {
-    pub(super) attrs: HashMap<String, String>,
-    pub(super) body: String,
+pub(crate) struct ScriptTag {
+    pub(crate) attrs: HashMap<String, String>,
+    pub(crate) body: String,
 }
 
-const fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
+pub(crate) const fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
     let mut quote = None;
     while i < bytes.len() {
         let b = bytes[i];
@@ -33,10 +34,16 @@ const fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
     None
 }
 
-fn parse_attrs(tag: &str) -> HashMap<String, String> {
+pub(crate) fn parse_attrs(tag: &str) -> HashMap<String, String> {
     let bytes = tag.as_bytes();
     let mut out = HashMap::new();
-    let mut i = tag.to_ascii_lowercase().find("script").map_or(0, |x| x + 6);
+    let mut i = 0usize;
+    while i < bytes.len() && (bytes[i].is_ascii_whitespace() || matches!(bytes[i], b'<' | b'/')) {
+        i += 1;
+    }
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'>' | b'/') {
+        i += 1;
+    }
     while i < bytes.len() {
         while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
             i += 1;
@@ -65,32 +72,34 @@ fn parse_attrs(tag: &str) -> HashMap<String, String> {
             while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
-            if i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b'"') {
+            let (value_start, value_end) = if i < bytes.len() && matches!(bytes[i], b'\'' | b'"') {
                 let quote = bytes[i];
                 i += 1;
-                let vstart = i;
+                let value_start = i;
                 while i < bytes.len() && bytes[i] != quote {
                     i += 1;
                 }
-                value = tag[vstart..i.min(bytes.len())].to_string();
+                let value_end = i;
                 i += usize::from(i < bytes.len());
+                (value_start, value_end)
             } else {
-                let vstart = i;
+                let value_start = i;
                 while i < bytes.len()
                     && !bytes[i].is_ascii_whitespace()
                     && !matches!(bytes[i], b'>' | b'/')
                 {
                     i += 1;
                 }
-                value = tag[vstart..i].to_string();
-            }
+                (value_start, i)
+            };
+            value = decode_html_entities(&tag[value_start..value_end]).into_owned();
         }
         out.insert(key, value);
     }
     out
 }
 
-pub(super) fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
+pub(crate) fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
     let lower = html.to_ascii_lowercase();
     let bytes = html.as_bytes();
     let mut out = Vec::new();
@@ -116,7 +125,7 @@ pub(super) fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
     out
 }
 
-pub(super) fn script_type(attrs: &HashMap<String, String>) -> String {
+pub(crate) fn script_type(attrs: &HashMap<String, String>) -> String {
     script_type_essence(attrs.get("type").map(String::as_str))
 }
 

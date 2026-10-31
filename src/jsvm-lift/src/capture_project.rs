@@ -132,6 +132,35 @@ pub fn read_manifest(path: &Path) -> Result<CaptureManifest> {
     Ok(manifest)
 }
 
+pub(crate) fn prepare_project_output(output: &Path, overwrite: bool) -> Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(output) {
+        if metadata.file_type().is_symlink() {
+            bail!("refusing symlink output path: {}", output.display());
+        }
+    }
+    if output.exists() {
+        if !overwrite {
+            bail!(
+                "output directory already exists: {} (use --overwrite)",
+                output.display()
+            );
+        }
+        if !output.is_dir() {
+            bail!(
+                "refusing to replace non-directory output: {}",
+                output.display()
+            );
+        }
+        let empty = fs::read_dir(output)?.next().is_none();
+        if !empty && !output.join(MANIFEST_NAME).is_file() {
+            bail!("refusing to recursively replace non-project output: {}; expected an empty directory or {MANIFEST_NAME}", output.display());
+        }
+        fs::remove_dir_all(output)?;
+    }
+    fs::create_dir_all(output)?;
+    Ok(())
+}
+
 pub fn write_manifest(path: &Path, manifest: &CaptureManifest) -> Result<()> {
     validate_manifest(manifest, &path.display().to_string())?;
     if let Some(parent) = path.parent() {

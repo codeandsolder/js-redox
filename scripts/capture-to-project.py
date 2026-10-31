@@ -19,7 +19,7 @@ def main() -> None:
     ap.add_argument("output", type=Path)
     ap.add_argument("--assets-dir", type=Path, help="saved-page companion resource directory")
     ap.add_argument("--overwrite", action="store_true")
-    ap.add_argument("--har-project-bin", type=Path, default=defaults.har_project)
+    ap.add_argument("--capture-import", type=Path, default=defaults.capture_import)
     ap.add_argument("--scanner", type=Path, default=defaults.scanner)
     ap.add_argument("--formatter", type=Path, default=defaults.formatter)
     ap.add_argument("--source-materializer", type=Path, default=defaults.source_materializer)
@@ -45,7 +45,7 @@ def main() -> None:
     args = ap.parse_args()
 
     tools = Toolchain(
-        har_project=args.har_project_bin,
+        capture_import=args.capture_import,
         scanner=args.scanner,
         formatter=args.formatter,
         source_materializer=args.source_materializer,

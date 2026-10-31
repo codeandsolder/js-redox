@@ -178,7 +178,7 @@ def main():
     }
     HAR.write_text(json.dumps(fixture), encoding="utf-8")
 
-    run(TOOL_ROOT / "har-project", HAR, "--output", PROJECT)
+    run(TOOL_ROOT / "capture-import", HAR, "--output", PROJECT)
     run(TOOL_ROOT / "source-materialize", PROJECT, "--jobs", "4")
 
     manifest = json.loads((PROJECT / "capture-manifest.json").read_text())

@@ -1,9 +1,10 @@
 pub mod analysis_artifacts;
 pub mod browser_script_types;
+pub mod capture_import;
 pub mod capture_project;
 pub mod content_dedup;
 
-pub mod har_project;
+mod har_project;
 pub mod js_format;
 pub mod js_refs;
 

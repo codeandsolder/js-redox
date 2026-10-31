@@ -144,7 +144,7 @@ def write_fixture(path: Path, title: str, js: str) -> None:
 
 
 def materialize_and_correlate(har: Path, project: Path) -> None:
-    run(TOOL_ROOT / "har-project", har, "--output", project)
+    run(TOOL_ROOT / "capture-import", har, "--output", project)
     run(TOOL_ROOT / "source-materialize", project)
     run(
         "uv", "run", "--no-project", "python",

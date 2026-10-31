@@ -129,7 +129,7 @@ def main():
     }
     HAR.write_text(json.dumps(fixture))
 
-    run(TOOL_ROOT / "har-project", HAR, "--output", PROJECT)
+    run(TOOL_ROOT / "capture-import", HAR, "--output", PROJECT)
     manifest = json.loads((PROJECT / "capture-manifest.json").read_text())
     wasm_resource = next(row for row in manifest["resources"] if row["kind"] == "wasm")
     assert wasm_resource["output_path"].endswith(".wasm")

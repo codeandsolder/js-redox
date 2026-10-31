@@ -72,7 +72,7 @@ mkdir -p "$canonical"
 # returns, while retaining the scratch path as a fallback for older wrappers.
 bins=(
   jsvm-lift reduce signature roles normalize disasm ir table-signature table-ir
-  switch-ir deobfuscate-safe har-project js-format js-refs bundle-unpack
+  switch-ir deobfuscate-safe capture-import js-format js-refs bundle-unpack
   source-materialize bundle-materialize vm-materialize wasm-materialize wasm-resource-provenance project-readme
   sourcemap-compose sus-scan wasm-redox fresh-eval wasm-import-semantics
   source-directives api-surface static-string-recover static-byte-artifacts
