@@ -1,8 +1,19 @@
 pub mod analysis_artifacts;
+pub mod ast_utils;
 pub mod browser_script_types;
+pub mod bytecode;
 pub mod capture_import;
 pub mod capture_project;
 pub mod content_dedup;
+pub mod decoder;
+pub mod dispatch;
+pub mod embedded;
+pub mod function_analysis;
+pub mod scan_report;
+pub mod scanner;
+pub mod source_text;
+pub mod state_flatten;
+pub mod table_vm;
 
 mod har_project;
 pub mod js_format;
