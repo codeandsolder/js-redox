@@ -13,7 +13,8 @@ oxc_allocator.workspace = true
 oxc_ast.workspace = true
 oxc_ast_visit.workspace = true
 oxc_parser.workspace = true
-oxc_ecmascript.workspace = true
+oxc_regular_expression.workspace = true
+oxc_ecmascript = { workspace = true, features = ["side_effects"] }
 oxc_semantic.workspace = true
 oxc_span.workspace = true
 oxc_syntax.workspace = true

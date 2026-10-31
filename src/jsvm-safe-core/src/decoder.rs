@@ -2,6 +2,8 @@ use crate::decoder_encoding::{
     decode_fixed_base64_latin1, decode_lower_alphabet_base64_rc4, decode_lower_alphabet_base64_uri,
     decode_standard_base64_latin1,
 };
+mod fixed_base64_proof;
+
 use crate::rewrite::Replacement;
 use crate::value_eval::{eval, js_to_uint32, render_value_array, same_values, Value};
 use crate::{
@@ -10,6 +12,7 @@ use crate::{
     statically_unresolved_global_reference, string_literal_value, symbol_has_only_read_references,
     symbol_of, template_element_value,
 };
+use fixed_base64_proof::fixed_base64_algorithm_proven;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, BindingPattern, CallExpression, Expression, ExpressionStatement, Statement,
@@ -161,31 +164,6 @@ fn decoder_static_arrays(
     let mut candidates = all_static_arrays(program);
     candidates.retain(|candidate| symbol_has_only_read_references(scoping, candidate.symbol));
     candidates
-}
-
-#[derive(Default)]
-struct DirectCallCounter {
-    count: usize,
-}
-
-impl<'a> Visit<'a> for DirectCallCounter {
-    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
-        self.count += 1;
-        walk::walk_call_expression(self, it);
-    }
-
-    fn visit_function(&mut self, _f: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
-        // Nested functions do not execute as part of the candidate decoder
-        // invocation itself, so do not count calls inside them.
-    }
-}
-
-fn direct_body_call_count(body: &oxc_ast::ast::FunctionBody<'_>) -> usize {
-    let mut counter = DirectCallCounter::default();
-    for statement in &body.statements {
-        counter.visit_statement(statement);
-    }
-    counter.count
 }
 
 fn fixed_decoder_loop_shape(statement: &Statement<'_>) -> bool {
@@ -876,6 +854,17 @@ fn unparenthesized<'a>(mut expression: &'a Expression<'a>) -> &'a Expression<'a>
     expression
 }
 
+fn function_parameters_have_no_runtime_effects(function: &oxc_ast::ast::Function<'_>) -> bool {
+    function.params.items.iter().all(|parameter| {
+        parameter.initializer.is_none()
+            && matches!(parameter.pattern, BindingPattern::BindingIdentifier(_))
+    }) && function
+        .params
+        .rest
+        .as_ref()
+        .is_none_or(|rest| matches!(rest.rest.argument, BindingPattern::BindingIdentifier(_)))
+}
+
 fn fixed_decoder_iife_wrapper_proven(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
@@ -1107,17 +1096,6 @@ fn expression_resolves_to_symbol(
         == Some(symbol)
 }
 
-fn function_parameters_have_no_runtime_effects(function: &oxc_ast::ast::Function<'_>) -> bool {
-    function.params.items.iter().all(|parameter| {
-        parameter.initializer.is_none()
-            && matches!(parameter.pattern, BindingPattern::BindingIdentifier(_))
-    }) && function
-        .params
-        .rest
-        .as_ref()
-        .is_none_or(|rest| matches!(rest.rest.argument, BindingPattern::BindingIdentifier(_)))
-}
-
 fn standard_base64_table_for_function(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
@@ -1264,15 +1242,11 @@ fn indexed_table_symbols_for_function(
 #[derive(Debug)]
 struct DirectFnInfo {
     symbol: SymbolId,
-    params: Vec<String>,
     span: Span,
-    body_statement_count: usize,
-    direct_call_count: usize,
     indexed_table_symbols: Vec<SymbolId>,
     standard_base64_table: Option<SymbolId>,
-    fixed_decoder_control_shape: bool,
-    fixed_decoder_iife_control_shape: bool,
     fixed_base64_alphabet: Option<String>,
+    fixed_base64_algorithm_proven: bool,
 }
 
 struct DirectFnInfoCollector<'c> {
@@ -1286,43 +1260,30 @@ impl<'a> Visit<'a> for DirectFnInfoCollector<'_> {
     fn visit_function(&mut self, f: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
         if let Some(id) = &f.id {
             if let Some(symbol) = id.symbol_id.get() {
-                let params = f
-                    .params
-                    .items
-                    .iter()
-                    .filter_map(|p| match &p.pattern {
-                        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-                        _ => None,
-                    })
-                    .collect();
-
+                let fixed_base64_alphabet = fixed_alphabet_for_function(
+                    f,
+                    symbol,
+                    self.scoping,
+                    self.aliases,
+                    self.reference_spans,
+                );
+                let fixed_base64_algorithm_proven =
+                    fixed_base64_alphabet.as_deref().is_some_and(|alphabet| {
+                        fixed_base64_algorithm_proven(
+                            f,
+                            self.scoping,
+                            self.aliases,
+                            self.reference_spans,
+                            alphabet,
+                        )
+                    });
                 self.out.push(DirectFnInfo {
                     symbol,
-                    params,
                     span: f.span,
-                    body_statement_count: f.body.as_ref().map_or(0, |body| body.statements.len()),
-                    direct_call_count: f
-                        .body
-                        .as_ref()
-                        .map_or(0, |body| direct_body_call_count(body)),
                     indexed_table_symbols: indexed_table_symbols_for_function(f, self.scoping),
                     standard_base64_table: standard_base64_table_for_function(f, self.scoping),
-                    fixed_decoder_control_shape: f
-                        .body
-                        .as_ref()
-                        .is_some_and(|body| fixed_decoder_control_shape(body)),
-                    fixed_decoder_iife_control_shape: fixed_decoder_iife_wrapper_proven(
-                        f,
-                        self.scoping,
-                        self.aliases,
-                    ),
-                    fixed_base64_alphabet: fixed_alphabet_for_function(
-                        f,
-                        symbol,
-                        self.scoping,
-                        self.aliases,
-                        self.reference_spans,
-                    ),
+                    fixed_base64_alphabet,
+                    fixed_base64_algorithm_proven,
                 });
             }
         }
@@ -1616,58 +1577,11 @@ fn contains_function_reassignment(body: &str, name: &str) -> bool {
     false
 }
 
-static BASE64_SENTINEL_RE: LazyLock<Option<regex::Regex>> =
-    LazyLock::new(|| compile_regex(r"(?:64\s*!=|!=\s*64)"));
 static RC4_CHAR_CODE_AT_RE: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
     compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*charCodeAt\s*\(([^)]*)\)")
 });
 static DIRECT_ARRAY_ACCESS_RE: LazyLock<Option<regex::Regex>> =
     LazyLock::new(|| compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([^\s\]]+)\s*\]"));
-
-fn fixed_base64_decoder_matches(
-    body: &str,
-    array: &str,
-    param: &str,
-    alphabet_hint: Option<&str>,
-    iife_wrapper_proven: bool,
-) -> Option<String> {
-    let alphabet = alphabet_hint?.to_owned();
-    let guarded_load = compile_regex(&format!(
-        r"typeof\s*\(?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*\)?",
-        regex::escape(array),
-        regex::escape(param)
-    ))?;
-
-    if let Some(alias) = guarded_load
-        .captures_iter(body)
-        .find_map(|caps| caps.get(1).map(|m| m.as_str()))
-    {
-        let return_alias = compile_regex(&format!(r"\breturn\s+{}\s*;", regex::escape(alias)))?;
-        if !return_alias.is_match(body) && !iife_wrapper_proven {
-            return None;
-        }
-    } else if !iife_wrapper_proven {
-        return None;
-    }
-
-    // Fail closed on a recognizable Base64 decoder shape rather than merely
-    // seeing an alphabet and String.fromCharCode somewhere in the function.
-    if !body.contains(".replace(/[^A-Za-z0-9\\+\\/\\=]/g")
-        || body.matches(".indexOf(").count() != 4
-        || body.matches(".charAt(").count() != 4
-        || body.matches("String.fromCharCode").count() != 3
-        || body.matches("<<").count() != 3
-        || body.matches(">>").count() != 2
-    {
-        return None;
-    }
-    let sentinel_checks = BASE64_SENTINEL_RE.as_ref()?;
-    if sentinel_checks.find_iter(body).count() != 2 {
-        return None;
-    }
-
-    Some(alphabet)
-}
 
 fn function_has_external_write(
     span: Span,
@@ -1752,10 +1666,6 @@ fn detect_sparse_direct_table_decoders(
         {
             continue;
         }
-        let Some(param) = function.params.first() else {
-            continue;
-        };
-        let body = fragment(source, function.span);
         let array = if let Some(symbol) = function.standard_base64_table {
             let Some(array) = arrays.iter().find(|array| array.symbol == symbol) else {
                 continue;
@@ -1815,20 +1725,10 @@ fn detect_sparse_direct_table_decoders(
 
         let transform = if function.standard_base64_table == Some(array.symbol) {
             DecoderTransform::StandardBase64
-        } else if ((function.body_statement_count == 3
-            && function.fixed_decoder_control_shape
-            && function.direct_call_count == 12)
-            || ((1..=2).contains(&function.body_statement_count)
-                && function.fixed_decoder_iife_control_shape))
+        } else if function.fixed_base64_algorithm_proven
             && !function_has_external_write(function.span, scoping, reference_spans)
         {
-            let Some(alphabet) = fixed_base64_decoder_matches(
-                body,
-                &array.name,
-                param,
-                function.fixed_base64_alphabet.as_deref(),
-                function.fixed_decoder_iife_control_shape,
-            ) else {
+            let Some(alphabet) = function.fixed_base64_alphabet.clone() else {
                 continue;
             };
             DecoderTransform::FixedBase64Alphabet(alphabet)
@@ -1936,10 +1836,6 @@ fn detect_direct_table_decoders(
         {
             continue;
         }
-        let Some(param) = function.params.first() else {
-            continue;
-        };
-        let body = fragment(source, function.span);
         let array = if let Some(symbol) = function.standard_base64_table {
             let Some(array) = arrays.iter().find(|array| array.symbol == symbol) else {
                 continue;
@@ -1993,19 +1889,10 @@ fn detect_direct_table_decoders(
 
         let transform = if function.standard_base64_table == Some(array.symbol) {
             DecoderTransform::StandardBase64
-        } else if ((function.body_statement_count == 3
-            && function.fixed_decoder_control_shape
-            && function.direct_call_count == 12)
-            || (function.body_statement_count == 1 && function.fixed_decoder_iife_control_shape))
+        } else if function.fixed_base64_algorithm_proven
             && !function_has_external_write(function.span, scoping, reference_spans)
         {
-            let Some(alphabet) = fixed_base64_decoder_matches(
-                body,
-                &array.name,
-                param,
-                function.fixed_base64_alphabet.as_deref(),
-                function.fixed_decoder_iife_control_shape,
-            ) else {
+            let Some(alphabet) = function.fixed_base64_alphabet.clone() else {
                 continue;
             };
             DecoderTransform::FixedBase64Alphabet(alphabet)

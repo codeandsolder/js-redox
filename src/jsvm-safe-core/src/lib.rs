@@ -2167,6 +2167,68 @@ sink(decode(0));
     }
 
     #[test]
+    fn fixed_base64_decoder_proves_dataflow_instead_of_operation_counts() {
+        let source = r#"
+const table = ["us49uStFKk5Z"];
+function decode(index, value) {
+    if ("string" != typeof (value = table[index])) return value;
+    for (
+        var byte0, sextet0, sextet3, sextet2, sextet1, byte1, output = void 0,
+            alphabet = "318mC4sQfF7VWJ/h5AiBOtzHogbKun2jvxwlp6NkXD=eUraRTy9+GcS0qYEIdLMPZ",
+            cursor = 0,
+            input = (input = value).replace(/[^A-Za-z0-9\+\/\=]/g, output = "");
+        cursor < input.length;
+    )
+        sextet0 = alphabet.indexOf(input.charAt(cursor++)),
+        byte1 = (15 & (sextet1 = alphabet.indexOf(input.charAt(cursor++)))) << 4 | (sextet2 = alphabet.indexOf(input.charAt(cursor++))) >> 2,
+        byte0 = (3 & sextet2) << 6 | (sextet3 = alphabet.indexOf(input.charAt(cursor++))),
+        output += String.fromCharCode(sextet0 << 2 | sextet1 >> 4),
+        64 != sextet2 && (output += String.fromCharCode(byte1)),
+        64 != sextet3 && (output += String.fromCharCode(byte0));
+    return output;
+}
+sink(decode(0));
+"#;
+        let recovered = recover_static_decoders(source, 4);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert_eq!(recovered.transforms.get("string_array_decode"), Some(&1));
+
+        let equivalent_filter = source.replace(r"\+\/\=", r"+\/=");
+        let equivalent = recover_static_decoders(&equivalent_filter, 4);
+        assert!(equivalent.is_some());
+        let equivalent = equivalent.unwrap_or_else(|| unreachable!());
+        assert_eq!(equivalent.transforms.get("string_array_decode"), Some(&1));
+
+        for rejected_source in [
+            source.replace("sextet1 >> 4", "sextet1 >> 3"),
+            source.replace("64 != sextet2", "64 != sextet1"),
+            source.replace("var byte0,", "var hidden = sideEffect(), byte0,"),
+        ] {
+            let rejected = recover_static_decoders(&rejected_source, 4);
+            assert!(rejected.is_some());
+            let rejected = rejected.unwrap_or_else(|| unreachable!());
+            assert_eq!(rejected.transforms.get("string_array_decode"), None);
+        }
+    }
+
+    #[test]
+    fn fixed_base64_iife_rejects_effectful_setup_reads() {
+        let source =
+            include_str!("../../../corpus/generated/reversible-obfuscation/sparse-direct-table.js");
+        let recovered = recover_static_decoders(source, 8);
+        assert!(recovered.is_some());
+        let recovered = recovered.unwrap_or_else(|| unreachable!());
+        assert!(!recovered.source.contains("INested(0)"));
+
+        let effectful = source.replace("var r, c, u, x,", "var hidden = n.x, r, c, u, x,");
+        let rejected = recover_static_decoders(&effectful, 8);
+        assert!(rejected.is_some());
+        let rejected = rejected.unwrap_or_else(|| unreachable!());
+        assert!(rejected.source.contains("INested(0)"));
+    }
+
+    #[test]
     fn decoder_only_recovery_handles_literal_key_rc4() {
         let source = r#"
 function p(){var table=["xSov","xCor"];p=function(){return table;};return p();}
