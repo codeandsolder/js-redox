@@ -580,12 +580,12 @@ pub(super) fn import_saved_page(
             }
         }
         let output_key = path_text(&output_rel);
-        if !inline_seen.contains_key(&output_key) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = inline_seen.entry(output_key) {
             if let Some(parent) = output.join(&output_rel).parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::write(output.join(&output_rel), bytes)?;
-            inline_seen.insert(output_key, digest.clone());
+            entry.insert(digest.clone());
         }
         inline_scripts.push(json!({
             "parent_resource_id": page_id,
