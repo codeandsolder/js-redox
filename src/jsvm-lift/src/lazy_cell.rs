@@ -1,4 +1,5 @@
 use crate::{
+    cfg_order::prove_event_before_barriers,
     forwarding_semantics::ProvenLazyRegistryReadCall,
     numeric::{eval_js_bitwise_i64, exact_i64},
     receiver_identity::{
@@ -9,6 +10,7 @@ use crate::{
         ProvenOriginDirectCall, ProvenPrototypeStringAtDirectCall,
     },
     state_flatten::{
+        prove_function_if_ladder_event_before_barriers,
         prove_function_if_ladder_event_unreachable_with_integer_parameters,
         prove_function_if_ladder_states_before_event_with_integer_parameters,
         prove_function_protected_if_ladder_event_unreachable_with_call_arguments,
@@ -1413,6 +1415,65 @@ fn call_argument_symbol_at(
     output.flatten()
 }
 
+fn symbol_only_forwarded_at_direct_call(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    symbol: SymbolId,
+    function_span: Span,
+    incoming: &ProvenOriginDirectCall,
+    call: &ProvenOriginDirectCall,
+    argument_index: usize,
+) -> bool {
+    let Some((argument_start, argument_end)) = call.argument_spans.get(argument_index).copied()
+    else {
+        return false;
+    };
+    let argument = Span::new(argument_start, argument_end);
+    let call_span = Span::new(call.call_start, call.call_end);
+    let mut allowed_references = 0usize;
+    let mut barriers = Vec::new();
+
+    for reference_id in semantic.scoping().get_resolved_reference_ids(symbol) {
+        let reference = semantic.scoping().get_reference(*reference_id);
+        let node = semantic.nodes().get_node(reference.node_id());
+        let span = node.kind().span();
+        if enclosing_function_span(semantic, reference.node_id()) != Some(function_span) {
+            return false;
+        }
+        if argument.start <= span.start && span.end <= argument.end {
+            if reference.is_write() {
+                return false;
+            }
+            allowed_references += 1;
+            continue;
+        }
+        if call_span.start <= span.start && span.end <= call_span.end {
+            return false;
+        }
+        if !proven_origin_direct_call_event_unreachable(
+            source,
+            program,
+            semantic.scoping(),
+            incoming,
+            span,
+        ) {
+            barriers.push(span);
+        }
+    }
+
+    allowed_references == 1
+        && (prove_event_before_barriers(semantic, call_span, &barriers)
+            || prove_function_if_ladder_event_before_barriers(
+                source,
+                program,
+                function_span.start,
+                function_span.end,
+                call_span,
+                &barriers,
+            ))
+}
+
 fn event_unreachable_with_integer_parameter(
     source: &str,
     program: &Program<'_>,
@@ -1668,8 +1729,11 @@ fn unique_argument_containing(
 ///
 /// Handler identity is carried along the exact same direct-call provenance
 /// chain that established the registry key. Every forwarding step must pass the
-/// current handler parameter directly and preserve that binding until the next
-/// edge; the final installer parameter must be the exact argument captured by M.
+/// current handler parameter directly, preserve that binding, and be proven by
+/// CFG ordering to occur before any other use of the handler in that invocation.
+/// The final installer parameter must likewise reach M's exact capture before
+/// any other use. This proves forwarding itself cannot invoke or expose the
+/// original handler before M captures it.
 #[must_use]
 pub fn proven_slow_lazy_cell_captured_handler_install(
     source: &str,
@@ -1736,6 +1800,18 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
         let [next_parameter_index] = matching_arguments.as_slice() else {
             return None;
         };
+        if !symbol_only_forwarded_at_direct_call(
+            source,
+            program,
+            semantic,
+            current_symbol,
+            Span::new(current_context.function_start, current_context.function_end),
+            &incoming,
+            next,
+            *next_parameter_index,
+        ) {
+            return None;
+        }
         let next_parameters = function_parameter_symbols_at(
             program,
             next.callee.function_start,
@@ -1784,7 +1860,22 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
         nested_handler_symbol: &mut nested_handler_symbol,
     }
     .visit_program(program);
-    if nested_handler_symbol != Some(current_symbol) {
+    if nested_handler_symbol != Some(current_symbol)
+        || !symbol_only_forwarded_at_direct_call(
+            source,
+            program,
+            semantic,
+            current_symbol,
+            Span::new(factory_caller.function_start, factory_caller.function_end),
+            &incoming,
+            &exact_assignment.assignment.factory_call.call,
+            exact_assignment
+                .assignment
+                .factory_call
+                .shape
+                .handler_parameter_index,
+        )
+    {
         return None;
     }
 
@@ -4179,6 +4270,115 @@ mod tests {
             23,
         )
         .is_none());
+    }
+
+    #[test]
+    fn forwarding_order_allows_flattened_use_after_forward() {
+        let source = r#"
+            const C = function() { install(this, 7, function handler() {}); };
+            function install(state, key, handler, pc) {
+                pc = 0;
+                while (pc != 99) {
+                    if (pc == 0) pc = 1;
+                    else if (pc == 1) { write(state, key, handler); pc = 2; }
+                    else if (pc == 2) { handler.tag = 1; pc = 99; }
+                    else if (pc == 3) { pc = 99; }
+                }
+            }
+            function write(state, key, handler) { state.T[key] = handler; }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let call_start = source
+            .find("write(state, key, handler)")
+            .expect("write call") as u32;
+        let call = flow
+            .direct_calls
+            .iter()
+            .find(|call| call.call_start == call_start)
+            .expect("exact forwarding call");
+        let parameters = super::function_parameter_symbols_at(
+            &parsed.program,
+            call.caller.function_start,
+            call.caller.function_end,
+        )
+        .expect("installer parameters");
+        let handler = parameters[2];
+        let incoming = flow
+            .direct_calls
+            .iter()
+            .find(|edge| edge.callee == call.caller)
+            .expect("exact installer entry");
+        assert!(super::symbol_only_forwarded_at_direct_call(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            handler,
+            oxc_span::Span::new(call.caller.function_start, call.caller.function_end),
+            incoming,
+            call,
+            2,
+        ));
+    }
+
+    #[test]
+    fn forwarding_order_rejects_handler_invocation_before_forward() {
+        let source = r#"
+            const C = function() { install(this, 7, function handler() {}); };
+            function install(state, key, handler) {
+                handler();
+                return write(state, key, handler);
+            }
+            function write(state, key, handler) { state.T[key] = handler; }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let call_start = source
+            .find("write(state, key, handler)")
+            .expect("write call") as u32;
+        let call = flow
+            .direct_calls
+            .iter()
+            .find(|call| call.call_start == call_start)
+            .expect("exact forwarding call");
+        let parameters = super::function_parameter_symbols_at(
+            &parsed.program,
+            call.caller.function_start,
+            call.caller.function_end,
+        )
+        .expect("installer parameters");
+        let handler = parameters[2];
+        let incoming = flow
+            .direct_calls
+            .iter()
+            .find(|edge| edge.callee == call.caller)
+            .expect("exact installer entry");
+        assert!(!super::symbol_only_forwarded_at_direct_call(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            handler,
+            oxc_span::Span::new(call.caller.function_start, call.caller.function_end),
+            incoming,
+            call,
+            2,
+        ));
     }
 
     #[test]
