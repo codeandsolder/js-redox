@@ -63,7 +63,7 @@ fn is_wasm_response(url: Option<&Value>, mime_type: Option<&Value>) -> bool {
 }
 
 fn response_body_expected(method: Option<&Value>, status: Option<&Value>) -> bool {
-    if stringish(method).to_ascii_uppercase() == "HEAD" {
+    if stringish(method).eq_ignore_ascii_case("HEAD") {
         return false;
     }
     let status = status_code(status);
@@ -78,7 +78,7 @@ fn resource_body_expected(resource: &Map<String, Value>) -> bool {
 }
 
 fn non_body_reason(method: Option<&Value>, status: Option<&Value>) -> String {
-    if stringish(method).to_ascii_uppercase() == "HEAD" {
+    if stringish(method).eq_ignore_ascii_case("HEAD") {
         "method_HEAD".to_owned()
     } else {
         format!("status_{}", status_code(status))
