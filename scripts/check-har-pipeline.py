@@ -185,29 +185,9 @@ def main():
     TRUNCATED_HAR.write_text(raw_fixture[:cut])
 
     cp = run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/capture-to-project.py",
+        TOOL_ROOT / "capture-project",
         HAR,
         PROJECT,
-        "--capture-import",
-        TOOL_ROOT / "capture-import",
-        "--scanner",
-        TOOL_ROOT / "jsvm-lift",
-        "--formatter",
-        TOOL_ROOT / "js-format",
-        "--switch-ir",
-        TOOL_ROOT / "switch-ir",
-        "--js-refs",
-        TOOL_ROOT / "js-refs",
-        "--deobfuscator",
-        TOOL_ROOT / "deobfuscate-safe",
-        "--bundle-materializer",
-        TOOL_ROOT / "bundle-materialize",
-        "--sourcemaps",
-        TOOL_ROOT / "sourcemaps",
     )
 
     manifest = json.loads((PROJECT / "capture-manifest.json").read_text())

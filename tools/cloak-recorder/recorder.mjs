@@ -1604,7 +1604,7 @@ async function main() {
     `worker CDP sessions attached: ${summary.workerCdpSessionsAttached} (${summary.workerCdpSessionsUnpausedAtAttach} already running)`,
     "",
     "Feed capture.har to the existing js-redox capture pipeline:",
-    `uv run python scripts/capture-to-project.py ${path.relative(ROOT, path.join(out, "capture.har"))} work/capture-project`,
+    `.cargo-target-nodebug/debug/capture-project ${path.relative(ROOT, path.join(out, "capture.har"))} work/capture-project`,
     "",
   ].join("\n"));
 

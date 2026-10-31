@@ -8,12 +8,11 @@ import json
 import shutil
 from collections import Counter
 import subprocess
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "work/runtime-script-regression"
-CAPTURE_TO_PROJECT = ROOT / "scripts/capture-to-project.py"
+CAPTURE_PROJECT = ROOT / ".cargo-target-nodebug/debug/capture-project"
 
 
 def digest(source: str) -> str:
@@ -165,8 +164,7 @@ def main() -> None:
     project = WORK / "project"
     subprocess.run(
         [
-            sys.executable,
-            str(CAPTURE_TO_PROJECT),
+            str(CAPTURE_PROJECT),
             str(capture),
             str(project),
             "--overwrite",

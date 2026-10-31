@@ -120,11 +120,7 @@ def main():
         project = WORK / name
         make_har(name, source, har)
         cp = run(
-            "uv",
-            "run",
-            "--no-project",
-            "python",
-            "scripts/capture-to-project.py",
+            TOOL_ROOT / "capture-project",
             har,
             project,
         )
