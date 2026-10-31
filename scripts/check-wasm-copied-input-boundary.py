@@ -154,11 +154,7 @@ def materialize_and_correlate(har: Path, project: Path) -> None:
         "--formatter", TOOL_ROOT / "js-format",
         "--jobs", 1,
     )
-    run(
-        "uv", "run", "--no-project", "python",
-        "scripts/materialize-wasm.py", project,
-        "--wasm-redox", TOOL_ROOT / "wasm-redox",
-    )
+    run(TOOL_ROOT / "wasm-materialize", project)
     run(
         "uv", "run", "--no-project", "python",
         "scripts/correlate-wasm-js-boundary.py", project,

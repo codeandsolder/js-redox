@@ -54,8 +54,9 @@ class Toolchain:
     string_recoverer: Path = ROOT / "scripts/recover-js-obfuscator-strings.py"
     bundle_materializer: Path = TOOL_ROOT / "bundle-materialize"
     sourcemap_composer: Path = TOOL_ROOT / "sourcemap-compose"
-    wasm_redox: Path = TOOL_ROOT / "wasm-redox"
+    wasm_materializer: Path = TOOL_ROOT / "wasm-materialize"
     wasm_import_semantics: Path = TOOL_ROOT / "wasm-import-semantics"
+    project_readme: Path = TOOL_ROOT / "project-readme"
 
 
 @dataclass(frozen=True)
@@ -232,15 +233,7 @@ def run_capture_pipeline(
         ]
     )
     if options.wasm_analysis:
-        run_checked(
-            [
-                sys.executable,
-                ROOT / "scripts/materialize-wasm.py",
-                output,
-                "--wasm-redox",
-                tools.wasm_redox,
-            ]
-        )
+        run_checked([tools.wasm_materializer, output])
         if kind == "recorder":
             run_checked(
                 [
@@ -329,7 +322,7 @@ def run_capture_pipeline(
 
     run_checked([tools.api_surface, "--project", output])
     run_checked([sys.executable, ROOT / "scripts/build-source-graph.py", output])
-    run_checked([sys.executable, ROOT / "scripts/refresh-project-readme.py", output])
+    run_checked([tools.project_readme, output])
 
     return load_project_summary(
         output,

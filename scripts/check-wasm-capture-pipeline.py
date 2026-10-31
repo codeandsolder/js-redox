@@ -152,16 +152,7 @@ def main():
         "--jobs",
         1,
     )
-    run(
-        "uv",
-        "run",
-        "--no-project",
-        "python",
-        "scripts/materialize-wasm.py",
-        PROJECT,
-        "--wasm-redox",
-        TOOL_ROOT / "wasm-redox",
-    )
+    run(TOOL_ROOT / "wasm-materialize", PROJECT)
 
     index = json.loads((PROJECT / "analysis/wasm/index.json").read_text())
     assert index["summary"] == {

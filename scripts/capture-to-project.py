@@ -33,8 +33,9 @@ def main() -> None:
     ap.add_argument("--string-recoverer", type=Path, default=defaults.string_recoverer)
     ap.add_argument("--bundle-materializer", type=Path, default=defaults.bundle_materializer)
     ap.add_argument("--sourcemap-composer", type=Path, default=defaults.sourcemap_composer)
-    ap.add_argument("--wasm-redox", type=Path, default=defaults.wasm_redox)
+    ap.add_argument("--wasm-materializer", type=Path, default=defaults.wasm_materializer)
     ap.add_argument("--wasm-import-semantics", type=Path, default=defaults.wasm_import_semantics)
+    ap.add_argument("--project-readme", type=Path, default=defaults.project_readme)
     ap.add_argument("--jobs", type=int, help="parallel workers for content-only analysis stages")
     ap.add_argument("--skip-safe-deobfuscation", action="store_true")
     ap.add_argument("--skip-bundle-unpack", action="store_true")
@@ -57,8 +58,9 @@ def main() -> None:
         string_recoverer=args.string_recoverer,
         bundle_materializer=args.bundle_materializer,
         sourcemap_composer=args.sourcemap_composer,
-        wasm_redox=args.wasm_redox,
+        wasm_materializer=args.wasm_materializer,
         wasm_import_semantics=args.wasm_import_semantics,
+        project_readme=args.project_readme,
     )
     options = PipelineOptions(
         overwrite=args.overwrite,

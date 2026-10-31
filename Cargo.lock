@@ -596,6 +596,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "url",
+ "wasm-redox",
  "wasmparser 0.262.0",
 ]
 

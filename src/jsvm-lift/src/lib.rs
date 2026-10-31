@@ -18,8 +18,10 @@ pub mod numeric;
 pub mod parse_int;
 pub mod project_api_surface;
 pub mod project_js_refs;
+pub mod project_readme;
 pub mod source_materialize;
 pub mod vm_materialize;
+pub mod wasm_materialize;
 
 pub mod pipeline;
 
