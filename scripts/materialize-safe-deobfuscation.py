@@ -2,6 +2,8 @@
 import argparse
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,11 +11,34 @@ from pathlib import Path
 
 from analysis_artifacts import DEOBFUSCATION, SOURCE_INDEX, STRING_RECOVERY, load_artifact, write_artifact
 
-from content_dedup import default_jobs, link_or_copy, sha256_path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STRING_RECOVERER = ROOT / "scripts/recover-js-obfuscator-strings.py"
 DEFAULT_FORMATTER = ROOT / ".cargo-target-nodebug/debug/js-format"
+
+
+def sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def default_jobs(cap: int = 8) -> int:
+    return max(1, min(cap, os.cpu_count() or 1))
+
+
+def link_or_copy(source: Path, dest: Path) -> str:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() or dest.is_symlink():
+        dest.unlink()
+    try:
+        dest.hardlink_to(source)
+        return "hardlink"
+    except OSError:
+        shutil.copyfile(source, dest)
+        return "copy"
 
 
 def derived_path(raw_path: str, root: str) -> Path:

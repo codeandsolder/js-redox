@@ -10,10 +10,29 @@ from pathlib import Path
 
 from analysis_artifacts import BUNDLES, DEOBFUSCATION, GENERATED_RECOVERY, JSVM_INDEX, SOURCE_INDEX, load_artifact, write_artifact
 
-from content_dedup import link_or_copy, sha256_path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STRING_RECOVERER = ROOT / "scripts/recover-js-obfuscator-strings.py"
+
+
+def sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def link_or_copy(source: Path, dest: Path) -> str:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() or dest.is_symlink():
+        dest.unlink()
+    try:
+        dest.hardlink_to(source)
+        return "hardlink"
+    except OSError:
+        shutil.copyfile(source, dest)
+        return "copy"
 
 
 def direct_summary(report):
