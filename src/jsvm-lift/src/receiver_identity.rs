@@ -1833,6 +1833,44 @@ pub fn proven_exact_own_data_field_at_direct_call(
         .iter()
         .filter(|initialization| initialization.property == property)
     {
+        if target.caller == initialization.context
+            && context_entry_has_no_prior_property_write(
+                source,
+                program,
+                scoping,
+                &flow,
+                &initialization.context,
+                &initialization.property,
+                &stable_prototypes,
+            )
+            && initialization.evaluation_order < target.evaluation_order
+            && prove_event_completion_before_event(
+                semantic,
+                Span::new(initialization.write_start, initialization.write_end),
+                Span::new(target.call_start, target.call_end),
+            )
+            && root_context_segment_preserves_field(
+                source,
+                program,
+                scoping,
+                &flow,
+                &initialization.context,
+                initialization.evaluation_order,
+                target.evaluation_order,
+                &initialization.property,
+                &stable_prototypes,
+                true,
+                &mut memo,
+                &mut visiting,
+            )
+        {
+            proven.push(ProvenExactOwnDataFieldAtDirectCall {
+                initialization: initialization.clone(),
+                entry_call: target.clone(),
+                direct_call: target.clone(),
+            });
+        }
+
         for entry in flow.direct_calls.iter().filter(|call| {
             call.caller == initialization.context
                 && call.callee == target.caller
@@ -2323,6 +2361,30 @@ pub fn structurally_proven_own_data_fields_at_runtime_method_calls(
     proven
 }
 
+fn context_entry_has_no_prior_property_write(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    flow: &ProvenOriginFlow,
+    target: &ProvenOriginContext,
+    property: &str,
+    stable_prototypes: &HashSet<(u32, u32)>,
+) -> bool {
+    exact_origin_property_reachability(
+        source,
+        program,
+        scoping,
+        flow,
+        target.allocation_start,
+        target.allocation_end,
+        target.constructor_start,
+        target.constructor_end,
+        property,
+        stable_prototypes,
+    )
+    .is_some_and(|reachability| reachability.valid_contexts.contains(target))
+}
+
 fn context_prefix_preserves_exact_property(
     source: &str,
     program: &Program<'_>,
@@ -2376,32 +2438,40 @@ fn context_prefix_preserves_exact_property(
         })
 }
 
-/// Prove direct calls reached from one concrete allocation while an inherited
-/// string-valued prototype property still has its exact value.
-///
-/// This is a must-analysis over the exact-origin context graph: a merged helper
-/// context is admitted only when every reachable incoming edge is itself proven
-/// from a valid context and its caller prefix preserves the exact property
-/// value. Cycles that cannot be established from already-proven predecessors
-/// remain unproven.
-#[must_use]
-pub fn proven_prototype_string_at_direct_calls(
+type OriginPropertyEdgeKey = (u32, u32, ProvenOriginContext, ProvenOriginContext);
+
+struct ProvenOriginPropertyReachability {
+    calls: Vec<ProvenOriginDirectCall>,
+    valid_contexts: HashSet<ProvenOriginContext>,
+    valid_edges: HashSet<OriginPropertyEdgeKey>,
+}
+
+fn origin_property_edge_key(call: &ProvenOriginDirectCall) -> OriginPropertyEdgeKey {
+    (
+        call.call_start,
+        call.call_end,
+        call.caller.clone(),
+        call.callee.clone(),
+    )
+}
+
+fn exact_origin_property_reachability(
     source: &str,
     program: &Program<'_>,
-    semantic: &Semantic<'_>,
-    string: &ProvenPrototypeStringAtAllocation,
-) -> Vec<ProvenPrototypeStringAtDirectCall> {
-    let scoping = semantic.scoping();
-    let flow = structurally_proven_origin_flow(program, scoping);
-    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
-        .into_iter()
-        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
-        .collect::<HashSet<_>>();
+    scoping: &Scoping,
+    flow: &ProvenOriginFlow,
+    allocation_start: u32,
+    allocation_end: u32,
+    constructor_start: u32,
+    constructor_end: u32,
+    property: &str,
+    stable_prototypes: &HashSet<(u32, u32)>,
+) -> Option<ProvenOriginPropertyReachability> {
     let same_origin = |context: &ProvenOriginContext| {
-        context.allocation_start == string.allocation_start
-            && context.allocation_end == string.allocation_end
-            && context.constructor_start == string.assignment.constructor_start
-            && context.constructor_end == string.assignment.constructor_end
+        context.allocation_start == allocation_start
+            && context.allocation_end == allocation_end
+            && context.constructor_start == constructor_start
+            && context.constructor_end == constructor_end
     };
     let roots = flow
         .direct_calls
@@ -2410,13 +2480,13 @@ pub fn proven_prototype_string_at_direct_calls(
         .filter(|context| {
             same_origin(context)
                 && context.this_origin
-                && context.function_start == string.assignment.constructor_start
-                && context.function_end == string.assignment.constructor_end
+                && context.function_start == constructor_start
+                && context.function_end == constructor_end
         })
         .cloned()
         .collect::<HashSet<_>>();
     if roots.is_empty() {
-        return Vec::new();
+        return None;
     }
 
     let calls = flow
@@ -2438,22 +2508,17 @@ pub fn proven_prototype_string_at_direct_calls(
         }
     }
 
-    let mut valid = roots;
-    let mut valid_edges = HashSet::<(u32, u32, ProvenOriginContext, ProvenOriginContext)>::new();
+    let mut valid_contexts = roots;
+    let mut valid_edges = HashSet::<OriginPropertyEdgeKey>::new();
     let mut memo = HashMap::new();
     let mut visiting = HashSet::new();
     loop {
         let mut changed = false;
         for call in &calls {
-            if !valid.contains(&call.caller) {
+            if !valid_contexts.contains(&call.caller) {
                 continue;
             }
-            let edge_key = (
-                call.call_start,
-                call.call_end,
-                call.caller.clone(),
-                call.callee.clone(),
-            );
+            let edge_key = origin_property_edge_key(call);
             if valid_edges.contains(&edge_key) {
                 continue;
             }
@@ -2461,11 +2526,11 @@ pub fn proven_prototype_string_at_direct_calls(
                 source,
                 program,
                 scoping,
-                &flow,
+                flow,
                 &call.caller,
                 call.evaluation_order,
-                &string.assignment.property,
-                &stable_prototypes,
+                property,
+                stable_prototypes,
                 &mut memo,
                 &mut visiting,
             ) {
@@ -2475,26 +2540,20 @@ pub fn proven_prototype_string_at_direct_calls(
         }
 
         for context in &reachable {
-            if valid.contains(context) {
+            if valid_contexts.contains(context) {
                 continue;
             }
             let incoming = calls
                 .iter()
                 .filter(|call| call.callee == *context && reachable.contains(&call.caller))
                 .collect::<Vec<_>>();
-            if incoming.is_empty() {
-                continue;
-            }
-            if incoming.iter().all(|call| {
-                valid.contains(&call.caller)
-                    && valid_edges.contains(&(
-                        call.call_start,
-                        call.call_end,
-                        call.caller.clone(),
-                        call.callee.clone(),
-                    ))
-            }) {
-                valid.insert(context.clone());
+            if !incoming.is_empty()
+                && incoming.iter().all(|call| {
+                    valid_contexts.contains(&call.caller)
+                        && valid_edges.contains(&origin_property_edge_key(call))
+                })
+            {
+                valid_contexts.insert(context.clone());
                 changed = true;
             }
         }
@@ -2503,16 +2562,59 @@ pub fn proven_prototype_string_at_direct_calls(
         }
     }
 
+    Some(ProvenOriginPropertyReachability {
+        calls,
+        valid_contexts,
+        valid_edges,
+    })
+}
+
+/// Prove direct calls reached from one concrete allocation while an inherited
+/// string-valued prototype property still has its exact value.
+///
+/// This is a must-analysis over the exact-origin context graph: a merged helper
+/// context is admitted only when every reachable incoming edge is itself proven
+/// from a valid context and its caller prefix preserves the exact property
+/// value. Cycles that cannot be established from already-proven predecessors
+/// remain unproven.
+#[must_use]
+pub fn proven_prototype_string_at_direct_calls(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    string: &ProvenPrototypeStringAtAllocation,
+) -> Vec<ProvenPrototypeStringAtDirectCall> {
+    let scoping = semantic.scoping();
+    let flow = structurally_proven_origin_flow(program, scoping);
+    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
+        .into_iter()
+        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+        .collect::<HashSet<_>>();
+    let Some(reachability) = exact_origin_property_reachability(
+        source,
+        program,
+        scoping,
+        &flow,
+        string.allocation_start,
+        string.allocation_end,
+        string.assignment.constructor_start,
+        string.assignment.constructor_end,
+        &string.assignment.property,
+        &stable_prototypes,
+    ) else {
+        return Vec::new();
+    };
+    let ProvenOriginPropertyReachability {
+        calls,
+        valid_contexts,
+        valid_edges,
+    } = reachability;
+
     let mut proven = calls
         .into_iter()
         .filter(|call| {
-            valid.contains(&call.caller)
-                && valid_edges.contains(&(
-                    call.call_start,
-                    call.call_end,
-                    call.caller.clone(),
-                    call.callee.clone(),
-                ))
+            valid_contexts.contains(&call.caller)
+                && valid_edges.contains(&origin_property_edge_key(call))
         })
         .map(|call| ProvenPrototypeStringAtDirectCall {
             string: string.clone(),
@@ -2649,10 +2751,10 @@ pub struct ProvenOwnDataFieldAtMemberCall {
 pub struct ProvenExactOwnDataFieldAtDirectCall {
     pub initialization: ProvenOwnDataFieldInitialization,
     /// First exact-origin direct call reached after the initialization in the
-    /// same context.
+    /// same context. Equals `direct_call` when the target itself is that root call.
     pub entry_call: ProvenOriginDirectCall,
-    /// Nested direct call in `entry_call`'s callee at which the exact field
-    /// value is still proven unchanged.
+    /// Target direct call at whose entry the exact field value is still proven
+    /// unchanged. May equal `entry_call` or occur transitively inside its callee.
     pub direct_call: ProvenOriginDirectCall,
 }
 
@@ -5910,6 +6012,48 @@ mod tests {
                     .get(proof.direct_call.call_start as usize..proof.direct_call.call_end as usize)
                     .is_some_and(|call| call == "helper(state)")
         }));
+    }
+
+    #[test]
+    fn exact_own_data_field_value_proves_direct_root_call() {
+        let source = r#"
+            const C = function() {
+                this.cell = {};
+                helper(this);
+            };
+            function helper(state) { void state.cell; }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        let flow =
+            super::structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let target = flow
+            .direct_calls
+            .iter()
+            .find(|call| {
+                source
+                    .get(call.call_start as usize..call.call_end as usize)
+                    .is_some_and(|call| call == "helper(this)")
+            })
+            .expect("helper call must be in exact-origin flow");
+        let proofs = super::proven_exact_own_data_field_at_direct_call(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            "cell",
+            target,
+        );
+        let proof = proofs
+            .iter()
+            .find(|proof| proof.initialization.property == "cell")
+            .expect("direct root proof");
+        assert_eq!(proof.entry_call, *target);
+        assert_eq!(proof.direct_call, *target);
     }
 
     #[test]

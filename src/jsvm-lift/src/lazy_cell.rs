@@ -75,8 +75,15 @@ pub struct ProvenSlowLazyCellStateFields {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenSlowLazyCellExactStateFields {
+    pub exact_assignment: ProvenSlowLazyCellExactRegistryAssignment,
+    pub fields: ProvenSlowLazyCellStateFields,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenSlowLazyCellPrototypeCarrier {
-    pub state_fields: ProvenSlowLazyCellStateFields,
+    pub state_fields: ProvenSlowLazyCellExactStateFields,
+    pub accessor: ProvenLazyRegistryReadCall,
     pub helper_function_start: u32,
     pub helper_function_end: u32,
     pub helper_call_start: u32,
@@ -157,6 +164,18 @@ pub struct ProvenSlowLazyCellResolvedHandler {
     pub captured_handler: ProvenSlowLazyCellCapturedHandlerInstall,
 }
 
+/// End-to-end proof that one exact slow-cell registry assignment is observed by
+/// the structural lazy accessor as the original logical handler.
+///
+/// The proof joins the same exact wrapper assignment across update-before-
+/// projection accessor semantics, inherited prototype getter delegation,
+/// resolver slot selection, and captured-handler provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenSlowLazyCellReadResult {
+    pub resolved_handler: ProvenSlowLazyCellResolvedHandler,
+    pub carrier: ProvenSlowLazyCellPrototypeCarrier,
+}
+
 fn strip_parentheses<'a>(expression: &'a Expression<'a>) -> &'a Expression<'a> {
     match expression {
         Expression::ParenthesizedExpression(parenthesized) => {
@@ -186,6 +205,17 @@ fn reference_symbol(scoping: &Scoping, expression: &Expression<'_>) -> Option<Sy
     scoping
         .get_reference(identifier.reference_id.get()?)
         .symbol_id()
+}
+
+fn same_direct_receiver(scoping: &Scoping, left: &Expression<'_>, right: &Expression<'_>) -> bool {
+    let left = last_sequence_expression(left);
+    let right = last_sequence_expression(right);
+    matches!(
+        (left, right),
+        (Expression::ThisExpression(_), Expression::ThisExpression(_))
+    ) || reference_symbol(scoping, left)
+        .zip(reference_symbol(scoping, right))
+        .is_some_and(|(left, right)| left == right)
 }
 
 fn assignment_symbol(scoping: &Scoping, target: &AssignmentTarget<'_>) -> Option<SymbolId> {
@@ -1798,6 +1828,36 @@ pub fn proven_slow_lazy_cell_resolved_handler(
     })
 }
 
+/// Join all independently proven slow-cell obligations for one exact wrapper.
+#[must_use]
+pub fn proven_slow_lazy_cell_read_result(
+    resolved_handler: &ProvenSlowLazyCellResolvedHandler,
+    carrier: &ProvenSlowLazyCellPrototypeCarrier,
+) -> Option<ProvenSlowLazyCellReadResult> {
+    let resolver = &resolved_handler.resolver;
+    let exact_assignment = &resolver.exact_assignment;
+    let factory_call = &resolver.update_state.factory_call;
+    let accessor = &carrier.accessor;
+    if resolved_handler.captured_handler.exact_assignment != *exact_assignment
+        || carrier.state_fields.exact_assignment != *exact_assignment
+        || carrier.state_fields.fields.factory_call != *factory_call
+        || exact_assignment.assignment.factory_call != *factory_call
+        || accessor.read.registry_path != exact_assignment.assignment.registry_path
+        || accessor.selector_start != resolver.selector_start
+        || accessor.selector_end != resolver.selector_end
+        || accessor.selector_key_symbol != resolver.selector_key_symbol
+        || carrier.method_name != accessor.update_property
+        || carrier.projection_property != accessor.projection_property
+        || carrier.resolver_property != factory_call.shape.resolver_property
+    {
+        return None;
+    }
+    Some(ProvenSlowLazyCellReadResult {
+        resolved_handler: resolved_handler.clone(),
+        carrier: carrier.clone(),
+    })
+}
+
 fn assignment_at_span<'a>(
     sequence: &'a oxc_ast::ast::SequenceExpression<'a>,
     start: u32,
@@ -2453,7 +2513,7 @@ pub fn proven_slow_lazy_cell_state_fields_for_exact_assignment(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     exact_assignment: &ProvenSlowLazyCellExactRegistryAssignment,
-) -> Option<ProvenSlowLazyCellStateFields> {
+) -> Option<ProvenSlowLazyCellExactStateFields> {
     let factory_call = &exact_assignment.assignment.factory_call;
     let shape = &factory_call.shape;
     let chain = &exact_assignment.provenance_calls;
@@ -2533,13 +2593,15 @@ pub fn proven_slow_lazy_cell_state_fields_for_exact_assignment(
         return None;
     }
 
-    Some(ProvenSlowLazyCellStateFields {
-        factory_call: factory_call.clone(),
-        prototype_field,
-        method_key,
+    Some(ProvenSlowLazyCellExactStateFields {
+        exact_assignment: exact_assignment.clone(),
+        fields: ProvenSlowLazyCellStateFields {
+            factory_call: factory_call.clone(),
+            prototype_field,
+            method_key,
+        },
     })
 }
-
 #[derive(Debug, Clone)]
 struct CarrierInitializerShape {
     helper_symbol: SymbolId,
@@ -2764,9 +2826,13 @@ fn carrier_initializer_shape(
             if left.optional || left.property.name.as_str() != self.property {
                 return;
             }
-            let Some(receiver_symbol) = reference_symbol(self.scoping, &left.object) else {
+            let receiver = &left.object;
+            if !matches!(
+                last_sequence_expression(receiver),
+                Expression::Identifier(_) | Expression::ThisExpression(_)
+            ) {
                 return;
-            };
+            }
             let Expression::CallExpression(call) = last_sequence_expression(&assignment.right)
             else {
                 return;
@@ -2793,7 +2859,7 @@ fn carrier_initializer_shape(
                 {
                     if !member.optional
                         && member.property.name.as_str() == self.method_key_field
-                        && reference_symbol(self.scoping, &member.object) == Some(receiver_symbol)
+                        && same_direct_receiver(self.scoping, receiver, &member.object)
                     {
                         method_keys.push(index);
                     }
@@ -3276,16 +3342,20 @@ pub fn proven_slow_lazy_cell_prototype_carrier(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
-    state_fields: &ProvenSlowLazyCellStateFields,
+    state_fields: &ProvenSlowLazyCellExactStateFields,
     accessor: &ProvenLazyRegistryReadCall,
 ) -> Option<ProvenSlowLazyCellPrototypeCarrier> {
     let scoping = semantic.scoping();
-    let factory_call = &state_fields.factory_call;
+    let fields = &state_fields.fields;
+    let factory_call = &fields.factory_call;
+    if state_fields.exact_assignment.assignment.factory_call != *factory_call {
+        return None;
+    }
     let shape = &factory_call.shape;
-    let method_name = state_fields.method_key.string.assignment.value.clone();
+    let method_name = fields.method_key.string.assignment.value.clone();
     if method_name != accessor.update_property
-        || state_fields.prototype_field.initialization.property != shape.prototype_field
-        || state_fields.method_key.string.assignment.property != shape.method_key_field
+        || fields.prototype_field.initialization.property != shape.prototype_field
+        || fields.method_key.string.assignment.property != shape.method_key_field
     {
         return None;
     }
@@ -3308,7 +3378,7 @@ pub fn proven_slow_lazy_cell_prototype_carrier(
     let initializer = carrier_initializer_shape(
         program,
         scoping,
-        &state_fields.prototype_field.initialization,
+        &fields.prototype_field.initialization,
         &shape.method_key_field,
         &shape.resolver_property,
     )?;
@@ -3356,6 +3426,7 @@ pub fn proven_slow_lazy_cell_prototype_carrier(
 
     Some(ProvenSlowLazyCellPrototypeCarrier {
         state_fields: state_fields.clone(),
+        accessor: accessor.clone(),
         helper_function_start: helper.function.start,
         helper_function_end: helper.function.end,
         helper_call_start: initializer.helper_call.start,
@@ -3429,9 +3500,9 @@ mod tests {
     use super::{
         proven_slow_lazy_cell_captured_handler_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
-        proven_slow_lazy_cell_prototype_carrier, proven_slow_lazy_cell_registry_assignment,
-        proven_slow_lazy_cell_resolved_handler, proven_slow_lazy_cell_resolver_index,
-        proven_slow_lazy_cell_state_fields,
+        proven_slow_lazy_cell_prototype_carrier, proven_slow_lazy_cell_read_result,
+        proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_resolved_handler,
+        proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_state_fields,
         proven_slow_lazy_cell_state_fields_for_exact_assignment,
         proven_slow_lazy_cell_update_state, structurally_proven_slow_lazy_cell_factory_shapes,
     };
@@ -3680,8 +3751,11 @@ mod tests {
             &exact,
         )
         .expect("path state fields");
-        assert_eq!(fields.method_key.string.assignment.value, "create");
-        assert_eq!(fields.prototype_field.initialization.property, "base");
+        assert_eq!(fields.fields.method_key.string.assignment.value, "create");
+        assert_eq!(
+            fields.fields.prototype_field.initialization.property,
+            "base"
+        );
     }
 
     #[test]
@@ -3691,6 +3765,7 @@ mod tests {
             const Seed = {};
             const Maker = Seed.constructor;
             const C = function() {
+                this.T = [];
                 this.base = carrier(0, 17, this.method, {
                     get: function() { return this.resolve(); }
                 });
@@ -3725,12 +3800,29 @@ mod tests {
             }
             function make(mode, q, y, state, key, handler, capture, s, phase, cell, out) {
                 return (mode | 48) == mode && (
-                    handler = [11, -39, 3, 4, 5, 6, handler, 87],
-                    s = 1,
+                    handler = [51, -39, -92, 71, -35, 4, handler, 87, -37, -29],
+                    s = -2 * ~(y & 7) + -8 + (y ^ 7) + (~y | 7),
                     phase = outer_phase,
                     cell = Maker[state.method](state.base),
-                    cell[state.method] = function(value) { s = value; },
-                    cell.resolve = function() { return handler[s]; },
+                    cell[state.method] = function(value) {
+                        s += 6 + 7 * (capture = value, y), s &= 7;
+                    },
+                    cell.resolve = function(r, n, m, d, T, B) {
+                        capture = (n = (B = (
+                            T = key % 16 + 1,
+                            +s + (phase() | 0) * T - T * capture
+                                + 61 * capture * capture
+                                - 305 * key * key * capture
+                                + handler[
+                                    r = s + q,
+                                    -~(r & 7) + (r ^ 7) + (~r ^ 7)
+                                ] * key * T
+                                + 5 * key * key * T
+                                + 2379 * key * capture
+                                - 1403 * capture
+                        ), handler)[B], void 0);
+                        return n;
+                    },
                     out = cell
                 ), out;
             }
@@ -3801,6 +3893,41 @@ mod tests {
         assert_eq!(carrier.projection_property, "prototype");
         assert_eq!(carrier.resolver_property, "resolve");
         assert!(carrier.standard_object_prototype_semantics_required);
+
+        let update =
+            proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, &factory)
+                .expect("update state");
+        let installs = proven_origin_registry_handler_installs(&parsed.program, scoping, &flow);
+        let install = installs
+            .iter()
+            .find(|install| install.exact_key == 7)
+            .expect("logical handler install");
+        let captured = proven_slow_lazy_cell_captured_handler_install(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &exact,
+            install,
+        )
+        .expect("captured handler");
+        let resolver = proven_slow_lazy_cell_resolver_index(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            &update,
+            accessor.selector_start,
+            accessor.selector_end,
+            accessor.selector_key_symbol,
+            &exact,
+            23,
+        )
+        .expect("resolver slot");
+        let resolved =
+            proven_slow_lazy_cell_resolved_handler(&resolver, &captured).expect("resolved handler");
+        let read =
+            proven_slow_lazy_cell_read_result(&resolved, &carrier).expect("end-to-end lazy read");
+        assert_eq!(read.resolved_handler.resolver.exact_key_value, 7);
+        assert_eq!(read.resolved_handler.resolver.handler_slot, 6);
     }
 
     #[test]
