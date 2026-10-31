@@ -2278,3 +2278,127 @@ console.log(d(0x10,"k"),d(0x11,"k"));
             .is_some_and(|count| *count >= 1));
     }
 }
+
+#[cfg(test)]
+mod fixture_regressions {
+    use super::{deobfuscate, safe_source_rejection, SafeSourceMode};
+
+    fn checked(source: &str) -> super::SafeTransformResult {
+        let result = deobfuscate(source, 16);
+        assert!(
+            result.is_some(),
+            "fixture should be accepted by safe deobfuscation"
+        );
+        let Some(result) = result else {
+            unreachable!();
+        };
+        assert_eq!(
+            safe_source_rejection(&result.source, SafeSourceMode::Auto),
+            None,
+            "transformed fixture must remain parser-valid"
+        );
+        result
+    }
+
+    #[test]
+    fn selector_dispatch_fixture_specializes_only_proven_calls() {
+        let source =
+            include_str!("../../../corpus/generated/reversible-obfuscation/selector-dispatch.js");
+        let result = checked(source);
+        assert_eq!(
+            result.transforms.get("selector_dispatch_specialize"),
+            Some(&7)
+        );
+        assert!(result.source.contains("dispatch(42, 9, 4)"));
+        assert_eq!(result.source.matches("ambiguous(1, 4)").count(), 2);
+    }
+
+    #[test]
+    fn direct_table_fixture_keeps_unsafe_decoder_shapes_dynamic() {
+        let source = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/datadome-direct-table.js"
+        );
+        let result = checked(source);
+        for dynamic in [
+            "QInvalid(0)",
+            "QDecoy(0)",
+            "CDecoy(0)",
+            "reassigned(5, 2)",
+            "QEscaped(0)",
+            "QInternalEscaped(0)",
+            "QReassigned(0)",
+            "QSideEffect(0)",
+            "C(7)",
+            "C(dynamicChoice ? 0 : 7)",
+            "CFixedSide(0)",
+        ] {
+            assert!(
+                result.source.contains(dynamic),
+                "missing dynamic shape {dynamic}"
+            );
+        }
+        assert!(!result.source.contains("C(dynamicChoice ? 0 : 1)"));
+        for recovered in [
+            "\"cookie\"",
+            "\"reload\"",
+            "\"parseInt\"",
+            "17",
+            "true",
+            "null",
+        ] {
+            assert!(
+                result.source.contains(recovered),
+                "missing recovered value {recovered}"
+            );
+        }
+        assert!(result
+            .transforms
+            .get("string_array_decode")
+            .is_some_and(|count| *count >= 15));
+        assert!(result
+            .transforms
+            .get("pure_function_eval")
+            .is_some_and(|count| *count >= 5));
+    }
+
+    #[test]
+    fn sparse_direct_table_fixture_folds_only_proven_entries() {
+        let source =
+            include_str!("../../../corpus/generated/reversible-obfuscation/sparse-direct-table.js");
+        let result = checked(source);
+        for folded in ["QSparse(0)", "QSparse(2)", "CSparse(0)", "CSparse(2)"] {
+            assert!(!result.source.contains(folded), "failed to fold {folded}");
+        }
+        for dynamic in ["QSparse(1)", "CSparse(1)", "INested(1)"] {
+            assert!(
+                result.source.contains(dynamic),
+                "lost dynamic shape {dynamic}"
+            );
+        }
+        assert!(!result.source.contains("INested(0)"));
+        assert!(result
+            .transforms
+            .get("string_array_decode")
+            .is_some_and(|count| *count >= 5));
+    }
+
+    #[test]
+    fn reference_identity_fixture_unflattens_proven_state_machine() {
+        let source = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/reference-identity-table.js"
+        );
+        let result = checked(source);
+        assert!(!result.source.contains("S[0][0] === S[4][0]"));
+        assert!(!result.source.contains("S[0][0] !== S[0][1]"));
+        assert!(!result.source.contains("switch (state)"));
+        assert!(!result.source.contains("switch(state)"));
+        assert!(result
+            .transforms
+            .get("reference_identity_compare")
+            .is_some_and(|count| *count >= 4));
+        assert!(result
+            .transforms
+            .get("reference_state_unflatten")
+            .is_some_and(|count| *count >= 1));
+    }
+}
