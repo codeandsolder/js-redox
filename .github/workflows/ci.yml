@@ -37,4 +37,3 @@ jobs:
         node tools/cloak-recorder/check-nested-cdp-session.mjs
         cargo +1.99.1 build --locked --workspace --bins --target-dir .cargo-target-nodebug
         uv run python scripts/check-safe-deobfuscate.py
-        uv run python scripts/check-vm-capture-pipeline.py

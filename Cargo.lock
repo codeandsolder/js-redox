@@ -688,7 +688,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "url",
- "wait-timeout",
  "wasm-redox",
  "wasmparser 0.262.0",
 ]
@@ -1632,15 +1631,6 @@ dependencies = [
  "smallvec",
  "wasm-encoder 0.248.0",
  "wasmparser 0.248.0",
-]
-
-[[package]]
-name = "wait-timeout"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
-dependencies = [
- "libc",
 ]
 
 [[package]]

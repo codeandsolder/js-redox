@@ -30,7 +30,6 @@ rolldown_redox = { workspace = true, features = ["ecmascript", "sourcemap"] }
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-wait-timeout.workspace = true
 sha2.workspace = true
 url.workspace = true
 wasmparser.workspace = true

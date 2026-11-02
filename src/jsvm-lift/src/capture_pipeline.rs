@@ -309,6 +309,12 @@ mod tests {
                 include_str!("../../../corpus/generated/js-virtualizer/vm.js"),
             ),
             (
+                "generated-safe",
+                include_str!(
+                    "../../../corpus/generated/reversible-obfuscation/generated-child-safe.js"
+                ),
+            ),
+            (
                 "generated-packer",
                 include_str!("../../../corpus/generated/reversible-obfuscation/packer-eval.js"),
             ),
@@ -358,32 +364,103 @@ mod tests {
             match name {
                 "direct-switch" => {
                     assert!(materialized.switch_vms >= 1);
-                    assert!(index["devirtualized_units"]
+                    assert!(code_units
+                        .iter()
+                        .any(|unit| { unit["confirmed_vm_signal"].as_bool().unwrap_or(false) }));
+                    let devirtualized = index["devirtualized_units"]
                         .as_array()
-                        .is_some_and(|units| units.iter().any(|unit| {
-                            unit["vm_kind"] == "direct_switch"
-                                && unit["source_path"]
-                                    .as_str()
-                                    .is_some_and(|path| project.join(path).is_file())
-                                && unit["pseudocode_path"]
-                                    .as_str()
-                                    .is_some_and(|path| project.join(path).is_file())
-                        })));
+                        .context("devirtualized units missing")?
+                        .iter()
+                        .filter(|unit| unit["vm_kind"] == "direct_switch")
+                        .collect::<Vec<_>>();
+                    assert!(!devirtualized.is_empty());
+                    assert!(devirtualized.iter().all(|unit| {
+                        ["source_path", "pseudocode_path"].iter().all(|field| {
+                            unit[*field]
+                                .as_str()
+                                .is_some_and(|path| project.join(path).is_file())
+                        })
+                    }));
                 }
                 "function-table" => {
                     assert!(materialized.table_vms >= 1);
-                    assert!(index["devirtualized_units"]
+                    assert!(code_units
+                        .iter()
+                        .any(|unit| { unit["table_vms"].as_u64().unwrap_or_default() > 0 }));
+                    let devirtualized = index["devirtualized_units"]
                         .as_array()
-                        .is_some_and(|units| units.iter().any(|unit| {
-                            unit["vm_kind"] == "function_table"
-                                && unit["handler_count"].as_u64().unwrap_or_default() >= 74
-                        })));
+                        .context("devirtualized units missing")?
+                        .iter()
+                        .filter(|unit| unit["vm_kind"] == "function_table")
+                        .collect::<Vec<_>>();
+                    assert!(!devirtualized.is_empty());
+                    assert!(devirtualized
+                        .iter()
+                        .any(|unit| unit["handler_count"].as_u64().unwrap_or_default() >= 74));
+                    assert!(devirtualized.iter().all(|unit| {
+                        ["source_path", "pseudocode_path"].iter().all(|field| {
+                            unit[*field]
+                                .as_str()
+                                .is_some_and(|path| project.join(path).is_file())
+                        })
+                    }));
+                }
+                "generated-safe" => {
+                    assert!(index["dynamic_code_units"]
+                        .as_array()
+                        .is_some_and(|units| !units.is_empty()));
+                    let generated = code_units
+                        .iter()
+                        .find(|unit| unit["origin"] == "generated_dynamic_code")
+                        .context("generated safe unit missing")?;
+                    assert_eq!(generated["analysis_origin"], "safe_deobfuscation");
+                    assert!(generated["path"]
+                        .as_str()
+                        .is_some_and(|path| path.starts_with("src/_dynamic_deobfuscated/")));
+
+                    let recovery = artifact(&project, GENERATED_RECOVERY)?;
+                    assert!(
+                        recovery["summary"]["generated_units"]
+                            .as_u64()
+                            .unwrap_or_default()
+                            >= 1
+                    );
+                    assert!(
+                        recovery["summary"]["safe_deobfuscation"]
+                            .as_u64()
+                            .unwrap_or_default()
+                            >= 1
+                    );
+                    let unit = recovery["units"]
+                        .as_array()
+                        .and_then(|units| units.first())
+                        .context("generated recovery unit missing")?;
+                    assert_eq!(unit["selected_stage"], "safe_deobfuscation");
+                    assert_eq!(unit["deobfuscation"]["changed"], true);
+                    assert!(
+                        unit["deobfuscation"]["transforms"]["constant_fold"]
+                            .as_u64()
+                            .unwrap_or_default()
+                            >= 1
+                    );
+                    for field in ["analysis_path", "readable_path"] {
+                        assert!(unit[field]
+                            .as_str()
+                            .is_some_and(|path| project.join(path).is_file()));
+                    }
                 }
                 "generated-packer" => {
-                    assert_eq!(
-                        index["dynamic_code_units"].as_array().map(Vec::len),
-                        Some(1)
-                    );
+                    let dynamic = index["dynamic_code_units"]
+                        .as_array()
+                        .context("dynamic code units missing")?;
+                    assert_eq!(dynamic.len(), 1);
+                    assert_eq!(dynamic[0]["kind"], "Dean Edwards P.A.C.K.E.R.");
+                    let generated = code_units
+                        .iter()
+                        .filter(|unit| unit["origin"] == "generated_dynamic_code")
+                        .collect::<Vec<_>>();
+                    assert_eq!(generated.len(), 1);
+                    assert_eq!(generated[0]["analysis_origin"], "safe_deobfuscation");
                     let recovery = artifact(&project, GENERATED_RECOVERY)?;
                     assert_eq!(recovery["summary"]["generated_units"], 1);
                     assert_eq!(recovery["summary"]["safe_deobfuscation"], 1);
@@ -397,6 +474,10 @@ mod tests {
                     assert!(readable.contains("console.log(answer);"));
                 }
                 "generated-obfuscated" => {
+                    assert!(index["dynamic_code_units"]
+                        .as_array()
+                        .is_some_and(|units| !units.is_empty()));
+                    assert!(code_units.len() >= 2);
                     let recovery = artifact(&project, GENERATED_RECOVERY)?;
                     assert!(
                         recovery["summary"]["string_recovery_only"]
@@ -413,29 +494,109 @@ mod tests {
                         })
                         .context("generated VM unit missing")?;
                     assert_eq!(generated["analysis_origin"], "string_recovery_only");
+                    assert!(generated["path"]
+                        .as_str()
+                        .is_some_and(|path| path.starts_with("src/_dynamic_deobfuscated/")));
                     assert!(
                         generated["largest_handler_table"]
                             .as_u64()
                             .unwrap_or_default()
                             >= 74
                     );
+                    assert_eq!(generated["large_handler_table_candidate"], false);
+                    assert!(generated["table_vms"].as_u64().unwrap_or_default() >= 1);
                     assert!(materialized.table_vms >= 1, "{generated:#}");
-                    assert!(index["devirtualized_units"]
+                    let scan_id = generated["scan_id"]
+                        .as_u64()
+                        .context("generated scan id missing")?;
+                    let devirtualized = index["devirtualized_units"]
                         .as_array()
-                        .is_some_and(|units| units.iter().any(|unit| {
+                        .context("devirtualized units missing")?
+                        .iter()
+                        .filter(|unit| {
                             unit["vm_kind"] == "function_table"
-                                && unit["handler_count"].as_u64().unwrap_or_default() >= 74
-                        })));
+                                && unit["parent_scan_id"].as_u64() == Some(scan_id)
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(!devirtualized.is_empty());
+                    assert!(devirtualized
+                        .iter()
+                        .any(|unit| unit["handler_count"].as_u64().unwrap_or_default() >= 74));
+                    assert!(devirtualized.iter().all(|unit| {
+                        ["source_path", "pseudocode_path"].iter().all(|field| {
+                            unit[*field]
+                                .as_str()
+                                .is_some_and(|path| project.join(path).is_file())
+                        })
+                    }));
+                    let recovered = recovery["units"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|unit| unit["selected_stage"] == "string_recovery_only")
+                        .context("string-recovery generated unit missing")?;
+                    assert_eq!(recovered["string_recovery"]["changed"], true);
+                    assert!(
+                        recovered["string_recovery"]["replacements"]
+                            .as_u64()
+                            .unwrap_or_default()
+                            >= 100
+                    );
+                    assert_ne!(
+                        recovered["deobfuscation"]["exit"]
+                            .as_i64()
+                            .unwrap_or_default(),
+                        0
+                    );
+                    assert_ne!(recovered["analysis_path"], recovered["raw_path"]);
                 }
                 _ => unreachable!(),
             }
 
             let graph = artifact(&project, SOURCE_GRAPH)?;
-            if name != "generated-packer" {
-                assert!(edge_count(&graph, "devirtualized_vm") >= 1, "{name}");
-            } else {
-                assert_eq!(edge_count(&graph, "generated_code"), 1);
-                assert_eq!(edge_count(&graph, "generated_safe_recovery"), 1);
+            match name {
+                "direct-switch" | "function-table" => {
+                    let kind = if name == "direct-switch" {
+                        "direct_switch"
+                    } else {
+                        "function_table"
+                    };
+                    let devirtualized = index["devirtualized_units"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|unit| unit["vm_kind"] == kind)
+                        .fold(0_u64, |count, _| count + 1);
+                    assert!(edge_count(&graph, "devirtualized_vm") >= devirtualized);
+                }
+                "generated-packer" => {
+                    assert_eq!(edge_count(&graph, "generated_code"), 1);
+                    assert_eq!(edge_count(&graph, "generated_safe_recovery"), 1);
+                }
+                "generated-safe" => {
+                    assert!(edge_count(&graph, "generated_code") >= 1);
+                    assert!(edge_count(&graph, "generated_safe_recovery") >= 1);
+                    let recovered = graph["nodes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|node| node["type"] == "generated_recovered_source")
+                        .context("generated recovered source node missing")?;
+                    assert_eq!(recovered["recovery_stage"], "safe_deobfuscation");
+                }
+                "generated-obfuscated" => {
+                    assert!(edge_count(&graph, "generated_code") >= 1);
+                    assert!(edge_count(&graph, "devirtualized_vm") >= 1);
+                    assert!(graph["nodes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|node| node["type"] == "generated_dynamic_code")
+                        .any(|node| node
+                            .get("child_scan_id")
+                            .is_some_and(|value| !value.is_null())));
+                }
+                _ => unreachable!(),
             }
         }
         Ok(())
