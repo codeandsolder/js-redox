@@ -235,7 +235,6 @@ fn expose_static_strings_with_mode(
     }))
 }
 
-#[must_use]
 pub fn expose_static_strings(
     source: &str,
     max_iterations: usize,
@@ -244,7 +243,6 @@ pub fn expose_static_strings(
     expose_static_strings_with_mode(source, max_iterations, SafeSourceMode::Auto, budget)
 }
 
-#[must_use]
 pub fn expose_static_strings_with_source_mode(
     source: &str,
     max_iterations: usize,

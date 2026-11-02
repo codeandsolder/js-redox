@@ -885,11 +885,13 @@ impl<'a> Visit<'a> for Base91CallCollector<'_, '_> {
     }
 }
 
+type StaticExposure = (String, BTreeMap<String, usize>);
+
 fn expose_static_strings_allow_with(
     source: &str,
     source_type: SourceType,
     budget: &WorkBudget,
-) -> Result<Option<(String, BTreeMap<String, usize>)>, BudgetExceeded> {
+) -> Result<Option<StaticExposure>, BudgetExceeded> {
     budget.checkpoint()?;
     let mut current = source.to_string();
     let mut total = BTreeMap::<String, usize>::new();
@@ -933,7 +935,6 @@ fn expose_static_strings_allow_with(
     Ok(Some((current, total)))
 }
 
-#[must_use]
 pub fn recover_base91_strings_with_source_mode(
     source: &str,
     max_iterations: usize,

@@ -1439,7 +1439,6 @@ fn recover_static_decoders_with_mode(
     }))
 }
 
-#[must_use]
 pub fn recover_static_decoders(
     source: &str,
     max_iterations: usize,
@@ -1448,7 +1447,6 @@ pub fn recover_static_decoders(
     recover_static_decoders_with_mode(source, max_iterations, SafeSourceMode::Auto, budget)
 }
 
-#[must_use]
 pub fn recover_static_decoders_with_source_mode(
     source: &str,
     max_iterations: usize,
@@ -1558,7 +1556,6 @@ fn deobfuscate_with_mode(
     }))
 }
 
-#[must_use]
 pub fn deobfuscate(
     source: &str,
     max_iterations: usize,
@@ -1569,7 +1566,6 @@ pub fn deobfuscate(
 
 /// Proof-oriented deobfuscation with an explicit host-language source mode.
 /// Use this when filename semantics make module/CommonJS mode authoritative.
-#[must_use]
 pub fn deobfuscate_with_source_mode(
     source: &str,
     max_iterations: usize,
@@ -1583,7 +1579,6 @@ pub fn deobfuscate_with_source_mode(
 /// `Number`, `parseInt`, and `Math.floor` through a proven stable global-object
 /// alias. Callers must surface this assumption in any claim derived from the
 /// transformed source; ordinary source rewriting must use [`deobfuscate`].
-#[must_use]
 pub fn deobfuscate_with_standard_numeric_builtins(
     source: &str,
     max_iterations: usize,
