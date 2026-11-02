@@ -179,8 +179,10 @@ mod tests {
     use crate::analysis_artifacts::{
         read_artifact, write_artifact, API_SURFACE, DEOBFUSCATION, SOURCE_INDEX,
     };
-    use serde_json::json;
+    use anyhow::Context;
+    use serde_json::{json, Map};
     use std::{
+        collections::BTreeMap,
         fs,
         path::PathBuf,
         process,
@@ -259,6 +261,197 @@ mod tests {
         assert_eq!(artifact["failures"][0]["source_index_ordinal"], 0);
 
         fs::remove_dir_all(project)?;
+        Ok(())
+    }
+
+    #[test]
+    fn api_surface_graph_and_readme_remain_consistent() -> anyhow::Result<()> {
+        use crate::{
+            capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME},
+            project_readme::refresh_project_readme,
+            source_graph::build_source_graph,
+        };
+
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join("resources"))?;
+        fs::create_dir_all(project.join("src/_deobfuscated"))?;
+
+        let source = r#"
+const apiOrigin = "https://api.example.test";
+const usersUrl = apiOrigin + "/v1/users";
+const writeMethod = "POST";
+fetch(usersUrl);
+fetch("/relative");
+fetch("/unknown-method", opts);
+fetch(apiOrigin + "/write", { ...opts, method: writeMethod });
+fetch("https://api.example.test/forbidden", { method: "trace" });
+navigator.sendBeacon("https://api.example.test/beacon", body);
+const xhr = new XMLHttpRequest();
+xhr.open("PATCH", "https://api.example.test/items");
+new WebSocket("wss://socket.example.test/ws");
+function shadow(fetch) { fetch("https://fake.invalid/"); }
+"#;
+        let rejected = "with (scope) { fetch(\"https://rejected.invalid/\"); }\n";
+        fs::write(project.join("resources/app.js"), source)?;
+        fs::write(project.join("resources/rejected.js"), rejected)?;
+        fs::write(project.join("src/app.js"), source)?;
+        fs::write(project.join("src/rejected.js"), rejected)?;
+        fs::write(project.join("src/_deobfuscated/app.js"), source)?;
+
+        write_manifest(
+            &project.join(MANIFEST_NAME),
+            &CaptureManifest {
+                schema: "capture-project/v1".into(),
+                source: CaptureSource {
+                    kind: "synthetic".into(),
+                    input: "synthetic-api-surface.js".into(),
+                    salvaged: false,
+                    extra: Map::new(),
+                },
+                pages: Vec::new(),
+                resources: vec![
+                    json!({
+                        "id": 0,
+                        "url": "https://app.example.test/app.js",
+                        "kind": "javascript",
+                        "output_path": "resources/app.js",
+                        "body_present": true,
+                        "references": [],
+                        "response_headers": [],
+                    }),
+                    json!({
+                        "id": 1,
+                        "url": "https://app.example.test/rejected.js",
+                        "kind": "javascript",
+                        "output_path": "resources/rejected.js",
+                        "body_present": true,
+                        "references": [],
+                        "response_headers": [],
+                    }),
+                ],
+                inline_scripts: Vec::new(),
+                counts: BTreeMap::new(),
+                extra: Map::new(),
+            },
+        )?;
+        write_artifact(
+            &project,
+            SOURCE_INDEX,
+            &json!({
+                "schema": SOURCE_INDEX.schema,
+                "units": [
+                    {"kind":"html","resource_id":0,"source_path":"src/page.html"},
+                    {"kind":"javascript","raw_path":"resources/app.js","resource_id":0,"url":"https://app.example.test/app.js","source_path":"src/app.js"},
+                    {"kind":"javascript","raw_path":"resources/rejected.js","resource_id":1,"url":"https://app.example.test/rejected.js","source_path":"src/rejected.js"}
+                ],
+                "summary": {}
+            }),
+        )?;
+        write_artifact(
+            &project,
+            DEOBFUSCATION,
+            &json!({
+                "schema": DEOBFUSCATION.schema,
+                "units": [{
+                    "ordinal": 0,
+                    "resource_id": 0,
+                    "raw_path": "resources/app.js",
+                    "output_path": "src/_deobfuscated/app.js",
+                    "exit": 0
+                }],
+                "summary": {}
+            }),
+        )?;
+
+        let summary = analyze_project_api_surface(&project)?;
+        assert_eq!(summary["units"], 2);
+        assert_eq!(summary["callsites"], 8);
+        assert_eq!(summary["failures"], 1);
+        assert_eq!(summary["static_urls"], 8);
+        assert_eq!(summary["kinds"]["fetch"], 5);
+        assert_eq!(summary["kinds"]["send_beacon"], 1);
+        assert_eq!(summary["kinds"]["websocket"], 1);
+        assert_eq!(summary["kinds"]["xhr_open"], 1);
+        assert_eq!(summary["absolute_network_urls"], 6);
+        assert_eq!(summary["static_methods"], 5);
+        assert_eq!(summary["invalid_methods"], 1);
+
+        let artifact = read_artifact(&project.join(API_SURFACE.relative_path), API_SURFACE)?;
+        let callsites = artifact["callsites"]
+            .as_array()
+            .context("api-surface callsites must be an array")?;
+        assert!(callsites.iter().all(|row| row["source_index_ordinal"] == 1));
+        assert!(callsites
+            .iter()
+            .all(|row| !row.to_string().contains("fake.invalid")));
+        assert_eq!(artifact["failures"][0]["source_index_ordinal"], 2);
+        let users = callsites
+            .iter()
+            .find(|row| row["url"] == "https://api.example.test/v1/users")
+            .context("missing users callsite")?;
+        assert_eq!(users["url_expression"], "usersUrl");
+        assert_eq!(users["method"], "GET");
+        let relative = callsites
+            .iter()
+            .find(|row| row["url"] == "/relative")
+            .context("missing relative callsite")?;
+        assert_eq!(relative["absolute_network_url"], false);
+        let write = callsites
+            .iter()
+            .find(|row| row["url"] == "https://api.example.test/write")
+            .context("missing write callsite")?;
+        assert_eq!(write["method"], "POST");
+        assert_eq!(write["url_expression"], r#"apiOrigin + "/write""#);
+        assert_eq!(write["method_expression"], "writeMethod");
+        let forbidden = callsites
+            .iter()
+            .find(|row| row["url"] == "https://api.example.test/forbidden")
+            .context("missing forbidden-method callsite")?;
+        assert_eq!(forbidden["method_status"], "invalid");
+        assert!(forbidden
+            .get("method")
+            .is_none_or(serde_json::Value::is_null));
+
+        let graph_summary = build_source_graph(&project)?;
+        assert!(graph_summary.nodes >= 8);
+        let graph = read_artifact(
+            &project.join(crate::analysis_artifacts::SOURCE_GRAPH.relative_path),
+            crate::analysis_artifacts::SOURCE_GRAPH,
+        )?;
+        let api_nodes = graph["nodes"]
+            .as_array()
+            .context("source graph nodes must be an array")?
+            .iter()
+            .filter(|node| node["type"] == "api_callsite")
+            .count();
+        let target_edges = graph["edges"]
+            .as_array()
+            .context("source graph edges must be an array")?
+            .iter()
+            .filter(|edge| edge["kind"] == "api_target")
+            .count();
+        assert_eq!(api_nodes, 8);
+        assert_eq!(target_edges, 5);
+        assert!(graph["nodes"].as_array().is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                node["type"] == "external_url" && node["url"] == "wss://socket.example.test/ws"
+            })
+        }));
+        assert!(!graph["nodes"].as_array().is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                node["type"] == "external_url"
+                    && node["url"] == "https://api.example.test/forbidden"
+            })
+        }));
+
+        refresh_project_readme(&project)?;
+        let readme = fs::read_to_string(project.join("README.md"))?;
+        assert!(readme.contains("[analysis/api-surface.json](analysis/api-surface.json)"));
+        assert!(readme.contains("Static browser API callsites: **8**"));
+        assert!(readme.contains("callsites with exact absolute network URLs: **6**"));
+        assert!(readme.contains("proven invalid methods: **1**"));
+        assert!(readme.contains("failed source units: **1**"));
         Ok(())
     }
 }
