@@ -1,5 +1,8 @@
-use crate::numeric::exact_u64;
-use anyhow::{ensure, Result};
+use crate::{
+    browser_decode::{decode_script, ScriptDecodeContext},
+    numeric::exact_u64,
+};
+use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use jsvm_safe_core::{
     eval_static_primitive, recover_browser_legacy_call_assignments, string_literal_value,
@@ -17,7 +20,8 @@ use oxc_syntax::scope::ScopeFlags;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap},
-    path::Path,
+    fs,
+    path::{Path, PathBuf},
 };
 
 use crate::structural_signals::{self as structures, apiish_name};
@@ -1523,6 +1527,87 @@ fn path_allows_classic_fallback(path: &Path) -> bool {
     !matches!(path.extension().and_then(|ext| ext.to_str()), Some("mjs"))
 }
 
+/// Analyze a JavaScript file from raw bytes using the same browser-oriented
+/// decoding fallback as capture ingestion. Detached classic scripts cannot
+/// recover their embedding document encoding, so replacement decoding remains
+/// explicitly uncertain rather than failing the scan.
+pub fn analyze_bytes(
+    bytes: &[u8],
+    input: &Path,
+    options: &SusScanOptions,
+) -> Result<SusFileReport> {
+    if let Ok(source) = std::str::from_utf8(bytes) {
+        return analyze_source(source, input, options);
+    }
+
+    let decoded = decode_script(bytes, ScriptDecodeContext::classic_unknown());
+    let mut report = analyze_source(&decoded.source, input, options)?;
+    report.bytes = bytes.len();
+    report.decode_encoding = decoded.encoding;
+    report.decode_source = decoded.decode_source.as_str().to_string();
+    report.decode_had_errors = decoded.had_errors;
+    report.decode_uncertain = decoded.uncertain;
+    Ok(report)
+}
+
+/// Read and analyze one explicitly selected source file.
+pub fn scan_file(path: &Path, options: &SusScanOptions) -> Result<SusFileReport> {
+    let bytes = fs::read(path).with_context(|| format!("reading JavaScript {}", path.display()))?;
+    analyze_bytes(&bytes, path, options)
+}
+
+fn is_js_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("js" | "mjs" | "cjs" | "jsx")
+    )
+}
+
+fn collect_path(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if metadata.is_file() {
+        // Explicit file arguments are authoritative: corpus bodies are often
+        // content-addressed and extensionless. Directory walks remain filtered.
+        out.push(path.to_path_buf());
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+
+    let mut entries = fs::read_dir(path)
+        .with_context(|| format!("reading directory {}", path.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_path(&child, out)?;
+        } else if metadata.is_file() && is_js_file(&child) {
+            out.push(child);
+        }
+    }
+    Ok(())
+}
+
+/// Expand explicit files and recursive directories into a deterministic source
+/// list. Explicit files are accepted regardless of extension; recursive walks
+/// select JavaScript-like extensions and never follow symlinks.
+pub fn collect_input_paths(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for input in inputs {
+        collect_path(input, &mut paths)?;
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 pub fn build_report(
     mut files: Vec<SusFileReport>,
     options: &SusScanOptions,
@@ -1571,4 +1656,333 @@ pub fn build_report(
         total_actionable_signals,
         files,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        analyze_bytes, analyze_source, collect_input_paths, scan_file, SusFileReport,
+        SusScanOptions,
+    };
+    use anyhow::{Context, Result};
+    use std::{fs, path::PathBuf};
+
+    fn options() -> SusScanOptions {
+        SusScanOptions {
+            include_signals: true,
+            ..SusScanOptions::default()
+        }
+    }
+
+    fn kind_count(report: &SusFileReport, kind: &str) -> usize {
+        report.signal_kinds.get(kind).copied().unwrap_or(0)
+    }
+
+    fn actionable_kind_count(report: &SusFileReport, kind: &str) -> usize {
+        report
+            .actionable_signal_kinds
+            .get(kind)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../corpus/generated/sus-scanner")
+            .join(name)
+    }
+
+    #[test]
+    fn file_boundary_preserves_extensionless_inputs_and_decode_provenance() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let extensionless = workspace.path().join("0123456789abcdef");
+        fs::write(&extensionless, "const value = 1;\n")?;
+        let paths = collect_input_paths(std::slice::from_ref(&extensionless))?;
+        assert_eq!(paths, vec![extensionless.clone()]);
+        let report = scan_file(&extensionless, &options())?;
+        assert_eq!(PathBuf::from(&report.input), extensionless);
+        assert!(!report.fatal_error);
+
+        let malformed = workspace.path().join("deadbeef");
+        let malformed_bytes = b"// Copyright \xa9 2013\nconst ok = 1;\n";
+        fs::write(&malformed, malformed_bytes)?;
+        let report = analyze_bytes(malformed_bytes, &malformed, &options())?;
+        assert!(!report.fatal_error);
+        assert!(report.decode_had_errors);
+        assert!(report.decode_uncertain);
+        assert_eq!(report.decode_encoding, "UTF-8");
+        assert_eq!(report.decode_source, "utf8-fallback");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_recovery_is_explicit_and_fails_closed_outside_supported_web_syntax() -> Result<()> {
+        let options = options();
+        let legacy = analyze_source(
+            "function target() { return 1; }\ntarget() = 2;\neval('visible');\n",
+            PathBuf::from("legacy.js").as_path(),
+            &options,
+        )?;
+        assert!(legacy.parser_fatal_error);
+        assert!(!legacy.fatal_error);
+        assert!(!legacy.analysis_complete);
+        assert_eq!(
+            legacy.parse_recovery.as_deref(),
+            Some("browser-legacy-call-assignment")
+        );
+        assert_eq!(legacy.opaque_parse_spans.len(), 1);
+        assert_eq!(
+            legacy.opaque_parse_spans[0].kind,
+            "browser_legacy_call_assignment_target"
+        );
+        assert!(kind_count(&legacy, "static_dynamic_code_call") >= 1);
+
+        let html_comment = analyze_source(
+            "<!--\n$(document).ready(function() { $('#slideshow0').nivoSlider(); });\n-->",
+            PathBuf::from("legacy-html-comment.js").as_path(),
+            &options,
+        )?;
+        assert!(html_comment.parser_fatal_error);
+        assert!(!html_comment.fatal_error);
+        assert!(html_comment.analysis_complete);
+        assert_eq!(
+            html_comment.parse_recovery.as_deref(),
+            Some("classic-script-fallback")
+        );
+        assert!(html_comment.opaque_parse_spans.is_empty());
+
+        let invalid = analyze_source(
+            "(1 + 2) = 3;\n",
+            PathBuf::from("invalid-assignment.js").as_path(),
+            &options,
+        )?;
+        assert!(invalid.parser_fatal_error);
+        assert!(invalid.fatal_error);
+        assert!(!invalid.analysis_complete);
+        assert!(invalid.parse_recovery.is_none());
+        assert!(invalid.opaque_parse_spans.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn actionability_separates_exposed_codecs_from_hidden_dynamic_code() -> Result<()> {
+        let options = options();
+        let literal = analyze_source(
+            concat!(
+                "eval('window.visible = 1');\n",
+                "Function('x', 'return x + 1');\n",
+                "new Function('x', 'return x * 2');\n",
+                "Function();\n",
+                "new Function();\n",
+                "eval('window.stillVisible = 1', getIgnored());\n",
+                "new Function('x', '' + 'return x - 1');\n",
+                "setTimeout('tick()', 10);\n",
+            ),
+            PathBuf::from("literal.js").as_path(),
+            &options,
+        )?;
+        assert_eq!(kind_count(&literal, "static_dynamic_code_call"), 4);
+        assert_eq!(kind_count(&literal, "static_dynamic_code_constructor"), 3);
+        assert_eq!(kind_count(&literal, "string_timer_call"), 1);
+        assert_eq!(kind_count(&literal, "dynamic_code_call"), 0);
+        assert_eq!(kind_count(&literal, "dynamic_code_constructor"), 0);
+        assert_eq!(literal.actionable_signal_count, 0);
+        assert_eq!(literal.actionable_top_score, 0);
+
+        let hidden = analyze_source(
+            concat!(
+                "const source = getSource();\n",
+                "eval(source);\n",
+                "Function('x', source);\n",
+                "new Function('x', source);\n",
+            ),
+            PathBuf::from("hidden.js").as_path(),
+            &options,
+        )?;
+        assert_eq!(kind_count(&hidden, "dynamic_code_call"), 2);
+        assert_eq!(kind_count(&hidden, "dynamic_code_constructor"), 1);
+        assert_eq!(hidden.actionable_signal_count, 3);
+        assert!(hidden.actionable_top_score > 0);
+
+        let codec = analyze_source(
+            concat!(
+                "function utf8(cp) { return String.fromCharCode(cp); }\n",
+                "function decode(x) { return atob(x); }\n",
+                "function id(n) { return n.toString(36); }\n",
+            ),
+            PathBuf::from("codec-control.js").as_path(),
+            &options,
+        )?;
+        assert_eq!(kind_count(&codec, "charcode_decode_call"), 1);
+        assert_eq!(kind_count(&codec, "base64_decode_call"), 1);
+        assert_eq!(kind_count(&codec, "radix_string_call"), 1);
+        assert_eq!(codec.actionable_signal_count, 0);
+        assert_eq!(codec.actionable_top_score, 0);
+
+        let codepoints = analyze_source(
+            "const hidden = String.fromCharCode(120, 116, 49);\nsink(hidden);\n",
+            PathBuf::from("literal-codepoints.js").as_path(),
+            &options,
+        )?;
+        assert_eq!(kind_count(&codepoints, "charcode_decode_call"), 1);
+        assert_eq!(kind_count(&codepoints, "charcode_literal_decode"), 1);
+        assert_eq!(
+            actionable_kind_count(&codepoints, "charcode_literal_decode"),
+            1
+        );
+        assert_eq!(
+            actionable_kind_count(&codepoints, "charcode_decode_call"),
+            0
+        );
+
+        let encoded = "QUJD".repeat(40);
+        let opaque =
+            "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_~!@#$%^&*()[]{}:;,.?|"
+                .repeat(6);
+        let blobs = analyze_source(
+            &format!("const encoded = {encoded:?};\nconst opaque = {opaque:?};\nsink(encoded, opaque);\n"),
+            PathBuf::from("data-blobs.js").as_path(),
+            &options,
+        )?;
+        assert!(kind_count(&blobs, "base64_blob") >= 1);
+        assert!(kind_count(&blobs, "opaque_blob") >= 1);
+        assert_eq!(actionable_kind_count(&blobs, "base64_blob"), 0);
+        assert_eq!(actionable_kind_count(&blobs, "opaque_blob"), 0);
+        assert_eq!(blobs.actionable_signal_count, 0);
+
+        let cookie = analyze_source(
+            concat!(
+                "function getCookieValue(name) {\n",
+                "  const cookie = {};\n",
+                "  document.cookie.split(';').forEach((item) => {\n",
+                "    const [key, value] = item.split('=');\n",
+                "    cookie[key.trim()] = value ? decodeURIComponent(value) : '';\n",
+                "  });\n",
+                "  return cookie[name];\n",
+                "}\n",
+            ),
+            PathBuf::from("cookie-helper.js").as_path(),
+            &options,
+        )?;
+        assert_eq!(actionable_kind_count(&cookie, "direct_table_decoder"), 0);
+
+        let direct = analyze_source(
+            "const table = ['QQ==', 'Qg=='];\nfunction decode(i) { return atob(table[i]); }\nsink(decode(0));\n",
+            PathBuf::from("direct-table-decoder.js").as_path(),
+            &options,
+        )?;
+        assert!(actionable_kind_count(&direct, "direct_table_decoder") >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn generated_corpus_keeps_detector_controls_discriminative() -> Result<()> {
+        let options = options();
+        let load = |name: &str| -> Result<SusFileReport> {
+            let path = fixture(name);
+            scan_file(&path, &options).with_context(|| format!("scanning {}", path.display()))
+        };
+
+        let dense = load("dense-obfuscation.js")?;
+        assert!(!dense.clusters.is_empty());
+        assert!(dense.top_score >= 30);
+        assert!(!dense.actionable_clusters.is_empty());
+        assert!(dense.actionable_top_score >= 12);
+        assert!(kind_count(&dense, "api_string_table") >= 1);
+        assert!(kind_count(&dense, "indexed_lookup") >= 10);
+        assert!(kind_count(&dense, "charcode_decode_call") >= 1);
+        assert!(kind_count(&dense, "base64_blob") >= 1);
+        assert!(kind_count(&dense, "base64_decode_call") >= 1);
+        assert!(kind_count(&dense, "numeric_decoder_call_candidate") >= 4);
+        assert!(kind_count(&dense, "bitwise_mix") >= 1);
+        assert!(dense.clusters.iter().any(|cluster| {
+            cluster
+                .repeated_subjects
+                .iter()
+                .any(|item| matches!(item.subject.as_str(), "pool" | "chars") && item.count >= 3)
+        }));
+
+        let clean = load("clean-control.js")?;
+        assert!(clean.clusters.is_empty());
+        assert_eq!(clean.top_score, 0);
+        assert!(clean.actionable_clusters.is_empty());
+        assert_eq!(clean.actionable_top_score, 0);
+
+        let module_loader = load("module-loader-control.js")?;
+        assert!(kind_count(&module_loader, "numeric_decoder_call_candidate") >= 4);
+        assert!(module_loader.top_score > 0);
+        assert_eq!(module_loader.actionable_top_score, 0);
+        assert!(module_loader.actionable_clusters.is_empty());
+
+        let asset = load("asset-control.js")?;
+        assert!(asset.clusters.is_empty());
+        assert_eq!(kind_count(&asset, "base64_blob"), 0);
+
+        let long_string = load("long-string-control.js")?;
+        assert!(long_string.clusters.is_empty());
+        assert_eq!(long_string.top_score, 0);
+        assert_eq!(kind_count(&long_string, "string_plus_chain"), 1);
+
+        let rotation = load("array-rotation.js")?;
+        assert!(!rotation.clusters.is_empty());
+        assert_eq!(kind_count(&rotation, "array_rotation"), 2);
+        assert!(rotation
+            .signals
+            .as_deref()
+            .context("rotation signals omitted")?
+            .iter()
+            .filter(|signal| signal.kind == "array_rotation")
+            .all(|signal| signal.subject.as_deref() == Some("table")));
+        let rotation_control = load("array-rotation-control.js")?;
+        assert!(rotation_control.clusters.is_empty());
+        assert_eq!(kind_count(&rotation_control, "array_rotation"), 1);
+
+        let bootstrap = load("rotation-bootstrap.js")?;
+        assert_eq!(kind_count(&bootstrap, "array_rotation"), 2);
+        assert_eq!(kind_count(&bootstrap, "rotation_checksum_iife"), 1);
+        assert_eq!(
+            kind_count(
+                &load("rotation-bootstrap-control.js")?,
+                "rotation_checksum_iife"
+            ),
+            0
+        );
+
+        for (positive, control, kind, expected) in [
+            (
+                "operator-proxy-table.js",
+                "operator-proxy-table-control.js",
+                "operator_proxy_table",
+                1,
+            ),
+            (
+                "one-shot-wrapper.js",
+                "one-shot-wrapper-control.js",
+                "one_shot_wrapper",
+                1,
+            ),
+            (
+                "direct-table-decoder.js",
+                "direct-table-decoder-control.js",
+                "direct_table_decoder",
+                1,
+            ),
+            (
+                "mba-helper-cluster.js",
+                "mba-helper-control.js",
+                "mba_helper",
+                4,
+            ),
+            (
+                "selector-dispatcher.js",
+                "selector-dispatcher-control.js",
+                "selector_dispatcher",
+                1,
+            ),
+        ] {
+            assert_eq!(kind_count(&load(positive)?, kind), expected, "{positive}");
+            assert_eq!(kind_count(&load(control)?, kind), 0, "{control}");
+        }
+        Ok(())
+    }
 }
