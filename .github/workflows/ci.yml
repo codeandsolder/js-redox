@@ -21,6 +21,11 @@ jobs:
       rust-components: "rustfmt clippy"
       timeout-minutes: 20
       command: |
+        python_files="$(git ls-files '*.py')"
+        if [[ -n "$python_files" ]]; then
+          printf 'tracked Python is not allowed in js-redox:\n%s\n' "$python_files"
+          exit 1
+        fi
         cargo +1.99.1 fmt --all -- --check
         cargo +1.99.1 test --locked --workspace
         cargo +1.99.1 clippy --locked --workspace --all-targets -- -D warnings

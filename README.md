@@ -37,6 +37,18 @@ scripts/build-jsvm-lift.sh
 
 It uses the machine-pinned Rust 1.99 toolchain, requires the distributed sccache build path, derives build parallelism from live farm capacity, and publishes durable executables under `.cargo-target-nodebug/`. The helper builds the scanner/tooling plus `sourcemaps`, `wasm-redox`, and the `fresh-eval` proof helper, and asks Cargo for the workspace target directory rather than assuming a member-local `target/` layout.
 
+## Pinned real-corpus evaluation
+
+`corpus-eval` is the single engine-facing evaluator for pinned private/real-world JavaScript corpora. The manifest owns capture hashes and acceptance policy; the evaluator formats, safe-deobfuscates, and structurally scans each raw sample through the Rust library APIs in-process. Node is used only as an independent syntax check for generated analyst/deobfuscated source. Reference samples are hash-verified but never executed.
+
+```sh
+cargo +1.99.1 run -p jsvm-lift --bin corpus-eval -- \
+  path/to/manifest.json --corpus-root /path/to/private/corpus \
+  --report /path/to/report.json
+```
+
+The evaluator uses a temporary directory for syntax-check inputs and leaves only the explicitly requested report behind. Public metadata can therefore remain in Git while private sample bytes live elsewhere.
+
 ## Suspicious-structure triage
 
 `sus-scan` is the cheap first-pass structural scanner used to rank code before deeper recovery. General AST-level obfuscation structures live in `src/jsvm-lift/src/bin/sus-scan/structures.rs` rather than being mixed into the scoring collector.

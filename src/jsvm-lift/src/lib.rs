@@ -6,6 +6,7 @@ pub mod capture_import;
 pub mod capture_pipeline;
 pub mod capture_project;
 pub mod content_dedup;
+pub mod corpus_eval;
 pub mod decoder;
 pub mod dispatch;
 pub mod embedded;
