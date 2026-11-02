@@ -227,3 +227,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "safe_deob_runtime_tests.rs"]
+mod runtime_equivalence;
