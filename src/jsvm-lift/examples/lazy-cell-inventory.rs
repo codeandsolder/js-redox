@@ -2,14 +2,15 @@ use anyhow::{Context, Result};
 use jsvm_lift::{
     forwarding_semantics::structurally_proven_lazy_registry_read_calls,
     lazy_cell::{
-        proven_slow_lazy_cell_captured_handler_from_value,
+        proven_fast_lazy_cell_factory_call, proven_slow_lazy_cell_captured_handler_from_value,
         proven_slow_lazy_cell_captured_value_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
         proven_slow_lazy_cell_prototype_carrier, proven_slow_lazy_cell_read_result,
         proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_resolved_handler,
         proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_state_fields,
         proven_slow_lazy_cell_state_fields_for_exact_assignment,
-        proven_slow_lazy_cell_update_state, structurally_proven_slow_lazy_cell_factory_shapes,
+        proven_slow_lazy_cell_update_state, structurally_proven_fast_lazy_cell_factory_shapes,
+        structurally_proven_slow_lazy_cell_factory_shapes,
     },
     receiver_identity::structurally_proven_origin_flow,
     registry_identity::{
@@ -108,7 +109,62 @@ fn main() -> Result<()> {
         })
         .collect::<Vec<_>>();
 
+    let fast_shapes = structurally_proven_fast_lazy_cell_factory_shapes(&parsed.program, scoping);
+    let fast_shape_json = fast_shapes
+        .iter()
+        .map(|shape| json!({
+            "function": [shape.function_start, shape.function_end],
+            "guard": [shape.guard_start, shape.guard_end],
+            "guard_source": snippet(&source, shape.guard_start, shape.guard_end),
+            "mode_parameter_index": shape.mode_parameter_index,
+            "value_parameter_index": shape.value_parameter_index,
+            "state_parameter_index": shape.state_parameter_index,
+            "prototype_field": shape.prototype_field,
+            "method_key_field": shape.method_key_field,
+            "updater_property": shape.updater_property,
+            "cell_construction": [shape.cell_construction_start, shape.cell_construction_end],
+            "getter_function": [shape.getter_function_start, shape.getter_function_end],
+            "updater_function": [shape.updater_function_start, shape.updater_function_end],
+            "post_construction_cell_reference_barriers": shape
+                .post_construction_cell_reference_barriers
+                .iter()
+                .map(|span| json!({
+                    "span": [span.start, span.end],
+                    "source": snippet(&source, span.start, span.end),
+                }))
+                .collect::<Vec<_>>(),
+            "standard_object_create_semantics_required": shape.standard_object_create_semantics_required,
+        }))
+        .collect::<Vec<_>>();
+
     let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+    let fast_calls = flow
+        .direct_calls
+        .iter()
+        .filter(|call| {
+            fast_shapes.iter().any(|shape| {
+                (shape.function_start, shape.function_end)
+                    == (call.callee.function_start, call.callee.function_end)
+            })
+        })
+        .map(|call| {
+            let proven = proven_fast_lazy_cell_factory_call(
+                &source,
+                &parsed.program,
+                &semantic.semantic,
+                call,
+            );
+            json!({
+                "call": [call.call_start, call.call_end],
+                "call_source": snippet(&source, call.call_start, call.call_end),
+                "caller": [call.caller.function_start, call.caller.function_end],
+                "origin_parameter_indices": call.callee.parameter_indices,
+                "exact_integer_arguments": call.exact_integer_arguments,
+                "proven": proven.is_some(),
+                "exact_mode_value": proven.as_ref().map(|proof| proof.exact_mode_value),
+            })
+        })
+        .collect::<Vec<_>>();
     let origin_installs = proven_origin_registry_handler_installs(&parsed.program, scoping, &flow);
     let origin_value_installs =
         proven_origin_registry_value_installs(&parsed.program, scoping, &flow);
@@ -396,6 +452,8 @@ fn main() -> Result<()> {
             "phase_value": phase_value,
             "lazy_accessor": accessor_json,
             "shapes": shape_json,
+            "fast_shapes": fast_shape_json,
+            "fast_calls": fast_calls,
             "candidate_calls": candidate_calls,
             "specialized_calls": specialized_calls,
             "origin_handler_installs": origin_installs.len(),

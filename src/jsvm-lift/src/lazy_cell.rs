@@ -64,6 +64,39 @@ pub struct SlowLazyCellFactoryShape {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastLazyCellFactoryShape {
+    pub function_start: u32,
+    pub function_end: u32,
+    pub guard_start: u32,
+    pub guard_end: u32,
+    pub mode_parameter_index: usize,
+    pub value_parameter_index: usize,
+    pub state_parameter_index: usize,
+    pub prototype_field: String,
+    pub method_key_field: String,
+    pub updater_property: String,
+    pub cell_construction_start: u32,
+    pub cell_construction_end: u32,
+    pub getter_function_start: u32,
+    pub getter_function_end: u32,
+    pub getter_entry_condition: Option<Span>,
+    pub updater_function_start: u32,
+    pub updater_function_end: u32,
+    pub returned_cell_assignment_start: u32,
+    pub returned_cell_assignment_end: u32,
+    pub object_constructor_symbol: SymbolId,
+    pub post_construction_cell_reference_barriers: Vec<Span>,
+    pub standard_object_create_semantics_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenFastLazyCellFactoryCall {
+    pub shape: FastLazyCellFactoryShape,
+    pub call: ProvenOriginDirectCall,
+    pub exact_mode_value: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenSlowLazyCellFactoryCall {
     pub shape: SlowLazyCellFactoryShape,
     pub call: ProvenOriginDirectCall,
@@ -299,6 +332,598 @@ fn assignment_expression<'a>(
         return None;
     };
     assignment.operator.is_assign().then_some(assignment)
+}
+
+fn direct_parameter_references(
+    scoping: &Scoping,
+    expression: &Expression<'_>,
+    parameters: &[SymbolId],
+) -> HashSet<usize> {
+    struct Probe<'c, 'p> {
+        scoping: &'c Scoping,
+        parameters: &'p [SymbolId],
+        references: HashSet<usize>,
+    }
+    impl<'a> Visit<'a> for Probe<'_, '_> {
+        fn visit_identifier_reference(
+            &mut self,
+            identifier: &oxc_ast::ast::IdentifierReference<'a>,
+        ) {
+            let Some(symbol) = identifier
+                .reference_id
+                .get()
+                .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+            else {
+                return;
+            };
+            if let Some(index) = self
+                .parameters
+                .iter()
+                .position(|parameter| *parameter == symbol)
+            {
+                self.references.insert(index);
+            }
+        }
+        fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+        }
+    }
+    let mut probe = Probe {
+        scoping,
+        parameters,
+        references: HashSet::new(),
+    };
+    probe.visit_expression(expression);
+    probe.references
+}
+
+fn symbol_references_in_function(
+    function: &Function<'_>,
+    scoping: &Scoping,
+    symbol: SymbolId,
+) -> Vec<(Span, bool)> {
+    struct Probe<'c> {
+        scoping: &'c Scoping,
+        symbol: SymbolId,
+        references: Vec<(Span, bool)>,
+    }
+    impl<'a> Visit<'a> for Probe<'_> {
+        fn visit_identifier_reference(
+            &mut self,
+            identifier: &oxc_ast::ast::IdentifierReference<'a>,
+        ) {
+            let Some(reference_id) = identifier.reference_id.get() else {
+                return;
+            };
+            let reference = self.scoping.get_reference(reference_id);
+            if reference.symbol_id() == Some(self.symbol) {
+                self.references
+                    .push((identifier.span, reference.is_write()));
+            }
+        }
+    }
+    let mut probe = Probe {
+        scoping,
+        symbol,
+        references: Vec::new(),
+    };
+    if let Some(body) = function.body.as_deref() {
+        probe.visit_function_body(body);
+    }
+    probe.references
+}
+
+fn fast_getter_return(
+    scoping: &Scoping,
+    function: &Function<'_>,
+    captured: SymbolId,
+) -> Option<Option<Span>> {
+    if function.r#async || function.generator || function.params.rest.is_some() {
+        return None;
+    }
+    let body = function.body.as_deref()?;
+    match body.statements.as_slice() {
+        [Statement::ReturnStatement(ret)] => {
+            (reference_symbol(scoping, ret.argument.as_ref()?) == Some(captured)).then_some(None)
+        }
+        [Statement::WhileStatement(statement)] => {
+            let Statement::BlockStatement(block) = &statement.body else {
+                return None;
+            };
+            let Statement::ReturnStatement(ret) = block.body.first()? else {
+                return None;
+            };
+            (reference_symbol(scoping, ret.argument.as_ref()?) == Some(captured))
+                .then_some(Some(statement.test.span()))
+        }
+        _ => None,
+    }
+}
+
+fn fast_updater_replaces_capture(
+    scoping: &Scoping,
+    function: &Function<'_>,
+    captured: SymbolId,
+) -> bool {
+    if function.r#async || function.generator || function.params.rest.is_some() {
+        return false;
+    }
+    let Some(parameter) = function.params.items.first().and_then(parameter_symbol) else {
+        return false;
+    };
+    if function.params.items.len() != 1 {
+        return false;
+    }
+    let Some(body) = function.body.as_deref() else {
+        return false;
+    };
+    let [Statement::ExpressionStatement(statement)] = body.statements.as_slice() else {
+        return false;
+    };
+    let Expression::AssignmentExpression(assignment) = &statement.expression else {
+        return false;
+    };
+    assignment.operator.is_assign()
+        && assignment_symbol(scoping, &assignment.left) == Some(captured)
+        && reference_symbol(scoping, &assignment.right) == Some(parameter)
+}
+
+fn fast_shape_for_function(
+    function: &Function<'_>,
+    scoping: &Scoping,
+) -> Option<FastLazyCellFactoryShape> {
+    if function.r#async || function.generator {
+        return None;
+    }
+    let parameters = parameter_symbols(function)?;
+    let body = function.body.as_deref()?;
+    let mut returns = body
+        .statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Statement::ReturnStatement(ret) => Some(ret),
+            _ => None,
+        });
+    let ret = returns.next()?;
+    if returns.next().is_some() {
+        return None;
+    }
+    let returned_symbol = reference_symbol(scoping, ret.argument.as_ref()?)?;
+
+    #[derive(Clone)]
+    struct Candidate {
+        guard: Span,
+        mode_parameter_index: usize,
+        value_parameter_index: usize,
+        state_parameter_index: usize,
+        prototype_field: String,
+        method_key_field: String,
+        updater_property: String,
+        cell_construction: Span,
+        getter_function: Span,
+        getter_entry_condition: Option<Span>,
+        updater_function: Span,
+        returned_cell_assignment: Span,
+        object_constructor_symbol: SymbolId,
+        cell_symbol: SymbolId,
+        getter_assignment: Span,
+        updater_assignment: Span,
+    }
+
+    struct Collector<'c, 'p> {
+        scoping: &'c Scoping,
+        parameters: &'p [SymbolId],
+        returned_symbol: SymbolId,
+        candidates: Vec<Candidate>,
+    }
+    impl<'a> Visit<'a> for Collector<'_, '_> {
+        fn visit_logical_expression(&mut self, logical: &oxc_ast::ast::LogicalExpression<'a>) {
+            if logical.operator.as_str() == "&&" {
+                if let Expression::SequenceExpression(sequence) = strip_parentheses(&logical.right)
+                {
+                    let mode_refs =
+                        direct_parameter_references(self.scoping, &logical.left, self.parameters);
+                    let mode_refs = mode_refs.into_iter().collect::<Vec<_>>();
+                    let [mode_parameter_index] = mode_refs.as_slice() else {
+                        walk::walk_logical_expression(self, logical);
+                        return;
+                    };
+                    let mode_parameter_index = *mode_parameter_index;
+                    let mut cell = None;
+                    let mut getter = None;
+                    let mut updater = None;
+                    let mut returned_cell_assignment = None;
+
+                    for expression in &sequence.expressions {
+                        let Some(assignment) = assignment_expression(expression) else {
+                            continue;
+                        };
+                        if let Some(target) = assignment_symbol(self.scoping, &assignment.left) {
+                            if let Expression::CallExpression(call) =
+                                last_sequence_expression(&assignment.right)
+                            {
+                                if !call.optional && call.arguments.len() == 1 {
+                                    let Some(argument) = call.arguments[0].as_expression() else {
+                                        continue;
+                                    };
+                                    let Some((state_parameter_index, prototype_field)) =
+                                        parameter_member(self.scoping, argument, self.parameters)
+                                    else {
+                                        continue;
+                                    };
+                                    let Expression::ComputedMemberExpression(callee) =
+                                        last_sequence_expression(&call.callee)
+                                    else {
+                                        continue;
+                                    };
+                                    if callee.optional {
+                                        continue;
+                                    }
+                                    let Some(object_constructor_symbol) =
+                                        reference_symbol(self.scoping, &callee.object)
+                                    else {
+                                        continue;
+                                    };
+                                    let Some((method_state_index, method_key_field)) =
+                                        parameter_member(
+                                            self.scoping,
+                                            &callee.expression,
+                                            self.parameters,
+                                        )
+                                    else {
+                                        continue;
+                                    };
+                                    if method_state_index != state_parameter_index {
+                                        continue;
+                                    }
+                                    cell = Some((
+                                        target,
+                                        state_parameter_index,
+                                        prototype_field,
+                                        method_key_field,
+                                        assignment.span,
+                                        object_constructor_symbol,
+                                    ));
+                                    continue;
+                                }
+                            }
+                            if target == self.returned_symbol {
+                                if let Some((cell_symbol, ..)) = cell.as_ref() {
+                                    if reference_symbol(self.scoping, &assignment.right)
+                                        == Some(*cell_symbol)
+                                    {
+                                        returned_cell_assignment = Some(assignment.span);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        let Some((cell_symbol, state_parameter_index, _, method_key_field, _, _)) =
+                            cell.as_ref()
+                        else {
+                            continue;
+                        };
+                        match &assignment.left {
+                            AssignmentTarget::ComputedMemberExpression(member)
+                                if !member.optional
+                                    && reference_symbol(self.scoping, &member.object)
+                                        == Some(*cell_symbol) =>
+                            {
+                                let Some((key_state_index, key_field)) = parameter_member(
+                                    self.scoping,
+                                    &member.expression,
+                                    self.parameters,
+                                ) else {
+                                    continue;
+                                };
+                                if key_state_index != *state_parameter_index
+                                    || key_field != *method_key_field
+                                {
+                                    continue;
+                                }
+                                let Expression::FunctionExpression(function) =
+                                    last_sequence_expression(&assignment.right)
+                                else {
+                                    continue;
+                                };
+                                let mut value_matches = Vec::new();
+                                for (index, parameter) in self.parameters.iter().enumerate() {
+                                    if let Some(entry_condition) =
+                                        fast_getter_return(self.scoping, function, *parameter)
+                                    {
+                                        value_matches.push((index, entry_condition));
+                                    }
+                                }
+                                let [(value_parameter_index, entry_condition)] =
+                                    value_matches.as_slice()
+                                else {
+                                    continue;
+                                };
+                                getter = Some((
+                                    *value_parameter_index,
+                                    assignment.span,
+                                    function.span,
+                                    *entry_condition,
+                                ));
+                            }
+                            AssignmentTarget::StaticMemberExpression(member)
+                                if !member.optional
+                                    && reference_symbol(self.scoping, &member.object)
+                                        == Some(*cell_symbol) =>
+                            {
+                                let Expression::FunctionExpression(function) =
+                                    last_sequence_expression(&assignment.right)
+                                else {
+                                    continue;
+                                };
+                                let mut value_matches = Vec::new();
+                                for (index, parameter) in self.parameters.iter().enumerate() {
+                                    if fast_updater_replaces_capture(
+                                        self.scoping,
+                                        function,
+                                        *parameter,
+                                    ) {
+                                        value_matches.push(index);
+                                    }
+                                }
+                                let [value_parameter_index] = value_matches.as_slice() else {
+                                    continue;
+                                };
+                                updater = Some((
+                                    *value_parameter_index,
+                                    member.property.name.to_string(),
+                                    assignment.span,
+                                    function.span,
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if let (
+                        Some((
+                            cell_symbol,
+                            state_parameter_index,
+                            prototype_field,
+                            method_key_field,
+                            cell_construction,
+                            object_constructor_symbol,
+                        )),
+                        Some((
+                            getter_value,
+                            getter_assignment,
+                            getter_function,
+                            getter_entry_condition,
+                        )),
+                        Some((
+                            updater_value,
+                            updater_property,
+                            updater_assignment,
+                            updater_function,
+                        )),
+                        Some(returned_cell_assignment),
+                    ) = (cell, getter, updater, returned_cell_assignment)
+                    {
+                        if getter_value == updater_value
+                            && getter_value != mode_parameter_index
+                            && state_parameter_index != mode_parameter_index
+                            && state_parameter_index != getter_value
+                        {
+                            self.candidates.push(Candidate {
+                                guard: logical.left.span(),
+                                mode_parameter_index,
+                                value_parameter_index: getter_value,
+                                state_parameter_index,
+                                prototype_field,
+                                method_key_field,
+                                updater_property,
+                                cell_construction,
+                                getter_function,
+                                getter_entry_condition,
+                                updater_function,
+                                returned_cell_assignment,
+                                object_constructor_symbol,
+                                cell_symbol,
+                                getter_assignment,
+                                updater_assignment,
+                            });
+                        }
+                    }
+                }
+            }
+            walk::walk_logical_expression(self, logical);
+        }
+        fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+        }
+    }
+
+    let mut collector = Collector {
+        scoping,
+        parameters: &parameters,
+        returned_symbol,
+        candidates: Vec::new(),
+    };
+    collector.visit_function_body(body);
+    let [candidate] = collector.candidates.as_slice() else {
+        return None;
+    };
+
+    for (span, is_write) in symbol_references_in_function(function, scoping, returned_symbol) {
+        if is_write
+            && span.start > candidate.returned_cell_assignment.end
+            && span.end <= function.span.end
+        {
+            return None;
+        }
+    }
+
+    // The same local may have held an unrelated value before the fast-cell
+    // assignment. Only uses after construction can observe the newly created
+    // cell. Keep every such non-structural use as a barrier; an exact call may
+    // discharge it only by proving the enclosing branch unreachable.
+    let allowed_cell_uses = [
+        candidate.cell_construction,
+        candidate.getter_assignment,
+        candidate.updater_assignment,
+        candidate.returned_cell_assignment,
+    ];
+    let post_construction_cell_reference_barriers =
+        symbol_references_in_function(function, scoping, candidate.cell_symbol)
+            .into_iter()
+            .map(|(span, _)| span)
+            .filter(|span| span.start >= candidate.cell_construction.start)
+            .filter(|span| {
+                !allowed_cell_uses
+                    .iter()
+                    .any(|allowed| allowed.start <= span.start && span.end <= allowed.end)
+            })
+            .collect::<Vec<_>>();
+
+    Some(FastLazyCellFactoryShape {
+        function_start: function.span.start,
+        function_end: function.span.end,
+        guard_start: candidate.guard.start,
+        guard_end: candidate.guard.end,
+        mode_parameter_index: candidate.mode_parameter_index,
+        value_parameter_index: candidate.value_parameter_index,
+        state_parameter_index: candidate.state_parameter_index,
+        prototype_field: candidate.prototype_field.clone(),
+        method_key_field: candidate.method_key_field.clone(),
+        updater_property: candidate.updater_property.clone(),
+        cell_construction_start: candidate.cell_construction.start,
+        cell_construction_end: candidate.cell_construction.end,
+        getter_function_start: candidate.getter_function.start,
+        getter_function_end: candidate.getter_function.end,
+        getter_entry_condition: candidate.getter_entry_condition,
+        updater_function_start: candidate.updater_function.start,
+        updater_function_end: candidate.updater_function.end,
+        returned_cell_assignment_start: candidate.returned_cell_assignment.start,
+        returned_cell_assignment_end: candidate.returned_cell_assignment.end,
+        object_constructor_symbol: candidate.object_constructor_symbol,
+        post_construction_cell_reference_barriers,
+        standard_object_create_semantics_required: true,
+    })
+}
+
+#[must_use]
+pub fn structurally_proven_fast_lazy_cell_factory_shapes(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<FastLazyCellFactoryShape> {
+    struct Collector<'c> {
+        scoping: &'c Scoping,
+        shapes: Vec<FastLazyCellFactoryShape>,
+    }
+    impl<'a> Visit<'a> for Collector<'_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if let Some(shape) = fast_shape_for_function(function, self.scoping) {
+                self.shapes.push(shape);
+            }
+            walk::walk_function(self, function, flags);
+        }
+    }
+    let mut collector = Collector {
+        scoping,
+        shapes: Vec::new(),
+    };
+    collector.visit_program(program);
+    collector
+        .shapes
+        .sort_by_key(|shape| (shape.function_start, shape.function_end));
+    collector.shapes.dedup();
+    collector.shapes
+}
+
+#[must_use]
+pub fn proven_fast_lazy_cell_factory_call(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    call: &ProvenOriginDirectCall,
+) -> Option<ProvenFastLazyCellFactoryCall> {
+    let shape = structurally_proven_fast_lazy_cell_factory_shapes(program, semantic.scoping())
+        .into_iter()
+        .find(|shape| {
+            (shape.function_start, shape.function_end)
+                == (call.callee.function_start, call.callee.function_end)
+        })?;
+    if !call
+        .callee
+        .parameter_indices
+        .contains(&shape.state_parameter_index)
+    {
+        return None;
+    }
+    let exact_mode_value = call
+        .exact_integer_arguments
+        .get(shape.mode_parameter_index)
+        .copied()
+        .flatten()?;
+    let mode_bindings = BTreeMap::from([(shape.mode_parameter_index, exact_mode_value)]);
+    if crate::state_flatten::proven_function_boolean_expression_with_integer_parameters(
+        program,
+        semantic.scoping(),
+        shape.function_start,
+        shape.function_end,
+        Span::new(shape.guard_start, shape.guard_end),
+        &mode_bindings,
+    ) != Some(true)
+    {
+        return None;
+    }
+    if let Some(condition) = shape.getter_entry_condition {
+        if crate::state_flatten::proven_function_boolean_expression_with_integer_parameters(
+            program,
+            semantic.scoping(),
+            shape.getter_function_start,
+            shape.getter_function_end,
+            condition,
+            &BTreeMap::new(),
+        ) != Some(true)
+        {
+            return None;
+        }
+    }
+    for barrier in &shape.post_construction_cell_reference_barriers {
+        if !prove_function_structured_branch_event_unreachable_with_integer_parameters(
+            program,
+            semantic.scoping(),
+            shape.function_start,
+            shape.function_end,
+            *barrier,
+            &mode_bindings,
+        ) && !prove_function_switch_event_unreachable_with_integer_parameters(
+            program,
+            semantic.scoping(),
+            shape.function_start,
+            shape.function_end,
+            *barrier,
+            &mode_bindings,
+        ) && !prove_function_if_ladder_event_unreachable_with_integer_parameters(
+            source,
+            program,
+            semantic.scoping(),
+            shape.function_start,
+            shape.function_end,
+            *barrier,
+            &mode_bindings,
+        ) {
+            return None;
+        }
+    }
+    Some(ProvenFastLazyCellFactoryCall {
+        shape,
+        call: call.clone(),
+        exact_mode_value,
+    })
 }
 
 fn shape_for_function(
@@ -3736,7 +4361,7 @@ pub fn structurally_proven_slow_lazy_cell_factory_shapes(
 #[cfg(test)]
 mod tests {
     use super::{
-        proven_slow_lazy_cell_captured_handler_from_value,
+        proven_fast_lazy_cell_factory_call, proven_slow_lazy_cell_captured_handler_from_value,
         proven_slow_lazy_cell_captured_handler_install,
         proven_slow_lazy_cell_captured_value_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
@@ -4020,6 +4645,143 @@ mod tests {
         )
         .expect("captured non-function value");
         assert_eq!(captured.exact_assignment.exact_key_value, 7);
+    }
+
+    #[test]
+    fn proves_exact_mode_fast_lazy_cell_factory_call() {
+        let source = r#"
+            const Maker = Object;
+            const C = function() {
+                make("payload", 11, this);
+                make("other", 24, this);
+            };
+            C.prototype.method = "create";
+            function make(value, mode, state) {
+                let cell, out;
+                ((mode | 2) >= 8 && mode - 5 < 10) && (
+                    cell = Maker[state.method](state.base),
+                    cell[state.method] = function() {
+                        while (![] == 0) {
+                            return value;
+                            if (!!null == 0) break;
+                        }
+                    },
+                    cell.concat = function(next) { value = next; },
+                    out = cell
+                );
+                while ((mode ^ 48) < 10 && mode << 2 >= 2) {
+                    observe(cell);
+                }
+                return out;
+            }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let calls = flow
+            .direct_calls
+            .iter()
+            .filter(|call| {
+                source[call.call_start as usize..call.call_end as usize].starts_with("make(")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let proven = calls
+            .iter()
+            .filter_map(|call| {
+                proven_fast_lazy_cell_factory_call(
+                    source,
+                    &parsed.program,
+                    &semantic.semantic,
+                    call,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(proven.len(), 1);
+        assert_eq!(proven[0].exact_mode_value, 11);
+        assert_eq!(proven[0].shape.value_parameter_index, 0);
+        assert_eq!(proven[0].shape.mode_parameter_index, 1);
+        assert_eq!(proven[0].shape.state_parameter_index, 2);
+        assert_eq!(proven[0].shape.method_key_field, "method");
+        assert_eq!(proven[0].shape.prototype_field, "base");
+        assert_eq!(proven[0].shape.updater_property, "concat");
+        assert!(proven[0].shape.standard_object_create_semantics_required);
+    }
+
+    #[test]
+    fn rejects_fast_lazy_cell_updater_that_transforms_capture() {
+        let source = r#"
+            const Maker = Object;
+            function make(value, mode, state) {
+                let cell, out;
+                ((mode | 2) >= 8 && mode - 5 < 10) && (
+                    cell = Maker[state.method](state.base),
+                    cell[state.method] = function() { return value; },
+                    cell.concat = function(next) { value = next + 1; },
+                    out = cell
+                );
+                return out;
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_fast_lazy_cell_factory_shapes(
+            &parsed.program,
+            semantic.semantic.scoping(),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn rejects_fast_lazy_cell_cell_escape_before_return() {
+        let source = r#"
+            const Maker = Object;
+            const C = function() { make("payload", 11, this); };
+            function make(value, mode, state) {
+                let cell, out;
+                ((mode | 2) >= 8 && mode - 5 < 10) && (
+                    cell = Maker[state.method](state.base),
+                    cell[state.method] = function() { return value; },
+                    cell.concat = function(next) { value = next; },
+                    observe(cell),
+                    out = cell
+                );
+                return out;
+            }
+            new C();
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let call = flow
+            .direct_calls
+            .iter()
+            .find(|call| {
+                source[call.call_start as usize..call.call_end as usize].starts_with("make(")
+            })
+            .expect("make call");
+        assert!(proven_fast_lazy_cell_factory_call(
+            source,
+            &parsed.program,
+            &semantic.semantic,
+            call
+        )
+        .is_none());
     }
 
     #[test]

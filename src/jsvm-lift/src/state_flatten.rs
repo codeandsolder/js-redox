@@ -1547,9 +1547,101 @@ pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
     harness.result.unwrap_or(false)
 }
 
+/// Evaluate one side-effect-free boolean expression in an exact function under
+/// proven integer formal-parameter bindings.
+///
+/// The expression is selected by exact source span and must belong to the
+/// requested function body. Parameter facts use the same fail-closed scalar
+/// environment as the structured-branch proofs: mutable parameters are
+/// omitted, while dynamic scope or `arguments` makes the result unknown.
+#[must_use]
+pub fn proven_function_boolean_expression_with_integer_parameters(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    function_start: u32,
+    function_end: u32,
+    expression: Span,
+    parameter_bindings: &BTreeMap<usize, i64>,
+) -> Option<bool> {
+    struct FunctionHarness<'b> {
+        scoping: &'b Scoping,
+        function_start: u32,
+        function_end: u32,
+        expression: Span,
+        parameter_bindings: &'b BTreeMap<usize, i64>,
+        result: Option<Option<bool>>,
+    }
+
+    impl<'a> Visit<'a> for FunctionHarness<'_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if self.result.is_some() {
+                return;
+            }
+            if function.span.start != self.function_start || function.span.end != self.function_end
+            {
+                walk::walk_function(self, function, flags);
+                return;
+            }
+            let Some(env) =
+                exact_integer_parameter_env(function, self.scoping, self.parameter_bindings)
+            else {
+                self.result = Some(None);
+                return;
+            };
+            let Some(body) = function.body.as_deref() else {
+                self.result = Some(None);
+                return;
+            };
+
+            struct ExpressionProbe<'e> {
+                env: &'e HashMap<String, Scalar>,
+                target: Span,
+                result: Option<Option<bool>>,
+            }
+            impl<'a> Visit<'a> for ExpressionProbe<'_> {
+                fn visit_expression(&mut self, expression: &Expression<'a>) {
+                    if self.result.is_some() {
+                        return;
+                    }
+                    if expression.span() == self.target {
+                        self.result = Some(branch_truthiness(expression, self.env));
+                        return;
+                    }
+                    walk::walk_expression(self, expression);
+                }
+                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+                fn visit_arrow_function_expression(
+                    &mut self,
+                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+                ) {
+                }
+            }
+
+            let mut probe = ExpressionProbe {
+                env: &env,
+                target: self.expression,
+                result: None,
+            };
+            probe.visit_function_body(body);
+            self.result = Some(probe.result.flatten());
+        }
+    }
+
+    let mut harness = FunctionHarness {
+        scoping,
+        function_start,
+        function_end,
+        expression,
+        parameter_bindings,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.flatten()
+}
+
 /// Prove that an event is excluded by an enclosing exact structured branch
-/// (`if`, conditional expression, or the RHS of `&&`/`||`) for exact integer
-/// formal-parameter values.
+/// (`if`, conditional expression, the RHS of `&&`/`||`, or a `while` body
+/// whose entry test is false) for exact integer formal-parameter values.
 ///
 /// Only the scalar evaluator's side-effect-free subset participates. Unknown
 /// tests, targets not contained by a recognized branch, and dynamic scalar
@@ -1665,6 +1757,19 @@ pub fn prove_function_structured_branch_event_unreachable_with_integer_parameter
                         }
                     }
                     walk::walk_logical_expression(self, expression);
+                }
+
+                fn visit_while_statement(&mut self, statement: &oxc_ast::ast::WhileStatement<'a>) {
+                    if self.excluded {
+                        return;
+                    }
+                    if Self::contains(statement.body.span(), self.event)
+                        && branch_truthiness(&statement.test, self.env) == Some(false)
+                    {
+                        self.excluded = true;
+                        return;
+                    }
+                    walk::walk_while_statement(self, statement);
                 }
 
                 fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
@@ -4028,6 +4133,12 @@ fn branch_scalar_on_normal_completion(
         Expression::ParenthesizedExpression(parenthesized) => {
             branch_scalar_on_normal_completion(&parenthesized.expression, env)
         }
+        // Logical negation always produces a boolean scalar. The operand may
+        // have a known truthiness even when it has no scalar representation
+        // of its own (for example, an empty array literal).
+        Expression::UnaryExpression(unary) if unary.operator.as_str() == "!" => {
+            branch_truthiness(&unary.argument, env).map(|truthy| Scalar::Int(i64::from(!truthy)))
+        }
         Expression::SequenceExpression(sequence) => sequence
             .expressions
             .last()
@@ -6154,6 +6265,52 @@ mod tests {
                 &BTreeMap::from([(0, 48), (1, 0)]),
             )
         );
+    }
+
+    #[test]
+    fn proves_false_while_body_unreachable_with_integer_parameters() {
+        let source = r#"
+            function f(mode, cell) {
+                while ((mode ^ 48) < 10 && mode << 2 >= 2) {
+                    observe(cell);
+                }
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+        struct FunctionSpan(Option<Span>);
+        impl<'a> Visit<'a> for FunctionSpan {
+            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+                self.0 = Some(function.span);
+            }
+        }
+        let mut function = FunctionSpan(None);
+        function.visit_program(&parsed.program);
+        let function = function.0.unwrap();
+        let event_start =
+            u32::try_from(source.find("observe(cell)").unwrap() + "observe(".len()).unwrap();
+        assert!(
+            prove_function_structured_branch_event_unreachable_with_integer_parameters(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                Span::new(event_start, event_start + 4),
+                &BTreeMap::from([(0, 11)]),
+            )
+        );
+    }
+
+    #[test]
+    fn branch_truthiness_materializes_logical_not_of_truthy_literal() {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, "![] == 0;", SourceType::cjs());
+        let expression = match &parsed.program.body[0] {
+            Statement::ExpressionStatement(statement) => &statement.expression,
+            _ => unreachable!(),
+        };
+        assert_eq!(branch_truthiness(expression, &HashMap::new()), Some(true));
     }
 
     #[test]

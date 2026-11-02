@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use jsvm_lift::forwarding_semantics::structurally_proven_lazy_registry_read_calls;
+use jsvm_lift::forwarding_semantics::{
+    structurally_proven_lazy_registry_read_calls,
+    structurally_proven_registry_forwarding_value_calls,
+};
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
@@ -31,7 +34,7 @@ fn main() -> Result<()> {
         .build(&parsed.program);
     anyhow::ensure!(semantic.diagnostics.is_empty(), "semantic diagnostics");
 
-    let proven = structurally_proven_lazy_registry_read_calls(
+    let reads = structurally_proven_lazy_registry_read_calls(
         &parsed.program,
         semantic.semantic.scoping(),
     )
@@ -51,6 +54,30 @@ fn main() -> Result<()> {
         })
     })
     .collect::<Vec<_>>();
-    println!("{}", serde_json::to_string_pretty(&proven)?);
+    let forwarding_values = structurally_proven_registry_forwarding_value_calls(
+        &parsed.program,
+        semantic.semantic.scoping(),
+    )
+    .into_iter()
+    .map(|proof| {
+        json!({
+            "call": [proof.call_start, proof.call_end],
+            "call_source": snippet(&source, proof.call_start, proof.call_end),
+            "registry_path": proof.registry_path,
+            "registry_key_confined": proof.registry_key_confined,
+            "receiver": [proof.receiver_start, proof.receiver_end],
+            "key": [proof.key_start, proof.key_end],
+            "value": [proof.value_start, proof.value_end],
+            "value_source": snippet(&source, proof.value_start, proof.value_end),
+        })
+    })
+    .collect::<Vec<_>>();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "reads": reads,
+            "forwarding_values": forwarding_values,
+        }))?
+    );
     Ok(())
 }
