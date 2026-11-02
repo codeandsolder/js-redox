@@ -11,7 +11,7 @@
   "keywords": [],
   "type": "module",
   "dependencies": {
-    "@duckduckgo/autoconsent": "^16.47.0",
+    "@duckduckgo/autoconsent": "^17.0.0",
     "cloakbrowser": "^0.6.0",
     "esbuild": "^0.28.2",
     "playwright-core": "^1.63.0"
