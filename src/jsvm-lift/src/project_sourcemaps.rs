@@ -380,7 +380,7 @@ fn last_source_map_directive(source: &str) -> Option<String> {
         .into_iter()
         .filter(|directive| directive.kind == "source_map")
         .map(|directive| directive.raw)
-        .last()
+        .next_back()
 }
 
 fn manifest_source_map_reference(resource: &Value) -> Option<String> {
@@ -391,7 +391,7 @@ fn manifest_source_map_reference(resource: &Value) -> Option<String> {
         .filter(|reference| reference.get("kind").and_then(Value::as_str) == Some("source_map"))
         .filter_map(|reference| reference.get("raw").and_then(Value::as_str))
         .map(ToOwned::to_owned)
-        .last()
+        .next_back()
 }
 
 fn source_code(

@@ -27,6 +27,29 @@ pub struct WasmJsBoundarySummary {
     pub proven_destination_load_interpretations: usize,
 }
 
+type RuntimeBindingMap = BTreeMap<i64, Value>;
+type RuntimeDependencyGraph = BTreeMap<i64, Vec<i64>>;
+type SemanticRuntimeGraph = (RuntimeBindingMap, RuntimeDependencyGraph, Vec<Value>);
+
+struct ModuleMemoryMatchContext<'a> {
+    document: &'a Value,
+    module_sha256: Option<&'a str>,
+    export_name: Option<&'a str>,
+    binding_proofs: &'a [Value],
+    report: &'a Value,
+}
+
+struct CopiedInputProofContext<'a> {
+    project: &'a Path,
+    module: &'a Value,
+    report: &'a Value,
+    function_imports: &'a [Value],
+    document: &'a Value,
+    module_memory_proofs: &'a [Value],
+    binding_proofs: &'a [Value],
+    export_name: Option<&'a str>,
+}
+
 fn read_json(path: &Path) -> Result<Value> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
@@ -424,9 +447,7 @@ fn semantic_ir_ssa_shape(expression: &Value) -> Option<(BTreeSet<i64>, BTreeSet<
     Some((definitions, references))
 }
 
-fn semantic_runtime_graph(
-    analysis: &Value,
-) -> Option<(BTreeMap<i64, Value>, BTreeMap<i64, Vec<i64>>, Vec<Value>)> {
+fn semantic_runtime_graph(analysis: &Value) -> Option<SemanticRuntimeGraph> {
     let bindings = analysis.get("runtime_bindings")?.as_array()?;
     let returns = analysis.get("returns")?.as_array()?;
     let mut runtime_by_value = BTreeMap::new();
@@ -825,18 +846,17 @@ fn source_word_semantic_overlay(
 }
 
 fn matching_module_memory_proofs(
-    document: &Value,
+    context: &ModuleMemoryMatchContext<'_>,
     import_module: Option<&str>,
     import_name: Option<&str>,
-    module_sha256: Option<&str>,
-    export_name: Option<&str>,
-    binding_proofs: &[Value],
-    report: &Value,
     candidate: &Value,
 ) -> Vec<Value> {
-    let (Some(import_module), Some(import_name), Some(module_sha256), Some(export_name)) =
-        (import_module, import_name, module_sha256, export_name)
-    else {
+    let (Some(import_module), Some(import_name), Some(module_sha256), Some(export_name)) = (
+        import_module,
+        import_name,
+        context.module_sha256,
+        context.export_name,
+    ) else {
         return Vec::new();
     };
     let load_memories = array_field(candidate, "destination_loads")
@@ -849,7 +869,8 @@ fn matching_module_memory_proofs(
     let Some(load_memory) = load_memories.iter().next().copied() else {
         return Vec::new();
     };
-    let binding_sites = binding_proofs
+    let binding_sites = context
+        .binding_proofs
         .iter()
         .flat_map(|proof| {
             array_field(proof, "instantiation_sites")
@@ -865,7 +886,7 @@ fn matching_module_memory_proofs(
         })
         .collect::<HashSet<_>>();
     let mut matches = Vec::new();
-    for proof in array_field(document, "module_memory_identity_proofs") {
+    for proof in array_field(context.document, "module_memory_identity_proofs") {
         if string_field(proof, "import_module") != Some(import_module)
             || string_field(proof, "import_name") != Some(import_name)
         {
@@ -891,7 +912,7 @@ fn matching_module_memory_proofs(
         let Some(memory_export_name) = string_field(proof, "memory_export_name") else {
             continue;
         };
-        let memory_exports = array_field(report, "exports")
+        let memory_exports = array_field(context.report, "exports")
             .iter()
             .filter(|exported| {
                 string_field(exported, "kind") == Some("memory")
@@ -924,20 +945,13 @@ fn verified_module_bytes(project: &Path, module: &Value) -> Option<(PathBuf, Str
 }
 
 fn fresh_destination_alignment_proof(
-    project: &Path,
-    module: &Value,
-    report: &Value,
-    function_imports: &[Value],
-    document: &Value,
+    context: &CopiedInputProofContext<'_>,
     candidate: &Value,
-    module_memory_proofs: &[Value],
-    binding_proofs: &[Value],
-    export_name: Option<&str>,
 ) -> Option<Value> {
     let recipe = candidate
         .get("fresh_destination_base_recipe")?
         .as_object()?;
-    let export_name = export_name?;
+    let export_name = context.export_name?;
     let function = recipe
         .get("function")?
         .as_u64()
@@ -962,10 +976,10 @@ fn fresh_destination_alignment_proof(
     }) {
         return None;
     }
-    let _length_import = function_imports.get(length_import_index)?;
+    let _length_import = context.function_imports.get(length_import_index)?;
     let source_parameter = usize_field(candidate, "source_entry_parameter");
     let exact_source_length = fixed_uint32_source_length_exact(
-        module_memory_proofs,
+        context.module_memory_proofs,
         Some(export_name),
         source_parameter,
     )?;
@@ -975,7 +989,7 @@ fn fresh_destination_alignment_proof(
     }
 
     let mut exports_bindings = BTreeSet::new();
-    for proof in module_memory_proofs {
+    for proof in context.module_memory_proofs {
         if string_field(proof, "initializer_only_wasm_export_call") != Some("__wbindgen_start")
             || bool_field(proof, "initializer_non_start_effects_memory_disjoint") != Some(true)
         {
@@ -998,7 +1012,7 @@ fn fresh_destination_alignment_proof(
     }
     let exports_binding = exports_bindings.iter().next()?;
 
-    let start_exports = array_field(report, "exports")
+    let start_exports = array_field(context.report, "exports")
         .iter()
         .filter(|exported| {
             string_field(exported, "name") == Some("__wbindgen_start")
@@ -1011,11 +1025,11 @@ fn fresh_destination_alignment_proof(
         return None;
     };
     let start_function = usize_field(start_export, "index")?;
-    let start_import = function_imports.get(start_function)?;
+    let start_import = context.function_imports.get(start_function)?;
     let start_module = string_field(start_import, "module")?;
     let start_name = string_field(start_import, "name")?;
 
-    let table_exports = array_field(report, "exports")
+    let table_exports = array_field(context.report, "exports")
         .iter()
         .filter(|exported| {
             string_field(exported, "kind") == Some("table")
@@ -1027,7 +1041,7 @@ fn fresh_destination_alignment_proof(
         return None;
     };
 
-    let normalized_handlers = array_field(document, "proof_normalized_handler_semantics")
+    let normalized_handlers = array_field(context.document, "proof_normalized_handler_semantics")
         .iter()
         .filter(|handler| {
             string_field(handler, "import_module") == Some(start_module)
@@ -1045,7 +1059,7 @@ fn fresh_destination_alignment_proof(
         return None;
     };
 
-    let start_usages = array_field(document, "import_object_usages")
+    let start_usages = array_field(context.document, "import_object_usages")
         .iter()
         .filter(|usage| {
             string_field(usage, "import_module") == Some(start_module)
@@ -1054,21 +1068,22 @@ fn fresh_destination_alignment_proof(
         .cloned()
         .collect::<Vec<_>>();
     let exact_start_usages =
-        exact_module_usage_proofs(&start_usages, string_field(module, "sha256"))
+        exact_module_usage_proofs(&start_usages, string_field(context.module, "sha256"))
             .into_iter()
-            .filter(|usage| exact_usage_matches_binding(usage, binding_proofs))
+            .filter(|usage| exact_usage_matches_binding(usage, context.binding_proofs))
             .collect::<Vec<_>>();
     let [start_usage] = exact_start_usages.as_slice() else {
         return None;
     };
 
-    let length_import = function_imports.get(length_import_index)?;
+    let length_import = context.function_imports.get(length_import_index)?;
     if string_field(length_import, "module").is_none()
         || string_field(length_import, "name").is_none()
     {
         return None;
     }
-    let (binary_path, module_sha256, bytes) = verified_module_bytes(project, module)?;
+    let (binary_path, module_sha256, bytes) =
+        verified_module_bytes(context.project, context.module)?;
     let byte_count = exact_source_length_u32.checked_shl(u32::try_from(length_shift).ok()?)?;
     let evaluation = evaluate_fresh_i32_call(&bytes, function, &[byte_count], None);
     let result = evaluation.proven_result()?;
@@ -1125,13 +1140,8 @@ fn access_is_disjoint_from_range(
 }
 
 fn fresh_cleanup_disjointness_proof(
-    project: &Path,
-    module: &Value,
-    function_imports: &[Value],
-    document: &Value,
+    context: &CopiedInputProofContext<'_>,
     candidate: &Value,
-    module_memory_proofs: &[Value],
-    binding_proofs: &[Value],
     fresh_alignment_proof: Option<&Value>,
 ) -> Option<Value> {
     let recipe = candidate
@@ -1165,7 +1175,7 @@ fn fresh_cleanup_disjointness_proof(
             .collect::<BTreeSet<_>>()
             .len()
             != 2
-        || module_memory_proofs.is_empty()
+        || context.module_memory_proofs.is_empty()
     {
         return None;
     }
@@ -1177,10 +1187,11 @@ fn fresh_cleanup_disjointness_proof(
     let [buffer_index] = buffer_indices.as_slice() else {
         return None;
     };
-    let buffer_import = function_imports.get(*buffer_index)?;
+    let buffer_import = context.function_imports.get(*buffer_index)?;
     let buffer_module = string_field(buffer_import, "module")?;
     let buffer_name = string_field(buffer_import, "name")?;
-    let binding_import_objects = binding_proofs
+    let binding_import_objects = context
+        .binding_proofs
         .iter()
         .filter_map(|proof| string_field(proof, "import_object"))
         .collect::<BTreeSet<_>>();
@@ -1188,14 +1199,19 @@ fn fresh_cleanup_disjointness_proof(
         return None;
     }
     let binding_import_object = *binding_import_objects.iter().next()?;
-    let buffer_handlers = matching_handler(document, buffer_module, buffer_name, "property_getter")
-        .into_iter()
-        .filter(|handler| {
-            string_field(handler, "property") == Some("buffer")
-                && bool_field(handler, "standard_builtin_semantics_required") == Some(true)
-                && string_field(handler, "import_object") == Some(binding_import_object)
-        })
-        .collect::<Vec<_>>();
+    let buffer_handlers = matching_handler(
+        context.document,
+        buffer_module,
+        buffer_name,
+        "property_getter",
+    )
+    .into_iter()
+    .filter(|handler| {
+        string_field(handler, "property") == Some("buffer")
+            && bool_field(handler, "standard_builtin_semantics_required") == Some(true)
+            && string_field(handler, "import_object") == Some(binding_import_object)
+    })
+    .collect::<Vec<_>>();
     let [buffer_handler] = buffer_handlers.as_slice() else {
         return None;
     };
@@ -1255,7 +1271,7 @@ fn fresh_cleanup_disjointness_proof(
             delta: *delta,
         })
         .collect::<Vec<_>>();
-    let (_, module_sha256, bytes) = verified_module_bytes(project, module)?;
+    let (_, module_sha256, bytes) = verified_module_bytes(context.project, context.module)?;
     let evaluation = evaluate_fresh_i32_sequence(&bytes, &table_grows, &calls, None);
     if evaluation.outcome != FreshEvalOutcome::Returned || evaluation.steps.len() != calls.len() {
         return None;
@@ -1310,7 +1326,7 @@ fn fresh_cleanup_disjointness_proof(
         "recipe": candidate.get("fresh_cleanup_disjointness_recipe").cloned().unwrap_or(Value::Null),
         "bypassed_setup_import_proofs": {
             "memory_import_function": memory_import_index,
-            "module_memory_identity_proofs": module_memory_proofs,
+            "module_memory_identity_proofs": context.module_memory_proofs,
             "buffer_import_function": buffer_index,
             "buffer_handler": buffer_handler,
             "exact_import_object": binding_import_object,
@@ -1613,14 +1629,17 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
                             &constructor_usages,
                             string_field(module, "sha256"),
                         );
-                        let memory_proofs = matching_module_memory_proofs(
+                        let memory_match_context = ModuleMemoryMatchContext {
                             document,
+                            module_sha256: string_field(module, "sha256"),
+                            export_name,
+                            binding_proofs: &binding_proofs,
+                            report: &report,
+                        };
+                        let memory_proofs = matching_module_memory_proofs(
+                            &memory_match_context,
                             memory_module,
                             memory_name,
-                            string_field(module, "sha256"),
-                            export_name,
-                            &binding_proofs,
-                            &report,
                             candidate,
                         );
                         let length_barrier_proofs = source_length_barrier_proofs(
@@ -1746,17 +1765,18 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
                     if let Some(source_path) = module_memory_sources.iter().next() {
                         fresh_document = full_cache.get(*source_path);
                         if let Some(document) = fresh_document {
-                            fresh_alignment_proof = fresh_destination_alignment_proof(
+                            let context = CopiedInputProofContext {
                                 project,
                                 module,
-                                &report,
-                                &function_imports,
+                                report: &report,
+                                function_imports: &function_imports,
                                 document,
-                                candidate,
-                                &module_memory_proofs,
-                                &copied_binding_proofs,
+                                module_memory_proofs: &module_memory_proofs,
+                                binding_proofs: &copied_binding_proofs,
                                 export_name,
-                            );
+                            };
+                            fresh_alignment_proof =
+                                fresh_destination_alignment_proof(&context, candidate);
                         }
                     }
                 }
@@ -1766,16 +1786,19 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
                     && !required_internal_barriers.is_empty()
                 {
                     match (fresh_document, fresh_alignment_proof.as_ref()) {
-                        (Some(document), Some(alignment)) => fresh_cleanup_disjointness_proof(
-                            project,
-                            module,
-                            &function_imports,
-                            document,
-                            candidate,
-                            &module_memory_proofs,
-                            &copied_binding_proofs,
-                            Some(alignment),
-                        ),
+                        (Some(document), Some(alignment)) => {
+                            let context = CopiedInputProofContext {
+                                project,
+                                module,
+                                report: &report,
+                                function_imports: &function_imports,
+                                document,
+                                module_memory_proofs: &module_memory_proofs,
+                                binding_proofs: &copied_binding_proofs,
+                                export_name,
+                            };
+                            fresh_cleanup_disjointness_proof(&context, candidate, Some(alignment))
+                        }
                         _ => None,
                     }
                 } else {
