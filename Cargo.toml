@@ -54,7 +54,7 @@ sha2 = "0.11"
 string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "458c995", default-features = false }
 rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "458c995", default-features = false }
 url = "2"
-wasmparser = "0.262.0"
-wasmprinter = "0.262.0"
+wasmparser = "0.263.0"
+wasmprinter = "0.263.0"
 waffle = { git = "https://github.com/codeandsolder/waffle.git", rev = "528b09ab97a67cda251fea2772040d29f7148851" }
 work-budget = { path = "src/work-budget" }
