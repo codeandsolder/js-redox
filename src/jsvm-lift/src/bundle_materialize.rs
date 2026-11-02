@@ -681,6 +681,94 @@ mod tests {
                 .get("source_path")
                 .and_then(Value::as_str)
                 .is_some_and(|path| project.join(path).is_file())));
+
+            let module = |id: &str| {
+                module_rows
+                    .iter()
+                    .find(|row| row.get("module_id").and_then(Value::as_str) == Some(id))
+            };
+            let module_20001 = module("20001").context("webpack module 20001 missing")?;
+            assert_eq!(
+                module_20001.get("dependencies"),
+                Some(&json!(["20002", "40000"]))
+            );
+            assert_eq!(
+                module_20001.get("export_names"),
+                Some(&json!(["name", "named"]))
+            );
+            assert!(module_rows.iter().all(|row| {
+                row.get("module_id").and_then(Value::as_str) != Some("29999")
+                    && row.get("module_id").and_then(Value::as_str) != Some("29996")
+            }));
+
+            let browserify = module("50001").context("Browserify module missing")?;
+            assert_eq!(
+                browserify.get("bundle_kind").and_then(Value::as_str),
+                Some("browserify_module_table")
+            );
+            assert_eq!(browserify.get("dependencies"), Some(&json!(["50002"])));
+            assert_eq!(
+                browserify.get("dependency_map"),
+                Some(&json!({"./beta": "50002", "external-package": "external-package"}))
+            );
+            assert_eq!(
+                module("51001").and_then(|row| row.get("dependencies")),
+                Some(&json!(["51002"]))
+            );
+            assert!(module("52001").is_none() && module("52002").is_none());
+
+            let rspack = module("rspA").context("Rspack module missing")?;
+            assert_eq!(
+                rspack.get("bundle_kind").and_then(Value::as_str),
+                Some("webpack_modules_binding")
+            );
+            assert_eq!(rspack.get("dependencies"), Some(&json!(["rspB"])));
+            let runtime = module("runA").context("webpack runtime module missing")?;
+            assert_eq!(
+                runtime.get("bundle_kind").and_then(Value::as_str),
+                Some("webpack_runtime_module_table")
+            );
+            assert_eq!(runtime.get("dependencies"), Some(&json!(["runB"])));
+
+            let jsonp = module("jsonpA").context("webpack JSONP module missing")?;
+            assert_eq!(
+                jsonp.get("bundle_kind").and_then(Value::as_str),
+                Some("webpack_jsonp_call")
+            );
+            assert_eq!(jsonp.get("chunk_ids"), Some(&json!(["91"])));
+            assert_eq!(jsonp.get("dependencies"), Some(&json!(["jsonpB"])));
+            assert!(module("jsonpShadow").is_none());
+
+            let object_bootstrap =
+                module("objectBootstrapA").context("object bootstrap module missing")?;
+            assert_eq!(
+                object_bootstrap.get("bundle_kind").and_then(Value::as_str),
+                Some("webpack_object_bootstrap")
+            );
+            assert_eq!(
+                object_bootstrap.get("dependencies"),
+                Some(&json!(["objectBootstrapB"]))
+            );
+            let firebase = module("firebaseA").context("firebase JSONP module missing")?;
+            assert_eq!(firebase.get("dependencies"), Some(&json!(["firebaseB"])));
+            assert!(module("firebaseShadow").is_none());
+
+            let amd = module("amd/alpha").context("AMD module missing")?;
+            assert_eq!(
+                amd.get("bundle_kind").and_then(Value::as_str),
+                Some("amd_named_modules")
+            );
+            assert_eq!(amd.get("dependencies"), Some(&json!(["amd/beta"])));
+            assert!(module("amd/local").is_some());
+            let member = module("embedded/alpha").context("member-loader module missing")?;
+            assert_eq!(
+                member.get("bundle_kind").and_then(Value::as_str),
+                Some("member_named_modules")
+            );
+            assert_eq!(member.get("dependencies"), Some(&json!(["embedded/beta"])));
+            assert!(module("not-amd/local-helper").is_none());
+            assert!(module("not-amd/member-helper").is_none());
+            assert!(module("not-module-inline-function").is_none());
             Ok(())
         })();
         let cleanup = fs::remove_dir_all(&project);

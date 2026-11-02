@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use jsvm_lift::{
     analysis_artifacts::{
@@ -6,17 +6,14 @@ use jsvm_lift::{
         JSVM_INDEX, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCEMAPS, SOURCE_GRAPH, SOURCE_INDEX,
         WASM_INDEX, WASM_JS_BOUNDARY, WASM_RESOURCE_PROVENANCE,
     },
+    capture_pipeline::{recover_capture_project, CapturePipelineOptions, VmPipelineOptions},
     capture_project::{read_manifest, MANIFEST_NAME},
-    project_scan::{scan_project, ProjectScanOptions},
     tool_environment::{repository_root, tool_dir},
-    wasm_js_boundary::correlate_project as correlate_wasm_js_boundary,
 };
 use serde_json::Value;
 use std::{
     env,
-    ffi::OsStr,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 #[derive(Parser, Debug)]
@@ -38,46 +35,6 @@ struct Args {
     skip_vm_scan: bool,
     #[arg(long)]
     skip_wasm_analysis: bool,
-}
-
-fn tool(root: &Path, name: &str) -> PathBuf {
-    root.join(name)
-}
-
-fn push_jobs(command: &mut Command, jobs: Option<usize>) {
-    if let Some(jobs) = jobs {
-        command.arg("--jobs").arg(jobs.to_string());
-    }
-}
-
-fn run(command: &mut Command, cwd: &Path) -> Result<()> {
-    command.current_dir(cwd);
-    let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .with_context(|| format!("launching {rendered}"))?;
-    if !output.status.success() {
-        bail!(
-            "command failed ({}): {rendered}\n{}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    if !output.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    }
-    Ok(())
-}
-
-fn run_tool<I, S>(tool_root: &Path, repo: &Path, name: &str, args: I) -> Result<()>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let mut command = Command::new(tool(tool_root, name));
-    command.args(args);
-    run(&mut command, repo)
 }
 
 fn required_artifact(project: &Path, spec: ArtifactSpec) -> Result<Value> {
@@ -263,13 +220,11 @@ fn print_summary(
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let repo = repository_root()?;
-    let tool_root = tool_dir()?;
+    let caller_cwd = env::current_dir()?;
     let capture = args
         .capture
         .canonicalize()
         .with_context(|| format!("capture does not exist: {}", args.capture.display()))?;
-    let caller_cwd = env::current_dir()?;
     let output = if args.output.is_absolute() {
         args.output.clone()
     } else {
@@ -289,109 +244,38 @@ fn main() -> Result<()> {
         })
         .transpose()?;
 
-    let mut import = Command::new(tool(&tool_root, "capture-import"));
-    import.arg(&capture).arg("--output").arg(&output);
-    if let Some(assets) = &assets_dir {
-        import.arg("--assets-dir").arg(assets);
-    }
-    if args.overwrite {
-        import.arg("--overwrite");
-    }
-    run(&mut import, &repo)?;
-
-    let manifest_path = output.join(MANIFEST_NAME);
-    let manifest = read_manifest(&manifest_path).with_context(|| {
-        format!(
-            "capture importer did not create a valid {}",
-            manifest_path.display()
-        )
-    })?;
-
-    let mut materialize = Command::new(tool(&tool_root, "source-materialize"));
-    materialize.arg(&output);
-    push_jobs(&mut materialize, args.jobs);
-    run(&mut materialize, &repo)?;
-
-    let wasm_analysis = !args.skip_wasm_analysis;
+    let vm = if args.skip_vm_scan {
+        None
+    } else {
+        let repo = repository_root()?;
+        let tools = tool_dir()?;
+        Some(VmPipelineOptions {
+            repo_root: repo,
+            switch_ir: tools.join("switch-ir"),
+            table_ir: tools.join("table-ir"),
+        })
+    };
     let safe_deob = !args.skip_safe_deobfuscation;
     let bundle_unpack = safe_deob && !args.skip_bundle_unpack;
-    let vm_scan = !args.skip_vm_scan;
+    let wasm_analysis = !args.skip_wasm_analysis;
 
-    if wasm_analysis {
-        run_tool(&tool_root, &repo, "wasm-materialize", [&output])?;
-        if manifest.source.kind == "recorder" {
-            run_tool(&tool_root, &repo, "wasm-resource-provenance", [&output])?;
-        }
-    }
+    recover_capture_project(&CapturePipelineOptions {
+        input: capture,
+        output: output.clone(),
+        assets_dir,
+        overwrite: args.overwrite,
+        jobs: args.jobs,
+        safe_deobfuscation: safe_deob,
+        bundle_materialization: bundle_unpack,
+        wasm_analysis,
+        vm,
+    })?;
 
-    run_tool(
-        &tool_root,
-        &repo,
-        "sourcemaps",
-        [OsStr::new("project"), output.as_os_str()],
-    )?;
-
-    let mut refs = Command::new(tool(&tool_root, "js-refs"));
-    refs.arg("--project").arg(&output);
-    push_jobs(&mut refs, args.jobs);
-    run(&mut refs, &repo)?;
-
-    if safe_deob {
-        let mut deob = Command::new(tool(&tool_root, "deobfuscate-safe"));
-        deob.arg("project").arg(&output);
-        push_jobs(&mut deob, args.jobs);
-        run(&mut deob, &repo)?;
-        if bundle_unpack {
-            let mut bundle = Command::new(tool(&tool_root, "bundle-materialize"));
-            bundle.arg(&output);
-            push_jobs(&mut bundle, args.jobs);
-            run(&mut bundle, &repo)?;
-        }
-    }
-
-    if wasm_analysis && safe_deob {
-        let summary = correlate_wasm_js_boundary(&output)?;
-        println!(
-            "WASM/JS boundary: {}/{} host-effect pair(s) have proven JS DataView.setUint32 shapes; {}/{} copied-input candidate(s) have proven JS Uint32Array constructor/set semantics; {} copied-input candidate(s) have proven exact module-memory identity; {} copied-input candidate(s) have proven source-word load interpretation",
-            summary.proven_js_set_u32_shapes,
-            summary.host_effect_pairs,
-            summary.proven_js_typed_array_copy_semantics,
-            summary.copied_input_candidates,
-            summary.proven_module_memory_identities,
-            summary.proven_destination_load_interpretations,
-        );
-    }
-
-    if vm_scan {
-        let summary = scan_project(
-            &output,
-            &ProjectScanOptions::with_defaults(
-                repo.clone(),
-                tool(&tool_root, "switch-ir"),
-                tool(&tool_root, "table-ir"),
-            ),
-        )?;
-        println!(
-            "VM scan: {} units; {} scanner invocations / {} exact-hash reuses; {} generated units; {} confirmed VM units; {} handler-table candidates; {} failures",
-            summary.code_units,
-            summary.scanner_invocations,
-            summary.deduplicated_scans,
-            summary.dynamic_units,
-            summary.confirmed_vm_units,
-            summary.handler_table_candidates,
-            summary.failures,
-        );
-        run_tool(&tool_root, &repo, "vm-materialize", [&output])?;
-    }
-
-    run_tool(
-        &tool_root,
-        &repo,
-        "api-surface",
-        [OsStr::new("--project"), output.as_os_str()],
-    )?;
-    run_tool(&tool_root, &repo, "source-graph", [&output])?;
-    run_tool(&tool_root, &repo, "project-readme", [&output])?;
-
-    print_summary(&output, wasm_analysis, safe_deob, bundle_unpack, vm_scan)
+    print_summary(
+        &output,
+        wasm_analysis,
+        safe_deob,
+        bundle_unpack,
+        !args.skip_vm_scan,
+    )
 }

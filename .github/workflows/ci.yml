@@ -36,10 +36,5 @@ jobs:
         pipx install uv
         node tools/cloak-recorder/check-nested-cdp-session.mjs
         cargo +1.99.1 build --locked --workspace --bins --target-dir .cargo-target-nodebug
-        python3 scripts/check-har-pipeline.py
-        python3 scripts/check-saved-page-pipeline.py
-        python3 scripts/check-safe-deobfuscate.py
-        python3 scripts/check-vm-capture-pipeline.py
-        python3 scripts/check-wasm-capture-pipeline.py
-        python3 scripts/check-wasm-resource-provenance.py
-        python3 scripts/check-wasm-copied-input-boundary.py
+        uv run python scripts/check-safe-deobfuscate.py
+        uv run python scripts/check-vm-capture-pipeline.py

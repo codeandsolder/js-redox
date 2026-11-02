@@ -4,6 +4,7 @@ mod bounded_process;
 pub mod browser_script_types;
 pub mod bytecode;
 pub mod capture_import;
+pub mod capture_pipeline;
 pub mod capture_project;
 pub mod content_dedup;
 pub mod decoder;
