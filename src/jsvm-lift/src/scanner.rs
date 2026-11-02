@@ -820,7 +820,7 @@ pub fn scan_source_core(
     scanner.visit_program(&parsed.program);
     scanner.finish_budget()?;
     budget.checkpoint()?;
-    let mut table_analysis = table_vm::analyze(source, &parsed.program);
+    let mut table_analysis = table_vm::analyze(source, &parsed.program, budget)?;
     budget.checkpoint()?;
 
     suppress_nested_table_vms(&scanner, &mut table_analysis);

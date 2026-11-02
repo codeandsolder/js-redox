@@ -734,7 +734,7 @@ mod tests {
     use rolldown_redox::ecmascript::parse_program;
 
     #[test]
-    fn generic_static_byte_assembly_augments_exact_module_sites() {
+    fn generic_static_byte_assembly_augments_exact_module_sites() -> Result<(), BudgetExceeded> {
         let source = r#"
             function load(imports) {
                 var bytes = new Uint8Array(8), decode = atob;
@@ -759,14 +759,14 @@ mod tests {
             semantic.semantic.scoping(),
             &HashMap::new(),
             &WorkBudget::unlimited("module-identity-test"),
-        )
-        .expect("static module identity recovery should stay within the test budget");
+        )?;
         assert_eq!(sites.len(), 1);
         let Some(site) = sites.values().next() else {
-            return;
+            return Ok(());
         };
         assert_eq!(site.sha256, crate::sha256_hex(b"\0asm\x01\0\0\0"));
         assert_eq!(site.identity_kind, "assembled_exact_bytes");
         assert!(site.standard_decode_builtins_required);
+        Ok(())
     }
 }

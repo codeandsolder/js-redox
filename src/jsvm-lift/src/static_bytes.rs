@@ -579,11 +579,12 @@ struct SinkCollector<'c, 'g, 'e, 'h> {
     sinks: Vec<Sink>,
     direct_artifacts: HashMap<(u32, u32), RecoveredByteArtifact>,
     poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
 }
 
 impl<'a> Visit<'a> for SinkCollector<'_, '_, '_, '_> {
     fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
-        if !self.poller.poll(1) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
             return;
         }
         let webassembly_member = (!call.optional)
@@ -612,11 +613,16 @@ impl<'a> Visit<'a> for SinkCollector<'_, '_, '_, '_> {
             };
             if let Some(argument) = call.arguments.first().and_then(Argument::as_expression) {
                 let mut state = EvalState::default();
-                if let Some(artifact) =
-                    artifact_from_argument(argument, sink, self.evaluator, &mut state)
-                {
-                    self.direct_artifacts
-                        .insert((sink.span.start, sink.span.end), artifact);
+                match artifact_from_argument(argument, sink, self.evaluator, &mut state) {
+                    Ok(Some(artifact)) => {
+                        self.direct_artifacts
+                            .insert((sink.span.start, sink.span.end), artifact);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.budget_error = Some(error);
+                        return;
+                    }
                 }
             }
             self.sinks.push(sink);
@@ -627,7 +633,7 @@ impl<'a> Visit<'a> for SinkCollector<'_, '_, '_, '_> {
     }
 
     fn visit_new_expression(&mut self, expression: &oxc_ast::ast::NewExpression<'a>) {
-        if !self.poller.poll(1) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
             return;
         }
         if namespace_member_name(
@@ -648,11 +654,16 @@ impl<'a> Visit<'a> for SinkCollector<'_, '_, '_, '_> {
                 .and_then(Argument::as_expression)
             {
                 let mut state = EvalState::default();
-                if let Some(artifact) =
-                    artifact_from_argument(argument, sink, self.evaluator, &mut state)
-                {
-                    self.direct_artifacts
-                        .insert((sink.span.start, sink.span.end), artifact);
+                match artifact_from_argument(argument, sink, self.evaluator, &mut state) {
+                    Ok(Some(artifact)) => {
+                        self.direct_artifacts
+                            .insert((sink.span.start, sink.span.end), artifact);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.budget_error = Some(error);
+                        return;
+                    }
                 }
             }
             self.sinks.push(sink);
@@ -853,6 +864,9 @@ struct Evaluator<'c, 'h, 'g> {
 
 impl Evaluator<'_, '_, '_> {
     fn eval(&self, expression: &Expression<'_>, state: &mut EvalState) -> Option<StaticValue> {
+        // Recursive evaluation is Option-valued, so budget exhaustion is latched in
+        // the shared WorkBudget and re-surfaced by eval_checked/helper_call_checked
+        // at every external evaluator boundary.
         self.budget.consume(1).ok()?;
         match unparenthesized(expression) {
             Expression::NumericLiteral(_) => exact_usize(expression).map(StaticValue::Number),
@@ -1010,6 +1024,26 @@ impl Evaluator<'_, '_, '_> {
         state.helper_calls_succeeded += 1;
         true
     }
+
+    fn eval_checked(
+        &self,
+        expression: &Expression<'_>,
+        state: &mut EvalState,
+    ) -> Result<Option<StaticValue>, BudgetExceeded> {
+        let value = self.eval(expression, state);
+        self.budget.checkpoint()?;
+        Ok(value)
+    }
+
+    fn helper_call_checked(
+        &self,
+        call: &oxc_ast::ast::CallExpression<'_>,
+        state: &mut EvalState,
+    ) -> Result<bool, BudgetExceeded> {
+        let handled = self.helper_call(call, state);
+        self.budget.checkpoint()?;
+        Ok(handled)
+    }
 }
 
 fn expression_buffer_ids(
@@ -1017,7 +1051,7 @@ fn expression_buffer_ids(
     scoping: &Scoping,
     state: &EvalState,
     budget: &WorkBudget,
-) -> Vec<usize> {
+) -> Result<Vec<usize>, BudgetExceeded> {
     struct Collector<'c, 's> {
         scoping: &'c Scoping,
         state: &'s EvalState,
@@ -1053,46 +1087,50 @@ fn expression_buffer_ids(
         poller: BudgetPoller::new(budget, 256),
     };
     collector.visit_expression(expression);
-    let _ = collector.poller.finish();
-    collector.out
+    collector.poller.finish()?;
+    Ok(collector.out)
 }
 
 fn normal_expression(
     expression: &Expression<'_>,
     evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
-) {
+) -> Result<(), BudgetExceeded> {
     match unparenthesized(expression) {
         Expression::SequenceExpression(sequence) => {
             for item in &sequence.expressions {
-                normal_expression(item, evaluator, state);
+                normal_expression(item, evaluator, state)?;
             }
         }
         Expression::AssignmentExpression(assignment) if assignment.operator.as_str() == "=" => {
             if let Some(symbol) = assignment_target_symbol(evaluator.scoping, &assignment.left) {
-                if let Some(value) = evaluator.eval(&assignment.right, state) {
+                if let Some(value) = evaluator.eval_checked(&assignment.right, state)? {
                     state.values.insert(symbol, value);
                 } else {
-                    normal_expression(&assignment.right, evaluator, state);
+                    evaluator.budget.checkpoint()?;
+                    normal_expression(&assignment.right, evaluator, state)?;
                     state.values.remove(&symbol);
                 }
             } else {
                 for id in
-                    expression_buffer_ids(expression, evaluator.scoping, state, &evaluator.budget)
+                    expression_buffer_ids(expression, evaluator.scoping, state, &evaluator.budget)?
                 {
                     state.invalidate_buffer(id, "unsupported_buffer_assignment");
                 }
             }
         }
         Expression::CallExpression(call) => {
-            if evaluator.helper_call(call, state) || evaluator.eval(expression, state).is_some() {
-                return;
+            if evaluator.helper_call_checked(call, state)? {
+                return Ok(());
+            }
+            if evaluator.eval_checked(expression, state)?.is_some() {
+                return Ok(());
             }
             let local_callee = symbol_of(evaluator.scoping, &call.callee).is_some();
             let direct_eval = unresolved_global(evaluator.scoping, &call.callee, "eval");
             if local_callee || direct_eval {
                 state.invalidate_all_buffers("unknown_local_call_or_direct_eval");
-                return;
+                return Ok(());
             }
             for argument in &call.arguments {
                 let Some(argument) = argument.as_expression() else {
@@ -1100,26 +1138,28 @@ fn normal_expression(
                     continue;
                 };
                 for id in
-                    expression_buffer_ids(argument, evaluator.scoping, state, &evaluator.budget)
+                    expression_buffer_ids(argument, evaluator.scoping, state, &evaluator.budget)?
                 {
                     state.invalidate_buffer(id, "buffer_passed_to_unknown_call");
                 }
             }
         }
         _ => {
-            for id in expression_buffer_ids(expression, evaluator.scoping, state, &evaluator.budget)
+            for id in
+                expression_buffer_ids(expression, evaluator.scoping, state, &evaluator.budget)?
             {
                 state.invalidate_buffer(id, "unsupported_buffer_use");
             }
         }
     }
+    Ok(())
 }
 
 fn normal_statement(
     statement: &Statement<'_>,
     evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
-) {
+) -> Result<(), BudgetExceeded> {
     match statement {
         Statement::VariableDeclaration(declaration) => {
             for declarator in &declaration.declarations {
@@ -1142,20 +1182,22 @@ fn normal_statement(
                     state.values.remove(&symbol);
                     continue;
                 }
-                if let Some(value) = evaluator.eval(initializer, state) {
+                if let Some(value) = evaluator.eval_checked(initializer, state)? {
                     state.values.insert(symbol, value);
                 } else {
-                    normal_expression(initializer, evaluator, state);
+                    evaluator.budget.checkpoint()?;
+                    normal_expression(initializer, evaluator, state)?;
                     state.values.remove(&symbol);
                 }
             }
         }
         Statement::ExpressionStatement(statement) => {
-            normal_expression(&statement.expression, evaluator, state);
+            normal_expression(&statement.expression, evaluator, state)?;
         }
         Statement::FunctionDeclaration(_) | Statement::EmptyStatement(_) => {}
         _ => state.invalidate_all_buffers("unsupported_statement"),
     }
+    Ok(())
 }
 
 fn sink_argument<'a>(expression: &'a Expression<'a>, sink: Sink) -> Option<&'a Expression<'a>> {
@@ -1175,28 +1217,28 @@ fn artifact_from_argument(
     sink: Sink,
     evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
-) -> Option<RecoveredByteArtifact> {
-    let Some(value) = evaluator.eval(argument, state) else {
+) -> Result<Option<RecoveredByteArtifact>, BudgetExceeded> {
+    let Some(value) = evaluator.eval_checked(argument, state)? else {
         state.sink_failure = Some("sink_argument_not_static");
-        return None;
+        return Ok(None);
     };
     let StaticValue::Buffer(id) = value else {
         state.sink_failure = Some("sink_argument_not_buffer");
-        return None;
+        return Ok(None);
     };
     let Some(buffer) = state.buffers.get(id) else {
         state.sink_failure = Some("sink_buffer_missing");
-        return None;
+        return Ok(None);
     };
     if !buffer.valid {
         state.sink_failure = Some("sink_buffer_invalid");
-        return None;
+        return Ok(None);
     }
     let Some(bytes) = validated_wasm_bytes(buffer.bytes.clone()) else {
         state.sink_failure = Some("sink_buffer_not_valid_core_wasm");
-        return None;
+        return Ok(None);
     };
-    Some(RecoveredByteArtifact {
+    Ok(Some(RecoveredByteArtifact {
         sha256: sha256_hex(&bytes),
         bytes,
         sink_start: sink.span.start,
@@ -1206,7 +1248,7 @@ fn artifact_from_argument(
         allocation_end: buffer.allocation_span.end,
         copy_writes: buffer.writes,
         standard_builtins_required: true,
-    })
+    }))
 }
 
 fn artifact_at_sink(
@@ -1214,10 +1256,10 @@ fn artifact_at_sink(
     sink: Sink,
     evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
-) -> Option<RecoveredByteArtifact> {
+) -> Result<Option<RecoveredByteArtifact>, BudgetExceeded> {
     let Some(argument) = sink_argument(expression, sink) else {
         state.sink_failure = Some("sink_argument_missing");
-        return None;
+        return Ok(None);
     };
     artifact_from_argument(argument, sink, evaluator, state)
 }
@@ -1227,7 +1269,7 @@ fn expression_to_sink(
     sink: Sink,
     evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
-) -> Option<RecoveredByteArtifact> {
+) -> Result<Option<RecoveredByteArtifact>, BudgetExceeded> {
     if expression.span() == sink.span {
         return artifact_at_sink(expression, sink, evaluator, state);
     }
@@ -1238,22 +1280,22 @@ fn expression_to_sink(
                 if span_contains(item.span(), sink.span) {
                     return expression_to_sink(item, sink, evaluator, state);
                 }
-                normal_expression(item, evaluator, state);
+                normal_expression(item, evaluator, state)?;
             }
-            None
+            Ok(None)
         }
         Expression::AssignmentExpression(assignment) => {
             if span_contains(assignment.right.span(), sink.span) {
                 expression_to_sink(&assignment.right, sink, evaluator, state)
             } else {
-                None
+                Ok(None)
             }
         }
         Expression::CallExpression(call) => {
             if span_contains(call.callee.span(), sink.span) {
                 return expression_to_sink(&call.callee, sink, evaluator, state);
             }
-            normal_expression(&call.callee, evaluator, state);
+            normal_expression(&call.callee, evaluator, state)?;
             for argument in &call.arguments {
                 let Some(argument) = argument.as_expression() else {
                     state.invalidate_all_buffers("unsupported_binding_pattern");
@@ -1262,9 +1304,9 @@ fn expression_to_sink(
                 if span_contains(argument.span(), sink.span) {
                     return expression_to_sink(argument, sink, evaluator, state);
                 }
-                normal_expression(argument, evaluator, state);
+                normal_expression(argument, evaluator, state)?;
             }
-            None
+            Ok(None)
         }
         Expression::StaticMemberExpression(member) => {
             expression_to_sink(&member.object, sink, evaluator, state)
@@ -1273,61 +1315,73 @@ fn expression_to_sink(
             if span_contains(member.object.span(), sink.span) {
                 expression_to_sink(&member.object, sink, evaluator, state)
             } else if span_contains(member.expression.span(), sink.span) {
-                normal_expression(&member.object, evaluator, state);
+                normal_expression(&member.object, evaluator, state)?;
                 expression_to_sink(&member.expression, sink, evaluator, state)
             } else {
-                None
+                Ok(None)
             }
         }
         Expression::ConditionalExpression(conditional) => {
-            normal_expression(&conditional.test, evaluator, state);
+            normal_expression(&conditional.test, evaluator, state)?;
             if span_contains(conditional.consequent.span(), sink.span) {
                 expression_to_sink(&conditional.consequent, sink, evaluator, state)
             } else if span_contains(conditional.alternate.span(), sink.span) {
                 expression_to_sink(&conditional.alternate, sink, evaluator, state)
             } else {
-                None
+                Ok(None)
             }
         }
         Expression::LogicalExpression(logical) => {
             if span_contains(logical.left.span(), sink.span) {
                 expression_to_sink(&logical.left, sink, evaluator, state)
             } else if span_contains(logical.right.span(), sink.span) {
-                normal_expression(&logical.left, evaluator, state);
+                normal_expression(&logical.left, evaluator, state)?;
                 expression_to_sink(&logical.right, sink, evaluator, state)
             } else {
-                None
+                Ok(None)
             }
         }
         Expression::UnaryExpression(unary) => {
             expression_to_sink(&unary.argument, sink, evaluator, state)
         }
-        Expression::ArrayExpression(array) => array
-            .elements
-            .iter()
-            .filter_map(|element| element.as_expression())
-            .find(|element| span_contains(element.span(), sink.span))
-            .and_then(|element| expression_to_sink(element, sink, evaluator, state)),
-        Expression::ObjectExpression(object) => object.properties.iter().find_map(|item| {
-            let ObjectPropertyKind::ObjectProperty(property) = item else {
-                return None;
-            };
-            span_contains(property.value.span(), sink.span)
-                .then(|| expression_to_sink(&property.value, sink, evaluator, state))
-                .flatten()
-        }),
+        Expression::ArrayExpression(array) => {
+            for element in array
+                .elements
+                .iter()
+                .filter_map(|element| element.as_expression())
+            {
+                if span_contains(element.span(), sink.span) {
+                    return expression_to_sink(element, sink, evaluator, state);
+                }
+            }
+            Ok(None)
+        }
+        Expression::ObjectExpression(object) => {
+            for item in &object.properties {
+                let ObjectPropertyKind::ObjectProperty(property) = item else {
+                    continue;
+                };
+                if span_contains(property.value.span(), sink.span) {
+                    return expression_to_sink(&property.value, sink, evaluator, state);
+                }
+            }
+            Ok(None)
+        }
         Expression::FunctionExpression(function) => {
             *state = EvalState::default();
-            statements_to_sink(&function.body.as_ref()?.statements, sink, evaluator, state)
+            let Some(body) = function.body.as_ref() else {
+                return Ok(None);
+            };
+            statements_to_sink(&body.statements, sink, evaluator, state)
         }
         Expression::ArrowFunctionExpression(function) => {
             let oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) = &function.body else {
-                return None;
+                return Ok(None);
             };
             *state = EvalState::default();
             statements_to_sink(&body.statements, sink, evaluator, state)
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -1336,11 +1390,11 @@ fn statement_to_sink(
     sink: Sink,
     evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
-) -> Option<RecoveredByteArtifact> {
+) -> Result<Option<RecoveredByteArtifact>, BudgetExceeded> {
     match statement {
         Statement::BlockStatement(block) => statements_to_sink(&block.body, sink, evaluator, state),
         Statement::IfStatement(branch) => {
-            normal_expression(&branch.test, evaluator, state);
+            normal_expression(&branch.test, evaluator, state)?;
             if span_contains(branch.consequent.span(), sink.span) {
                 statement_to_sink(&branch.consequent, sink, evaluator, state)
             } else if branch
@@ -1348,9 +1402,12 @@ fn statement_to_sink(
                 .as_ref()
                 .is_some_and(|alternate| span_contains(alternate.span(), sink.span))
             {
-                statement_to_sink(branch.alternate.as_ref()?, sink, evaluator, state)
+                let Some(alternate) = branch.alternate.as_ref() else {
+                    return Ok(None);
+                };
+                statement_to_sink(alternate, sink, evaluator, state)
             } else {
-                None
+                Ok(None)
             }
         }
         Statement::ExpressionStatement(statement) => {
@@ -1379,25 +1436,34 @@ fn statement_to_sink(
                     state.values.remove(&symbol);
                     continue;
                 }
-                if let Some(value) = evaluator.eval(initializer, state) {
+                if let Some(value) = evaluator.eval_checked(initializer, state)? {
                     state.values.insert(symbol, value);
                 } else {
-                    normal_expression(initializer, evaluator, state);
+                    evaluator.budget.checkpoint()?;
+                    normal_expression(initializer, evaluator, state)?;
                     state.values.remove(&symbol);
                 }
             }
-            None
+            Ok(None)
         }
         Statement::FunctionDeclaration(function) => {
             *state = EvalState::default();
-            statements_to_sink(&function.body.as_ref()?.statements, sink, evaluator, state)
+            let Some(body) = function.body.as_ref() else {
+                return Ok(None);
+            };
+            statements_to_sink(&body.statements, sink, evaluator, state)
         }
-        Statement::ReturnStatement(statement) => statement
-            .argument
-            .as_ref()
-            .filter(|argument| span_contains(argument.span(), sink.span))
-            .and_then(|argument| expression_to_sink(argument, sink, evaluator, state)),
-        _ => None,
+        Statement::ReturnStatement(statement) => {
+            let Some(argument) = statement
+                .argument
+                .as_ref()
+                .filter(|argument| span_contains(argument.span(), sink.span))
+            else {
+                return Ok(None);
+            };
+            expression_to_sink(argument, sink, evaluator, state)
+        }
+        _ => Ok(None),
     }
 }
 
@@ -1406,16 +1472,16 @@ fn statements_to_sink(
     sink: Sink,
     evaluator: &Evaluator<'_, '_, '_>,
     state: &mut EvalState,
-) -> Option<RecoveredByteArtifact> {
+) -> Result<Option<RecoveredByteArtifact>, BudgetExceeded> {
     for statement in statements {
         if span_contains(statement.span(), sink.span) {
             return statement_to_sink(statement, sink, evaluator, state);
         }
         if statement.span().end <= sink.span.start {
-            normal_statement(statement, evaluator, state);
+            normal_statement(statement, evaluator, state)?;
         }
     }
-    None
+    Ok(None)
 }
 
 pub fn recover_webassembly_byte_artifacts_from_program(
@@ -1442,8 +1508,12 @@ pub fn recover_webassembly_byte_artifacts_from_program(
         sinks: Vec::new(),
         direct_artifacts: HashMap::new(),
         poller: BudgetPoller::new(budget, 256),
+        budget_error: None,
     };
     sink_collector.visit_program(program);
+    if let Some(error) = sink_collector.budget_error.take() {
+        return Err(error);
+    }
     sink_collector.poller.finish()?;
     let sink_count = sink_collector.sinks.len();
     let mut out = Vec::new();
@@ -1451,10 +1521,14 @@ pub fn recover_webassembly_byte_artifacts_from_program(
     for sink in sink_collector.sinks {
         budget.consume(1)?;
         let mut state = EvalState::default();
-        let artifact = sink_collector
+        let artifact = if let Some(artifact) = sink_collector
             .direct_artifacts
             .remove(&(sink.span.start, sink.span.end))
-            .or_else(|| statements_to_sink(&program.body, sink, &evaluator, &mut state));
+        {
+            Some(artifact)
+        } else {
+            statements_to_sink(&program.body, sink, &evaluator, &mut state)?
+        };
         let recovered = artifact.is_some();
         if let Some(artifact) = artifact {
             out.push(artifact);
@@ -1540,15 +1614,18 @@ mod tests {
             "static-byte-budget-test",
             work_budget::BudgetLimits::work(0),
         );
-        let error = analyze_webassembly_byte_artifacts(
+        let result = analyze_webassembly_byte_artifacts(
             "WebAssembly.compile(new Uint8Array([0,97,115,109,1,0,0,0]));",
             &budget,
-        )
-        .expect_err("zero work budget must abort static byte analysis");
-        let exceeded = work_budget::find_budget_exceeded(error.as_ref())
-            .expect("analysis error should retain budget exhaustion");
-        assert_eq!(exceeded.kind(), work_budget::BudgetExceededKind::Work);
-        assert_eq!(exceeded.scope(), "static-byte-budget-test");
+        );
+        assert!(matches!(
+            result,
+            Err(ref error)
+                if work_budget::find_budget_exceeded(error.as_ref()).is_some_and(|exceeded|
+                    exceeded.kind() == work_budget::BudgetExceededKind::Work
+                        && exceeded.scope() == "static-byte-budget-test"
+                )
+        ));
     }
 
     #[test]

@@ -1555,7 +1555,6 @@ fn parse<'a>(
 }
 
 /// Analyze one JavaScript source body for statically explicit bundle/module tables.
-#[must_use]
 pub fn analyze_bundle_source(
     source: &str,
     input: impl Into<String>,

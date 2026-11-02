@@ -217,7 +217,7 @@ mod tests {
     use rolldown_redox::ecmascript::parse_program;
 
     #[test]
-    fn resolves_direct_transitive_and_computed_global_builtins() {
+    fn resolves_direct_transitive_and_computed_global_builtins() -> Result<(), BudgetExceeded> {
         let source = r#"
             var host = window;
             var host2 = host;
@@ -232,8 +232,7 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let aliases = collect_global_aliases(&parsed.program, scoping, &test_budget())
-            .expect("unlimited alias test budget should not fail");
+        let aliases = collect_global_aliases(&parsed.program, scoping, &test_budget())?;
         assert_eq!(aliases.len(), 2);
 
         struct Probe<'c, 'g> {
@@ -271,10 +270,11 @@ mod tests {
         probe.visit_program(&parsed.program);
         assert!(probe.wasm);
         assert!(probe.data_view);
+        Ok(())
     }
 
     #[test]
-    fn rejects_reassigned_aliases_and_dynamic_global_resolution() {
+    fn rejects_reassigned_aliases_and_dynamic_global_resolution() -> Result<(), BudgetExceeded> {
         let source = r#"
             var host = window;
             host = fake;
@@ -288,8 +288,7 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let aliases =
-            collect_global_aliases(&parsed.program, semantic.semantic.scoping(), &test_budget())
-                .expect("unlimited alias test budget should not fail");
+            collect_global_aliases(&parsed.program, semantic.semantic.scoping(), &test_budget())?;
         assert!(aliases.is_empty());
 
         let source = r#"
@@ -307,8 +306,7 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let aliases = collect_global_aliases(&parsed.program, scoping, &test_budget())
-            .expect("unlimited alias test budget should not fail");
+        let aliases = collect_global_aliases(&parsed.program, scoping, &test_budget())?;
 
         struct Probe<'c, 'g> {
             scoping: &'c Scoping,
@@ -332,5 +330,6 @@ mod tests {
         };
         probe.visit_program(&parsed.program);
         assert!(!probe.resolved);
+        Ok(())
     }
 }

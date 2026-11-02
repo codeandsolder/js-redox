@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
-use jsvm_lift::analysis_budget::AnalysisBudgets;
 use jsvm_lift::{
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     js_refs::extract_js_references,
@@ -41,6 +40,11 @@ fn main() -> Result<()> {
         .context("input is required unless --project is used")?;
     let source =
         fs::read_to_string(&input).with_context(|| format!("reading {}", input.display()))?;
+    let budgets = AnalysisBudgets::standard("js-refs");
+    let budget = budgets.operation(
+        AnalysisOperation::ReferenceScan,
+        input.display().to_string(),
+    );
     println!(
         "{}",
         serde_json::to_string(&extract_js_references(&source, &budget)?)?

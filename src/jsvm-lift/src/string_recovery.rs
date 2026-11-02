@@ -8,7 +8,6 @@ pub struct StaticStringRecoveryOutcome {
     pub report: Value,
 }
 
-#[must_use]
 pub fn recover_static_strings(
     original: &str,
     input_label: impl Into<String>,

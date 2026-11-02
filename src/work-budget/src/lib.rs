@@ -10,7 +10,7 @@ use std::{
     error::Error,
     fmt,
     io::{self, Read},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
@@ -203,6 +203,36 @@ impl CommandRunError {
     }
 }
 
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_process_group(child: &Child) {
+    use nix::{
+        sys::signal::{killpg, Signal},
+        unistd::Pid,
+    };
+
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child: &Child) {}
+
+fn terminate_child_tree(child: &mut Child) {
+    kill_process_group(child);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn join_output_reader(
     handle: thread::JoinHandle<io::Result<Vec<u8>>>,
 ) -> Result<Vec<u8>, CommandRunError> {
@@ -219,11 +249,14 @@ fn join_output_reader(
 ///
 /// `stdout` and `stderr` are drained concurrently so a verbose child cannot
 /// deadlock on full pipes. The child is killed and reaped when the budget is
-/// exhausted or cancelled. The budget is checked at most 10 ms apart while
-/// the child is running.
+/// exhausted or cancelled. On Unix the command runs in a dedicated process
+/// group, so descendants are killed with it and cannot keep inherited pipes
+/// open after the parent exits. The budget is checked at most 10 ms apart
+/// while the child is running.
 pub fn run_command(command: &mut Command, budget: &WorkBudget) -> Result<Output, CommandRunError> {
     budget.checkpoint().map_err(CommandRunError::Budget)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_process_group(command);
     let mut child = command.spawn().map_err(CommandRunError::Spawn)?;
     let stdout = child.stdout.take().ok_or_else(|| {
         CommandRunError::Output(io::Error::other("child stdout pipe was not created"))
@@ -246,8 +279,7 @@ pub fn run_command(command: &mut Command, budget: &WorkBudget) -> Result<Output,
 
     let status = loop {
         if let Err(error) = budget.checkpoint() {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child_tree(&mut child);
             let _ = join_output_reader(stdout_reader);
             let _ = join_output_reader(stderr_reader);
             return Err(CommandRunError::Budget(error));
@@ -256,8 +288,7 @@ pub fn run_command(command: &mut Command, budget: &WorkBudget) -> Result<Output,
             Ok(Some(status)) => break status,
             Ok(None) => thread::sleep(Duration::from_millis(10)),
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child_tree(&mut child);
                 let _ = join_output_reader(stdout_reader);
                 let _ = join_output_reader(stderr_reader);
                 return Err(CommandRunError::Wait(error));
@@ -265,6 +296,10 @@ pub fn run_command(command: &mut Command, budget: &WorkBudget) -> Result<Output,
         }
     };
 
+    // A synchronous command is complete when its parent exits. Any process still
+    // in the dedicated group is a leaked descendant; terminate it before joining
+    // pipe readers so inherited descriptors cannot outlive the command budget.
+    kill_process_group(&child);
     let stdout = join_output_reader(stdout_reader)?;
     let stderr = join_output_reader(stderr_reader)?;
     budget.checkpoint().map_err(CommandRunError::Budget)?;
@@ -474,6 +509,20 @@ impl WorkBudget {
     pub fn has_work_limit(&self) -> bool {
         self.states.iter().any(|state| state.work_limit.is_some())
     }
+
+    /// Return the tightest deterministic work allowance still available in this
+    /// scope hierarchy. `None` means every scope is work-unbounded.
+    #[must_use]
+    pub fn remaining_work(&self) -> Option<u64> {
+        self.states
+            .iter()
+            .filter_map(|state| {
+                state
+                    .work_limit
+                    .map(|_| state.remaining_work.load(Ordering::Acquire))
+            })
+            .min()
+    }
 }
 
 /// Adapts a [`WorkBudget`] to callback/visitor APIs that cannot return errors.
@@ -594,6 +643,17 @@ mod tests {
     }
 
     #[test]
+    fn remaining_work_uses_tightest_hierarchical_allowance() {
+        let root = WorkBudget::new("root", BudgetLimits::work(10));
+        let child = root.child("child", BudgetLimits::work(4));
+        assert_eq!(child.remaining_work(), Some(4));
+        assert!(child.consume(3).is_ok());
+        assert_eq!(child.remaining_work(), Some(1));
+        assert_eq!(root.remaining_work(), Some(7));
+        assert_eq!(WorkBudget::unlimited("unlimited").remaining_work(), None);
+    }
+
+    #[test]
     fn zero_deadline_fails_immediately_and_stays_failed() {
         let budget = WorkBudget::new("parse", BudgetLimits::wall_time(Duration::ZERO));
         assert!(matches!(
@@ -647,14 +707,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn budgeted_command_captures_output() {
+    fn budgeted_command_captures_output() -> Result<(), CommandRunError> {
         let budget = WorkBudget::new("child", BudgetLimits::wall_time(Duration::from_secs(1)));
         let mut command = Command::new("sh");
         command.args(["-c", "printf stdout; printf stderr >&2"]);
-        let output = run_command(&mut command, &budget).expect("child should complete");
+        let output = run_command(&mut command, &budget)?;
         assert!(output.status.success());
         assert_eq!(output.stdout, b"stdout");
         assert_eq!(output.stderr, b"stderr");
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -668,5 +729,22 @@ mod tests {
             Err(CommandRunError::Budget(ref error))
                 if error.kind() == BudgetExceededKind::Deadline
         ));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn budgeted_command_kills_descendant_process_group() {
+        let budget = WorkBudget::new(
+            "child-tree",
+            BudgetLimits::wall_time(Duration::from_millis(20)),
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5 & wait"]);
+        let started = Instant::now();
+        assert!(matches!(
+            run_command(&mut command, &budget),
+            Err(CommandRunError::Budget(ref error))
+                if error.kind() == BudgetExceededKind::Deadline
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

@@ -200,6 +200,9 @@ fn relative_sample_path(path: &Path) -> bool {
 }
 
 fn canonical_corpus_path(root: &Path, relative: &Path, label: &str) -> Result<PathBuf> {
+    if !relative_sample_path(relative) {
+        bail!("{label}: path must stay under corpus root");
+    }
     let candidate = root.join(relative);
     let canonical = candidate
         .canonicalize()
@@ -353,11 +356,7 @@ fn assert_node_syntax(
         })
         .take(96)
         .collect::<String>();
-    let extension = match mode {
-        SourceMode::Module => "mjs",
-        SourceMode::CommonJs => "cjs",
-        SourceMode::Auto => "js",
-    };
+    let extension = mode.suffix().trim_start_matches('.');
     let path = temp
         .path()
         .join(format!("{safe_label}.{suffix}.{extension}"));
@@ -538,7 +537,9 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
         let raw_source = std::str::from_utf8(&raw_bytes)
             .with_context(|| format!("{}: JavaScript is not UTF-8", sample.id))?;
 
-        let source_mode = SourceMode::for_path(&raw_path);
+        // Module/CommonJS semantics belong to the manifest's logical filename,
+        // not to a canonical symlink target whose suffix may differ.
+        let source_mode = SourceMode::for_path(&sample.path);
         let format_budget =
             budgets.operation_under(&sample_budget, AnalysisOperation::Format, &sample.id);
         let pretty = format_source(raw_source, &format_budget)
@@ -710,7 +711,7 @@ mod tests {
 
     #[test]
     fn manifest_rejects_unknown_corpus_role() {
-        let error = serde_json::from_str::<CorpusManifest>(
+        let result = serde_json::from_str::<CorpusManifest>(
             r#"{
               "schema":"jsvm-corpus/v1",
               "samples":[{
@@ -718,9 +719,11 @@ mod tests {
                 "path":"sample.js","bytes":1,"sha256":"00"
               }]
             }"#,
-        )
-        .expect_err("unknown corpus role must fail closed");
-        assert!(error.to_string().contains("unknown variant"));
+        );
+        assert!(matches!(
+            result,
+            Err(ref error) if error.to_string().contains("unknown variant")
+        ));
     }
 
     #[cfg(unix)]
@@ -736,9 +739,10 @@ mod tests {
         symlink(&outside, corpus.join("sample.js"))?;
         let canonical_root = corpus.canonicalize()?;
 
-        let error = canonical_corpus_path(&canonical_root, Path::new("sample.js"), "fixture")
-            .expect_err("symlink escape must fail closed");
-        assert!(error.to_string().contains("escapes corpus root"));
+        assert!(matches!(
+            canonical_corpus_path(&canonical_root, Path::new("sample.js"), "fixture"),
+            Err(ref error) if error.to_string().contains("escapes corpus root")
+        ));
         Ok(())
     }
 

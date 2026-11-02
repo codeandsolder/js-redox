@@ -176,9 +176,10 @@ mod tests {
     fn inherited_budget_errors_are_not_recoverable_unit_failures() {
         let root = WorkBudget::new("project", BudgetLimits::work(0));
         let unit = root.child("unit", BudgetLimits::work(1));
-        let error = unit
-            .consume(1)
-            .expect_err("root budget should be exhausted");
-        assert!(recoverable_unit_error(AnyError::new(error)).is_err());
+        let result = unit.consume(1);
+        assert!(match result {
+            Ok(()) => false,
+            Err(error) => recoverable_unit_error(AnyError::new(error)).is_err(),
+        });
     }
 }

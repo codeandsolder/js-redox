@@ -184,7 +184,7 @@ mod tests {
         let budget = WorkBudget::unlimited("scan-report-module-test");
         let report = scan_source(source, "fixture.mjs", None, SourceMode::Module, &budget)?;
         assert!(!report.fatal_error);
-        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.diagnostics, 0);
         Ok(())
     }
 }

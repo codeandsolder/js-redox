@@ -929,7 +929,6 @@ fn analyze_source(
     Ok(WasmImportSemanticsAnalysis::default())
 }
 
-#[must_use]
 pub fn proven_wasm_import_semantics(
     source: &str,
     budget: &WorkBudget,
@@ -937,7 +936,6 @@ pub fn proven_wasm_import_semantics(
     analyze_source(source, None, None, None, budget)
 }
 
-#[must_use]
 pub fn proven_wasm_import_semantics_for(
     source: &str,
     import_module: &str,
@@ -954,7 +952,6 @@ pub fn proven_wasm_import_semantics_for(
     )
 }
 
-#[must_use]
 pub fn proven_wasm_import_data_view_set_u32_shapes(
     source: &str,
     budget: &WorkBudget,
@@ -962,7 +959,6 @@ pub fn proven_wasm_import_data_view_set_u32_shapes(
     Ok(proven_wasm_import_semantics(source, budget)?.shapes)
 }
 
-#[must_use]
 pub fn proven_wasm_import_data_view_set_u32_shape_at_offset(
     source: &str,
     import_module: &str,
