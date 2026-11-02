@@ -50,6 +50,7 @@ struct CopiedInputProofContext<'a> {
     module_memory_proofs: &'a [Value],
     binding_proofs: &'a [Value],
     export_name: Option<&'a str>,
+    budget: &'a WorkBudget,
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -1087,7 +1088,8 @@ fn fresh_destination_alignment_proof(
     let (binary_path, module_sha256, bytes) =
         verified_module_bytes(context.project, context.module)?;
     let byte_count = exact_source_length_u32.checked_shl(u32::try_from(length_shift).ok()?)?;
-    let evaluation = evaluate_fresh_i32_call(&bytes, function, &[byte_count], None);
+    let evaluation =
+        evaluate_fresh_i32_call(&bytes, function, &[byte_count], None, context.budget).ok()?;
     let result = evaluation.proven_result()?;
     if result % 4 != 0 {
         return None;
@@ -1274,7 +1276,8 @@ fn fresh_cleanup_disjointness_proof(
         })
         .collect::<Vec<_>>();
     let (_, module_sha256, bytes) = verified_module_bytes(context.project, context.module)?;
-    let evaluation = evaluate_fresh_i32_sequence(&bytes, &table_grows, &calls, None);
+    let evaluation =
+        evaluate_fresh_i32_sequence(&bytes, &table_grows, &calls, None, context.budget).ok()?;
     if evaluation.outcome != FreshEvalOutcome::Returned || evaluation.steps.len() != calls.len() {
         return None;
     }
@@ -1798,6 +1801,7 @@ pub fn correlate_project(
                                 module_memory_proofs: &module_memory_proofs,
                                 binding_proofs: &copied_binding_proofs,
                                 export_name,
+                                budget: &stage_budget,
                             };
                             stage_budget.checkpoint()?;
                             fresh_alignment_proof =
@@ -1822,6 +1826,7 @@ pub fn correlate_project(
                                 module_memory_proofs: &module_memory_proofs,
                                 binding_proofs: &copied_binding_proofs,
                                 export_name,
+                                budget: &stage_budget,
                             };
                             stage_budget.checkpoint()?;
                             let proof = fresh_cleanup_disjointness_proof(

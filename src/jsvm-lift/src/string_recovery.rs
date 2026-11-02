@@ -225,7 +225,13 @@ mod tests {
     ) -> Result<()> {
         let scratch = TempDir::new()?;
         let budget = work_budget::WorkBudget::unlimited(format!("base91-fixture:{label}"));
-        let scan = scan_source(source, label, Some(scratch.path()), &budget)?;
+        let scan = scan_source(
+            source,
+            label,
+            Some(scratch.path()),
+            SourceMode::Auto,
+            &budget,
+        )?;
         let mut dumps = Vec::new();
         dumped_generated_sources(&scan.embedded, &mut dumps);
         assert!(!dumps.is_empty(), "{label}: no generated source");

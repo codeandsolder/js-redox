@@ -87,7 +87,7 @@ pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) ->
         let source = match fs::read_to_string(&source_path) {
             Ok(source) => source,
             Err(error) => {
-                let error = recoverable_unit_error(error)?;
+                let error = recoverable_unit_error(error.into())?;
                 failures.push(json!({
                     "source_index_ordinal": source_index_ordinal,
                     "resource_id": unit.get("resource_id").cloned().unwrap_or(Value::Null),

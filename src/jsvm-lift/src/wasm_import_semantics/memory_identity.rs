@@ -1033,12 +1033,13 @@ fn normalized_initializer_proof(
         return Ok(None);
     };
     budget.checkpoint()?;
-    Ok(normalized_initializer_proof_from_source(
+    normalized_initializer_proof_from_source(
         &normalized.source,
         helper_name,
         exports_binding,
         parameter,
-    ))
+        budget,
+    )
 }
 
 fn normalized_initializer_proof_from_source(
@@ -1046,8 +1047,10 @@ fn normalized_initializer_proof_from_source(
     helper_name: &str,
     exports_binding: &str,
     parameter: usize,
-) -> Option<NormalizedInitializerProof> {
+    budget: &WorkBudget,
+) -> Result<Option<NormalizedInitializerProof>, BudgetExceeded> {
     for source_type in [SourceType::unambiguous(), SourceType::cjs()] {
+        budget.consume(1)?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, source_type);
         if !parsed.is_clean() {
@@ -1060,7 +1063,7 @@ fn normalized_initializer_proof_from_source(
             continue;
         }
         let scoping = semantic.semantic.scoping();
-        let global_aliases = collect_global_aliases(&parsed.program, scoping);
+        let global_aliases = collect_global_aliases(&parsed.program, scoping, budget)?;
         let mut proven = Vec::new();
         struct HelperFinder<'c, 's> {
             scoping: &'c Scoping,
@@ -1332,10 +1335,10 @@ fn normalized_initializer_proof_from_source(
         };
         finder.visit_program(&parsed.program);
         if let [proof] = proven.as_slice() {
-            return Some(*proof);
+            return Ok(Some(*proof));
         }
     }
-    None
+    Ok(None)
 }
 
 fn unique_exact_instance_paths(

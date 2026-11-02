@@ -269,7 +269,7 @@ pub fn materialize_wasm(
         }
         let text = std::str::from_utf8(&raw)
             .with_context(|| format!("{} is not UTF-8 JavaScript", source.path.display()))?;
-        let recovery = match analyze_webassembly_byte_artifacts(text) {
+        let recovery = match analyze_webassembly_byte_artifacts(text, &budget) {
             Ok(recovery) => recovery,
             Err(error) if error.to_string() == PARSE_REFUSAL => continue,
             Err(error) => {

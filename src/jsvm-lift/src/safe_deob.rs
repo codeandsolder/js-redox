@@ -1,6 +1,7 @@
 use crate::{forwarding_alias, js_format::format_source, sha256_hex};
 use anyhow::{anyhow, Result};
 use jsvm_safe_core::{SafeSourceMode, SafeSourceRecovery, SafeSourceRejection};
+use oxc_span::SourceType;
 use serde::Serialize;
 use std::{collections::BTreeMap, path::Path};
 use work_budget::WorkBudget;
@@ -37,6 +38,15 @@ impl SourceMode {
             Self::Auto => SafeSourceMode::Auto,
             Self::Module => SafeSourceMode::Module,
             Self::CommonJs => SafeSourceMode::CommonJs,
+        }
+    }
+
+    #[must_use]
+    pub fn source_type(self) -> SourceType {
+        match self {
+            Self::Auto => SourceType::unambiguous(),
+            Self::Module => SourceType::mjs(),
+            Self::CommonJs => SourceType::cjs(),
         }
     }
 

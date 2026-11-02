@@ -16,6 +16,7 @@ use crate::{
     function_analysis::{
         evidence_reaches_computed, expression_evidence, FunctionMetrics, FunctionState,
     },
+    safe_deob::SourceMode,
     source_text::preview,
     state_flatten::{
         self, detect_for_state_machines, IfLadderStateMachineCandidate, OpcodeMapCandidate,
@@ -26,7 +27,6 @@ use crate::{
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{ArrayExpressionElement, Expression};
 use oxc_ast_visit::{walk, Visit};
-use oxc_span::SourceType;
 use oxc_syntax::scope::ScopeFlags;
 use rolldown_redox::ecmascript::parse_program;
 use std::collections::{BTreeSet, HashMap};
@@ -806,10 +806,14 @@ fn sort_scan_inventory(scanner: &mut Scanner<'_>) {
         .sort_by_key(|table| std::cmp::Reverse(table.function_values));
 }
 
-pub fn scan_source_core(source: &str, budget: &WorkBudget) -> Result<ScanCore, BudgetExceeded> {
+pub fn scan_source_core(
+    source: &str,
+    source_mode: SourceMode,
+    budget: &WorkBudget,
+) -> Result<ScanCore, BudgetExceeded> {
     budget.checkpoint()?;
     let allocator = Allocator::default();
-    let parsed = parse_program(&allocator, source, SourceType::cjs());
+    let parsed = parse_program(&allocator, source, source_mode.source_type());
     budget.checkpoint()?;
 
     let mut scanner = Scanner::new(source, budget);
@@ -854,7 +858,7 @@ mod tests {
     fn scanner_propagates_work_budget_exhaustion() {
         let budget = WorkBudget::new("scanner-fuel", work_budget::BudgetLimits::work(0));
         assert!(matches!(
-            scan_source_core("function f(){ return 1; }", &budget),
+            scan_source_core("function f(){ return 1; }", SourceMode::Auto, &budget),
             Err(ref error)
                 if error.kind() == work_budget::BudgetExceededKind::Work
                     && error.scope() == "scanner-fuel"
@@ -895,7 +899,7 @@ mod tests {
         ";
 
         let budget = WorkBudget::unlimited("scanner-test");
-        let core = scan_source_core(source, &budget)?;
+        let core = scan_source_core(source, SourceMode::Auto, &budget)?;
         assert!(!core.fatal_error);
         assert_eq!(core.diagnostics, 0);
         assert_eq!(core.arrays.len(), 1);

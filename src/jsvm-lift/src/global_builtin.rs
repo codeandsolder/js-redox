@@ -5,6 +5,7 @@ use oxc_semantic::Scoping;
 use oxc_syntax::symbol::SymbolId;
 use std::collections::HashMap;
 
+use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 fn unparenthesized<'a>(mut expression: &'a Expression<'a>) -> &'a Expression<'a> {
     while let Expression::ParenthesizedExpression(parenthesized) = expression {
         expression = &parenthesized.expression;
@@ -53,11 +54,13 @@ fn global_object_name(
 pub(crate) fn collect_global_aliases(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> HashMap<SymbolId, String> {
+    budget: &WorkBudget,
+) -> Result<HashMap<SymbolId, String>, BudgetExceeded> {
     struct Collector<'c, 'm> {
         scoping: &'c Scoping,
         known: &'m HashMap<SymbolId, String>,
         discovered: HashMap<SymbolId, String>,
+        poller: BudgetPoller,
     }
 
     impl<'a> Visit<'a> for Collector<'_, '_> {
@@ -65,6 +68,9 @@ pub(crate) fn collect_global_aliases(
             &mut self,
             declaration: &oxc_ast::ast::VariableDeclaration<'a>,
         ) {
+            if !self.poller.poll(1) {
+                return;
+            }
             for declarator in &declaration.declarations {
                 let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
                     continue;
@@ -93,16 +99,19 @@ pub(crate) fn collect_global_aliases(
 
     let mut aliases = HashMap::new();
     loop {
+        budget.consume(1)?;
         let mut collector = Collector {
             scoping,
             known: &aliases,
             discovered: HashMap::new(),
+            poller: BudgetPoller::new(budget, 256),
         };
         collector.visit_program(program);
+        collector.poller.finish()?;
         let before = aliases.len();
         aliases.extend(collector.discovered);
         if aliases.len() == before {
-            return aliases;
+            return Ok(aliases);
         }
     }
 }
@@ -198,6 +207,10 @@ pub(crate) fn namespace_member_name<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("global-builtin-test")
+    }
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
@@ -219,7 +232,8 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let aliases = collect_global_aliases(&parsed.program, scoping);
+        let aliases = collect_global_aliases(&parsed.program, scoping, &test_budget())
+            .expect("unlimited alias test budget should not fail");
         assert_eq!(aliases.len(), 2);
 
         struct Probe<'c, 'g> {
@@ -273,7 +287,9 @@ mod tests {
             .with_check_syntax_error(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let aliases = collect_global_aliases(&parsed.program, semantic.semantic.scoping());
+        let aliases =
+            collect_global_aliases(&parsed.program, semantic.semantic.scoping(), &test_budget())
+                .expect("unlimited alias test budget should not fail");
         assert!(aliases.is_empty());
 
         let source = r#"
@@ -291,7 +307,8 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let aliases = collect_global_aliases(&parsed.program, scoping);
+        let aliases = collect_global_aliases(&parsed.program, scoping, &test_budget())
+            .expect("unlimited alias test budget should not fail");
 
         struct Probe<'c, 'g> {
             scoping: &'c Scoping,

@@ -22,6 +22,7 @@ use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use rolldown_redox::ecmascript::parse_program;
 use std::collections::HashMap;
 use wasmparser::{Parser, Validator};
+use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 
 const MAX_STATIC_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
@@ -461,6 +462,7 @@ fn classify_copy_helper(
 struct HelperCollector<'c> {
     scoping: &'c Scoping,
     helpers: HashMap<SymbolId, CopyHelper>,
+    poller: BudgetPoller,
 }
 
 impl HelperCollector<'_> {
@@ -478,6 +480,9 @@ impl HelperCollector<'_> {
 
 impl<'a> Visit<'a> for HelperCollector<'_> {
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if !self.poller.poll(1) {
+            return;
+        }
         if let Some(identifier) = &function.id {
             if let Some(symbol) = identifier.symbol_id.get() {
                 if let Some(helper) = classify_copy_helper(function, self.scoping, 0) {
@@ -489,6 +494,9 @@ impl<'a> Visit<'a> for HelperCollector<'_> {
     }
 
     fn visit_variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
         for declarator in &declaration.declarations {
             let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
                 continue;
@@ -510,10 +518,14 @@ impl<'a> Visit<'a> for HelperCollector<'_> {
 
 struct DirectCalleeReferenceCollector {
     references: std::collections::HashSet<ReferenceId>,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for DirectCalleeReferenceCollector {
     fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
         if let Expression::Identifier(identifier) = unparenthesized(&call.callee) {
             if let Some(reference_id) = identifier.reference_id.get() {
                 self.references.insert(reference_id);
@@ -526,17 +538,22 @@ impl<'a> Visit<'a> for DirectCalleeReferenceCollector {
 fn collect_helpers(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
-) -> HashMap<SymbolId, CopyHelper> {
+    budget: &WorkBudget,
+) -> Result<HashMap<SymbolId, CopyHelper>, BudgetExceeded> {
     let mut collector = HelperCollector {
         scoping,
         helpers: HashMap::new(),
+        poller: BudgetPoller::new(budget, 256),
     };
     collector.visit_program(program);
+    collector.poller.finish()?;
 
     let mut direct_calls = DirectCalleeReferenceCollector {
         references: std::collections::HashSet::new(),
+        poller: BudgetPoller::new(budget, 256),
     };
     direct_calls.visit_program(program);
+    direct_calls.poller.finish()?;
     collector.helpers.retain(|symbol, _| {
         scoping
             .get_resolved_reference_ids(*symbol)
@@ -546,7 +563,7 @@ fn collect_helpers(
                     && statically_resolved_symbol(scoping, *reference_id) == Some(*symbol)
             })
     });
-    collector.helpers
+    Ok(collector.helpers)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -561,10 +578,14 @@ struct SinkCollector<'c, 'g, 'e, 'h> {
     evaluator: &'e Evaluator<'c, 'h, 'g>,
     sinks: Vec<Sink>,
     direct_artifacts: HashMap<(u32, u32), RecoveredByteArtifact>,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for SinkCollector<'_, '_, '_, '_> {
     fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
         let webassembly_member = (!call.optional)
             .then(|| {
                 namespace_member_name(
@@ -606,6 +627,9 @@ impl<'a> Visit<'a> for SinkCollector<'_, '_, '_, '_> {
     }
 
     fn visit_new_expression(&mut self, expression: &oxc_ast::ast::NewExpression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
         if namespace_member_name(
             self.scoping,
             self.global_aliases,
@@ -755,13 +779,16 @@ fn decoded_static_wasm_carriers(text: &str) -> Vec<(Vec<u8>, &'static str, Optio
         .collect()
 }
 
-#[derive(Default)]
 struct InlineWasmLiteralCollector {
     artifacts: Vec<RecoveredInlineWasmArtifact>,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for InlineWasmLiteralCollector {
     fn visit_string_literal(&mut self, literal: &oxc_ast::ast::StringLiteral<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
         let Some(text) = literal.value.as_str() else {
             return;
         };
@@ -780,13 +807,18 @@ impl<'a> Visit<'a> for InlineWasmLiteralCollector {
 
 fn collect_inline_wasm_literals(
     program: &oxc_ast::ast::Program<'_>,
-) -> Vec<RecoveredInlineWasmArtifact> {
-    let mut collector = InlineWasmLiteralCollector::default();
+    budget: &WorkBudget,
+) -> Result<Vec<RecoveredInlineWasmArtifact>, BudgetExceeded> {
+    let mut collector = InlineWasmLiteralCollector {
+        artifacts: Vec::new(),
+        poller: BudgetPoller::new(budget, 256),
+    };
     collector.visit_program(program);
+    collector.poller.finish()?;
     collector
         .artifacts
         .sort_by_key(|artifact| (artifact.source_start, artifact.source_end));
-    collector.artifacts
+    Ok(collector.artifacts)
 }
 
 fn exact_byte(expression: &Expression<'_>) -> Option<u8> {
@@ -816,10 +848,12 @@ struct Evaluator<'c, 'h, 'g> {
     scoping: &'c Scoping,
     helpers: &'h HashMap<SymbolId, CopyHelper>,
     global_aliases: &'g HashMap<SymbolId, String>,
+    budget: WorkBudget,
 }
 
 impl Evaluator<'_, '_, '_> {
     fn eval(&self, expression: &Expression<'_>, state: &mut EvalState) -> Option<StaticValue> {
+        self.budget.consume(1).ok()?;
         match unparenthesized(expression) {
             Expression::NumericLiteral(_) => exact_usize(expression).map(StaticValue::Number),
             Expression::StringLiteral(literal) => literal
@@ -908,6 +942,9 @@ impl Evaluator<'_, '_, '_> {
     }
 
     fn helper_call(&self, call: &oxc_ast::ast::CallExpression<'_>, state: &mut EvalState) -> bool {
+        if self.budget.consume(1).is_err() {
+            return false;
+        }
         if call.optional || call.arguments.iter().any(Argument::is_spread) {
             return false;
         }
@@ -979,17 +1016,22 @@ fn expression_buffer_ids(
     expression: &Expression<'_>,
     scoping: &Scoping,
     state: &EvalState,
+    budget: &WorkBudget,
 ) -> Vec<usize> {
     struct Collector<'c, 's> {
         scoping: &'c Scoping,
         state: &'s EvalState,
         out: Vec<usize>,
+        poller: BudgetPoller,
     }
     impl<'a> Visit<'a> for Collector<'_, '_> {
         fn visit_identifier_reference(
             &mut self,
             identifier: &oxc_ast::ast::IdentifierReference<'a>,
         ) {
+            if !self.poller.poll(1) {
+                return;
+            }
             let Some(reference_id) = identifier.reference_id.get() else {
                 return;
             };
@@ -1008,8 +1050,10 @@ fn expression_buffer_ids(
         scoping,
         state,
         out: Vec::new(),
+        poller: BudgetPoller::new(budget, 256),
     };
     collector.visit_expression(expression);
+    let _ = collector.poller.finish();
     collector.out
 }
 
@@ -1033,7 +1077,9 @@ fn normal_expression(
                     state.values.remove(&symbol);
                 }
             } else {
-                for id in expression_buffer_ids(expression, evaluator.scoping, state) {
+                for id in
+                    expression_buffer_ids(expression, evaluator.scoping, state, &evaluator.budget)
+                {
                     state.invalidate_buffer(id, "unsupported_buffer_assignment");
                 }
             }
@@ -1053,13 +1099,16 @@ fn normal_expression(
                     state.invalidate_all_buffers("spread_argument_to_unknown_call");
                     continue;
                 };
-                for id in expression_buffer_ids(argument, evaluator.scoping, state) {
+                for id in
+                    expression_buffer_ids(argument, evaluator.scoping, state, &evaluator.budget)
+                {
                     state.invalidate_buffer(id, "buffer_passed_to_unknown_call");
                 }
             }
         }
         _ => {
-            for id in expression_buffer_ids(expression, evaluator.scoping, state) {
+            for id in expression_buffer_ids(expression, evaluator.scoping, state, &evaluator.budget)
+            {
                 state.invalidate_buffer(id, "unsupported_buffer_use");
             }
         }
@@ -1369,18 +1418,22 @@ fn statements_to_sink(
     None
 }
 
-#[must_use]
 pub fn recover_webassembly_byte_artifacts_from_program(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
-) -> StaticByteRecoverySummary {
-    let helpers = collect_helpers(program, scoping);
-    let inline_wasm_literals = collect_inline_wasm_literals(program);
-    let global_aliases = collect_global_aliases(program, scoping);
+    budget: &WorkBudget,
+) -> Result<StaticByteRecoverySummary, BudgetExceeded> {
+    budget.checkpoint()?;
+    let helpers = collect_helpers(program, scoping, budget)?;
+    let inline_wasm_literals = collect_inline_wasm_literals(program, budget)?;
+    budget.checkpoint()?;
+    let global_aliases = collect_global_aliases(program, scoping, budget)?;
+    budget.checkpoint()?;
     let evaluator = Evaluator {
         scoping,
         helpers: &helpers,
         global_aliases: &global_aliases,
+        budget: budget.clone(),
     };
     let mut sink_collector = SinkCollector {
         scoping,
@@ -1388,12 +1441,15 @@ pub fn recover_webassembly_byte_artifacts_from_program(
         evaluator: &evaluator,
         sinks: Vec::new(),
         direct_artifacts: HashMap::new(),
+        poller: BudgetPoller::new(budget, 256),
     };
     sink_collector.visit_program(program);
+    sink_collector.poller.finish()?;
     let sink_count = sink_collector.sinks.len();
     let mut out = Vec::new();
     let mut sink_diagnostics = Vec::with_capacity(sink_count);
     for sink in sink_collector.sinks {
+        budget.consume(1)?;
         let mut state = EvalState::default();
         let artifact = sink_collector
             .direct_artifacts
@@ -1418,13 +1474,14 @@ pub fn recover_webassembly_byte_artifacts_from_program(
         });
     }
     out.sort_by_key(|artifact| artifact.sink_start);
-    StaticByteRecoverySummary {
+    budget.checkpoint()?;
+    Ok(StaticByteRecoverySummary {
         artifacts: out,
         inline_wasm_literals,
         proven_copy_helpers: helpers.len(),
         webassembly_sinks: sink_count,
         sink_diagnostics,
-    }
+    })
 }
 
 /// Recover exact byte buffers that are proven to reach a WebAssembly compilation sink.
@@ -1434,8 +1491,11 @@ pub fn recover_webassembly_byte_artifacts_from_program(
 /// ambiguous, or dynamic scope prevents static name resolution.
 pub fn analyze_webassembly_byte_artifacts(
     source: &str,
+    budget: &WorkBudget,
 ) -> anyhow::Result<StaticByteRecoverySummary> {
+    budget.checkpoint()?;
     for source_type in [SourceType::unambiguous(), SourceType::cjs()] {
+        budget.consume(1)?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, source_type);
         if !parsed.is_clean() {
@@ -1450,22 +1510,45 @@ pub fn analyze_webassembly_byte_artifacts(
         return Ok(recover_webassembly_byte_artifacts_from_program(
             &parsed.program,
             semantic.semantic.scoping(),
-        ));
+            budget,
+        )?);
     }
     anyhow::bail!("JavaScript did not parse as unambiguous or CommonJS source")
 }
 
 pub fn recover_webassembly_byte_artifacts(
     source: &str,
+    budget: &WorkBudget,
 ) -> anyhow::Result<Vec<RecoveredByteArtifact>> {
-    Ok(analyze_webassembly_byte_artifacts(source)?.artifacts)
+    Ok(analyze_webassembly_byte_artifacts(source, budget)?.artifacts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("static-bytes-test")
+    }
+
     fn recover(source: &str) -> Vec<RecoveredByteArtifact> {
-        recover_webassembly_byte_artifacts(source).unwrap_or_default()
+        recover_webassembly_byte_artifacts(source, &test_budget()).unwrap_or_default()
+    }
+
+    #[test]
+    fn static_byte_analysis_propagates_work_budget_exhaustion() {
+        let budget = WorkBudget::new(
+            "static-byte-budget-test",
+            work_budget::BudgetLimits::work(0),
+        );
+        let error = analyze_webassembly_byte_artifacts(
+            "WebAssembly.compile(new Uint8Array([0,97,115,109,1,0,0,0]));",
+            &budget,
+        )
+        .expect_err("zero work budget must abort static byte analysis");
+        let exceeded = work_budget::find_budget_exceeded(error.as_ref())
+            .expect("analysis error should retain budget exhaustion");
+        assert_eq!(exceeded.kind(), work_budget::BudgetExceededKind::Work);
+        assert_eq!(exceeded.scope(), "static-byte-budget-test");
     }
 
     #[test]
@@ -1474,7 +1557,7 @@ mod tests {
             const module = "AGFzbQEAAAA=";
             consume(module);
         "#;
-        let analysis = analyze_webassembly_byte_artifacts(complete);
+        let analysis = analyze_webassembly_byte_artifacts(complete, &test_budget());
         assert!(analysis.is_ok());
         let Ok(analysis) = analysis else {
             return;
@@ -1486,7 +1569,7 @@ mod tests {
             const chunk = "AGFzbQEAAAAB";
             consume(chunk);
         "#;
-        let analysis = analyze_webassembly_byte_artifacts(truncated);
+        let analysis = analyze_webassembly_byte_artifacts(truncated, &test_budget());
         assert!(analysis.is_ok());
         let Ok(analysis) = analysis else {
             return;
@@ -1501,7 +1584,7 @@ mod tests {
             const data = "data:application/octet-stream;base64,AGFzbQEAAAA=";
             const serialized = '["not wasm", "AGFzbQEAAAA=", {"nested":"AGFzbQEAAAA="}]';
         "#;
-        let analysis = analyze_webassembly_byte_artifacts(source);
+        let analysis = analyze_webassembly_byte_artifacts(source, &test_budget());
         assert!(analysis.is_ok());
         let Ok(analysis) = analysis else {
             return;
@@ -1586,7 +1669,7 @@ mod tests {
                 return WebAssembly.instantiate(bytes, imports);
             }
         "#;
-        let analysis = analyze_webassembly_byte_artifacts(source);
+        let analysis = analyze_webassembly_byte_artifacts(source, &test_budget());
         assert!(analysis.is_ok());
         let Ok(analysis) = analysis else {
             return;

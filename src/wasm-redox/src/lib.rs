@@ -334,7 +334,7 @@ pub fn deep_analyze(
         let Some(export) = function.exports.first() else {
             continue;
         };
-        match state_machine::analyze_export_semantics(bytes, export) {
+        match state_machine::analyze_export_semantics(bytes, export, budget) {
             Ok(analysis) => exports.push(DeepExportAnalysis {
                 export: export.clone(),
                 function_index: function.index,

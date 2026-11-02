@@ -722,8 +722,9 @@ fn analyze_program(
     if has_dynamic_scope(program, scoping) {
         return Ok(WasmImportSemanticsAnalysis::default());
     }
-    let global_aliases = collect_global_aliases(program, scoping);
-    let exact_module_sites = collect_exact_module_sites(source, program, scoping, &global_aliases);
+    let global_aliases = collect_global_aliases(program, scoping, budget)?;
+    let exact_module_sites =
+        collect_exact_module_sites(source, program, scoping, &global_aliases, budget)?;
     let instantiation_sites =
         collect_instantiation_sites(program, scoping, &global_aliases, &exact_module_sites);
     let module_memory_identity_proofs =
@@ -805,7 +806,7 @@ fn collect_proof_normalized_handler_semantics(
         if has_dynamic_scope(&parsed.program, scoping) {
             return Ok(Vec::new());
         }
-        let global_aliases = collect_global_aliases(&parsed.program, scoping);
+        let global_aliases = collect_global_aliases(&parsed.program, scoping, budget)?;
         struct Collector<'c, 'g> {
             scoping: &'c Scoping,
             global_aliases: &'g HashMap<SymbolId, String>,

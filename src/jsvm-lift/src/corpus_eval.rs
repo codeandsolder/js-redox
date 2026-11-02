@@ -31,16 +31,21 @@ pub struct CorpusManifest {
     pub samples: Vec<CorpusSample>,
 }
 
-fn raw_role() -> String {
-    "raw".to_owned()
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CorpusRole {
+    #[default]
+    Raw,
+    Reference,
+    DeobfuscatedReference,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CorpusSample {
     pub id: String,
     pub family: String,
-    #[serde(default = "raw_role")]
-    pub role: String,
+    #[serde(default)]
+    pub role: CorpusRole,
     pub path: PathBuf,
     pub bytes: u64,
     pub sha256: String,
@@ -152,7 +157,7 @@ impl ScannerMetrics {
 pub struct CorpusEvalRow {
     pub id: String,
     pub family: String,
-    pub role: String,
+    pub role: CorpusRole,
     pub bytes: u64,
     pub sha256: String,
     pub formatter_bytes: Option<usize>,
@@ -192,6 +197,21 @@ fn relative_sample_path(path: &Path) -> bool {
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
             )
         })
+}
+
+fn canonical_corpus_path(root: &Path, relative: &Path, label: &str) -> Result<PathBuf> {
+    let candidate = root.join(relative);
+    let canonical = candidate
+        .canonicalize()
+        .with_context(|| format!("{label}: resolving {}", candidate.display()))?;
+    if !canonical.starts_with(root) {
+        bail!(
+            "{label}: resolved path {} escapes corpus root {}",
+            canonical.display(),
+            root.display()
+        );
+    }
+    Ok(canonical)
 }
 
 fn validate_manifest(manifest: &CorpusManifest) -> Result<()> {
@@ -463,6 +483,9 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
         .with_context(|| format!("parsing manifest {}", manifest_path.display()))?;
     validate_manifest(&manifest)
         .with_context(|| format!("validating manifest {}", manifest_path.display()))?;
+    let corpus_root = corpus_root
+        .canonicalize()
+        .with_context(|| format!("resolving corpus root {}", corpus_root.display()))?;
 
     let temp = TempDir::new().context("creating corpus-eval scratch directory")?;
     let budgets = AnalysisBudgets::standard(format!("corpus-eval:{}", manifest_path.display()));
@@ -475,7 +498,8 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
     for sample in &manifest.samples {
         let sample_budget = budgets.operation(AnalysisOperation::CorpusEvaluation, &sample.id);
         sample_budget.checkpoint()?;
-        let raw_path = corpus_root.join(&sample.path);
+        let raw_path =
+            canonical_corpus_path(&corpus_root, &sample.path, &format!("{} sample", sample.id))?;
         let raw_bytes = verify_file(&raw_path, sample.bytes, &sample.sha256, &sample.id)?;
 
         if let Some(source) = sample
@@ -491,12 +515,12 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
             }
         }
 
-        if sample.role != "raw" {
+        if sample.role != CorpusRole::Raw {
             reference_samples += 1;
             rows.push(CorpusEvalRow {
                 id: sample.id.clone(),
                 family: sample.family.clone(),
-                role: sample.role.clone(),
+                role: sample.role,
                 bytes: sample.bytes,
                 sha256: sample.sha256.clone(),
                 formatter_bytes: None,
@@ -533,7 +557,8 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
             &syntax_budget,
         )?;
         if let Some(pretty_path) = &sample.pretty_path {
-            let committed_path = corpus_root.join(pretty_path);
+            let committed_path =
+                canonical_corpus_path(&corpus_root, pretty_path, &format!("{} pretty", sample.id))?;
             if let (Some(expected_bytes), Some(expected_sha)) =
                 (sample.pretty_bytes, sample.pretty_sha256.as_deref())
             {
@@ -598,7 +623,7 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
             AnalysisOperation::StructuralScan,
             &sample.id,
         );
-        let scan = scan_source(&pretty, sample.id.clone(), None, &scan_budget)?;
+        let scan = scan_source(&pretty, sample.id.clone(), None, source_mode, &scan_budget)?;
         if scan.fatal_error {
             bail!("{}: scanner fatal error", sample.id);
         }
@@ -617,7 +642,7 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
         rows.push(CorpusEvalRow {
             id: sample.id.clone(),
             family: sample.family.clone(),
-            role: sample.role.clone(),
+            role: sample.role,
             bytes: sample.bytes,
             sha256: sample.sha256.clone(),
             formatter_bytes: Some(pretty.len()),
@@ -677,9 +702,43 @@ mod tests {
             }"#,
         )?;
         let sample = manifest.samples.first().context("sample missing")?;
-        assert_eq!(sample.role, "raw");
+        assert_eq!(sample.role, CorpusRole::Raw);
         assert_eq!(sample.expect_deob_rewrites_min, Some(3));
         assert_eq!(sample.expect_table_vm_max, Some(7));
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_rejects_unknown_corpus_role() {
+        let error = serde_json::from_str::<CorpusManifest>(
+            r#"{
+              "schema":"jsvm-corpus/v1",
+              "samples":[{
+                "id":"bad-role","family":"fixture","role":"refernece",
+                "path":"sample.js","bytes":1,"sha256":"00"
+              }]
+            }"#,
+        )
+        .expect_err("unknown corpus role must fail closed");
+        assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_corpus_path_rejects_symlink_escape() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let scratch = TempDir::new()?;
+        let corpus = scratch.path().join("corpus");
+        fs::create_dir(&corpus)?;
+        let outside = scratch.path().join("outside.js");
+        fs::write(&outside, "export const escaped = true;")?;
+        symlink(&outside, corpus.join("sample.js"))?;
+        let canonical_root = corpus.canonicalize()?;
+
+        let error = canonical_corpus_path(&canonical_root, Path::new("sample.js"), "fixture")
+            .expect_err("symlink escape must fail closed");
+        assert!(error.to_string().contains("escapes corpus root"));
         Ok(())
     }
 

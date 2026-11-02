@@ -4,6 +4,7 @@ use crate::{
     dispatch::{DirectSwitchMapCandidate, HandlerTableCandidate},
     embedded::EmbeddedCodeCandidate,
     function_analysis::FunctionMetrics,
+    safe_deob::SourceMode,
     scanner::scan_source_core,
     state_flatten::{IfLadderStateMachineCandidate, OpcodeMapCandidate, StateMachineCandidate},
     table_vm,
@@ -82,7 +83,7 @@ fn scan_embedded_candidate(
         Some(path.display().to_string())
     });
 
-    let core = scan_source_core(&wrapper, budget)?;
+    let core = scan_source_core(&wrapper, SourceMode::CommonJs, budget)?;
     let embedded = if depth < 3 {
         core.embedded_code
             .into_iter()
@@ -120,9 +121,10 @@ pub fn scan_source(
     source: &str,
     input_label: impl Into<String>,
     dump_dir: Option<&Path>,
+    source_mode: SourceMode,
     budget: &WorkBudget,
 ) -> Result<ScanReport> {
-    let core = scan_source_core(source, budget)?;
+    let core = scan_source_core(source, source_mode, budget)?;
     let embedded = core
         .embedded_code
         .into_iter()
@@ -152,7 +154,13 @@ pub fn scan_source(
 
 pub fn scan_file(path: &Path, dump_dir: Option<&Path>, budget: &WorkBudget) -> Result<ScanReport> {
     let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    scan_source(&source, path.display().to_string(), dump_dir, budget)
+    scan_source(
+        &source,
+        path.display().to_string(),
+        dump_dir,
+        SourceMode::for_path(path),
+        budget,
+    )
 }
 
 #[cfg(test)]
@@ -163,10 +171,20 @@ mod tests {
     fn report_surface_preserves_scanner_inventory() -> Result<()> {
         let source = "function f(){ const code=[0,1,2,3]; return code[0]; }";
         let budget = WorkBudget::unlimited("scan-report-test");
-        let report = scan_source(source, "fixture.js", None, &budget)?;
+        let report = scan_source(source, "fixture.js", None, SourceMode::Auto, &budget)?;
         assert_eq!(report.file, "fixture.js");
         assert_eq!(report.bytes, source.len());
         assert!(!report.fatal_error);
+        Ok(())
+    }
+
+    #[test]
+    fn scanner_respects_module_source_mode() -> Result<()> {
+        let source = "export const value = 1;";
+        let budget = WorkBudget::unlimited("scan-report-module-test");
+        let report = scan_source(source, "fixture.mjs", None, SourceMode::Module, &budget)?;
+        assert!(!report.fatal_error);
+        assert!(report.diagnostics.is_empty());
         Ok(())
     }
 }
