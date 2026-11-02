@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
-use jsvm_lift::table_ir::materialize;
+use jsvm_lift::{
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
+    table_ir::materialize,
+};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -14,7 +17,12 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    materialize(&args.source, &args.scan, &args.output)?;
+    let budgets = AnalysisBudgets::standard("table-ir");
+    let budget = budgets.operation(
+        AnalysisOperation::IrMaterialization,
+        args.source.display().to_string(),
+    );
+    materialize(&args.source, &args.scan, &args.output, &budget)?;
     println!("wrote {}", args.output.display());
     Ok(())
 }

@@ -34,3 +34,5 @@ sha2.workspace = true
 url.workspace = true
 wasmparser.workspace = true
 wasm-redox = { path = "../wasm-redox" }
+
+work-budget.workspace = true

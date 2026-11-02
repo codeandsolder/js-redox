@@ -1,5 +1,6 @@
 use crate::{
     analysis_artifacts::{write_artifact, WASM_RESOURCE_PROVENANCE},
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::load_manifest,
 };
 use anyhow::{Context, Result};
@@ -202,13 +203,22 @@ fn observation_key(row: &Value) -> (String, String, String, String) {
     )
 }
 
-pub fn correlate_wasm_resource_provenance(project: &Path) -> Result<WasmResourceProvenanceSummary> {
+pub fn correlate_wasm_resource_provenance(
+    project: &Path,
+    budgets: &AnalysisBudgets,
+) -> Result<WasmResourceProvenanceSummary> {
     let project = project
         .canonicalize()
         .with_context(|| format!("resolving project {}", project.display()))?;
+    let budget = budgets.operation(
+        AnalysisOperation::RuntimeAnalysis,
+        project.display().to_string(),
+    );
+    budget.checkpoint()?;
     let manifest = load_manifest(&project)?;
     if manifest.source.kind != "recorder" {
         let document = unavailable("not_recorder_capture");
+        budget.checkpoint()?;
         write_artifact(&project, WASM_RESOURCE_PROVENANCE, &document)?;
         return Ok(WasmResourceProvenanceSummary {
             observations: 0,
@@ -232,6 +242,7 @@ pub fn correlate_wasm_resource_provenance(project: &Path) -> Result<WasmResource
             applicable: false,
         });
     }
+    budget.checkpoint()?;
     let cdp_document = match load_json(&cdp_path) {
         Ok(document) => document,
         Err(_) => {
@@ -258,10 +269,12 @@ pub fn correlate_wasm_resource_provenance(project: &Path) -> Result<WasmResource
         });
     };
 
+    budget.checkpoint()?;
     let mut wasm_resources: HashMap<(String, String), Vec<u64>> = HashMap::new();
     let mut wasm_resources_by_url: HashMap<String, Vec<&Map<String, Value>>> = HashMap::new();
     let mut js_resources_by_url: HashMap<String, Vec<u64>> = HashMap::new();
     for resource in &manifest.resources {
+        budget.checkpoint()?;
         let Some(resource) = resource.as_object() else {
             continue;
         };
@@ -301,6 +314,7 @@ pub fn correlate_wasm_resource_provenance(project: &Path) -> Result<WasmResource
 
     let mut cdp_wasm_counts: HashMap<String, usize> = HashMap::new();
     for row in cdp_rows {
+        budget.checkpoint()?;
         let Some(row) = row.as_object() else {
             continue;
         };
@@ -319,6 +333,7 @@ pub fn correlate_wasm_resource_provenance(project: &Path) -> Result<WasmResource
     let mut ignored_non_body = Vec::new();
 
     for row in cdp_rows {
+        budget.checkpoint()?;
         let Some(row) = row.as_object() else {
             continue;
         };
@@ -451,6 +466,7 @@ pub fn correlate_wasm_resource_provenance(project: &Path) -> Result<WasmResource
         }));
     }
 
+    budget.checkpoint()?;
     observations.sort_by_key(observation_key);
     unmatched.sort_by_key(|row| {
         let Some(row) = row.as_object() else {

@@ -1,5 +1,6 @@
 use crate::{
     analysis_artifacts::{write_artifact, WASM_INDEX},
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::load_manifest,
     sha256_hex,
     static_bytes::analyze_webassembly_byte_artifacts,
@@ -13,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+use work_budget::{run_command, CommandRunError, WorkBudget};
 
 const PARSE_REFUSAL: &str = "JavaScript did not parse as unambiguous or CommonJS source";
 
@@ -77,11 +79,13 @@ fn origin_with(
     Value::Object(origin)
 }
 
-fn write_wax(binary: &Path, output: &Path, wax: &Path) -> Result<()> {
-    let result = Command::new(wax).arg(binary).output();
+fn write_wax(binary: &Path, output: &Path, wax: &Path, budget: &WorkBudget) -> Result<()> {
+    let mut command = Command::new(wax);
+    command.arg(binary);
+    let result = run_command(&mut command, budget);
     let result = match result {
         Ok(result) => result,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
+        Err(CommandRunError::Spawn(error)) if error.kind() == ErrorKind::NotFound => {
             eprintln!(
                 "wasm-materialize: Wax not found at {}; skipping high-level view",
                 wax.display()
@@ -102,11 +106,20 @@ fn write_wax(binary: &Path, output: &Path, wax: &Path) -> Result<()> {
     fs::write(output, result.stdout).with_context(|| format!("writing {}", output.display()))
 }
 
-fn analyze_module(binary: &Path, output_dir: &Path, wax: Option<&Path>) -> Result<()> {
+fn analyze_module(
+    binary: &Path,
+    output_dir: &Path,
+    wax: Option<&Path>,
+    budget: &WorkBudget,
+) -> Result<()> {
+    budget.checkpoint()?;
     let bytes = fs::read(binary).with_context(|| format!("reading {}", binary.display()))?;
-    let report = wasm_redox::analyze(&bytes)?;
-    let wat = wasm_redox::folded_wat(&bytes)?;
-    let deep = wasm_redox::deep_analyze(&bytes, &report);
+    let report = wasm_redox::analyze(&bytes, budget)?;
+    budget.checkpoint()?;
+    let wat = wasm_redox::folded_wat(&bytes, budget)?;
+    budget.checkpoint()?;
+    let deep = wasm_redox::deep_analyze(&bytes, &report, budget)?;
+    budget.checkpoint()?;
 
     fs::create_dir_all(output_dir).with_context(|| format!("creating {}", output_dir.display()))?;
     fs::write(
@@ -120,7 +133,9 @@ fn analyze_module(binary: &Path, output_dir: &Path, wax: Option<&Path>) -> Resul
     )?;
     let wax_output = output_dir.join("module.readable.wax");
     if let Some(wax) = wax {
-        write_wax(binary, &wax_output, wax)?;
+        budget.checkpoint()?;
+        write_wax(binary, &wax_output, wax, budget)?;
+        budget.checkpoint()?;
     } else if wax_output.exists() {
         fs::remove_file(&wax_output)
             .with_context(|| format!("removing stale {}", wax_output.display()))?;
@@ -128,10 +143,19 @@ fn analyze_module(binary: &Path, output_dir: &Path, wax: Option<&Path>) -> Resul
     Ok(())
 }
 
-pub fn materialize_wasm(project: &Path, wax: Option<&Path>) -> Result<WasmMaterializeSummary> {
+pub fn materialize_wasm(
+    project: &Path,
+    wax: Option<&Path>,
+    budgets: &AnalysisBudgets,
+) -> Result<WasmMaterializeSummary> {
     let project = project
         .canonicalize()
         .with_context(|| format!("resolving project {}", project.display()))?;
+    let stage_budget = budgets.operation(
+        AnalysisOperation::WasmAnalysis,
+        project.display().to_string(),
+    );
+    stage_budget.checkpoint()?;
     let manifest = load_manifest(&project)?;
     let analysis_root = project.join("analysis/wasm");
     let modules_root = analysis_root.join("modules");
@@ -143,6 +167,7 @@ pub fn materialize_wasm(project: &Path, wax: Option<&Path>) -> Result<WasmMateri
     let mut inline_origin = BTreeSet::new();
 
     for resource in &manifest.resources {
+        stage_budget.checkpoint()?;
         if resource.get("kind").and_then(Value::as_str) != Some("wasm")
             || resource.get("body_present").and_then(Value::as_bool) != Some(true)
         {
@@ -231,6 +256,12 @@ pub fn materialize_wasm(project: &Path, wax: Option<&Path>) -> Result<WasmMateri
 
     let mut seen_occurrences: BTreeSet<(String, &'static str, u32, u32)> = BTreeSet::new();
     for source in sources {
+        let budget = budgets.operation_under(
+            &stage_budget,
+            AnalysisOperation::WasmAnalysis,
+            source.path.display().to_string(),
+        );
+        budget.checkpoint()?;
         let raw =
             fs::read(&source.path).with_context(|| format!("reading {}", source.path.display()))?;
         if !contains_bytes(&raw, b"AGFzbQ") && !contains_bytes(&raw, b"WebAssembly") {
@@ -245,8 +276,10 @@ pub fn materialize_wasm(project: &Path, wax: Option<&Path>) -> Result<WasmMateri
                 return Err(error).with_context(|| format!("analyzing {}", source.path.display()));
             }
         };
+        budget.checkpoint()?;
 
         for artifact in recovery.inline_wasm_literals {
+            budget.checkpoint()?;
             let key = (
                 source.source_path.clone(),
                 "inline_base64_literal",
@@ -283,6 +316,7 @@ pub fn materialize_wasm(project: &Path, wax: Option<&Path>) -> Result<WasmMateri
         }
 
         for artifact in recovery.artifacts {
+            budget.checkpoint()?;
             let key = (
                 source.source_path.clone(),
                 "static_byte_assembly",
@@ -331,12 +365,15 @@ pub fn materialize_wasm(project: &Path, wax: Option<&Path>) -> Result<WasmMateri
     let mut failed = 0usize;
     let mut origin_count = 0usize;
     for (digest, module_origins) in &origins {
+        stage_budget.checkpoint()?;
         origin_count += module_origins.len();
         let binary = binary_paths
             .get(digest)
             .with_context(|| format!("missing binary path for recovered WASM {digest}"))?;
         let output = modules_root.join(digest);
-        let analysis = analyze_module(binary, &output, wax);
+        let budget =
+            budgets.operation_under(&stage_budget, AnalysisOperation::WasmAnalysis, digest);
+        let analysis = analyze_module(binary, &output, wax, &budget);
         let mut row = Map::new();
         row.insert("sha256".into(), Value::String(digest.clone()));
         row.insert(
@@ -460,7 +497,11 @@ mod tests {
             let manifest = validate_manifest_value(&manifest_value, "test")?;
             write_manifest(&project.join("capture-manifest.json"), &manifest)?;
 
-            let summary = materialize_wasm(&project, None)?;
+            let summary = materialize_wasm(
+                &project,
+                None,
+                &AnalysisBudgets::standard("wasm-materialize-test"),
+            )?;
             assert_eq!(summary.modules, 1);
             assert_eq!(summary.origins, 2);
             assert_eq!(summary.failed, 0);

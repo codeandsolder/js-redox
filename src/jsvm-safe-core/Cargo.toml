@@ -22,3 +22,5 @@ regex.workspace = true
 rolldown_redox = { workspace = true, features = ["ecmascript"] }
 serde_json.workspace = true
 string_wizard.workspace = true
+
+work-budget.workspace = true

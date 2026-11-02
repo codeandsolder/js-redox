@@ -11,6 +11,7 @@ use crate::{
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::{fs, path::Path};
+use work_budget::WorkBudget;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EmbeddedScanReport {
@@ -61,7 +62,8 @@ fn scan_embedded_candidate(
     candidate: EmbeddedCodeCandidate,
     depth: usize,
     dump_dir: Option<&Path>,
-) -> EmbeddedScanReport {
+    budget: &WorkBudget,
+) -> Result<EmbeddedScanReport> {
     let wrapper = format!(
         "function __embedded({}) {{\n{}\n}}\n",
         candidate.params.join(","),
@@ -80,17 +82,17 @@ fn scan_embedded_candidate(
         Some(path.display().to_string())
     });
 
-    let core = scan_source_core(&wrapper);
+    let core = scan_source_core(&wrapper, budget)?;
     let embedded = if depth < 3 {
         core.embedded_code
             .into_iter()
-            .map(|child| scan_embedded_candidate(child, depth + 1, dump_dir))
-            .collect()
+            .map(|child| scan_embedded_candidate(child, depth + 1, dump_dir, budget))
+            .collect::<Result<Vec<_>>>()?
     } else {
         Vec::new()
     };
 
-    EmbeddedScanReport {
+    Ok(EmbeddedScanReport {
         outer_start: candidate.outer_start,
         outer_end: candidate.outer_end,
         kind: candidate.kind,
@@ -111,22 +113,23 @@ fn scan_embedded_candidate(
         table_vms: core.table_vms,
         functions: core.functions,
         embedded,
-    }
+    })
 }
 
 pub fn scan_source(
     source: &str,
     input_label: impl Into<String>,
     dump_dir: Option<&Path>,
-) -> ScanReport {
-    let core = scan_source_core(source);
+    budget: &WorkBudget,
+) -> Result<ScanReport> {
+    let core = scan_source_core(source, budget)?;
     let embedded = core
         .embedded_code
         .into_iter()
-        .map(|candidate| scan_embedded_candidate(candidate, 1, dump_dir))
-        .collect();
+        .map(|candidate| scan_embedded_candidate(candidate, 1, dump_dir, budget))
+        .collect::<Result<Vec<_>>>()?;
 
-    ScanReport {
+    Ok(ScanReport {
         file: input_label.into(),
         bytes: source.len(),
         diagnostics: core.diagnostics,
@@ -144,12 +147,12 @@ pub fn scan_source(
         table_vms: core.table_vms,
         functions: core.functions,
         embedded,
-    }
+    })
 }
 
-pub fn scan_file(path: &Path, dump_dir: Option<&Path>) -> Result<ScanReport> {
+pub fn scan_file(path: &Path, dump_dir: Option<&Path>, budget: &WorkBudget) -> Result<ScanReport> {
     let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(scan_source(&source, path.display().to_string(), dump_dir))
+    scan_source(&source, path.display().to_string(), dump_dir, budget)
 }
 
 #[cfg(test)]
@@ -157,11 +160,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn report_surface_preserves_scanner_inventory() {
+    fn report_surface_preserves_scanner_inventory() -> Result<()> {
         let source = "function f(){ const code=[0,1,2,3]; return code[0]; }";
-        let report = scan_source(source, "fixture.js", None);
+        let budget = WorkBudget::unlimited("scan-report-test");
+        let report = scan_source(source, "fixture.js", None, &budget)?;
         assert_eq!(report.file, "fixture.js");
         assert_eq!(report.bytes, source.len());
         assert!(!report.fatal_error);
+        Ok(())
     }
 }

@@ -3,6 +3,7 @@ use crate::{
         load_artifact, write_artifact, BUNDLES, DEOBFUSCATION, GENERATED_RECOVERY, JSVM_INDEX,
         SOURCE_INDEX,
     },
+    analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     content_dedup::{link_or_copy, sha256_path},
     js_format::format_source,
     safe_deob::{deobfuscate_source, SourceMode},
@@ -16,11 +17,13 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use work_budget::WorkBudget;
 
 #[derive(Debug, Clone)]
 pub struct ProjectScanOptions {
     pub max_generated_depth: usize,
     pub max_code_units: usize,
+    pub budgets: AnalysisBudgets,
 }
 
 impl Default for ProjectScanOptions {
@@ -28,6 +31,7 @@ impl Default for ProjectScanOptions {
         Self {
             max_generated_depth: 8,
             max_code_units: 256,
+            budgets: AnalysisBudgets::standard("project-scan"),
         }
     }
 }
@@ -148,6 +152,8 @@ fn recover_generated_unit(
     raw_rel: &str,
     scan_id: usize,
     ordinal: usize,
+    budgets: &AnalysisBudgets,
+    parent_budget: &WorkBudget,
 ) -> Result<Value> {
     let recovery_rel =
         PathBuf::from("analysis/generated-recovery").join(format!("{scan_id:04}-{ordinal:03}"));
@@ -186,55 +192,84 @@ fn recover_generated_unit(
             raw.display()
         );
     }
-    let string_outcome =
-        recover_static_strings(&raw_source, raw.display().to_string(), SourceMode::Auto, 8);
-    fs::write(&string_tmp, string_outcome.source.as_bytes())
-        .with_context(|| format!("writing {}", string_tmp.display()))?;
-    write_json(&string_report, &string_outcome.report)?;
-    let output_sha = crate::sha256_hex(string_outcome.source.as_bytes());
-    let string_ok = string_outcome
-        .report
-        .get("safe_static_only")
-        .and_then(Value::as_bool)
-        == Some(true)
-        && string_outcome
-            .report
-            .get("input_sha256")
-            .and_then(Value::as_str)
-            == Some(raw_sha.as_str())
-        && string_outcome
-            .report
-            .get("output_sha256")
-            .and_then(Value::as_str)
-            == Some(output_sha.as_str());
-    if !string_ok {
-        bail!(
-            "generated string-recovery provenance/hash validation failed for {}",
-            raw.display()
-        );
-    }
-    let string_changed = string_outcome
-        .report
-        .get("changed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    row["string_recovery"] = json!({
-        "exit": 0,
-        "changed": string_changed,
-        "replacements": value_usize(&string_outcome.report, "replacements"),
-        "output_sha256": output_sha,
-    });
-    let selected = string_tmp.clone();
+    let string_budget = budgets.operation_under(
+        parent_budget,
+        AnalysisOperation::StaticStringRecovery,
+        raw.display().to_string(),
+    );
+    let (selected, string_ok, string_changed) = match recover_static_strings(
+        &raw_source,
+        raw.display().to_string(),
+        SourceMode::Auto,
+        8,
+        &string_budget,
+    ) {
+        Ok(string_outcome) => {
+            fs::write(&string_tmp, string_outcome.source.as_bytes())
+                .with_context(|| format!("writing {}", string_tmp.display()))?;
+            write_json(&string_report, &string_outcome.report)?;
+            let output_sha = crate::sha256_hex(string_outcome.source.as_bytes());
+            let string_ok = string_outcome
+                .report
+                .get("safe_static_only")
+                .and_then(Value::as_bool)
+                == Some(true)
+                && string_outcome
+                    .report
+                    .get("input_sha256")
+                    .and_then(Value::as_str)
+                    == Some(raw_sha.as_str())
+                && string_outcome
+                    .report
+                    .get("output_sha256")
+                    .and_then(Value::as_str)
+                    == Some(output_sha.as_str());
+            if !string_ok {
+                bail!(
+                    "generated string-recovery provenance/hash validation failed for {}",
+                    raw.display()
+                );
+            }
+            let string_changed = string_outcome
+                .report
+                .get("changed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            row["string_recovery"] = json!({
+                "exit": 0,
+                "changed": string_changed,
+                "replacements": value_usize(&string_outcome.report, "replacements"),
+                "output_sha256": output_sha,
+            });
+            (string_tmp.clone(), true, string_changed)
+        }
+        Err(error) => {
+            let error = recoverable_unit_error(anyhow::Error::new(error))?;
+            row["string_recovery_report"] = Value::Null;
+            row["string_recovery"] = json!({
+                "exit": 1,
+                "changed": false,
+                "error": error.to_string(),
+            });
+            (raw.to_path_buf(), false, false)
+        }
+    };
 
     let selected_source =
         fs::read_to_string(&selected).with_context(|| format!("reading {}", selected.display()))?;
     let selected_sha = sha256_path(&selected)?;
+    let deob_budget = budgets.operation_under(
+        parent_budget,
+        AnalysisOperation::SafeDeobfuscation,
+        selected.display().to_string(),
+    );
     let deob = deobfuscate_source(
         &selected_source,
         selected.display().to_string(),
         SourceMode::Auto,
         16,
         false,
+        &deob_budget,
     );
     let (analysis_rel, selected_stage) = match deob {
         Ok(outcome) => {
@@ -263,6 +298,8 @@ fn recover_generated_unit(
             (safe_rel.clone(), "safe_deobfuscation")
         }
         Err(error) => {
+            let error = recoverable_unit_error(error)?;
+            row["deobfuscation_report"] = Value::Null;
             row["deobfuscation"] = json!({"exit": 1, "changed": false, "error": error.to_string()});
             if string_ok && string_changed {
                 fs::copy(&string_tmp, &safe_dest).with_context(|| {
@@ -282,9 +319,18 @@ fn recover_generated_unit(
     let analysis_source = project.join(&analysis_rel);
     let exact = fs::read_to_string(&analysis_source)
         .with_context(|| format!("reading {}", analysis_source.display()))?;
-    let (readable, readable_formatted, format_error) = match format_source(&exact) {
+    let format_budget = budgets.operation_under(
+        parent_budget,
+        AnalysisOperation::Format,
+        analysis_source.display().to_string(),
+    );
+    let formatted = format_source(&exact, &format_budget);
+    let (readable, readable_formatted, format_error) = match formatted {
         Ok(formatted) => (formatted, true, None),
-        Err(error) => (exact, false, Some(error.to_string())),
+        Err(error) => {
+            let error = recoverable_unit_error(error)?;
+            (exact, false, Some(error.to_string()))
+        }
     };
     fs::write(&readable_dest, readable.as_bytes())
         .with_context(|| format!("writing {}", readable_dest.display()))?;
@@ -408,6 +454,10 @@ fn queue_unit(
 }
 
 pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<ProjectScanSummary> {
+    let stage_budget = options
+        .budgets
+        .scope(format!("project-scan:{}", project.display()));
+    stage_budget.checkpoint()?;
     let source_index = load_artifact(project, SOURCE_INDEX, false)?
         .context("source index is required for VM project scanning")?;
     let deob = load_artifact(project, DEOBFUSCATION, true)?.unwrap_or_else(|| json!({"units": []}));
@@ -496,6 +546,7 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
     let mut deduplicated_scans = 0usize;
 
     while let Some(unit) = queue.pop_front() {
+        stage_budget.checkpoint()?;
         let scan_id = rows.len();
         let path = value_string(&unit, "path").context("queued unit path missing")?;
         let source = project.join(&path);
@@ -519,9 +570,15 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
             _ => {
                 let dump_dir = outdir.join("embedded").join(format!("{scan_id:04}"));
                 scanner_invocations += 1;
-                let report = match scan_file(&source, Some(&dump_dir)) {
+                let scan_budget = options.budgets.operation_under(
+                    &stage_budget,
+                    AnalysisOperation::StructuralScan,
+                    source.display().to_string(),
+                );
+                let report = match scan_file(&source, Some(&dump_dir), &scan_budget) {
                     Ok(report) => report,
                     Err(error) => {
+                        let error = recoverable_unit_error(error)?;
                         row["scanner_exit"] = 1.into();
                         row["scanner_deduplicated"] = false.into();
                         row["error"] = error.to_string().into();
@@ -613,8 +670,15 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
             let recovery = match generated_recovery_cache.get(&raw_sha) {
                 Some(cached) => reuse_generated_unit(project, &raw_rel, scan_id, ordinal, cached)?,
                 None => {
-                    let mut recovery =
-                        recover_generated_unit(project, &raw, &raw_rel, scan_id, ordinal)?;
+                    let mut recovery = recover_generated_unit(
+                        project,
+                        &raw,
+                        &raw_rel,
+                        scan_id,
+                        ordinal,
+                        &options.budgets,
+                        &stage_budget,
+                    )?;
                     recovery["deduplicated"] = false.into();
                     generated_recovery_cache.insert(raw_sha, recovery.clone());
                     recovery
@@ -672,12 +736,18 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
 
         if value_usize(&row, "confirmed_direct_switch_maps") > 0 {
             let output_path = outdir.join(format!("{scan_id:04}.switch-ir.json"));
-            match crate::switch_ir::materialize(&source, &report_path, &output_path) {
+            let ir_budget = options.budgets.operation_under(
+                &stage_budget,
+                AnalysisOperation::IrMaterialization,
+                format!("switch-ir:{}", source.display()),
+            );
+            match crate::switch_ir::materialize(&source, &report_path, &output_path, &ir_budget) {
                 Ok(()) => {
                     row["switch_ir_exit"] = 0.into();
                     row["switch_ir"] = relative_string(project, &output_path)?.into();
                 }
                 Err(error) => {
+                    let error = recoverable_unit_error(error)?;
                     row["switch_ir_exit"] = 1.into();
                     row["switch_ir_error"] = error.to_string().into();
                 }
@@ -685,12 +755,18 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
         }
         if value_usize(&row, "table_vms") > 0 {
             let output_path = outdir.join(format!("{scan_id:04}.table-ir.json"));
-            match crate::table_ir::materialize(&source, &report_path, &output_path) {
+            let ir_budget = options.budgets.operation_under(
+                &stage_budget,
+                AnalysisOperation::IrMaterialization,
+                format!("table-ir:{}", source.display()),
+            );
+            match crate::table_ir::materialize(&source, &report_path, &output_path, &ir_budget) {
                 Ok(()) => {
                     row["table_ir_exit"] = 0.into();
                     row["table_ir"] = relative_string(project, &output_path)?.into();
                 }
                 Err(error) => {
+                    let error = recoverable_unit_error(error)?;
                     row["table_ir_exit"] = 1.into();
                     row["table_ir_error"] = error.to_string().into();
                 }

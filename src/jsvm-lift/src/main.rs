@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::Parser as ClapParser;
-use jsvm_lift::scan_report::{scan_file, EmbeddedScanReport, ScanReport};
+use jsvm_lift::{
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
+    scan_report::{scan_file, EmbeddedScanReport, ScanReport},
+};
 use std::path::PathBuf;
 
 #[derive(ClapParser, Debug)]
@@ -264,8 +267,13 @@ fn print_report(report: &ScanReport, min_score: u32) {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let budgets = AnalysisBudgets::standard("jsvm-lift");
     for path in &args.files {
-        let report = scan_file(path, args.dump_embedded.as_deref())?;
+        let budget = budgets.operation(
+            AnalysisOperation::StructuralScan,
+            path.display().to_string(),
+        );
+        let report = scan_file(path, args.dump_embedded.as_deref(), &budget)?;
         if args.json {
             println!("{}", serde_json::to_string(&report)?);
             continue;

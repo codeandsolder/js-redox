@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use jsvm_lift::wasm_materialize::materialize_wasm;
+use jsvm_lift::{analysis_budget::AnalysisBudgets, wasm_materialize::materialize_wasm};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -14,7 +14,11 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let summary = materialize_wasm(&args.project, args.wax.as_deref())?;
+    let summary = materialize_wasm(
+        &args.project,
+        args.wax.as_deref(),
+        &AnalysisBudgets::standard("wasm-materialize"),
+    )?;
     println!(
         "WASM: {} unique module(s), {} origin(s), {} failed",
         summary.modules, summary.origins, summary.failed

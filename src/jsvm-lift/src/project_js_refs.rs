@@ -1,5 +1,6 @@
 use crate::{
     analysis_artifacts::{load_artifact, write_artifact, IMPORT_MAPS, JS_REFERENCES, SOURCE_INDEX},
+    analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     browser_script_types::is_executable_script,
     capture_project::load_manifest,
     content_dedup::{default_jobs, sha256_path},
@@ -485,12 +486,19 @@ fn set_resolution_fields(target: &mut Map<String, Value>, source: &Value) {
 pub fn scan_project_references(
     project: &Path,
     jobs: Option<usize>,
+    budgets: &AnalysisBudgets,
 ) -> Result<ReferenceScanSummary> {
     let jobs = jobs.unwrap_or_else(|| default_jobs(8)).max(1);
+    let stage_budget = budgets.operation(
+        AnalysisOperation::ReferenceScan,
+        project.display().to_string(),
+    );
+    stage_budget.checkpoint()?;
     let manifest = load_manifest(project)?;
     let source_index =
         load_artifact(project, SOURCE_INDEX, false)?.context("source index missing")?;
     let (import_maps, import_map_analysis) = load_import_maps(project, &manifest)?;
+    stage_budget.checkpoint()?;
 
     let mut javascript_units = Vec::<JsUnit>::new();
     let mut extraction_groups = BTreeMap::<String, Vec<usize>>::new();
@@ -528,9 +536,26 @@ pub fn scan_project_references(
             .map(|(digest, group)| {
                 let canonical_index = *group.first().context("empty JS-reference group")?;
                 let canonical = &javascript_units[canonical_index];
+                let budget = budgets.operation_under(
+                    &stage_budget,
+                    AnalysisOperation::ReferenceScan,
+                    canonical.source.display().to_string(),
+                );
+                if let Err(error) = budget.checkpoint() {
+                    let error = recoverable_unit_error(anyhow::Error::new(error))?;
+                    return Ok::<_, anyhow::Error>((
+                        (*digest).clone(),
+                        ExtractionResult {
+                            canonical_source_path: canonical.source_path.clone(),
+                            group_size: group.len(),
+                            references: Vec::new(),
+                            error: Some(error.to_string()),
+                        },
+                    ));
+                }
                 let source = fs::read_to_string(&canonical.source)
                     .with_context(|| format!("reading {}", canonical.source.display()))?;
-                let result = extract_js_references(&source);
+                let result = extract_js_references(&source, &budget);
                 let (references, error) = match result {
                     Ok(references) => (
                         serde_json::to_value(references)?
@@ -539,7 +564,10 @@ pub fn scan_project_references(
                             .unwrap_or_default(),
                         None,
                     ),
-                    Err(error) => (Vec::new(), Some(error.to_string())),
+                    Err(error) => {
+                        let error = recoverable_unit_error(error)?;
+                        (Vec::new(), Some(error.to_string()))
+                    }
                 };
                 Ok::<_, anyhow::Error>((
                     (*digest).clone(),
@@ -558,6 +586,7 @@ pub fn scan_project_references(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
+    stage_budget.checkpoint()?;
 
     let mut rows = Vec::<Value>::new();
     let mut failures = 0_usize;
@@ -566,6 +595,7 @@ pub fn scan_project_references(
     let mut units_by_raw = BTreeMap::<String, usize>::new();
     let mut seen_per_digest = BTreeMap::<String, usize>::new();
     for item in &javascript_units {
+        stage_budget.checkpoint()?;
         let result = extraction_results
             .get(&item.digest)
             .context("missing extraction result")?;
@@ -610,6 +640,7 @@ pub fn scan_project_references(
     let mut dynamic_glob_matches = BTreeMap::<(usize, usize), Vec<String>>::new();
     let mut dynamic_glob_patterns = 0_usize;
     for (row_id, row) in rows.iter_mut().enumerate() {
+        stage_budget.checkpoint()?;
         let base_url = row
             .get("url")
             .and_then(Value::as_str)
@@ -677,6 +708,7 @@ pub fn scan_project_references(
     let mut candidates = BTreeMap::<(usize, usize), BTreeMap<String, Value>>::new();
     let mut seen_context = BTreeSet::<(usize, u64)>::new();
     while let Some((row_id, document_id)) = queue.pop_front() {
+        stage_budget.checkpoint()?;
         if !seen_context.insert((row_id, document_id)) {
             continue;
         }

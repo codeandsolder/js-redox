@@ -1,5 +1,6 @@
 use crate::{safe_deob::SourceMode, sha256_hex};
 use serde_json::{json, Value};
+use work_budget::{BudgetExceeded, WorkBudget};
 
 #[derive(Debug, Clone)]
 pub struct StaticStringRecoveryOutcome {
@@ -13,14 +14,16 @@ pub fn recover_static_strings(
     input_label: impl Into<String>,
     source_mode: SourceMode,
     max_iterations: usize,
-) -> StaticStringRecoveryOutcome {
+    budget: &WorkBudget,
+) -> Result<StaticStringRecoveryOutcome, BudgetExceeded> {
     let input_label = input_label.into();
     let safe_mode = source_mode.safe_mode();
     let classic = jsvm_safe_core::recover_static_decoders_with_source_mode(
         original,
         max_iterations,
         safe_mode,
-    );
+        budget,
+    )?;
     let (
         classic_source,
         classic_iterations,
@@ -59,8 +62,12 @@ pub fn recover_static_strings(
         "status": classic_status,
     });
 
-    let base91 =
-        jsvm_safe_core::recover_base91_strings_with_source_mode(&classic_source, 4, safe_mode);
+    let base91 = jsvm_safe_core::recover_base91_strings_with_source_mode(
+        &classic_source,
+        4,
+        safe_mode,
+        budget,
+    )?;
     let (source, decoders, base91_iterations, base91_replacements, base91_transforms) = match base91
     {
         Some(result) => {
@@ -156,7 +163,7 @@ pub fn recover_static_strings(
         "base91_transforms": base91_transforms,
         "replacements": replacements,
     });
-    StaticStringRecoveryOutcome { source, report }
+    Ok(StaticStringRecoveryOutcome { source, report })
 }
 
 #[cfg(test)]
@@ -168,9 +175,10 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn ordinary_crlf_source_is_byte_identical_when_nothing_is_proven() {
+    fn ordinary_crlf_source_is_byte_identical_when_nothing_is_proven() -> Result<()> {
         let source = "const answer = 42;\r\nconsole.log(answer);\r\n";
-        let outcome = recover_static_strings(source, "ordinary.js", SourceMode::Auto, 8);
+        let budget = WorkBudget::unlimited("ordinary-test");
+        let outcome = recover_static_strings(source, "ordinary.js", SourceMode::Auto, 8, &budget)?;
         assert_eq!(outcome.source.as_bytes(), source.as_bytes());
         assert_eq!(outcome.report["changed"], false);
         assert_eq!(outcome.report["replacements"], 0);
@@ -178,12 +186,14 @@ mod tests {
             outcome.report["base91_iterations"][0]["preflight_skipped"],
             true
         );
+        Ok(())
     }
 
     #[test]
-    fn dynamic_with_without_base91_stays_exact_identity() {
+    fn dynamic_with_without_base91_stays_exact_identity() -> Result<()> {
         let source = "var value = 1; with ({}) { value; }\r\n";
-        let outcome = recover_static_strings(source, "with.js", SourceMode::Auto, 8);
+        let budget = WorkBudget::unlimited("with-test");
+        let outcome = recover_static_strings(source, "with.js", SourceMode::Auto, 8, &budget)?;
         assert_eq!(outcome.source.as_bytes(), source.as_bytes());
         assert_eq!(outcome.report["changed"], false);
         assert_eq!(outcome.report["replacements"], 0);
@@ -195,6 +205,7 @@ mod tests {
             outcome.report["base91_iterations"][0]["preflight_skipped"],
             true
         );
+        Ok(())
     }
     fn dumped_generated_sources<'a>(rows: &'a [EmbeddedScanReport], output: &mut Vec<&'a str>) {
         for row in rows {
@@ -213,7 +224,8 @@ mod tests {
         expected_decoder: Option<&str>,
     ) -> Result<()> {
         let scratch = TempDir::new()?;
-        let scan = scan_source(source, label, Some(scratch.path()));
+        let budget = work_budget::WorkBudget::unlimited(format!("base91-fixture:{label}"));
+        let scan = scan_source(source, label, Some(scratch.path()), &budget)?;
         let mut dumps = Vec::new();
         dumped_generated_sources(&scan.embedded, &mut dumps);
         assert!(!dumps.is_empty(), "{label}: no generated source");
@@ -222,7 +234,9 @@ mod tests {
         for path in dumps {
             let generated = fs::read_to_string(path)
                 .with_context(|| format!("reading generated fixture {path}"))?;
-            let outcome = recover_static_strings(&generated, path, SourceMode::Auto, 8);
+            let recovery_budget = WorkBudget::unlimited(format!("base91-recovery:{path}"));
+            let outcome =
+                recover_static_strings(&generated, path, SourceMode::Auto, 8, &recovery_budget)?;
             let shapes = outcome.report["decoders"]
                 .as_array()
                 .context("decoder rows must be an array")?

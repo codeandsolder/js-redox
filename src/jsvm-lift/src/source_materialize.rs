@@ -1,5 +1,6 @@
 use crate::{
     analysis_artifacts::{write_artifact, SOURCE_INDEX},
+    analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     browser_script_types::{inline_script_kind, InlineScriptKind},
     capture_project::load_manifest,
     content_dedup::{default_jobs, link_or_copy, sha256_path, Materialization},
@@ -207,10 +208,21 @@ fn materialize_text(
     ]))
 }
 
-fn format_javascript(source: &Path, resource: Option<&Value>) -> Result<JsGroupResult> {
+fn format_javascript(
+    source: &Path,
+    resource: Option<&Value>,
+    budgets: &AnalysisBudgets,
+    parent_budget: &work_budget::WorkBudget,
+) -> Result<JsGroupResult> {
+    let budget = budgets.operation_under(
+        parent_budget,
+        AnalysisOperation::Format,
+        source.display().to_string(),
+    );
     let raw = fs::read(source).with_context(|| format!("reading {}", source.display()))?;
     let decoded = decode_text_bytes(&raw, resource)?;
-    match format_source(&decoded.text) {
+    let formatted = format_source(&decoded.text, &budget);
+    match formatted {
         Ok(output) => Ok(JsGroupResult {
             transform: "oxc_parse_codegen",
             formatted: true,
@@ -219,14 +231,17 @@ fn format_javascript(source: &Path, resource: Option<&Value>) -> Result<JsGroupR
             encoding_fallback: decoded.fallback,
             output,
         }),
-        Err(error) => Ok(JsGroupResult {
-            transform: "utf8_raw_fallback",
-            formatted: false,
-            format_error: Some(error.to_string()),
-            source_encoding: decoded.encoding,
-            encoding_fallback: decoded.fallback,
-            output: decoded.text,
-        }),
+        Err(error) => {
+            let error = recoverable_unit_error(error)?;
+            Ok(JsGroupResult {
+                transform: "utf8_raw_fallback",
+                formatted: false,
+                format_error: Some(error.to_string()),
+                source_encoding: decoded.encoding,
+                encoding_fallback: decoded.fallback,
+                output: decoded.text,
+            })
+        }
     }
 }
 
@@ -254,9 +269,16 @@ fn materialization_name(value: Materialization) -> &'static str {
 pub fn materialize_capture_source(
     project: &Path,
     jobs: Option<usize>,
+    budgets: &AnalysisBudgets,
 ) -> Result<SourceMaterializeSummary> {
     let jobs = jobs.unwrap_or_else(|| default_jobs(8)).max(1);
+    let stage_budget = budgets.operation(
+        AnalysisOperation::SourceMaterialization,
+        project.display().to_string(),
+    );
+    stage_budget.checkpoint()?;
     let manifest = load_manifest(project)?;
+    stage_budget.checkpoint()?;
     let mut resources_by_id = BTreeMap::<u64, &Value>::new();
     for resource in &manifest.resources {
         let id = object_u64(resource, "id")?;
@@ -377,7 +399,9 @@ pub fn materialize_capture_source(
                 resource: unit.resource,
             });
         } else {
+            stage_budget.checkpoint()?;
             let extra = materialize_text(&source, &dest, &unit.kind, unit.resource.as_ref())?;
+            stage_budget.checkpoint()?;
             row.as_object_mut()
                 .context("source row must be an object")?
                 .extend(extra);
@@ -409,7 +433,12 @@ pub fn materialize_capture_source(
             .par_iter()
             .map(|(key, group)| {
                 let canonical = group.first().context("empty JavaScript content group")?;
-                let result = format_javascript(&canonical.source, canonical.resource.as_ref())?;
+                let result = format_javascript(
+                    &canonical.source,
+                    canonical.resource.as_ref(),
+                    budgets,
+                    &stage_budget,
+                )?;
                 Ok::<_, anyhow::Error>(((*key).clone(), result))
             })
             .collect::<Vec<_>>()
@@ -419,6 +448,7 @@ pub fn materialize_capture_source(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
+    stage_budget.checkpoint()?;
 
     for (key, group) in &groups {
         let result = results
@@ -570,7 +600,11 @@ mod tests {
             });
             let manifest = validate_manifest_value(&raw, "test")?;
             write_manifest(&project.join("capture-manifest.json"), &manifest)?;
-            let summary = materialize_capture_source(&project, Some(2))?;
+            let summary = materialize_capture_source(
+                &project,
+                Some(2),
+                &AnalysisBudgets::standard("source-materialize-test"),
+            )?;
             assert_eq!(summary.incomplete_units, 1);
             let index: Value = serde_json::from_str(&fs::read_to_string(
                 project.join("analysis/source-index.json"),

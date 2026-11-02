@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use jsvm_lift::project_sourcemaps::{compose_sourcemap_json, recover_project_sourcemaps};
+use jsvm_lift::{
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
+    project_sourcemaps::{compose_sourcemap_json, recover_project_sourcemaps},
+};
 use std::{fs, path::PathBuf};
 
 #[derive(Parser, Debug)]
@@ -37,12 +40,18 @@ fn main() -> Result<()> {
                 .with_context(|| format!("reading {}", downstream.display()))?;
             let upstream_json = fs::read_to_string(&upstream)
                 .with_context(|| format!("reading {}", upstream.display()))?;
-            let composed = compose_sourcemap_json(&downstream_json, &upstream_json, source_id)?;
+            let budgets = AnalysisBudgets::standard("sourcemap-compose");
+            let budget = budgets.operation(AnalysisOperation::SourcemapRecovery, "compose");
+            let composed =
+                compose_sourcemap_json(&downstream_json, &upstream_json, source_id, &budget)?;
             fs::write(&output, composed)
                 .with_context(|| format!("writing {}", output.display()))?;
         }
         Command::Project { project } => {
-            let summary = recover_project_sourcemaps(&project)?;
+            let summary = recover_project_sourcemaps(
+                &project,
+                &AnalysisBudgets::standard("sourcemap-project"),
+            )?;
             println!(
                 "source maps: {} referenced; {} direct source files recovered; {} nested map link(s) composed; {} final source files recovered; {} missing map resources",
                 summary.referenced,

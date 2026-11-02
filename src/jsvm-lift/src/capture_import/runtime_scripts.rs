@@ -12,6 +12,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use work_budget::WorkBudget;
 
 const ALPINE_PREFIX: &str =
     "(async function anonymous(__self,scope\n) {\nwith (scope) { __self.result = ";
@@ -541,7 +542,9 @@ pub(super) fn analyze_recorder_runtime_scripts(
     capture: &Path,
     project: &Path,
     manifest: &CaptureManifest,
+    budget: &WorkBudget,
 ) -> Result<()> {
+    budget.checkpoint()?;
     let runtime_manifest = capture.join("runtime-scripts.json");
     let runtime_dir = capture.join("runtime-scripts");
     if !runtime_manifest.is_file() || !runtime_dir.is_dir() {
@@ -552,17 +555,20 @@ pub(super) fn analyze_recorder_runtime_scripts(
     }
     let events_value: Value = serde_json::from_slice(&fs::read(&runtime_manifest)?)
         .with_context(|| format!("parsing {}", runtime_manifest.display()))?;
+    budget.checkpoint()?;
     let events = events_value
         .as_array()
         .context("runtime-scripts.json must contain an array")?;
     let patterns = RuntimePatterns::new()?;
     let directives = frame_directives(capture)?;
+    budget.checkpoint()?;
     let inline_by_hash = inline_origins(manifest);
     let (body_hashes, network_urls) = captured_resource_identity(manifest);
 
     let mut events_by_hash = HashMap::<String, Vec<usize>>::new();
     let mut events_by_script_id = HashMap::<(String, String), usize>::new();
     for (index, event) in events.iter().enumerate() {
+        budget.checkpoint()?;
         let Some(event) = event.as_object() else {
             continue;
         };
@@ -602,6 +608,7 @@ pub(super) fn analyze_recorder_runtime_scripts(
     let mut alpine_dom_matches = 0usize;
 
     for source_path in source_paths {
+        budget.checkpoint()?;
         let raw_source = fs::read(&source_path)?;
         let digest = sha256_hex(&raw_source);
         let source = String::from_utf8_lossy(&raw_source);
@@ -612,6 +619,7 @@ pub(super) fn analyze_recorder_runtime_scripts(
         let mut execution_context_values = Vec::new();
         let mut script_instances = Vec::new();
         for event_index in &event_rows {
+            budget.checkpoint()?;
             let Some(event) = events.get(*event_index).and_then(Value::as_object) else {
                 continue;
             };
@@ -661,6 +669,7 @@ pub(super) fn analyze_recorder_runtime_scripts(
             let mut root_urls = BTreeSet::new();
             let mut max_depth = 0usize;
             for origin in &origins {
+                budget.checkpoint()?;
                 let chain = origin
                     .get("chain")
                     .and_then(Value::as_array)

@@ -10,6 +10,7 @@ use oxc_span::{GetSpan, SourceType};
 use rolldown_redox::ecmascript::{dynamic_import_to_glob, parse_program};
 use serde::Serialize;
 use std::collections::BTreeSet;
+use work_budget::WorkBudget;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct JsReference {
@@ -221,15 +222,24 @@ fn parse<'a>(
     }
 }
 
-pub fn extract_js_references(source: &str) -> Result<Vec<JsReference>> {
+pub fn extract_js_references(source: &str, budget: &WorkBudget) -> Result<Vec<JsReference>> {
+    budget.checkpoint()?;
     let allocator = Allocator::default();
-    let program = parse(&allocator, source, SourceType::mjs())
-        .or_else(|| parse(&allocator, source, SourceType::cjs()))
-        .ok_or_else(|| anyhow::anyhow!("Oxc could not parse source as module or script"))?;
+    let program = if let Some(program) = parse(&allocator, source, SourceType::mjs()) {
+        budget.checkpoint()?;
+        program
+    } else {
+        budget.checkpoint()?;
+        let program = parse(&allocator, source, SourceType::cjs())
+            .ok_or_else(|| anyhow::anyhow!("Oxc could not parse source as module or script"))?;
+        budget.checkpoint()?;
+        program
+    };
     let mut collector = Collector {
         source,
         refs: BTreeSet::new(),
     };
     collector.visit_program(&program);
+    budget.checkpoint()?;
     Ok(collector.refs.into_iter().collect())
 }

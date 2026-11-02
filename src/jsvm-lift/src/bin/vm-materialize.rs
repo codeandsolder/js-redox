@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser as ClapParser;
-use jsvm_lift::vm_materialize::materialize_project;
+use jsvm_lift::{analysis_budget::AnalysisBudgets, vm_materialize::materialize_project};
 use std::path::PathBuf;
 
 #[derive(ClapParser, Debug)]
@@ -11,7 +11,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let summary = materialize_project(&args.project)?;
+    let summary = materialize_project(&args.project, &AnalysisBudgets::standard("vm-materialize"))?;
     println!(
         "materialized {} VM module(s): {} direct-switch + {} function-table; human pseudocode under src/_devirtualized/",
         summary.devirtualized_units, summary.switch_vms, summary.table_vms

@@ -13,6 +13,8 @@ use std::{
 
 use crate::semantic_ir::{classify_effect, IrOp};
 
+use work_budget::WorkBudget;
+
 #[derive(Debug, Deserialize)]
 struct ScanReport {
     #[serde(default)]
@@ -847,25 +849,37 @@ fn lift_switch_vm(source: &str, function: &FunctionInfo, map: &DirectSwitchMap) 
     }
 }
 
-fn lift_switch_vms(source: &str, report: &ScanReport) -> Vec<SwitchVmIr> {
+fn lift_switch_vms(
+    source: &str,
+    report: &ScanReport,
+    budget: &WorkBudget,
+) -> Result<Vec<SwitchVmIr>> {
+    budget.checkpoint()?;
     let functions: HashMap<_, _> = report
         .functions
         .iter()
         .map(|function| (function.id.as_str(), function))
         .collect();
-    report
-        .direct_switch_maps
-        .iter()
-        .filter(|map| map.confirmed_vm)
-        .filter_map(|map| {
-            functions
-                .get(map.parent_function_id.as_str())
-                .map(|function| lift_switch_vm(source, function, map))
-        })
-        .collect()
+    let mut vms = Vec::new();
+    for map in &report.direct_switch_maps {
+        budget.checkpoint()?;
+        if !map.confirmed_vm {
+            continue;
+        }
+        if let Some(function) = functions.get(map.parent_function_id.as_str()) {
+            vms.push(lift_switch_vm(source, function, map));
+        }
+    }
+    Ok(vms)
 }
 
-pub fn materialize(source_path: &Path, scan_path: &Path, output_path: &Path) -> Result<()> {
+pub fn materialize(
+    source_path: &Path,
+    scan_path: &Path,
+    output_path: &Path,
+    budget: &WorkBudget,
+) -> Result<()> {
+    budget.checkpoint()?;
     let source = fs::read_to_string(source_path)
         .with_context(|| format!("reading {}", source_path.display()))?;
     let report: ScanReport = serde_json::from_str(
@@ -874,11 +888,13 @@ pub fn materialize(source_path: &Path, scan_path: &Path, output_path: &Path) -> 
             .trim(),
     )
     .with_context(|| format!("parsing {}", scan_path.display()))?;
+    budget.checkpoint()?;
     let output = Output {
         schema: "jsvm-switch-ir/v0",
         source: source_path.display().to_string(),
-        vms: lift_switch_vms(&source, &report),
+        vms: lift_switch_vms(&source, &report, budget)?,
     };
+    budget.checkpoint()?;
     fs::write(
         output_path,
         format!("{}\n", serde_json::to_string_pretty(&output)?),

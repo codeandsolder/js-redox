@@ -6,6 +6,7 @@ use jsvm_lift::{
         JSVM_INDEX, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCEMAPS, SOURCE_GRAPH, SOURCE_INDEX,
         WASM_INDEX, WASM_JS_BOUNDARY, WASM_RESOURCE_PROVENANCE,
     },
+    analysis_budget::AnalysisBudgets,
     capture_pipeline::{recover_capture_project, CapturePipelineOptions},
     capture_project::{read_manifest, MANIFEST_NAME},
 };
@@ -257,6 +258,7 @@ fn main() -> Result<()> {
         bundle_materialization: bundle_unpack,
         wasm_analysis,
         vm_scan: !args.skip_vm_scan,
+        budgets: AnalysisBudgets::standard("capture-project"),
     })?;
 
     print_summary(

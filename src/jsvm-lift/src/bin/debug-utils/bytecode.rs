@@ -1,5 +1,8 @@
 use anyhow::{bail, Context, Result};
-use jsvm_lift::parse_int::{parse_int_aliases, resolve_literal_parse_int};
+use jsvm_lift::{
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
+    parse_int::{parse_int_aliases, resolve_literal_parse_int},
+};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -7,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+use work_budget::run_command;
 
 fn concatenated_json(path: &Path) -> Result<Vec<Value>> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -377,10 +381,14 @@ fn scanner_path(explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn scan(path: &Path, scanner: &Path) -> Result<Value> {
-    let output = Command::new(scanner)
-        .arg("--json")
-        .arg(path)
-        .output()
+    let budgets = AnalysisBudgets::standard("debug-utils-bytecode");
+    let budget = budgets.operation(
+        AnalysisOperation::StructuralScan,
+        path.display().to_string(),
+    );
+    let mut command = Command::new(scanner);
+    command.arg("--json").arg(path);
+    let output = run_command(&mut command, &budget)
         .with_context(|| format!("running {}", scanner.display()))?;
     if !output.status.success() {
         bail!(

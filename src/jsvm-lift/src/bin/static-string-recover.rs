@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser as ClapParser, ValueEnum};
-use jsvm_lift::{safe_deob::SourceMode, string_recovery::recover_static_strings};
+use jsvm_lift::{
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
+    safe_deob::SourceMode,
+    string_recovery::recover_static_strings,
+};
 use std::{fs, path::PathBuf};
 
 #[derive(ClapParser, Debug)]
@@ -40,12 +44,18 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let original = fs::read_to_string(&args.input)
         .with_context(|| format!("reading {}", args.input.display()))?;
+    let budgets = AnalysisBudgets::standard("static-string-recover");
+    let budget = budgets.operation(
+        AnalysisOperation::StaticStringRecovery,
+        args.input.display().to_string(),
+    );
     let outcome = recover_static_strings(
         &original,
         args.input.display().to_string(),
         args.source_mode.into(),
         args.max_iterations,
-    );
+        &budget,
+    )?;
 
     if let Some(parent) = args.output.parent() {
         fs::create_dir_all(parent)?;

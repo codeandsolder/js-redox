@@ -13,6 +13,7 @@ use oxc_span::{SourceType, Span};
 use oxc_syntax::{scope::ScopeId, symbol::SymbolId};
 use regex::{Captures, Regex};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use work_budget::{BudgetExceeded, WorkBudget};
 
 const IDENT: &str = r"[A-Za-z_$][A-Za-z0-9_$]*";
 const NUM: &str = r"(?:0[xX][0-9A-Fa-f]+|\d+)";
@@ -887,30 +888,40 @@ impl<'a> Visit<'a> for Base91CallCollector<'_, '_> {
 fn expose_static_strings_allow_with(
     source: &str,
     source_type: SourceType,
-) -> Option<(String, BTreeMap<String, usize>)> {
+    budget: &WorkBudget,
+) -> Result<Option<(String, BTreeMap<String, usize>)>, BudgetExceeded> {
+    budget.checkpoint()?;
     let mut current = source.to_string();
     let mut total = BTreeMap::<String, usize>::new();
     for iteration in 1..=8 {
+        budget.consume(1)?;
         let allocator = Allocator::default();
-        let program = parse_as(&allocator, &current, source_type)?;
+        let Some(program) = parse_as(&allocator, &current, source_type) else {
+            return Ok(None);
+        };
+        budget.checkpoint()?;
         let semantic_ret = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&program);
         if !semantic_ret.diagnostics.is_empty() {
-            return None;
+            return Ok(None);
         }
+        budget.checkpoint()?;
         let replacements = static_string_exposure_pass(&program, semantic_ret.semantic.scoping());
+        budget.checkpoint()?;
         if replacements.is_empty() {
             break;
         }
         let mut counts = Counts::default();
-        let next = apply(
+        let Some(next) = apply(
             &current,
             replacements,
             &mut counts,
             &mut Vec::new(),
             iteration,
-        )?;
+        ) else {
+            return Ok(None);
+        };
         for (kind, count) in counts.into_inner() {
             *total.entry(kind).or_default() += count;
         }
@@ -919,7 +930,7 @@ fn expose_static_strings_allow_with(
         }
         current = next;
     }
-    Some((current, total))
+    Ok(Some((current, total)))
 }
 
 #[must_use]
@@ -927,8 +938,13 @@ pub fn recover_base91_strings_with_source_mode(
     source: &str,
     max_iterations: usize,
     source_mode: SafeSourceMode,
-) -> Option<Base91RecoveryResult> {
-    let source_type = parse_semantically_allow_with(source, source_mode)?;
+    budget: &WorkBudget,
+) -> Result<Option<Base91RecoveryResult>, BudgetExceeded> {
+    budget.checkpoint()?;
+    let Some(source_type) = parse_semantically_allow_with(source, source_mode) else {
+        return Ok(None);
+    };
+    budget.checkpoint()?;
     let mut current = source.to_string();
     let mut proofs = Vec::new();
     let mut iterations = Vec::new();
@@ -936,14 +952,19 @@ pub fn recover_base91_strings_with_source_mode(
     let mut total_replacements = 0usize;
 
     for iteration in 1..=max_iterations.min(4) {
+        budget.consume(1)?;
         let allocator = Allocator::default();
-        let program = parse_as(&allocator, &current, source_type)?;
+        let Some(program) = parse_as(&allocator, &current, source_type) else {
+            return Ok(None);
+        };
+        budget.checkpoint()?;
         let semantic_ret = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&program);
         if !semantic_ret.diagnostics.is_empty() {
-            return None;
+            return Ok(None);
         }
+        budget.checkpoint()?;
         let mut string_collector = StringValueCollector::default();
         string_collector.visit_program(&program);
         let preflight = string_collector.values.iter().any(|literal| {
@@ -960,6 +981,7 @@ pub fn recover_base91_strings_with_source_mode(
             });
             break;
         }
+        budget.checkpoint()?;
         let scoping = semantic_ret.semantic.scoping();
         let mut function_collector = FunctionCollector {
             scoping,
@@ -967,6 +989,7 @@ pub fn recover_base91_strings_with_source_mode(
             scope_spans: HashMap::new(),
         };
         function_collector.visit_program(&program);
+        budget.checkpoint()?;
         let mut call_collector = FunctionCallCollector {
             scoping,
             calls: HashMap::new(),
@@ -977,6 +1000,7 @@ pub fn recover_base91_strings_with_source_mode(
             providers: Vec::new(),
         };
         provider_collector.visit_program(&program);
+        budget.checkpoint()?;
         let mut array_collector = SimpleArrayCollector::default();
         array_collector.visit_program(&program);
         let mut wrapper_collector = WrapperLinkCollector {
@@ -984,6 +1008,7 @@ pub fn recover_base91_strings_with_source_mode(
             links: Vec::new(),
         };
         wrapper_collector.visit_program(&program);
+        budget.checkpoint()?;
         let discovery = DecoderDiscoveryContext {
             source: &current,
             scoping,
@@ -995,6 +1020,7 @@ pub fn recover_base91_strings_with_source_mode(
             arrays: &array_collector.arrays,
         };
         let decoders = discover_decoders(&discovery, &provider_collector.providers);
+        budget.checkpoint()?;
         let mut decoder_map = HashMap::new();
         let mut ambiguous = HashSet::new();
         for decoder in &decoders {
@@ -1016,6 +1042,7 @@ pub fn recover_base91_strings_with_source_mode(
             counts: HashMap::new(),
         };
         call_collector.visit_program(&program);
+        budget.checkpoint()?;
         let mut iteration_proofs = Vec::new();
         for decoder in &decoders {
             let count = call_collector
@@ -1043,20 +1070,26 @@ pub fn recover_base91_strings_with_source_mode(
         let next = if replacements.is_empty() {
             current.clone()
         } else {
-            apply(
+            let Some(next) = apply(
                 &current,
                 replacements,
                 &mut counts,
                 &mut Vec::new(),
                 iteration,
-            )?
+            ) else {
+                return Ok(None);
+            };
+            next
         };
         let decoder_calls = counts
             .into_inner()
             .get("base91_decoder_call")
             .copied()
             .unwrap_or(0);
-        let (next, exposure) = expose_static_strings_allow_with(&next, source_type)?;
+        let Some((next, exposure)) = expose_static_strings_allow_with(&next, source_type, budget)?
+        else {
+            return Ok(None);
+        };
         let table_reads = exposure
             .get("static_string_table_lookup")
             .copied()
@@ -1083,13 +1116,13 @@ pub fn recover_base91_strings_with_source_mode(
         current = next;
     }
 
-    Some(Base91RecoveryResult {
+    Ok(Some(Base91RecoveryResult {
         source: current,
         decoders: proofs,
         iterations,
         replacements: total_replacements,
         transforms,
-    })
+    }))
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@ use crate::{
         JSVM_INDEX, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCEMAPS, SOURCE_GRAPH, SOURCE_INDEX,
         WASM_RESOURCE_PROVENANCE,
     },
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::load_manifest,
 };
 use anyhow::{Context, Result};
@@ -71,12 +72,18 @@ fn compact(value: Option<&Value>) -> String {
         .unwrap_or_else(|| "{}".into())
 }
 
-pub fn refresh_project_readme(project: &Path) -> Result<()> {
+pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Result<()> {
+    let budget = budgets.operation(
+        AnalysisOperation::ProjectReadme,
+        project.display().to_string(),
+    );
+    budget.checkpoint()?;
     let project = project
         .canonicalize()
         .with_context(|| format!("resolving project {}", project.display()))?;
     let manifest = load_manifest(&project)?;
     let manifest_value = serde_json::to_value(&manifest)?;
+    budget.checkpoint()?;
 
     let source_index = load_or(
         &project,
@@ -189,6 +196,7 @@ pub fn refresh_project_readme(project: &Path) -> Result<()> {
         ),
     )?;
     let wasm_resource_provenance = load_artifact(&project, WASM_RESOURCE_PROVENANCE, true)?;
+    budget.checkpoint()?;
 
     let resources = array(&manifest_value, "resources");
     let source_units = array(&source_index, "units");
@@ -198,6 +206,7 @@ pub fn refresh_project_readme(project: &Path) -> Result<()> {
         .collect::<Vec<_>>();
     let mut source_kinds = BTreeMap::<String, usize>::new();
     for unit in source_units {
+        budget.checkpoint()?;
         *source_kinds
             .entry(str_field(unit, "kind").unwrap_or("unknown").to_owned())
             .or_default() += 1;
@@ -206,6 +215,7 @@ pub fn refresh_project_readme(project: &Path) -> Result<()> {
     let mut recovered_originals = 0usize;
     let mut composed_sourcemap_links = 0usize;
     for sm in array(&sourcemaps, "source_maps") {
+        budget.checkpoint()?;
         let composed = array(sm, "composed_recovered");
         let recovered = if composed.is_empty() {
             array(sm, "recovered")
@@ -565,7 +575,7 @@ mod tests {
             });
             let manifest = validate_manifest_value(&raw, "test")?;
             write_manifest(&project.join("capture-manifest.json"), &manifest)?;
-            refresh_project_readme(&project)?;
+            refresh_project_readme(&project, &AnalysisBudgets::standard("project-readme-test"))?;
             let readme = fs::read_to_string(project.join("README.md"))?;
             assert!(readme.contains("# Recovered source project"));
             assert!(readme.contains("Capture state: **SALVAGED / truncated**"));

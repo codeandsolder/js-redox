@@ -1,4 +1,5 @@
 use crate::{
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
     js_format::format_source,
     safe_deob::{deobfuscate_source, SourceMode},
     scan_report::{scan_source, EmbeddedScanReport, ScanReport},
@@ -14,6 +15,7 @@ use std::{
     process::Command,
 };
 use tempfile::TempDir;
+use work_budget::{run_command, WorkBudget};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct CorpusDefaults {
@@ -312,7 +314,14 @@ fn scanner_metrics(report: &ScanReport) -> ScannerMetrics {
     }
 }
 
-fn assert_node_syntax(temp: &TempDir, label: &str, suffix: &str, source: &str) -> Result<()> {
+fn assert_node_syntax(
+    temp: &TempDir,
+    label: &str,
+    suffix: &str,
+    source: &str,
+    mode: SourceMode,
+    budget: &WorkBudget,
+) -> Result<()> {
     let safe_label = label
         .chars()
         .map(|character| {
@@ -324,13 +333,18 @@ fn assert_node_syntax(temp: &TempDir, label: &str, suffix: &str, source: &str) -
         })
         .take(96)
         .collect::<String>();
-    let path = temp.path().join(format!("{safe_label}.{suffix}.js"));
+    let extension = match mode {
+        SourceMode::Module => "mjs",
+        SourceMode::CommonJs => "cjs",
+        SourceMode::Auto => "js",
+    };
+    let path = temp
+        .path()
+        .join(format!("{safe_label}.{suffix}.{extension}"));
     fs::write(&path, source).with_context(|| format!("writing {}", path.display()))?;
-    let output = Command::new("node")
-        .arg("--check")
-        .arg(&path)
-        .output()
-        .with_context(|| "running node --check")?;
+    let mut command = Command::new("node");
+    command.arg("--check").arg(&path);
+    let output = run_command(&mut command, budget).context("running node --check")?;
     if !output.status.success() {
         bail!(
             "node --check failed for {label}/{suffix}: {}{}",
@@ -451,6 +465,7 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
         .with_context(|| format!("validating manifest {}", manifest_path.display()))?;
 
     let temp = TempDir::new().context("creating corpus-eval scratch directory")?;
+    let budgets = AnalysisBudgets::standard(format!("corpus-eval:{}", manifest_path.display()));
     let mut rows = Vec::with_capacity(manifest.samples.len());
     let mut proven_rewrites = 0_usize;
     let mut confirmed_dispatchers = 0_usize;
@@ -458,6 +473,8 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
     let mut reference_samples = 0_usize;
 
     for sample in &manifest.samples {
+        let sample_budget = budgets.operation(AnalysisOperation::CorpusEvaluation, &sample.id);
+        sample_budget.checkpoint()?;
         let raw_path = corpus_root.join(&sample.path);
         let raw_bytes = verify_file(&raw_path, sample.bytes, &sample.sha256, &sample.id)?;
 
@@ -497,9 +514,24 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
         let raw_source = std::str::from_utf8(&raw_bytes)
             .with_context(|| format!("{}: JavaScript is not UTF-8", sample.id))?;
 
-        let pretty =
-            format_source(raw_source).with_context(|| format!("{}: formatting", sample.id))?;
-        assert_node_syntax(&temp, &sample.id, "pretty", &pretty)?;
+        let source_mode = SourceMode::for_path(&raw_path);
+        let format_budget =
+            budgets.operation_under(&sample_budget, AnalysisOperation::Format, &sample.id);
+        let pretty = format_source(raw_source, &format_budget)
+            .with_context(|| format!("{}: formatting", sample.id))?;
+        let syntax_budget = budgets.operation_under(
+            &sample_budget,
+            AnalysisOperation::SyntaxCheck,
+            format!("{}:pretty", sample.id),
+        );
+        assert_node_syntax(
+            &temp,
+            &sample.id,
+            "pretty",
+            &pretty,
+            source_mode,
+            &syntax_budget,
+        )?;
         if let Some(pretty_path) = &sample.pretty_path {
             let committed_path = corpus_root.join(pretty_path);
             if let (Some(expected_bytes), Some(expected_sha)) =
@@ -517,15 +549,33 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
             }
         }
 
+        let deob_budget = budgets.operation_under(
+            &sample_budget,
+            AnalysisOperation::SafeDeobfuscation,
+            &sample.id,
+        );
         let deob = deobfuscate_source(
             raw_source,
             raw_path.display().to_string(),
-            SourceMode::for_path(&raw_path),
+            source_mode,
             16,
             false,
+            &deob_budget,
         )
         .with_context(|| format!("{}: safe deobfuscation", sample.id))?;
-        assert_node_syntax(&temp, &sample.id, "deob", &deob.source)?;
+        let syntax_budget = budgets.operation_under(
+            &sample_budget,
+            AnalysisOperation::SyntaxCheck,
+            format!("{}:deob", sample.id),
+        );
+        assert_node_syntax(
+            &temp,
+            &sample.id,
+            "deob",
+            &deob.source,
+            source_mode,
+            &syntax_budget,
+        )?;
         if !deob.report.safe_static_only
             || deob.report.presentation_formatted
             || !deob.report.runtime_semantics_preserved_by_design
@@ -543,7 +593,12 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
             .map(|(_, count)| *count)
             .sum::<usize>();
 
-        let scan = scan_source(&pretty, sample.id.clone(), None);
+        let scan_budget = budgets.operation_under(
+            &sample_budget,
+            AnalysisOperation::StructuralScan,
+            &sample.id,
+        );
+        let scan = scan_source(&pretty, sample.id.clone(), None, &scan_budget)?;
         if scan.fatal_error {
             bail!("{}: scanner fatal error", sample.id);
         }

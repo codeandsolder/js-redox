@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use jsvm_lift::{
+    analysis_budget::AnalysisBudgets,
     capture_import::{import_capture_project, CaptureImportOptions},
     sha256_hex,
     source_graph::build_source_graph,
@@ -183,12 +184,15 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
     )?;
 
     let project = workspace.path().join("project");
-    let summary = import_capture_project(&CaptureImportOptions {
-        input: capture,
-        output: project.clone(),
-        assets_dir: None,
-        overwrite: false,
-    })?;
+    let summary = import_capture_project(
+        &CaptureImportOptions {
+            input: capture,
+            output: project.clone(),
+            assets_dir: None,
+            overwrite: false,
+        },
+        &AnalysisBudgets::standard("runtime-script-project-test"),
+    )?;
     assert_eq!(summary.kind.as_str(), "recorder");
 
     let report = read_json(&project.join("analysis/runtime-scripts.json"))?;
@@ -242,7 +246,10 @@ fn recorder_runtime_provenance_flows_into_source_graph() -> Result<()> {
     assert_eq!(observed["sha256"], digest(observed_network));
     assert_eq!(observed["event_count"], 1);
 
-    build_source_graph(&project)?;
+    build_source_graph(
+        &project,
+        &AnalysisBudgets::standard("runtime-script-graph-test"),
+    )?;
     let graph = read_json(&project.join("analysis/source-graph.json"))?;
     let nodes = graph
         .get("nodes")

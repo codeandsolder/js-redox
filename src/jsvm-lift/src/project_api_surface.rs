@@ -1,5 +1,6 @@
 use crate::{
     analysis_artifacts::{load_artifact, write_artifact, API_SURFACE, DEOBFUSCATION, SOURCE_INDEX},
+    analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     api_surface::analyze_api_surface,
 };
 use anyhow::{Context, Result};
@@ -23,7 +24,9 @@ fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 
 /// Analyze every selected JavaScript view in a capture project and persist the
 /// canonical `capture-api-surface/v2` artifact.
-pub fn analyze_project_api_surface(project: &Path) -> Result<Value> {
+pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) -> Result<Value> {
+    let stage_budget = budgets.scope(format!("api-surface-project:{}", project.display()));
+    stage_budget.checkpoint()?;
     let source_index = load_artifact(project, SOURCE_INDEX, false)?
         .context("source index is required for API-surface analysis")?;
     let deobfuscation = load_artifact(project, DEOBFUSCATION, true)?;
@@ -54,6 +57,7 @@ pub fn analyze_project_api_surface(project: &Path) -> Result<Value> {
     let mut analyzed_units = 0_usize;
 
     for (source_index_ordinal, unit) in units.iter().enumerate() {
+        stage_budget.checkpoint()?;
         if string_field(unit, "kind") != Some("javascript")
             || string_field(unit, "source_path").is_none()
         {
@@ -83,6 +87,7 @@ pub fn analyze_project_api_surface(project: &Path) -> Result<Value> {
         let source = match fs::read_to_string(&source_path) {
             Ok(source) => source,
             Err(error) => {
+                let error = recoverable_unit_error(error)?;
                 failures.push(json!({
                     "source_index_ordinal": source_index_ordinal,
                     "resource_id": unit.get("resource_id").cloned().unwrap_or(Value::Null),
@@ -93,9 +98,15 @@ pub fn analyze_project_api_surface(project: &Path) -> Result<Value> {
                 continue;
             }
         };
-        let rows = match analyze_api_surface(&source) {
+        let budget = budgets.operation_under(
+            &stage_budget,
+            AnalysisOperation::ApiSurface,
+            source_path.display().to_string(),
+        );
+        let rows = match analyze_api_surface(&source, &budget) {
             Ok(rows) => rows,
             Err(error) => {
+                let error = recoverable_unit_error(error)?;
                 failures.push(json!({
                     "source_index_ordinal": source_index_ordinal,
                     "resource_id": unit.get("resource_id").cloned().unwrap_or(Value::Null),
@@ -179,6 +190,7 @@ mod tests {
     use crate::analysis_artifacts::{
         read_artifact, write_artifact, API_SURFACE, DEOBFUSCATION, SOURCE_INDEX,
     };
+    use crate::analysis_budget::AnalysisBudgets;
     use anyhow::Context;
     use serde_json::{json, Map};
     use std::{
@@ -246,7 +258,10 @@ mod tests {
         });
         write_artifact(&project, DEOBFUSCATION, &deobfuscation)?;
 
-        let summary = analyze_project_api_surface(&project)?;
+        let summary = analyze_project_api_surface(
+            &project,
+            &AnalysisBudgets::standard("api-surface-project-test"),
+        )?;
         assert_eq!(summary["units"], 2);
         assert_eq!(summary["callsites"], 1);
         assert_eq!(summary["failures"], 1);
@@ -364,7 +379,10 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             }),
         )?;
 
-        let summary = analyze_project_api_surface(&project)?;
+        let summary = analyze_project_api_surface(
+            &project,
+            &AnalysisBudgets::standard("api-surface-graph-test"),
+        )?;
         assert_eq!(summary["units"], 2);
         assert_eq!(summary["callsites"], 8);
         assert_eq!(summary["failures"], 1);
@@ -413,7 +431,10 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             .get("method")
             .is_none_or(serde_json::Value::is_null));
 
-        let graph_summary = build_source_graph(&project)?;
+        let graph_summary = build_source_graph(
+            &project,
+            &AnalysisBudgets::standard("api-source-graph-test"),
+        )?;
         assert!(graph_summary.nodes >= 8);
         let graph = read_artifact(
             &project.join(crate::analysis_artifacts::SOURCE_GRAPH.relative_path),
@@ -445,7 +466,10 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             })
         }));
 
-        refresh_project_readme(&project)?;
+        refresh_project_readme(
+            &project,
+            &AnalysisBudgets::standard("api-project-readme-test"),
+        )?;
         let readme = fs::read_to_string(project.join("README.md"))?;
         assert!(readme.contains("[analysis/api-surface.json](analysis/api-surface.json)"));
         assert!(readme.contains("Static browser API callsites: **8**"));

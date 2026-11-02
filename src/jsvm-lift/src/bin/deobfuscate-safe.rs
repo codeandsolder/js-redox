@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use jsvm_lift::{
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions},
     safe_deob::{deobfuscate_source, SourceMode},
 };
@@ -76,12 +77,18 @@ fn source_mode(args: &SourceArgs) -> SourceMode {
 fn run_source(args: SourceArgs) -> Result<()> {
     let original = fs::read_to_string(&args.input)
         .with_context(|| format!("reading {}", args.input.display()))?;
+    let budgets = AnalysisBudgets::standard("deobfuscate-safe");
+    let budget = budgets.operation(
+        AnalysisOperation::SafeDeobfuscation,
+        args.input.display().to_string(),
+    );
     let outcome = deobfuscate_source(
         &original,
         args.input.display().to_string(),
         source_mode(&args),
         args.max_iterations,
         args.format_output,
+        &budget,
     )?;
 
     if let Some(parent) = args.output.parent() {
@@ -116,6 +123,7 @@ fn run_project(args: ProjectArgs) -> Result<()> {
         &ProjectDeobOptions {
             jobs: args.jobs,
             max_iterations: args.max_iterations,
+            budgets: AnalysisBudgets::standard("deobfuscate-safe-project"),
         },
     )?;
     println!(

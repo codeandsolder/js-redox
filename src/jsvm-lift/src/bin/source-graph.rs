@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use jsvm_lift::source_graph::build_source_graph;
+use jsvm_lift::{analysis_budget::AnalysisBudgets, source_graph::build_source_graph};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -11,7 +11,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let summary = build_source_graph(&args.project)?;
+    let summary = build_source_graph(&args.project, &AnalysisBudgets::standard("source-graph"))?;
     println!(
         "source graph: {} nodes / {} edges / {} external URLs",
         summary.nodes, summary.edges, summary.external_urls

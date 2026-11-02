@@ -2,6 +2,7 @@ use crate::{
     analysis_artifacts::{
         load_artifact, write_artifact, DEOBFUSCATION, WASM_INDEX, WASM_JS_BOUNDARY,
     },
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
     content_dedup::sha256_path,
     wasm_import_semantics::{proven_wasm_import_semantics, proven_wasm_import_semantics_for},
 };
@@ -16,6 +17,7 @@ use wasm_redox::fresh_eval::{
     evaluate_fresh_i32_call, evaluate_fresh_i32_sequence, FreshEvalOutcome, FreshI32Arg,
     FreshI32CallRequest, FreshTableGrowRequest,
 };
+use work_budget::WorkBudget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmJsBoundarySummary {
@@ -1343,11 +1345,11 @@ fn fresh_cleanup_disjointness_proof(
     }))
 }
 
-fn semantics_for_source(source: &Path) -> Result<Value> {
+fn semantics_for_source(source: &Path, budget: &WorkBudget) -> Result<Value> {
     let text =
         fs::read_to_string(source).with_context(|| format!("reading {}", source.display()))?;
-    serde_json::to_value(proven_wasm_import_semantics(&text))
-        .context("serializing JS WASM semantics")
+    let analysis = proven_wasm_import_semantics(&text, budget)?;
+    serde_json::to_value(analysis).context("serializing JS WASM semantics")
 }
 
 fn targeted_semantics_for_source(
@@ -1355,16 +1357,13 @@ fn targeted_semantics_for_source(
     import_module: &str,
     import_name: &str,
     offset: u32,
+    budget: &WorkBudget,
 ) -> Result<Value> {
     let text =
         fs::read_to_string(source).with_context(|| format!("reading {}", source.display()))?;
-    serde_json::to_value(proven_wasm_import_semantics_for(
-        &text,
-        import_module,
-        import_name,
-        offset,
-    ))
-    .context("serializing targeted JS WASM semantics")
+    let analysis =
+        proven_wasm_import_semantics_for(&text, import_module, import_name, offset, budget)?;
+    serde_json::to_value(analysis).context("serializing targeted JS WASM semantics")
 }
 
 fn matching_usages(document: &Value, import_module: &str, import_name: &str) -> Vec<Value> {
@@ -1378,7 +1377,15 @@ fn matching_usages(document: &Value, import_module: &str, import_name: &str) -> 
         .collect()
 }
 
-pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
+pub fn correlate_project(
+    project: &Path,
+    budgets: &AnalysisBudgets,
+) -> Result<WasmJsBoundarySummary> {
+    let stage_budget = budgets.operation(
+        AnalysisOperation::WasmAnalysis,
+        format!("boundary:{}", project.display()),
+    );
+    stage_budget.checkpoint()?;
     let wasm_index = load_artifact(project, WASM_INDEX, false)?
         .context("WASM index is required for WASM/JS boundary correlation")?;
     let deob = load_artifact(project, DEOBFUSCATION, false)?
@@ -1400,6 +1407,7 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
     let mut carrier_sources = BTreeSet::<String>::new();
 
     for module in array_field(&wasm_index, "modules") {
+        stage_budget.checkpoint()?;
         if string_field(module, "status") != Some("ok")
             || string_field(module, "deep_path").is_none()
         {
@@ -1427,6 +1435,7 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
 
         let mut carrier_candidates = Vec::<String>::new();
         for origin in array_field(module, "origins") {
+            stage_budget.checkpoint()?;
             let Some(raw) = string_field(origin, "source_path") else {
                 continue;
             };
@@ -1439,10 +1448,12 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
         }
 
         for export in array_field(&deep, "exports") {
+            stage_budget.checkpoint()?;
             let analysis = export.get("analysis").unwrap_or(&Value::Null);
             let export_name = string_field(export, "export");
 
             for pair in array_field(analysis, "opaque_host_effect_memory_reads") {
+                stage_budget.checkpoint()?;
                 let host_import = pair.get("host_import").cloned().unwrap_or(Value::Null);
                 let host_import_function = usize_field(pair, "host_import_function");
                 let raw_import = host_import_function
@@ -1459,6 +1470,7 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
                     (raw_module, raw_import, offset)
                 {
                     for relative in &carrier_candidates {
+                        stage_budget.checkpoint()?;
                         let source = project.join(relative);
                         if !source.is_file() {
                             continue;
@@ -1471,12 +1483,16 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
                             offset,
                         );
                         if !targeted_cache.contains_key(&key) {
-                            targeted_cache.insert(
-                                key.clone(),
+                            targeted_cache.insert(key.clone(), {
+                                let budget = budgets.operation_under(
+                                    &stage_budget,
+                                    AnalysisOperation::WasmAnalysis,
+                                    source.display().to_string(),
+                                );
                                 targeted_semantics_for_source(
-                                    &source, raw_module, raw_import, offset,
-                                )?,
-                            );
+                                    &source, raw_module, raw_import, offset, &budget,
+                                )?
+                            });
                         }
                         let probe = targeted_cache.get(&key).context("missing targeted cache")?;
                         let writes = array_field(probe, "shapes");
@@ -1570,6 +1586,7 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
             }
 
             for candidate in array_field(analysis, "externref_bulk_copy_candidates") {
+                stage_budget.checkpoint()?;
                 let set_import = usize_field(candidate, "set_import_function")
                     .and_then(|index| function_imports.get(index));
                 let constructor_import = usize_field(candidate, "constructor_import_function")
@@ -1596,13 +1613,20 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
                 ) = (set_module, set_name, constructor_module, constructor_name)
                 {
                     for relative in &carrier_candidates {
+                        stage_budget.checkpoint()?;
                         let source = project.join(relative);
                         if !source.is_file() {
                             continue;
                         }
                         carrier_sources.insert(relative.clone());
                         if !full_cache.contains_key(relative) {
-                            full_cache.insert(relative.clone(), semantics_for_source(&source)?);
+                            let budget = budgets.operation_under(
+                                &stage_budget,
+                                AnalysisOperation::WasmAnalysis,
+                                source.display().to_string(),
+                            );
+                            full_cache
+                                .insert(relative.clone(), semantics_for_source(&source, &budget)?);
                         }
                         let document = full_cache
                             .get(relative)
@@ -1775,8 +1799,10 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
                                 binding_proofs: &copied_binding_proofs,
                                 export_name,
                             };
+                            stage_budget.checkpoint()?;
                             fresh_alignment_proof =
                                 fresh_destination_alignment_proof(&context, candidate);
+                            stage_budget.checkpoint()?;
                         }
                     }
                 }
@@ -1797,7 +1823,14 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
                                 binding_proofs: &copied_binding_proofs,
                                 export_name,
                             };
-                            fresh_cleanup_disjointness_proof(&context, candidate, Some(alignment))
+                            stage_budget.checkpoint()?;
+                            let proof = fresh_cleanup_disjointness_proof(
+                                &context,
+                                candidate,
+                                Some(alignment),
+                            );
+                            stage_budget.checkpoint()?;
+                            proof
                         }
                         _ => None,
                     }
@@ -1982,6 +2015,7 @@ pub fn correlate_project(project: &Path) -> Result<WasmJsBoundarySummary> {
         "skipped_modules": skipped_modules,
         "summary": summary,
     });
+    stage_budget.checkpoint()?;
     write_artifact(project, WASM_JS_BOUNDARY, &document)?;
 
     Ok(WasmJsBoundarySummary {

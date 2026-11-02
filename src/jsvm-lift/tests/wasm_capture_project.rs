@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use jsvm_lift::{
+    analysis_budget::AnalysisBudgets,
     capture_import::{import_capture_project, CaptureImportOptions},
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions},
     source_graph::build_source_graph,
@@ -135,22 +136,34 @@ fn write_inline_wasm_har(path: &Path, title: &str, source: &str) -> Result<()> {
 }
 
 fn run_wasm_boundary_pipeline(input: &Path, project: &Path) -> Result<Value> {
-    import_capture_project(&CaptureImportOptions {
-        input: input.to_owned(),
-        output: project.to_owned(),
-        assets_dir: None,
-        overwrite: false,
-    })?;
-    materialize_capture_source(project, Some(1))?;
-    materialize_wasm(project, None)?;
+    import_capture_project(
+        &CaptureImportOptions {
+            input: input.to_owned(),
+            output: project.to_owned(),
+            assets_dir: None,
+            overwrite: false,
+        },
+        &AnalysisBudgets::standard("wasm-capture-import-test"),
+    )?;
+    materialize_capture_source(
+        project,
+        Some(1),
+        &AnalysisBudgets::standard("wasm-capture-source-test"),
+    )?;
+    materialize_wasm(
+        project,
+        None,
+        &AnalysisBudgets::standard("wasm-materialize-project-test"),
+    )?;
     materialize_project_deobfuscation(
         project,
         &ProjectDeobOptions {
             jobs: Some(1),
             max_iterations: 16,
+            budgets: AnalysisBudgets::standard("wasm-capture-project-test"),
         },
     )?;
-    correlate_project(project)?;
+    correlate_project(project, &AnalysisBudgets::standard("wasm-boundary-test"))?;
     read_json(&project.join("analysis/wasm-js-boundary.json"))
 }
 
@@ -314,7 +327,10 @@ fn wasm_capture_deduplicates_origins_and_correlates_host_effects() -> Result<()>
             && row["import_binding_identity_proven"] == true
     ));
 
-    build_source_graph(&project)?;
+    build_source_graph(
+        &project,
+        &AnalysisBudgets::standard("wasm-capture-graph-test"),
+    )?;
     let graph = read_json(&project.join("analysis/source-graph.json"))?;
     let wasm_node = graph["nodes"]
         .as_array()

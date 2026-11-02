@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use jsvm_lift::{
+    analysis_budget::AnalysisBudgets,
     capture_import::{import_capture_project, CaptureImportOptions},
     project_js_refs::scan_project_references,
     source_graph::build_source_graph,
@@ -71,15 +72,26 @@ fn reference<'a>(row: &'a Value, specifier: &str) -> Result<&'a Value> {
 }
 
 fn run_pipeline(input: &Path, project: &Path) -> Result<()> {
-    import_capture_project(&CaptureImportOptions {
-        input: input.to_owned(),
-        output: project.to_owned(),
-        assets_dir: None,
-        overwrite: false,
-    })?;
-    materialize_capture_source(project, Some(2))?;
-    scan_project_references(project, Some(2))?;
-    build_source_graph(project)?;
+    import_capture_project(
+        &CaptureImportOptions {
+            input: input.to_owned(),
+            output: project.to_owned(),
+            assets_dir: None,
+            overwrite: false,
+        },
+        &AnalysisBudgets::standard("import-map-capture-import-test"),
+    )?;
+    materialize_capture_source(
+        project,
+        Some(2),
+        &AnalysisBudgets::standard("import-map-project-test"),
+    )?;
+    scan_project_references(
+        project,
+        Some(2),
+        &AnalysisBudgets::standard("import-map-reference-test"),
+    )?;
+    build_source_graph(project, &AnalysisBudgets::standard("import-map-graph-test"))?;
     Ok(())
 }
 

@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use jsvm_lift::wasm_resource_provenance::correlate_wasm_resource_provenance;
+use jsvm_lift::{
+    analysis_budget::AnalysisBudgets, wasm_resource_provenance::correlate_wasm_resource_provenance,
+};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -11,7 +13,10 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let summary = correlate_wasm_resource_provenance(&args.project)?;
+    let summary = correlate_wasm_resource_provenance(
+        &args.project,
+        &AnalysisBudgets::standard("wasm-resource-provenance"),
+    )?;
     if summary.applicable {
         println!(
             "WASM runtime provenance: {} exact response observation(s), {} exact runtime initiator(s), {} unmatched, {} non-body observation(s)",

@@ -1,5 +1,6 @@
 use crate::{
     analysis_artifacts::{write_artifact, SOURCEMAPS},
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::load_manifest,
     sha256_hex,
     source_directive::source_directives,
@@ -14,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use url::Url;
+use work_budget::WorkBudget;
 
 const MAX_CHAIN_DEPTH: usize = 16;
 const MAX_SOURCE_MAP_BYTES: usize = 64 * 1024 * 1024;
@@ -419,24 +421,34 @@ pub fn compose_sourcemap_json(
     downstream_json: &str,
     upstream_json: &str,
     source_id: u32,
+    budget: &WorkBudget,
 ) -> Result<String> {
+    budget.checkpoint()?;
     let downstream = OwnedSourceMap::from_json_string(downstream_json)
         .context("parsing downstream source map")?;
     let upstream =
         OwnedSourceMap::from_json_string(upstream_json).context("parsing upstream source map")?;
-    Ok(compose_sourcemap_source(
+    budget.checkpoint()?;
+    let composed = compose_sourcemap_source(
         downstream.as_source_map(),
         source_id,
         upstream.as_source_map(),
     )
-    .to_json_string())
+    .to_json_string();
+    budget.checkpoint()?;
+    Ok(composed)
 }
 
-fn compose_documents(downstream: &Value, upstream: &Value, source_id: usize) -> Result<Value> {
+fn compose_documents(
+    downstream: &Value,
+    upstream: &Value,
+    source_id: usize,
+    budget: &WorkBudget,
+) -> Result<Value> {
     let source_id = u32::try_from(source_id).context("source-map source ordinal exceeds u32")?;
     let downstream = serde_json::to_string(downstream)?;
     let upstream = serde_json::to_string(upstream)?;
-    let composed = compose_sourcemap_json(&downstream, &upstream, source_id)?;
+    let composed = compose_sourcemap_json(&downstream, &upstream, source_id, budget)?;
     serde_json::from_str(&composed).context("parsing composed source map")
 }
 
@@ -450,7 +462,9 @@ fn expand_map(
     project: &Path,
     stack: &BTreeSet<String>,
     depth: usize,
+    budget: &WorkBudget,
 ) -> Result<(Value, Vec<Value>, usize)> {
+    budget.checkpoint()?;
     let normalized = normalize_map_document(loaded)?;
     let sources = normalized
         .get("sources")
@@ -465,6 +479,7 @@ fn expand_map(
     }
 
     for ordinal in (0..sources.len()).rev() {
+        budget.checkpoint()?;
         let logical_source = value_text(&sources[ordinal]);
         let Some((code, code_origin, code_resource_id)) =
             source_code(&normalized, ordinal, &logical_source, by_url, project)
@@ -517,13 +532,13 @@ fn expand_map(
         let mut nested_stack = stack.clone();
         nested_stack.insert(upstream.identity.clone());
         let (expanded_upstream, nested_links, nested_compositions) =
-            expand_map(&upstream, by_url, project, &nested_stack, depth + 1)?;
+            expand_map(&upstream, by_url, project, &nested_stack, depth + 1, budget)?;
         let upstream_sources = expanded_upstream
             .get("sources")
             .and_then(Value::as_array)
             .map_or(0, Vec::len);
         row.insert("upstream_sources".into(), Value::from(upstream_sources));
-        match compose_documents(&composed, &expanded_upstream, ordinal) {
+        match compose_documents(&composed, &expanded_upstream, ordinal, budget) {
             Ok(next) => {
                 composed = next;
                 row.insert("status".into(), Value::String("composed".into()));
@@ -540,7 +555,13 @@ fn expand_map(
     Ok((composed, links, compositions))
 }
 
-fn materialize_sources(document: &Value, root: &Path, project: &Path) -> Result<Vec<Value>> {
+fn materialize_sources(
+    document: &Value,
+    root: &Path,
+    project: &Path,
+    budget: &WorkBudget,
+) -> Result<Vec<Value>> {
+    budget.checkpoint()?;
     let sources = document
         .get("sources")
         .and_then(Value::as_array)
@@ -553,6 +574,7 @@ fn materialize_sources(document: &Value, root: &Path, project: &Path) -> Result<
         .unwrap_or_default();
     let mut recovered = Vec::with_capacity(sources.len());
     for (ordinal, source) in sources.iter().enumerate() {
+        budget.checkpoint()?;
         let source_text = value_text(source);
         let content = contents.get(ordinal).filter(|content| !content.is_null());
         let Some(content) = content else {
@@ -605,10 +627,18 @@ fn recovered_count(rows: &[Value]) -> usize {
         .count()
 }
 
-pub fn recover_project_sourcemaps(project: &Path) -> Result<ProjectSourcemapSummary> {
+pub fn recover_project_sourcemaps(
+    project: &Path,
+    budgets: &AnalysisBudgets,
+) -> Result<ProjectSourcemapSummary> {
     let project = project
         .canonicalize()
         .with_context(|| format!("resolving project {}", project.display()))?;
+    let stage_budget = budgets.operation(
+        AnalysisOperation::SourcemapRecovery,
+        project.display().to_string(),
+    );
+    stage_budget.checkpoint()?;
     let manifest = load_manifest(&project)?;
     let mut by_url = BTreeMap::new();
     for resource in &manifest.resources {
@@ -619,6 +649,7 @@ pub fn recover_project_sourcemaps(project: &Path) -> Result<ProjectSourcemapSumm
 
     let mut results = Vec::new();
     for resource in &manifest.resources {
+        stage_budget.checkpoint()?;
         if resource.get("kind").and_then(Value::as_str) != Some("javascript") {
             continue;
         }
@@ -631,6 +662,12 @@ pub fn recover_project_sourcemaps(project: &Path) -> Result<ProjectSourcemapSumm
         let Some(resource_id) = resource_id(resource) else {
             continue;
         };
+        let budget = budgets.operation_under(
+            &stage_budget,
+            AnalysisOperation::SourcemapRecovery,
+            format!("{resource_id}:{code_url}"),
+        );
+        budget.checkpoint()?;
         let loaded = match load_map(&raw_reference, code_url, &by_url, &project) {
             Ok(loaded) => loaded,
             Err(values) => {
@@ -649,10 +686,11 @@ pub fn recover_project_sourcemaps(project: &Path) -> Result<ProjectSourcemapSumm
         let source_root = project
             .join("src/_sourcemap")
             .join(format!("{resource_id:04}-{digest}"));
-        let recovered = materialize_sources(&direct_document, &source_root, &project)?;
+        let recovered = materialize_sources(&direct_document, &source_root, &project, &budget)?;
         let mut stack = BTreeSet::new();
         stack.insert(loaded.identity.clone());
-        let (composed, links, compositions) = expand_map(&loaded, &by_url, &project, &stack, 0)?;
+        let (composed, links, compositions) =
+            expand_map(&loaded, &by_url, &project, &stack, 0, &budget)?;
 
         let mut composed_recovered = Vec::new();
         let mut composed_map_path = Value::Null;
@@ -670,7 +708,7 @@ pub fn recover_project_sourcemaps(project: &Path) -> Result<ProjectSourcemapSumm
                     .into_owned(),
             );
             composed_recovered =
-                materialize_sources(&composed, &source_root.join("final"), &project)?;
+                materialize_sources(&composed, &source_root.join("final"), &project, &budget)?;
         }
         let composition_status = if links.is_empty() {
             "not_needed"

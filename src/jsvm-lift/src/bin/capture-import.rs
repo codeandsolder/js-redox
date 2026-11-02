@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
-use jsvm_lift::capture_import::{import_capture_project, CaptureImportOptions};
+use jsvm_lift::{
+    analysis_budget::AnalysisBudgets,
+    capture_import::{import_capture_project, CaptureImportOptions},
+};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -17,12 +20,15 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let summary = import_capture_project(&CaptureImportOptions {
-        input: args.input,
-        output: args.output.clone(),
-        assets_dir: args.assets_dir,
-        overwrite: args.overwrite,
-    })?;
+    let summary = import_capture_project(
+        &CaptureImportOptions {
+            input: args.input,
+            output: args.output.clone(),
+            assets_dir: args.assets_dir,
+            overwrite: args.overwrite,
+        },
+        &AnalysisBudgets::standard("capture-import"),
+    )?;
     println!(
         "{} capture: {} resources, {} script records -> {}",
         summary.kind.as_str(),

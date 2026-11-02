@@ -24,6 +24,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use url::Url;
+use work_budget::WorkBudget;
 
 const SAVED_ORIGIN: &str = "https://saved-page.invalid/";
 
@@ -283,11 +284,18 @@ fn discover_assets_dir(page: &Path) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-fn collect_asset_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
-    fn visit(root: &Path, directory: &Path, output: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
+fn collect_asset_files(root: &Path, budget: &WorkBudget) -> Result<Vec<(PathBuf, PathBuf)>> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        output: &mut Vec<(PathBuf, PathBuf)>,
+        budget: &WorkBudget,
+    ) -> Result<()> {
+        budget.checkpoint()?;
         for entry in
             fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))?
         {
+            budget.checkpoint()?;
             let entry = entry?;
             let file_type = entry.file_type()?;
             if file_type.is_symlink() {
@@ -295,7 +303,7 @@ fn collect_asset_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
             }
             let path = entry.path();
             if file_type.is_dir() {
-                visit(root, &path, output)?;
+                visit(root, &path, output, budget)?;
             } else if file_type.is_file() {
                 let resolved = path.canonicalize()?;
                 let Ok(relative) = resolved.strip_prefix(root) else {
@@ -307,7 +315,7 @@ fn collect_asset_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
         Ok(())
     }
     let mut output = Vec::new();
-    visit(root, root, &mut output)?;
+    visit(root, root, &mut output, budget)?;
     output.sort_by(|left, right| left.1.cmp(&right.1));
     Ok(output)
 }
@@ -325,7 +333,9 @@ pub(super) fn import_saved_page(
     page: &Path,
     output: &Path,
     options: &SavedPageOptions,
+    budget: &WorkBudget,
 ) -> Result<SavedPageSummary> {
+    budget.checkpoint()?;
     let page = page
         .canonicalize()
         .with_context(|| format!("saved page HTML does not exist: {}", page.display()))?;
@@ -341,6 +351,7 @@ pub(super) fn import_saved_page(
 
     let page_bytes = fs::read(&page)?;
     let decoded = decode_html(&page_bytes, None, None);
+    budget.checkpoint()?;
     let page_text = decoded.source;
     let assets = if let Some(explicit) = &options.assets_dir {
         let resolved = explicit
@@ -364,7 +375,7 @@ pub(super) fn import_saved_page(
         let assets_name = assets_root
             .file_name()
             .context("assets directory has no name")?;
-        for (source, relative) in collect_asset_files(assets_root)? {
+        for (source, relative) in collect_asset_files(assets_root, budget)? {
             files.push((
                 source,
                 PathBuf::from("saved-page").join(assets_name).join(relative),
@@ -376,6 +387,7 @@ pub(super) fn import_saved_page(
     let mut counts = BTreeMap::<String, usize>::new();
     let mut rel_to_id = HashMap::<PathBuf, u64>::new();
     for (id, (source, capture_rel)) in files.iter().enumerate() {
+        budget.checkpoint()?;
         let resource_id = u64::try_from(id).context("too many saved-page resources")?;
         let output_rel = PathBuf::from("resources").join(capture_rel);
         let data = write_copy(source, &output.join(&output_rel))?;
@@ -430,7 +442,9 @@ pub(super) fn import_saved_page(
         .as_str()
         .context("saved page resource URL missing")?
         .to_owned();
+    budget.checkpoint()?;
     let page_refs = html_references(&page_text, &page_url)?;
+    budget.checkpoint()?;
     resources[page_index]["references"] = Value::Array(page_refs.clone());
 
     let by_url = resources
@@ -444,6 +458,7 @@ pub(super) fn import_saved_page(
         })
         .collect::<HashMap<_, _>>();
     for reference in &page_refs {
+        budget.checkpoint()?;
         let Some(url) = reference.get("resolved_url").and_then(Value::as_str) else {
             continue;
         };
@@ -464,6 +479,7 @@ pub(super) fn import_saved_page(
     }
 
     for resource in &mut resources {
+        budget.checkpoint()?;
         let Some(kind) = resource.get("kind").and_then(Value::as_str) else {
             continue;
         };
@@ -530,7 +546,9 @@ pub(super) fn import_saved_page(
 
     let mut inline_scripts = Vec::<Value>::new();
     let mut inline_seen = HashMap::<String, String>::new();
+    budget.checkpoint()?;
     for (offset, script) in extract_script_tags(&page_text).into_iter().enumerate() {
+        budget.checkpoint()?;
         let ordinal = offset + 1;
         let script_type = script_type_essence(script.attrs.get("type").map(String::as_str));
         let src = script.attrs.get("src").and_then(|value| clean_ref(value));
@@ -649,7 +667,9 @@ pub(super) fn import_saved_page(
         counts,
         extra: Map::new(),
     };
+    budget.checkpoint()?;
     write_manifest(&output.join(MANIFEST_NAME), &manifest)?;
+    budget.checkpoint()?;
     fs::create_dir_all(output.join(".vscode"))?;
     fs::write(
         output.join(".vscode/settings.json"),

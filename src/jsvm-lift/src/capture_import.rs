@@ -2,6 +2,7 @@ mod runtime_scripts;
 mod saved_page;
 
 use crate::{
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::{load_manifest, write_manifest},
     har_project::{import_har_project, HarProjectOptions},
 };
@@ -69,7 +70,15 @@ pub fn detect_capture_input(path: &Path) -> Result<CaptureInputKind> {
     }
 }
 
-pub fn import_capture_project(options: &CaptureImportOptions) -> Result<CaptureImportSummary> {
+pub fn import_capture_project(
+    options: &CaptureImportOptions,
+    budgets: &AnalysisBudgets,
+) -> Result<CaptureImportSummary> {
+    let budget = budgets.operation(
+        AnalysisOperation::CaptureImport,
+        options.input.display().to_string(),
+    );
+    budget.checkpoint()?;
     let input = options
         .input
         .canonicalize()
@@ -84,6 +93,7 @@ pub fn import_capture_project(options: &CaptureImportOptions) -> Result<CaptureI
                     assets_dir: options.assets_dir.clone(),
                     overwrite: options.overwrite,
                 },
+                &budget,
             )?;
             Ok(CaptureImportSummary {
                 kind,
@@ -100,11 +110,14 @@ pub fn import_capture_project(options: &CaptureImportOptions) -> Result<CaptureI
             } else {
                 input.clone()
             };
-            let summary = import_har_project(&HarProjectOptions {
-                har: har.clone(),
-                output: options.output.clone(),
-                overwrite: options.overwrite,
-            })?;
+            let summary = import_har_project(
+                &HarProjectOptions {
+                    har: har.clone(),
+                    output: options.output.clone(),
+                    overwrite: options.overwrite,
+                },
+                &budget,
+            )?;
             if kind == CaptureInputKind::Recorder {
                 let mut manifest = load_manifest(&options.output)?;
                 manifest.source.kind = "recorder".into();
@@ -114,7 +127,7 @@ pub fn import_capture_project(options: &CaptureImportOptions) -> Result<CaptureI
                     .extra
                     .insert("har_input".into(), Value::String(har.display().to_string()));
                 write_manifest(&options.output.join("capture-manifest.json"), &manifest)?;
-                analyze_recorder_runtime_scripts(&input, &options.output, &manifest)?;
+                analyze_recorder_runtime_scripts(&input, &options.output, &manifest, &budget)?;
             }
             Ok(CaptureImportSummary {
                 kind,

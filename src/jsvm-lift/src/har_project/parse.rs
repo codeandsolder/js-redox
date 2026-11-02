@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::{fs, path::Path};
+use work_budget::{BudgetPoller, WorkBudget};
 
 #[derive(Debug, Deserialize)]
 pub(super) struct Har {
@@ -97,7 +98,8 @@ pub(super) struct NameValue {
     pub(super) value: String,
 }
 
-fn salvage_har(raw: &[u8]) -> Result<(Har, Vec<String>)> {
+fn salvage_har(raw: &[u8], budget: &WorkBudget) -> Result<(Har, Vec<String>)> {
+    budget.checkpoint()?;
     let text = std::str::from_utf8(raw).context("HAR is not valid UTF-8")?;
     let marker = text
         .find("\"entries\"")
@@ -116,7 +118,11 @@ fn salvage_har(raw: &[u8]) -> Result<(Har, Vec<String>)> {
     let mut array_depth = 1usize;
     let mut entry_start = None;
 
+    let mut poller = BudgetPoller::new(budget, 4096);
     for i in (array_start + 1)..bytes.len() {
+        if !poller.poll(1) {
+            break;
+        }
         let byte = bytes[i];
         if in_string {
             if escaped {
@@ -164,6 +170,7 @@ fn salvage_har(raw: &[u8]) -> Result<(Har, Vec<String>)> {
         }
     }
 
+    poller.finish()?;
     if entries.is_empty() {
         bail!("no complete HAR entries could be salvaged");
     }
@@ -180,7 +187,11 @@ fn salvage_har(raw: &[u8]) -> Result<(Har, Vec<String>)> {
     ))
 }
 
-pub(super) fn read_har(path: &Path) -> Result<(Har, bool, Option<String>, Vec<String>)> {
+pub(super) fn read_har(
+    path: &Path,
+    budget: &WorkBudget,
+) -> Result<(Har, bool, Option<String>, Vec<String>)> {
+    budget.checkpoint()?;
     let raw = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let first = raw.iter().copied().find(|byte| !byte.is_ascii_whitespace());
     if first != Some(b'{') {
@@ -191,10 +202,13 @@ pub(super) fn read_har(path: &Path) -> Result<(Har, bool, Option<String>, Vec<St
         );
     }
     let parsed = match serde_json::from_slice::<Har>(&raw) {
-        Ok(har) => (har, false, None, Vec::new()),
+        Ok(har) => {
+            budget.checkpoint()?;
+            (har, false, None, Vec::new())
+        }
         Err(error) => {
             let message = error.to_string();
-            let (har, warnings) = salvage_har(&raw)
+            let (har, warnings) = salvage_har(&raw, budget)
                 .with_context(|| format!("salvaging truncated HAR {}", path.display()))?;
             (har, true, Some(message), warnings)
         }
@@ -208,12 +222,13 @@ pub(super) fn read_har(path: &Path) -> Result<(Har, bool, Option<String>, Vec<St
 #[cfg(test)]
 mod tests {
     use super::salvage_har;
+    use work_budget::WorkBudget;
 
     #[test]
     fn salvage_reports_skipped_complete_entries() -> anyhow::Result<()> {
         let raw =
             br#"{"log":{"entries":[{"request":{},"response":{"content":{}}},{"request":{}}]}}"#;
-        let (har, warnings) = salvage_har(raw)?;
+        let (har, warnings) = salvage_har(raw, &WorkBudget::unlimited("har-salvage-test"))?;
 
         assert_eq!(har.log.entries.len(), 1);
         assert_eq!(warnings.len(), 1);

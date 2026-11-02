@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
-use jsvm_lift::api_surface::{analyze_api_surface, ApiCallsite};
+use jsvm_lift::{
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
+    api_surface::{analyze_api_surface, ApiCallsite},
+};
 use serde::Serialize;
 use std::{fs, path::PathBuf};
 
@@ -26,7 +29,10 @@ struct ApiSurfaceFileReport {
 fn main() -> Result<()> {
     let args = Args::parse();
     if let Some(project) = args.project {
-        let summary = jsvm_lift::project_api_surface::analyze_project_api_surface(&project)?;
+        let summary = jsvm_lift::project_api_surface::analyze_project_api_surface(
+            &project,
+            &AnalysisBudgets::standard("api-surface-project"),
+        )?;
         println!("{}", serde_json::to_string(&summary)?);
         return Ok(());
     }
@@ -35,8 +41,10 @@ fn main() -> Result<()> {
         .context("input is required unless --project is used")?;
     let source =
         fs::read_to_string(&input).with_context(|| format!("reading {}", input.display()))?;
-    let callsites =
-        analyze_api_surface(&source).with_context(|| format!("analyzing {}", input.display()))?;
+    let budgets = AnalysisBudgets::standard("api-surface");
+    let budget = budgets.operation(AnalysisOperation::ApiSurface, input.display().to_string());
+    let callsites = analyze_api_surface(&source, &budget)
+        .with_context(|| format!("analyzing {}", input.display()))?;
     let report = ApiSurfaceFileReport {
         schema: "jsvm-api-surface/v2",
         input: input.display().to_string(),

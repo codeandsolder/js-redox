@@ -12,6 +12,8 @@ use std::{
 
 use crate::semantic_ir::{classify_effect, IrOp};
 
+use work_budget::WorkBudget;
+
 #[derive(Debug, Deserialize)]
 struct ScanReport {
     #[serde(default)]
@@ -690,23 +692,37 @@ fn lift_table_vm(source: &str, report: &ScanReport, vm: &TableVm) -> Option<Tabl
     })
 }
 
-fn lift_table_vms(source: &str, report: &ScanReport) -> Vec<TableVmIr> {
+fn lift_table_vms(
+    source: &str,
+    report: &ScanReport,
+    budget: &WorkBudget,
+) -> Result<Vec<TableVmIr>> {
+    budget.checkpoint()?;
     let mut seen = HashSet::new();
-    report
-        .table_vms
-        .iter()
-        .filter(|vm| {
-            seen.insert((
-                vm.handler_table.clone(),
-                vm.handler_count,
-                vm.linked_transducer_function_id.clone(),
-            ))
-        })
-        .filter_map(|vm| lift_table_vm(source, report, vm))
-        .collect()
+    let mut vms = Vec::new();
+    for vm in &report.table_vms {
+        budget.checkpoint()?;
+        if !seen.insert((
+            vm.handler_table.clone(),
+            vm.handler_count,
+            vm.linked_transducer_function_id.clone(),
+        )) {
+            continue;
+        }
+        if let Some(lifted) = lift_table_vm(source, report, vm) {
+            vms.push(lifted);
+        }
+    }
+    Ok(vms)
 }
 
-pub fn materialize(source_path: &Path, scan_path: &Path, output_path: &Path) -> Result<()> {
+pub fn materialize(
+    source_path: &Path,
+    scan_path: &Path,
+    output_path: &Path,
+    budget: &WorkBudget,
+) -> Result<()> {
+    budget.checkpoint()?;
     let source = fs::read_to_string(source_path)
         .with_context(|| format!("reading {}", source_path.display()))?;
     let report: ScanReport = serde_json::from_str(
@@ -715,11 +731,13 @@ pub fn materialize(source_path: &Path, scan_path: &Path, output_path: &Path) -> 
             .trim(),
     )
     .with_context(|| format!("parsing {}", scan_path.display()))?;
+    budget.checkpoint()?;
     let output = Output {
         schema: "jsvm-table-ir/v0",
         source: source_path.display().to_string(),
-        vms: lift_table_vms(&source, &report),
+        vms: lift_table_vms(&source, &report, budget)?,
     };
+    budget.checkpoint()?;
     fs::write(
         output_path,
         format!("{}\n", serde_json::to_string_pretty(&output)?),

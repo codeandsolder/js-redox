@@ -690,6 +690,7 @@ dependencies = [
  "url",
  "wasm-redox",
  "wasmparser 0.262.0",
+ "work-budget",
 ]
 
 [[package]]
@@ -710,6 +711,7 @@ dependencies = [
  "rolldown_redox",
  "serde_json",
  "string_wizard",
+ "work-budget",
 ]
 
 [[package]]
@@ -1709,6 +1711,7 @@ dependencies = [
  "wasmparser 0.262.0",
  "wasmprinter",
  "wat",
+ "work-budget",
 ]
 
 [[package]]
@@ -1790,6 +1793,10 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
+
+[[package]]
+name = "work-budget"
+version = "0.1.0"
 
 [[package]]
 name = "writeable"

@@ -1,4 +1,5 @@
 use crate::analysis_artifacts::{load_artifact, write_artifact, JSVM_INDEX};
+use crate::analysis_budget::{AnalysisBudgets, AnalysisOperation};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -7,6 +8,7 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
 };
+use work_budget::WorkBudget;
 
 const SWITCH_IR_SCHEMA: &str = "jsvm-switch-ir/v0";
 const TABLE_IR_SCHEMA: &str = "jsvm-table-ir/v0";
@@ -413,10 +415,13 @@ fn materialize_switch_vms(
     row: &Map<String, Value>,
     scan_id: u64,
     relative_ir: &str,
+    budget: &WorkBudget,
 ) -> Result<Vec<Value>> {
+    budget.checkpoint()?;
     let ir = read_switch_ir(project, relative_ir)?;
     let mut units = Vec::new();
     for (index, vm) in ir.vms.iter().enumerate() {
+        budget.checkpoint()?;
         let ordinal = index + 1;
         let stem = safe_name(
             vm.function_name
@@ -537,10 +542,13 @@ fn materialize_table_vms(
     row: &Map<String, Value>,
     scan_id: u64,
     relative_ir: &str,
+    budget: &WorkBudget,
 ) -> Result<Vec<Value>> {
+    budget.checkpoint()?;
     let ir = read_table_ir(project, relative_ir)?;
     let mut units = Vec::new();
     for (index, vm) in ir.vms.iter().enumerate() {
+        budget.checkpoint()?;
         let ordinal = index + 1;
         let stem = safe_name(Some(&vm.handler_table));
         let base = PathBuf::from("src/_devirtualized")
@@ -605,7 +613,15 @@ fn materialize_table_vms(
     Ok(units)
 }
 
-pub fn materialize_project(project: &Path) -> Result<MaterializeSummary> {
+pub fn materialize_project(
+    project: &Path,
+    budgets: &AnalysisBudgets,
+) -> Result<MaterializeSummary> {
+    let stage_budget = budgets.operation(
+        AnalysisOperation::VmMaterialization,
+        project.display().to_string(),
+    );
+    stage_budget.checkpoint()?;
     let Some(mut index) = load_artifact(project, JSVM_INDEX, true)? else {
         return Ok(MaterializeSummary {
             devirtualized_units: 0,
@@ -625,6 +641,7 @@ pub fn materialize_project(project: &Path) -> Result<MaterializeSummary> {
     let mut switch_vms = 0_usize;
     let mut table_vms = 0_usize;
     for (row_index, row) in rows.iter_mut().enumerate() {
+        stage_budget.checkpoint()?;
         let row = row
             .as_object_mut()
             .with_context(|| format!("code_units[{row_index}] must be an object"))?;
@@ -635,6 +652,12 @@ pub fn materialize_project(project: &Path) -> Result<MaterializeSummary> {
             .with_context(|| {
                 format!("code_units[{row_index}].scan_id must be a non-negative integer")
             })?;
+        let budget = budgets.operation_under(
+            &stage_budget,
+            AnalysisOperation::VmMaterialization,
+            format!("scan-{scan_id}"),
+        );
+        budget.checkpoint()?;
         let switch_ir = row
             .get("switch_ir")
             .and_then(Value::as_str)
@@ -646,12 +669,12 @@ pub fn materialize_project(project: &Path) -> Result<MaterializeSummary> {
 
         let mut units = Vec::new();
         if let Some(relative) = switch_ir {
-            let created = materialize_switch_vms(project, row, scan_id, &relative)?;
+            let created = materialize_switch_vms(project, row, scan_id, &relative, &budget)?;
             switch_vms += created.len();
             units.extend(created);
         }
         if let Some(relative) = table_ir {
-            let created = materialize_table_vms(project, row, scan_id, &relative)?;
+            let created = materialize_table_vms(project, row, scan_id, &relative, &budget)?;
             table_vms += created.len();
             units.extend(created);
         }
@@ -662,6 +685,7 @@ pub fn materialize_project(project: &Path) -> Result<MaterializeSummary> {
         "devirtualized_units".into(),
         Value::Array(all_units.clone()),
     );
+    stage_budget.checkpoint()?;
     write_artifact(project, JSVM_INDEX, &index)?;
     Ok(MaterializeSummary {
         devirtualized_units: all_units.len(),
@@ -757,7 +781,8 @@ mod tests {
                 }))?,
             )?;
 
-            let summary = materialize_project(&project)?;
+            let summary =
+                materialize_project(&project, &AnalysisBudgets::standard("vm-materialize-test"))?;
             assert_eq!(
                 summary,
                 MaterializeSummary {
@@ -816,7 +841,11 @@ mod tests {
                 "dynamic_code_units": []
             });
             write_artifact(&project, JSVM_INDEX, &index)?;
-            assert!(materialize_project(&project).is_err());
+            assert!(materialize_project(
+                &project,
+                &AnalysisBudgets::standard("vm-materialize-escape-test"),
+            )
+            .is_err());
             Ok(())
         })();
         let cleanup = fs::remove_dir_all(&project);

@@ -3,6 +3,7 @@ use anyhow::{anyhow, Result};
 use jsvm_safe_core::{SafeSourceMode, SafeSourceRecovery, SafeSourceRejection};
 use serde::Serialize;
 use std::{collections::BTreeMap, path::Path};
+use work_budget::WorkBudget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SourceMode {
@@ -110,14 +111,16 @@ pub fn deobfuscate_source(
     source_mode: SourceMode,
     max_iterations: usize,
     format_output: bool,
+    budget: &WorkBudget,
 ) -> Result<SafeDeobOutcome> {
     let safe_mode = source_mode.safe_mode();
-    let result = jsvm_safe_core::deobfuscate_with_source_mode(original, max_iterations, safe_mode)
-        .ok_or_else(|| {
-            let reason = jsvm_safe_core::safe_source_rejection(original, safe_mode)
-                .map_or("rewrite-validation-failure", SafeSourceRejection::as_str);
-            anyhow!("source rejected by safe deobfuscation: {reason}")
-        })?;
+    let result =
+        jsvm_safe_core::deobfuscate_with_source_mode(original, max_iterations, safe_mode, budget)?
+            .ok_or_else(|| {
+                let reason = jsvm_safe_core::safe_source_rejection(original, safe_mode)
+                    .map_or("rewrite-validation-failure", SafeSourceRejection::as_str);
+                anyhow!("source rejected by safe deobfuscation: {reason}")
+            })?;
 
     let arithmetic_state_proofs = result
         .arithmetic_state_proofs
@@ -166,7 +169,7 @@ pub fn deobfuscate_source(
 
     let mut transforms = result.transforms;
     let source = if format_output {
-        let formatted = format_source(&result.source)?;
+        let formatted = format_source(&result.source, budget)?;
         if formatted != result.source {
             *transforms.entry("presentation_codegen".into()).or_default() += 1;
         }
@@ -217,7 +220,9 @@ mod tests {
     #[test]
     fn report_hashes_exact_analysis_source_before_presentation_formatting() -> Result<()> {
         let source = "const x = 1 + 2; sink(x);\n";
-        let outcome = deobfuscate_source(source, "fixture.js", SourceMode::Auto, 8, false)?;
+        let budget = WorkBudget::unlimited("safe-deob-test");
+        let outcome =
+            deobfuscate_source(source, "fixture.js", SourceMode::Auto, 8, false, &budget)?;
         assert!(outcome.report.safe_static_only);
         assert!(outcome.report.runtime_semantics_preserved_by_design);
         assert_eq!(

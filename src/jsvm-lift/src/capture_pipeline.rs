@@ -1,4 +1,5 @@
 use crate::{
+    analysis_budget::AnalysisBudgets,
     bundle_materialize::{materialize_bundle_modules, BundleMaterializeSummary},
     capture_import::{import_capture_project, CaptureImportOptions, CaptureImportSummary},
     capture_project::{read_manifest, MANIFEST_NAME},
@@ -29,6 +30,7 @@ pub struct CapturePipelineOptions {
     pub bundle_materialization: bool,
     pub wasm_analysis: bool,
     pub vm_scan: bool,
+    pub budgets: AnalysisBudgets,
 }
 
 #[derive(Debug)]
@@ -57,29 +59,35 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
         "bundle materialization requires safe deobfuscation"
     );
 
-    let import = import_capture_project(&CaptureImportOptions {
-        input: options.input.clone(),
-        output: options.output.clone(),
-        assets_dir: options.assets_dir.clone(),
-        overwrite: options.overwrite,
-    })?;
+    let import = import_capture_project(
+        &CaptureImportOptions {
+            input: options.input.clone(),
+            output: options.output.clone(),
+            assets_dir: options.assets_dir.clone(),
+            overwrite: options.overwrite,
+        },
+        &options.budgets,
+    )?;
     let project = &options.output;
     let manifest = read_manifest(&project.join(MANIFEST_NAME))?;
 
-    let source = materialize_capture_source(project, options.jobs)?;
+    let source = materialize_capture_source(project, options.jobs, &options.budgets)?;
 
     let wasm = options
         .wasm_analysis
-        .then(|| materialize_wasm(project, None))
+        .then(|| materialize_wasm(project, None, &options.budgets))
         .transpose()?;
     let wasm_resource_provenance = if options.wasm_analysis && manifest.source.kind == "recorder" {
-        Some(correlate_wasm_resource_provenance(project)?)
+        Some(correlate_wasm_resource_provenance(
+            project,
+            &options.budgets,
+        )?)
     } else {
         None
     };
 
-    let sourcemaps = recover_project_sourcemaps(project)?;
-    let references = scan_project_references(project, options.jobs)?;
+    let sourcemaps = recover_project_sourcemaps(project, &options.budgets)?;
+    let references = scan_project_references(project, options.jobs, &options.budgets)?;
 
     let deobfuscation = options
         .safe_deobfuscation
@@ -89,32 +97,39 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
                 &ProjectDeobOptions {
                     jobs: options.jobs,
                     max_iterations: 16,
+                    budgets: options.budgets.clone(),
                 },
             )
         })
         .transpose()?;
     let bundles = options
         .bundle_materialization
-        .then(|| materialize_bundle_modules(project, options.jobs))
+        .then(|| materialize_bundle_modules(project, options.jobs, &options.budgets))
         .transpose()?;
 
     let wasm_js_boundary = if options.wasm_analysis && options.safe_deobfuscation {
-        Some(correlate_wasm_js_boundary(project)?)
+        Some(correlate_wasm_js_boundary(project, &options.budgets)?)
     } else {
         None
     };
 
     let (vm_scan, vm_materialization) = if options.vm_scan {
-        let scan = scan_project(project, &ProjectScanOptions::default())?;
-        let materialized = materialize_vm_project(project)?;
+        let scan = scan_project(
+            project,
+            &ProjectScanOptions {
+                budgets: options.budgets.clone(),
+                ..ProjectScanOptions::default()
+            },
+        )?;
+        let materialized = materialize_vm_project(project, &options.budgets)?;
         (Some(scan), Some(materialized))
     } else {
         (None, None)
     };
 
-    analyze_project_api_surface(project)?;
-    let graph = build_source_graph(project)?;
-    refresh_project_readme(project)?;
+    analyze_project_api_surface(project, &options.budgets)?;
+    let graph = build_source_graph(project, &options.budgets)?;
+    refresh_project_readme(project, &options.budgets)?;
 
     Ok(CapturePipelineSummary {
         import,
@@ -227,6 +242,7 @@ mod tests {
             bundle_materialization: false,
             wasm_analysis: false,
             vm_scan: true,
+            budgets: AnalysisBudgets::standard("capture-pipeline-vm-test"),
         }
     }
 
@@ -241,6 +257,7 @@ mod tests {
             bundle_materialization: true,
             wasm_analysis: false,
             vm_scan: false,
+            budgets: AnalysisBudgets::standard("capture-pipeline-static-test"),
         }
     }
 
@@ -769,12 +786,15 @@ mod tests {
             .context("HAR cut marker missing")?
             .saturating_add(cut_marker.len() + 32);
         fs::write(&truncated_har, &raw[..cut.min(raw.len())])?;
-        let truncated = import_capture_project(&CaptureImportOptions {
-            input: truncated_har,
-            output: truncated_project.clone(),
-            assets_dir: None,
-            overwrite: false,
-        })?;
+        let truncated = import_capture_project(
+            &CaptureImportOptions {
+                input: truncated_har,
+                output: truncated_project.clone(),
+                assets_dir: None,
+                overwrite: false,
+            },
+            &AnalysisBudgets::standard("truncated-har-import-test"),
+        )?;
         assert_eq!(truncated.resources, 7);
         let truncated_manifest = read_manifest(&truncated_project.join(MANIFEST_NAME))?;
         assert!(truncated_manifest.source.salvaged);

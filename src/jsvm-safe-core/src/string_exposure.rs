@@ -12,6 +12,8 @@ use oxc_span::Span;
 use oxc_syntax::symbol::SymbolId;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use work_budget::{BudgetExceeded, WorkBudget};
+
 #[derive(Default)]
 struct StaticArrayCandidateCollector {
     arrays: HashMap<SymbolId, Vec<Value>>,
@@ -179,33 +181,46 @@ fn expose_static_strings_with_mode(
     source: &str,
     max_iterations: usize,
     source_mode: SafeSourceMode,
-) -> Option<StaticStringExposureResult> {
-    let source_type = semantically_valid_source_type(source, source_mode)?;
+    budget: &WorkBudget,
+) -> Result<Option<StaticStringExposureResult>, BudgetExceeded> {
+    budget.checkpoint()?;
+    let Some(source_type) = semantically_valid_source_type(source, source_mode) else {
+        return Ok(None);
+    };
+    budget.checkpoint()?;
     let mut current = source.to_string();
     let mut counts = Counts::default();
     let mut iterations = 0usize;
 
     for iteration in 1..=max_iterations {
+        budget.consume(1)?;
         let allocator = Allocator::default();
-        let program = parse_as(&allocator, &current, source_type)?;
+        let Some(program) = parse_as(&allocator, &current, source_type) else {
+            return Ok(None);
+        };
+        budget.checkpoint()?;
         let semantic_ret = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&program);
         if !semantic_ret.diagnostics.is_empty() {
-            return None;
+            return Ok(None);
         }
+        budget.checkpoint()?;
         let scoping = semantic_ret.semantic.scoping();
         let replacements = static_string_exposure_pass(&program, scoping);
+        budget.checkpoint()?;
         if replacements.is_empty() {
             break;
         }
-        let next = apply(
+        let Some(next) = apply(
             &current,
             replacements,
             &mut counts,
             &mut Vec::new(),
             iteration,
-        )?;
+        ) else {
+            return Ok(None);
+        };
         if next == current {
             break;
         }
@@ -213,19 +228,20 @@ fn expose_static_strings_with_mode(
         current = next;
     }
 
-    Some(StaticStringExposureResult {
+    Ok(Some(StaticStringExposureResult {
         source: current,
         iterations,
         transforms: counts.into_inner(),
-    })
+    }))
 }
 
 #[must_use]
 pub fn expose_static_strings(
     source: &str,
     max_iterations: usize,
-) -> Option<StaticStringExposureResult> {
-    expose_static_strings_with_mode(source, max_iterations, SafeSourceMode::Auto)
+    budget: &WorkBudget,
+) -> Result<Option<StaticStringExposureResult>, BudgetExceeded> {
+    expose_static_strings_with_mode(source, max_iterations, SafeSourceMode::Auto, budget)
 }
 
 #[must_use]
@@ -233,8 +249,9 @@ pub fn expose_static_strings_with_source_mode(
     source: &str,
     max_iterations: usize,
     source_mode: SafeSourceMode,
-) -> Option<StaticStringExposureResult> {
-    expose_static_strings_with_mode(source, max_iterations, source_mode)
+    budget: &WorkBudget,
+) -> Result<Option<StaticStringExposureResult>, BudgetExceeded> {
+    expose_static_strings_with_mode(source, max_iterations, source_mode, budget)
 }
 
 #[cfg(test)]

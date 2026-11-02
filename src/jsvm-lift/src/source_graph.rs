@@ -4,6 +4,7 @@ use crate::{
         JSVM_INDEX, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCEMAPS, SOURCE_GRAPH, SOURCE_INDEX,
         WASM_INDEX, WASM_RESOURCE_PROVENANCE,
     },
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::load_manifest,
     sha256_hex,
 };
@@ -154,7 +155,12 @@ fn optional_artifact(
     Ok(load_artifact(project, spec, true)?.unwrap_or(fallback))
 }
 
-pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
+pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<SourceGraphSummary> {
+    let budget = budgets.operation(
+        AnalysisOperation::SourceGraph,
+        project.display().to_string(),
+    );
+    budget.checkpoint()?;
     let project = project
         .canonicalize()
         .with_context(|| format!("capture project does not exist: {}", project.display()))?;
@@ -189,6 +195,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
 
     let mut source_by_resource = BTreeMap::<u64, Vec<&Value>>::new();
     for unit in array_field(&source_index, "units") {
+        budget.checkpoint()?;
         if let Some(resource_id) = u64_field(unit, "resource_id") {
             source_by_resource
                 .entry(resource_id)
@@ -200,6 +207,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
     let mut graph = GraphBuilder::default();
     let mut resource_nodes_by_sha = BTreeMap::<String, Vec<String>>::new();
     for (index, resource) in manifest.resources.iter().enumerate() {
+        budget.checkpoint()?;
         let resource_id = required_u64(resource, "id", &format!("manifest.resources[{index}]"))?;
         let node_id = format!("resource:{resource_id}");
         let units = source_by_resource
@@ -238,6 +246,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
 
     // HAR-extracted HTML/script/source-map references and redirects.
     for resource in &manifest.resources {
+        budget.checkpoint()?;
         let resource_id = required_u64(resource, "id", "manifest resource")?;
         let src = format!("resource:{resource_id}");
         for reference in array_field(resource, "references") {
@@ -279,6 +288,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
     let mut inline_node_by_raw = BTreeMap::<String, String>::new();
     let mut inline_nodes_by_sha = BTreeMap::<String, Vec<String>>::new();
     for (index, item) in manifest.inline_scripts.iter().enumerate() {
+        budget.checkpoint()?;
         let Some(output_path) = nonempty_string_field(item, "output_path") else {
             continue;
         };
@@ -343,6 +353,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
     let mut runtime_instance_conflicts = BTreeSet::<(String, String)>::new();
 
     for source in array_field(&runtime, "sources") {
+        budget.checkpoint()?;
         let Some(digest) = nonempty_string_field(source, "sha256") else {
             continue;
         };
@@ -573,6 +584,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
 
     // Runtime-observed WASM requests are capture evidence, not universal static control flow.
     for observation in array_field(&wasm_resource_provenance, "observations") {
+        budget.checkpoint()?;
         let key = compact_key((
             nonempty_string_field(observation, "cdp_session").unwrap_or("main"),
             field(observation, "request_id"),
@@ -678,6 +690,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
     // Safe static deobfuscation is a provenance-preserving source transform.
     let mut deob_nodes = BTreeMap::<u64, String>::new();
     for unit in array_field(&deobfuscation, "units") {
+        budget.checkpoint()?;
         if unit.get("exit").and_then(Value::as_i64).unwrap_or(0) != 0 {
             continue;
         }
@@ -729,6 +742,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
 
     // Static browser API callsites hang off the exact selected source derivative.
     for row in array_field(&api_surface, "callsites") {
+        budget.checkpoint()?;
         let source_index_ordinal = required_u64(row, "source_index_ordinal", "api callsite")?;
         let callsite_ordinal = required_u64(row, "callsite_ordinal", "api callsite")?;
         let node_id = format!("api-call:{source_index_ordinal}:{callsite_ordinal}");
@@ -792,6 +806,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
     // Statically explicit Webpack/Next module tables become navigable project modules.
     let mut bundle_nodes = BTreeMap::<u64, String>::new();
     for bundle in array_field(&bundles, "bundles") {
+        budget.checkpoint()?;
         let bundle_id = required_u64(bundle, "bundle_id", "bundle")?;
         let node_id = format!("bundle:{bundle_id}");
         bundle_nodes.insert(bundle_id, node_id.clone());
@@ -829,6 +844,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
     let mut module_nodes_by_id = BTreeMap::<String, Vec<String>>::new();
     let mut module_rows = BTreeMap::<String, &Value>::new();
     for module in array_field(&bundles, "modules") {
+        budget.checkpoint()?;
         let bundle_id = required_u64(module, "bundle_id", "bundle module")?;
         let ordinal = u64_field(module, "module_ordinal").unwrap_or(0);
         let node_id = format!("bundle-module:{bundle_id}:{ordinal}");
@@ -905,6 +921,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
     };
 
     for (source_node, module) in &module_rows {
+        budget.checkpoint()?;
         let bundle_id = required_u64(module, "bundle_id", "bundle module")?;
         for dependency in array_field(module, "dependencies") {
             let dependency = dependency
@@ -973,6 +990,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
 
     // Source maps link generated JS -> map resource -> recovered original source.
     for source_map in array_field(&sourcemaps, "source_maps") {
+        budget.checkpoint()?;
         let Some(resource_id) = u64_field(source_map, "resource_id") else {
             continue;
         };
@@ -1113,6 +1131,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
     // Static Function(...) recovery is a generated-code provenance edge.
     let mut generated_analysis_parent = BTreeMap::<u64, String>::new();
     for dynamic in array_field(&jsvm, "dynamic_code_units") {
+        budget.checkpoint()?;
         let parent_scan_id = required_u64(dynamic, "parent_scan_id", "dynamic code unit")?;
         let ordinal = required_u64(dynamic, "ordinal", "dynamic code unit")?;
         let node_id = format!("dynamic:{parent_scan_id}:{ordinal}");
@@ -1168,6 +1187,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
 
     let mut scan_to_parent = BTreeMap::<u64, String>::new();
     for unit in array_field(&jsvm, "code_units") {
+        budget.checkpoint()?;
         let Some(scan_id) = u64_field(unit, "scan_id") else {
             continue;
         };
@@ -1194,6 +1214,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
     }
 
     for dynamic in array_field(&jsvm, "dynamic_code_units") {
+        budget.checkpoint()?;
         let parent_scan_id = required_u64(dynamic, "parent_scan_id", "dynamic code unit")?;
         let ordinal = required_u64(dynamic, "ordinal", "dynamic code unit")?;
         let node_id = format!("dynamic:{parent_scan_id}:{ordinal}");
@@ -1212,6 +1233,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
     }
 
     for unit in array_field(&jsvm, "devirtualized_units") {
+        budget.checkpoint()?;
         let parent_scan_id = required_u64(unit, "parent_scan_id", "devirtualized unit")?;
         let ordinal = required_u64(unit, "vm_ordinal", "devirtualized unit")?;
         let vm_kind = nonempty_string_field(unit, "vm_kind").unwrap_or("unknown");
@@ -1257,6 +1279,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
 
     // Import-map definitions are captured provenance too, not just resolver state.
     for record in array_field(&import_maps, "maps") {
+        budget.checkpoint()?;
         let Some(raw_path) = string_field(record, "raw_path") else {
             continue;
         };
@@ -1314,6 +1337,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
     // AST-backed JavaScript module / worker references.
     let mut specifier_nodes = BTreeMap::<String, String>::new();
     for unit in array_field(&jsrefs, "code_units") {
+        budget.checkpoint()?;
         let Some(resource_id) = u64_field(unit, "resource_id") else {
             continue;
         };
@@ -1422,6 +1446,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
 
     // Captured or statically recovered WebAssembly modules are first-class derived sources.
     for module in array_field(&wasm, "modules") {
+        budget.checkpoint()?;
         let digest = string_field(module, "sha256").context("WASM module sha256 is required")?;
         let node_id = format!("wasm:{}", &digest[..digest.len().min(20)]);
         graph.add_node(
@@ -1482,12 +1507,14 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
 
     let mut edge_counts = BTreeMap::<String, usize>::new();
     for edge in &graph.edges {
+        budget.checkpoint()?;
         if let Some(kind) = string_field(edge, "kind") {
             *edge_counts.entry(kind.to_string()).or_default() += 1;
         }
     }
     let mut node_counts = BTreeMap::<String, usize>::new();
     for node in graph.nodes.values() {
+        budget.checkpoint()?;
         if let Some(kind) = string_field(node, "type") {
             *node_counts.entry(kind.to_string()).or_default() += 1;
         }
@@ -1530,6 +1557,7 @@ pub fn build_source_graph(project: &Path) -> Result<SourceGraphSummary> {
             "external_urls":summary.external_urls,
         },
     });
+    budget.checkpoint()?;
     write_artifact(&project, SOURCE_GRAPH, &document)?;
     Ok(summary)
 }
@@ -1584,7 +1612,8 @@ mod tests {
             extra: Map::new(),
         };
         write_manifest(&project.join(MANIFEST_NAME), &manifest)?;
-        let summary = build_source_graph(&project)?;
+        let summary =
+            build_source_graph(&project, &AnalysisBudgets::standard("source-graph-test"))?;
         assert_eq!(summary.nodes, 2);
         assert_eq!(summary.edges, 1);
         assert_eq!(summary.external_urls, 0);

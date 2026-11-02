@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
-use jsvm_lift::js_refs::extract_js_references;
+use jsvm_lift::analysis_budget::AnalysisBudgets;
+use jsvm_lift::{
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
+    js_refs::extract_js_references,
+};
 use std::{fs, path::PathBuf};
 
 #[derive(ClapParser, Debug)]
@@ -16,7 +20,11 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     if let Some(project) = args.project {
-        let summary = jsvm_lift::project_js_refs::scan_project_references(&project, args.jobs)?;
+        let summary = jsvm_lift::project_js_refs::scan_project_references(
+            &project,
+            args.jobs,
+            &AnalysisBudgets::standard("js-refs-project"),
+        )?;
         println!(
             "JavaScript references: {} units, {} references, {} import-map resolutions, {} unresolved bare, {} ambiguous contexts, {} failures",
             summary.javascript_units,
@@ -35,7 +43,7 @@ fn main() -> Result<()> {
         fs::read_to_string(&input).with_context(|| format!("reading {}", input.display()))?;
     println!(
         "{}",
-        serde_json::to_string(&extract_js_references(&source)?)?
+        serde_json::to_string(&extract_js_references(&source, &budget)?)?
     );
     Ok(())
 }

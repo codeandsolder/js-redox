@@ -2,6 +2,7 @@ use crate::{
     analysis_artifacts::{
         load_artifact, write_artifact, DEOBFUSCATION, SOURCE_INDEX, STRING_RECOVERY,
     },
+    analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     content_dedup::{default_jobs, link_or_copy},
     js_format::format_source,
     safe_deob::{deobfuscate_source, SafeDeobReport, SourceMode},
@@ -17,11 +18,13 @@ use std::{
     path::{Path, PathBuf},
 };
 use tempfile::Builder as TempDirBuilder;
+use work_budget::WorkBudget;
 
 #[derive(Debug, Clone)]
 pub struct ProjectDeobOptions {
     pub jobs: Option<usize>,
     pub max_iterations: usize,
+    pub budgets: AnalysisBudgets,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +113,8 @@ fn run_string_recovery(
     work: &Path,
     key: &ContentKey,
     group: &[Occurrence],
+    budgets: &AnalysisBudgets,
+    parent_budget: &WorkBudget,
 ) -> Result<StringResult> {
     let (raw_sha, mode) = key;
     let canonical = group.first().context("empty raw-source group")?;
@@ -125,8 +130,36 @@ fn run_string_recovery(
             canonical.source.display()
         );
     }
-    let outcome =
-        recover_static_strings(&original, canonical.source.display().to_string(), *mode, 8);
+    let budget = budgets.operation_under(
+        parent_budget,
+        AnalysisOperation::StaticStringRecovery,
+        canonical.source.display().to_string(),
+    );
+    let outcome = match recover_static_strings(
+        &original,
+        canonical.source.display().to_string(),
+        *mode,
+        8,
+        &budget,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let error = recoverable_unit_error(anyhow::Error::new(error))?;
+            return Ok(StringResult {
+                mode: *mode,
+                canonical_ordinal: canonical.ordinal,
+                canonical_raw_path: canonical.raw_path.clone(),
+                report_path: None,
+                exit: 1,
+                changed: false,
+                replacements: 0,
+                decoders: json!([]),
+                selected_path: canonical.source.clone(),
+                selected_sha: raw_sha.clone(),
+                error: Some(error.to_string()),
+            });
+        }
+    };
     fs::write(&recovered, outcome.source.as_bytes())
         .with_context(|| format!("writing {}", recovered.display()))?;
     write_json(&report, &outcome.report)?;
@@ -169,6 +202,8 @@ fn run_safe_deob(
     raw_group_keys: &[ContentKey],
     string_results: &BTreeMap<ContentKey, StringResult>,
     max_iterations: usize,
+    budgets: &AnalysisBudgets,
+    parent_budget: &WorkBudget,
 ) -> Result<DeobResult> {
     let (selected_sha, mode) = key;
     let representative_key = raw_group_keys
@@ -186,12 +221,18 @@ fn run_safe_deob(
         );
     }
 
+    let budget = budgets.operation_under(
+        parent_budget,
+        AnalysisOperation::SafeDeobfuscation,
+        representative.canonical_raw_path.clone(),
+    );
     match deobfuscate_source(
         &selected,
         representative.canonical_raw_path.clone(),
         *mode,
         max_iterations,
         false,
+        &budget,
     ) {
         Ok(outcome) => {
             let cache = work.join("deob").join(mode.as_str()).join(selected_sha);
@@ -207,17 +248,26 @@ fn run_safe_deob(
                 error: None,
             })
         }
-        Err(error) => Ok(DeobResult {
-            mode: *mode,
-            report: None,
-            output_path: None,
-            exit: 1,
-            error: Some(error.to_string()),
-        }),
+        Err(error) => {
+            let error = recoverable_unit_error(error)?;
+            Ok(DeobResult {
+                mode: *mode,
+                report: None,
+                output_path: None,
+                exit: 1,
+                error: Some(error.to_string()),
+            })
+        }
     }
 }
 
-fn format_output(work: &Path, key: &ContentKey, deob: &DeobResult) -> Result<ReadableResult> {
+fn format_output(
+    work: &Path,
+    key: &ContentKey,
+    deob: &DeobResult,
+    budgets: &AnalysisBudgets,
+    parent_budget: &WorkBudget,
+) -> Result<ReadableResult> {
     let (output_sha, mode) = key;
     let output_path = deob
         .output_path
@@ -225,9 +275,18 @@ fn format_output(work: &Path, key: &ContentKey, deob: &DeobResult) -> Result<Rea
         .context("missing deobfuscated output")?;
     let exact = fs::read_to_string(output_path)
         .with_context(|| format!("reading {}", output_path.display()))?;
-    let (source, formatted, error) = match format_source(&exact) {
+    let budget = budgets.operation_under(
+        parent_budget,
+        AnalysisOperation::Format,
+        output_path.display().to_string(),
+    );
+    let formatted_result = format_source(&exact, &budget);
+    let (source, formatted, error) = match formatted_result {
         Ok(source) => (source, true, None),
-        Err(error) => (exact, false, Some(error.to_string())),
+        Err(error) => {
+            let error = recoverable_unit_error(error)?;
+            (exact, false, Some(error.to_string()))
+        }
     };
     let cache = work.join("readable").join(mode.as_str()).join(output_sha);
     fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
@@ -250,6 +309,10 @@ pub fn materialize_project_deobfuscation(
     project: &Path,
     options: &ProjectDeobOptions,
 ) -> Result<ProjectDeobSummary> {
+    let stage_budget = options
+        .budgets
+        .scope(format!("project-deob:{}", project.display()));
+    stage_budget.checkpoint()?;
     let source_index = load_artifact(project, SOURCE_INDEX, false)?
         .context("source index is required for project deobfuscation")?;
     let source_units = source_index
@@ -318,7 +381,7 @@ pub fn materialize_project_deobfuscation(
             raw_group_refs
                 .par_iter()
                 .map(|(key, group)| {
-                    run_string_recovery(work_path, key, group)
+                    run_string_recovery(work_path, key, group, &options.budgets, &stage_budget)
                         .map(|result| ((*key).clone(), result))
                 })
                 .collect::<Vec<_>>()
@@ -327,6 +390,7 @@ pub fn materialize_project_deobfuscation(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
+    stage_budget.checkpoint()?;
 
     let mut pre_deob_groups = BTreeMap::<ContentKey, Vec<ContentKey>>::new();
     for (raw_key, result) in &string_results {
@@ -348,6 +412,8 @@ pub fn materialize_project_deobfuscation(
                         raw_keys,
                         &string_results,
                         options.max_iterations,
+                        &options.budgets,
+                        &stage_budget,
                     )
                     .map(|result| ((*key).clone(), result))
                 })
@@ -357,6 +423,7 @@ pub fn materialize_project_deobfuscation(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
+    stage_budget.checkpoint()?;
 
     let mut output_groups = BTreeMap::<ContentKey, Vec<ContentKey>>::new();
     for (pre_key, result) in &deob_results {
@@ -379,8 +446,14 @@ pub fn materialize_project_deobfuscation(
                         .first()
                         .and_then(|pre_key| deob_results.get(pre_key))
                         .context("missing representative deob result")?;
-                    format_output(work_path, key, representative)
-                        .map(|result| ((*key).clone(), result))
+                    format_output(
+                        work_path,
+                        key,
+                        representative,
+                        &options.budgets,
+                        &stage_budget,
+                    )
+                    .map(|result| ((*key).clone(), result))
                 })
                 .collect::<Vec<_>>()
         })
@@ -388,6 +461,7 @@ pub fn materialize_project_deobfuscation(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
+    stage_budget.checkpoint()?;
 
     let deob_report_dir = project.join("analysis/deobfuscation");
     let string_report_dir = project.join("analysis/string-recovery");
@@ -659,6 +733,7 @@ mod tests {
             &ProjectDeobOptions {
                 jobs: Some(2),
                 max_iterations: 16,
+                budgets: AnalysisBudgets::standard("project-deob-test"),
             },
         )?;
         assert_eq!(summary.javascript_units, 2);

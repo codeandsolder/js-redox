@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use jsvm_lift::{
-    sha256_hex, source_graph::build_source_graph,
+    analysis_budget::AnalysisBudgets, sha256_hex, source_graph::build_source_graph,
     wasm_resource_provenance::correlate_wasm_resource_provenance,
 };
 use serde_json::{json, Value};
@@ -217,7 +217,10 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
         &runtime_artifact,
     )?;
 
-    let summary = correlate_wasm_resource_provenance(&project)?;
+    let summary = correlate_wasm_resource_provenance(
+        &project,
+        &AnalysisBudgets::standard("wasm-resource-provenance-test"),
+    )?;
     assert_eq!(summary.observations, 2);
     assert_eq!(summary.runtime_script_identities, 2);
     assert_eq!(summary.unmatched_wasm_events, 1);
@@ -267,7 +270,10 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
     );
     assert_eq!(provenance["unmatched"][0]["request_id"], "req-bad");
 
-    build_source_graph(&project)?;
+    build_source_graph(
+        &project,
+        &AnalysisBudgets::standard("wasm-provenance-graph-test"),
+    )?;
     let graph = read_json(&project.join("analysis/source-graph.json"))?;
     let nodes = graph["nodes"].as_array().context("graph nodes missing")?;
     let edges = graph["edges"].as_array().context("graph edges missing")?;
@@ -347,7 +353,10 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
         &runtime_artifact,
     )?;
 
-    let conflicted = correlate_wasm_resource_provenance(&project)?;
+    let conflicted = correlate_wasm_resource_provenance(
+        &project,
+        &AnalysisBudgets::standard("wasm-resource-provenance-test"),
+    )?;
     assert_eq!(conflicted.observations, 2);
     assert_eq!(conflicted.runtime_script_identities, 0);
     let conflicted_artifact = read_json(&project.join("analysis/wasm-resource-provenance.json"))?;
@@ -356,7 +365,10 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
         .context("conflicted observations missing")?
         .iter()
         .all(|row| row["initiator_runtime_sha256"].is_null()));
-    build_source_graph(&project)?;
+    build_source_graph(
+        &project,
+        &AnalysisBudgets::standard("wasm-provenance-graph-test"),
+    )?;
     let conflict_graph = read_json(&project.join("analysis/source-graph.json"))?;
     let runtime_nodes = [
         format!("runtime:{}", &js_sha[..20]),
@@ -374,7 +386,10 @@ fn runtime_wasm_provenance_is_exact_and_fails_closed() -> Result<()> {
         }));
 
     fs::remove_file(capture.join("cdp-streams.json"))?;
-    let unavailable = correlate_wasm_resource_provenance(&project)?;
+    let unavailable = correlate_wasm_resource_provenance(
+        &project,
+        &AnalysisBudgets::standard("wasm-resource-provenance-test"),
+    )?;
     assert!(!unavailable.applicable);
     let unavailable_artifact = read_json(&project.join("analysis/wasm-resource-provenance.json"))?;
     assert_eq!(

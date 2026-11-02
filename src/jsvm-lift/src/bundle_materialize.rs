@@ -1,5 +1,6 @@
 use crate::{
     analysis_artifacts::{load_artifact, write_artifact, BUNDLES, DEOBFUSCATION},
+    analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     bundle_unpack::{analyze_bundle_source, BundleInventoryReport, ModuleRecord},
     content_dedup::{default_jobs, sha256_path},
     js_format::format_source,
@@ -351,22 +352,52 @@ fn report_for_group(
     digest: &str,
     group: &[usize],
     units: &[EligibleUnit],
-) -> (String, Result<BundleInventoryReport, String>) {
+    budgets: &AnalysisBudgets,
+    parent_budget: &work_budget::WorkBudget,
+) -> Result<(String, Result<BundleInventoryReport, String>)> {
     let Some(&index) = group.first() else {
-        return (digest.to_owned(), Err("empty inventory group".to_owned()));
+        return Ok((digest.to_owned(), Err("empty inventory group".to_owned())));
     };
     let unit = &units[index];
-    let result = fs::read_to_string(&unit.parent)
-        .map_err(|error| format!("reading {}: {error}", unit.parent.display()))
-        .map(|source| analyze_bundle_source(&source, unit.parent.display().to_string()));
-    (digest.to_owned(), result)
+    let budget = budgets.operation_under(
+        parent_budget,
+        AnalysisOperation::BundleMaterialization,
+        unit.parent.display().to_string(),
+    );
+    if let Err(error) = budget.checkpoint() {
+        let error = recoverable_unit_error(anyhow::Error::new(error))?;
+        return Ok((digest.to_owned(), Err(error.to_string())));
+    }
+    let source = match fs::read_to_string(&unit.parent) {
+        Ok(source) => source,
+        Err(error) => {
+            return Ok((
+                digest.to_owned(),
+                Err(format!("reading {}: {error}", unit.parent.display())),
+            ));
+        }
+    };
+    let result = match analyze_bundle_source(&source, unit.parent.display().to_string(), &budget) {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            let error = recoverable_unit_error(anyhow::Error::new(error))?;
+            Err(error.to_string())
+        }
+    };
+    Ok((digest.to_owned(), result))
 }
 
 pub fn materialize_bundle_modules(
     project: &Path,
     jobs: Option<usize>,
+    budgets: &AnalysisBudgets,
 ) -> Result<BundleMaterializeSummary> {
     let jobs = jobs.unwrap_or_else(|| default_jobs(32)).max(1);
+    let stage_budget = budgets.operation(
+        AnalysisOperation::BundleMaterialization,
+        project.display().to_string(),
+    );
+    stage_budget.checkpoint()?;
     let deob = load_artifact(project, DEOBFUSCATION, false)?
         .context("safe deobfuscation artifact is missing")?;
     let deob_units = deob
@@ -413,10 +444,15 @@ pub fn materialize_bundle_modules(
     let inventory_rows = pool.install(|| {
         grouped
             .par_iter()
-            .map(|(digest, group)| report_for_group(digest, group, &units))
+            .map(|(digest, group)| report_for_group(digest, group, &units, budgets, &stage_budget))
             .collect::<Vec<_>>()
     });
-    let inventory = inventory_rows.into_iter().collect::<BTreeMap<_, _>>();
+    let inventory = inventory_rows
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    stage_budget.checkpoint()?;
 
     let mut bundles = Vec::<Value>::new();
     let mut modules = Vec::<Value>::new();
@@ -425,6 +461,7 @@ pub fn materialize_bundle_modules(
     let mut seen_digest = BTreeMap::<String, usize>::new();
 
     for unit in &units {
+        stage_budget.checkpoint()?;
         let occurrence = *seen_digest.get(&unit.content_sha256).unwrap_or(&0);
         seen_digest.insert(unit.content_sha256.clone(), occurrence + 1);
         let group_size = groups.get(&unit.content_sha256).map_or(0, Vec::len);
@@ -511,22 +548,36 @@ pub fn materialize_bundle_modules(
             .par_iter()
             .map(|(digest, group)| {
                 let Some(&index) = group.first() else {
-                    return (digest.to_string(), String::new(), false);
+                    return Ok::<_, anyhow::Error>((digest.to_string(), String::new(), false));
                 };
-                let raw = &tasks[index].raw;
-                match format_source(raw) {
+                let task = &tasks[index];
+                let budget = budgets.operation_under(
+                    &stage_budget,
+                    AnalysisOperation::Format,
+                    task.dest.display().to_string(),
+                );
+                let raw = &task.raw;
+                let result = match format_source(raw, &budget) {
                     Ok(formatted) => (digest.to_string(), formatted, true),
-                    Err(_) => (digest.to_string(), raw.clone(), false),
-                }
+                    Err(error) => {
+                        let _error = recoverable_unit_error(error)?;
+                        (digest.to_string(), raw.clone(), false)
+                    }
+                };
+                Ok(result)
             })
             .collect::<Vec<_>>()
     });
     let formatted = formatted
         .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
         .map(|(digest, source, ok)| (digest, (source, ok)))
         .collect::<BTreeMap<_, _>>();
+    stage_budget.checkpoint()?;
 
     for group in format_groups.values() {
+        stage_budget.checkpoint()?;
         let Some(&canonical_task) = group.first() else {
             continue;
         };
@@ -657,7 +708,11 @@ mod tests {
                 "summary": {}
             });
             write_artifact(&project, DEOBFUSCATION, &artifact)?;
-            let summary = materialize_bundle_modules(&project, Some(2))?;
+            let summary = materialize_bundle_modules(
+                &project,
+                Some(2),
+                &AnalysisBudgets::standard("bundle-materialize-test"),
+            )?;
             assert_eq!(summary.eligible_units, 2);
             assert_eq!(summary.unique_input_bodies, 1);
             assert!(summary.bundles >= 2);

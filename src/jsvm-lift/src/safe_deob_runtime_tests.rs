@@ -2,6 +2,7 @@ use super::*;
 use anyhow::{anyhow, Context, Result};
 use std::{collections::BTreeMap, fs, path::Path, process::Command};
 use tempfile::TempDir;
+use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
 const MAIN_FIXTURES: [&str; 28] = [
@@ -35,6 +36,10 @@ const MAIN_FIXTURES: [&str; 28] = [
     "static-alias-live-forwarding.js",
 ];
 
+fn budget(label: &str) -> WorkBudget {
+    WorkBudget::unlimited(format!("semantic-test:{label}"))
+}
+
 fn repo_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -53,10 +58,12 @@ fn node(path: &Path, check_only: bool) -> Result<Vec<u8>> {
     if check_only {
         command.arg("--check");
     }
-    let output = command
-        .arg(path)
-        .current_dir(repo_root())
-        .output()
+    command.arg(path).current_dir(repo_root());
+    let node_budget = WorkBudget::new(
+        format!("node:{}", path.display()),
+        BudgetLimits::wall_time(std::time::Duration::from_secs(60)),
+    );
+    let output = run_command(&mut command, &node_budget)
         .with_context(|| format!("running Node for {}", path.display()))?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -101,7 +108,8 @@ fn assert_invariants(label: &str, outcome: &SafeDeobOutcome) {
 
 fn deob_fixture(scratch: &Path, file: &str) -> Result<SafeDeobOutcome> {
     let source = fixture(file)?;
-    let outcome = deobfuscate_source(&source, file, SourceMode::Auto, 16, false)
+    let work_budget = budget(file);
+    let outcome = deobfuscate_source(&source, file, SourceMode::Auto, 16, false, &work_budget)
         .with_context(|| format!("deobfuscating {file}"))?;
     runtime_equivalent(scratch, file, &source, &outcome.source)?;
     assert_invariants(file, &outcome);
@@ -222,7 +230,15 @@ fn depythonify_safe_deob_generated_runtime_equivalence() -> Result<()> {
     }
 
     let source = fixture("static-alias-installer-calls.js")?;
-    let formatted = deobfuscate_source(&source, "formatted-alias", SourceMode::Auto, 16, true)?;
+    let work_budget = budget("formatted-alias");
+    let formatted = deobfuscate_source(
+        &source,
+        "formatted-alias",
+        SourceMode::Auto,
+        16,
+        true,
+        &work_budget,
+    )?;
     assert!(formatted.report.presentation_formatted);
     assert_ne!(
         formatted.report.analysis_source_sha256,
@@ -255,6 +271,7 @@ fn depythonify_safe_deob_safety_runtime_equivalence() -> Result<()> {
         SourceMode::Auto,
         16,
         false,
+        &budget("with-statement-negative"),
     )
     .is_err());
 
@@ -265,6 +282,7 @@ fn depythonify_safe_deob_safety_runtime_equivalence() -> Result<()> {
         SourceMode::Auto,
         16,
         false,
+        &budget("fixed-rotated-direct-decoder"),
     )?;
     runtime_equivalent(
         scratch.path(),
@@ -373,6 +391,7 @@ fn depythonify_safe_deob_real_et_external_corpus() -> Result<()> {
             SourceMode::Auto,
             16,
             false,
+            &budget(&path.display().to_string()),
         )?;
         let output = scratch
             .path()

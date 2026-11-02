@@ -1,6 +1,7 @@
 use crate::capture_project::prepare_project_output;
 use anyhow::Result;
 use std::path::PathBuf;
+use work_budget::WorkBudget;
 
 pub(crate) mod html;
 mod materialize;
@@ -26,10 +27,15 @@ pub(crate) struct HarProjectSummary {
 }
 
 /// Materialize a HAR capture as a canonical capture project.
-pub(crate) fn import_har_project(args: &HarProjectOptions) -> Result<HarProjectSummary> {
+pub(crate) fn import_har_project(
+    args: &HarProjectOptions,
+    budget: &WorkBudget,
+) -> Result<HarProjectSummary> {
+    budget.checkpoint()?;
     prepare_project_output(&args.output, args.overwrite)?;
-    let (har, salvaged, parse_error, parse_warnings) = read_har(&args.har)?;
-    materialize_project(args, har, salvaged, parse_error, parse_warnings)
+    let (har, salvaged, parse_error, parse_warnings) = read_har(&args.har, budget)?;
+    budget.checkpoint()?;
+    materialize_project(args, har, salvaged, parse_error, parse_warnings, budget)
 }
 #[cfg(test)]
 mod tests {

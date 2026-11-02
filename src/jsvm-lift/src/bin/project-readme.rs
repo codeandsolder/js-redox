@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use jsvm_lift::project_readme::refresh_project_readme;
+use jsvm_lift::{analysis_budget::AnalysisBudgets, project_readme::refresh_project_readme};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -13,7 +13,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    refresh_project_readme(&args.project)?;
+    refresh_project_readme(&args.project, &AnalysisBudgets::standard("project-readme"))?;
     println!("refreshed {}/README.md", args.project.display());
     Ok(())
 }
