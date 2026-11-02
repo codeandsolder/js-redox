@@ -2,20 +2,26 @@ use crate::decoder_encoding::{
     decode_fixed_base64_latin1, decode_lower_alphabet_base64_rc4, decode_lower_alphabet_base64_uri,
     decode_standard_base64_latin1,
 };
+mod fixed_base64_proof;
+
 use crate::rewrite::Replacement;
 use crate::value_eval::{eval, js_to_uint32, render_value_array, same_values, Value};
 use crate::{
     argument_integer, array_element, decoder_argument_integer, expression_integer, fragment,
-    reference_is_statically_resolved_read, statically_resolved_symbol, string_literal_value,
-    symbol_has_only_read_references, symbol_of, template_element_value,
+    reference_is_statically_resolved_read, statically_resolved_symbol,
+    statically_unresolved_global_reference, string_literal_value, symbol_has_only_read_references,
+    symbol_of, template_element_value,
 };
+use fixed_base64_proof::fixed_base64_algorithm_proven;
+use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, BindingPattern, CallExpression, Expression, ExpressionStatement, Statement,
     VariableDeclarationKind,
 };
 use oxc_ast_visit::{walk, Visit};
+use oxc_parser::Parser;
 use oxc_semantic::{ReferenceId, Scoping};
-use oxc_span::{GetSpan, Span};
+use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::{
     scope::{ScopeFlags, ScopeId},
     symbol::SymbolId,
@@ -158,31 +164,6 @@ fn decoder_static_arrays(
     let mut candidates = all_static_arrays(program);
     candidates.retain(|candidate| symbol_has_only_read_references(scoping, candidate.symbol));
     candidates
-}
-
-#[derive(Default)]
-struct DirectCallCounter {
-    count: usize,
-}
-
-impl<'a> Visit<'a> for DirectCallCounter {
-    fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
-        self.count += 1;
-        walk::walk_call_expression(self, it);
-    }
-
-    fn visit_function(&mut self, _f: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
-        // Nested functions do not execute as part of the candidate decoder
-        // invocation itself, so do not count calls inside them.
-    }
-}
-
-fn direct_body_call_count(body: &oxc_ast::ast::FunctionBody<'_>) -> usize {
-    let mut counter = DirectCallCounter::default();
-    for statement in &body.statements {
-        counter.visit_statement(statement);
-    }
-    counter.count
 }
 
 fn fixed_decoder_loop_shape(statement: &Statement<'_>) -> bool {
@@ -802,13 +783,23 @@ impl FixedAlphabetProbe<'_> {
         else {
             return;
         };
-        if is_base64_alphabet(&value) && !used_aliases.is_empty() {
+        if is_base64_alphabet(&value) {
             self.candidates.push((value, used_aliases));
         }
     }
 }
 
 impl<'a> Visit<'a> for FixedAlphabetProbe<'_> {
+    fn visit_function(&mut self, _function: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        // Alphabets assigned inside deferred nested functions do not
+        // exist at the point the decoder body executes.
+    }
+
     fn visit_variable_declarator(&mut self, declarator: &oxc_ast::ast::VariableDeclarator<'a>) {
         if let Some(initializer) = &declarator.init {
             self.consider(initializer);
@@ -846,6 +837,9 @@ fn fixed_alphabet_for_function(
     let [(alphabet, used_aliases)] = probe.candidates.as_slice() else {
         return None;
     };
+    if used_aliases.is_empty() {
+        return Some(alphabet.clone());
+    }
     let initialized_after = used_aliases
         .iter()
         .filter_map(|alias| aliases.get(alias))
@@ -868,6 +862,17 @@ fn unparenthesized<'a>(mut expression: &'a Expression<'a>) -> &'a Expression<'a>
         expression = &parenthesized.expression;
     }
     expression
+}
+
+fn function_parameters_have_no_runtime_effects(function: &oxc_ast::ast::Function<'_>) -> bool {
+    function.params.items.iter().all(|parameter| {
+        parameter.initializer.is_none()
+            && matches!(parameter.pattern, BindingPattern::BindingIdentifier(_))
+    }) && function
+        .params
+        .rest
+        .as_ref()
+        .is_none_or(|rest| matches!(rest.rest.argument, BindingPattern::BindingIdentifier(_)))
 }
 
 fn fixed_decoder_iife_wrapper_proven(
@@ -1041,16 +1046,217 @@ fn fixed_decoder_iife_wrapper_proven(
     )
 }
 
+fn indexed_table_symbol(
+    expression: &Expression<'_>,
+    index_symbol: SymbolId,
+    scoping: &Scoping,
+) -> Option<SymbolId> {
+    let Expression::ComputedMemberExpression(member) = unparenthesized(expression) else {
+        return None;
+    };
+    if member.optional {
+        return None;
+    }
+    let Expression::Identifier(table) = unparenthesized(&member.object) else {
+        return None;
+    };
+    let Expression::Identifier(index) = unparenthesized(&member.expression) else {
+        return None;
+    };
+    if statically_resolved_symbol(scoping, index.reference_id.get()?) != Some(index_symbol) {
+        return None;
+    }
+    statically_resolved_symbol(scoping, table.reference_id.get()?)
+}
+
+fn unresolved_global_call_argument<'a>(
+    expression: &'a Expression<'a>,
+    name: &str,
+    scoping: &Scoping,
+) -> Option<&'a Expression<'a>> {
+    let Expression::CallExpression(call) = unparenthesized(expression) else {
+        return None;
+    };
+    if call.optional || call.arguments.len() != 1 || call.arguments[0].is_spread() {
+        return None;
+    }
+    let Expression::Identifier(callee) = unparenthesized(&call.callee) else {
+        return None;
+    };
+    if callee.name.as_str() != name
+        || !statically_unresolved_global_reference(scoping, callee.reference_id.get()?)
+    {
+        return None;
+    }
+    call.arguments[0].as_expression().map(unparenthesized)
+}
+
+fn expression_resolves_to_symbol(
+    expression: &Expression<'_>,
+    symbol: SymbolId,
+    scoping: &Scoping,
+) -> bool {
+    let Expression::Identifier(identifier) = unparenthesized(expression) else {
+        return false;
+    };
+    identifier
+        .reference_id
+        .get()
+        .and_then(|reference_id| statically_resolved_symbol(scoping, reference_id))
+        == Some(symbol)
+}
+
+fn standard_base64_table_for_function(
+    function: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+) -> Option<SymbolId> {
+    if function.r#async
+        || function.generator
+        || !function_parameters_have_no_runtime_effects(function)
+    {
+        return None;
+    }
+    let body = function.body.as_ref()?;
+    let first_param = function.params.items.first()?;
+    let BindingPattern::BindingIdentifier(first_param) = &first_param.pattern else {
+        return None;
+    };
+    let index_symbol = first_param.symbol_id.get()?;
+
+    let local_assignment = |expression: &Expression<'_>| -> Option<(SymbolId, SymbolId)> {
+        let (target, value) = assignment_identifier(expression)?;
+        let target_symbol = statically_resolved_symbol(scoping, target.reference_id.get()?)?;
+        let declaration = scoping.symbol_span(target_symbol);
+        if declaration.start < function.span.start || declaration.end > function.span.end {
+            return None;
+        }
+        Some((
+            target_symbol,
+            indexed_table_symbol(value, index_symbol, scoping)?,
+        ))
+    };
+
+    let atob_of_symbol = |expression: &Expression<'_>, symbol: SymbolId| -> bool {
+        unresolved_global_call_argument(expression, "atob", scoping)
+            .is_some_and(|argument| expression_resolves_to_symbol(argument, symbol, scoping))
+    };
+
+    match body.statements.as_slice() {
+        [Statement::ReturnStatement(ret)] => {
+            let argument = ret.argument.as_ref()?;
+            if let Some(table) = unresolved_global_call_argument(argument, "atob", scoping)
+                .and_then(|argument| indexed_table_symbol(argument, index_symbol, scoping))
+            {
+                return Some(table);
+            }
+            let Expression::SequenceExpression(sequence) = unparenthesized(argument) else {
+                return None;
+            };
+            let [assignment, decode] = sequence.expressions.as_slice() else {
+                return None;
+            };
+            let (alias, table) = local_assignment(assignment)?;
+            atob_of_symbol(decode, alias).then_some(table)
+        }
+        [Statement::ExpressionStatement(load), Statement::ReturnStatement(ret)] => {
+            let (alias, table) = local_assignment(&load.expression)?;
+            atob_of_symbol(ret.argument.as_ref()?, alias).then_some(table)
+        }
+        [Statement::VariableDeclaration(declaration), Statement::ReturnStatement(ret)] => {
+            let [declarator] = declaration.declarations.as_slice() else {
+                return None;
+            };
+            let BindingPattern::BindingIdentifier(alias) = &declarator.id else {
+                return None;
+            };
+            let alias_symbol = alias.symbol_id.get()?;
+            let table = indexed_table_symbol(declarator.init.as_ref()?, index_symbol, scoping)?;
+            atob_of_symbol(ret.argument.as_ref()?, alias_symbol).then_some(table)
+        }
+        _ => None,
+    }
+}
+
+fn indexed_table_symbols_for_function(
+    function: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+) -> Vec<SymbolId> {
+    let Some(first_param) = function.params.items.first() else {
+        return Vec::new();
+    };
+    let BindingPattern::BindingIdentifier(first_param) = &first_param.pattern else {
+        return Vec::new();
+    };
+    let Some(index_symbol) = first_param.symbol_id.get() else {
+        return Vec::new();
+    };
+    let Some(body) = function.body.as_ref() else {
+        return Vec::new();
+    };
+
+    struct Probe<'c> {
+        scoping: &'c Scoping,
+        index_symbol: SymbolId,
+        tables: Vec<SymbolId>,
+    }
+    impl<'a> Visit<'a> for Probe<'_> {
+        fn visit_function(&mut self, _function: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {
+            // Reads inside nested functions do not execute as part of this decoder
+            // invocation and must not contaminate the candidate table set.
+        }
+
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+            // Same boundary as nested function expressions/declarations above.
+        }
+
+        fn visit_computed_member_expression(
+            &mut self,
+            member: &oxc_ast::ast::ComputedMemberExpression<'a>,
+        ) {
+            if !member.optional {
+                if let Expression::Identifier(index) = unparenthesized(&member.expression) {
+                    if index.reference_id.get().is_some_and(|reference_id| {
+                        statically_resolved_symbol(self.scoping, reference_id)
+                            == Some(self.index_symbol)
+                    }) {
+                        if let Expression::Identifier(table) = unparenthesized(&member.object) {
+                            if let Some(reference_id) = table.reference_id.get() {
+                                if let Some(symbol) =
+                                    statically_resolved_symbol(self.scoping, reference_id)
+                                {
+                                    self.tables.push(symbol);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            walk::walk_computed_member_expression(self, member);
+        }
+    }
+
+    let mut probe = Probe {
+        scoping,
+        index_symbol,
+        tables: Vec::new(),
+    };
+    probe.visit_function_body(body);
+    probe.tables.sort();
+    probe.tables.dedup();
+    probe.tables
+}
+
 #[derive(Debug)]
 struct DirectFnInfo {
     symbol: SymbolId,
-    params: Vec<String>,
     span: Span,
-    body_statement_count: usize,
-    direct_call_count: usize,
-    fixed_decoder_control_shape: bool,
-    fixed_decoder_iife_control_shape: bool,
+    indexed_table_symbols: Vec<SymbolId>,
+    standard_base64_table: Option<SymbolId>,
     fixed_base64_alphabet: Option<String>,
+    fixed_base64_algorithm_proven: bool,
 }
 
 struct DirectFnInfoCollector<'c> {
@@ -1064,41 +1270,30 @@ impl<'a> Visit<'a> for DirectFnInfoCollector<'_> {
     fn visit_function(&mut self, f: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
         if let Some(id) = &f.id {
             if let Some(symbol) = id.symbol_id.get() {
-                let params = f
-                    .params
-                    .items
-                    .iter()
-                    .filter_map(|p| match &p.pattern {
-                        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-                        _ => None,
-                    })
-                    .collect();
-
+                let fixed_base64_alphabet = fixed_alphabet_for_function(
+                    f,
+                    symbol,
+                    self.scoping,
+                    self.aliases,
+                    self.reference_spans,
+                );
+                let fixed_base64_algorithm_proven =
+                    fixed_base64_alphabet.as_deref().is_some_and(|alphabet| {
+                        fixed_base64_algorithm_proven(
+                            f,
+                            self.scoping,
+                            self.aliases,
+                            self.reference_spans,
+                            alphabet,
+                        )
+                    });
                 self.out.push(DirectFnInfo {
                     symbol,
-                    params,
                     span: f.span,
-                    body_statement_count: f.body.as_ref().map_or(0, |body| body.statements.len()),
-                    direct_call_count: f
-                        .body
-                        .as_ref()
-                        .map_or(0, |body| direct_body_call_count(body)),
-                    fixed_decoder_control_shape: f
-                        .body
-                        .as_ref()
-                        .is_some_and(|body| fixed_decoder_control_shape(body)),
-                    fixed_decoder_iife_control_shape: fixed_decoder_iife_wrapper_proven(
-                        f,
-                        self.scoping,
-                        self.aliases,
-                    ),
-                    fixed_base64_alphabet: fixed_alphabet_for_function(
-                        f,
-                        symbol,
-                        self.scoping,
-                        self.aliases,
-                        self.reference_spans,
-                    ),
+                    indexed_table_symbols: indexed_table_symbols_for_function(f, self.scoping),
+                    standard_base64_table: standard_base64_table_for_function(f, self.scoping),
+                    fixed_base64_alphabet,
+                    fixed_base64_algorithm_proven,
                 });
             }
         }
@@ -1392,133 +1587,11 @@ fn contains_function_reassignment(body: &str, name: &str) -> bool {
     false
 }
 
-static FIXED_BASE64_ALPHABET_RE: LazyLock<Option<regex::Regex>> =
-    LazyLock::new(|| compile_regex(r#"["']([A-Za-z0-9+/=]{65})["']"#));
-static BASE64_SENTINEL_RE: LazyLock<Option<regex::Regex>> =
-    LazyLock::new(|| compile_regex(r"(?:64\s*!=|!=\s*64)"));
 static RC4_CHAR_CODE_AT_RE: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
     compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*charCodeAt\s*\(([^)]*)\)")
 });
 static DIRECT_ARRAY_ACCESS_RE: LazyLock<Option<regex::Regex>> =
     LazyLock::new(|| compile_regex(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([^\s\]]+)\s*\]"));
-
-fn fixed_base64_alphabet(body: &str) -> Option<String> {
-    if !body.contains("String.fromCharCode")
-        || !body.contains(".indexOf")
-        || !body.contains(".charAt")
-    {
-        return None;
-    }
-    let re = FIXED_BASE64_ALPHABET_RE.as_ref()?;
-    let standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
-        .chars()
-        .collect::<HashSet<_>>();
-    let mut candidates = re
-        .captures_iter(body)
-        .filter_map(|caps| caps.get(1).map(|capture| capture.as_str().to_string()))
-        .filter(|candidate| candidate.chars().collect::<HashSet<_>>() == standard)
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
-    (candidates.len() == 1).then(|| candidates.remove(0))
-}
-
-fn function_inner_source(body: &str) -> Option<&str> {
-    let start = body.find('{')?.checked_add(1)?;
-    let end = body.rfind('}')?;
-    (start <= end).then(|| &body[start..end])
-}
-
-fn standard_base64_decoder_matches(body: &str, array: &str, param: &str) -> bool {
-    let Some(inner) = function_inner_source(body) else {
-        return false;
-    };
-
-    // Match the complete function body, not merely a decoder-looking
-    // expression somewhere inside it. Replacing a call removes the entire
-    // function execution, so accepting extra statements could silently drop
-    // observable side effects.
-    let Some(direct) = compile_regex(&format!(
-        r"(?s)^\s*return\s+atob\s*\(\s*{}\s*\[\s*{}\s*\]\s*\)\s*;?\s*$",
-        regex::escape(array),
-        regex::escape(param)
-    )) else {
-        return false;
-    };
-    if direct.is_match(inner) {
-        return true;
-    }
-
-    let Some(sequence) = compile_regex(&format!(
-        r"(?s)^\s*return\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*,\s*atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$",
-        regex::escape(array),
-        regex::escape(param)
-    )) else {
-        return false;
-    };
-    if sequence
-        .captures(inner)
-        .is_some_and(|caps| caps.get(1).map(|m| m.as_str()) == caps.get(2).map(|m| m.as_str()))
-    {
-        return true;
-    }
-
-    let Some(assignment) = compile_regex(&format!(
-        r"(?s)^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*;\s*return\s+atob\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)\s*;?\s*$",
-        regex::escape(array),
-        regex::escape(param)
-    )) else {
-        return false;
-    };
-    assignment
-        .captures(inner)
-        .is_some_and(|caps| caps.get(1).map(|m| m.as_str()) == caps.get(2).map(|m| m.as_str()))
-}
-
-fn fixed_base64_decoder_matches(
-    body: &str,
-    array: &str,
-    param: &str,
-    alphabet_hint: Option<&str>,
-    iife_wrapper_proven: bool,
-) -> Option<String> {
-    let alphabet = fixed_base64_alphabet(body).or_else(|| alphabet_hint.map(str::to_owned))?;
-    let guarded_load = compile_regex(&format!(
-        r"typeof\s*\(?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*{}\s*\[\s*{}\s*\]\s*\)?",
-        regex::escape(array),
-        regex::escape(param)
-    ))?;
-
-    if let Some(alias) = guarded_load
-        .captures_iter(body)
-        .find_map(|caps| caps.get(1).map(|m| m.as_str()))
-    {
-        let return_alias = compile_regex(&format!(r"\breturn\s+{}\s*;", regex::escape(alias)))?;
-        if !return_alias.is_match(body) && !iife_wrapper_proven {
-            return None;
-        }
-    } else if !iife_wrapper_proven {
-        return None;
-    }
-
-    // Fail closed on a recognizable Base64 decoder shape rather than merely
-    // seeing an alphabet and String.fromCharCode somewhere in the function.
-    if !body.contains(".replace(/[^A-Za-z0-9\\+\\/\\=]/g")
-        || body.matches(".indexOf(").count() != 4
-        || body.matches(".charAt(").count() != 4
-        || body.matches("String.fromCharCode").count() != 3
-        || body.matches("<<").count() != 3
-        || body.matches(">>").count() != 2
-    {
-        return None;
-    }
-    let sentinel_checks = BASE64_SENTINEL_RE.as_ref()?;
-    if sentinel_checks.find_iter(body).count() != 2 {
-        return None;
-    }
-
-    Some(alphabet)
-}
 
 fn function_has_external_write(
     span: Span,
@@ -1593,14 +1666,6 @@ fn detect_sparse_direct_table_decoders(
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> HashMap<SymbolId, SparseDirectDecoder> {
-    let mut arrays_by_name: HashMap<&str, Vec<&PartialStaticArrayInfo>> = HashMap::new();
-    for array in arrays {
-        arrays_by_name
-            .entry(array.name.as_str())
-            .or_default()
-            .push(array);
-    }
-
     let mut out = HashMap::new();
     for function in functions {
         if complete_decoders.contains_key(&function.symbol)
@@ -1611,33 +1676,32 @@ fn detect_sparse_direct_table_decoders(
         {
             continue;
         }
-        let Some(param) = function.params.first() else {
-            continue;
-        };
-        let body = fragment(source, function.span);
-        let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
-            continue;
-        };
-        let mut matched = access
-            .captures_iter(body)
-            .filter(|caps| caps.get(2).is_some_and(|capture| capture.as_str() == param))
-            .filter_map(|caps| caps.get(1).map(|capture| capture.as_str()))
-            .filter_map(|name| arrays_by_name.get(name))
-            .flat_map(|candidates| candidates.iter().copied())
-            .filter(|array| {
-                let references = scoping.get_resolved_reference_ids(array.symbol);
-                let [reference_id] = references else {
-                    return false;
-                };
-                reference_spans.get(reference_id).is_some_and(|span| {
-                    function.span.start <= span.start && span.end <= function.span.end
+        let array = if let Some(symbol) = function.standard_base64_table {
+            let Some(array) = arrays.iter().find(|array| array.symbol == symbol) else {
+                continue;
+            };
+            array
+        } else {
+            let mut matched = function
+                .indexed_table_symbols
+                .iter()
+                .filter_map(|symbol| arrays.iter().find(|array| array.symbol == *symbol))
+                .filter(|array| {
+                    let references = scoping.get_resolved_reference_ids(array.symbol);
+                    let [reference_id] = references else {
+                        return false;
+                    };
+                    reference_spans.get(reference_id).is_some_and(|span| {
+                        function.span.start <= span.start && span.end <= function.span.end
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        matched.sort_by_key(|array| array.symbol);
-        matched.dedup_by_key(|array| array.symbol);
-        let [array] = matched.as_slice() else {
-            continue;
+                .collect::<Vec<_>>();
+            matched.sort_by_key(|array| array.symbol);
+            matched.dedup_by_key(|array| array.symbol);
+            let [array] = matched.as_slice() else {
+                continue;
+            };
+            *array
         };
 
         // The table binding is immutable, and its only resolved read is the
@@ -1669,22 +1733,12 @@ fn detect_sparse_direct_table_decoders(
             continue;
         }
 
-        let transform = if standard_base64_decoder_matches(body, &array.name, param) {
+        let transform = if function.standard_base64_table == Some(array.symbol) {
             DecoderTransform::StandardBase64
-        } else if ((function.body_statement_count == 3
-            && function.fixed_decoder_control_shape
-            && function.direct_call_count == 12)
-            || ((1..=2).contains(&function.body_statement_count)
-                && function.fixed_decoder_iife_control_shape))
+        } else if function.fixed_base64_algorithm_proven
             && !function_has_external_write(function.span, scoping, reference_spans)
         {
-            let Some(alphabet) = fixed_base64_decoder_matches(
-                body,
-                &array.name,
-                param,
-                function.fixed_base64_alphabet.as_deref(),
-                function.fixed_decoder_iife_control_shape,
-            ) else {
+            let Some(alphabet) = function.fixed_base64_alphabet.clone() else {
                 continue;
             };
             DecoderTransform::FixedBase64Alphabet(alphabet)
@@ -1783,14 +1837,6 @@ fn detect_direct_table_decoders(
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> HashMap<SymbolId, Decoder> {
-    let mut arrays_by_name: HashMap<&str, Vec<&StaticArrayInfo>> = HashMap::new();
-    for array in arrays {
-        arrays_by_name
-            .entry(array.name.as_str())
-            .or_default()
-            .push(array);
-    }
-
     let mut out = HashMap::new();
     for function in functions {
         if scoping
@@ -1800,27 +1846,24 @@ fn detect_direct_table_decoders(
         {
             continue;
         }
-        let Some(param) = function.params.first() else {
-            continue;
+        let array = if let Some(symbol) = function.standard_base64_table {
+            let Some(array) = arrays.iter().find(|array| array.symbol == symbol) else {
+                continue;
+            };
+            array
+        } else {
+            let mut matched = function
+                .indexed_table_symbols
+                .iter()
+                .filter_map(|symbol| arrays.iter().find(|array| array.symbol == *symbol))
+                .collect::<Vec<_>>();
+            matched.sort_by_key(|array| array.symbol);
+            matched.dedup_by_key(|array| array.symbol);
+            let [array] = matched.as_slice() else {
+                continue;
+            };
+            *array
         };
-        let body = fragment(source, function.span);
-        let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
-            continue;
-        };
-        let mut matched = access
-            .captures_iter(body)
-            .filter(|caps| caps.get(2).is_some_and(|capture| capture.as_str() == param))
-            .filter_map(|caps| caps.get(1).map(|capture| capture.as_str()))
-            .filter_map(|name| arrays_by_name.get(name))
-            .filter(|candidates| candidates.len() == 1)
-            .map(|candidates| candidates[0])
-            .collect::<Vec<_>>();
-        matched.sort_by_key(|array| array.symbol);
-        matched.dedup_by_key(|array| array.symbol);
-        if matched.len() != 1 {
-            continue;
-        }
-        let array = matched[0];
 
         // A direct literal-table decoder should have exactly one resolved
         // use of the table binding: the indexed load proved above. Requiring a
@@ -1854,21 +1897,12 @@ fn detect_direct_table_decoders(
             continue;
         }
 
-        let transform = if standard_base64_decoder_matches(body, &array.name, param) {
+        let transform = if function.standard_base64_table == Some(array.symbol) {
             DecoderTransform::StandardBase64
-        } else if ((function.body_statement_count == 3
-            && function.fixed_decoder_control_shape
-            && function.direct_call_count == 12)
-            || (function.body_statement_count == 1 && function.fixed_decoder_iife_control_shape))
+        } else if function.fixed_base64_algorithm_proven
             && !function_has_external_write(function.span, scoping, reference_spans)
         {
-            let Some(alphabet) = fixed_base64_decoder_matches(
-                body,
-                &array.name,
-                param,
-                function.fixed_base64_alphabet.as_deref(),
-                function.fixed_decoder_iife_control_shape,
-            ) else {
+            let Some(alphabet) = function.fixed_base64_alphabet.clone() else {
                 continue;
             };
             DecoderTransform::FixedBase64Alphabet(alphabet)
@@ -1937,341 +1971,143 @@ pub(super) fn js_parse_int(text: &str, radix: u32) -> Option<f64> {
     Some(if negative { -value } else { value })
 }
 
-struct RotationExprParser<'a, 'd> {
-    source: &'a str,
-    pos: usize,
-    alias: &'a str,
-    decoder: &'d Decoder,
-    numeric_members: &'d HashMap<(String, String), i64>,
-    rotation: usize,
+fn rotation_static_integer(
+    expression: &Expression<'_>,
+    numeric_members: &HashMap<(String, String), i64>,
+) -> Option<i64> {
+    let expression = unparenthesized(expression);
+    if let Some(value) = expression_integer(expression) {
+        return Some(value);
+    }
+    let Expression::StaticMemberExpression(member) = expression else {
+        return None;
+    };
+    let Expression::Identifier(object) = unparenthesized(&member.object) else {
+        return None;
+    };
+    numeric_members
+        .get(&(object.name.to_string(), member.property.name.to_string()))
+        .copied()
 }
 
-impl RotationExprParser<'_, '_> {
-    fn rest(&self) -> &str {
-        &self.source[self.pos..]
-    }
-
-    fn skip_ws(&mut self) {
-        while let Some(ch) = self.rest().chars().next() {
-            if !ch.is_whitespace() {
-                break;
-            }
-            self.pos += ch.len_utf8();
+fn rotation_literal_integer(expression: &Expression<'_>) -> Option<i64> {
+    let expression = unparenthesized(expression);
+    match expression {
+        Expression::NumericLiteral(_) => expression_integer(expression),
+        Expression::UnaryExpression(unary)
+            if matches!(unary.operator.as_str(), "+" | "-")
+                && matches!(
+                    unparenthesized(&unary.argument),
+                    Expression::NumericLiteral(_)
+                ) =>
+        {
+            expression_integer(expression)
         }
+        _ => None,
     }
+}
 
-    fn eat(&mut self, text: &str) -> bool {
-        self.skip_ws();
-        if self.rest().starts_with(text) {
-            self.pos += text.len();
-            true
-        } else {
-            false
-        }
+fn rotation_decoder_call(
+    call: &CallExpression<'_>,
+    alias: &str,
+    decoder: &Decoder,
+    numeric_members: &HashMap<(String, String), i64>,
+    rotation: usize,
+) -> Option<String> {
+    if call.optional
+        || !(1..=2).contains(&call.arguments.len())
+        || call.arguments.iter().any(Argument::is_spread)
+    {
+        return None;
     }
-
-    fn ident(&mut self) -> Option<String> {
-        self.skip_ws();
-        let rest = self.rest();
-        let mut len = 0usize;
-        for (i, ch) in rest.char_indices() {
-            let valid = if i == 0 {
-                ch == '_' || ch == '$' || ch.is_ascii_alphabetic()
-            } else {
-                ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
+    let Expression::Identifier(callee) = unparenthesized(&call.callee) else {
+        return None;
+    };
+    if callee.name.as_str() != alias {
+        return None;
+    }
+    let raw = rotation_static_integer(call.arguments.first()?.as_expression()?, numeric_members)?;
+    let key = match call.arguments.get(1) {
+        Some(argument) => {
+            let Expression::StringLiteral(literal) = unparenthesized(argument.as_expression()?)
+            else {
+                return None;
             };
-            if !valid {
-                break;
-            }
-            len = i + ch.len_utf8();
+            Some(string_literal_value(literal)?)
         }
-        if len == 0 {
-            return None;
-        }
-        let value = rest[..len].to_string();
-        self.pos += len;
-        Some(value)
-    }
+        None => None,
+    };
+    decoder
+        .value_for_raw_rotated_with_key(raw, rotation, key.as_deref())?
+        .js_string()
+}
 
-    fn number(&mut self) -> Option<f64> {
-        self.skip_ws();
-        let rest = self.rest();
-        if rest.starts_with("0x") || rest.starts_with("0X") {
-            let digits = rest[2..].bytes().take_while(u8::is_ascii_hexdigit).count();
-            if digits == 0 {
+fn eval_rotation_expression(
+    expression: &Expression<'_>,
+    alias: &str,
+    decoder: &Decoder,
+    numeric_members: &HashMap<(String, String), i64>,
+    rotation: usize,
+) -> Option<f64> {
+    match unparenthesized(expression) {
+        Expression::NumericLiteral(number) => Some(number.value),
+        Expression::StaticMemberExpression(_) => {
+            rotation_static_integer(expression, numeric_members).map(js_number_from_i64)
+        }
+        Expression::UnaryExpression(unary) => {
+            let value = eval_rotation_expression(
+                &unary.argument,
+                alias,
+                decoder,
+                numeric_members,
+                rotation,
+            )?;
+            match unary.operator.as_str() {
+                "+" => Some(value),
+                "-" => Some(-value),
+                _ => None,
+            }
+        }
+        Expression::BinaryExpression(binary) => {
+            let left =
+                eval_rotation_expression(&binary.left, alias, decoder, numeric_members, rotation)?;
+            let right =
+                eval_rotation_expression(&binary.right, alias, decoder, numeric_members, rotation)?;
+            match binary.operator.as_str() {
+                "+" => Some(left + right),
+                "-" => Some(left - right),
+                "*" => Some(left * right),
+                "/" => Some(left / right),
+                "%" => Some(left % right),
+                _ => None,
+            }
+        }
+        Expression::CallExpression(call) => {
+            if call.optional || !(1..=2).contains(&call.arguments.len()) {
                 return None;
             }
-            let len = 2 + digits;
-            let value = js_number_from_i64(i64::from_str_radix(&rest[2..len], 16).ok()?);
-            self.pos += len;
-            return Some(value);
-        }
-
-        let bytes = rest.as_bytes();
-        let mut len = 0usize;
-        while len < bytes.len() && bytes[len].is_ascii_digit() {
-            len += 1;
-        }
-        if len < bytes.len() && bytes[len] == b'.' {
-            len += 1;
-            while len < bytes.len() && bytes[len].is_ascii_digit() {
-                len += 1;
-            }
-        }
-        if len < bytes.len() && matches!(bytes[len], b'e' | b'E') {
-            let exp_start = len;
-            len += 1;
-            if len < bytes.len() && matches!(bytes[len], b'+' | b'-') {
-                len += 1;
-            }
-            let digits_start = len;
-            while len < bytes.len() && bytes[len].is_ascii_digit() {
-                len += 1;
-            }
-            if digits_start == len {
-                len = exp_start;
-            }
-        }
-        if len == 0 {
-            return None;
-        }
-        let value = rest[..len].parse().ok()?;
-        self.pos += len;
-        Some(value)
-    }
-
-    fn signed_integer(&mut self) -> Option<i64> {
-        self.skip_ws();
-        let start = self.pos;
-        if self.eat("-") || self.eat("+") {
-            self.skip_ws();
-        }
-        let rest = self.rest();
-        let len = if rest.starts_with("0x") || rest.starts_with("0X") {
-            let digits = rest[2..].bytes().take_while(u8::is_ascii_hexdigit).count();
-            if digits == 0 {
-                self.pos = start;
+            let Expression::Identifier(callee) = unparenthesized(&call.callee) else {
+                return None;
+            };
+            if callee.name.as_str() != "parseInt" {
                 return None;
             }
-            2 + digits
-        } else {
-            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-            if digits == 0 {
-                self.pos = start;
+            let decoded_call = call.arguments.first()?.as_expression()?;
+            let Expression::CallExpression(decoded_call) = unparenthesized(decoded_call) else {
                 return None;
-            }
-            digits
-        };
-        self.pos += len;
-        parse_i64_literal(&self.source[start..self.pos].replace(char::is_whitespace, ""))
-    }
-
-    fn numeric_member(&mut self) -> Option<i64> {
-        self.skip_ws();
-        let start = self.pos;
-        let object = self.ident()?;
-        if !self.eat(".") {
-            self.pos = start;
-            return None;
-        }
-        let property = self.ident()?;
-        let Some(value) = self.numeric_members.get(&(object, property)).copied() else {
-            self.pos = start;
-            return None;
-        };
-        Some(value)
-    }
-
-    fn integer_atom(&mut self) -> Option<i64> {
-        let start = self.pos;
-        if let Some(value) = self.signed_integer() {
-            return Some(value);
-        }
-        self.pos = start;
-        self.numeric_member()
-    }
-
-    fn string_literal(&mut self) -> Option<String> {
-        self.skip_ws();
-        let quote = self.rest().chars().next()?;
-        if !matches!(quote, '\'' | '"') {
-            return None;
-        }
-        self.pos += quote.len_utf8();
-        let mut units = Vec::<u16>::new();
-        loop {
-            let ch = self.rest().chars().next()?;
-            if ch == quote {
-                self.pos += ch.len_utf8();
-                return String::from_utf16(&units).ok();
-            }
-            if matches!(ch, '\n' | '\r') {
-                return None;
-            }
-            if ch != '\\' {
-                let mut buf = [0u16; 2];
-                units.extend_from_slice(ch.encode_utf16(&mut buf));
-                self.pos += ch.len_utf8();
-                continue;
-            }
-
-            self.pos += ch.len_utf8();
-            let escape = self.rest().chars().next()?;
-            self.pos += escape.len_utf8();
-            match escape {
-                '\\' | '\'' | '"' | '/' => units.push(u16::try_from(u32::from(escape)).ok()?),
-                'b' => units.push(0x08),
-                'f' => units.push(0x0c),
-                'n' => units.push(u16::from(b'\n')),
-                'r' => units.push(u16::from(b'\r')),
-                't' => units.push(u16::from(b'\t')),
-                'v' => units.push(0x0b),
-                '0' => {
-                    if self
-                        .rest()
-                        .chars()
-                        .next()
-                        .is_some_and(|next| next.is_ascii_digit())
-                    {
-                        return None;
-                    }
-                    units.push(0);
-                }
-                'x' => {
-                    let digits = self.rest().get(..2)?;
-                    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                        return None;
-                    }
-                    units.push(u16::from_str_radix(digits, 16).ok()?);
-                    self.pos += 2;
-                }
-                'u' => {
-                    if self.rest().starts_with('{') {
-                        self.pos += 1;
-                        let end = self.rest().find('}')?;
-                        let digits = self.rest().get(..end)?;
-                        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
-                        {
-                            return None;
-                        }
-                        let scalar = u32::from_str_radix(digits, 16).ok()?;
-                        let value = char::from_u32(scalar)?;
-                        let mut buf = [0u16; 2];
-                        units.extend_from_slice(value.encode_utf16(&mut buf));
-                        self.pos += end + 1;
-                    } else {
-                        let digits = self.rest().get(..4)?;
-                        if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                            return None;
-                        }
-                        units.push(u16::from_str_radix(digits, 16).ok()?);
-                        self.pos += 4;
-                    }
-                }
-                '\n' => {}
-                '\r' => {
-                    if self.rest().starts_with('\n') {
-                        self.pos += 1;
-                    }
-                }
-                other => {
-                    let mut buf = [0u16; 2];
-                    units.extend_from_slice(other.encode_utf16(&mut buf));
-                }
-            }
-        }
-    }
-
-    fn decoder_call(&mut self) -> Option<String> {
-        let name = self.ident()?;
-        if name != self.alias || !self.eat("(") {
-            return None;
-        }
-        let raw = self.integer_atom()?;
-        let key = if self.eat(",") {
-            Some(self.string_literal()?)
-        } else {
-            None
-        };
-        if !self.eat(")") {
-            return None;
-        }
-        let value =
-            self.decoder
-                .value_for_raw_rotated_with_key(raw, self.rotation, key.as_deref())?;
-        match value {
-            Value::String(value) => Some(value),
-            value => value.js_string(),
-        }
-    }
-
-    fn factor(&mut self) -> Option<f64> {
-        self.skip_ws();
-        if self.eat("(") {
-            let value = self.expr()?;
-            if !self.eat(")") {
-                return None;
-            }
-            return Some(value);
-        }
-        if self.eat("+") {
-            return self.factor();
-        }
-        if self.eat("-") {
-            return self.factor().map(|value| -value);
-        }
-
-        let before = self.pos;
-        if let Some(name) = self.ident() {
-            if name == "parseInt" && self.eat("(") {
-                let decoded = self.decoder_call()?;
-                let radix = if self.eat(",") {
-                    let radix = self.signed_integer()?;
+            };
+            let decoded =
+                rotation_decoder_call(decoded_call, alias, decoder, numeric_members, rotation)?;
+            let radix = match call.arguments.get(1) {
+                Some(argument) => {
+                    let radix = rotation_literal_integer(argument.as_expression()?)?;
                     u32::try_from(radix).ok()?
-                } else {
-                    10
-                };
-                if !self.eat(")") {
-                    return None;
                 }
-                return js_parse_int(&decoded, radix);
-            }
-            self.pos = before;
+                None => 10,
+            };
+            js_parse_int(&decoded, radix)
         }
-        if let Some(value) = self.numeric_member() {
-            return Some(js_number_from_i64(value));
-        }
-        self.number()
-    }
-
-    fn term(&mut self) -> Option<f64> {
-        let mut value = self.factor()?;
-        loop {
-            if self.eat("*") {
-                value *= self.factor()?;
-            } else if self.eat("/") {
-                value /= self.factor()?;
-            } else if self.eat("%") {
-                value %= self.factor()?;
-            } else {
-                break;
-            }
-        }
-        Some(value)
-    }
-
-    fn expr(&mut self) -> Option<f64> {
-        let mut value = self.term()?;
-        loop {
-            if self.eat("+") {
-                value += self.term()?;
-            } else if self.eat("-") {
-                value -= self.term()?;
-            } else {
-                break;
-            }
-        }
-        Some(value)
+        _ => None,
     }
 }
 
@@ -2282,17 +2118,22 @@ fn eval_rotation_checksum(
     numeric_members: &HashMap<(String, String), i64>,
     rotation: usize,
 ) -> Option<f64> {
-    let mut parser = RotationExprParser {
-        source: expression,
-        pos: 0,
+    let wrapped = format!("({expression});");
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, &wrapped, SourceType::cjs()).parse();
+    if parsed.fatal_error || !parsed.diagnostics.is_empty() || parsed.program.body.len() != 1 {
+        return None;
+    }
+    let Statement::ExpressionStatement(statement) = &parsed.program.body[0] else {
+        return None;
+    };
+    eval_rotation_expression(
+        &statement.expression,
         alias,
         decoder,
         numeric_members,
         rotation,
-    };
-    let value = parser.expr()?;
-    parser.skip_ws();
-    (parser.pos == expression.len()).then_some(value)
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -2405,6 +2246,48 @@ fn rotation_has_dynamic_scope(function: &oxc_ast::ast::Function<'_>) -> bool {
     let mut probe = RotationDynamicScopeProbe::default();
     probe.visit_function_body(body);
     probe.found
+}
+
+fn rotation_parse_int_references_are_global(
+    function: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+) -> bool {
+    let Some(body) = &function.body else {
+        return false;
+    };
+
+    struct Probe<'c> {
+        scoping: &'c Scoping,
+        valid: bool,
+    }
+
+    impl<'a> Visit<'a> for Probe<'_> {
+        fn visit_identifier_reference(
+            &mut self,
+            identifier: &oxc_ast::ast::IdentifierReference<'a>,
+        ) {
+            if identifier.name.as_str() == "parseInt" {
+                self.valid &= identifier.reference_id.get().is_some_and(|reference_id| {
+                    statically_unresolved_global_reference(self.scoping, reference_id)
+                });
+            }
+        }
+
+        fn visit_function(&mut self, _function: &oxc_ast::ast::Function<'a>, _flags: ScopeFlags) {}
+
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+        }
+    }
+
+    let mut probe = Probe {
+        scoping,
+        valid: true,
+    };
+    probe.visit_function_body(body);
+    probe.valid
 }
 
 fn stable_rotation_alias(
@@ -2869,6 +2752,7 @@ impl<'a> Visit<'a> for RotationIifeCollector<'_, '_> {
                             .is_some_and(|params| params.len() >= 2)
                         && provider_is_function
                         && rotation_parameter_names_unshadowed(function, self.scoping)
+                        && rotation_parse_int_references_are_global(function, self.scoping)
                         && !rotation_has_dynamic_scope(function);
                     let local_params = local_params.unwrap_or_default();
                     let array_param = local_params.first().cloned().unwrap_or_default();
@@ -4179,7 +4063,27 @@ mod tests {
         );
         assert_eq!(
             eval_rotation_checksum(
+                "parseInt(G(/* static index */ 0x0f + 1, '\\u006b')) * 10 + parseInt(G(0x11, 'k'))",
+                "G",
+                &decoder,
+                &HashMap::new(),
+                3,
+            ),
+            Some(193.0)
+        );
+        assert_eq!(
+            eval_rotation_checksum(
                 "parseInt(G(0x10, dynamic))",
+                "G",
+                &decoder,
+                &HashMap::new(),
+                3,
+            ),
+            None
+        );
+        assert_eq!(
+            eval_rotation_checksum(
+                "parseInt(G(sideEffect(), 'k'))",
                 "G",
                 &decoder,
                 &HashMap::new(),

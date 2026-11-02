@@ -110,15 +110,6 @@ struct Output {
     vms: Vec<SwitchVmIr>,
 }
 
-fn fnv1a64(data: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in data {
-        h ^= u64::from(*byte);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
-}
-
 const fn is_ident_char(c: char) -> bool {
     c == '_' || c == '$' || c.is_ascii_alphanumeric()
 }
@@ -815,8 +806,11 @@ fn lift_handler(
         opcode: handler.key,
         key_source: handler.key_source.clone(),
         terminal: handler.terminal.clone(),
-        semantic_hash: format!("{:016x}", fnv1a64(signature.join("|").as_bytes())),
-        coarse_semantic_hash: format!("{:016x}", fnv1a64(semantic_label.as_bytes())),
+        semantic_hash: format!(
+            "{:016x}",
+            jsvm_lift::fnv1a64(signature.join("|").as_bytes())
+        ),
+        coarse_semantic_hash: format!("{:016x}", jsvm_lift::fnv1a64(semantic_label.as_bytes())),
         semantic_label,
         op_kinds: effects
             .iter()

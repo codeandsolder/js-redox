@@ -597,15 +597,6 @@ fn normalize_statement(
     replace_ident(&out, param, "ctx")
 }
 
-fn fnv1a64(data: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in data {
-        h ^= u64::from(*byte);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
-}
-
 fn matching_table<'a>(report: &'a ScanReport, vm: &TableVm) -> Option<&'a HandlerTable> {
     report
         .handler_function_tables
@@ -656,7 +647,10 @@ fn lift_handlers(
                 start: slot.start,
                 end: slot.end,
                 parameter,
-                semantic_hash: format!("{:016x}", fnv1a64(signature.join("|").as_bytes())),
+                semantic_hash: format!(
+                    "{:016x}",
+                    jsvm_lift::fnv1a64(signature.join("|").as_bytes())
+                ),
                 op_kinds: statements
                     .iter()
                     .map(|statement| statement.ir.kind.clone())
