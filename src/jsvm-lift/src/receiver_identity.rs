@@ -10,8 +10,8 @@ use crate::{
         prove_function_protected_if_ladder_event_unreachable_with_call_arguments,
         prove_function_structured_branch_event_unreachable_with_integer_parameters,
         prove_function_switch_event_unreachable_with_integer_parameters,
-        structurally_proven_if_ladder_identifier_equalities_at_event,
-        ProvenIfLadderIdentifierEquality,
+        structurally_proven_if_ladder_identifier_equalities_at_event, CallArgumentEvent,
+        IntegerParameterEvent, ProvenIfLadderIdentifierEquality,
     },
 };
 use jsvm_safe_core::{eval_static_primitive, string_literal_value};
@@ -700,8 +700,10 @@ impl<'a> Visit<'a> for ContextProbe<'_, '_> {
             .active
             .then(|| self.assignment_member(&assignment.left))
             .flatten();
-        let suppressed = (assignment.operator.is_assign())
-            .then(|| member_target.as_ref())
+        let suppressed = assignment
+            .operator
+            .is_assign()
+            .then_some(member_target.as_ref())
             .flatten()
             .map(|_| {
                 let span = assignment.left.span();
@@ -1304,6 +1306,7 @@ type PreservationKey = (
     bool,
 );
 
+#[allow(clippy::too_many_arguments)]
 fn direct_call_preserves_field(
     source: &str,
     program: &Program<'_>,
@@ -1532,6 +1535,7 @@ pub fn proven_origin_direct_call_prefix_preserves_exact_property_before_direct_c
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn root_context_segment_preserves_field(
     source: &str,
     program: &Program<'_>,
@@ -1596,6 +1600,7 @@ fn root_context_segment_preserves_field(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn direct_call_prefix_preserves_field(
     source: &str,
     program: &Program<'_>,
@@ -1983,6 +1988,7 @@ fn collect_unique_direct_call_path(
     Some(path.clone())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn context_field_prefix_before_event(
     source: &str,
     program: &Program<'_>,
@@ -2136,6 +2142,7 @@ fn context_field_prefix_before_event(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prove_own_data_field_at_runtime_method_call_with_facts(
     source: &str,
     program: &Program<'_>,
@@ -2385,6 +2392,7 @@ fn context_entry_has_no_prior_property_write(
     .is_some_and(|reachability| reachability.valid_contexts.contains(target))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn context_prefix_preserves_exact_property(
     source: &str,
     program: &Program<'_>,
@@ -2455,6 +2463,7 @@ fn origin_property_edge_key(call: &ProvenOriginDirectCall) -> OriginPropertyEdge
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exact_origin_property_reachability(
     source: &str,
     program: &Program<'_>,
@@ -2695,10 +2704,11 @@ pub fn proven_origin_direct_call_event_unreachable(
         source,
         program,
         scoping,
-        call.callee.function_start,
-        call.callee.function_end,
-        event,
-        &bindings,
+        IntegerParameterEvent {
+            function: Span::new(call.callee.function_start, call.callee.function_end),
+            event,
+            parameter_bindings: &bindings,
+        },
     ) || prove_function_switch_event_unreachable_with_integer_parameters(
         program,
         scoping,
@@ -2717,11 +2727,12 @@ pub fn proven_origin_direct_call_event_unreachable(
         source,
         program,
         scoping,
-        call.callee.function_start,
-        call.callee.function_end,
-        event,
-        call.argument_spans.len(),
-        &bindings,
+        CallArgumentEvent {
+            function: Span::new(call.callee.function_start, call.callee.function_end),
+            event,
+            provided_argument_count: call.argument_spans.len(),
+            parameter_bindings: &bindings,
+        },
     )
 }
 
@@ -4792,6 +4803,7 @@ fn direct_call_event_unreachable_if_specialized(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn summarize_receiver_context(
     source: &str,
     program: &Program<'_>,

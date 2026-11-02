@@ -316,7 +316,7 @@ fn expression_state_init(expression: &Expression<'_>, state_var: &str) -> Option
             .expressions
             .iter()
             .filter_map(|expression| expression_state_init(expression, state_var))
-            .last(),
+            .next_back(),
         Expression::AssignmentExpression(assignment) => {
             assignment_expression_state_init(assignment, state_var)
         }
@@ -343,7 +343,7 @@ fn for_state_init_for_var(for_stmt: &ForStatement<'_>, state_var: &str) -> Optio
             .expressions
             .iter()
             .filter_map(|expression| expression_state_init(expression, state_var))
-            .last(),
+            .next_back(),
         _ => None,
     }
 }
@@ -446,8 +446,7 @@ fn unconditional_for_if_ladder_candidates(
         if let Some(machine) = detect_if_ladder_candidate(
             source,
             function_id,
-            for_stmt.span.start,
-            for_stmt.span.end,
+            for_stmt.span,
             &for_stmt.body,
             state_var,
             init_state,
@@ -1258,6 +1257,21 @@ fn execute_scalar_prefix_to_while(
     None
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CallArgumentEvent<'a> {
+    pub function: Span,
+    pub event: Span,
+    pub provided_argument_count: usize,
+    pub parameter_bindings: &'a BTreeMap<usize, i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct IntegerParameterEvent<'a> {
+    pub function: Span,
+    pub event: Span,
+    pub parameter_bindings: &'a BTreeMap<usize, i64>,
+}
+
 /// Prove an event unreachable inside a protected flattened state loop of the
 /// form `while (...) try { if (state == ...) ... } catch (...) { ... }` for a
 /// concrete direct call.
@@ -1272,11 +1286,7 @@ pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
     source: &str,
     program: &Program<'_>,
     scoping: &Scoping,
-    function_start: u32,
-    function_end: u32,
-    event: Span,
-    provided_argument_count: usize,
-    parameter_bindings: &BTreeMap<usize, i64>,
+    facts: CallArgumentEvent<'_>,
 ) -> bool {
     struct Harness<'s, 'b> {
         source: &'s str,
@@ -1537,11 +1547,11 @@ pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
     let mut harness = Harness {
         source,
         scoping,
-        function_start,
-        function_end,
-        event,
-        provided_argument_count,
-        parameter_bindings,
+        function_start: facts.function.start,
+        function_end: facts.function.end,
+        event: facts.event,
+        provided_argument_count: facts.provided_argument_count,
+        parameter_bindings: facts.parameter_bindings,
         result: None,
     };
     harness.visit_program(program);
@@ -1977,21 +1987,9 @@ pub fn prove_function_if_ladder_event_unreachable_with_integer_parameters(
     source: &str,
     program: &Program<'_>,
     scoping: &Scoping,
-    function_start: u32,
-    function_end: u32,
-    event: Span,
-    parameter_bindings: &BTreeMap<usize, i64>,
+    facts: IntegerParameterEvent<'_>,
 ) -> bool {
-    prove_function_if_ladder_goal_with_integer_parameters(
-        source,
-        program,
-        scoping,
-        function_start,
-        function_end,
-        event,
-        parameter_bindings,
-        None,
-    )
+    prove_function_if_ladder_goal_with_integer_parameters(source, program, scoping, facts, None)
 }
 
 /// Prove that exact flattened-machine states dominate `event` for one exact
@@ -2006,21 +2004,15 @@ pub fn prove_function_if_ladder_states_before_event_with_integer_parameters(
     source: &str,
     program: &Program<'_>,
     scoping: &Scoping,
-    function_start: u32,
-    function_end: u32,
     required_states: &[u64],
-    event: Span,
-    parameter_bindings: &BTreeMap<usize, i64>,
+    facts: IntegerParameterEvent<'_>,
 ) -> bool {
     !required_states.is_empty()
         && prove_function_if_ladder_goal_with_integer_parameters(
             source,
             program,
             scoping,
-            function_start,
-            function_end,
-            event,
-            parameter_bindings,
+            facts,
             Some(required_states),
         )
 }
@@ -2029,10 +2021,7 @@ fn prove_function_if_ladder_goal_with_integer_parameters(
     source: &str,
     program: &Program<'_>,
     scoping: &Scoping,
-    function_start: u32,
-    function_end: u32,
-    event: Span,
-    parameter_bindings: &BTreeMap<usize, i64>,
+    facts: IntegerParameterEvent<'_>,
     required_states: Option<&[u64]>,
 ) -> bool {
     struct FunctionHarness<'s, 'b, 'r> {
@@ -2314,10 +2303,10 @@ fn prove_function_if_ladder_goal_with_integer_parameters(
 
     let mut harness = FunctionHarness {
         source,
-        function_start,
-        function_end,
-        event,
-        parameter_bindings,
+        function_start: facts.function.start,
+        function_end: facts.function.end,
+        event: facts.event,
+        parameter_bindings: facts.parameter_bindings,
         required_states,
         scoping,
         result: None,
@@ -3820,8 +3809,7 @@ impl<'a> Visit<'a> for IfLadderEvidenceVisitor<'_> {
 fn detect_if_ladder_candidate(
     source: &str,
     function_id: &str,
-    start: u32,
-    end: u32,
+    span: Span,
     body: &Statement<'_>,
     state_var: String,
     init_state: u64,
@@ -3847,8 +3835,8 @@ fn detect_if_ladder_candidate(
     transitions.dedup();
     Some(IfLadderStateMachineCandidate {
         function_id: function_id.to_string(),
-        start,
-        end,
+        start: span.start,
+        end: span.end,
         state_var,
         init_state,
         exit_state,
@@ -3857,7 +3845,7 @@ fn detect_if_ladder_candidate(
         constant_state_assignments: evidence.constant_state_assignments,
         dynamic_state_assignments: evidence.dynamic_state_assignments,
         transitions,
-        preview: preview(source, start, end, 180),
+        preview: preview(source, span.start, span.end, 180),
     })
 }
 
@@ -3873,8 +3861,7 @@ pub fn detect_while_state_machine(
     detect_if_ladder_candidate(
         source,
         function_id,
-        while_statement.span.start,
-        while_statement.span.end,
+        while_statement.span,
         &while_statement.body,
         state_var,
         init_state,
@@ -3960,8 +3947,7 @@ pub fn detect_for_state_machines(
             if let Some(machine) = detect_if_ladder_candidate(
                 source,
                 function_id,
-                for_stmt.span.start,
-                for_stmt.span.end,
+                for_stmt.span,
                 &for_stmt.body,
                 state_var,
                 init_state,
@@ -4417,7 +4403,6 @@ fn record_ambiguous_effect(
 fn exec_control_expr_impl(
     expr: &Expression<'_>,
     source: &str,
-    state_var: &str,
     env: &mut HashMap<String, Scalar>,
     semantic: &mut Vec<String>,
     ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
@@ -4431,7 +4416,6 @@ fn exec_control_expr_impl(
             return exec_control_expr_impl(
                 &parenthesized.expression,
                 source,
-                state_var,
                 env,
                 semantic,
                 ambiguous_envs,
@@ -4443,7 +4427,6 @@ fn exec_control_expr_impl(
                 let status = exec_control_expr_impl(
                     expression,
                     source,
-                    state_var,
                     env,
                     semantic,
                     ambiguous_envs,
@@ -4486,7 +4469,6 @@ fn exec_control_expr_impl(
                 return exec_control_expr_impl(
                     branch,
                     source,
-                    state_var,
                     env,
                     semantic,
                     ambiguous_envs,
@@ -4506,7 +4488,6 @@ fn exec_control_expr_impl(
                         return exec_control_expr_impl(
                             &logical.right,
                             source,
-                            state_var,
                             env,
                             semantic,
                             ambiguous_envs,
@@ -4517,7 +4498,6 @@ fn exec_control_expr_impl(
                         return exec_control_expr_impl(
                             &logical.right,
                             source,
-                            state_var,
                             env,
                             semantic,
                             ambiguous_envs,
@@ -4661,7 +4641,6 @@ fn exec_statement_impl(
             return exec_control_expr_impl(
                 &expression.expression,
                 source,
-                state_var,
                 env,
                 semantic,
                 ambiguous_envs,
@@ -5181,7 +5160,8 @@ impl LoopRunner<'_, '_> {
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
-        let mut handlers = Vec::with_capacity((opcode_max + 1) as usize);
+        let handler_capacity = usize::try_from(opcode_max + 1).unwrap_or(256);
+        let mut handlers = Vec::with_capacity(handler_capacity);
         for opcode in 0..=opcode_max {
             handlers.push(self.simulate_opcode(opcode, &case_map, &observed_opcodes)?);
         }
@@ -6437,10 +6417,11 @@ mod tests {
                 source,
                 &parsed.program,
                 semantic.semantic.scoping(),
-                function.span.start,
-                function.span.end,
-                event,
-                &[(0usize, 14i64)].into_iter().collect(),
+                IntegerParameterEvent {
+                    function: Span::new(function.span.start, function.span.end),
+                    event: event,
+                    parameter_bindings: &[(0usize, 14i64)].into_iter().collect(),
+                },
             )
         );
     }
@@ -6481,11 +6462,12 @@ mod tests {
                 source,
                 &parsed.program,
                 semantic.semantic.scoping(),
-                function.span.start,
-                function.span.end,
                 &[48],
-                event,
-                &BTreeMap::from([(0, 0), (1, 17)]),
+                IntegerParameterEvent {
+                    function: Span::new(function.span.start, function.span.end),
+                    event: event,
+                    parameter_bindings: &BTreeMap::from([(0, 0), (1, 17)]),
+                },
             )
         );
         assert!(
@@ -6493,11 +6475,12 @@ mod tests {
                 source,
                 &parsed.program,
                 semantic.semantic.scoping(),
-                function.span.start,
-                function.span.end,
                 &[48],
-                event,
-                &BTreeMap::from([(0, 0), (1, 0)]),
+                IntegerParameterEvent {
+                    function: Span::new(function.span.start, function.span.end),
+                    event: event,
+                    parameter_bindings: &BTreeMap::from([(0, 0), (1, 0)]),
+                },
             )
         );
     }
@@ -6535,10 +6518,11 @@ mod tests {
                 source,
                 &parsed.program,
                 semantic.semantic.scoping(),
-                function.start,
-                function.end,
-                event,
-                &BTreeMap::from([(0, 15)]),
+                IntegerParameterEvent {
+                    function: Span::new(function.start, function.end),
+                    event: event,
+                    parameter_bindings: &BTreeMap::from([(0, 15)]),
+                },
             )
         );
         assert!(
@@ -6546,10 +6530,11 @@ mod tests {
                 source,
                 &parsed.program,
                 semantic.semantic.scoping(),
-                function.start,
-                function.end,
-                event,
-                &BTreeMap::from([(0, 14)]),
+                IntegerParameterEvent {
+                    function: Span::new(function.start, function.end),
+                    event: event,
+                    parameter_bindings: &BTreeMap::from([(0, 14)]),
+                },
             )
         );
     }
@@ -6821,10 +6806,11 @@ mod tests {
                 source,
                 &parsed.program,
                 semantic.semantic.scoping(),
-                function.start,
-                function.end,
-                event,
-                &BTreeMap::from([(1, 47)]),
+                IntegerParameterEvent {
+                    function: Span::new(function.start, function.end),
+                    event: event,
+                    parameter_bindings: &BTreeMap::from([(1, 47)]),
+                },
             )
         );
         assert!(
@@ -6832,10 +6818,11 @@ mod tests {
                 source,
                 &parsed.program,
                 semantic.semantic.scoping(),
-                function.start,
-                function.end,
-                event,
-                &BTreeMap::from([(1, 46)]),
+                IntegerParameterEvent {
+                    function: Span::new(function.start, function.end),
+                    event: event,
+                    parameter_bindings: &BTreeMap::from([(1, 46)]),
+                },
             )
         );
     }
@@ -6860,11 +6847,12 @@ mod tests {
             source,
             &parsed.program,
             semantic.semantic.scoping(),
-            function.start,
-            function.end,
-            Span::new(start, start + 8),
-            provided,
-            &BTreeMap::new(),
+            CallArgumentEvent {
+                function: Span::new(function.start, function.end),
+                event: Span::new(start, start + 8),
+                provided_argument_count: provided,
+                parameter_bindings: &BTreeMap::new(),
+            },
         )
     }
 

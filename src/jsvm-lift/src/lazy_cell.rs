@@ -15,7 +15,8 @@ use crate::{
         prove_function_if_ladder_states_before_event_with_integer_parameters,
         prove_function_protected_if_ladder_event_unreachable_with_call_arguments,
         prove_function_structured_branch_event_unreachable_with_integer_parameters,
-        prove_function_switch_event_unreachable_with_integer_parameters,
+        prove_function_switch_event_unreachable_with_integer_parameters, CallArgumentEvent,
+        IntegerParameterEvent,
     },
     symbolic_integer::{normalize_integer_polynomial, IntegerPolynomial},
 };
@@ -911,10 +912,11 @@ pub fn proven_fast_lazy_cell_factory_call(
             source,
             program,
             semantic.scoping(),
-            shape.function_start,
-            shape.function_end,
-            *barrier,
-            &mode_bindings,
+            IntegerParameterEvent {
+                function: Span::new(shape.function_start, shape.function_end),
+                event: *barrier,
+                parameter_bindings: &mode_bindings,
+            },
         ) {
             return None;
         }
@@ -2135,10 +2137,11 @@ fn event_unreachable_with_integer_parameter(
         source,
         program,
         scoping,
-        function_start,
-        function_end,
-        event,
-        &bindings,
+        IntegerParameterEvent {
+            function: Span::new(function_start, function_end),
+            event,
+            parameter_bindings: &bindings,
+        },
     ) || prove_function_switch_event_unreachable_with_integer_parameters(
         program,
         scoping,
@@ -2157,11 +2160,12 @@ fn event_unreachable_with_integer_parameter(
         source,
         program,
         scoping,
-        function_start,
-        function_end,
-        event,
-        provided_argument_count,
-        &bindings,
+        CallArgumentEvent {
+            function: Span::new(function_start, function_end),
+            event,
+            provided_argument_count,
+            parameter_bindings: &bindings,
+        },
     )
 }
 
@@ -4270,11 +4274,12 @@ pub fn proven_slow_lazy_cell_prototype_carrier(
             source,
             program,
             scoping,
-            helper.function.start,
-            helper.function.end,
             &[helper.create_state],
-            helper.return_event,
-            &initializer.exact_integer_arguments,
+            IntegerParameterEvent {
+                function: helper.function,
+                event: helper.return_event,
+                parameter_bindings: &initializer.exact_integer_arguments,
+            },
         )
     {
         return None;

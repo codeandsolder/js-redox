@@ -2762,7 +2762,6 @@ impl<'a> Visit<'a> for RegistryReadCallCollector<'_, '_> {
     }
 }
 
-#[must_use]
 pub fn structurally_proven_registry_read_calls(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -2938,7 +2937,6 @@ impl<'a> Visit<'a> for LazyRegistryReadCallCollector<'_, '_> {
 /// Find call sites of registry accessors whose loaded cell follows one proven
 /// lazy-accessor shape. The returned selector span belongs to the accessor
 /// function body; callers may feed it into symbolic normalization separately.
-#[must_use]
 pub fn structurally_proven_lazy_registry_read_calls(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -3081,7 +3079,6 @@ impl<'a> Visit<'a> for RegistryForwardingValueCallCollector<'_, '_> {
 
 /// Find all calls through structurally proven registry forwarders, preserving
 /// the exact source span of the evaluated value that enters the forwarder.
-#[must_use]
 pub fn structurally_proven_registry_forwarding_value_calls(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -3193,7 +3190,6 @@ impl<'a> Visit<'a> for RegistryForwardingCallCollector<'_, '_> {
     }
 }
 
-#[must_use]
 pub fn structurally_proven_registry_forwarding_calls(
     program: &Program<'_>,
     scoping: &Scoping,
