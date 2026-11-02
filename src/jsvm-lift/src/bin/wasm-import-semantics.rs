@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use jsvm_lift::analysis_budget::{AnalysisBudgets, AnalysisOperation};
 use serde::Serialize;
 use std::{fs, path::PathBuf};
 
@@ -34,6 +35,11 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let source = fs::read_to_string(&args.input)
         .with_context(|| format!("reading {}", args.input.display()))?;
+    let budgets = AnalysisBudgets::standard("wasm-import-semantics");
+    let budget = budgets.operation(
+        AnalysisOperation::WasmAnalysis,
+        args.input.display().to_string(),
+    );
     let analysis = match (
         args.import_module.as_deref(),
         args.import_name.as_deref(),
@@ -45,10 +51,11 @@ fn main() -> Result<()> {
                 import_module,
                 import_name,
                 offset,
-            )
+                &budget,
+            )?
         }
         (None, None, None) => {
-            jsvm_lift::wasm_import_semantics::proven_wasm_import_semantics(&source)
+            jsvm_lift::wasm_import_semantics::proven_wasm_import_semantics(&source, &budget)?
         }
         _ => bail!("--import-module, --import-name and --offset must be supplied together"),
     };

@@ -5,7 +5,9 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
+use work_budget::{run_command, BudgetLimits, CommandRunError, WorkBudget};
 
 #[derive(Debug, Parser)]
 #[command(about = "Recover readable, provenance-friendly views of WebAssembly modules")]
@@ -25,11 +27,13 @@ struct Args {
     skip_deep: bool,
 }
 
-fn write_wax(input: &Path, output: &Path, wax: &Path) -> Result<()> {
-    let result = Command::new(wax).arg(input).output();
+fn write_wax(input: &Path, output: &Path, wax: &Path, budget: &WorkBudget) -> Result<()> {
+    let mut command = Command::new(wax);
+    command.arg(input);
+    let result = run_command(&mut command, budget);
     let result = match result {
         Ok(result) => result,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
+        Err(CommandRunError::Spawn(error)) if error.kind() == ErrorKind::NotFound => {
             eprintln!(
                 "wasm-redox: Wax not found at {}; skipping high-level view",
                 wax.display()
@@ -54,8 +58,12 @@ fn write_wax(input: &Path, output: &Path, wax: &Path) -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
     let bytes = fs::read(&args.input).with_context(|| format!("read {}", args.input.display()))?;
-    let report = wasm_redox::analyze(&bytes)?;
-    let wat = wasm_redox::folded_wat(&bytes)?;
+    let budget = WorkBudget::new(
+        format!("wasm-redox:{}", args.input.display()),
+        BudgetLimits::wall_time(Duration::from_secs(180)),
+    );
+    let report = wasm_redox::analyze(&bytes, &budget)?;
+    let wat = wasm_redox::folded_wat(&bytes, &budget)?;
 
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("create {}", args.output_dir.display()))?;
@@ -67,17 +75,22 @@ fn main() -> Result<()> {
     fs::write(&wat_path, wat).with_context(|| format!("write {}", wat_path.display()))?;
 
     if !args.skip_deep {
-        let deep = wasm_redox::deep_analyze(&bytes, &report);
+        let deep = wasm_redox::deep_analyze(&bytes, &report, &budget)?;
         let deep_path = args.output_dir.join("module.deep.json");
         fs::write(&deep_path, serde_json::to_vec_pretty(&deep)?)
             .with_context(|| format!("write {}", deep_path.display()))?;
     }
 
     if !args.skip_wax {
+        let wax_budget = budget.child(
+            format!("wax:{}", args.input.display()),
+            BudgetLimits::wall_time(Duration::from_secs(180)),
+        );
         write_wax(
             &args.input,
             &args.output_dir.join("module.readable.wax"),
             &args.wax,
+            &wax_budget,
         )?;
     }
 

@@ -16,6 +16,8 @@ use std::collections::BTreeSet;
 
 const STANDARD_BROWSER_API_ASSUMPTION: &str = "standard_browser_api_binding_semantics";
 
+use work_budget::WorkBudget;
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct ApiCallsite {
     pub kind: String,
@@ -739,12 +741,15 @@ fn contains_with_statement(program: &Program<'_>) -> bool {
     detector.found
 }
 
-pub fn analyze_api_surface(source: &str) -> Result<Vec<ApiCallsite>> {
+pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<Vec<ApiCallsite>> {
+    budget.checkpoint()?;
     for source_type in [SourceType::unambiguous(), SourceType::cjs()] {
         let allocator = Allocator::default();
         let Some(program) = parse_clean(&allocator, source, source_type) else {
+            budget.checkpoint()?;
             continue;
         };
+        budget.checkpoint()?;
         if contains_with_statement(&program) {
             return Err(anyhow!(
                 "with statement makes browser API identifier resolution environment-dependent"
@@ -758,16 +763,20 @@ pub fn analyze_api_surface(source: &str) -> Result<Vec<ApiCallsite>> {
             continue;
         }
         let scoping = semantic.semantic.scoping();
+        budget.checkpoint()?;
         let constants = ProvenConstantEnvironment::collect(&program, scoping);
+        budget.checkpoint()?;
 
         let mut safe_member_refs = SafeMemberReferenceCollector::default();
         safe_member_refs.visit_program(&program);
+        budget.checkpoint()?;
 
         let mut mutations = SinkMutationCollector {
             scoping,
             mutated: BTreeSet::new(),
         };
         mutations.visit_program(&program);
+        budget.checkpoint()?;
 
         let mut xhr = XhrBindingCollector {
             scoping,
@@ -776,6 +785,7 @@ pub fn analyze_api_surface(source: &str) -> Result<Vec<ApiCallsite>> {
             symbols: BTreeSet::new(),
         };
         xhr.visit_program(&program);
+        budget.checkpoint()?;
 
         let mut collector = Collector {
             source,
@@ -787,6 +797,7 @@ pub fn analyze_api_surface(source: &str) -> Result<Vec<ApiCallsite>> {
             callsites: BTreeSet::new(),
         };
         collector.visit_program(&program);
+        budget.checkpoint()?;
         let mut callsites = collector.callsites.into_iter().collect::<Vec<_>>();
         callsites.sort_by(|left, right| {
             (left.start, left.end, left.kind.as_str()).cmp(&(
@@ -805,8 +816,14 @@ pub fn analyze_api_surface(source: &str) -> Result<Vec<ApiCallsite>> {
 
 #[cfg(test)]
 mod tests {
-    use super::analyze_api_surface;
+    use super::analyze_api_surface as analyze_api_surface_budgeted;
+    use super::ApiCallsite;
     use anyhow::Result;
+    use work_budget::WorkBudget;
+
+    fn analyze_api_surface(source: &str) -> Result<Vec<ApiCallsite>> {
+        analyze_api_surface_budgeted(source, &WorkBudget::unlimited("api-surface-test"))
+    }
 
     #[test]
     fn records_exact_browser_api_calls_and_preserves_unresolved_arguments() -> Result<()> {

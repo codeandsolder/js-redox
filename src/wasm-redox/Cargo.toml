@@ -16,6 +16,7 @@ sha2.workspace = true
 wasmparser.workspace = true
 wasmprinter.workspace = true
 waffle.workspace = true
+work-budget.workspace = true
 
 [dev-dependencies]
 wat = "1.261.0"

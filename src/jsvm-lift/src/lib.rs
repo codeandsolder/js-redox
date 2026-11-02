@@ -1,5 +1,29 @@
-pub mod har_project;
+pub mod analysis_artifacts;
+pub mod analysis_budget;
+pub mod ast_utils;
+pub mod browser_script_types;
+pub mod bytecode;
+pub mod capture_import;
+pub mod capture_pipeline;
+pub mod capture_project;
+pub mod content_dedup;
+pub mod corpus_eval;
+pub mod decoder;
+pub mod dispatch;
+pub mod embedded;
+pub mod function_analysis;
+pub mod scan_report;
+pub mod scanner;
+pub mod source_text;
+pub mod state_flatten;
+pub mod string_recovery;
+pub mod table_vm;
 
+mod har_project;
+pub mod js_format;
+pub mod js_refs;
+
+pub mod bundle_materialize;
 pub mod bundle_unpack;
 
 pub mod browser_decode;
@@ -7,6 +31,20 @@ pub mod browser_decode;
 pub mod effect_shape;
 
 pub mod numeric;
+pub mod parse_int;
+pub mod project_api_surface;
+pub mod project_deob;
+pub mod project_js_refs;
+pub mod project_readme;
+pub mod project_scan;
+pub mod project_sourcemaps;
+pub mod safe_deob;
+pub mod source_graph;
+pub mod source_materialize;
+pub mod tool_environment;
+pub mod vm_materialize;
+pub mod wasm_materialize;
+pub mod wasm_resource_provenance;
 
 pub mod pipeline;
 
@@ -40,6 +78,7 @@ pub mod forwarding_semantics;
 pub(crate) mod global_builtin;
 
 pub mod wasm_import_semantics;
+pub mod wasm_js_boundary;
 
 pub mod source_directive;
 
@@ -50,3 +89,5 @@ pub mod api_surface;
 pub mod static_bytes;
 pub mod structural_signals;
 pub mod sus_scan;
+pub mod switch_ir;
+pub mod table_ir;

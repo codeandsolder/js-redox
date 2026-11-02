@@ -13,6 +13,7 @@ use oxc_semantic::Scoping;
 use oxc_span::GetSpan;
 use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use std::collections::{HashMap, HashSet};
+use work_budget::{BudgetExceeded, WorkBudget};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum StaticWasmValue {
@@ -677,7 +678,8 @@ pub(super) fn collect_exact_module_sites(
     program: &Program<'_>,
     scoping: &Scoping,
     global_aliases: &HashMap<SymbolId, String>,
-) -> HashMap<(u32, u32), ExactModuleSite> {
+    budget: &WorkBudget,
+) -> Result<HashMap<(u32, u32), ExactModuleSite>, BudgetExceeded> {
     let helpers = collect_helpers(source, program, scoping, global_aliases);
     let values = collect_static_values(program, scoping, &helpers, global_aliases);
     let evaluator = Evaluator {
@@ -706,7 +708,7 @@ pub(super) fn collect_exact_module_sites(
     };
     collector.visit_program(program);
 
-    let assembled = recover_webassembly_byte_artifacts_from_program(program, scoping);
+    let assembled = recover_webassembly_byte_artifacts_from_program(program, scoping, budget)?;
     for artifact in assembled.artifacts {
         if artifact.sink_kind != "WebAssembly.instantiate" {
             continue;
@@ -720,7 +722,7 @@ pub(super) fn collect_exact_module_sites(
                 standard_decode_builtins_required: artifact.standard_builtins_required,
             });
     }
-    collector.sites
+    Ok(collector.sites)
 }
 
 #[cfg(test)]
@@ -732,7 +734,7 @@ mod tests {
     use rolldown_redox::ecmascript::parse_program;
 
     #[test]
-    fn generic_static_byte_assembly_augments_exact_module_sites() {
+    fn generic_static_byte_assembly_augments_exact_module_sites() -> Result<(), BudgetExceeded> {
         let source = r#"
             function load(imports) {
                 var bytes = new Uint8Array(8), decode = atob;
@@ -756,13 +758,15 @@ mod tests {
             &parsed.program,
             semantic.semantic.scoping(),
             &HashMap::new(),
-        );
+            &WorkBudget::unlimited("module-identity-test"),
+        )?;
         assert_eq!(sites.len(), 1);
         let Some(site) = sites.values().next() else {
-            return;
+            return Ok(());
         };
         assert_eq!(site.sha256, crate::sha256_hex(b"\0asm\x01\0\0\0"));
         assert_eq!(site.identity_kind, "assembled_exact_bytes");
         assert!(site.standard_decode_builtins_required);
+        Ok(())
     }
 }

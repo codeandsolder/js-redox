@@ -33,7 +33,7 @@ fn mime_base(mime: &str) -> &str {
     mime.split(';').next().unwrap_or(mime).trim()
 }
 
-pub(super) fn resource_kind(url: &str, mime: &str) -> &'static str {
+pub(crate) fn resource_kind(url: &str, mime: &str) -> &'static str {
     let m = mime_base(mime).to_ascii_lowercase();
     let path = Url::parse(url)
         .ok()
@@ -324,4 +324,81 @@ pub(super) fn write_resource(
         seen.insert(path.clone(), digest);
     }
     Ok((path, reused))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn javascript_transport_is_reclassified_from_captured_content() {
+        assert_eq!(
+            refine_resource_kind(
+                "javascript",
+                Some("xhr"),
+                "application/javascript",
+                br#"for (;;);{"payload":{"value":42}}"#,
+            ),
+            "json"
+        );
+        assert_eq!(
+            refine_resource_kind(
+                "javascript",
+                Some("script"),
+                "application/javascript",
+                b"<!doctype html><html><body>error</body></html>",
+            ),
+            "html"
+        );
+        assert_eq!(
+            refine_resource_kind(
+                "javascript",
+                Some("script"),
+                "application/javascript",
+                br#"<script src="https://cdn.invalid/not-code.js"></script>"#,
+            ),
+            "html"
+        );
+        assert_eq!(
+            refine_resource_kind(
+                "javascript",
+                Some("script"),
+                "application/javascript",
+                b"upstream connect error before headers: Connection refused",
+            ),
+            "text"
+        );
+        assert_eq!(
+            refine_resource_kind(
+                "javascript",
+                Some("script"),
+                "application/javascript",
+                b"export const answer = 42;\n",
+            ),
+            "javascript"
+        );
+    }
+
+    #[test]
+    fn recorder_sidecar_body_is_authoritative_over_har_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::create_dir_all(temp.path().join("bodies"))?;
+        let body = b"// Copyright \xa9 2012\nwindow.legacy = ok;\n";
+        fs::write(temp.path().join("bodies/legacy-sidecar"), body)?;
+        let content = HarContent {
+            size: 22,
+            mime_type: "application/javascript; charset=iso-8859-1".into(),
+            text: Some("THIS HAR TEXT MUST NOT WIN".into()),
+            encoding: None,
+        };
+        let reference = JsRedoxBodyRef {
+            path: "bodies/legacy-sidecar".into(),
+            sha256: sha256_hex(body),
+            size: body.len(),
+        };
+        let decoded = decode_body(&content, Some(&reference), temp.path())?
+            .context("sidecar body unexpectedly absent")?;
+        assert_eq!(decoded, body);
+        Ok(())
+    }
 }

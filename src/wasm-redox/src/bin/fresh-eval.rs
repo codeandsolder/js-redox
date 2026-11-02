@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Duration};
 use wasm_redox::fresh_eval::{FreshI32Arg, FreshI32CallRequest, FreshTableGrowRequest};
+use work_budget::{BudgetLimits, WorkBudget};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -76,13 +77,18 @@ fn parse_table_grow(value: &str) -> std::result::Result<FreshTableGrowRequest, S
 fn main() -> Result<()> {
     let args = Args::parse();
     let bytes = fs::read(&args.input).with_context(|| format!("read {}", args.input.display()))?;
+    let budget = WorkBudget::new(
+        format!("fresh-eval:{}", args.input.display()),
+        BudgetLimits::wall_time(Duration::from_secs(180)),
+    );
     if args.then_calls.is_empty() && args.initial_table_grows.is_empty() {
         let report = wasm_redox::fresh_eval::evaluate_fresh_i32_call(
             &bytes,
             args.function_index,
             &args.i32_args,
             Some(args.fuel),
-        );
+            &budget,
+        )?;
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         let mut calls = Vec::with_capacity(args.then_calls.len() + 1);
@@ -100,7 +106,8 @@ fn main() -> Result<()> {
             &args.initial_table_grows,
             &calls,
             Some(args.fuel),
-        );
+            &budget,
+        )?;
         println!("{}", serde_json::to_string_pretty(&report)?);
     }
     Ok(())

@@ -82,7 +82,7 @@ If the top page/context/browser target closes itself after acquisition has begun
 ## Feed into js-redox
 
 ```bash
-uv run python scripts/capture-to-project.py \
+.cargo-target-nodebug/debug/capture-project \
   work/captures/example/capture.har \
   work/example-project
 ```
