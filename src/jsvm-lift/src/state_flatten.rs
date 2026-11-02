@@ -4147,14 +4147,6 @@ fn eval_expr(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Option<Sca
     eval_expr_impl(expr, env, None).unwrap_or(None)
 }
 
-fn eval_expr_budgeted(
-    expr: &Expression<'_>,
-    env: &HashMap<String, Scalar>,
-    budget: &WorkBudget,
-) -> Result<Option<Scalar>, BudgetExceeded> {
-    eval_expr_impl(expr, env, Some(budget))
-}
-
 /// Evaluate a scalar result on every normal completion for branch reachability.
 ///
 /// This is intentionally weaker than `eval_expr`: side-effectful or opaque
@@ -4401,18 +4393,6 @@ fn expression_definitely_throws_impl(
         }
         _ => Ok(false),
     }
-}
-
-fn expression_definitely_throws(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> bool {
-    expression_definitely_throws_impl(expr, env, None).unwrap_or(false)
-}
-
-fn expression_definitely_throws_budgeted(
-    expr: &Expression<'_>,
-    env: &HashMap<String, Scalar>,
-    budget: &WorkBudget,
-) -> Result<bool, BudgetExceeded> {
-    expression_definitely_throws_impl(expr, env, Some(budget))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
