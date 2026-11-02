@@ -1,4 +1,5 @@
 mod base91;
+mod base91_recovery;
 mod browser_legacy;
 mod control_flow;
 mod decoder;
@@ -55,6 +56,11 @@ pub use value_eval::{
     eval as eval_static_primitive, eval_with_resolver as eval_static_primitive_with_resolver,
     known_bool_with_resolver as known_static_bool_with_resolver, string_literal_value,
     template_element_value, Value as StaticPrimitiveValue,
+};
+
+pub use base91_recovery::{
+    recover_base91_strings_with_source_mode, Base91DecoderProof, Base91Iteration,
+    Base91RecoveryResult,
 };
 
 #[must_use]

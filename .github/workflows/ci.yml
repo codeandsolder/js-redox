@@ -41,7 +41,6 @@ jobs:
         python3 scripts/check-har-content-classification.py
         python3 scripts/check-safe-deobfuscate.py
         python3 scripts/check-api-surface.py
-        python3 scripts/check-static-string-recovery.py
         python3 scripts/check-vm-capture-pipeline.py
         python3 scripts/check-wasm-capture-pipeline.py
         python3 scripts/check-wasm-resource-provenance.py

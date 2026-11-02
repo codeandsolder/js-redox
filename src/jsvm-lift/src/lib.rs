@@ -14,6 +14,7 @@ pub mod scan_report;
 pub mod scanner;
 pub mod source_text;
 pub mod state_flatten;
+pub mod string_recovery;
 pub mod table_vm;
 
 mod har_project;

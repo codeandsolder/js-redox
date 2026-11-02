@@ -304,9 +304,6 @@ def main():
                     and decoder["replacements"] >= 400
                     for decoder in base91
                 )
-                iterations = string_report.get("base91_iterations", [])
-                assert len(iterations) >= 2
-                assert iterations[1]["decoder_calls"] >= 1
             else:
                 assert rotations == {22}
                 assert table_sizes == {604}

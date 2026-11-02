@@ -3,7 +3,6 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use jsvm_lift::{
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions},
     safe_deob::{deobfuscate_source, SourceMode},
-    tool_environment::{repository_root, sibling_tool},
 };
 use std::{fs, path::PathBuf};
 
@@ -45,10 +44,6 @@ struct SourceArgs {
 #[derive(ClapArgs, Debug)]
 struct ProjectArgs {
     project: PathBuf,
-    #[arg(long)]
-    string_recoverer: Option<PathBuf>,
-    #[arg(long)]
-    decoder_recoverer: Option<PathBuf>,
     #[arg(long)]
     jobs: Option<usize>,
     #[arg(long, default_value_t = 16)]
@@ -112,24 +107,13 @@ fn run_source(args: SourceArgs) -> Result<()> {
 }
 
 fn run_project(args: ProjectArgs) -> Result<()> {
-    let repo_root = repository_root()?;
     let project = args
         .project
         .canonicalize()
         .with_context(|| format!("project does not exist: {}", args.project.display()))?;
-    let string_recoverer = args
-        .string_recoverer
-        .unwrap_or_else(|| repo_root.join("scripts/recover-js-obfuscator-strings.py"));
-    let decoder_recoverer = match args.decoder_recoverer {
-        Some(path) => path,
-        None => sibling_tool("static-string-recover")?,
-    };
     let summary = materialize_project_deobfuscation(
         &project,
         &ProjectDeobOptions {
-            repo_root,
-            string_recoverer,
-            decoder_recoverer,
             jobs: args.jobs,
             max_iterations: args.max_iterations,
         },

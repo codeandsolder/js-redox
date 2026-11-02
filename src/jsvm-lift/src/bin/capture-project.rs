@@ -367,7 +367,6 @@ fn main() -> Result<()> {
             &output,
             &ProjectScanOptions::with_defaults(
                 repo.clone(),
-                repo.join("scripts/recover-js-obfuscator-strings.py"),
                 tool(&tool_root, "switch-ir"),
                 tool(&tool_root, "table-ir"),
             ),

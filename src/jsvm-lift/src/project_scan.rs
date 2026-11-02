@@ -8,6 +8,7 @@ use crate::{
     js_format::format_source,
     safe_deob::{deobfuscate_source, SourceMode},
     scan_report::{scan_file, ScanReport},
+    string_recovery::recover_static_strings,
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
@@ -23,7 +24,6 @@ use tempfile::Builder as TempDirBuilder;
 #[derive(Debug, Clone)]
 pub struct ProjectScanOptions {
     pub repo_root: PathBuf,
-    pub string_recoverer: PathBuf,
     pub switch_ir: PathBuf,
     pub table_ir: PathBuf,
     pub max_generated_depth: usize,
@@ -32,15 +32,9 @@ pub struct ProjectScanOptions {
 
 impl ProjectScanOptions {
     #[must_use]
-    pub fn with_defaults(
-        repo_root: PathBuf,
-        string_recoverer: PathBuf,
-        switch_ir: PathBuf,
-        table_ir: PathBuf,
-    ) -> Self {
+    pub fn with_defaults(repo_root: PathBuf, switch_ir: PathBuf, table_ir: PathBuf) -> Self {
         Self {
             repo_root,
-            string_recoverer,
             switch_ir,
             table_ir,
             max_generated_depth: 8,
@@ -165,7 +159,6 @@ fn recover_generated_unit(
     raw_rel: &str,
     scan_id: usize,
     ordinal: usize,
-    options: &ProjectScanOptions,
 ) -> Result<Value> {
     let recovery_rel =
         PathBuf::from("analysis/generated-recovery").join(format!("{scan_id:04}-{ordinal:03}"));
@@ -196,67 +189,53 @@ fn recover_generated_unit(
         "deobfuscation_report": relative_string(project, &deob_report)?,
     });
 
-    let string_work = TempDirBuilder::new()
-        .prefix(".string-recovery-")
-        .tempdir_in(&recovery_dir)
-        .with_context(|| format!("creating helper scratch in {}", recovery_dir.display()))?;
-    let mut string_command = Command::new("uv");
-    string_command
-        .arg("run")
-        .arg("--no-project")
-        .arg("python")
-        .arg(&options.string_recoverer)
-        .arg(raw)
-        .arg(&string_tmp)
-        .arg("--report")
-        .arg(&string_report)
-        .current_dir(&options.repo_root);
-    let string_output = run_command_with_timeout(
-        &mut string_command,
-        string_work.path(),
-        Duration::from_secs(180),
-    )?;
-
-    let mut selected = raw.to_path_buf();
-    let mut string_ok = false;
-    let mut string_changed = false;
-    if string_output.code == 0 && string_tmp.is_file() && string_report.is_file() {
-        let metadata = fs::read_to_string(&string_report)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-        if let Some(metadata) = metadata {
-            let output_sha = sha256_path(&string_tmp)?;
-            string_ok = metadata.get("safe_static_only").and_then(Value::as_bool) == Some(true)
-                && metadata.get("input_sha256").and_then(Value::as_str) == Some(raw_sha.as_str())
-                && metadata.get("output_sha256").and_then(Value::as_str)
-                    == Some(output_sha.as_str());
-            if string_ok {
-                selected = string_tmp.clone();
-                string_changed = metadata
-                    .get("changed")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                row["string_recovery"] = json!({
-                    "exit": 0,
-                    "changed": string_changed,
-                    "replacements": value_usize(&metadata, "replacements"),
-                    "output_sha256": output_sha,
-                });
-            }
-        }
+    let raw_source =
+        fs::read_to_string(raw).with_context(|| format!("reading {}", raw.display()))?;
+    if crate::sha256_hex(raw_source.as_bytes()) != raw_sha {
+        bail!(
+            "generated string recovery input hash mismatch for {}",
+            raw.display()
+        );
     }
+    let string_outcome =
+        recover_static_strings(&raw_source, raw.display().to_string(), SourceMode::Auto, 8);
+    fs::write(&string_tmp, string_outcome.source.as_bytes())
+        .with_context(|| format!("writing {}", string_tmp.display()))?;
+    write_json(&string_report, &string_outcome.report)?;
+    let output_sha = crate::sha256_hex(string_outcome.source.as_bytes());
+    let string_ok = string_outcome
+        .report
+        .get("safe_static_only")
+        .and_then(Value::as_bool)
+        == Some(true)
+        && string_outcome
+            .report
+            .get("input_sha256")
+            .and_then(Value::as_str)
+            == Some(raw_sha.as_str())
+        && string_outcome
+            .report
+            .get("output_sha256")
+            .and_then(Value::as_str)
+            == Some(output_sha.as_str());
     if !string_ok {
-        row["string_recovery"] = json!({
-            "exit": if string_output.code == 0 { 1 } else { string_output.code },
-            "changed": false,
-            "replacements": 0,
-            "error": if string_output.code == 0 {
-                "string-recovery provenance/hash validation failed".to_owned()
-            } else {
-                command_error(&string_output)
-            },
-        });
+        bail!(
+            "generated string-recovery provenance/hash validation failed for {}",
+            raw.display()
+        );
     }
+    let string_changed = string_outcome
+        .report
+        .get("changed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    row["string_recovery"] = json!({
+        "exit": 0,
+        "changed": string_changed,
+        "replacements": value_usize(&string_outcome.report, "replacements"),
+        "output_sha256": output_sha,
+    });
+    let selected = string_tmp.clone();
 
     let selected_source =
         fs::read_to_string(&selected).with_context(|| format!("reading {}", selected.display()))?;
@@ -670,7 +649,7 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
                 Some(cached) => reuse_generated_unit(project, &raw_rel, scan_id, ordinal, cached)?,
                 None => {
                     let mut recovery =
-                        recover_generated_unit(project, &raw, &raw_rel, scan_id, ordinal, options)?;
+                        recover_generated_unit(project, &raw, &raw_rel, scan_id, ordinal)?;
                     recovery["deduplicated"] = false.into();
                     generated_recovery_cache.insert(raw_sha, recovery.clone());
                     recovery

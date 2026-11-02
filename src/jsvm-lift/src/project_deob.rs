@@ -2,11 +2,11 @@ use crate::{
     analysis_artifacts::{
         load_artifact, write_artifact, DEOBFUSCATION, SOURCE_INDEX, STRING_RECOVERY,
     },
-    bounded_process::{command_error, run_command_with_timeout},
     content_dedup::{default_jobs, link_or_copy},
     js_format::format_source,
     safe_deob::{deobfuscate_source, SafeDeobReport, SourceMode},
     sha256_hex,
+    string_recovery::recover_static_strings,
 };
 use anyhow::{bail, Context, Result};
 use rayon::{prelude::*, ThreadPoolBuilder};
@@ -15,16 +15,11 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
 };
 use tempfile::Builder as TempDirBuilder;
 
 #[derive(Debug, Clone)]
 pub struct ProjectDeobOptions {
-    pub repo_root: PathBuf,
-    pub string_recoverer: PathBuf,
-    pub decoder_recoverer: PathBuf,
     pub jobs: Option<usize>,
     pub max_iterations: usize,
 }
@@ -112,7 +107,6 @@ fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
 }
 
 fn run_string_recovery(
-    options: &ProjectDeobOptions,
     work: &Path,
     key: &ContentKey,
     group: &[Occurrence],
@@ -123,82 +117,50 @@ fn run_string_recovery(
     fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
     let recovered = cache.join(format!("recovered{}", mode.suffix()));
     let report = cache.join("report.json");
-
-    let mut command = Command::new("uv");
-    command
-        .arg("run")
-        .arg("--no-project")
-        .arg("python")
-        .arg(&options.string_recoverer)
-        .arg(&canonical.source)
-        .arg(&recovered)
-        .arg("--report")
-        .arg(&report)
-        .arg("--decoder-recoverer")
-        .arg(&options.decoder_recoverer)
-        .current_dir(&options.repo_root);
-    let output = run_command_with_timeout(&mut command, &cache, Duration::from_secs(180))?;
-
-    let mut result = StringResult {
-        mode: *mode,
-        canonical_ordinal: canonical.ordinal,
-        canonical_raw_path: canonical.raw_path.clone(),
-        report_path: None,
-        exit: output.code,
-        changed: false,
-        replacements: 0,
-        decoders: json!([]),
-        selected_path: canonical.source.clone(),
-        selected_sha: raw_sha.clone(),
-        error: None,
-    };
-
-    if output.code != 0 || !report.is_file() || !recovered.is_file() {
-        result.error = Some(command_error(&output));
-        return Ok(result);
-    }
-
-    let report_text =
-        fs::read_to_string(&report).with_context(|| format!("reading {}", report.display()))?;
-    let meta: Value = serde_json::from_str(&report_text)
-        .with_context(|| format!("parsing {}", report.display()))?;
-    let recovered_bytes =
-        fs::read(&recovered).with_context(|| format!("reading {}", recovered.display()))?;
-    let recovered_sha = sha256_hex(&recovered_bytes);
-    if meta.get("safe_static_only").and_then(Value::as_bool) != Some(true) {
-        bail!(
-            "unsafe string recovery report for {}",
-            canonical.source.display()
-        );
-    }
-    if meta.get("input_sha256").and_then(Value::as_str) != Some(raw_sha.as_str()) {
+    let original = fs::read_to_string(&canonical.source)
+        .with_context(|| format!("reading {}", canonical.source.display()))?;
+    if sha256_hex(original.as_bytes()) != *raw_sha {
         bail!(
             "string recovery input hash mismatch for {}",
             canonical.source.display()
         );
     }
-    if meta.get("output_sha256").and_then(Value::as_str) != Some(recovered_sha.as_str()) {
+    let outcome =
+        recover_static_strings(&original, canonical.source.display().to_string(), *mode, 8);
+    fs::write(&recovered, outcome.source.as_bytes())
+        .with_context(|| format!("writing {}", recovered.display()))?;
+    write_json(&report, &outcome.report)?;
+    let recovered_sha = sha256_hex(outcome.source.as_bytes());
+    let meta = outcome.report;
+    if meta.get("safe_static_only").and_then(Value::as_bool) != Some(true)
+        || meta.get("input_sha256").and_then(Value::as_str) != Some(raw_sha.as_str())
+        || meta.get("output_sha256").and_then(Value::as_str) != Some(recovered_sha.as_str())
+    {
         bail!(
-            "string recovery output hash mismatch for {}",
+            "string recovery provenance/hash validation failed for {}",
             canonical.source.display()
         );
     }
-
-    result.exit = 0;
-    result.changed = meta
-        .get("changed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    result.replacements = meta
-        .get("replacements")
-        .and_then(Value::as_u64)
-        .and_then(|count| usize::try_from(count).ok())
-        .unwrap_or(0);
-    result.decoders = meta.get("decoders").cloned().unwrap_or_else(|| json!([]));
-    result.selected_path = recovered;
-    result.selected_sha = recovered_sha;
-    result.report_path = Some(report);
-    Ok(result)
+    Ok(StringResult {
+        mode: *mode,
+        canonical_ordinal: canonical.ordinal,
+        canonical_raw_path: canonical.raw_path.clone(),
+        report_path: Some(report),
+        exit: 0,
+        changed: meta
+            .get("changed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        replacements: meta
+            .get("replacements")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .unwrap_or(0),
+        decoders: meta.get("decoders").cloned().unwrap_or_else(|| json!([])),
+        selected_path: recovered,
+        selected_sha: recovered_sha,
+        error: None,
+    })
 }
 
 fn run_safe_deob(
@@ -356,7 +318,7 @@ pub fn materialize_project_deobfuscation(
             raw_group_refs
                 .par_iter()
                 .map(|(key, group)| {
-                    run_string_recovery(options, work_path, key, group)
+                    run_string_recovery(work_path, key, group)
                         .map(|result| ((*key).clone(), result))
                 })
                 .collect::<Vec<_>>()
@@ -583,7 +545,7 @@ pub fn materialize_project_deobfuscation(
         "schema": STRING_RECOVERY.schema,
         "safe_static_only": true,
         "mode_sensitive_deduplication": true,
-        "recoverer": options.string_recoverer.to_string_lossy(),
+        "recoverer": "jsvm_lift::string_recovery",
         "units": string_units,
         "summary": {
             "javascript_units": occurrences.len(),
@@ -666,34 +628,6 @@ mod tests {
     use crate::analysis_artifacts::{
         load_artifact, write_artifact, DEOBFUSCATION, SOURCE_INDEX, STRING_RECOVERY,
     };
-    use std::time::Duration;
-
-    #[test]
-    fn optional_helper_timeout_is_bounded_and_kills_descendants() -> Result<()> {
-        let work = tempfile::tempdir()?;
-        let pid_file = work.path().join("grandchild.pid");
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg("sleep 30 & echo $! > \"$1\"; wait")
-            .arg("sh")
-            .arg(&pid_file);
-        let result =
-            run_command_with_timeout(&mut command, work.path(), Duration::from_millis(200))?;
-        assert_eq!(result.code, 124);
-        assert!(String::from_utf8_lossy(&result.stderr).contains("timed out"));
-        #[cfg(unix)]
-        {
-            let grandchild = fs::read_to_string(&pid_file)
-                .with_context(|| format!("reading {}", pid_file.display()))?;
-            let status = Command::new("kill")
-                .arg("-0")
-                .arg(grandchild.trim())
-                .status()?;
-            assert!(!status.success(), "timed-out helper grandchild survived");
-        }
-        Ok(())
-    }
 
     #[test]
     fn project_mode_keeps_identical_module_and_commonjs_inputs_semantically_distinct() -> Result<()>
@@ -720,35 +654,9 @@ mod tests {
             }),
         )?;
 
-        let recoverer = temp.path().join("recover.py");
-        fs::write(
-            &recoverer,
-            r#"import hashlib, json, sys
-from pathlib import Path
-src, dst = Path(sys.argv[1]), Path(sys.argv[2])
-report = Path(sys.argv[sys.argv.index("--report") + 1])
-source = src.read_bytes()
-recovered = source + b"// recovered\n"
-dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_bytes(recovered)
-report.parent.mkdir(parents=True, exist_ok=True)
-report.write_text(json.dumps({
-    "safe_static_only": True,
-    "input_sha256": hashlib.sha256(source).hexdigest(),
-    "output_sha256": hashlib.sha256(recovered).hexdigest(),
-    "changed": True,
-    "replacements": 1,
-    "decoders": [],
-}) + "\n")
-"#,
-        )?;
-
         let summary = materialize_project_deobfuscation(
             &project,
             &ProjectDeobOptions {
-                repo_root: std::env::current_dir()?,
-                string_recoverer: recoverer,
-                decoder_recoverer: temp.path().join("unused-decoder"),
                 jobs: Some(2),
                 max_iterations: 16,
             },
@@ -779,8 +687,8 @@ report.write_text(json.dumps({
         assert_ne!(module["exit"], 0);
         assert_eq!(commonjs["exit"], 0);
         assert_eq!(commonjs["safe_static_only"], true);
-        assert_ne!(module["pre_deob_sha256"], module["input_sha256"]);
-        assert_ne!(commonjs["pre_deob_sha256"], commonjs["input_sha256"]);
+        assert_eq!(module["pre_deob_sha256"], module["input_sha256"]);
+        assert_eq!(commonjs["pre_deob_sha256"], commonjs["input_sha256"]);
 
         let strings =
             load_artifact(&project, STRING_RECOVERY, false)?.context("missing string artifact")?;
@@ -795,10 +703,10 @@ report.write_text(json.dumps({
         );
         assert!(rows.iter().all(|row| row["exit"] == 0));
         assert!(rows.iter().all(|row| row.get("fallback").is_none()));
-        assert!(rows.iter().all(|row| row["changed"] == true));
+        assert!(rows.iter().all(|row| row["changed"] == false));
         assert!(rows
             .iter()
-            .all(|row| row["input_sha256"] != row["output_sha256"]));
+            .all(|row| row["input_sha256"] == row["output_sha256"]));
         assert_eq!(strings["summary"]["unique_input_bodies"], 2);
         assert_eq!(strings["summary"]["failed_units"], 0);
         Ok(())
