@@ -162,6 +162,10 @@ pub fn recover_static_strings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan_report::{scan_source, EmbeddedScanReport};
+    use anyhow::{Context, Result};
+    use std::{collections::BTreeSet, fs};
+    use tempfile::TempDir;
 
     #[test]
     fn ordinary_crlf_source_is_byte_identical_when_nothing_is_proven() {
@@ -191,5 +195,156 @@ mod tests {
             outcome.report["base91_iterations"][0]["preflight_skipped"],
             true
         );
+    }
+    fn dumped_generated_sources<'a>(rows: &'a [EmbeddedScanReport], output: &mut Vec<&'a str>) {
+        for row in rows {
+            if let Some(path) = row.dump_path.as_deref() {
+                output.push(path);
+            }
+            dumped_generated_sources(&row.embedded, output);
+        }
+    }
+
+    fn assert_generated_base91_fixture(
+        source: &str,
+        label: &str,
+        expected_rotation: u64,
+        expected_table_entries: u64,
+        expected_decoder: Option<&str>,
+    ) -> Result<()> {
+        let scratch = TempDir::new()?;
+        let scan = scan_source(source, label, Some(scratch.path()));
+        let mut dumps = Vec::new();
+        dumped_generated_sources(&scan.embedded, &mut dumps);
+        assert!(!dumps.is_empty(), "{label}: no generated source");
+
+        let mut matching_report = None;
+        for path in dumps {
+            let generated = fs::read_to_string(path)
+                .with_context(|| format!("reading generated fixture {path}"))?;
+            let outcome = recover_static_strings(&generated, path, SourceMode::Auto, 8);
+            let shapes = outcome.report["decoders"]
+                .as_array()
+                .context("decoder rows must be an array")?
+                .iter()
+                .filter(|decoder| decoder["mode"] == "rotated_base91")
+                .filter_map(|decoder| {
+                    Some((
+                        decoder["rotation"].as_u64()?,
+                        decoder["table_entries"].as_u64()?,
+                    ))
+                })
+                .collect::<BTreeSet<_>>();
+            if shapes.contains(&(expected_rotation, expected_table_entries)) {
+                matching_report = Some(outcome.report);
+                break;
+            }
+        }
+
+        let report = matching_report.with_context(|| {
+            format!(
+                "{label}: no generated child with Base91 family ({expected_rotation}, {expected_table_entries})"
+            )
+        })?;
+        assert_eq!(report["changed"], true, "{label}");
+        assert!(
+            report["replacements"].as_u64().unwrap_or_default() >= 100,
+            "{label}"
+        );
+        assert!(
+            report["decoder_call_replacements"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 90,
+            "{label}"
+        );
+        let base91 = report["decoders"]
+            .as_array()
+            .context("decoder rows must be an array")?
+            .iter()
+            .filter(|decoder| decoder["mode"] == "rotated_base91")
+            .collect::<Vec<_>>();
+        assert!(!base91.is_empty(), "{label}");
+        let shapes = base91
+            .iter()
+            .filter_map(|decoder| {
+                Some((
+                    decoder["rotation"].as_u64()?,
+                    decoder["table_entries"].as_u64()?,
+                ))
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            shapes,
+            BTreeSet::from([(expected_rotation, expected_table_entries)]),
+            "{label}"
+        );
+        assert!(
+            base91
+                .iter()
+                .any(|decoder| decoder["replacements"].as_u64().unwrap_or_default() > 0),
+            "{label}"
+        );
+        if let Some(expected_decoder) = expected_decoder {
+            assert!(
+                base91.iter().any(|decoder| {
+                    decoder["decoder"].as_str() == Some(expected_decoder)
+                        && decoder["scope_start"].as_u64() == Some(0)
+                        && decoder["replacements"].as_u64().unwrap_or_default() >= 400
+                }),
+                "{label}"
+            );
+        } else {
+            assert!(
+                base91.iter().any(|decoder| {
+                    decoder["scope_start"].as_u64().unwrap_or_default() > 0
+                        && decoder["replacements"].as_u64().unwrap_or_default() >= 10
+                }),
+                "{label}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn depythonify_vm_base91_fixtures_preserve_decoder_scope_contracts() -> Result<()> {
+        assert_generated_base91_fixture(
+            include_str!("../../../corpus/generated/js-virtualizer/vm-obfuscated.js"),
+            "vm-obfuscated.js",
+            12,
+            668,
+            None,
+        )?;
+        // The affine fixture's tempting file-scope decoder performs its proven
+        // table/transform lookup inside dynamic `with`. The deleted Python
+        // regex harness ignored that interception boundary and over-recovered
+        // >500 calls. Rust deliberately requires a statically resolved symbol
+        // and therefore keeps only the independently proven nested decoders.
+        assert_generated_base91_fixture(
+            include_str!("../../../corpus/generated/js-virtualizer/vm-obfuscated-affine-cff.js"),
+            "vm-obfuscated-affine-cff.js",
+            2,
+            613,
+            None,
+        )?;
+        assert_generated_base91_fixture(
+            include_str!(
+                "../../../corpus/generated/js-virtualizer/vm-obfuscated-constructor-local.js"
+            ),
+            "vm-obfuscated-constructor-local.js",
+            22,
+            604,
+            None,
+        )?;
+        assert_generated_base91_fixture(
+            include_str!(
+                "../../../corpus/generated/js-virtualizer/vm-obfuscated-flattened-base91.js"
+            ),
+            "vm-obfuscated-flattened-base91.js",
+            7,
+            650,
+            Some("olQJbc"),
+        )?;
+        Ok(())
     }
 }

@@ -10,7 +10,7 @@ use oxc_ast::ast::{Argument, AssignmentTarget, BindingPattern, Expression};
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, SemanticBuilder};
 use oxc_span::{SourceType, Span};
-use oxc_syntax::symbol::SymbolId;
+use oxc_syntax::{scope::ScopeId, symbol::SymbolId};
 use regex::{Captures, Regex};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -61,46 +61,138 @@ pub struct Base91RecoveryResult {
     pub transforms: BTreeMap<String, usize>,
 }
 
+fn owning_function_scope(scoping: &Scoping, mut scope: ScopeId) -> ScopeId {
+    loop {
+        if scoping.scope_flags(scope).is_function() || scoping.scope_parent_id(scope).is_none() {
+            return scope;
+        }
+        let Some(parent) = scoping.scope_parent_id(scope) else {
+            return scope;
+        };
+        scope = parent;
+    }
+}
+
+fn scope_is_descendant_of(scoping: &Scoping, scope: ScopeId, ancestor: ScopeId) -> bool {
+    scoping
+        .scope_ancestors(scope)
+        .any(|candidate| candidate == ancestor)
+}
+
 #[derive(Debug, Clone)]
 struct FunctionInfo {
     symbol: SymbolId,
     name: String,
     params: Vec<String>,
     span: Span,
+    owner_scope: ScopeId,
+    body_scope: ScopeId,
 }
 
-#[derive(Default)]
-struct FunctionCollector {
+struct FunctionCollector<'s> {
+    scoping: &'s Scoping,
     functions: Vec<FunctionInfo>,
+    scope_spans: HashMap<ScopeId, Span>,
 }
 
-impl<'a> Visit<'a> for FunctionCollector {
+impl<'a> Visit<'a> for FunctionCollector<'_> {
     fn visit_function(
         &mut self,
         function: &oxc_ast::ast::Function<'a>,
         flags: oxc_syntax::scope::ScopeFlags,
     ) {
-        if let Some(id) = &function.id {
-            if let Some(symbol) = id.symbol_id.get() {
-                let params = function
-                    .params
-                    .items
-                    .iter()
-                    .filter_map(|param| match &param.pattern {
-                        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-                        _ => None,
-                    })
-                    .collect();
-                self.functions.push(FunctionInfo {
-                    symbol,
-                    name: id.name.to_string(),
-                    params,
-                    span: function.span,
-                });
+        if let Some(body_scope) = function.scope_id.get() {
+            self.scope_spans.insert(body_scope, function.span);
+            if let Some(id) = &function.id {
+                if let Some(symbol) = id.symbol_id.get() {
+                    let params = function
+                        .params
+                        .items
+                        .iter()
+                        .filter_map(|param| match &param.pattern {
+                            BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                            _ => None,
+                        })
+                        .collect();
+                    self.functions.push(FunctionInfo {
+                        symbol,
+                        name: id.name.to_string(),
+                        params,
+                        span: function.span,
+                        owner_scope: owning_function_scope(
+                            self.scoping,
+                            self.scoping.symbol_scope_id(symbol),
+                        ),
+                        body_scope,
+                    });
+                }
             }
         }
         walk::walk_function(self, function, flags);
     }
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        if let Some(scope) = function.scope_id.get() {
+            self.scope_spans.insert(scope, function.span);
+        }
+        walk::walk_arrow_function_expression(self, function);
+    }
+}
+
+struct FunctionCallCollector<'s> {
+    scoping: &'s Scoping,
+    calls: HashMap<ScopeId, HashSet<SymbolId>>,
+}
+
+impl<'a> Visit<'a> for FunctionCallCollector<'_> {
+    fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+        if let Expression::Identifier(callee) = &call.callee {
+            if let Some(reference) = callee.reference_id.get() {
+                if let Some(symbol) = statically_resolved_symbol(self.scoping, reference) {
+                    let caller = owning_function_scope(
+                        self.scoping,
+                        self.scoping.get_reference(reference).scope_id(),
+                    );
+                    self.calls.entry(caller).or_default().insert(symbol);
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+fn reachable_nested_function_scopes(
+    scoping: &Scoping,
+    decoder: &FunctionInfo,
+    functions: &[FunctionInfo],
+    calls: &HashMap<ScopeId, HashSet<SymbolId>>,
+) -> HashSet<ScopeId> {
+    let by_symbol = functions
+        .iter()
+        .map(|function| (function.symbol, function))
+        .collect::<HashMap<_, _>>();
+    let mut reachable = HashSet::from([decoder.body_scope]);
+    let mut pending = vec![decoder.body_scope];
+    while let Some(caller) = pending.pop() {
+        for symbol in calls.get(&caller).into_iter().flatten() {
+            let Some(callee) = by_symbol.get(symbol).copied() else {
+                continue;
+            };
+            // Only lexical descendants are implementation delegates. Calls to
+            // sibling/global helpers do not make those helpers part of the
+            // decoder proof merely because the decoder invokes them.
+            if !scope_is_descendant_of(scoping, callee.owner_scope, decoder.body_scope) {
+                continue;
+            }
+            if reachable.insert(callee.body_scope) {
+                pending.push(callee.body_scope);
+            }
+        }
+    }
+    reachable
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +203,8 @@ struct ProviderTable {
     values: Vec<String>,
     rotation: usize,
     assignment_start: usize,
+    assignment_end: usize,
+    owner_scope: ScopeId,
 }
 
 struct ProviderCollector<'s> {
@@ -133,10 +227,16 @@ impl<'a> Visit<'a> for ProviderCollector<'_> {
                     if !call.optional && call.arguments.len() == 2 {
                         if let Expression::Identifier(rotator) = &call.callee {
                             if let Argument::ArrayExpression(array) = &call.arguments[0] {
-                                let provider_symbol =
-                                    target.reference_id.get().and_then(|reference| {
-                                        statically_resolved_symbol(self.scoping, reference)
-                                    });
+                                let provider_reference = target.reference_id.get();
+                                let provider_symbol = provider_reference.and_then(|reference| {
+                                    statically_resolved_symbol(self.scoping, reference)
+                                });
+                                let owner_scope = provider_reference.map(|reference| {
+                                    owning_function_scope(
+                                        self.scoping,
+                                        self.scoping.get_reference(reference).scope_id(),
+                                    )
+                                });
                                 let rotator_symbol =
                                     rotator.reference_id.get().and_then(|reference| {
                                         statically_resolved_symbol(self.scoping, reference)
@@ -160,8 +260,14 @@ impl<'a> Visit<'a> for ProviderCollector<'_> {
                                     Some(rotator_symbol),
                                     Some(values),
                                     Some(rotation),
-                                ) = (provider_symbol, rotator_symbol, values, rotation)
-                                {
+                                    Some(owner_scope),
+                                ) = (
+                                    provider_symbol,
+                                    rotator_symbol,
+                                    values,
+                                    rotation,
+                                    owner_scope,
+                                ) {
                                     if !values.is_empty() {
                                         self.providers.push(ProviderTable {
                                             provider: target.name.to_string(),
@@ -170,6 +276,8 @@ impl<'a> Visit<'a> for ProviderCollector<'_> {
                                             rotation: rotation % values.len(),
                                             values,
                                             assignment_start: assignment.span.start as usize,
+                                            assignment_end: assignment.span.end as usize,
+                                            owner_scope,
                                         });
                                     }
                                 }
@@ -250,23 +358,18 @@ fn function_body<'a>(source: &'a str, function: &FunctionInfo) -> &'a str {
     text.get(start + 1..end).unwrap_or(text)
 }
 
-fn enclosing_scope(
-    functions: &[FunctionInfo],
-    start: usize,
-    end: usize,
+fn function_scope_span(
+    scoping: &Scoping,
+    scope_spans: &HashMap<ScopeId, Span>,
+    scope: ScopeId,
     source_len: usize,
-) -> (usize, usize) {
-    functions
-        .iter()
-        .filter(|function| {
-            let outer_start = function.span.start as usize;
-            let outer_end = function.span.end as usize;
-            outer_start < start && end <= outer_end
-        })
-        .min_by_key(|function| function.span.end - function.span.start)
-        .map_or((0, source_len), |function| {
-            (function.span.start as usize, function.span.end as usize)
-        })
+) -> Option<(usize, usize)> {
+    if scope == scoping.root_scope_id() {
+        return Some((0, source_len));
+    }
+    scope_spans
+        .get(&scope)
+        .map(|span| (span.start as usize, span.end as usize))
 }
 
 fn rotator_matches(source: &str, function: &FunctionInfo) -> bool {
@@ -528,7 +631,7 @@ impl<'a> Visit<'a> for StringValueCollector {
 
 #[derive(Debug, Clone, Copy)]
 struct WrapperLink {
-    span: Span,
+    scope: ScopeId,
     provider_symbol: SymbolId,
     transform_symbol: SymbolId,
 }
@@ -545,19 +648,21 @@ impl<'a> Visit<'a> for WrapperLinkCollector<'_> {
                 if let Some(Argument::ComputedMemberExpression(member)) = call.arguments.first() {
                     if !member.optional {
                         if let Expression::Identifier(provider) = &member.object {
-                            let transform_symbol =
-                                transform.reference_id.get().and_then(|reference| {
-                                    statically_resolved_symbol(self.scoping, reference)
-                                });
+                            let transform_reference = transform.reference_id.get();
+                            let transform_symbol = transform_reference.and_then(|reference| {
+                                statically_resolved_symbol(self.scoping, reference)
+                            });
+                            let scope = transform_reference
+                                .map(|reference| self.scoping.get_reference(reference).scope_id());
                             let provider_symbol =
                                 provider.reference_id.get().and_then(|reference| {
                                     statically_resolved_symbol(self.scoping, reference)
                                 });
-                            if let (Some(transform_symbol), Some(provider_symbol)) =
-                                (transform_symbol, provider_symbol)
+                            if let (Some(transform_symbol), Some(provider_symbol), Some(scope)) =
+                                (transform_symbol, provider_symbol, scope)
                             {
                                 self.links.push(WrapperLink {
-                                    span: call.span,
+                                    scope,
                                     provider_symbol,
                                     transform_symbol,
                                 });
@@ -583,54 +688,73 @@ struct DecoderCandidate {
     scope_end: usize,
 }
 
+struct DecoderDiscoveryContext<'a> {
+    source: &'a str,
+    scoping: &'a Scoping,
+    scope_spans: &'a HashMap<ScopeId, Span>,
+    functions: &'a [FunctionInfo],
+    calls: &'a HashMap<ScopeId, HashSet<SymbolId>>,
+    wrapper_links: &'a [WrapperLink],
+    string_values: &'a [StringValue],
+    arrays: &'a HashMap<String, Vec<Value>>,
+}
+
 fn discover_decoders(
-    source: &str,
-    functions: &[FunctionInfo],
+    context: &DecoderDiscoveryContext<'_>,
     providers: &[ProviderTable],
-    wrapper_links: &[WrapperLink],
-    string_values: &[StringValue],
-    arrays: &HashMap<String, Vec<Value>>,
 ) -> Vec<DecoderCandidate> {
     let mut out = Vec::new();
     for provider in providers {
-        let provider_scope = enclosing_scope(
-            functions,
-            provider.assignment_start,
-            provider.assignment_start + 1,
-            source.len(),
-        );
-        let Some(rotator) = functions.iter().find(|function| {
-            function.symbol == provider.rotator_symbol
-                && enclosing_scope(
-                    functions,
-                    function.span.start as usize,
-                    function.span.end as usize,
-                    source.len(),
-                ) == provider_scope
-                && rotator_matches(source, function)
+        let Some(_rotator) = context.functions.iter().find(|function| {
+            function.symbol == provider.rotator_symbol && rotator_matches(context.source, function)
         }) else {
             continue;
         };
-        let _ = rotator;
-        for decoder in functions {
+        for decoder in context.functions {
             let declaration_start = decoder.span.start as usize;
-            let declaration_end = decoder.span.end as usize;
-            let scope =
-                enclosing_scope(functions, declaration_start, declaration_end, source.len());
-            let nested = provider_scope.0 <= scope.0 && scope.1 <= provider_scope.1;
-            if !nested || (scope != provider_scope && scope.0 <= provider.assignment_start) {
+            let Some((scope_start, scope_end)) = function_scope_span(
+                context.scoping,
+                context.scope_spans,
+                decoder.owner_scope,
+                context.source.len(),
+            ) else {
                 continue;
+            };
+            if decoder.owner_scope == provider.owner_scope {
+                // The canonical generated scaffold hoists same-scope decoder
+                // helpers before the rotated table is initialized. A helper
+                // declared after that initialization is not attributed to the
+                // table merely because it happens to share its binding.
+                if declaration_start >= provider.assignment_start {
+                    continue;
+                }
+            } else {
+                if !scope_is_descendant_of(
+                    context.scoping,
+                    decoder.owner_scope,
+                    provider.owner_scope,
+                ) || scope_start <= provider.assignment_end
+                {
+                    continue;
+                }
             }
-            let body = function_body(source, decoder);
+            let body = function_body(context.source, decoder);
             if body.len() > 4096 || !body.contains("typeof") || !body.contains("return") {
                 continue;
             }
-            let transforms = wrapper_links
+            let implementation_scopes = reachable_nested_function_scopes(
+                context.scoping,
+                decoder,
+                context.functions,
+                context.calls,
+            );
+            let transforms = context
+                .wrapper_links
                 .iter()
                 .filter(|link| {
-                    decoder.span.start <= link.span.start
-                        && link.span.end <= decoder.span.end
-                        && link.provider_symbol == provider.provider_symbol
+                    link.provider_symbol == provider.provider_symbol
+                        && implementation_scopes
+                            .contains(&owning_function_scope(context.scoping, link.scope))
                 })
                 .map(|link| link.transform_symbol)
                 .collect::<HashSet<_>>();
@@ -640,27 +764,25 @@ fn discover_decoders(
             let Some(transform_symbol) = transforms.iter().next().copied() else {
                 continue;
             };
-            let Some(transform_fn) = functions.iter().find(|function| {
+            let Some(transform_fn) = context.functions.iter().find(|function| {
                 function.symbol == transform_symbol
                     && function.span.start < decoder.span.start
-                    && enclosing_scope(
-                        functions,
-                        function.span.start as usize,
-                        function.span.end as usize,
-                        source.len(),
-                    ) == scope
+                    && function.owner_scope == decoder.owner_scope
             }) else {
                 continue;
             };
-            let transform_body = function_body(source, transform_fn);
-            let Some(alphabet) = string_values
+            let transform_body = function_body(context.source, transform_fn);
+            let Some(alphabet) = context
+                .string_values
                 .iter()
                 .filter(|literal| {
                     transform_fn.span.start <= literal.span.start
                         && literal.span.end <= transform_fn.span.end
                 })
                 .map(|literal| literal.value.clone())
-                .find(|candidate| looks_like_base91_decoder(transform_body, candidate, arrays))
+                .find(|candidate| {
+                    looks_like_base91_decoder(transform_body, candidate, context.arrays)
+                })
             else {
                 continue;
             };
@@ -673,8 +795,8 @@ fn discover_decoders(
                 transform: transform_fn.name.clone(),
                 alphabet,
                 declaration_start,
-                scope_start: scope.0,
-                scope_end: scope.1,
+                scope_start,
+                scope_end,
             });
         }
     }
@@ -838,9 +960,18 @@ pub fn recover_base91_strings_with_source_mode(
             });
             break;
         }
-        let mut function_collector = FunctionCollector::default();
-        function_collector.visit_program(&program);
         let scoping = semantic_ret.semantic.scoping();
+        let mut function_collector = FunctionCollector {
+            scoping,
+            functions: Vec::new(),
+            scope_spans: HashMap::new(),
+        };
+        function_collector.visit_program(&program);
+        let mut call_collector = FunctionCallCollector {
+            scoping,
+            calls: HashMap::new(),
+        };
+        call_collector.visit_program(&program);
         let mut provider_collector = ProviderCollector {
             scoping,
             providers: Vec::new(),
@@ -853,14 +984,17 @@ pub fn recover_base91_strings_with_source_mode(
             links: Vec::new(),
         };
         wrapper_collector.visit_program(&program);
-        let decoders = discover_decoders(
-            &current,
-            &function_collector.functions,
-            &provider_collector.providers,
-            &wrapper_collector.links,
-            &string_collector.values,
-            &array_collector.arrays,
-        );
+        let discovery = DecoderDiscoveryContext {
+            source: &current,
+            scoping,
+            scope_spans: &function_collector.scope_spans,
+            functions: &function_collector.functions,
+            calls: &call_collector.calls,
+            wrapper_links: &wrapper_collector.links,
+            string_values: &string_collector.values,
+            arrays: &array_collector.arrays,
+        };
+        let decoders = discover_decoders(&discovery, &provider_collector.providers);
         let mut decoder_map = HashMap::new();
         let mut ambiguous = HashSet::new();
         for decoder in &decoders {
