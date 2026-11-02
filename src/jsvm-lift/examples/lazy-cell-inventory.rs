@@ -23,6 +23,7 @@ use oxc_span::SourceType;
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::json;
 use std::{env, fs, path::PathBuf};
+use work_budget::WorkBudget;
 
 fn snippet(source: &str, start: u32, end: u32) -> String {
     source
@@ -34,6 +35,7 @@ fn snippet(source: &str, start: u32, end: u32) -> String {
 }
 
 fn main() -> Result<()> {
+    let budget = WorkBudget::unlimited("lazy-cell-inventory");
     let mut args = env::args_os();
     let _program = args.next();
     let path = args.next().map(PathBuf::from).context(
@@ -61,7 +63,8 @@ fn main() -> Result<()> {
     anyhow::ensure!(semantic.diagnostics.is_empty(), "semantic diagnostics");
     let scoping = semantic.semantic.scoping();
 
-    let lazy_reads = structurally_proven_lazy_registry_read_calls(&parsed.program, scoping);
+    let lazy_reads =
+        structurally_proven_lazy_registry_read_calls(&parsed.program, scoping, &budget)?;
     let accessor = lazy_reads.first().filter(|first| {
         lazy_reads.iter().all(|read| {
             read.accessor_function_start == first.accessor_function_start
@@ -165,9 +168,10 @@ fn main() -> Result<()> {
             })
         })
         .collect::<Vec<_>>();
-    let origin_installs = proven_origin_registry_handler_installs(&parsed.program, scoping, &flow);
+    let origin_installs =
+        proven_origin_registry_handler_installs(&parsed.program, scoping, &flow, &budget)?;
     let origin_value_installs =
-        proven_origin_registry_value_installs(&parsed.program, scoping, &flow);
+        proven_origin_registry_value_installs(&parsed.program, scoping, &flow, &budget)?;
     let candidate_calls = flow
         .direct_calls
         .iter()

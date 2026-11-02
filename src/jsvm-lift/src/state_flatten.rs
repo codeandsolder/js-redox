@@ -17,6 +17,7 @@ use oxc_span::{GetSpan, Span};
 use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 
 #[derive(Debug, Clone)]
 pub struct DecoderControlInfo {
@@ -4029,85 +4030,129 @@ impl Scalar {
     }
 }
 
-fn eval_expr(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Option<Scalar> {
-    match expr {
-        Expression::NumericLiteral(n) => exact_i64(n.value).map(Scalar::Int),
-        Expression::BooleanLiteral(b) => Some(Scalar::Int(i64::from(b.value))),
-        Expression::Identifier(id) => {
-            if id.name.as_str() == "undefined" {
+fn eval_expr_impl(
+    expr: &Expression<'_>,
+    env: &HashMap<String, Scalar>,
+    budget: Option<&WorkBudget>,
+) -> Result<Option<Scalar>, BudgetExceeded> {
+    if let Some(budget) = budget {
+        budget.consume(1)?;
+    }
+    let result = match expr {
+        Expression::NumericLiteral(number) => exact_i64(number.value).map(Scalar::Int),
+        Expression::BooleanLiteral(boolean) => Some(Scalar::Int(i64::from(boolean.value))),
+        Expression::Identifier(identifier) => {
+            if identifier.name.as_str() == "undefined" {
                 Some(Scalar::Undefined)
             } else {
-                env.get(id.name.as_str()).copied()
+                env.get(identifier.name.as_str()).copied()
             }
         }
-        Expression::ParenthesizedExpression(p) => eval_expr(&p.expression, env),
-        Expression::UnaryExpression(u) => {
-            let v = eval_expr(&u.argument, env)?;
-            match u.operator.as_str() {
-                "!" => Some(Scalar::Int(i64::from(!v.truthy()))),
-                "~" => Some(Scalar::Int(i64::from(!js_int32_from_i64(v.int()?)))),
-                "+" => Some(Scalar::Int(v.int()?)),
-                "-" => Some(Scalar::Int(-v.int()?)),
+        Expression::ParenthesizedExpression(parenthesized) => {
+            return eval_expr_impl(&parenthesized.expression, env, budget);
+        }
+        Expression::UnaryExpression(unary) => {
+            let Some(value) = eval_expr_impl(&unary.argument, env, budget)? else {
+                return Ok(None);
+            };
+            match unary.operator.as_str() {
+                "!" => Some(Scalar::Int(i64::from(!value.truthy()))),
+                "~" => value
+                    .int()
+                    .map(|value| Scalar::Int(i64::from(!js_int32_from_i64(value)))),
+                "+" => value.int().map(Scalar::Int),
+                "-" => value.int().map(|value| Scalar::Int(-value)),
                 "void" => Some(Scalar::Undefined),
                 _ => None,
             }
         }
-        Expression::BinaryExpression(b) => {
-            let lhs = eval_expr(&b.left, env)?;
-            let rhs = eval_expr(&b.right, env)?;
-            let op = b.operator.as_str();
-            match op {
-                "==" | "===" => Some(Scalar::Int(i64::from(match (lhs, rhs) {
+        Expression::BinaryExpression(binary) => {
+            let Some(left) = eval_expr_impl(&binary.left, env, budget)? else {
+                return Ok(None);
+            };
+            let Some(right) = eval_expr_impl(&binary.right, env, budget)? else {
+                return Ok(None);
+            };
+            match binary.operator.as_str() {
+                "==" | "===" => Some(Scalar::Int(i64::from(match (left, right) {
                     (Scalar::Undefined, Scalar::Undefined) => true,
-                    (Scalar::Int(a), Scalar::Int(b)) => a == b,
+                    (Scalar::Int(left), Scalar::Int(right)) => left == right,
                     _ => false,
                 }))),
-                "!=" | "!==" => Some(Scalar::Int(i64::from(match (lhs, rhs) {
+                "!=" | "!==" => Some(Scalar::Int(i64::from(match (left, right) {
                     (Scalar::Undefined, Scalar::Undefined) => false,
-                    (Scalar::Int(a), Scalar::Int(b)) => a != b,
+                    (Scalar::Int(left), Scalar::Int(right)) => left != right,
                     _ => true,
                 }))),
-                "<" => Some(Scalar::Int(i64::from(lhs.int()? < rhs.int()?))),
-                "<=" => Some(Scalar::Int(i64::from(lhs.int()? <= rhs.int()?))),
-                ">" => Some(Scalar::Int(i64::from(lhs.int()? > rhs.int()?))),
-                ">=" => Some(Scalar::Int(i64::from(lhs.int()? >= rhs.int()?))),
-                "&" | "|" | "^" | "<<" | ">>" | ">>>" => {
-                    eval_js_bitwise_i64(op, lhs.int()?, rhs.int()?).map(Scalar::Int)
-                }
-                "+" => Some(Scalar::Int(lhs.int()?.wrapping_add(rhs.int()?))),
-                "-" => Some(Scalar::Int(lhs.int()?.wrapping_sub(rhs.int()?))),
+                "<" => match (left.int(), right.int()) {
+                    (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left < right))),
+                    _ => None,
+                },
+                "<=" => match (left.int(), right.int()) {
+                    (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left <= right))),
+                    _ => None,
+                },
+                ">" => match (left.int(), right.int()) {
+                    (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left > right))),
+                    _ => None,
+                },
+                ">=" => match (left.int(), right.int()) {
+                    (Some(left), Some(right)) => Some(Scalar::Int(i64::from(left >= right))),
+                    _ => None,
+                },
+                op @ ("&" | "|" | "^" | "<<" | ">>" | ">>>") => match (left.int(), right.int()) {
+                    (Some(left), Some(right)) => {
+                        eval_js_bitwise_i64(op, left, right).map(Scalar::Int)
+                    }
+                    _ => None,
+                },
+                "+" => match (left.int(), right.int()) {
+                    (Some(left), Some(right)) => Some(Scalar::Int(left.wrapping_add(right))),
+                    _ => None,
+                },
+                "-" => match (left.int(), right.int()) {
+                    (Some(left), Some(right)) => Some(Scalar::Int(left.wrapping_sub(right))),
+                    _ => None,
+                },
                 _ => None,
             }
         }
-        Expression::LogicalExpression(l) => {
-            let lhs = eval_expr(&l.left, env)?;
-            match l.operator.as_str() {
-                "&&" => {
-                    if lhs.truthy() {
-                        eval_expr(&l.right, env)
-                    } else {
-                        Some(lhs)
-                    }
-                }
-                "||" => {
-                    if lhs.truthy() {
-                        Some(lhs)
-                    } else {
-                        eval_expr(&l.right, env)
-                    }
-                }
+        Expression::LogicalExpression(logical) => {
+            let Some(left) = eval_expr_impl(&logical.left, env, budget)? else {
+                return Ok(None);
+            };
+            match logical.operator.as_str() {
+                "&&" if left.truthy() => eval_expr_impl(&logical.right, env, budget)?,
+                "&&" => Some(left),
+                "||" if left.truthy() => Some(left),
+                "||" => eval_expr_impl(&logical.right, env, budget)?,
                 _ => None,
             }
         }
-        Expression::ConditionalExpression(c) => {
-            if eval_expr(&c.test, env)?.truthy() {
-                eval_expr(&c.consequent, env)
-            } else {
-                eval_expr(&c.alternate, env)
+        Expression::ConditionalExpression(conditional) => {
+            let Some(test) = eval_expr_impl(&conditional.test, env, budget)? else {
+                return Ok(None);
+            };
+            if test.truthy() {
+                return eval_expr_impl(&conditional.consequent, env, budget);
             }
+            return eval_expr_impl(&conditional.alternate, env, budget);
         }
         _ => None,
-    }
+    };
+    Ok(result)
+}
+
+fn eval_expr(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> Option<Scalar> {
+    eval_expr_impl(expr, env, None).unwrap_or(None)
+}
+
+fn eval_expr_budgeted(
+    expr: &Expression<'_>,
+    env: &HashMap<String, Scalar>,
+    budget: &WorkBudget,
+) -> Result<Option<Scalar>, BudgetExceeded> {
+    eval_expr_impl(expr, env, Some(budget))
 }
 
 /// Evaluate a scalar result on every normal completion for branch reachability.
@@ -4259,69 +4304,115 @@ fn boolean_result_on_normal_completion(
     expression_has_boolean_result(expression).then(|| branch_truthiness(expression, env))?
 }
 
-fn expression_definitely_throws(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> bool {
+fn expression_definitely_throws_impl(
+    expr: &Expression<'_>,
+    env: &HashMap<String, Scalar>,
+    budget: Option<&WorkBudget>,
+) -> Result<bool, BudgetExceeded> {
+    if let Some(budget) = budget {
+        budget.consume(1)?;
+    }
     match expr {
         Expression::ParenthesizedExpression(parenthesized) => {
-            expression_definitely_throws(&parenthesized.expression, env)
+            expression_definitely_throws_impl(&parenthesized.expression, env, budget)
         }
-        Expression::SequenceExpression(sequence) => sequence
-            .expressions
-            .iter()
-            .any(|expression| expression_definitely_throws(expression, env)),
+        Expression::SequenceExpression(sequence) => {
+            for expression in &sequence.expressions {
+                if expression_definitely_throws_impl(expression, env, budget)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
         Expression::StaticMemberExpression(member) => {
-            expression_definitely_throws(&member.object, env)
-                || matches!(eval_expr(&member.object, env), Some(Scalar::Undefined))
+            if expression_definitely_throws_impl(&member.object, env, budget)? {
+                return Ok(true);
+            }
+            Ok(matches!(
+                eval_expr_impl(&member.object, env, budget)?,
+                Some(Scalar::Undefined)
+            ))
         }
         Expression::ComputedMemberExpression(member) => {
-            expression_definitely_throws(&member.object, env)
-                || matches!(eval_expr(&member.object, env), Some(Scalar::Undefined))
-                || expression_definitely_throws(&member.expression, env)
+            if expression_definitely_throws_impl(&member.object, env, budget)? {
+                return Ok(true);
+            }
+            if matches!(
+                eval_expr_impl(&member.object, env, budget)?,
+                Some(Scalar::Undefined)
+            ) {
+                return Ok(true);
+            }
+            expression_definitely_throws_impl(&member.expression, env, budget)
         }
-        Expression::UnaryExpression(unary) => expression_definitely_throws(&unary.argument, env),
+        Expression::UnaryExpression(unary) => {
+            expression_definitely_throws_impl(&unary.argument, env, budget)
+        }
         Expression::BinaryExpression(binary) => {
-            expression_definitely_throws(&binary.left, env)
-                || expression_definitely_throws(&binary.right, env)
+            Ok(
+                expression_definitely_throws_impl(&binary.left, env, budget)?
+                    || expression_definitely_throws_impl(&binary.right, env, budget)?,
+            )
         }
         Expression::LogicalExpression(logical) => {
-            if expression_definitely_throws(&logical.left, env) {
-                return true;
+            if expression_definitely_throws_impl(&logical.left, env, budget)? {
+                return Ok(true);
             }
-            let Some(lhs) = eval_expr(&logical.left, env) else {
-                return false;
+            let Some(left) = eval_expr_impl(&logical.left, env, budget)? else {
+                return Ok(false);
             };
             match logical.operator.as_str() {
-                "&&" if lhs.truthy() => expression_definitely_throws(&logical.right, env),
-                "||" if !lhs.truthy() => expression_definitely_throws(&logical.right, env),
-                "&&" | "||" => false,
-                _ => false,
+                "&&" if left.truthy() => {
+                    expression_definitely_throws_impl(&logical.right, env, budget)
+                }
+                "||" if !left.truthy() => {
+                    expression_definitely_throws_impl(&logical.right, env, budget)
+                }
+                "&&" | "||" => Ok(false),
+                _ => Ok(false),
             }
         }
         Expression::ConditionalExpression(conditional) => {
-            if expression_definitely_throws(&conditional.test, env) {
-                return true;
+            if expression_definitely_throws_impl(&conditional.test, env, budget)? {
+                return Ok(true);
             }
-            let Some(test) = eval_expr(&conditional.test, env) else {
-                return false;
+            let Some(test) = eval_expr_impl(&conditional.test, env, budget)? else {
+                return Ok(false);
             };
             if test.truthy() {
-                expression_definitely_throws(&conditional.consequent, env)
+                expression_definitely_throws_impl(&conditional.consequent, env, budget)
             } else {
-                expression_definitely_throws(&conditional.alternate, env)
+                expression_definitely_throws_impl(&conditional.alternate, env, budget)
             }
         }
         Expression::AssignmentExpression(assignment) => {
-            expression_definitely_throws(&assignment.right, env)
+            expression_definitely_throws_impl(&assignment.right, env, budget)
         }
         Expression::CallExpression(call) => {
-            expression_definitely_throws(&call.callee, env)
-                || call
-                    .arguments
-                    .iter()
-                    .filter_map(Argument::as_expression)
-                    .any(|argument| expression_definitely_throws(argument, env))
+            if expression_definitely_throws_impl(&call.callee, env, budget)? {
+                return Ok(true);
+            }
+            for argument in call.arguments.iter().filter_map(Argument::as_expression) {
+                if expression_definitely_throws_impl(argument, env, budget)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }
-        _ => false,
+        _ => Ok(false),
     }
+}
+
+fn expression_definitely_throws(expr: &Expression<'_>, env: &HashMap<String, Scalar>) -> bool {
+    expression_definitely_throws_impl(expr, env, None).unwrap_or(false)
+}
+
+fn expression_definitely_throws_budgeted(
+    expr: &Expression<'_>,
+    env: &HashMap<String, Scalar>,
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    expression_definitely_throws_impl(expr, env, Some(budget))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4343,45 +4434,59 @@ fn record_ambiguous_effect(
     semantic.push(slice(source, span));
 }
 
-fn exec_control_expr(
+fn exec_control_expr_impl(
     expr: &Expression<'_>,
     source: &str,
     state_var: &str,
     env: &mut HashMap<String, Scalar>,
     semantic: &mut Vec<String>,
     ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
-) -> ExecStatus {
-    match expr {
-        Expression::ParenthesizedExpression(parenthesized) => exec_control_expr(
-            &parenthesized.expression,
-            source,
-            state_var,
-            env,
-            semantic,
-            ambiguous_envs,
-        ),
+    budget: Option<&WorkBudget>,
+) -> Result<ExecStatus, BudgetExceeded> {
+    if let Some(budget) = budget {
+        budget.consume(1)?;
+    }
+    let status = match expr {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            return exec_control_expr_impl(
+                &parenthesized.expression,
+                source,
+                state_var,
+                env,
+                semantic,
+                ambiguous_envs,
+                budget,
+            );
+        }
         Expression::SequenceExpression(sequence) => {
             for expression in &sequence.expressions {
-                let status =
-                    exec_control_expr(expression, source, state_var, env, semantic, ambiguous_envs);
+                let status = exec_control_expr_impl(
+                    expression,
+                    source,
+                    state_var,
+                    env,
+                    semantic,
+                    ambiguous_envs,
+                    budget,
+                )?;
                 if status != ExecStatus::Normal {
-                    return status;
+                    return Ok(status);
                 }
             }
             ExecStatus::Normal
         }
         Expression::AssignmentExpression(assignment) if assignment.operator.is_assign() => {
             if let Some(target) = assignment.left.get_identifier_name() {
-                if let Some(value) = eval_expr(&assignment.right, env) {
+                if let Some(value) = eval_expr_impl(&assignment.right, env, budget)? {
                     env.insert(target.to_string(), value);
-                } else if expression_definitely_throws(&assignment.right, env) {
-                    return ExecStatus::Throw;
+                } else if expression_definitely_throws_impl(&assignment.right, env, budget)? {
+                    return Ok(ExecStatus::Throw);
                 } else {
                     record_ambiguous_effect(source, assignment.span, env, semantic, ambiguous_envs);
                     env.remove(target);
                 }
                 ExecStatus::Normal
-            } else if expression_definitely_throws(&assignment.right, env) {
+            } else if expression_definitely_throws_impl(&assignment.right, env, budget)? {
                 ExecStatus::Throw
             } else {
                 record_ambiguous_effect(source, assignment.span, env, semantic, ambiguous_envs);
@@ -4389,43 +4494,56 @@ fn exec_control_expr(
             }
         }
         Expression::ConditionalExpression(conditional) => {
-            if expression_definitely_throws(&conditional.test, env) {
-                return ExecStatus::Throw;
+            if expression_definitely_throws_impl(&conditional.test, env, budget)? {
+                return Ok(ExecStatus::Throw);
             }
-            if let Some(test) = eval_expr(&conditional.test, env) {
+            if let Some(test) = eval_expr_impl(&conditional.test, env, budget)? {
                 let branch = if test.truthy() {
                     &conditional.consequent
                 } else {
                     &conditional.alternate
                 };
-                exec_control_expr(branch, source, state_var, env, semantic, ambiguous_envs)
-            } else {
-                record_ambiguous_effect(source, conditional.span, env, semantic, ambiguous_envs);
-                ExecStatus::Normal
+                return exec_control_expr_impl(
+                    branch,
+                    source,
+                    state_var,
+                    env,
+                    semantic,
+                    ambiguous_envs,
+                    budget,
+                );
             }
+            record_ambiguous_effect(source, conditional.span, env, semantic, ambiguous_envs);
+            ExecStatus::Normal
         }
         Expression::LogicalExpression(logical) => {
-            if expression_definitely_throws(&logical.left, env) {
-                return ExecStatus::Throw;
+            if expression_definitely_throws_impl(&logical.left, env, budget)? {
+                return Ok(ExecStatus::Throw);
             }
-            if let Some(lhs) = eval_expr(&logical.left, env) {
+            if let Some(left) = eval_expr_impl(&logical.left, env, budget)? {
                 match logical.operator.as_str() {
-                    "&&" if lhs.truthy() => exec_control_expr(
-                        &logical.right,
-                        source,
-                        state_var,
-                        env,
-                        semantic,
-                        ambiguous_envs,
-                    ),
-                    "||" if !lhs.truthy() => exec_control_expr(
-                        &logical.right,
-                        source,
-                        state_var,
-                        env,
-                        semantic,
-                        ambiguous_envs,
-                    ),
+                    "&&" if left.truthy() => {
+                        return exec_control_expr_impl(
+                            &logical.right,
+                            source,
+                            state_var,
+                            env,
+                            semantic,
+                            ambiguous_envs,
+                            budget,
+                        );
+                    }
+                    "||" if !left.truthy() => {
+                        return exec_control_expr_impl(
+                            &logical.right,
+                            source,
+                            state_var,
+                            env,
+                            semantic,
+                            ambiguous_envs,
+                            budget,
+                        );
+                    }
                     "&&" | "||" => ExecStatus::Normal,
                     _ => {
                         record_ambiguous_effect(
@@ -4443,46 +4561,58 @@ fn exec_control_expr(
                 ExecStatus::Normal
             }
         }
-        _ if expression_definitely_throws(expr, env) => ExecStatus::Throw,
+        _ if expression_definitely_throws_impl(expr, env, budget)? => ExecStatus::Throw,
         _ => {
             record_ambiguous_effect(source, expr.span(), env, semantic, ambiguous_envs);
             ExecStatus::Normal
         }
-    }
+    };
+    Ok(status)
 }
 
-fn exec_statements(
+fn exec_statements_impl(
     statements: &[Statement<'_>],
     source: &str,
     state_var: &str,
     env: &mut HashMap<String, Scalar>,
     semantic: &mut Vec<String>,
     ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
-) -> ExecStatus {
-    for stmt in statements {
-        let status = exec_statement(stmt, source, state_var, env, semantic, ambiguous_envs);
+    budget: Option<&WorkBudget>,
+) -> Result<ExecStatus, BudgetExceeded> {
+    for statement in statements {
+        let status = exec_statement_impl(
+            statement,
+            source,
+            state_var,
+            env,
+            semantic,
+            ambiguous_envs,
+            budget,
+        )?;
         if status != ExecStatus::Normal {
-            return status;
+            return Ok(status);
         }
     }
-    ExecStatus::Normal
+    Ok(ExecStatus::Normal)
 }
 
-fn exec_function_body(
+fn exec_function_body_impl(
     body: &FunctionBody<'_>,
     source: &str,
     state_var: &str,
     env: &mut HashMap<String, Scalar>,
     semantic: &mut Vec<String>,
     ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
-) -> ExecStatus {
-    exec_statements(
+    budget: Option<&WorkBudget>,
+) -> Result<ExecStatus, BudgetExceeded> {
+    exec_statements_impl(
         &body.statements,
         source,
         state_var,
         env,
         semantic,
         ambiguous_envs,
+        budget,
     )
 }
 
@@ -4510,110 +4640,203 @@ fn argument_function_body<'a>(arg: &'a Argument<'a>) -> Option<&'a FunctionBody<
     }
 }
 
-fn exec_statement(
-    stmt: &Statement<'_>,
+fn exec_statement_impl(
+    statement: &Statement<'_>,
     source: &str,
     state_var: &str,
     env: &mut HashMap<String, Scalar>,
     semantic: &mut Vec<String>,
     ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
-) -> ExecStatus {
-    match stmt {
-        Statement::BlockStatement(b) => {
-            exec_statements(&b.body, source, state_var, env, semantic, ambiguous_envs)
+    budget: Option<&WorkBudget>,
+) -> Result<ExecStatus, BudgetExceeded> {
+    if let Some(budget) = budget {
+        budget.consume(1)?;
+    }
+    let status = match statement {
+        Statement::BlockStatement(block) => {
+            return exec_statements_impl(
+                &block.body,
+                source,
+                state_var,
+                env,
+                semantic,
+                ambiguous_envs,
+                budget,
+            );
         }
-        Statement::ExpressionStatement(e) => {
-            if let Expression::CallExpression(call) = &e.expression {
+        Statement::ExpressionStatement(expression) => {
+            if let Expression::CallExpression(call) = &expression.expression {
                 if let Some(body) = call.arguments.first().and_then(argument_function_body) {
-                    return exec_function_body(
+                    return exec_function_body_impl(
                         body,
                         source,
                         state_var,
                         env,
                         semantic,
                         ambiguous_envs,
+                        budget,
                     );
                 }
             }
-            exec_control_expr(
-                &e.expression,
+            return exec_control_expr_impl(
+                &expression.expression,
                 source,
                 state_var,
                 env,
                 semantic,
                 ambiguous_envs,
-            )
+                budget,
+            );
         }
-        Statement::IfStatement(i) => {
-            if expression_definitely_throws(&i.test, env) {
-                return ExecStatus::Throw;
+        Statement::IfStatement(if_statement) => {
+            if expression_definitely_throws_impl(&if_statement.test, env, budget)? {
+                return Ok(ExecStatus::Throw);
             }
-            let Some(test) = eval_expr(&i.test, env) else {
-                record_ambiguous_effect(source, i.span, env, semantic, ambiguous_envs);
-                return ExecStatus::Normal;
+            let Some(test) = eval_expr_impl(&if_statement.test, env, budget)? else {
+                record_ambiguous_effect(source, if_statement.span, env, semantic, ambiguous_envs);
+                return Ok(ExecStatus::Normal);
             };
             if test.truthy() {
-                exec_statement(
-                    &i.consequent,
+                return exec_statement_impl(
+                    &if_statement.consequent,
                     source,
                     state_var,
                     env,
                     semantic,
                     ambiguous_envs,
-                )
-            } else if let Some(alt) = &i.alternate {
-                exec_statement(alt, source, state_var, env, semantic, ambiguous_envs)
-            } else {
-                ExecStatus::Normal
+                    budget,
+                );
             }
-        }
-        Statement::TryStatement(t) => {
-            record_ambiguous_effect(source, t.span, env, semantic, ambiguous_envs);
+            if let Some(alternate) = &if_statement.alternate {
+                return exec_statement_impl(
+                    alternate,
+                    source,
+                    state_var,
+                    env,
+                    semantic,
+                    ambiguous_envs,
+                    budget,
+                );
+            }
             ExecStatus::Normal
         }
-        Statement::ThrowStatement(t) => {
-            semantic.push(slice(source, t.span));
+        Statement::TryStatement(try_statement) => {
+            record_ambiguous_effect(source, try_statement.span, env, semantic, ambiguous_envs);
+            ExecStatus::Normal
+        }
+        Statement::ThrowStatement(throw_statement) => {
+            semantic.push(slice(source, throw_statement.span));
             ExecStatus::Throw
         }
-        Statement::ReturnStatement(r) => {
-            semantic.push(slice(source, r.span));
+        Statement::ReturnStatement(return_statement) => {
+            semantic.push(slice(source, return_statement.span));
             ExecStatus::Return
         }
         Statement::BreakStatement(_) => ExecStatus::Break,
         _ => {
-            record_ambiguous_effect(source, stmt.span(), env, semantic, ambiguous_envs);
+            record_ambiguous_effect(source, statement.span(), env, semantic, ambiguous_envs);
             ExecStatus::Normal
         }
-    }
+    };
+    Ok(status)
+}
+
+fn exec_statement(
+    statement: &Statement<'_>,
+    source: &str,
+    state_var: &str,
+    env: &mut HashMap<String, Scalar>,
+    semantic: &mut Vec<String>,
+    ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
+) -> ExecStatus {
+    exec_statement_impl(
+        statement,
+        source,
+        state_var,
+        env,
+        semantic,
+        ambiguous_envs,
+        None,
+    )
+    .unwrap_or(ExecStatus::Normal)
+}
+
+fn exec_statements(
+    statements: &[Statement<'_>],
+    source: &str,
+    state_var: &str,
+    env: &mut HashMap<String, Scalar>,
+    semantic: &mut Vec<String>,
+    ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
+) -> ExecStatus {
+    exec_statements_impl(
+        statements,
+        source,
+        state_var,
+        env,
+        semantic,
+        ambiguous_envs,
+        None,
+    )
+    .unwrap_or(ExecStatus::Normal)
+}
+
+fn exec_statements_budgeted(
+    statements: &[Statement<'_>],
+    source: &str,
+    state_var: &str,
+    env: &mut HashMap<String, Scalar>,
+    semantic: &mut Vec<String>,
+    ambiguous_envs: &mut Vec<HashMap<String, Scalar>>,
+    budget: &WorkBudget,
+) -> Result<ExecStatus, BudgetExceeded> {
+    exec_statements_impl(
+        statements,
+        source,
+        state_var,
+        env,
+        semantic,
+        ambiguous_envs,
+        Some(budget),
+    )
 }
 
 struct NumericMaskCollector<'m> {
     masks: &'m BTreeSet<u64>,
     found: BTreeSet<u64>,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for NumericMaskCollector<'_> {
-    fn enter_node(&mut self, kind: AstKind<'a>) {
-        if let AstKind::NumericLiteral(n) = kind {
-            if let Some(value) = exact_u64(n.value) {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        if let Expression::NumericLiteral(number) = expression {
+            if let Some(value) = exact_u64(number.value) {
                 if self.masks.contains(&value) {
                     self.found.insert(value);
                 }
             }
         }
+        walk::walk_expression(self, expression);
     }
 }
 
-#[derive(Default)]
 struct IdentifierCollector {
     names: BTreeSet<String>,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for IdentifierCollector {
-    fn enter_node(&mut self, kind: AstKind<'a>) {
-        if let AstKind::IdentifierReference(id) = kind {
-            self.names.insert(id.name.to_string());
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
         }
+        if let Expression::Identifier(identifier) = expression {
+            self.names.insert(identifier.name.to_string());
+        }
+        walk::walk_expression(self, expression);
     }
 }
 
@@ -4623,52 +4846,73 @@ struct MaskBindingCollector<'m> {
     selector_var: &'m str,
     aliases: HashMap<String, String>,
     targets: HashMap<String, (BTreeSet<u64>, u32)>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
 }
 
 impl MaskBindingCollector<'_> {
-    fn resolve_alias(&self, name: &str) -> String {
+    fn resolve_alias(&self, name: &str) -> Result<String, BudgetExceeded> {
         let mut cur = name.to_string();
         let mut seen = BTreeSet::new();
         while seen.insert(cur.clone()) {
+            self.budget.consume(1)?;
             let Some(next) = self.aliases.get(&cur) else {
                 break;
             };
             cur.clone_from(next);
         }
-        cur
+        Ok(cur)
     }
 
-    fn rhs_depends_on_selector(&self, expr: &Expression<'_>) -> bool {
-        let mut ids = IdentifierCollector::default();
+    fn rhs_depends_on_selector(&self, expr: &Expression<'_>) -> Result<bool, BudgetExceeded> {
+        let mut ids = IdentifierCollector {
+            names: BTreeSet::new(),
+            poller: BudgetPoller::new(&self.budget, 256),
+        };
         ids.visit_expression(expr);
-        ids.names
-            .iter()
-            .any(|name| name == self.selector_var || self.resolve_alias(name) == self.selector_var)
-    }
-
-    fn direct_alias_rhs(&self, expr: &Expression<'_>) -> Option<String> {
-        match expr {
-            Expression::Identifier(id) => {
-                let resolved = self.resolve_alias(id.name.as_str());
-                (resolved == self.selector_var).then_some(resolved)
+        ids.poller.finish()?;
+        for name in &ids.names {
+            if name == self.selector_var || self.resolve_alias(name)? == self.selector_var {
+                return Ok(true);
             }
-            Expression::ParenthesizedExpression(p) => self.direct_alias_rhs(&p.expression),
-            _ => None,
+        }
+        Ok(false)
+    }
+
+    fn direct_alias_rhs(&self, expr: &Expression<'_>) -> Result<Option<String>, BudgetExceeded> {
+        self.budget.consume(1)?;
+        match expr {
+            Expression::Identifier(identifier) => {
+                let resolved = self.resolve_alias(identifier.name.as_str())?;
+                Ok((resolved == self.selector_var).then_some(resolved))
+            }
+            Expression::ParenthesizedExpression(parenthesized) => {
+                self.direct_alias_rhs(&parenthesized.expression)
+            }
+            _ => Ok(None),
         }
     }
 
-    fn record_binding(&mut self, target: &str, rhs: &Expression<'_>, start: u32) {
+    fn record_binding(
+        &mut self,
+        target: &str,
+        rhs: &Expression<'_>,
+        start: u32,
+    ) -> Result<(), BudgetExceeded> {
         if start >= self.loop_start {
-            return;
+            return Ok(());
         }
 
-        let depends = self.rhs_depends_on_selector(rhs);
+        let depends = self.rhs_depends_on_selector(rhs)?;
         if depends {
             let mut collector = NumericMaskCollector {
                 masks: self.masks,
                 found: BTreeSet::new(),
+                poller: BudgetPoller::new(&self.budget, 256),
             };
             collector.visit_expression(rhs);
+            collector.poller.finish()?;
             if !collector.found.is_empty() {
                 let entry = self
                     .targets
@@ -4679,36 +4923,60 @@ impl MaskBindingCollector<'_> {
             }
         }
 
-        if let Some(alias) = self.direct_alias_rhs(rhs) {
+        if let Some(alias) = self.direct_alias_rhs(rhs)? {
             self.aliases.insert(target.to_string(), alias);
         } else if !depends {
             self.aliases.remove(target);
+        }
+        Ok(())
+    }
+
+    fn record_result(&mut self, result: Result<(), BudgetExceeded>) {
+        if let Err(error) = result {
+            self.budget_error = Some(error);
         }
     }
 }
 
 impl<'a> Visit<'a> for MaskBindingCollector<'_> {
-    fn enter_node(&mut self, kind: AstKind<'a>) {
-        match kind {
-            AstKind::AssignmentExpression(a) => {
-                if !a.operator.is_assign() {
-                    return;
-                }
-                let Some(target) = a.left.get_identifier_name() else {
-                    return;
-                };
-                self.record_binding(target, &a.right, a.span.start);
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment.operator.is_assign() {
+            if let Some(target) = assignment.left.get_identifier_name() {
+                let result = self.record_binding(target, &assignment.right, assignment.span.start);
+                self.record_result(result);
             }
-            AstKind::VariableDeclarator(v) => {
-                let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &v.id else {
-                    return;
-                };
-                let Some(init) = &v.init else {
-                    return;
-                };
-                self.record_binding(id.name.as_str(), init, v.span.start);
-            }
-            _ => {}
+        }
+        if self.budget_error.is_none() {
+            walk::walk_assignment_expression(self, assignment);
+        }
+    }
+
+    fn visit_variable_declarator(&mut self, declarator: &oxc_ast::ast::VariableDeclarator<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        if let (oxc_ast::ast::BindingPattern::BindingIdentifier(identifier), Some(init)) =
+            (&declarator.id, &declarator.init)
+        {
+            let result = self.record_binding(identifier.name.as_str(), init, declarator.span.start);
+            self.record_result(result);
+        }
+        if self.budget_error.is_none() {
+            walk::walk_variable_declarator(self, declarator);
         }
     }
 }
@@ -4720,9 +4988,11 @@ fn derive_bindings(
     loop_end: u32,
     selector_var: &str,
     masks: &[u64],
-) -> BTreeMap<String, u64> {
+    budget: &WorkBudget,
+) -> Result<BTreeMap<String, u64>, BudgetExceeded> {
+    budget.checkpoint()?;
     let Some(body) = &function.body else {
-        return BTreeMap::new();
+        return Ok(BTreeMap::new());
     };
 
     let mask_set: BTreeSet<u64> = masks.iter().copied().collect();
@@ -4732,8 +5002,15 @@ fn derive_bindings(
         selector_var,
         aliases: HashMap::new(),
         targets: HashMap::new(),
+        budget: budget.clone(),
+        poller: BudgetPoller::new(budget, 256),
+        budget_error: None,
     };
     collector.visit_function_body(body);
+    collector.poller.finish()?;
+    if let Some(error) = collector.budget_error.take() {
+        return Err(error);
+    }
 
     let loop_text = source
         .get(loop_start as usize..loop_end as usize)
@@ -4741,6 +5018,7 @@ fn derive_bindings(
 
     let mut by_mask: BTreeMap<u64, Vec<(String, u32)>> = BTreeMap::new();
     for (name, (found, last_start)) in collector.targets {
+        budget.consume(1)?;
         if found.len() != 1 || !loop_text.contains(&name) {
             continue;
         }
@@ -4752,6 +5030,7 @@ fn derive_bindings(
 
     let mut out = BTreeMap::new();
     for mask in masks {
+        budget.consume(1)?;
         let Some(candidates) = by_mask.get_mut(mask) else {
             continue;
         };
@@ -4760,7 +5039,7 @@ fn derive_bindings(
             out.insert(name.clone(), *mask);
         }
     }
-    out
+    Ok(out)
 }
 
 struct LoopRunner<'s, 'm> {
@@ -4769,29 +5048,36 @@ struct LoopRunner<'s, 'm> {
     decoder: &'m DecoderControlInfo,
     machine: &'m StateMachineInfo,
     bindings: &'m BTreeMap<String, u64>,
+    budget: &'m WorkBudget,
+    budget_error: Option<BudgetExceeded>,
     result: Option<OpcodeMapCandidate>,
 }
 
-fn numeric_case_map<'a>(switch: &'a SwitchStatement<'a>) -> BTreeMap<u64, &'a [Statement<'a>]> {
-    switch
-        .cases
-        .iter()
-        .filter_map(|case| {
-            let Expression::NumericLiteral(number) = case.test.as_ref()? else {
-                return None;
-            };
-            exact_u64(number.value).map(|value| (value, case.consequent.as_slice()))
-        })
-        .collect()
+fn numeric_case_map<'a>(
+    switch: &'a SwitchStatement<'a>,
+    budget: &WorkBudget,
+) -> Result<BTreeMap<u64, &'a [Statement<'a>]>, BudgetExceeded> {
+    let mut cases = BTreeMap::new();
+    for case in &switch.cases {
+        budget.consume(1)?;
+        let Some(Expression::NumericLiteral(number)) = case.test.as_ref() else {
+            continue;
+        };
+        if let Some(value) = exact_u64(number.value) {
+            cases.insert(value, case.consequent.as_slice());
+        }
+    }
+    Ok(cases)
 }
 
 impl LoopRunner<'_, '_> {
     fn simulate_opcode<'a>(
-        &self,
+        &mut self,
         opcode: u64,
         case_map: &BTreeMap<u64, &'a [Statement<'a>]>,
         observed_opcodes: &BTreeSet<u64>,
-    ) -> OpcodeHandler {
+    ) -> Result<OpcodeHandler, BudgetExceeded> {
+        self.budget.consume(1)?;
         let Some(mut env) = self
             .bindings
             .iter()
@@ -4802,13 +5088,13 @@ impl LoopRunner<'_, '_> {
             })
             .collect::<Option<HashMap<_, _>>>()
         else {
-            return OpcodeHandler {
+            return Ok(OpcodeHandler {
                 opcode,
                 observed: observed_opcodes.contains(&opcode),
                 path: Vec::new(),
                 terminal: "integer-overflow".to_string(),
                 semantic: Vec::new(),
-            };
+            });
         };
         let mut state = self.machine.init_state;
         let mut path = Vec::new();
@@ -4816,6 +5102,7 @@ impl LoopRunner<'_, '_> {
         let mut terminal = "step-limit".to_string();
 
         for _ in 0..128 {
+            self.budget.consume(1)?;
             path.push(state);
             let Ok(state_i64) = i64::try_from(state) else {
                 terminal = "integer-overflow".to_string();
@@ -4840,14 +5127,15 @@ impl LoopRunner<'_, '_> {
                 break;
             };
             let mut ambiguous_envs = Vec::new();
-            match exec_statements(
+            match exec_statements_budgeted(
                 statements,
                 self.source,
                 &self.machine.state_var,
                 &mut env,
                 &mut semantic,
                 &mut ambiguous_envs,
-            ) {
+                self.budget,
+            )? {
                 ExecStatus::Return => {
                     terminal = "return".to_string();
                     break;
@@ -4882,17 +5170,21 @@ impl LoopRunner<'_, '_> {
             }
         }
 
-        OpcodeHandler {
+        Ok(OpcodeHandler {
             opcode,
             observed: observed_opcodes.contains(&opcode),
             path,
             terminal,
             semantic,
-        }
+        })
     }
 
-    fn build_opcode_map(&self, switch: &SwitchStatement<'_>) -> Option<OpcodeMapCandidate> {
-        let case_map = numeric_case_map(switch);
+    fn build_opcode_map(
+        &mut self,
+        switch: &SwitchStatement<'_>,
+    ) -> Result<Option<OpcodeMapCandidate>, BudgetExceeded> {
+        self.budget.checkpoint()?;
+        let case_map = numeric_case_map(switch, self.budget)?;
         let opcode_max = self
             .decoder
             .selector_masks
@@ -4900,7 +5192,7 @@ impl LoopRunner<'_, '_> {
             .copied()
             .fold(0u64, |acc, value| acc | value);
         if opcode_max > 255 {
-            return None;
+            return Ok(None);
         }
 
         let observed_opcodes = self
@@ -4909,11 +5201,12 @@ impl LoopRunner<'_, '_> {
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
-        let handlers = (0..=opcode_max)
-            .map(|opcode| self.simulate_opcode(opcode, &case_map, &observed_opcodes))
-            .collect();
+        let mut handlers = Vec::with_capacity((opcode_max + 1) as usize);
+        for opcode in 0..=opcode_max {
+            handlers.push(self.simulate_opcode(opcode, &case_map, &observed_opcodes)?);
+        }
 
-        Some(OpcodeMapCandidate {
+        Ok(Some(OpcodeMapCandidate {
             parent_function_id: self.parent_function_id.to_string(),
             decoder_function_id: self.decoder.function_id.clone(),
             decoder_selector_var: self.decoder.selector_var.clone(),
@@ -4924,13 +5217,35 @@ impl LoopRunner<'_, '_> {
             opcode_max,
             observed_opcodes: self.decoder.observed_opcodes.clone(),
             handlers,
-        })
+        }))
     }
 }
 
 impl<'a> Visit<'a> for LoopRunner<'_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.result.is_some() || self.budget_error.is_some() {
+            return;
+        }
+        if let Err(error) = self.budget.consume(1) {
+            self.budget_error = Some(error);
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.result.is_some() || self.budget_error.is_some() {
+            return;
+        }
+        if let Err(error) = self.budget.consume(1) {
+            self.budget_error = Some(error);
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
-        if self.result.is_some() {
+        if self.result.is_some() || self.budget_error.is_some() {
             return;
         }
         if statement.span.start != self.machine.start || statement.span.end != self.machine.end {
@@ -4948,7 +5263,12 @@ impl<'a> Visit<'a> for LoopRunner<'_, '_> {
                 None
             }
         });
-        self.result = switch.and_then(|switch| self.build_opcode_map(switch));
+        if let Some(switch) = switch {
+            match self.build_opcode_map(switch) {
+                Ok(result) => self.result = result,
+                Err(error) => self.budget_error = Some(error),
+            }
+        }
     }
 }
 
@@ -4956,14 +5276,17 @@ const fn ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
 }
 
-fn count_identifier(text: &[u8], name: &str) -> usize {
+fn count_identifier(text: &[u8], name: &str, budget: &WorkBudget) -> Result<usize, BudgetExceeded> {
     let needle = name.as_bytes();
     if needle.is_empty() || text.len() < needle.len() {
-        return 0;
+        return Ok(0);
     }
 
     let mut count = 0usize;
     for start in 0..=text.len() - needle.len() {
+        if start % 4096 == 0 {
+            budget.consume(1)?;
+        }
         if &text[start..start + needle.len()] != needle {
             continue;
         }
@@ -4974,7 +5297,7 @@ fn count_identifier(text: &[u8], name: &str) -> usize {
             count += 1;
         }
     }
-    count
+    Ok(count)
 }
 
 fn direct_binding_score(
@@ -4982,11 +5305,13 @@ fn direct_binding_score(
     machine: &StateMachineInfo,
     all_machines: &[StateMachineInfo],
     bindings: &BTreeMap<String, u64>,
-) -> usize {
+    budget: &WorkBudget,
+) -> Result<usize, BudgetExceeded> {
+    budget.checkpoint()?;
     let start = machine.start as usize;
     let end = (machine.end as usize).min(source.len());
     if start >= end {
-        return 0;
+        return Ok(0);
     }
 
     // Outer protector loops physically contain the real opcode loop. Remove
@@ -4994,6 +5319,7 @@ fn direct_binding_score(
     // to opcode-bit variables from the inner semantic dispatcher.
     let mut direct = source.as_bytes()[start..end].to_vec();
     for nested in all_machines {
+        budget.consume(1)?;
         if nested.start <= machine.start || nested.end >= machine.end {
             continue;
         }
@@ -5008,10 +5334,11 @@ fn direct_binding_score(
         }
     }
 
-    bindings
-        .keys()
-        .map(|name| count_identifier(&direct, name))
-        .sum()
+    let mut score = 0usize;
+    for name in bindings.keys() {
+        score += count_identifier(&direct, name, budget)?;
+    }
+    Ok(score)
 }
 
 pub fn analyze_function(
@@ -5020,14 +5347,17 @@ pub fn analyze_function(
     parent_function_id: &str,
     decoders: &[DecoderControlInfo],
     machines: &[StateMachineInfo],
-) -> Vec<OpcodeMapCandidate> {
+    budget: &WorkBudget,
+) -> Result<Vec<OpcodeMapCandidate>, BudgetExceeded> {
+    budget.checkpoint()?;
     let Some(body) = &function.body else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let mut out = Vec::new();
 
     for decoder in decoders {
+        budget.consume(1)?;
         if decoder.selector_masks.len() < 2 {
             continue;
         }
@@ -5038,6 +5368,7 @@ pub fn analyze_function(
 
         let mut candidates = Vec::new();
         for machine in machines {
+            budget.consume(1)?;
             let bindings = derive_bindings(
                 source,
                 function,
@@ -5045,7 +5376,8 @@ pub fn analyze_function(
                 machine.end,
                 &decoder.selector_var,
                 &decoder.selector_masks,
-            );
+                budget,
+            )?;
             if bindings.len() != mask_set.len() {
                 continue;
             }
@@ -5054,7 +5386,7 @@ pub fn analyze_function(
                 continue;
             }
 
-            let score = direct_binding_score(source, machine, machines, &bindings);
+            let score = direct_binding_score(source, machine, machines, &bindings, budget)?;
             if score == 0 {
                 continue;
             }
@@ -5071,15 +5403,21 @@ pub fn analyze_function(
         });
 
         for (_, _, machine, bindings) in candidates {
+            budget.consume(1)?;
             let mut runner = LoopRunner {
                 source,
                 parent_function_id,
                 decoder,
                 machine,
                 bindings: &bindings,
+                budget,
+                budget_error: None,
                 result: None,
             };
             runner.visit_function_body(body);
+            if let Some(error) = runner.budget_error {
+                return Err(error);
+            }
             if let Some(result) = runner.result {
                 out.push(result);
                 break;
@@ -5087,7 +5425,8 @@ pub fn analyze_function(
         }
     }
 
-    out
+    budget.checkpoint()?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -5097,6 +5436,7 @@ mod tests {
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
+    use work_budget::{BudgetExceededKind, BudgetLimits};
 
     #[derive(Default)]
     struct DetectorHarness<'s> {
@@ -6688,5 +7028,34 @@ mod tests {
         let detected = detect("for (let i = 0; i < 10; i += 1) { work(i); }");
         assert!(detected.switch_machines.is_empty());
         assert!(detected.if_ladder_machines.is_empty());
+    }
+    #[test]
+    fn state_flatten_propagates_work_budget_exhaustion() {
+        let allocator = Allocator::default();
+        let source = "function target() {}";
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let function = parsed
+            .program
+            .body
+            .iter()
+            .find_map(|statement| match statement {
+                Statement::FunctionDeclaration(function) => Some(function),
+                _ => None,
+            })
+            .expect("target function");
+        let decoder = DecoderControlInfo {
+            function_id: "decoder".into(),
+            selector_var: "selector".into(),
+            selector_masks: vec![1, 2],
+            observed_opcodes: Vec::new(),
+        };
+        let budget = WorkBudget::new("state-flatten-fuel", BudgetLimits::work(0));
+        assert!(matches!(
+            analyze_function(source, function, "target", &[decoder], &[], &budget),
+            Err(ref error)
+                if error.kind() == BudgetExceededKind::Work
+                    && error.scope() == "state-flatten-fuel"
+        ));
     }
 }

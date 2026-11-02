@@ -9,6 +9,7 @@ use crate::{
 };
 use oxc_ast::ast::Program;
 use oxc_semantic::Scoping;
+use work_budget::{BudgetExceeded, WorkBudget};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProvenRegistryObjectOrigin {
@@ -101,8 +102,9 @@ pub fn proven_origin_registry_read_calls(
     program: &Program<'_>,
     scoping: &Scoping,
     flow: &ProvenOriginFlow,
-) -> Vec<ProvenOriginRegistryReadCall> {
-    let mut proven = structurally_proven_registry_read_calls(program, scoping)
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenOriginRegistryReadCall>, BudgetExceeded> {
+    let mut proven = structurally_proven_registry_read_calls(program, scoping, budget)?
         .into_iter()
         .filter_map(|read| {
             let (origin, exact_key) = joined_origin_and_key(
@@ -123,7 +125,7 @@ pub fn proven_origin_registry_read_calls(
         .collect::<Vec<_>>();
     proven.sort_by_key(|proof| (proof.read.call_start, proof.read.call_end, proof.exact_key));
     proven.dedup();
-    proven
+    Ok(proven)
 }
 
 #[must_use]
@@ -131,8 +133,9 @@ pub fn proven_origin_registry_value_installs(
     program: &Program<'_>,
     scoping: &Scoping,
     flow: &ProvenOriginFlow,
-) -> Vec<ProvenOriginRegistryValueInstall> {
-    let mut proven = structurally_proven_registry_forwarding_value_calls(program, scoping)
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenOriginRegistryValueInstall>, BudgetExceeded> {
+    let mut proven = structurally_proven_registry_forwarding_value_calls(program, scoping, budget)?
         .into_iter()
         .filter_map(|install| {
             let (origin, exact_key) = joined_origin_and_key(
@@ -160,7 +163,7 @@ pub fn proven_origin_registry_value_installs(
         )
     });
     proven.dedup();
-    proven
+    Ok(proven)
 }
 
 #[must_use]
@@ -168,8 +171,9 @@ pub fn proven_origin_registry_handler_installs(
     program: &Program<'_>,
     scoping: &Scoping,
     flow: &ProvenOriginFlow,
-) -> Vec<ProvenOriginRegistryHandlerInstall> {
-    let mut proven = structurally_proven_registry_forwarding_calls(program, scoping)
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenOriginRegistryHandlerInstall>, BudgetExceeded> {
+    let mut proven = structurally_proven_registry_forwarding_calls(program, scoping, budget)?
         .into_iter()
         .filter_map(|install| {
             let (origin, exact_key) = joined_origin_and_key(
@@ -197,7 +201,7 @@ pub fn proven_origin_registry_handler_installs(
         )
     });
     proven.dedup();
-    proven
+    Ok(proven)
 }
 
 #[cfg(test)]
@@ -211,6 +215,11 @@ mod tests {
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
+    use work_budget::WorkBudget;
+
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("registry-identity-test")
+    }
 
     #[test]
     fn joins_registry_reads_and_installs_by_exact_origin_and_key() {
@@ -231,8 +240,16 @@ mod tests {
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
         let flow = structurally_proven_origin_flow(&parsed.program, scoping);
-        let installs = proven_origin_registry_handler_installs(&parsed.program, scoping, &flow);
-        let reads = proven_origin_registry_read_calls(&parsed.program, scoping, &flow);
+        let installs = proven_origin_registry_handler_installs(
+            &parsed.program,
+            scoping,
+            &flow,
+            &test_budget(),
+        )
+        .expect("proven_origin_registry_handler_installs");
+        let reads =
+            proven_origin_registry_read_calls(&parsed.program, scoping, &flow, &test_budget())
+                .expect("proven_origin_registry_read_calls");
         assert_eq!(installs.len(), 1);
         assert_eq!(reads.len(), 1);
         assert_eq!(installs[0].exact_key, 7);
@@ -261,8 +278,16 @@ mod tests {
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
         let flow = structurally_proven_origin_flow(&parsed.program, scoping);
-        let values = proven_origin_registry_value_installs(&parsed.program, scoping, &flow);
-        let handlers = proven_origin_registry_handler_installs(&parsed.program, scoping, &flow);
+        let values =
+            proven_origin_registry_value_installs(&parsed.program, scoping, &flow, &test_budget())
+                .expect("proven_origin_registry_value_installs");
+        let handlers = proven_origin_registry_handler_installs(
+            &parsed.program,
+            scoping,
+            &flow,
+            &test_budget(),
+        )
+        .expect("proven_origin_registry_handler_installs");
         assert_eq!(values.len(), 1);
         let root = values
             .iter()
@@ -295,7 +320,9 @@ mod tests {
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
         let flow = structurally_proven_origin_flow(&parsed.program, scoping);
-        let reads = proven_origin_registry_read_calls(&parsed.program, scoping, &flow);
+        let reads =
+            proven_origin_registry_read_calls(&parsed.program, scoping, &flow, &test_budget())
+                .expect("proven_origin_registry_read_calls");
         assert_eq!(reads.len(), 1);
         assert_eq!(reads[0].exact_key, None);
         assert_eq!(reads[0].read.registry_path, vec!["T"]);
@@ -320,8 +347,16 @@ mod tests {
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
         let flow = structurally_proven_origin_flow(&parsed.program, scoping);
-        let installs = proven_origin_registry_handler_installs(&parsed.program, scoping, &flow);
-        let reads = proven_origin_registry_read_calls(&parsed.program, scoping, &flow);
+        let installs = proven_origin_registry_handler_installs(
+            &parsed.program,
+            scoping,
+            &flow,
+            &test_budget(),
+        )
+        .expect("proven_origin_registry_handler_installs");
+        let reads =
+            proven_origin_registry_read_calls(&parsed.program, scoping, &flow, &test_budget())
+                .expect("proven_origin_registry_read_calls");
         assert_eq!(installs.len(), 1);
         assert!(reads.is_empty());
     }

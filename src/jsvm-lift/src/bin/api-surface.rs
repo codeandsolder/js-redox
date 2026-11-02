@@ -1,13 +1,21 @@
 use anyhow::{Context, Result};
 use clap::Parser as ClapParser;
-use jsvm_lift::api_surface::{analyze_api_surface, ApiCallsite};
+use jsvm_lift::{
+    analysis_budget::{AnalysisBudgets, AnalysisOperation},
+    api_surface::{analyze_api_surface, ApiCallsite},
+};
 use serde::Serialize;
 use std::{fs, path::PathBuf};
 
 #[derive(ClapParser, Debug)]
 #[command(about = "Extract static browser API request callsites from JavaScript")]
 struct Args {
-    input: PathBuf,
+    /// Analyze one JavaScript file.
+    #[arg(required_unless_present = "project")]
+    input: Option<PathBuf>,
+    /// Analyze every selected JavaScript unit in a capture project and write analysis/api-surface.json.
+    #[arg(long, conflicts_with = "input")]
+    project: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -20,13 +28,26 @@ struct ApiSurfaceFileReport {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let source = fs::read_to_string(&args.input)
-        .with_context(|| format!("reading {}", args.input.display()))?;
-    let callsites = analyze_api_surface(&source)
-        .with_context(|| format!("analyzing {}", args.input.display()))?;
+    if let Some(project) = args.project {
+        let summary = jsvm_lift::project_api_surface::analyze_project_api_surface(
+            &project,
+            &AnalysisBudgets::standard("api-surface-project"),
+        )?;
+        println!("{}", serde_json::to_string(&summary)?);
+        return Ok(());
+    }
+    let input = args
+        .input
+        .context("input is required unless --project is used")?;
+    let source =
+        fs::read_to_string(&input).with_context(|| format!("reading {}", input.display()))?;
+    let budgets = AnalysisBudgets::standard("api-surface");
+    let budget = budgets.operation(AnalysisOperation::ApiSurface, input.display().to_string());
+    let callsites = analyze_api_surface(&source, &budget)
+        .with_context(|| format!("analyzing {}", input.display()))?;
     let report = ApiSurfaceFileReport {
         schema: "jsvm-api-surface/v2",
-        input: args.input.display().to_string(),
+        input: input.display().to_string(),
         bytes: source.len(),
         callsites,
     };

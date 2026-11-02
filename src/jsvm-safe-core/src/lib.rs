@@ -1,4 +1,5 @@
 mod base91;
+mod base91_recovery;
 mod browser_legacy;
 mod control_flow;
 mod decoder;
@@ -55,6 +56,12 @@ pub use value_eval::{
     eval as eval_static_primitive, eval_with_resolver as eval_static_primitive_with_resolver,
     known_bool_with_resolver as known_static_bool_with_resolver, string_literal_value,
     template_element_value, Value as StaticPrimitiveValue,
+};
+use work_budget::{BudgetExceeded, WorkBudget};
+
+pub use base91_recovery::{
+    recover_base91_strings_with_source_mode, Base91DecoderProof, Base91Iteration,
+    Base91RecoveryResult,
 };
 
 #[must_use]
@@ -1269,32 +1276,45 @@ fn transform_once(
     arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
     standard_numeric_builtins: bool,
-) -> Option<String> {
+    budget: &WorkBudget,
+) -> Result<Option<String>, BudgetExceeded> {
+    budget.checkpoint()?;
     let allocator = Allocator::default();
-    let program = parse_as(&allocator, source, source_type)?;
+    let Some(program) = parse_as(&allocator, source, source_type) else {
+        return Ok(None);
+    };
+    budget.checkpoint()?;
     let semantic_ret = SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&program);
     if !semantic_ret.diagnostics.is_empty() {
-        return None;
+        return Ok(None);
     }
+    budget.checkpoint()?;
     let semantic = semantic_ret.semantic;
     let scoping = semantic.scoping();
 
     let arrays = static_readonly_arrays(&program, scoping);
+    budget.checkpoint()?;
     let reference_spans = collect_reference_spans(&program);
+    budget.checkpoint()?;
     let decoder_analysis = analyze_decoders(source, &program, scoping, &reference_spans);
+    budget.checkpoint()?;
     let decoders = decoder_analysis.decoders;
     let mut protected_spans = decoder_analysis.protected_spans;
     let mut initial_replacements = decoder_analysis.replacements;
     let constants = collect_const_values(&program, scoping);
+    budget.checkpoint()?;
     let shorthand_spans = collect_shorthand_spans(&program);
     let proxies = collect_proxy_objects(&program, scoping);
+    budget.checkpoint()?;
     let pure_functions = collect_pure_functions(&program, scoping);
     let from_char_code_aliases = collect_from_char_code_aliases(&program, scoping);
     let global_object_aliases = collect_global_object_aliases(&program, scoping);
+    budget.checkpoint()?;
     let reference_identity_tables =
         detect_reference_identity_tables(source, scoping, &reference_spans);
+    budget.checkpoint()?;
     protected_spans.extend(
         reference_identity_tables
             .values()
@@ -1304,12 +1324,14 @@ fn transform_once(
     let var_number_initializers = collect_var_number_initializers(&program);
     let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
     let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
+    budget.checkpoint()?;
     initial_replacements.extend(remove_unused_proven_helpers(
         scoping,
         &decoder_analysis.removable_helpers,
         &pure_functions,
         has_direct_eval(&program),
     ));
+    budget.checkpoint()?;
 
     let mut collector = Collector {
         source,
@@ -1333,16 +1355,17 @@ fn transform_once(
         replacements: initial_replacements,
     };
     collector.visit_program(&program);
+    budget.checkpoint()?;
     if collector.replacements.is_empty() {
-        Some(source.to_string())
+        Ok(Some(source.to_string()))
     } else {
-        apply(
+        Ok(apply(
             source,
             collector.replacements,
             counts,
             arithmetic_state_proofs,
             iteration,
-        )
+        ))
     }
 }
 
@@ -1358,36 +1381,49 @@ fn recover_static_decoders_with_mode(
     source: &str,
     max_iterations: usize,
     source_mode: SafeSourceMode,
-) -> Option<StaticDecoderRecoveryResult> {
-    let source_type = semantically_valid_source_type(source, source_mode)?;
+    budget: &WorkBudget,
+) -> Result<Option<StaticDecoderRecoveryResult>, BudgetExceeded> {
+    budget.checkpoint()?;
+    let Some(source_type) = semantically_valid_source_type(source, source_mode) else {
+        return Ok(None);
+    };
+    budget.checkpoint()?;
     let mut current = source.to_string();
     let mut counts = Counts::default();
     let mut iterations = 0usize;
     let mut decoder_candidates = 0usize;
 
     for iteration in 1..=max_iterations {
+        budget.consume(1)?;
         let allocator = Allocator::default();
-        let program = parse_as(&allocator, &current, source_type)?;
+        let Some(program) = parse_as(&allocator, &current, source_type) else {
+            return Ok(None);
+        };
+        budget.checkpoint()?;
         let semantic_ret = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&program);
         if !semantic_ret.diagnostics.is_empty() {
-            return None;
+            return Ok(None);
         }
+        budget.checkpoint()?;
         let scoping = semantic_ret.semantic.scoping();
         let reference_spans = collect_reference_spans(&program);
         let pass = static_decoder_pass(&current, &program, scoping, &reference_spans);
+        budget.checkpoint()?;
         decoder_candidates = decoder_candidates.max(pass.decoder_count);
         if pass.replacements.is_empty() {
             break;
         }
-        let next = apply(
+        let Some(next) = apply(
             &current,
             pass.replacements,
             &mut counts,
             &mut Vec::new(),
             iteration,
-        )?;
+        ) else {
+            return Ok(None);
+        };
         if next == current {
             break;
         }
@@ -1395,29 +1431,29 @@ fn recover_static_decoders_with_mode(
         current = next;
     }
 
-    Some(StaticDecoderRecoveryResult {
+    Ok(Some(StaticDecoderRecoveryResult {
         source: current,
         iterations,
         transforms: counts.into_inner(),
         decoder_candidates,
-    })
+    }))
 }
 
-#[must_use]
 pub fn recover_static_decoders(
     source: &str,
     max_iterations: usize,
-) -> Option<StaticDecoderRecoveryResult> {
-    recover_static_decoders_with_mode(source, max_iterations, SafeSourceMode::Auto)
+    budget: &WorkBudget,
+) -> Result<Option<StaticDecoderRecoveryResult>, BudgetExceeded> {
+    recover_static_decoders_with_mode(source, max_iterations, SafeSourceMode::Auto, budget)
 }
 
-#[must_use]
 pub fn recover_static_decoders_with_source_mode(
     source: &str,
     max_iterations: usize,
     source_mode: SafeSourceMode,
-) -> Option<StaticDecoderRecoveryResult> {
-    recover_static_decoders_with_mode(source, max_iterations, source_mode)
+    budget: &WorkBudget,
+) -> Result<Option<StaticDecoderRecoveryResult>, BudgetExceeded> {
+    recover_static_decoders_with_mode(source, max_iterations, source_mode, budget)
 }
 
 #[derive(Debug, Clone)]
@@ -1435,7 +1471,9 @@ fn deobfuscate_with_mode(
     max_iterations: usize,
     standard_numeric_builtins: bool,
     source_mode: SafeSourceMode,
-) -> Option<SafeTransformResult> {
+    budget: &WorkBudget,
+) -> Result<Option<SafeTransformResult>, BudgetExceeded> {
+    budget.checkpoint()?;
     // Select a source mode only after both parsing and semantic validation. Some
     // legacy browser scripts parse as modules but are invalid under module
     // strictness (for example duplicate top-level function declarations) while
@@ -1448,17 +1486,19 @@ fn deobfuscate_with_mode(
             // The masked recovery is analysis-only. Until the proof engine can
             // model the legacy assignment target directly, preserving the exact
             // original source is the only semantics-preserving transform.
-            return Some(SafeTransformResult {
+            budget.checkpoint()?;
+            return Ok(Some(SafeTransformResult {
                 source: source.to_string(),
                 iterations: 0,
                 transforms: BTreeMap::new(),
                 arithmetic_state_proofs: Vec::new(),
                 analysis_complete: false,
                 source_recovery: Some(SafeSourceRecovery::BrowserLegacyCallAssignment),
-            });
+            }));
         }
-        Err(_) => return None,
+        Err(_) => return Ok(None),
     };
+    budget.checkpoint()?;
 
     let mut current = source.to_string();
     let mut counts = Counts::default();
@@ -1466,14 +1506,19 @@ fn deobfuscate_with_mode(
     let mut arithmetic_state_proofs = Vec::new();
 
     for iteration in 1..=max_iterations {
-        let next = transform_once(
+        budget.consume(1)?;
+        let Some(next) = transform_once(
             &current,
             source_type,
             &mut counts,
             &mut arithmetic_state_proofs,
             iteration,
             standard_numeric_builtins,
-        )?;
+            budget,
+        )?
+        else {
+            return Ok(None);
+        };
         if next == current {
             break;
         }
@@ -1484,63 +1529,74 @@ fn deobfuscate_with_mode(
     // Every ordinary fixed-point exit has already validated `current` at the
     // start of its final no-op iteration. If every allowed iteration changed
     // the source, however, there is no next iteration to validate the final
-    // rewrite. Revalidate only that budget-exhaustion case so callers can never
-    // receive syntactically or semantically invalid transformed source.
+    // rewrite. Revalidate only that iteration-budget-exhaustion case so callers
+    // can never receive syntactically or semantically invalid transformed source.
     if max_iterations > 0 && iterations == max_iterations {
+        budget.checkpoint()?;
         let allocator = Allocator::default();
-        let program = parse_as(&allocator, &current, source_type)?;
+        let Some(program) = parse_as(&allocator, &current, source_type) else {
+            return Ok(None);
+        };
         let semantic_ret = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&program);
         if !semantic_ret.diagnostics.is_empty() {
-            return None;
+            return Ok(None);
         }
+        budget.checkpoint()?;
     }
 
-    Some(SafeTransformResult {
+    Ok(Some(SafeTransformResult {
         source: current,
         iterations,
         transforms: counts.into_inner(),
         arithmetic_state_proofs,
         analysis_complete: true,
         source_recovery: None,
-    })
+    }))
 }
 
-#[must_use]
-pub fn deobfuscate(source: &str, max_iterations: usize) -> Option<SafeTransformResult> {
-    deobfuscate_with_mode(source, max_iterations, false, SafeSourceMode::Auto)
+pub fn deobfuscate(
+    source: &str,
+    max_iterations: usize,
+    budget: &WorkBudget,
+) -> Result<Option<SafeTransformResult>, BudgetExceeded> {
+    deobfuscate_with_mode(source, max_iterations, false, SafeSourceMode::Auto, budget)
 }
 
 /// Proof-oriented deobfuscation with an explicit host-language source mode.
 /// Use this when filename semantics make module/CommonJS mode authoritative.
-#[must_use]
 pub fn deobfuscate_with_source_mode(
     source: &str,
     max_iterations: usize,
     source_mode: SafeSourceMode,
-) -> Option<SafeTransformResult> {
-    deobfuscate_with_mode(source, max_iterations, false, source_mode)
+    budget: &WorkBudget,
+) -> Result<Option<SafeTransformResult>, BudgetExceeded> {
+    deobfuscate_with_mode(source, max_iterations, false, source_mode, budget)
 }
 
 /// Proof-oriented variant that may evaluate standard numeric globals such as
 /// `Number`, `parseInt`, and `Math.floor` through a proven stable global-object
 /// alias. Callers must surface this assumption in any claim derived from the
 /// transformed source; ordinary source rewriting must use [`deobfuscate`].
-#[must_use]
 pub fn deobfuscate_with_standard_numeric_builtins(
     source: &str,
     max_iterations: usize,
-) -> Option<SafeTransformResult> {
-    deobfuscate_with_mode(source, max_iterations, true, SafeSourceMode::Auto)
+    budget: &WorkBudget,
+) -> Result<Option<SafeTransformResult>, BudgetExceeded> {
+    deobfuscate_with_mode(source, max_iterations, true, SafeSourceMode::Auto, budget)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        deobfuscate, deobfuscate_with_source_mode, deobfuscate_with_standard_numeric_builtins,
-        expose_static_strings, recover_static_decoders, safe_source_rejection,
+        deobfuscate as deobfuscate_budgeted,
+        deobfuscate_with_source_mode as deobfuscate_with_source_mode_budgeted,
+        deobfuscate_with_standard_numeric_builtins as deobfuscate_with_standard_numeric_builtins_budgeted,
+        expose_static_strings as expose_static_strings_budgeted,
+        recover_static_decoders as recover_static_decoders_budgeted, safe_source_rejection,
         ProvenConstantEnvironment, SafeSourceMode, SafeSourceRecovery, SafeSourceRejection,
+        SafeTransformResult, StaticDecoderRecoveryResult, StaticStringExposureResult,
     };
     use oxc_allocator::Allocator;
     use oxc_ast::ast::{CallExpression, Expression};
@@ -1548,6 +1604,66 @@ mod tests {
     use oxc_semantic::{Scoping, SemanticBuilder};
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
+
+    use work_budget::WorkBudget;
+
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("jsvm-safe-core-test")
+    }
+
+    fn deobfuscate(source: &str, max_iterations: usize) -> Option<SafeTransformResult> {
+        deobfuscate_budgeted(source, max_iterations, &test_budget())
+            .ok()
+            .flatten()
+    }
+
+    fn deobfuscate_with_source_mode(
+        source: &str,
+        max_iterations: usize,
+        source_mode: SafeSourceMode,
+    ) -> Option<SafeTransformResult> {
+        deobfuscate_with_source_mode_budgeted(source, max_iterations, source_mode, &test_budget())
+            .ok()
+            .flatten()
+    }
+
+    fn deobfuscate_with_standard_numeric_builtins(
+        source: &str,
+        max_iterations: usize,
+    ) -> Option<SafeTransformResult> {
+        deobfuscate_with_standard_numeric_builtins_budgeted(source, max_iterations, &test_budget())
+            .ok()
+            .flatten()
+    }
+
+    fn recover_static_decoders(
+        source: &str,
+        max_iterations: usize,
+    ) -> Option<StaticDecoderRecoveryResult> {
+        recover_static_decoders_budgeted(source, max_iterations, &test_budget())
+            .ok()
+            .flatten()
+    }
+
+    fn expose_static_strings(
+        source: &str,
+        max_iterations: usize,
+    ) -> Option<StaticStringExposureResult> {
+        expose_static_strings_budgeted(source, max_iterations, &test_budget())
+            .ok()
+            .flatten()
+    }
+
+    #[test]
+    fn safe_deobfuscation_propagates_work_budget_exhaustion() {
+        let budget = WorkBudget::new("safe-deob-fuel", work_budget::BudgetLimits::work(0));
+        assert!(matches!(
+            deobfuscate_budgeted("const x = 1 + 2; sink(x);", 8, &budget),
+            Err(ref error)
+                if error.kind() == work_budget::BudgetExceededKind::Work
+                    && error.scope() == "safe-deob-fuel"
+        ));
+    }
 
     #[test]
     fn proven_constant_environment_respects_identity_and_declaration_order() {
@@ -2434,6 +2550,133 @@ console.log(d(0x10,"k"),d(0x11,"k"));
         assert!(!proof.source.contains("out.push(\"bad\")"));
         assert!(!proof.source.contains("out.push(\"wrong\")"));
         assert!(proof
+            .transforms
+            .get("reference_state_unflatten")
+            .is_some_and(|count| *count >= 1));
+    }
+}
+
+#[cfg(test)]
+mod fixture_regressions {
+    use super::{deobfuscate, safe_source_rejection, SafeSourceMode};
+    use work_budget::WorkBudget;
+
+    fn checked(source: &str) -> super::SafeTransformResult {
+        let result = deobfuscate(source, 16, &WorkBudget::unlimited("fixture-regression"))
+            .ok()
+            .flatten();
+        assert!(
+            result.is_some(),
+            "fixture should be accepted by safe deobfuscation"
+        );
+        let Some(result) = result else {
+            unreachable!();
+        };
+        assert_eq!(
+            safe_source_rejection(&result.source, SafeSourceMode::Auto),
+            None,
+            "transformed fixture must remain parser-valid"
+        );
+        result
+    }
+
+    #[test]
+    fn selector_dispatch_fixture_specializes_only_proven_calls() {
+        let source =
+            include_str!("../../../corpus/generated/reversible-obfuscation/selector-dispatch.js");
+        let result = checked(source);
+        assert_eq!(
+            result.transforms.get("selector_dispatch_specialize"),
+            Some(&7)
+        );
+        assert!(result.source.contains("dispatch(42, 9, 4)"));
+        assert_eq!(result.source.matches("ambiguous(1, 4)").count(), 2);
+    }
+
+    #[test]
+    fn direct_table_fixture_keeps_unsafe_decoder_shapes_dynamic() {
+        let source = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/datadome-direct-table.js"
+        );
+        let result = checked(source);
+        for dynamic in [
+            "QInvalid(0)",
+            "QDecoy(0)",
+            "CDecoy(0)",
+            "reassigned(5, 2)",
+            "QEscaped(0)",
+            "QInternalEscaped(0)",
+            "QReassigned(0)",
+            "QSideEffect(0)",
+            "C(7)",
+            "C(dynamicChoice ? 0 : 7)",
+            "CFixedSide(0)",
+        ] {
+            assert!(
+                result.source.contains(dynamic),
+                "missing dynamic shape {dynamic}"
+            );
+        }
+        assert!(!result.source.contains("C(dynamicChoice ? 0 : 1)"));
+        for recovered in [
+            "\"cookie\"",
+            "\"reload\"",
+            "\"parseInt\"",
+            "17",
+            "true",
+            "null",
+        ] {
+            assert!(
+                result.source.contains(recovered),
+                "missing recovered value {recovered}"
+            );
+        }
+        assert!(result
+            .transforms
+            .get("string_array_decode")
+            .is_some_and(|count| *count >= 15));
+        assert!(result
+            .transforms
+            .get("pure_function_eval")
+            .is_some_and(|count| *count >= 5));
+    }
+
+    #[test]
+    fn sparse_direct_table_fixture_folds_only_proven_entries() {
+        let source =
+            include_str!("../../../corpus/generated/reversible-obfuscation/sparse-direct-table.js");
+        let result = checked(source);
+        for folded in ["QSparse(0)", "QSparse(2)", "CSparse(0)", "CSparse(2)"] {
+            assert!(!result.source.contains(folded), "failed to fold {folded}");
+        }
+        for dynamic in ["QSparse(1)", "CSparse(1)", "INested(1)"] {
+            assert!(
+                result.source.contains(dynamic),
+                "lost dynamic shape {dynamic}"
+            );
+        }
+        assert!(!result.source.contains("INested(0)"));
+        assert!(result
+            .transforms
+            .get("string_array_decode")
+            .is_some_and(|count| *count >= 5));
+    }
+
+    #[test]
+    fn reference_identity_fixture_unflattens_proven_state_machine() {
+        let source = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/reference-identity-table.js"
+        );
+        let result = checked(source);
+        assert!(!result.source.contains("S[0][0] === S[4][0]"));
+        assert!(!result.source.contains("S[0][0] !== S[0][1]"));
+        assert!(!result.source.contains("switch (state)"));
+        assert!(!result.source.contains("switch(state)"));
+        assert!(result
+            .transforms
+            .get("reference_identity_compare")
+            .is_some_and(|count| *count >= 4));
+        assert!(result
             .transforms
             .get("reference_state_unflatten")
             .is_some_and(|count| *count >= 1));

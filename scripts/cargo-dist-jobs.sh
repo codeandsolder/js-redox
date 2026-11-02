@@ -6,17 +6,16 @@ if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
   exit 0
 fi
 
-if command -v sccache >/dev/null 2>&1 && command -v uv >/dev/null 2>&1; then
+if command -v sccache >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
   status=$(sccache --dist-status 2>/dev/null || true)
   parsed=$(
-    printf '%s' "$status" | uv run --no-project python -c '
-import json, sys
-try:
-    d=json.load(sys.stdin)["SchedulerStatus"][1]
-    print(int(d["num_cpus"]), int(d.get("in_progress", 0)))
-except Exception:
-    pass
-' 2>/dev/null || true
+    printf '%s' "$status" | jq -r '
+      try (
+        .SchedulerStatus[1]
+        | [(.num_cpus | tonumber), ((.in_progress // 0) | tonumber)]
+        | @tsv
+      ) catch empty
+    ' 2>/dev/null || true
   )
   cpus=""
   busy=""
@@ -37,7 +36,8 @@ except Exception:
 
     jobs=$cap
     (( free < jobs )) && jobs=$free
-    printf '%s\n' "$jobs"
+    printf '%s
+' "$jobs"
     exit 0
   fi
 fi

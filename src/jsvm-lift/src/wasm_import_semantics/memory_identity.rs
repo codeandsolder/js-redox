@@ -16,6 +16,7 @@ use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use work_budget::{BudgetExceeded, WorkBudget};
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct WasmInstanceExportCall {
@@ -1023,11 +1024,35 @@ fn normalized_initializer_proof(
     helper_name: &str,
     exports_binding: &str,
     parameter: usize,
-) -> Option<NormalizedInitializerProof> {
-    let normalized = jsvm_safe_core::deobfuscate_with_standard_numeric_builtins(source, 16)?;
+    budget: &WorkBudget,
+) -> Result<Option<NormalizedInitializerProof>, BudgetExceeded> {
+    budget.checkpoint()?;
+    let Some(normalized) =
+        jsvm_safe_core::deobfuscate_with_standard_numeric_builtins(source, 16, budget)?
+    else {
+        return Ok(None);
+    };
+    budget.checkpoint()?;
+    normalized_initializer_proof_from_source(
+        &normalized.source,
+        helper_name,
+        exports_binding,
+        parameter,
+        budget,
+    )
+}
+
+fn normalized_initializer_proof_from_source(
+    source: &str,
+    helper_name: &str,
+    exports_binding: &str,
+    parameter: usize,
+    budget: &WorkBudget,
+) -> Result<Option<NormalizedInitializerProof>, BudgetExceeded> {
     for source_type in [SourceType::unambiguous(), SourceType::cjs()] {
+        budget.consume(1)?;
         let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, &normalized.source, source_type);
+        let parsed = parse_program(&allocator, source, source_type);
         if !parsed.is_clean() {
             continue;
         }
@@ -1038,7 +1063,7 @@ fn normalized_initializer_proof(
             continue;
         }
         let scoping = semantic.semantic.scoping();
-        let global_aliases = collect_global_aliases(&parsed.program, scoping);
+        let global_aliases = collect_global_aliases(&parsed.program, scoping, budget)?;
         let mut proven = Vec::new();
         struct HelperFinder<'c, 's> {
             scoping: &'c Scoping,
@@ -1310,10 +1335,10 @@ fn normalized_initializer_proof(
         };
         finder.visit_program(&parsed.program);
         if let [proof] = proven.as_slice() {
-            return Some(*proof);
+            return Ok(Some(*proof));
         }
     }
-    None
+    Ok(None)
 }
 
 fn unique_exact_instance_paths(
@@ -1361,12 +1386,15 @@ pub(super) fn collect_module_memory_identity_proofs(
     scoping: &Scoping,
     global_aliases: &HashMap<SymbolId, String>,
     instantiation_sites: &HashMap<(u32, u32), Vec<WasmInstantiationSite>>,
-) -> Vec<WasmModuleMemoryIdentityProof> {
+    budget: &WorkBudget,
+) -> Result<Vec<WasmModuleMemoryIdentityProof>, BudgetExceeded> {
+    budget.checkpoint()?;
     let mut function_collector = FunctionCollector {
         scoping,
         functions: HashMap::new(),
     };
     function_collector.visit_program(program);
+    budget.checkpoint()?;
 
     let mut write_collector = ExportsWriteCollector {
         scoping,
@@ -1375,24 +1403,28 @@ pub(super) fn collect_module_memory_identity_proofs(
         writes: HashMap::new(),
     };
     write_collector.visit_program(program);
+    budget.checkpoint()?;
 
     let mut getter_collector = MemoryGetterCollector {
         scoping,
         candidates: Vec::new(),
     };
     getter_collector.visit_program(program);
+    budget.checkpoint()?;
 
     let mut binding_collector = InstanceBindingCollector {
         scoping,
         paths: Vec::new(),
     };
     binding_collector.visit_program(program);
+    budget.checkpoint()?;
 
     let mut promise_collector = PromiseInstanceCollector {
         scoping,
         paths: Vec::new(),
     };
     promise_collector.visit_program(program);
+    budget.checkpoint()?;
 
     let mut length_collector = StableUint32ArrayLengthCollector {
         scoping,
@@ -1400,6 +1432,7 @@ pub(super) fn collect_module_memory_identity_proofs(
         lengths: HashMap::new(),
     };
     length_collector.visit_program(program);
+    budget.checkpoint()?;
 
     let mut proofs = Vec::new();
     for getter in getter_collector.candidates {
@@ -1424,7 +1457,9 @@ pub(super) fn collect_module_memory_identity_proofs(
             &function.name,
             &getter.exports_binding,
             write.parameter,
-        ) else {
+            budget,
+        )?
+        else {
             continue;
         };
         if !initializer_proof.write_dominates_normal_exit {
@@ -1573,5 +1608,5 @@ pub(super) fn collect_module_memory_identity_proofs(
             .then_with(|| left.instance_binding.cmp(&right.instance_binding))
     });
     proofs.dedup();
-    proofs
+    Ok(proofs)
 }

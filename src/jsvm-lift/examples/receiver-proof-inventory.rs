@@ -31,6 +31,7 @@ use oxc_span::{GetSpan, SourceType, Span};
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
+use work_budget::WorkBudget;
 
 fn snippet(source: &str, start: u32, end: u32) -> String {
     source
@@ -42,6 +43,7 @@ fn snippet(source: &str, start: u32, end: u32) -> String {
 }
 
 fn main() -> Result<()> {
+    let budget = WorkBudget::unlimited("receiver-proof-inventory");
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let summary = args.iter().any(|arg| arg == "--summary");
     let runtime_only = args.iter().any(|arg| arg == "--runtime-only");
@@ -317,7 +319,7 @@ fn main() -> Result<()> {
             })
                 })
                 .collect::<Vec<_>>();
-        let reads = proven_origin_registry_read_calls(&parsed.program, scoping, &seeded)
+        let reads = proven_origin_registry_read_calls(&parsed.program, scoping, &seeded, &budget)?
             .into_iter()
             .filter(|proof| {
                 (
@@ -337,8 +339,13 @@ fn main() -> Result<()> {
                 })
             })
             .collect::<Vec<_>>();
-        let table_analysis =
-            table_vm::analyze_with_registry_origins(&source, &parsed.program, &base, &seeded);
+        let table_analysis = table_vm::analyze_with_registry_origins(
+            &source,
+            &parsed.program,
+            &base,
+            &seeded,
+            &budget,
+        )?;
         let origin_prefix = format!(
             "origin@{}-{}:{}-{}",
             target_origin.0, target_origin.1, target_origin.2, target_origin.3
@@ -360,7 +367,7 @@ fn main() -> Result<()> {
             })
             .collect::<Vec<_>>();
         let seeded_installs =
-            proven_origin_registry_handler_installs(&parsed.program, scoping, &seeded)
+            proven_origin_registry_handler_installs(&parsed.program, scoping, &seeded, &budget)?
                 .into_iter()
                 .filter(|proof| {
                     (
@@ -379,29 +386,30 @@ fn main() -> Result<()> {
                     })
                 })
                 .collect::<Vec<_>>();
-        let installs = proven_origin_registry_handler_installs(&parsed.program, scoping, &base)
-            .into_iter()
-            .filter(|proof| {
-                (
-                    proof.origin.allocation_start,
-                    proof.origin.allocation_end,
-                    proof.origin.constructor_start,
-                    proof.origin.constructor_end,
-                ) == target_origin
-            })
-            .map(|proof| {
-                json!({
-                    "call": [proof.install.call_start, proof.install.call_end],
-                    "receiver": [proof.install.receiver_start, proof.install.receiver_end],
-                    "key_span": [proof.install.key_start, proof.install.key_end],
-                    "exact_key": proof.exact_key,
-                    "registry_path": proof.install.registry_path,
-                    "handler": [proof.install.handler_start, proof.install.handler_end],
-                    "handler_params": proof.install.handler_params,
-                    "handler_async": proof.install.handler_async,
+        let installs =
+            proven_origin_registry_handler_installs(&parsed.program, scoping, &base, &budget)?
+                .into_iter()
+                .filter(|proof| {
+                    (
+                        proof.origin.allocation_start,
+                        proof.origin.allocation_end,
+                        proof.origin.constructor_start,
+                        proof.origin.constructor_end,
+                    ) == target_origin
                 })
-            })
-            .collect::<Vec<_>>();
+                .map(|proof| {
+                    json!({
+                        "call": [proof.install.call_start, proof.install.call_end],
+                        "receiver": [proof.install.receiver_start, proof.install.receiver_end],
+                        "key_span": [proof.install.key_start, proof.install.key_end],
+                        "exact_key": proof.exact_key,
+                        "registry_path": proof.install.registry_path,
+                        "handler": [proof.install.handler_start, proof.install.handler_end],
+                        "handler_params": proof.install.handler_params,
+                        "handler_async": proof.install.handler_async,
+                    })
+                })
+                .collect::<Vec<_>>();
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({

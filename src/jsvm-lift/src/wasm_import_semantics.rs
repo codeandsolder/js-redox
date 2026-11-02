@@ -11,6 +11,7 @@ use oxc_syntax::symbol::SymbolId;
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use std::collections::HashMap;
+use work_budget::{BudgetExceeded, WorkBudget};
 
 mod bulk_import;
 mod import_object;
@@ -715,12 +716,15 @@ fn analyze_program(
     module_filter: Option<&str>,
     import_filter: Option<&str>,
     offset_value: Option<u32>,
-) -> WasmImportSemanticsAnalysis {
+    budget: &WorkBudget,
+) -> Result<WasmImportSemanticsAnalysis, BudgetExceeded> {
+    budget.checkpoint()?;
     if has_dynamic_scope(program, scoping) {
-        return WasmImportSemanticsAnalysis::default();
+        return Ok(WasmImportSemanticsAnalysis::default());
     }
-    let global_aliases = collect_global_aliases(program, scoping);
-    let exact_module_sites = collect_exact_module_sites(source, program, scoping, &global_aliases);
+    let global_aliases = collect_global_aliases(program, scoping, budget)?;
+    let exact_module_sites =
+        collect_exact_module_sites(source, program, scoping, &global_aliases, budget)?;
     let instantiation_sites =
         collect_instantiation_sites(program, scoping, &global_aliases, &exact_module_sites);
     let module_memory_identity_proofs =
@@ -731,7 +735,8 @@ fn analyze_program(
                 scoping,
                 &global_aliases,
                 &instantiation_sites,
-            )
+                budget,
+            )?
         } else {
             Vec::new()
         };
@@ -766,19 +771,24 @@ fn analyze_program(
             .then_with(|| left.import_name.cmp(&right.import_name))
     });
     collector.import_object_usages.dedup();
-    WasmImportSemanticsAnalysis {
+    budget.checkpoint()?;
+    Ok(WasmImportSemanticsAnalysis {
         shapes: collector.reports,
         handler_semantics: collector.handler_semantics,
         proof_normalized_handler_semantics: Vec::new(),
         import_object_usages: collector.import_object_usages,
         module_memory_identity_proofs,
-    }
+    })
 }
 
-fn collect_proof_normalized_handler_semantics(source: &str) -> Vec<WasmImportHandlerShape> {
-    let Some(normalized) = jsvm_safe_core::deobfuscate_with_standard_numeric_builtins(source, 16)
+fn collect_proof_normalized_handler_semantics(
+    source: &str,
+    budget: &WorkBudget,
+) -> Result<Vec<WasmImportHandlerShape>, BudgetExceeded> {
+    let Some(normalized) =
+        jsvm_safe_core::deobfuscate_with_standard_numeric_builtins(source, 16, budget)?
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     for source_type in [SourceType::unambiguous(), SourceType::cjs()] {
         let allocator = Allocator::default();
@@ -794,9 +804,9 @@ fn collect_proof_normalized_handler_semantics(source: &str) -> Vec<WasmImportHan
         }
         let scoping = semantic.semantic.scoping();
         if has_dynamic_scope(&parsed.program, scoping) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let global_aliases = collect_global_aliases(&parsed.program, scoping);
+        let global_aliases = collect_global_aliases(&parsed.program, scoping, budget)?;
         struct Collector<'c, 'g> {
             scoping: &'c Scoping,
             global_aliases: &'g HashMap<SymbolId, String>,
@@ -874,9 +884,10 @@ fn collect_proof_normalized_handler_semantics(source: &str) -> Vec<WasmImportHan
                 .then_with(|| left.assignment_start.cmp(&right.assignment_start))
         });
         collector.shapes.dedup();
-        return collector.shapes;
+        budget.checkpoint()?;
+        return Ok(collector.shapes);
     }
-    Vec::new()
+    Ok(Vec::new())
 }
 
 fn analyze_source(
@@ -884,7 +895,9 @@ fn analyze_source(
     module_filter: Option<&str>,
     import_filter: Option<&str>,
     offset_value: Option<u32>,
-) -> WasmImportSemanticsAnalysis {
+    budget: &WorkBudget,
+) -> Result<WasmImportSemanticsAnalysis, BudgetExceeded> {
+    budget.checkpoint()?;
     for source_type in [SourceType::unambiguous(), SourceType::cjs()] {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, source_type);
@@ -904,53 +917,103 @@ fn analyze_source(
             module_filter,
             import_filter,
             offset_value,
-        );
+            budget,
+        )?;
         if module_filter.is_none() && import_filter.is_none() && offset_value.is_none() {
             analysis.proof_normalized_handler_semantics =
-                collect_proof_normalized_handler_semantics(source);
+                collect_proof_normalized_handler_semantics(source, budget)?;
         }
-        return analysis;
+        budget.checkpoint()?;
+        return Ok(analysis);
     }
-    WasmImportSemanticsAnalysis::default()
+    Ok(WasmImportSemanticsAnalysis::default())
 }
 
-#[must_use]
-pub fn proven_wasm_import_semantics(source: &str) -> WasmImportSemanticsAnalysis {
-    analyze_source(source, None, None, None)
+pub fn proven_wasm_import_semantics(
+    source: &str,
+    budget: &WorkBudget,
+) -> Result<WasmImportSemanticsAnalysis, BudgetExceeded> {
+    analyze_source(source, None, None, None, budget)
 }
 
-#[must_use]
 pub fn proven_wasm_import_semantics_for(
     source: &str,
     import_module: &str,
     import_name: &str,
     offset: u32,
-) -> WasmImportSemanticsAnalysis {
-    analyze_source(source, Some(import_module), Some(import_name), Some(offset))
+    budget: &WorkBudget,
+) -> Result<WasmImportSemanticsAnalysis, BudgetExceeded> {
+    analyze_source(
+        source,
+        Some(import_module),
+        Some(import_name),
+        Some(offset),
+        budget,
+    )
 }
 
-#[must_use]
 pub fn proven_wasm_import_data_view_set_u32_shapes(
     source: &str,
-) -> Vec<WasmImportDataViewSetU32Shape> {
-    proven_wasm_import_semantics(source).shapes
+    budget: &WorkBudget,
+) -> Result<Vec<WasmImportDataViewSetU32Shape>, BudgetExceeded> {
+    Ok(proven_wasm_import_semantics(source, budget)?.shapes)
 }
 
-#[must_use]
 pub fn proven_wasm_import_data_view_set_u32_shape_at_offset(
     source: &str,
     import_module: &str,
     import_name: &str,
     offset: u32,
-) -> Option<WasmImportDataViewSetU32Shape> {
+    budget: &WorkBudget,
+) -> Result<Option<WasmImportDataViewSetU32Shape>, BudgetExceeded> {
     let mut reports =
-        proven_wasm_import_semantics_for(source, import_module, import_name, offset).shapes;
-    (reports.len() == 1).then(|| reports.remove(0))
+        proven_wasm_import_semantics_for(source, import_module, import_name, offset, budget)?
+            .shapes;
+    Ok((reports.len() == 1).then(|| reports.remove(0)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        proven_wasm_import_data_view_set_u32_shape_at_offset as shape_at_offset_budgeted,
+        proven_wasm_import_data_view_set_u32_shapes as shapes_budgeted,
+        proven_wasm_import_semantics as semantics_budgeted,
+        proven_wasm_import_semantics_for as semantics_for_budgeted, *,
+    };
+
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("wasm-import-semantics-test")
+    }
+
+    fn proven_wasm_import_semantics(source: &str) -> WasmImportSemanticsAnalysis {
+        semantics_budgeted(source, &test_budget()).unwrap_or_default()
+    }
+
+    fn proven_wasm_import_semantics_for(
+        source: &str,
+        import_module: &str,
+        import_name: &str,
+        offset: u32,
+    ) -> WasmImportSemanticsAnalysis {
+        semantics_for_budgeted(source, import_module, import_name, offset, &test_budget())
+            .unwrap_or_default()
+    }
+
+    fn proven_wasm_import_data_view_set_u32_shapes(
+        source: &str,
+    ) -> Vec<WasmImportDataViewSetU32Shape> {
+        shapes_budgeted(source, &test_budget()).unwrap_or_default()
+    }
+
+    fn proven_wasm_import_data_view_set_u32_shape_at_offset(
+        source: &str,
+        import_module: &str,
+        import_name: &str,
+        offset: u32,
+    ) -> Option<WasmImportDataViewSetU32Shape> {
+        shape_at_offset_budgeted(source, import_module, import_name, offset, &test_budget())
+            .unwrap_or_default()
+    }
 
     #[test]
     fn proves_direct_and_wrapped_global_dataview_writes() {

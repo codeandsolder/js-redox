@@ -14,7 +14,22 @@
       "purpose": "Production DataDome browser tag; large anti-fraud/fingerprinting sample and current safe-deob hard case.",
       "bytes": 132516,
       "sha256": "9c002086227c79e328e8ddf2b5870de416af0d175615d9a90589d92e6d5c2714",
-      "pretty_path": "datadome/qwant-tags-v5.10.0.pretty.js"
+      "pretty_path": "datadome/qwant-tags-v5.10.0.pretty.js",
+      "expect_deob_transforms_min": {
+        "string_array_decode": 4000,
+        "pure_function_eval": 120,
+        "reference_identity_compare": 13,
+        "reference_state_unflatten": 36
+      },
+      "expect_deob_strings": [
+        "__selenium_evaluate",
+        "AudioContext",
+        "enumerateDevices",
+        "parseInt"
+      ],
+      "expect_scan_signals_min": {
+        "handler_tables": 3
+      }
     },
     {
       "id": "cloudflare-ecosia-orchestrate-1",
@@ -26,7 +41,17 @@
       "purpose": "Fresh managed-challenge orchestrator; sample 1 of a polymorphic wrapper pair.",
       "bytes": 240897,
       "sha256": "784d5f9958eb8e742f38de01eed29431accc9bbb836722688525c173b4130560",
-      "pretty_path": "cloudflare/ecosia-orchestrate-sample1.pretty.js"
+      "pretty_path": "cloudflare/ecosia-orchestrate-sample1.pretty.js",
+      "expect_deob_transforms_min": {
+        "string_array_decode": 90,
+        "computed_property": 90,
+        "materialize_decoder_rotation": 1,
+        "remove_decoder_rotation_iife": 1
+      },
+      "expect_scan_signals_min": {
+        "direct_switch_maps": 2,
+        "handler_function_tables": 6
+      }
     },
     {
       "id": "cloudflare-ecosia-orchestrate-2",
@@ -38,7 +63,17 @@
       "purpose": "Fresh managed-challenge orchestrator; sample 2 with reshuffled decoder/offset but stable protocol skeleton.",
       "bytes": 232932,
       "sha256": "feb2f98cb40bf6c82b37a571c3a5252bec99027bb3f652a8dfa8693f9067b618",
-      "pretty_path": "cloudflare/ecosia-orchestrate-sample2.pretty.js"
+      "pretty_path": "cloudflare/ecosia-orchestrate-sample2.pretty.js",
+      "expect_deob_transforms_min": {
+        "string_array_decode": 90,
+        "computed_property": 90,
+        "materialize_decoder_rotation": 1,
+        "remove_decoder_rotation_iife": 1
+      },
+      "expect_scan_signals_min": {
+        "direct_switch_maps": 2,
+        "handler_function_tables": 6
+      }
     },
     {
       "id": "cloudflare-main-chrome-raw",
@@ -50,7 +85,10 @@
       "purpose": "Compact raw Cloudflare fixture with a known external deobfuscated counterpart.",
       "bytes": 20639,
       "sha256": "68e18d639933ad44351c22a5dd89d9247bf103ac724a0e645bcf42e70c3d98c1",
-      "pretty_path": "cloudflare/main-chrome.pretty.js"
+      "pretty_path": "cloudflare/main-chrome.pretty.js",
+      "expect_scan_signals_min": {
+        "handler_function_tables": 1
+      }
     },
     {
       "id": "cloudflare-main-chrome-reference",
@@ -73,7 +111,11 @@
       "purpose": "Large browser anti-fraud/fingerprinting bundle; structurally different from challenge-page VMs.",
       "bytes": 647451,
       "sha256": "8a6caeb6bb26da3060bdd5cc213c63f327e764af9b0ac098d0916247133f5eb3",
-      "pretty_path": "castle/castle-Cs-TYKFF.pretty.js"
+      "pretty_path": "castle/castle-Cs-TYKFF.pretty.js",
+      "expect_diagnostics_max": 2,
+      "expect_scan_signals_min": {
+        "handler_function_tables": 4
+      }
     },
     {
       "id": "castle-reference",
@@ -96,7 +138,11 @@
       "purpose": "Current live Knitsail custom-VM body; heavily polymorphed relative to historical bodies while outer ABI stays stable.",
       "bytes": 63650,
       "sha256": "e414463345509a89678cd7dc9afa9b9391e4dce58a56f6a1e641990f2884fa5e",
-      "pretty_path": "google-knitsail/current-live-vm-20260927.pretty.js"
+      "pretty_path": "google-knitsail/current-live-vm-20260927.pretty.js",
+      "expect_scan_signals_min": {
+        "embedded": 1,
+        "if_ladder_state_machines_recursive": 40
+      }
     },
     {
       "id": "google-knitsail-public-reference",
@@ -170,5 +216,8 @@
       "bytes": 62928,
       "sha256": "4ed54d7d53efdc38268abf91688c87edec443db17c62d6101fbc7b156a5b09ad"
     }
-  ]
+  ],
+  "defaults": {
+    "expect_diagnostics_max": 0
+  }
 }

@@ -21,6 +21,21 @@ jobs:
       rust-components: "rustfmt clippy"
       timeout-minutes: 20
       command: |
+        python_files="$(git ls-files '*.py' '*.pyw' '*.pyi')"
+        python_shebang_files="$(
+          while IFS= read -r -d '' file; do
+            [[ -x "$file" ]] || continue
+            IFS= read -r first_line < "$file" || true
+            if [[ "$first_line" =~ ^#!.*(^|[[:space:]/])python([0-9.]*)?([[:space:]]|$) ]]; then
+              printf '%s\n' "$file"
+            fi
+          done < <(git ls-files -z)
+        )"
+        if [[ -n "$python_files" || -n "$python_shebang_files" ]]; then
+          printf 'tracked Python is not allowed in js-redox:\n%s\n%s\n' \
+            "$python_files" "$python_shebang_files"
+          exit 1
+        fi
         cargo +1.99.1 fmt --all -- --check
         cargo +1.99.1 test --locked --workspace
         cargo +1.99.1 clippy --locked --workspace --all-targets -- -D warnings
@@ -33,19 +48,5 @@ jobs:
       rust-toolchain: "1.99.1"
       timeout-minutes: 20
       command: |
-        pipx install uv
-        python3 scripts/check-capture-project-contract.py
-        python3 scripts/check-analysis-artifact-contract.py
         node tools/cloak-recorder/check-nested-cdp-session.mjs
-        cargo +1.99.1 build --locked --workspace --bins --target-dir .cargo-target-nodebug
-        python3 scripts/check-har-pipeline.py
-        python3 scripts/check-saved-page-pipeline.py
-        python3 scripts/check-har-content-classification.py
-        python3 scripts/check-safe-deobfuscate.py
-        python3 scripts/check-deobfuscation-source-mode-pipeline.py
-        python3 scripts/check-api-surface.py
-        python3 scripts/check-static-string-recovery.py
-        python3 scripts/check-vm-capture-pipeline.py
-        python3 scripts/check-wasm-capture-pipeline.py
-        python3 scripts/check-wasm-resource-provenance.py
-        python3 scripts/check-wasm-copied-input-boundary.py
+        cargo +1.99.1 test -p jsvm-lift --lib depythonify_safe_deob_ -- --ignored --nocapture

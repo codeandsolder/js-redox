@@ -4383,6 +4383,11 @@ mod tests {
     use oxc_semantic::SemanticBuilder;
     use oxc_span::{GetSpan, SourceType};
     use rolldown_redox::ecmascript::parse_program;
+    use work_budget::WorkBudget;
+
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("lazy-cell-test")
+    }
 
     fn shapes(source: &str) -> Vec<super::SlowLazyCellFactoryShape> {
         let allocator = Allocator::default();
@@ -4627,7 +4632,9 @@ mod tests {
             &parsed.program,
             semantic.semantic.scoping(),
             &flow,
-        );
+            &test_budget(),
+        )
+        .expect("proven_origin_registry_value_installs");
         let value = values
             .iter()
             .find(|proof| {
@@ -4905,7 +4912,9 @@ mod tests {
             &exact,
         )
         .expect("path state fields");
-        let reads = structurally_proven_lazy_registry_read_calls(&parsed.program, scoping);
+        let reads =
+            structurally_proven_lazy_registry_read_calls(&parsed.program, scoping, &test_budget())
+                .expect("lazy registry proof");
         let accessor = reads.first().expect("lazy accessor");
         let carrier = proven_slow_lazy_cell_prototype_carrier(
             source,
@@ -4923,7 +4932,13 @@ mod tests {
         let update =
             proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, &factory)
                 .expect("update state");
-        let installs = proven_origin_registry_handler_installs(&parsed.program, scoping, &flow);
+        let installs = proven_origin_registry_handler_installs(
+            &parsed.program,
+            scoping,
+            &flow,
+            &test_budget(),
+        )
+        .expect("proven_origin_registry_handler_installs");
         let install = installs
             .iter()
             .find(|install| install.exact_key == 7)
@@ -4936,7 +4951,9 @@ mod tests {
             install,
         )
         .expect("captured handler");
-        let values = proven_origin_registry_value_installs(&parsed.program, scoping, &flow);
+        let values =
+            proven_origin_registry_value_installs(&parsed.program, scoping, &flow, &test_budget())
+                .expect("proven_origin_registry_value_installs");
         let value = values
             .iter()
             .find(|value| {
@@ -5145,8 +5162,13 @@ mod tests {
             .iter()
             .find(|proof| proof.exact_key_value == 1_000_000)
             .expect("large exact key");
-        let origin_installs =
-            proven_origin_registry_handler_installs(&parsed.program, scoping, &flow);
+        let origin_installs = proven_origin_registry_handler_installs(
+            &parsed.program,
+            scoping,
+            &flow,
+            &test_budget(),
+        )
+        .expect("proven_origin_registry_handler_installs");
         let install_seven = origin_installs
             .iter()
             .find(|install| install.exact_key == 7)

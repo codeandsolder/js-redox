@@ -21,6 +21,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
 };
 use waffle::{entity::EntityRef, ExportKind, FrontendOptions, Module, OptOptions};
+use work_budget::WorkBudget;
 
 #[derive(Debug, Serialize)]
 pub struct ExportSemanticAnalysis {
@@ -34,8 +35,15 @@ pub struct ExportSemanticAnalysis {
     pub returns: Vec<SemanticReturnReport>,
 }
 
-pub fn analyze_export_semantics(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalysis> {
-    match catch_unwind(AssertUnwindSafe(|| analyze_inner(bytes, export_name))) {
+pub fn analyze_export_semantics(
+    bytes: &[u8],
+    export_name: &str,
+    budget: &WorkBudget,
+) -> Result<ExportSemanticAnalysis> {
+    budget.checkpoint()?;
+    match catch_unwind(AssertUnwindSafe(|| {
+        analyze_inner(bytes, export_name, budget)
+    })) {
         Ok(result) => result,
         Err(payload) => {
             let detail = payload
@@ -48,8 +56,14 @@ pub fn analyze_export_semantics(bytes: &[u8], export_name: &str) -> Result<Expor
     }
 }
 
-fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalysis> {
+fn analyze_inner(
+    bytes: &[u8],
+    export_name: &str,
+    budget: &WorkBudget,
+) -> Result<ExportSemanticAnalysis> {
+    budget.checkpoint()?;
     let mut module = Module::from_wasm_bytes(bytes, &FrontendOptions::default())?;
+    budget.checkpoint()?;
     let func = module
         .exports
         .iter()
@@ -62,16 +76,19 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
     // reachable internal call graph. Expand lazy defined bodies up front so an
     // unparsed internal helper is never mistaken for an opaque host import.
     module.expand_all_funcs()?;
+    budget.checkpoint()?;
     module.funcs[func]
         .body_mut()
         .context("body")?
         .optimize(&OptOptions::default());
+    budget.checkpoint()?;
     let call_names = build_semantic_call_names(&mut module, func);
     let body = module.funcs[func].body().context("body")?;
     let externref_bulk_copy_candidates = externref_bulk_copy_candidates(&module, body, &call_names);
 
     let mut candidates = Vec::new();
     for (block, def) in body.blocks.entries() {
+        budget.consume(1)?;
         for (param_index, (_, param)) in def.params.iter().enumerate() {
             let n = state_cmp_count(body, *param);
             if n >= 5 {
@@ -84,8 +101,10 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
     let mut machines = Vec::new();
     let mut metadata = Vec::new();
     for (cmp_count, dispatcher, param_index, state) in candidates {
+        budget.consume(1)?;
         let mut initial = BTreeSet::new();
         for (_, pred) in body.blocks.entries() {
+            budget.consume(1)?;
             pred.terminator.visit_targets(|target| {
                 if target.block == dispatcher {
                     if let Some(arg) = target.args.get(param_index) {
@@ -105,6 +124,7 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
         let mut unresolved = 0usize;
         let mut forks = 0usize;
         while let Some(current) = states.pop_front() {
+            budget.consume(1)?;
             if !seen.insert(current) || seen.len() > 256 {
                 continue;
             }
@@ -136,21 +156,20 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
         let order = linearized
             .clone()
             .unwrap_or_else(|| graph.keys().copied().collect());
-        let cases = order
-            .into_iter()
-            .map(|current| {
-                let trace = transitions_for(body, dispatcher, state, param_index, current);
-                summarize_state_case(
-                    body,
-                    dispatcher,
-                    state,
-                    param_index,
-                    current,
-                    &trace,
-                    &BTreeSet::new(),
-                )
-            })
-            .collect();
+        let mut cases = Vec::with_capacity(order.len());
+        for current in order {
+            budget.consume(1)?;
+            let trace = transitions_for(body, dispatcher, state, param_index, current);
+            cases.push(summarize_state_case(
+                body,
+                dispatcher,
+                state,
+                param_index,
+                current,
+                &trace,
+                &BTreeSet::new(),
+            ));
+        }
 
         let machine_index = machines.len();
         machines.push(StateMachineReport {
@@ -174,16 +193,25 @@ fn analyze_inner(bytes: &[u8], export_name: &str) -> Result<ExportSemanticAnalys
             param_index,
         });
     }
+    budget.checkpoint()?;
     annotate_initial_entries(body, &mut machines, &metadata);
+    budget.checkpoint()?;
     annotate_nested_machines(body, &mut machines, &metadata);
+    budget.checkpoint()?;
     annotate_composed_machine_flows(&mut machines);
+    budget.checkpoint()?;
     let state_machine_roots = root_machine_indices(&machines);
+    budget.checkpoint()?;
     let state_machine_pipelines = compose_machine_pipelines(&machines);
+    budget.checkpoint()?;
     let (bindings, terminal_bindings) = terminal_bindings(body, &machines, &metadata);
+    budget.checkpoint()?;
     let (returns, runtime_bindings, runtime_names) =
         render_return_semantics(body, &bindings, &call_names);
+    budget.checkpoint()?;
     let opaque_host_effect_memory_reads =
         opaque_host_effect_memory_reads(body, &call_names, &runtime_names);
+    budget.checkpoint()?;
     Ok(ExportSemanticAnalysis {
         state_machine_roots,
         state_machine_pipelines,

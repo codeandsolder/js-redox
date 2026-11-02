@@ -14,6 +14,7 @@ use oxc_syntax::symbol::SymbolId;
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ModuleRecord {
@@ -291,6 +292,7 @@ struct Collector<'s, 'c> {
     amd_loader_evidence: HashMap<SymbolId, AmdLoaderEvidence>,
     webpack_table_candidates: HashMap<SymbolId, (oxc_span::Span, Vec<ModuleRecord>)>,
     local_function_symbols: HashSet<SymbolId>,
+    budget_poller: BudgetPoller,
 }
 
 impl Collector<'_, '_> {
@@ -1521,6 +1523,9 @@ impl Collector<'_, '_> {
 
 impl<'a> Visit<'a> for Collector<'_, '_> {
     fn enter_node(&mut self, kind: AstKind<'a>) {
+        if !self.budget_poller.poll(1) {
+            return;
+        }
         match kind {
             AstKind::AssignmentExpression(assign) => {
                 self.record_amd_loader_assignment(assign);
@@ -1550,12 +1555,18 @@ fn parse<'a>(
 }
 
 /// Analyze one JavaScript source body for statically explicit bundle/module tables.
-#[must_use]
-pub fn analyze_bundle_source(source: &str, input: impl Into<String>) -> BundleInventoryReport {
+pub fn analyze_bundle_source(
+    source: &str,
+    input: impl Into<String>,
+    budget: &WorkBudget,
+) -> Result<BundleInventoryReport, BudgetExceeded> {
+    budget.checkpoint()?;
     let allocator = Allocator::default();
     let mut parsed = parse(&allocator, source, SourceType::mjs());
+    budget.checkpoint()?;
     if parsed.fatal_error {
         parsed = parse(&allocator, source, SourceType::cjs());
+        budget.checkpoint()?;
     }
 
     let mut diagnostics = parsed.diagnostics;
@@ -1577,8 +1588,11 @@ pub fn analyze_bundle_source(source: &str, input: impl Into<String>) -> BundleIn
             amd_loader_evidence: HashMap::new(),
             webpack_table_candidates: HashMap::new(),
             local_function_symbols: HashSet::new(),
+            budget_poller: BudgetPoller::new(budget, 256),
         };
         collector.visit_program(&parsed.program);
+        collector.budget_poller.finish()?;
+        budget.checkpoint()?;
         if !collector.amd_modules.is_empty() {
             let start = collector.amd_start.unwrap_or_default();
             let end = collector.amd_end.unwrap_or(start);
@@ -1653,11 +1667,12 @@ pub fn analyze_bundle_source(source: &str, input: impl Into<String>) -> BundleIn
     });
     bundles.sort_by_key(|b| b.start);
 
-    BundleInventoryReport {
+    budget.checkpoint()?;
+    Ok(BundleInventoryReport {
         schema: "js-bundle-inventory/v5",
         input: input.into(),
         diagnostics,
         fatal_error,
         bundles,
-    }
+    })
 }

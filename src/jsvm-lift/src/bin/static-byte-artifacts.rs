@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use jsvm_lift::static_bytes::analyze_webassembly_byte_artifacts;
 use serde::Serialize;
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Duration};
+use work_budget::{BudgetLimits, WorkBudget};
 
 #[derive(Parser, Debug)]
 #[command(about = "Recover exact statically constructed byte artifacts reaching WebAssembly sinks")]
@@ -66,7 +67,11 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let source = fs::read_to_string(&args.input)
         .with_context(|| format!("reading {}", args.input.display()))?;
-    let recovery = analyze_webassembly_byte_artifacts(&source)
+    let budget = WorkBudget::new(
+        format!("static-byte-artifacts:{}", args.input.display()),
+        BudgetLimits::wall_time(Duration::from_secs(180)),
+    );
+    let recovery = analyze_webassembly_byte_artifacts(&source, &budget)
         .with_context(|| format!("analyzing {}", args.input.display()))?;
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("creating {}", args.output_dir.display()))?;

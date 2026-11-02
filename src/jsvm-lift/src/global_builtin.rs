@@ -5,6 +5,7 @@ use oxc_semantic::Scoping;
 use oxc_syntax::symbol::SymbolId;
 use std::collections::HashMap;
 
+use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 fn unparenthesized<'a>(mut expression: &'a Expression<'a>) -> &'a Expression<'a> {
     while let Expression::ParenthesizedExpression(parenthesized) = expression {
         expression = &parenthesized.expression;
@@ -53,11 +54,13 @@ fn global_object_name(
 pub(crate) fn collect_global_aliases(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> HashMap<SymbolId, String> {
+    budget: &WorkBudget,
+) -> Result<HashMap<SymbolId, String>, BudgetExceeded> {
     struct Collector<'c, 'm> {
         scoping: &'c Scoping,
         known: &'m HashMap<SymbolId, String>,
         discovered: HashMap<SymbolId, String>,
+        poller: BudgetPoller,
     }
 
     impl<'a> Visit<'a> for Collector<'_, '_> {
@@ -65,6 +68,9 @@ pub(crate) fn collect_global_aliases(
             &mut self,
             declaration: &oxc_ast::ast::VariableDeclaration<'a>,
         ) {
+            if !self.poller.poll(1) {
+                return;
+            }
             for declarator in &declaration.declarations {
                 let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
                     continue;
@@ -93,16 +99,19 @@ pub(crate) fn collect_global_aliases(
 
     let mut aliases = HashMap::new();
     loop {
+        budget.consume(1)?;
         let mut collector = Collector {
             scoping,
             known: &aliases,
             discovered: HashMap::new(),
+            poller: BudgetPoller::new(budget, 256),
         };
         collector.visit_program(program);
+        collector.poller.finish()?;
         let before = aliases.len();
         aliases.extend(collector.discovered);
         if aliases.len() == before {
-            return aliases;
+            return Ok(aliases);
         }
     }
 }
@@ -198,13 +207,17 @@ pub(crate) fn namespace_member_name<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("global-builtin-test")
+    }
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
 
     #[test]
-    fn resolves_direct_transitive_and_computed_global_builtins() {
+    fn resolves_direct_transitive_and_computed_global_builtins() -> Result<(), BudgetExceeded> {
         let source = r#"
             var host = window;
             var host2 = host;
@@ -219,7 +232,7 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let aliases = collect_global_aliases(&parsed.program, scoping);
+        let aliases = collect_global_aliases(&parsed.program, scoping, &test_budget())?;
         assert_eq!(aliases.len(), 2);
 
         struct Probe<'c, 'g> {
@@ -257,10 +270,11 @@ mod tests {
         probe.visit_program(&parsed.program);
         assert!(probe.wasm);
         assert!(probe.data_view);
+        Ok(())
     }
 
     #[test]
-    fn rejects_reassigned_aliases_and_dynamic_global_resolution() {
+    fn rejects_reassigned_aliases_and_dynamic_global_resolution() -> Result<(), BudgetExceeded> {
         let source = r#"
             var host = window;
             host = fake;
@@ -273,7 +287,8 @@ mod tests {
             .with_check_syntax_error(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let aliases = collect_global_aliases(&parsed.program, semantic.semantic.scoping());
+        let aliases =
+            collect_global_aliases(&parsed.program, semantic.semantic.scoping(), &test_budget())?;
         assert!(aliases.is_empty());
 
         let source = r#"
@@ -291,7 +306,7 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let aliases = collect_global_aliases(&parsed.program, scoping);
+        let aliases = collect_global_aliases(&parsed.program, scoping, &test_budget())?;
 
         struct Probe<'c, 'g> {
             scoping: &'c Scoping,
@@ -315,5 +330,6 @@ mod tests {
         };
         probe.visit_program(&parsed.program);
         assert!(!probe.resolved);
+        Ok(())
     }
 }

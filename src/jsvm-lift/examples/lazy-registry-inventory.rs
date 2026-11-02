@@ -9,6 +9,7 @@ use oxc_span::SourceType;
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::json;
 use std::{env, fs, path::PathBuf};
+use work_budget::WorkBudget;
 
 fn snippet(source: &str, start: u32, end: u32) -> String {
     source
@@ -20,6 +21,7 @@ fn snippet(source: &str, start: u32, end: u32) -> String {
 }
 
 fn main() -> Result<()> {
+    let budget = WorkBudget::unlimited("lazy-registry-inventory");
     let path = env::args_os()
         .nth(1)
         .map(PathBuf::from)
@@ -37,7 +39,8 @@ fn main() -> Result<()> {
     let reads = structurally_proven_lazy_registry_read_calls(
         &parsed.program,
         semantic.semantic.scoping(),
-    )
+        &budget,
+    )?
     .into_iter()
     .map(|proof| {
         json!({
@@ -57,7 +60,8 @@ fn main() -> Result<()> {
     let forwarding_values = structurally_proven_registry_forwarding_value_calls(
         &parsed.program,
         semantic.semantic.scoping(),
-    )
+        &budget,
+    )?
     .into_iter()
     .map(|proof| {
         json!({

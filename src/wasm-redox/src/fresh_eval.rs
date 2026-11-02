@@ -4,10 +4,19 @@ use waffle::{
     entity::EntityRef, ConstVal, FrontendOptions, Func, ImportKind, InterpContext,
     InterpMemoryAccessKind, InterpResult, Module, Operator, Table, ValueDef,
 };
+use work_budget::{BudgetExceeded, WorkBudget};
 
 const DEFAULT_FUEL: u64 = 1_000_000;
 const MAX_MEMORY_PAGES: usize = 2048;
 const MAX_TABLE_ELEMENTS: usize = 100_000;
+
+fn budget_capped_fuel(requested: u64, budget: &WorkBudget) -> Result<(u64, bool), BudgetExceeded> {
+    match budget.remaining_work() {
+        Some(0) => budget.consume(1).map(|()| (0, true)),
+        Some(remaining) if remaining < requested => Ok((remaining, true)),
+        _ => Ok((requested, false)),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -136,19 +145,22 @@ pub fn evaluate_fresh_i32_call(
     function_index: usize,
     i32_args: &[u32],
     fuel_limit: Option<u64>,
-) -> FreshI32CallReport {
+    budget: &WorkBudget,
+) -> Result<FreshI32CallReport, BudgetExceeded> {
+    budget.checkpoint()?;
     let fuel_limit = fuel_limit.unwrap_or(DEFAULT_FUEL);
     if fuel_limit == 0 {
-        return failed_report(
+        return Ok(failed_report(
             function_index,
             i32_args,
             fuel_limit,
             FreshEvalOutcome::InvalidRequest,
-        );
+        ));
     }
 
-    match catch_unwind(AssertUnwindSafe(|| {
-        evaluate_inner(bytes, function_index, i32_args, fuel_limit)
+    let (effective_fuel_limit, budget_limited) = budget_capped_fuel(fuel_limit, budget)?;
+    let report = match catch_unwind(AssertUnwindSafe(|| {
+        evaluate_inner(bytes, function_index, i32_args, effective_fuel_limit)
     })) {
         Ok(report) => report,
         Err(_) => failed_report(
@@ -157,7 +169,16 @@ pub fn evaluate_fresh_i32_call(
             fuel_limit,
             FreshEvalOutcome::UnsupportedOrPanicked,
         ),
+    };
+    if let Some(consumed) = report.fuel_consumed {
+        budget.consume(consumed)?;
+        if budget_limited && report.outcome == FreshEvalOutcome::OutOfFuel {
+            budget.consume(1)?;
+        }
+    } else {
+        budget.checkpoint()?;
     }
+    Ok(report)
 }
 
 fn closed_direct_call_graph(
@@ -253,7 +274,9 @@ pub fn evaluate_fresh_i32_sequence(
     initial_table_grows: &[FreshTableGrowRequest],
     calls: &[FreshI32CallRequest],
     fuel_limit_per_call: Option<u64>,
-) -> FreshI32SequenceReport {
+    budget: &WorkBudget,
+) -> Result<FreshI32SequenceReport, BudgetExceeded> {
+    budget.checkpoint()?;
     let fuel_limit_per_call = fuel_limit_per_call.unwrap_or(DEFAULT_FUEL);
     let failed = |outcome| FreshI32SequenceReport {
         schema: "wasm-redox/fresh-i32-sequence-v2",
@@ -264,13 +287,22 @@ pub fn evaluate_fresh_i32_sequence(
         steps: Vec::new(),
     };
     if calls.is_empty() || fuel_limit_per_call == 0 {
-        return failed(FreshEvalOutcome::InvalidRequest);
+        return Ok(failed(FreshEvalOutcome::InvalidRequest));
     }
     match catch_unwind(AssertUnwindSafe(|| {
-        evaluate_sequence_inner(bytes, initial_table_grows, calls, fuel_limit_per_call)
+        evaluate_sequence_inner(
+            bytes,
+            initial_table_grows,
+            calls,
+            fuel_limit_per_call,
+            budget,
+        )
     })) {
         Ok(report) => report,
-        Err(_) => failed(FreshEvalOutcome::UnsupportedOrPanicked),
+        Err(_) => {
+            budget.checkpoint()?;
+            Ok(failed(FreshEvalOutcome::UnsupportedOrPanicked))
+        }
     }
 }
 
@@ -338,7 +370,8 @@ fn evaluate_sequence_inner(
     initial_table_grows: &[FreshTableGrowRequest],
     calls: &[FreshI32CallRequest],
     fuel_limit_per_call: u64,
-) -> FreshI32SequenceReport {
+    budget: &WorkBudget,
+) -> Result<FreshI32SequenceReport, BudgetExceeded> {
     let failed = |outcome, steps| {
         sequence_report(
             initial_table_grows,
@@ -349,7 +382,7 @@ fn evaluate_sequence_inner(
         )
     };
     let Ok(mut module) = Module::from_wasm_bytes(bytes, &FrontendOptions::default()) else {
-        return failed(FreshEvalOutcome::InvalidRequest, Vec::new());
+        return Ok(failed(FreshEvalOutcome::InvalidRequest, Vec::new()));
     };
     if module.expand_all_funcs().is_err()
         || module.start_func.is_some()
@@ -367,27 +400,27 @@ fn evaluate_sequence_inner(
             )
         })
     {
-        return failed(FreshEvalOutcome::UnsupportedOrPanicked, Vec::new());
+        return Ok(failed(FreshEvalOutcome::UnsupportedOrPanicked, Vec::new()));
     }
 
     let Ok(mut context) = InterpContext::new(&module) else {
-        return failed(FreshEvalOutcome::InvalidRequest, Vec::new());
+        return Ok(failed(FreshEvalOutcome::InvalidRequest, Vec::new()));
     };
     if !apply_initial_table_grows(&module, &mut context, initial_table_grows) {
-        return failed(FreshEvalOutcome::InvalidRequest, Vec::new());
+        return Ok(failed(FreshEvalOutcome::InvalidRequest, Vec::new()));
     }
 
     let mut steps = Vec::with_capacity(calls.len());
     for call in calls {
         if call.function_index >= module.funcs.len() {
-            return failed(FreshEvalOutcome::InvalidRequest, steps);
+            return Ok(failed(FreshEvalOutcome::InvalidRequest, steps));
         }
         let Some(resolved_i32_args) = resolve_sequence_args(&call.i32_args, &steps) else {
-            return failed(FreshEvalOutcome::InvalidRequest, steps);
+            return Ok(failed(FreshEvalOutcome::InvalidRequest, steps));
         };
         let function = Func::new(call.function_index);
         if module.funcs[function].body().is_none() {
-            return failed(FreshEvalOutcome::InvalidRequest, steps);
+            return Ok(failed(FreshEvalOutcome::InvalidRequest, steps));
         }
         if !closed_sequence_call_graph(
             &module,
@@ -395,7 +428,7 @@ fn evaluate_sequence_inner(
             &mut std::collections::BTreeSet::new(),
             &mut std::collections::BTreeSet::new(),
         ) {
-            return failed(FreshEvalOutcome::UnsupportedOrPanicked, steps);
+            return Ok(failed(FreshEvalOutcome::UnsupportedOrPanicked, steps));
         }
         let signature = &module.signatures[module.funcs[function].sig()];
         let returns_i32 = signature.returns.as_slice() == [waffle::Type::I32];
@@ -404,7 +437,7 @@ fn evaluate_sequence_inner(
             || !signature.params.iter().all(|ty| *ty == waffle::Type::I32)
             || (!returns_i32 && !returns_void)
         {
-            return failed(FreshEvalOutcome::InvalidRequest, steps);
+            return Ok(failed(FreshEvalOutcome::InvalidRequest, steps));
         }
 
         // Each step gets its own access trace. That makes a caller-selected
@@ -412,7 +445,9 @@ fn evaluate_sequence_inner(
         // explicit without mutating or snapshotting linear memory.
         context.take_memory_accesses();
         let initial_memory_pages = memory_pages(&module, &context);
-        context.fuel = fuel_limit_per_call;
+        let (effective_fuel_limit, budget_limited) =
+            budget_capped_fuel(fuel_limit_per_call, budget)?;
+        context.fuel = effective_fuel_limit;
         let arguments = resolved_i32_args
             .iter()
             .copied()
@@ -420,7 +455,9 @@ fn evaluate_sequence_inner(
             .collect::<Vec<_>>();
         let result = context.call(&module, function, &arguments);
         let final_memory_pages = memory_pages(&module, &context);
-        let fuel_consumed = Some(fuel_limit_per_call.saturating_sub(context.fuel));
+        let consumed = effective_fuel_limit.saturating_sub(context.fuel);
+        budget.consume(consumed)?;
+        let fuel_consumed = Some(consumed);
         let memory_accesses = context
             .take_memory_accesses()
             .into_iter()
@@ -451,6 +488,9 @@ fn evaluate_sequence_inner(
             InterpResult::Trap(..) => (FreshEvalOutcome::Trap, None),
             InterpResult::OutOfFuel => (FreshEvalOutcome::OutOfFuel, None),
         };
+        if budget_limited && outcome == FreshEvalOutcome::OutOfFuel {
+            budget.consume(1)?;
+        }
         steps.push(FreshI32SequenceStepReport {
             function_index: call.function_index,
             resolved_i32_args,
@@ -462,11 +502,11 @@ fn evaluate_sequence_inner(
             memory_accesses,
         });
         if outcome != FreshEvalOutcome::Returned {
-            return failed(outcome, steps);
+            return Ok(failed(outcome, steps));
         }
     }
 
-    failed(FreshEvalOutcome::Returned, steps)
+    Ok(failed(FreshEvalOutcome::Returned, steps))
 }
 
 fn evaluate_inner(
@@ -588,6 +628,74 @@ fn evaluate_inner(
 mod tests {
     use super::*;
 
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("fresh-eval-test")
+    }
+
+    fn evaluate_call(
+        bytes: &[u8],
+        function_index: usize,
+        i32_args: &[u32],
+        fuel_limit: Option<u64>,
+    ) -> Result<FreshI32CallReport, BudgetExceeded> {
+        evaluate_fresh_i32_call(bytes, function_index, i32_args, fuel_limit, &test_budget())
+    }
+
+    fn evaluate_sequence(
+        bytes: &[u8],
+        initial_table_grows: &[FreshTableGrowRequest],
+        calls: &[FreshI32CallRequest],
+        fuel_limit_per_call: Option<u64>,
+    ) -> Result<FreshI32SequenceReport, BudgetExceeded> {
+        evaluate_fresh_i32_sequence(
+            bytes,
+            initial_table_grows,
+            calls,
+            fuel_limit_per_call,
+            &test_budget(),
+        )
+    }
+
+    #[test]
+    fn fresh_eval_charges_interpreter_fuel_to_work_budget() -> anyhow::Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (memory 1)
+                (func (param i32) (result i32)
+                    local.get 0
+                    i32.const 3
+                    i32.add))"#,
+        )?;
+        let budget = WorkBudget::new("fresh-eval-work-test", work_budget::BudgetLimits::work(0));
+        assert!(matches!(
+            evaluate_fresh_i32_call(&bytes, 0, &[39], Some(100), &budget),
+            Err(ref error)
+                if error.kind() == work_budget::BudgetExceededKind::Work
+                    && error.scope() == "fresh-eval-work-test"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_eval_pre_caps_interpreter_fuel_to_remaining_work() -> anyhow::Result<()> {
+        let bytes = wat::parse_str(
+            r#"(module
+                (func (result i32)
+                    (loop $again
+                        br $again)
+                    i32.const 0))"#,
+        )?;
+        let budget = WorkBudget::new("fresh-eval-cap", work_budget::BudgetLimits::work(8));
+        assert!(matches!(
+            evaluate_fresh_i32_call(&bytes, 0, &[], Some(10_000), &budget),
+            Err(ref error)
+                if error.kind() == work_budget::BudgetExceededKind::Work
+                    && error.scope() == "fresh-eval-cap"
+                    && error.work_consumed() == Some(8)
+        ));
+        Ok(())
+    }
+
     #[test]
     fn exact_fresh_i32_call_returns_concrete_value() -> anyhow::Result<()> {
         let bytes = wat::parse_str(
@@ -598,7 +706,7 @@ mod tests {
                     i32.const 3
                     i32.add))"#,
         )?;
-        let report = evaluate_fresh_i32_call(&bytes, 0, &[39], Some(100));
+        let report = evaluate_call(&bytes, 0, &[39], Some(100))?;
         assert_eq!(report.outcome, FreshEvalOutcome::Returned);
         assert_eq!(report.proven_result(), Some(42));
         assert!(report.fuel_consumed.is_some_and(|fuel| fuel > 0));
@@ -622,7 +730,7 @@ mod tests {
                     global.set $next
                     local.get $old))"#,
         )?;
-        let report = evaluate_fresh_i32_sequence(
+        let report = evaluate_sequence(
             &bytes,
             &[],
             &[
@@ -636,7 +744,7 @@ mod tests {
                 },
             ],
             Some(100),
-        );
+        )?;
         assert_eq!(report.outcome, FreshEvalOutcome::Returned);
         assert_eq!(report.proven_result(0), Some(64));
         assert_eq!(report.proven_result(1), Some(80));
@@ -663,7 +771,7 @@ mod tests {
                     i32.const 99
                     i32.store))"#,
         )?;
-        let report = evaluate_fresh_i32_sequence(
+        let report = evaluate_sequence(
             &bytes,
             &[FreshTableGrowRequest {
                 table_index: 0,
@@ -684,7 +792,7 @@ mod tests {
                 },
             ],
             Some(100),
-        );
+        )?;
         assert_eq!(report.outcome, FreshEvalOutcome::Returned);
         assert_eq!(report.proven_result(0), Some(4));
         assert_eq!(report.steps[1].resolved_i32_args, vec![4]);
@@ -710,11 +818,11 @@ mod tests {
                     local.get 0
                     call $f))"#,
         )?;
-        let report = evaluate_fresh_i32_call(&bytes, 1, &[1], Some(100));
+        let report = evaluate_call(&bytes, 1, &[1], Some(100))?;
         assert_eq!(report.outcome, FreshEvalOutcome::UnsupportedOrPanicked);
         assert_eq!(report.proven_result(), None);
 
-        let sequence = evaluate_fresh_i32_sequence(
+        let sequence = evaluate_sequence(
             &bytes,
             &[],
             &[FreshI32CallRequest {
@@ -722,7 +830,7 @@ mod tests {
                 i32_args: vec![FreshI32Arg::Literal { value: 1 }],
             }],
             Some(100),
-        );
+        )?;
         assert_eq!(sequence.outcome, FreshEvalOutcome::UnsupportedOrPanicked);
         assert!(sequence.steps.is_empty());
         Ok(())
@@ -737,7 +845,7 @@ mod tests {
                 (func (param i32) (result i32)
                     local.get 0))"#,
         )?;
-        let report = evaluate_fresh_i32_call(&with_start, 1, &[7], Some(100));
+        let report = evaluate_call(&with_start, 1, &[7], Some(100))?;
         assert_eq!(report.outcome, FreshEvalOutcome::UnsupportedOrPanicked);
         assert_eq!(report.proven_result(), None);
 
@@ -750,7 +858,7 @@ mod tests {
                     drop
                     local.get 0))"#,
         )?;
-        let report = evaluate_fresh_i32_call(&table_dependent, 0, &[7], Some(100));
+        let report = evaluate_call(&table_dependent, 0, &[7], Some(100))?;
         assert_eq!(report.outcome, FreshEvalOutcome::UnsupportedOrPanicked);
         assert_eq!(report.proven_result(), None);
 
@@ -760,7 +868,7 @@ mod tests {
                 (func (param i32) (result i32)
                     local.get 0))"#,
         )?;
-        let report = evaluate_fresh_i32_call(&imported_memory, 0, &[7], Some(100));
+        let report = evaluate_call(&imported_memory, 0, &[7], Some(100))?;
         assert_eq!(report.outcome, FreshEvalOutcome::UnsupportedOrPanicked);
         assert_eq!(report.proven_result(), None);
 
@@ -770,7 +878,7 @@ mod tests {
                 (func (param i32) (result i32)
                     local.get 0))"#,
         )?;
-        let report = evaluate_fresh_i32_call(&oversized_memory, 0, &[7], Some(100));
+        let report = evaluate_call(&oversized_memory, 0, &[7], Some(100))?;
         assert_eq!(report.outcome, FreshEvalOutcome::UnsupportedOrPanicked);
         assert_eq!(report.proven_result(), None);
 
@@ -780,7 +888,7 @@ mod tests {
                     local.get 0
                     call $recur))"#,
         )?;
-        let report = evaluate_fresh_i32_call(&recursive, 0, &[7], Some(100));
+        let report = evaluate_call(&recursive, 0, &[7], Some(100))?;
         assert_eq!(report.outcome, FreshEvalOutcome::UnsupportedOrPanicked);
         assert_eq!(report.proven_result(), None);
         Ok(())
@@ -795,7 +903,7 @@ mod tests {
                         br $again)
                     local.get 0))"#,
         )?;
-        let report = evaluate_fresh_i32_call(&bytes, 0, &[1], Some(8));
+        let report = evaluate_call(&bytes, 0, &[1], Some(8))?;
         assert_eq!(report.outcome, FreshEvalOutcome::OutOfFuel);
         assert_eq!(report.proven_result(), None);
         Ok(())

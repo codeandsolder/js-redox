@@ -18,6 +18,8 @@ use std::{
     path::Path,
 };
 
+use work_budget::WorkBudget;
+
 #[derive(Debug, Clone, Serialize)]
 struct PageMeta {
     id: String,
@@ -368,7 +370,9 @@ fn build_manifest(
     salvaged: bool,
     parse_error: Option<String>,
     parse_warnings: Vec<String>,
+    budget: &WorkBudget,
 ) -> Result<ProjectManifest> {
+    budget.checkpoint()?;
     let pages = page_metadata(&har);
     let mut seen = HashMap::new();
     let mut counts = BTreeMap::new();
@@ -376,6 +380,7 @@ fn build_manifest(
     let mut resources = Vec::with_capacity(har.log.entries.len());
     let har_root = args.har.parent().unwrap_or_else(|| Path::new("."));
     for (id, entry) in har.log.entries.iter().enumerate() {
+        budget.checkpoint()?;
         resources.push(materialize_entry(
             id,
             entry,
@@ -406,9 +411,11 @@ fn build_manifest(
 }
 
 fn write_project_metadata(args: &HarProjectOptions, manifest: &ProjectManifest) -> Result<()> {
+    let manifest_value = serde_json::to_value(manifest)?;
+    crate::capture_project::validate_manifest_value(&manifest_value, "HAR capture manifest")?;
     fs::write(
-        args.output.join("capture-manifest.json"),
-        format!("{}\n", serde_json::to_string_pretty(manifest)?),
+        args.output.join(crate::capture_project::MANIFEST_NAME),
+        format!("{}\n", serde_json::to_string_pretty(&manifest_value)?),
     )?;
     fs::create_dir_all(args.output.join(".vscode"))?;
     fs::write(
@@ -436,14 +443,15 @@ pub(super) fn materialize_project(
     salvaged: bool,
     parse_error: Option<String>,
     parse_warnings: Vec<String>,
+    budget: &WorkBudget,
 ) -> Result<HarProjectSummary> {
-    let manifest = build_manifest(args, har, salvaged, parse_error, parse_warnings)?;
+    let manifest = build_manifest(args, har, salvaged, parse_error, parse_warnings, budget)?;
+    budget.checkpoint()?;
     write_project_metadata(args, &manifest)?;
+    budget.checkpoint()?;
     Ok(HarProjectSummary {
         resources: manifest.resources.len(),
         script_records: manifest.inline_scripts.len(),
-        parse_warnings: manifest.source.parse_warnings.clone(),
-        counts: manifest.counts,
     })
 }
 

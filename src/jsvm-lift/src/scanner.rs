@@ -16,6 +16,7 @@ use crate::{
     function_analysis::{
         evidence_reaches_computed, expression_evidence, FunctionMetrics, FunctionState,
     },
+    safe_deob::SourceMode,
     source_text::preview,
     state_flatten::{
         self, detect_for_state_machines, detect_while_state_machine, IfLadderStateMachineCandidate,
@@ -26,10 +27,10 @@ use crate::{
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{ArrayExpressionElement, Expression, FunctionBody, Statement};
 use oxc_ast_visit::{walk, Visit};
-use oxc_span::SourceType;
 use oxc_syntax::scope::ScopeFlags;
 use rolldown_redox::ecmascript::parse_program;
 use std::collections::{BTreeSet, HashMap};
+use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 
 fn indexed_access(source: &str, expr: &Expression<'_>) -> Option<IndexedAccess> {
     let Expression::ComputedMemberExpression(member) = expr else {
@@ -50,6 +51,9 @@ fn indexed_access(source: &str, expr: &Expression<'_>) -> Option<IndexedAccess> 
 
 struct Scanner<'s> {
     source: &'s str,
+    budget: WorkBudget,
+    budget_poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
     arrays: Vec<ArrayCandidate>,
     push_builders: Vec<PushBuilderCandidate>,
     decoder_candidates: Vec<DecoderCandidate>,
@@ -64,9 +68,12 @@ struct Scanner<'s> {
 }
 
 impl<'s> Scanner<'s> {
-    const fn new(source: &'s str) -> Self {
+    fn new(source: &'s str, budget: &WorkBudget) -> Self {
         Self {
             source,
+            budget: budget.clone(),
+            budget_poller: BudgetPoller::new(budget, 256),
+            budget_error: None,
             arrays: Vec::new(),
             push_builders: Vec::new(),
             decoder_candidates: Vec::new(),
@@ -81,11 +88,25 @@ impl<'s> Scanner<'s> {
         }
     }
 
+    fn poll_budget(&mut self, units: u64) -> bool {
+        self.budget_error.is_none() && self.budget_poller.poll(units)
+    }
+
+    fn finish_budget(&mut self) -> Result<(), BudgetExceeded> {
+        if let Some(error) = self.budget_error.take() {
+            return Err(error);
+        }
+        self.budget_poller.finish()
+    }
+
     fn push_function(&mut self, kind: &str, name: Option<String>, start: u32, end: u32) {
         self.stack.push(FunctionState::new(kind, name, start, end));
     }
 
     fn analyze_opcode_maps(&mut self, function: &oxc_ast::ast::Function<'_>) {
+        if self.budget_error.is_some() {
+            return;
+        }
         let Some(current) = self.stack.last() else {
             return;
         };
@@ -113,14 +134,17 @@ impl<'s> Scanner<'s> {
             return;
         }
 
-        let mut maps = state_flatten::analyze_function(
+        match state_flatten::analyze_function(
             self.source,
             function,
             &parent_function_id,
             &decoders,
             &machines,
-        );
-        self.opcode_maps.append(&mut maps);
+            &self.budget,
+        ) {
+            Ok(mut maps) => self.opcode_maps.append(&mut maps),
+            Err(error) => self.budget_error = Some(error),
+        }
     }
 
     fn finish_function(&mut self) {
@@ -249,6 +273,9 @@ impl<'s> Scanner<'s> {
 
 impl<'a> Visit<'a> for Scanner<'_> {
     fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        if !self.poll_budget(1) {
+            return;
+        }
         let name = function.id.as_ref().map(|id| id.name.to_string());
         self.push_function("function", name, function.span.start, function.span.end);
         walk::walk_function(self, function, flags);
@@ -260,17 +287,26 @@ impl<'a> Visit<'a> for Scanner<'_> {
         &mut self,
         function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
     ) {
+        if !self.poll_budget(1) {
+            return;
+        }
         self.push_function("arrow", None, function.span.start, function.span.end);
         walk::walk_arrow_function_expression(self, function);
         self.finish_function();
     }
 
     fn visit_object_expression(&mut self, object: &oxc_ast::ast::ObjectExpression<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         self.record_handler_table(object);
         walk::walk_object_expression(self, object);
     }
 
     fn visit_array_expression(&mut self, array: &oxc_ast::ast::ArrayExpression<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         self.record_array(array);
         if let Some(current) = self.stack.last_mut() {
             current.m.arrays += 1;
@@ -282,6 +318,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_switch_statement(&mut self, switch: &oxc_ast::ast::SwitchStatement<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         self.record_direct_switch(switch);
         if let Some(current) = self.stack.last_mut() {
             current.m.switches += 1;
@@ -304,6 +343,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_for_statement(&mut self, statement: &oxc_ast::ast::ForStatement<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         if let Some(function_id) = self.stack.last().map(|current| current.m.id.as_str()) {
             let detected = detect_for_state_machines(self.source, function_id, statement);
             self.state_machines.extend(detected.switch_machines);
@@ -317,6 +359,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_while_statement(&mut self, statement: &oxc_ast::ast::WhileStatement<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         if let Some(current) = self.stack.last_mut() {
             current.m.loops += 1;
         }
@@ -324,6 +369,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_do_while_statement(&mut self, statement: &oxc_ast::ast::DoWhileStatement<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         if let Some(current) = self.stack.last_mut() {
             current.m.loops += 1;
         }
@@ -331,6 +379,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_for_in_statement(&mut self, statement: &oxc_ast::ast::ForInStatement<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         if let Some(current) = self.stack.last_mut() {
             current.m.loops += 1;
         }
@@ -338,6 +389,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_for_of_statement(&mut self, statement: &oxc_ast::ast::ForOfStatement<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         if let Some(current) = self.stack.last_mut() {
             current.m.loops += 1;
         }
@@ -348,6 +402,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
         &mut self,
         expression: &oxc_ast::ast::ConditionalExpression<'a>,
     ) {
+        if !self.poll_budget(1) {
+            return;
+        }
         if let Some(current) = self.stack.last_mut() {
             current.m.conditionals += 1;
         }
@@ -358,6 +415,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
         &mut self,
         member: &oxc_ast::ast::ComputedMemberExpression<'a>,
     ) {
+        if !self.poll_budget(1) {
+            return;
+        }
         let indexed_access = if let Expression::Identifier(object) = &member.object {
             index_shape(&member.expression).map(|shape| IndexedAccess {
                 object: object.name.to_string(),
@@ -380,6 +440,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_variable_declarator(&mut self, declarator: &oxc_ast::ast::VariableDeclarator<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         let fetched_access =
             if let (oxc_ast::ast::BindingPattern::BindingIdentifier(id), Some(init)) =
                 (&declarator.id, &declarator.init)
@@ -411,6 +474,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         self.record_push_builder(call);
         if let Some(candidate) = detect_packer_eval(call) {
             self.embedded_code.push(candidate);
@@ -445,6 +511,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_new_expression(&mut self, expression: &oxc_ast::ast::NewExpression<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         if matches!(
             &expression.callee,
             Expression::Identifier(id) if id.name.as_str() == "Function"
@@ -462,6 +531,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         let lhs = if assignment.operator.is_assign() {
             target_ident(&assignment.left)
         } else {
@@ -490,6 +562,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_binary_expression(&mut self, binary: &oxc_ast::ast::BinaryExpression<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         let bit_mask = if binary.operator.as_str() == "&" {
             if let (Some(name), Some(mask)) =
                 (origin_ident(&binary.left), origin_u64(&binary.right))
@@ -526,6 +601,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_unary_expression(&mut self, expression: &oxc_ast::ast::UnaryExpression<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         if let Some(current) = self.stack.last_mut() {
             current.m.unary_exprs += 1;
         }
@@ -533,6 +611,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_sequence_expression(&mut self, expression: &oxc_ast::ast::SequenceExpression<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         if let Some(current) = self.stack.last_mut() {
             current.m.sequence_exprs += 1;
         }
@@ -540,18 +621,27 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_numeric_literal(&mut self, _literal: &oxc_ast::ast::NumericLiteral<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         if let Some(current) = self.stack.last_mut() {
             current.m.numeric_literals += 1;
         }
     }
 
     fn visit_string_literal(&mut self, _literal: &oxc_ast::ast::StringLiteral<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         if let Some(current) = self.stack.last_mut() {
             current.m.string_literals += 1;
         }
     }
 
     fn visit_try_statement(&mut self, statement: &oxc_ast::ast::TryStatement<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         if let Some(current) = self.stack.last_mut() {
             current.m.tries += 1;
         }
@@ -559,6 +649,9 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
 
     fn visit_program(&mut self, program: &oxc_ast::ast::Program<'a>) {
+        if !self.poll_budget(1) {
+            return;
+        }
         walk::walk_program(self, program);
     }
 }
@@ -752,13 +845,22 @@ fn sort_scan_inventory(scanner: &mut Scanner<'_>) {
         .sort_by_key(|table| std::cmp::Reverse(table.function_values));
 }
 
-pub fn scan_source_core(source: &str) -> ScanCore {
+pub fn scan_source_core(
+    source: &str,
+    source_mode: SourceMode,
+    budget: &WorkBudget,
+) -> Result<ScanCore, BudgetExceeded> {
+    budget.checkpoint()?;
     let allocator = Allocator::default();
-    let parsed = parse_program(&allocator, source, SourceType::cjs());
+    let parsed = parse_program(&allocator, source, source_mode.source_type());
+    budget.checkpoint()?;
 
-    let mut scanner = Scanner::new(source);
+    let mut scanner = Scanner::new(source, budget);
     scanner.visit_program(&parsed.program);
-    let mut table_analysis = table_vm::analyze(source, &parsed.program);
+    scanner.finish_budget()?;
+    budget.checkpoint()?;
+    let mut table_analysis = table_vm::analyze(source, &parsed.program, budget)?;
+    budget.checkpoint()?;
 
     suppress_nested_table_vms(&scanner, &mut table_analysis);
     normalize_decoders(&mut scanner);
@@ -766,8 +868,9 @@ pub fn scan_source_core(source: &str) -> ScanCore {
     attach_observed_opcodes(&mut scanner);
     reconcile_dispatch_confirmation(&mut scanner, &table_analysis);
     sort_scan_inventory(&mut scanner);
+    budget.checkpoint()?;
 
-    ScanCore {
+    Ok(ScanCore {
         diagnostics: parsed.diagnostics,
         fatal_error: parsed.fatal_error,
         arrays: scanner.arrays,
@@ -783,7 +886,7 @@ pub fn scan_source_core(source: &str) -> ScanCore {
         table_vms: table_analysis.table_vms,
         functions: scanner.functions,
         embedded_code: scanner.embedded_code,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -791,7 +894,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scanner_integrates_vm_detectors() {
+    fn scanner_propagates_work_budget_exhaustion() {
+        let budget = WorkBudget::new("scanner-fuel", work_budget::BudgetLimits::work(0));
+        assert!(matches!(
+            scan_source_core("function f(){ return 1; }", SourceMode::Auto, &budget),
+            Err(ref error)
+                if error.kind() == work_budget::BudgetExceededKind::Work
+                    && error.scope() == "scanner-fuel"
+        ));
+    }
+
+    #[test]
+    fn scanner_integrates_vm_detectors() -> Result<(), BudgetExceeded> {
         let source = r"
             function vm() {
                 const code = [
@@ -823,7 +937,8 @@ mod tests {
             }
         ";
 
-        let core = scan_source_core(source);
+        let budget = WorkBudget::unlimited("scanner-test");
+        let core = scan_source_core(source, SourceMode::Auto, &budget)?;
         assert!(!core.fatal_error);
         assert_eq!(core.diagnostics, 0);
         assert_eq!(core.arrays.len(), 1);
@@ -833,5 +948,6 @@ mod tests {
             .functions
             .iter()
             .any(|function| function.name.as_deref() == Some("vm") && function.confirmed_dispatch));
+        Ok(())
     }
 }

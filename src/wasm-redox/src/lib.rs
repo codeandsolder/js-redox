@@ -6,6 +6,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use wasmparser::{ExternalKind, Operator, Parser, Payload, TypeRef, Validator, WasmFeatures};
+use work_budget::WorkBudget;
 
 fn lowercase_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -161,10 +162,12 @@ fn extract_ascii_strings(bytes: &[u8]) -> Vec<String> {
     result
 }
 
-pub fn analyze(bytes: &[u8]) -> Result<ModuleReport> {
+pub fn analyze(bytes: &[u8], budget: &WorkBudget) -> Result<ModuleReport> {
+    budget.checkpoint()?;
     Validator::new_with_features(WasmFeatures::all())
         .validate_all(bytes)
         .context("validate WebAssembly")?;
+    budget.checkpoint()?;
 
     let digest = Sha256::digest(bytes);
     let mut sections = SectionCounts::default();
@@ -176,11 +179,14 @@ pub fn analyze(bytes: &[u8]) -> Result<ModuleReport> {
     let mut next_defined_function = None;
 
     for payload in Parser::new(0).parse_all(bytes) {
+        budget.checkpoint()?;
         match payload.context("parse WebAssembly payload")? {
             Payload::TypeSection(reader) => sections.types = reader.count(),
             Payload::ImportSection(reader) => {
                 for group in reader {
+                    budget.checkpoint()?;
                     for import in group.context("parse import group")?.into_iter() {
+                        budget.checkpoint()?;
                         let (_, import) = import.context("parse import")?;
                         let kind = import_kind(import.ty);
                         if kind == "function" {
@@ -206,6 +212,7 @@ pub fn analyze(bytes: &[u8]) -> Result<ModuleReport> {
             Payload::DataSection(reader) => sections.data_segments = reader.count(),
             Payload::ExportSection(reader) => {
                 for export in reader {
+                    budget.checkpoint()?;
                     let export = export.context("parse export")?;
                     let kind = export_kind(export.kind);
                     if kind == "function" {
@@ -233,6 +240,7 @@ pub fn analyze(bytes: &[u8]) -> Result<ModuleReport> {
                     .get_operators_reader()
                     .context("read function operators")?;
                 while !operators.eof() {
+                    budget.checkpoint()?;
                     match operators.read().context("read function operator")? {
                         Operator::Call { function_index }
                         | Operator::ReturnCall { function_index } => {
@@ -270,9 +278,11 @@ pub fn analyze(bytes: &[u8]) -> Result<ModuleReport> {
         .collect::<Vec<_>>();
     let mut export_reachability = Vec::new();
     for (export_name, root) in function_exports {
+        budget.checkpoint()?;
         let mut queue = VecDeque::from([root]);
         let mut reachable = BTreeSet::new();
         while let Some(function_index) = queue.pop_front() {
+            budget.checkpoint()?;
             if !reachable.insert(function_index) {
                 continue;
             }
@@ -281,6 +291,7 @@ pub fn analyze(bytes: &[u8]) -> Result<ModuleReport> {
             }
         }
         for function in &mut functions {
+            budget.checkpoint()?;
             if reachable.contains(&function.index) {
                 function.reachable_from_exports.push(export_name.clone());
             }
@@ -308,16 +319,22 @@ pub fn analyze(bytes: &[u8]) -> Result<ModuleReport> {
     })
 }
 
-pub fn deep_analyze(bytes: &[u8], report: &ModuleReport) -> DeepModuleReport {
+pub fn deep_analyze(
+    bytes: &[u8],
+    report: &ModuleReport,
+    budget: &WorkBudget,
+) -> Result<DeepModuleReport> {
+    budget.checkpoint()?;
     let mut exports = Vec::new();
     for function in &report.functions {
+        budget.checkpoint()?;
         if function.role != "exported_core" || function.body_bytes < 128 {
             continue;
         }
         let Some(export) = function.exports.first() else {
             continue;
         };
-        match state_machine::analyze_export_semantics(bytes, export) {
+        match state_machine::analyze_export_semantics(bytes, export, budget) {
             Ok(analysis) => exports.push(DeepExportAnalysis {
                 export: export.clone(),
                 function_index: function.index,
@@ -334,19 +351,21 @@ pub fn deep_analyze(bytes: &[u8], report: &ModuleReport) -> DeepModuleReport {
             }),
         }
     }
-    DeepModuleReport {
+    Ok(DeepModuleReport {
         schema: "wasm-redox/deep-v14",
         exports,
-    }
+    })
 }
 
-pub fn folded_wat(bytes: &[u8]) -> Result<String> {
+pub fn folded_wat(bytes: &[u8], budget: &WorkBudget) -> Result<String> {
+    budget.checkpoint()?;
     let mut config = wasmprinter::Config::new();
     config.name_unnamed(true).fold_instructions(true);
     let mut output = String::new();
     config
         .print(bytes, &mut wasmprinter::PrintFmtWrite(&mut output))
         .context("print folded WAT")?;
+    budget.checkpoint()?;
     Ok(output)
 }
 
@@ -365,8 +384,12 @@ mod tests {
                     i32.add)
             )"#,
         )?;
-        let report = analyze(&bytes)?;
-        assert_eq!(deep_analyze(&bytes, &report).schema, "wasm-redox/deep-v14");
+        let budget = WorkBudget::unlimited("wasm-redox-test");
+        let report = analyze(&bytes, &budget)?;
+        assert_eq!(
+            deep_analyze(&bytes, &report, &budget)?.schema,
+            "wasm-redox/deep-v14"
+        );
         assert_eq!(report.sections.imported_functions, 1);
         assert_eq!(report.sections.defined_functions, 1);
         assert_eq!(report.functions.len(), 1);
@@ -377,7 +400,7 @@ mod tests {
         assert_eq!(report.call_graph.exports[0].export, "add");
         assert_eq!(report.call_graph.exports[0].reachable_functions, [1]);
 
-        let readable = folded_wat(&bytes)?;
+        let readable = folded_wat(&bytes, &budget)?;
         assert!(readable.contains("i32.add"));
         assert!(readable.contains("(export \"add\""));
         Ok(())

@@ -37,6 +37,11 @@ pub use semantic_render::{SemanticExpression, SemanticReturnReport, SemanticRunt
 mod tests {
     use super::copied_input::FreshCleanupSlotRole;
     use super::*;
+    use work_budget::WorkBudget;
+
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("state-machine-test")
+    }
 
     fn return_expressions(analysis: &ExportSemanticAnalysis) -> Vec<&str> {
         analysis
@@ -94,7 +99,7 @@ mod tests {
                     i32.load offset=4
                     i32.add))"#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         assert_eq!(analysis.externref_bulk_copy_candidates.len(), 1);
         let candidate = &analysis.externref_bulk_copy_candidates[0];
         assert_eq!(candidate.set_import_function, 1);
@@ -136,7 +141,7 @@ mod tests {
                     call $set
                     local.get $aligned i32.load))"#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
             return Err(anyhow::anyhow!("expected one copied-input candidate"));
         };
@@ -172,7 +177,7 @@ mod tests {
                     call $set
                     local.get $aligned i32.load))"#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
             return Err(anyhow::anyhow!("expected one copied-input candidate"));
         };
@@ -311,7 +316,7 @@ mod tests {
     #[test]
     fn copied_input_fresh_alignment_boundary_requires_exact_evaluation() -> Result<()> {
         let bytes = copied_input_fresh_alignment_boundary_fixture()?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
             return Err(anyhow::anyhow!("expected one copied-input candidate"));
         };
@@ -329,7 +334,7 @@ mod tests {
     #[test]
     fn copied_input_reports_fresh_destination_recipe() -> Result<()> {
         let bytes = copied_input_recipe_fixture(4, 0)?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
             return Err(anyhow::anyhow!("expected one copied-input candidate"));
         };
@@ -348,7 +353,7 @@ mod tests {
             copied_input_recipe_fixture(2, 0)?,
             copied_input_recipe_fixture(4, 3)?,
         ] {
-            let analysis = analyze_export_semantics(&bytes, "copy")?;
+            let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
             let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
                 return Err(anyhow::anyhow!("expected one copied-input candidate"));
             };
@@ -375,7 +380,7 @@ mod tests {
                     local.get $base i32.const 99 i32.store
                     local.get $base i32.load))"#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
             return Err(anyhow::anyhow!("expected one copied-input candidate"));
         };
@@ -414,7 +419,7 @@ mod tests {
                         local.set $result)
                     local.get $result))"#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
             return Err(anyhow::anyhow!("expected one copied-input candidate"));
         };
@@ -448,7 +453,7 @@ mod tests {
                     end
                     local.get $base i32.load))"#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
             return Err(anyhow::anyhow!("expected one copied-input candidate"));
         };
@@ -478,7 +483,7 @@ mod tests {
                     local.get $base i32.const 99 i32.store $other
                     local.get $base i32.load $copied))"#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
             return Err(anyhow::anyhow!("expected one copied-input candidate"));
         };
@@ -508,7 +513,7 @@ mod tests {
                     call $opaque
                     local.get $base i32.load))"#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
             return Err(anyhow::anyhow!("expected one copied-input candidate"));
         };
@@ -660,7 +665,7 @@ mod tests {
                     i32.load offset=4
                     i32.add))"#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         assert_eq!(analysis.externref_bulk_copy_candidates.len(), 1);
         let candidate = &analysis.externref_bulk_copy_candidates[0];
         assert_eq!(candidate.constructor_import_function, 1);
@@ -768,7 +773,7 @@ mod tests {
                     local.get $base
                     i32.load))"#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
             return Err(anyhow::anyhow!("expected one copied-input candidate"));
         };
@@ -830,7 +835,7 @@ mod tests {
                     i32.shr_u
                     call $set))"#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "copy")?;
+        let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         assert!(analysis.externref_bulk_copy_candidates.is_empty());
         Ok(())
     }
@@ -870,7 +875,7 @@ mod tests {
                     end
                     unreachable))"#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         let machines = &analysis.state_machines;
         assert_eq!(machines.len(), 1);
         let machine = &machines[0];
@@ -972,7 +977,7 @@ mod tests {
                     unreachable))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(analysis.state_machines.len(), 1);
         assert_eq!(analysis.state_machine_pipelines.len(), 1);
         assert!(analysis
@@ -1049,7 +1054,7 @@ mod tests {
                     i32.or))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "reverse")?;
+        let analysis = analyze_export_semantics(&bytes, "reverse", &test_budget())?;
         assert_eq!(return_expressions(&analysis), ["reverse_bits32($arg0)"]);
         assert!(analysis.state_machines.is_empty());
         Ok(())
@@ -1097,7 +1102,7 @@ mod tests {
                     unreachable))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         let machines = &analysis.state_machines;
         assert_eq!(machines.len(), 2);
         let roots = &analysis.state_machine_roots;
@@ -1139,7 +1144,7 @@ mod tests {
                     call $length_slot))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(return_expressions(&analysis), ["$runtime0"]);
         assert_eq!(analysis.runtime_bindings.len(), 1);
         assert_eq!(analysis.runtime_bindings[0].name, "$runtime0");
@@ -1172,7 +1177,7 @@ mod tests {
                     call $length_plus_one))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(return_expressions(&analysis).len(), 1);
         assert!(analysis
             .runtime_bindings
@@ -1200,7 +1205,7 @@ mod tests {
                     table.get 0))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(
             return_expressions(&analysis),
             ["table_get<table0>($runtime0)"]
@@ -1228,7 +1233,7 @@ mod tests {
                     call $bridge))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(return_expressions(&analysis), ["$runtime0"]);
         assert_eq!(analysis.runtime_bindings.len(), 1);
         assert_eq!(
@@ -1253,7 +1258,7 @@ mod tests {
                     i32.add))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(analysis.runtime_bindings.len(), 1);
         assert_eq!(
             analysis.runtime_bindings[0].expression,
@@ -1303,7 +1308,7 @@ mod tests {
                     i32.mul))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert!(analysis.returns[0].runtime_dependencies.is_empty());
         let SemanticExpression::Operation {
             operator,
@@ -1344,7 +1349,7 @@ mod tests {
                     call $transform))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(analysis.runtime_bindings.len(), 2);
         let inner = &analysis.runtime_bindings[0];
         let outer = &analysis.runtime_bindings[1];
@@ -1409,7 +1414,7 @@ mod tests {
                     local.get $x))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(analysis.runtime_bindings.len(), 2);
         let first = &analysis.runtime_bindings[0];
         let second = &analysis.runtime_bindings[1];
@@ -1462,7 +1467,7 @@ mod tests {
                     i32.add))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         let expression = analysis
             .returns
             .first()
@@ -1544,7 +1549,7 @@ mod tests {
                     call $alloc))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(return_expressions(&analysis), ["$runtime0"]);
         assert_eq!(analysis.runtime_bindings.len(), 1);
         assert_eq!(
@@ -1567,7 +1572,7 @@ mod tests {
                     call $grow))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(return_expressions(&analysis), ["$runtime0"]);
         assert_eq!(analysis.runtime_bindings.len(), 1);
         assert!(!analysis.runtime_bindings[0]
@@ -1595,7 +1600,7 @@ mod tests {
                     local.get $value))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         let expression = analysis
             .returns
             .first()
@@ -1627,7 +1632,7 @@ mod tests {
                     call $grow))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(analysis.runtime_bindings.len(), 2);
         assert_eq!(
             analysis.runtime_bindings[0].expression,
@@ -1747,7 +1752,7 @@ mod tests {
                 call $memory_get
             "#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(analysis.opaque_host_effect_memory_reads.len(), 1);
         let relation = &analysis.opaque_host_effect_memory_reads[0];
         assert_eq!(relation.offset, 3536);
@@ -1774,7 +1779,7 @@ mod tests {
                 call $memory_get
             "#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert!(analysis.opaque_host_effect_memory_reads.is_empty());
         Ok(())
     }
@@ -1794,7 +1799,7 @@ mod tests {
                 call $memory_get
             "#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert!(analysis.opaque_host_effect_memory_reads.is_empty());
         Ok(())
     }
@@ -1816,7 +1821,7 @@ mod tests {
                 i32.const 0
             "#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert!(analysis.opaque_host_effect_memory_reads.is_empty());
         Ok(())
     }
@@ -1845,7 +1850,7 @@ mod tests {
                 call $memory_get
             "#,
         )?;
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert!(analysis.opaque_host_effect_memory_reads.is_empty());
         Ok(())
     }
@@ -1920,7 +1925,7 @@ mod tests {
                     call $memory_get))"#,
         )?;
 
-        let analysis = analyze_export_semantics(&bytes, "run")?;
+        let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(analysis.runtime_bindings.len(), 1);
         assert_eq!(
             analysis.runtime_bindings[0].expression,

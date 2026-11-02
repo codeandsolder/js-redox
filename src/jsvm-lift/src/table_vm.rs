@@ -22,6 +22,7 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, Span};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HandlerFunctionSlot {
@@ -150,6 +151,9 @@ struct FunctionSummary {
 
 struct Analyzer<'s> {
     source: &'s str,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
     function_stack: Vec<FunctionState>,
     function_aliases: HashMap<(u32, u32), String>,
     tables: Vec<DetailedHandlerTableCandidate>,
@@ -269,11 +273,12 @@ fn function_expr_meta(expr: &Expression<'_>) -> Option<(u32, u32, usize, bool)> 
 struct NumericScheduleUseVisitor<'s> {
     schedules: &'s HashSet<String>,
     found: bool,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for NumericScheduleUseVisitor<'_> {
     fn enter_node(&mut self, kind: AstKind<'a>) {
-        if self.found {
+        if self.found || !self.poller.poll(1) {
             return;
         }
         let AstKind::ComputedMemberExpression(cm) = kind else {
@@ -288,16 +293,23 @@ impl<'a> Visit<'a> for NumericScheduleUseVisitor<'_> {
     }
 }
 
-fn expression_uses_numeric_schedule(expr: &Expression<'_>, schedules: &HashSet<String>) -> bool {
+fn expression_uses_numeric_schedule(
+    expr: &Expression<'_>,
+    schedules: &HashSet<String>,
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    budget.checkpoint()?;
     if schedules.is_empty() {
-        return false;
+        return Ok(false);
     }
     let mut visitor = NumericScheduleUseVisitor {
         schedules,
         found: false,
+        poller: BudgetPoller::new(budget, 128),
     };
     visitor.visit_expression(expr);
-    visitor.found
+    visitor.poller.finish()?;
+    Ok(visitor.found)
 }
 
 fn is_static_numeric_index(index: &str) -> bool {
@@ -312,6 +324,7 @@ fn is_static_numeric_index(index: &str) -> bool {
 impl<'s> Analyzer<'s> {
     fn new(
         source: &'s str,
+        budget: &WorkBudget,
         forwarded_calls: Vec<ProvenRegistryForwardingCall>,
         read_calls: Vec<ProvenRegistryReadCall>,
         forwarded_registry_origins: HashMap<(u32, u32), ProvenRegistryObjectOrigin>,
@@ -319,6 +332,9 @@ impl<'s> Analyzer<'s> {
     ) -> Self {
         Self {
             source,
+            budget: budget.clone(),
+            poller: BudgetPoller::new(budget, 256),
+            budget_error: None,
             function_stack: Vec::new(),
             function_aliases: HashMap::new(),
             tables: Vec::new(),
@@ -673,12 +689,20 @@ impl<'s> Analyzer<'s> {
             .last()
             .map(|current| current.numeric_schedules.clone())
             .unwrap_or_default();
+        let schedule_backed =
+            match expression_uses_numeric_schedule(&member.expression, &schedules, &self.budget) {
+                Ok(schedule_backed) => schedule_backed,
+                Err(error) => {
+                    self.budget_error = Some(error);
+                    return;
+                }
+            };
         let alias = HandlerCall {
             table: fragment(self.source, member.object.span()),
             index: fragment(self.source, member.expression.span()),
             start: member.span.start,
             end: member.span.end,
-            schedule_backed: expression_uses_numeric_schedule(&member.expression, &schedules),
+            schedule_backed,
         };
         if let Some(current) = self.current_mut() {
             current.handler_aliases.insert(name.to_string(), alias);
@@ -803,8 +827,17 @@ impl<'s> Analyzer<'s> {
                     .last()
                     .map(|current| current.numeric_schedules.clone())
                     .unwrap_or_default();
-                let schedule_backed =
-                    expression_uses_numeric_schedule(&member.expression, &schedules);
+                let schedule_backed = match expression_uses_numeric_schedule(
+                    &member.expression,
+                    &schedules,
+                    &self.budget,
+                ) {
+                    Ok(schedule_backed) => schedule_backed,
+                    Err(error) => {
+                        self.budget_error = Some(error);
+                        return;
+                    }
+                };
                 if let Some(current) = self.current_mut() {
                     current.handler_calls.push(HandlerCall {
                         table,
@@ -842,6 +875,9 @@ impl<'s> Analyzer<'s> {
             .cloned();
 
         for draft in state.transitions.values() {
+            if !self.poller.poll(1) {
+                break;
+            }
             let (Some(state_target), Some(state_result_index), Some(opcode_result_index)) = (
                 draft.state_target.clone(),
                 draft.state_result_index,
@@ -885,6 +921,9 @@ impl<'s> Analyzer<'s> {
 
     fn materialize_registry_tables(&mut self) {
         for ((scope_start, scope_end, binding), handlers) in self.registry_handlers.drain() {
+            if !self.poller.poll(1) {
+                break;
+            }
             if handlers.len() < 4 {
                 continue;
             }
@@ -919,6 +958,9 @@ impl<'s> Analyzer<'s> {
         for ((scope_start, scope_end, binding), handlers) in
             self.forwarded_registry_handlers.drain()
         {
+            if !self.poller.poll(1) {
+                break;
+            }
             if handlers.len() < 4 {
                 continue;
             }
@@ -955,6 +997,9 @@ impl<'s> Analyzer<'s> {
 
     fn materialize_derived_registries(&mut self) {
         for ((scope_start, scope_end, binding), source) in &self.registry_sources {
+            if !self.poller.poll(1) {
+                break;
+            }
             let key = (*scope_start, *scope_end, binding.clone());
             let Some((start, end)) = self.registry_spans.get(&key).copied() else {
                 continue;
@@ -1019,8 +1064,11 @@ impl<'s> Analyzer<'s> {
     }
 
     fn count_dynamic_call_sites(&mut self) {
-        for table in &mut self.tables {
+        'tables: for table in &mut self.tables {
             for function in &self.functions {
+                if !self.poller.poll(1) {
+                    break 'tables;
+                }
                 if table.scope_start > function.start || table.scope_end < function.end {
                     continue;
                 }
@@ -1131,17 +1179,18 @@ impl<'s> Analyzer<'s> {
         })
     }
 
-    fn derive_table_vms(&self) -> Vec<TableVmCandidate> {
-        let mut table_vms = self
-            .functions
-            .iter()
-            .flat_map(|function| {
-                function
-                    .handler_calls
-                    .iter()
-                    .filter_map(|call| self.table_vm_candidate(function, call))
-            })
-            .collect::<Vec<_>>();
+    fn derive_table_vms(&mut self) -> Vec<TableVmCandidate> {
+        let mut table_vms = Vec::new();
+        'functions: for function in &self.functions {
+            for call in &function.handler_calls {
+                if !self.poller.poll(1) {
+                    break 'functions;
+                }
+                if let Some(candidate) = self.table_vm_candidate(function, call) {
+                    table_vms.push(candidate);
+                }
+            }
+        }
         table_vms.sort_by(|a, b| {
             (
                 &a.dispatcher_function_id,
@@ -1162,24 +1211,37 @@ impl<'s> Analyzer<'s> {
         table_vms
     }
 
-    fn finish(mut self) -> TableVmAnalysis {
+    fn finish(mut self) -> Result<TableVmAnalysis, BudgetExceeded> {
+        if let Some(error) = self.budget_error.take() {
+            return Err(error);
+        }
+        self.poller.finish()?;
         self.materialize_registry_tables();
+        self.poller.finish()?;
         self.materialize_forwarded_registries();
+        self.poller.finish()?;
         self.materialize_derived_registries();
+        self.poller.finish()?;
         self.normalize_inventory();
+        self.poller.finish()?;
         self.count_dynamic_call_sites();
+        self.poller.finish()?;
         let table_vms = self.derive_table_vms();
+        self.poller.finish()?;
 
-        TableVmAnalysis {
+        Ok(TableVmAnalysis {
             handler_function_tables: self.tables,
             byte_transducers: self.transducers,
             table_vms,
-        }
+        })
     }
 }
 
 impl<'a> Visit<'a> for Analyzer<'_> {
     fn enter_node(&mut self, kind: AstKind<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
         match kind {
             AstKind::Function(function) => {
                 let id = format!("fn@{:x}-{:x}", function.span.start, function.span.end);
@@ -1218,6 +1280,9 @@ impl<'a> Visit<'a> for Analyzer<'_> {
     }
 
     fn leave_node(&mut self, kind: AstKind<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
         if matches!(
             kind,
             AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
@@ -1231,20 +1296,36 @@ impl<'a> Visit<'a> for Analyzer<'_> {
     }
 }
 
-pub fn analyze(source: &str, program: &oxc_ast::ast::Program<'_>) -> TableVmAnalysis {
+pub fn analyze(
+    source: &str,
+    program: &oxc_ast::ast::Program<'_>,
+    budget: &WorkBudget,
+) -> Result<TableVmAnalysis, BudgetExceeded> {
+    budget.checkpoint()?;
     let semantic_ret = SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(program);
+    budget.checkpoint()?;
     let (forwarded_calls, read_calls) = if semantic_ret.diagnostics.is_empty() {
         (
-            structurally_proven_registry_forwarding_calls(program, semantic_ret.semantic.scoping()),
-            structurally_proven_registry_read_calls(program, semantic_ret.semantic.scoping()),
+            structurally_proven_registry_forwarding_calls(
+                program,
+                semantic_ret.semantic.scoping(),
+                budget,
+            )?,
+            structurally_proven_registry_read_calls(
+                program,
+                semantic_ret.semantic.scoping(),
+                budget,
+            )?,
         )
     } else {
         (Vec::new(), Vec::new())
     };
+    budget.checkpoint()?;
     let mut analyzer = Analyzer::new(
         source,
+        budget,
         forwarded_calls,
         read_calls,
         HashMap::new(),
@@ -1263,17 +1344,20 @@ pub fn analyze_with_registry_origins(
     program: &oxc_ast::ast::Program<'_>,
     install_flow: &ProvenOriginFlow,
     read_flow: &ProvenOriginFlow,
-) -> TableVmAnalysis {
+    budget: &WorkBudget,
+) -> Result<TableVmAnalysis, BudgetExceeded> {
+    budget.checkpoint()?;
     let semantic_ret = SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(program);
     let (forwarded_calls, read_calls, forwarded_registry_origins, registry_read_origins) =
         if semantic_ret.diagnostics.is_empty() {
             let scoping = semantic_ret.semantic.scoping();
-            let forwarded_calls = structurally_proven_registry_forwarding_calls(program, scoping);
-            let read_calls = structurally_proven_registry_read_calls(program, scoping);
+            let forwarded_calls =
+                structurally_proven_registry_forwarding_calls(program, scoping, budget)?;
+            let read_calls = structurally_proven_registry_read_calls(program, scoping, budget)?;
             let forwarded_registry_origins =
-                proven_origin_registry_handler_installs(program, scoping, install_flow)
+                proven_origin_registry_handler_installs(program, scoping, install_flow, budget)?
                     .into_iter()
                     .map(|proof| {
                         (
@@ -1283,7 +1367,7 @@ pub fn analyze_with_registry_origins(
                     })
                     .collect();
             let registry_read_origins =
-                proven_origin_registry_read_calls(program, scoping, read_flow)
+                proven_origin_registry_read_calls(program, scoping, read_flow, budget)?
                     .into_iter()
                     .map(|proof| ((proof.read.call_start, proof.read.call_end), proof.origin))
                     .collect();
@@ -1296,8 +1380,10 @@ pub fn analyze_with_registry_origins(
         } else {
             (Vec::new(), Vec::new(), HashMap::new(), HashMap::new())
         };
+    budget.checkpoint()?;
     let mut analyzer = Analyzer::new(
         source,
+        budget,
         forwarded_calls,
         read_calls,
         forwarded_registry_origins,
@@ -1313,6 +1399,11 @@ mod tests {
     use oxc_allocator::Allocator;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
+    use work_budget::{BudgetExceededKind, BudgetLimits, WorkBudget};
+
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("table-vm-test")
+    }
 
     #[test]
     fn origin_aware_registry_joins_install_and_dynamic_read() {
@@ -1338,7 +1429,10 @@ mod tests {
         let semantic = SemanticBuilder::new().build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
-        let analysis = analyze_with_registry_origins(source, &parsed.program, &flow, &flow);
+        let budget = test_budget();
+        let analysis =
+            analyze_with_registry_origins(source, &parsed.program, &flow, &flow, &budget)
+                .expect("origin-aware table analysis");
         let table = analysis
             .handler_function_tables
             .iter()
@@ -1367,7 +1461,8 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
-        let analysis = analyze(source, &parsed.program);
+        let budget = test_budget();
+        let analysis = analyze(source, &parsed.program, &budget).expect("table analysis");
         assert_eq!(analysis.handler_function_tables.len(), 1);
         let table = &analysis.handler_function_tables[0];
         assert_eq!(table.container_kind, "forwarded-registry");
@@ -1393,7 +1488,8 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
-        let analysis = analyze(source, &parsed.program);
+        let budget = test_budget();
+        let analysis = analyze(source, &parsed.program, &budget).expect("table analysis");
         assert_eq!(analysis.handler_function_tables.len(), 1);
         let table = &analysis.handler_function_tables[0];
         assert_eq!(table.container_kind, "forwarded-registry");
@@ -1407,5 +1503,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["1", "2", "3", "4"]
         );
+    }
+
+    #[test]
+    fn table_vm_propagates_work_budget_exhaustion() {
+        let allocator = Allocator::default();
+        let source = "function vm(){ const table=[()=>0,()=>1,()=>2,()=>3]; return table[0](); }";
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let budget = WorkBudget::new("table-vm-fuel", BudgetLimits::work(0));
+        assert!(matches!(
+            analyze(source, &parsed.program, &budget),
+            Err(ref error)
+                if error.kind() == BudgetExceededKind::Work
+                    && error.scope() == "table-vm-fuel"
+        ));
     }
 }
