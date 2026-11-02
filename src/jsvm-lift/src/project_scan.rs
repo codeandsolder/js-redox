@@ -3,7 +3,6 @@ use crate::{
         load_artifact, write_artifact, BUNDLES, DEOBFUSCATION, GENERATED_RECOVERY, JSVM_INDEX,
         SOURCE_INDEX,
     },
-    bounded_process::{command_error, run_command_with_timeout, CommandResult},
     content_dedup::{link_or_copy, sha256_path},
     js_format::format_source,
     safe_deob::{deobfuscate_source, SourceMode},
@@ -16,27 +15,17 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
 };
-use tempfile::Builder as TempDirBuilder;
 
 #[derive(Debug, Clone)]
 pub struct ProjectScanOptions {
-    pub repo_root: PathBuf,
-    pub switch_ir: PathBuf,
-    pub table_ir: PathBuf,
     pub max_generated_depth: usize,
     pub max_code_units: usize,
 }
 
-impl ProjectScanOptions {
-    #[must_use]
-    pub fn with_defaults(repo_root: PathBuf, switch_ir: PathBuf, table_ir: PathBuf) -> Self {
+impl Default for ProjectScanOptions {
+    fn default() -> Self {
         Self {
-            repo_root,
-            switch_ir,
-            table_ir,
             max_generated_depth: 8,
             max_code_units: 256,
         }
@@ -401,30 +390,6 @@ fn reuse_generated_unit(
     Ok(row)
 }
 
-fn run_ir_tool(
-    executable: &Path,
-    source: &Path,
-    report_path: &Path,
-    output_path: &Path,
-    repo_root: &Path,
-) -> Result<CommandResult> {
-    let parent = output_path
-        .parent()
-        .context("IR output path has no parent")?;
-    let work = TempDirBuilder::new()
-        .prefix(".ir-tool-")
-        .tempdir_in(parent)
-        .with_context(|| format!("creating IR helper scratch in {}", parent.display()))?;
-    let mut command = Command::new(executable);
-    command
-        .arg(source)
-        .arg(report_path)
-        .arg("--output")
-        .arg(output_path)
-        .current_dir(repo_root);
-    run_command_with_timeout(&mut command, work.path(), Duration::from_secs(180))
-}
-
 fn queue_unit(
     queue: &mut VecDeque<Value>,
     seen_paths: &mut BTreeSet<String>,
@@ -707,34 +672,28 @@ pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<Proj
 
         if value_usize(&row, "confirmed_direct_switch_maps") > 0 {
             let output_path = outdir.join(format!("{scan_id:04}.switch-ir.json"));
-            let output = run_ir_tool(
-                &options.switch_ir,
-                &source,
-                &report_path,
-                &output_path,
-                &options.repo_root,
-            )?;
-            row["switch_ir_exit"] = output.code.into();
-            if output.code == 0 {
-                row["switch_ir"] = relative_string(project, &output_path)?.into();
-            } else {
-                row["switch_ir_error"] = command_error(&output).into();
+            match crate::switch_ir::materialize(&source, &report_path, &output_path) {
+                Ok(()) => {
+                    row["switch_ir_exit"] = 0.into();
+                    row["switch_ir"] = relative_string(project, &output_path)?.into();
+                }
+                Err(error) => {
+                    row["switch_ir_exit"] = 1.into();
+                    row["switch_ir_error"] = error.to_string().into();
+                }
             }
         }
         if value_usize(&row, "table_vms") > 0 {
             let output_path = outdir.join(format!("{scan_id:04}.table-ir.json"));
-            let output = run_ir_tool(
-                &options.table_ir,
-                &source,
-                &report_path,
-                &output_path,
-                &options.repo_root,
-            )?;
-            row["table_ir_exit"] = output.code.into();
-            if output.code == 0 {
-                row["table_ir"] = relative_string(project, &output_path)?.into();
-            } else {
-                row["table_ir_error"] = command_error(&output).into();
+            match crate::table_ir::materialize(&source, &report_path, &output_path) {
+                Ok(()) => {
+                    row["table_ir_exit"] = 0.into();
+                    row["table_ir"] = relative_string(project, &output_path)?.into();
+                }
+                Err(error) => {
+                    row["table_ir_exit"] = 1.into();
+                    row["table_ir_error"] = error.to_string().into();
+                }
             }
         }
 

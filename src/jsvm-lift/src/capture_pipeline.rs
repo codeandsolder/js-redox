@@ -19,13 +19,6 @@ use anyhow::{ensure, Result};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
-pub struct VmPipelineOptions {
-    pub repo_root: PathBuf,
-    pub switch_ir: PathBuf,
-    pub table_ir: PathBuf,
-}
-
-#[derive(Debug, Clone)]
 pub struct CapturePipelineOptions {
     pub input: PathBuf,
     pub output: PathBuf,
@@ -35,7 +28,7 @@ pub struct CapturePipelineOptions {
     pub safe_deobfuscation: bool,
     pub bundle_materialization: bool,
     pub wasm_analysis: bool,
-    pub vm: Option<VmPipelineOptions>,
+    pub vm_scan: bool,
 }
 
 #[derive(Debug)]
@@ -111,15 +104,8 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
         None
     };
 
-    let (vm_scan, vm_materialization) = if let Some(vm) = &options.vm {
-        let scan = scan_project(
-            project,
-            &ProjectScanOptions::with_defaults(
-                vm.repo_root.clone(),
-                vm.switch_ir.clone(),
-                vm.table_ir.clone(),
-            ),
-        )?;
+    let (vm_scan, vm_materialization) = if options.vm_scan {
+        let scan = scan_project(project, &ProjectScanOptions::default())?;
         let materialized = materialize_vm_project(project)?;
         (Some(scan), Some(materialized))
     } else {
@@ -150,7 +136,10 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
 mod tests {
     use super::*;
     use crate::{
-        analysis_artifacts::{load_artifact, BUNDLES, JS_REFERENCES, SOURCEMAPS, SOURCE_GRAPH},
+        analysis_artifacts::{
+            load_artifact, BUNDLES, GENERATED_RECOVERY, JSVM_INDEX, JS_REFERENCES, SOURCEMAPS,
+            SOURCE_GRAPH,
+        },
         capture_project::read_manifest,
     };
     use anyhow::Context;
@@ -204,6 +193,43 @@ mod tests {
         })
     }
 
+    fn write_single_script_har(path: &Path, name: &str, source: &str) -> Result<()> {
+        let fixture = json!({
+            "log": {
+                "version": "1.2",
+                "creator": {"name": "VM capture regression", "version": "1"},
+                "pages": [{
+                    "startedDateTime": "2026-10-03T00:00:00.000Z",
+                    "id": "page_1",
+                    "title": name,
+                    "pageTimings": {}
+                }],
+                "entries": [har_entry(
+                    &format!("https://fixture.invalid/{name}.js"),
+                    "application/javascript",
+                    source.as_bytes(),
+                    false,
+                )]
+            }
+        });
+        fs::write(path, serde_json::to_vec(&fixture)?)?;
+        Ok(())
+    }
+
+    fn vm_options(input: &Path, output: &Path) -> CapturePipelineOptions {
+        CapturePipelineOptions {
+            input: input.to_path_buf(),
+            output: output.to_path_buf(),
+            assets_dir: None,
+            overwrite: false,
+            jobs: Some(2),
+            safe_deobfuscation: true,
+            bundle_materialization: false,
+            wasm_analysis: false,
+            vm_scan: true,
+        }
+    }
+
     fn static_options(input: &Path, output: &Path) -> CapturePipelineOptions {
         CapturePipelineOptions {
             input: input.to_path_buf(),
@@ -214,7 +240,7 @@ mod tests {
             safe_deobfuscation: true,
             bundle_materialization: true,
             wasm_analysis: false,
-            vm: None,
+            vm_scan: false,
         }
     }
 
@@ -267,6 +293,151 @@ mod tests {
             .get("source_path")
             .and_then(Value::as_str)
             .is_some_and(|path| project.join(path).is_file())));
+        Ok(())
+    }
+
+    #[test]
+    fn depythonify_vm_pipeline_materializes_representative_static_and_generated_vms() -> Result<()>
+    {
+        let cases = [
+            (
+                "direct-switch",
+                include_str!("../../../corpus/generated/js-vm-obfuscator/virtualized.js"),
+            ),
+            (
+                "function-table",
+                include_str!("../../../corpus/generated/js-virtualizer/vm.js"),
+            ),
+            (
+                "generated-packer",
+                include_str!("../../../corpus/generated/reversible-obfuscation/packer-eval.js"),
+            ),
+            (
+                "generated-obfuscated",
+                include_str!("../../../corpus/generated/js-virtualizer/vm-obfuscated.js"),
+            ),
+        ];
+
+        for (name, source) in cases {
+            let work = TempDir::new()?;
+            let har = work.path().join(format!("{name}.har"));
+            let project = work.path().join("project");
+            write_single_script_har(&har, name, source)?;
+            let summary = recover_capture_project(&vm_options(&har, &project))?;
+            let scan = summary.vm_scan.context("VM scan summary missing")?;
+            assert_eq!(scan.failures, 0, "{name}");
+            let materialized = summary
+                .vm_materialization
+                .context("VM materialization summary missing")?;
+            let index = artifact(&project, JSVM_INDEX)?;
+            assert_eq!(index["recursive_generated_code"], true, "{name}");
+
+            let code_units = index["code_units"]
+                .as_array()
+                .context("VM code units missing")?;
+            assert!(
+                code_units.iter().all(|unit| {
+                    unit.get("scanner_exit")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                        == 0
+                        && unit
+                            .get("switch_ir_exit")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default()
+                            == 0
+                        && unit
+                            .get("table_ir_exit")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default()
+                            == 0
+                }),
+                "{name}"
+            );
+
+            match name {
+                "direct-switch" => {
+                    assert!(materialized.switch_vms >= 1);
+                    assert!(index["devirtualized_units"]
+                        .as_array()
+                        .is_some_and(|units| units.iter().any(|unit| {
+                            unit["vm_kind"] == "direct_switch"
+                                && unit["source_path"]
+                                    .as_str()
+                                    .is_some_and(|path| project.join(path).is_file())
+                                && unit["pseudocode_path"]
+                                    .as_str()
+                                    .is_some_and(|path| project.join(path).is_file())
+                        })));
+                }
+                "function-table" => {
+                    assert!(materialized.table_vms >= 1);
+                    assert!(index["devirtualized_units"]
+                        .as_array()
+                        .is_some_and(|units| units.iter().any(|unit| {
+                            unit["vm_kind"] == "function_table"
+                                && unit["handler_count"].as_u64().unwrap_or_default() >= 74
+                        })));
+                }
+                "generated-packer" => {
+                    assert_eq!(
+                        index["dynamic_code_units"].as_array().map(Vec::len),
+                        Some(1)
+                    );
+                    let recovery = artifact(&project, GENERATED_RECOVERY)?;
+                    assert_eq!(recovery["summary"]["generated_units"], 1);
+                    assert_eq!(recovery["summary"]["safe_deobfuscation"], 1);
+                    let recovered = &recovery["units"][0];
+                    assert_eq!(recovered["selected_stage"], "safe_deobfuscation");
+                    let readable = recovered["readable_path"]
+                        .as_str()
+                        .context("generated readable path missing")?;
+                    let readable = fs::read_to_string(project.join(readable))?;
+                    assert!(readable.contains("var answer = fortytwo;"));
+                    assert!(readable.contains("console.log(answer);"));
+                }
+                "generated-obfuscated" => {
+                    let recovery = artifact(&project, GENERATED_RECOVERY)?;
+                    assert!(
+                        recovery["summary"]["string_recovery_only"]
+                            .as_u64()
+                            .unwrap_or_default()
+                            >= 1
+                    );
+                    assert_eq!(recovery["summary"]["exact_fallback"], 0);
+                    let generated = code_units
+                        .iter()
+                        .filter(|unit| unit["origin"] == "generated_dynamic_code")
+                        .max_by_key(|unit| {
+                            unit["largest_handler_table"].as_u64().unwrap_or_default()
+                        })
+                        .context("generated VM unit missing")?;
+                    assert_eq!(generated["analysis_origin"], "string_recovery_only");
+                    assert!(
+                        generated["largest_handler_table"]
+                            .as_u64()
+                            .unwrap_or_default()
+                            >= 74
+                    );
+                    assert!(materialized.table_vms >= 1, "{generated:#}");
+                    assert!(index["devirtualized_units"]
+                        .as_array()
+                        .is_some_and(|units| units.iter().any(|unit| {
+                            unit["vm_kind"] == "function_table"
+                                && unit["handler_count"].as_u64().unwrap_or_default() >= 74
+                        })));
+                }
+                _ => unreachable!(),
+            }
+
+            let graph = artifact(&project, SOURCE_GRAPH)?;
+            if name != "generated-packer" {
+                assert!(edge_count(&graph, "devirtualized_vm") >= 1, "{name}");
+            } else {
+                assert_eq!(edge_count(&graph, "generated_code"), 1);
+                assert_eq!(edge_count(&graph, "generated_safe_recovery"), 1);
+            }
+        }
         Ok(())
     }
 

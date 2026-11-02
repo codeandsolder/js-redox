@@ -1,6 +1,5 @@
 pub mod analysis_artifacts;
 pub mod ast_utils;
-mod bounded_process;
 pub mod browser_script_types;
 pub mod bytecode;
 pub mod capture_import;
@@ -88,3 +87,5 @@ pub mod api_surface;
 pub mod static_bytes;
 pub mod structural_signals;
 pub mod sus_scan;
+pub mod switch_ir;
+pub mod table_ir;

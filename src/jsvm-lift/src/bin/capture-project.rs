@@ -6,9 +6,8 @@ use jsvm_lift::{
         JSVM_INDEX, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCEMAPS, SOURCE_GRAPH, SOURCE_INDEX,
         WASM_INDEX, WASM_JS_BOUNDARY, WASM_RESOURCE_PROVENANCE,
     },
-    capture_pipeline::{recover_capture_project, CapturePipelineOptions, VmPipelineOptions},
+    capture_pipeline::{recover_capture_project, CapturePipelineOptions},
     capture_project::{read_manifest, MANIFEST_NAME},
-    tool_environment::{repository_root, tool_dir},
 };
 use serde_json::Value;
 use std::{
@@ -244,17 +243,6 @@ fn main() -> Result<()> {
         })
         .transpose()?;
 
-    let vm = if args.skip_vm_scan {
-        None
-    } else {
-        let repo = repository_root()?;
-        let tools = tool_dir()?;
-        Some(VmPipelineOptions {
-            repo_root: repo,
-            switch_ir: tools.join("switch-ir"),
-            table_ir: tools.join("table-ir"),
-        })
-    };
     let safe_deob = !args.skip_safe_deobfuscation;
     let bundle_unpack = safe_deob && !args.skip_bundle_unpack;
     let wasm_analysis = !args.skip_wasm_analysis;
@@ -268,7 +256,7 @@ fn main() -> Result<()> {
         safe_deobfuscation: safe_deob,
         bundle_materialization: bundle_unpack,
         wasm_analysis,
-        vm,
+        vm_scan: !args.skip_vm_scan,
     })?;
 
     print_summary(
