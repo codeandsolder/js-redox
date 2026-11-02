@@ -1396,6 +1396,7 @@ pub fn analyze_with_registry_origins(
 #[cfg(test)]
 mod tests {
     use super::{analyze, analyze_with_registry_origins};
+    use crate::test_support::{TestResult, TestValue};
     use oxc_allocator::Allocator;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
@@ -1406,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn origin_aware_registry_joins_install_and_dynamic_read() {
+    fn origin_aware_registry_joins_install_and_dynamic_read() -> TestResult {
         use crate::receiver_identity::structurally_proven_origin_flow;
         use oxc_semantic::SemanticBuilder;
 
@@ -1432,21 +1433,22 @@ mod tests {
         let budget = test_budget();
         let analysis =
             analyze_with_registry_origins(source, &parsed.program, &flow, &flow, &budget)
-                .expect("origin-aware table analysis");
+                .test_value("origin-aware table analysis")?;
         let table = analysis
             .handler_function_tables
             .iter()
             .find(|table| table.binding.starts_with("origin@"))
-            .expect("origin-canonical registry");
+            .test_value("origin-canonical registry")?;
         assert_eq!(table.entries, 4);
         assert_eq!(table.function_values, 4);
         assert_eq!(table.read_sites, 1);
         assert_eq!(table.dynamic_read_sites, 1);
         assert!(analysis.table_vms.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn materializes_proven_forwarded_registry_calls() {
+    fn materializes_proven_forwarded_registry_calls() -> TestResult {
         let source = r#"
             function install(receiver, key, value) {
                 receiver.handlers[key] = wrap(receiver, key, value);
@@ -1462,17 +1464,18 @@ mod tests {
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
         let budget = test_budget();
-        let analysis = analyze(source, &parsed.program, &budget).expect("table analysis");
+        let analysis = analyze(source, &parsed.program, &budget).test_value("table analysis")?;
         assert_eq!(analysis.handler_function_tables.len(), 1);
         let table = &analysis.handler_function_tables[0];
         assert_eq!(table.container_kind, "forwarded-registry");
         assert_eq!(table.binding, "state.handlers");
         assert_eq!(table.function_values, 4);
         assert_eq!(table.handlers[0].key, "1");
+        Ok(())
     }
 
     #[test]
-    fn groups_proven_sequence_receivers_by_stable_final_binding() {
+    fn groups_proven_sequence_receivers_by_stable_final_binding() -> TestResult {
         let source = r#"
             function install(receiver, key, value) {
                 receiver.handlers[key] = wrap(receiver, key, value);
@@ -1489,7 +1492,7 @@ mod tests {
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
         let budget = test_budget();
-        let analysis = analyze(source, &parsed.program, &budget).expect("table analysis");
+        let analysis = analyze(source, &parsed.program, &budget).test_value("table analysis")?;
         assert_eq!(analysis.handler_function_tables.len(), 1);
         let table = &analysis.handler_function_tables[0];
         assert_eq!(table.container_kind, "forwarded-registry");
@@ -1503,6 +1506,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["1", "2", "3", "4"]
         );
+        Ok(())
     }
 
     #[test]

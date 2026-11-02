@@ -207,7 +207,10 @@ mod tests {
         proven_origin_registry_handler_installs, proven_origin_registry_read_calls,
         proven_origin_registry_value_installs,
     };
-    use crate::receiver_identity::structurally_proven_origin_flow;
+    use crate::{
+        receiver_identity::structurally_proven_origin_flow,
+        test_support::{TestResult, TestValue},
+    };
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
@@ -219,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn joins_registry_reads_and_installs_by_exact_origin_and_key() {
+    fn joins_registry_reads_and_installs_by_exact_origin_and_key() -> TestResult {
         let source = r#"
             const C = function() {
                 install(this, 7, function handler() {});
@@ -243,10 +246,10 @@ mod tests {
             &flow,
             &test_budget(),
         )
-        .expect("proven_origin_registry_handler_installs");
+        .test_value("proven_origin_registry_handler_installs")?;
         let reads =
             proven_origin_registry_read_calls(&parsed.program, scoping, &flow, &test_budget())
-                .expect("proven_origin_registry_read_calls");
+                .test_value("proven_origin_registry_read_calls")?;
         assert_eq!(installs.len(), 1);
         assert_eq!(reads.len(), 1);
         assert_eq!(installs[0].exact_key, 7);
@@ -256,10 +259,11 @@ mod tests {
             installs[0].install.registry_path,
             reads[0].read.registry_path
         );
+        Ok(())
     }
 
     #[test]
-    fn joins_non_function_registry_values_by_exact_origin_and_key() {
+    fn joins_non_function_registry_values_by_exact_origin_and_key() -> TestResult {
         let source = r#"
             const C = function() {
                 install(this, 7, "payload");
@@ -277,29 +281,31 @@ mod tests {
         let flow = structurally_proven_origin_flow(&parsed.program, scoping);
         let values =
             proven_origin_registry_value_installs(&parsed.program, scoping, &flow, &test_budget())
-                .expect("proven_origin_registry_value_installs");
+                .test_value("proven_origin_registry_value_installs")?;
         let handlers = proven_origin_registry_handler_installs(
             &parsed.program,
             scoping,
             &flow,
             &test_budget(),
         )
-        .expect("proven_origin_registry_handler_installs");
+        .test_value("proven_origin_registry_handler_installs")?;
         assert_eq!(values.len(), 1);
         let root = values
             .iter()
-            .find(|proof| {
-                &source[proof.install.value_start as usize..proof.install.value_end as usize]
-                    == "\"payload\""
+            .find_map(|proof| {
+                let start = usize::try_from(proof.install.value_start).ok()?;
+                let end = usize::try_from(proof.install.value_end).ok()?;
+                (source.get(start..end) == Some("\"payload\"")).then_some(proof)
             })
-            .expect("outer literal value");
+            .test_value("outer literal value")?;
         assert_eq!(root.exact_key, 7);
         assert_eq!(root.install.registry_path, vec!["T"]);
         assert!(handlers.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn keeps_origin_for_dynamic_registry_read_key() {
+    fn keeps_origin_for_dynamic_registry_read_key() -> TestResult {
         let source = r#"
             const C = function(key) {
                 install(this, 7, function handler() {});
@@ -319,14 +325,15 @@ mod tests {
         let flow = structurally_proven_origin_flow(&parsed.program, scoping);
         let reads =
             proven_origin_registry_read_calls(&parsed.program, scoping, &flow, &test_budget())
-                .expect("proven_origin_registry_read_calls");
+                .test_value("proven_origin_registry_read_calls")?;
         assert_eq!(reads.len(), 1);
         assert_eq!(reads[0].exact_key, None);
         assert_eq!(reads[0].read.registry_path, vec!["T"]);
+        Ok(())
     }
 
     #[test]
-    fn does_not_join_same_registry_shape_on_different_object() {
+    fn does_not_join_same_registry_shape_on_different_object() -> TestResult {
         let source = r#"
             const C = function(other) {
                 install(this, 7, function handler() {});
@@ -350,11 +357,12 @@ mod tests {
             &flow,
             &test_budget(),
         )
-        .expect("proven_origin_registry_handler_installs");
+        .test_value("proven_origin_registry_handler_installs")?;
         let reads =
             proven_origin_registry_read_calls(&parsed.program, scoping, &flow, &test_budget())
-                .expect("proven_origin_registry_read_calls");
+                .test_value("proven_origin_registry_read_calls")?;
         assert_eq!(installs.len(), 1);
         assert!(reads.is_empty());
+        Ok(())
     }
 }

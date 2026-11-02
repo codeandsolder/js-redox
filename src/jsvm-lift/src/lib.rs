@@ -20,6 +20,9 @@ pub mod string_recovery;
 pub mod symbolic_integer;
 pub mod table_vm;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 mod har_project;
 pub mod js_format;
 pub mod js_refs;
