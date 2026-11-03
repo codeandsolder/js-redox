@@ -1,15 +1,18 @@
 use anyhow::{Context, Result};
 use jsvm_lift::{
-    forwarding_semantics::structurally_proven_lazy_registry_read_calls,
+    forwarding_semantics::{
+        structurally_proven_lazy_registry_read_calls, ProvenLazyRegistryReadCall,
+    },
     lazy_cell::{
         proven_fast_lazy_cell_factory_call, proven_slow_lazy_cell_captured_handler_from_value,
         proven_slow_lazy_cell_captured_value_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
-        proven_slow_lazy_cell_prototype_carrier, proven_slow_lazy_cell_read_result,
-        proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_resolved_handler,
-        proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_state_fields,
+        proven_slow_lazy_cell_prototype_carrier, proven_slow_lazy_cell_registry_assignment,
+        proven_slow_lazy_cell_resolved_handler, proven_slow_lazy_cell_resolver_index,
+        proven_slow_lazy_cell_state_fields,
         proven_slow_lazy_cell_state_fields_for_exact_assignment,
-        proven_slow_lazy_cell_update_state, structurally_proven_fast_lazy_cell_factory_shapes,
+        proven_slow_lazy_cell_update_state, structurally_compatible_slow_lazy_cell_read,
+        structurally_proven_fast_lazy_cell_factory_shapes,
         structurally_proven_slow_lazy_cell_factory_shapes, SlowLazyCellResolverIndexFacts,
     },
     receiver_identity::structurally_proven_origin_flow,
@@ -23,7 +26,7 @@ use oxc_span::{SourceType, Span};
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::json;
 use std::{env, fs, path::PathBuf};
-use work_budget::WorkBudget;
+use work_budget::{BudgetExceeded, WorkBudget};
 
 fn snippet(source: &str, start: u32, end: u32) -> String {
     source
@@ -32,6 +35,36 @@ fn snippet(source: &str, start: u32, end: u32) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Group a source file's lazy registry reads by their independently proven
+/// accessor shape, rather than requiring every call to use one accessor.
+fn distinct_lazy_accessor_families<'a>(
+    reads: &'a [ProvenLazyRegistryReadCall],
+    budget: &WorkBudget,
+) -> Result<Vec<&'a ProvenLazyRegistryReadCall>, BudgetExceeded> {
+    let mut families: Vec<&ProvenLazyRegistryReadCall> = Vec::new();
+    for read in reads {
+        budget.consume(1)?;
+        if families.iter().any(|prior| {
+            prior.accessor_function_start == read.accessor_function_start
+                && prior.accessor_function_end == read.accessor_function_end
+                && prior.cell_assignment_start == read.cell_assignment_start
+                && prior.cell_assignment_end == read.cell_assignment_end
+                && prior.read.registry_path == read.read.registry_path
+                && prior.probe_property == read.probe_property
+                && prior.update_property == read.update_property
+                && prior.projection_property == read.projection_property
+                && prior.selector_start == read.selector_start
+                && prior.selector_end == read.selector_end
+                && prior.selector_key_symbol == read.selector_key_symbol
+                && prior.selector_polynomial == read.selector_polynomial
+        }) {
+            continue;
+        }
+        families.push(read);
+    }
+    Ok(families)
 }
 
 fn main() -> Result<()> {
@@ -65,17 +98,7 @@ fn main() -> Result<()> {
 
     let lazy_reads =
         structurally_proven_lazy_registry_read_calls(&parsed.program, scoping, &budget)?;
-    let accessor = lazy_reads.first().filter(|first| {
-        lazy_reads.iter().all(|read| {
-            read.accessor_function_start == first.accessor_function_start
-                && read.accessor_function_end == first.accessor_function_end
-                && read.read.registry_path.as_slice() == first.read.registry_path.as_slice()
-                && read.update_property == first.update_property
-                && read.projection_property == first.projection_property
-                && read.selector_key_symbol == first.selector_key_symbol
-                && read.selector_polynomial == first.selector_polynomial
-        })
-    });
+    let accessors = distinct_lazy_accessor_families(&lazy_reads, &budget)?;
 
     let shapes = structurally_proven_slow_lazy_cell_factory_shapes(&parsed.program, scoping);
     let shape_json = shapes
@@ -234,7 +257,7 @@ fn main() -> Result<()> {
                 }
             }
             let mut carrier_proofs = Vec::new();
-            if let Some(accessor) = accessor {
+            for accessor in &accessors {
                 for fields in &path_state_fields {
                     if let Some(proof) = proven_slow_lazy_cell_prototype_carrier(
                         &source,
@@ -270,11 +293,11 @@ fn main() -> Result<()> {
                     })
                 })
                 .collect::<Vec<_>>();
-            let resolver_proofs = match (&update, accessor, phase_value) {
-                (Some(update), Some(accessor), Some(phase_value)) => exact_assignments
-                    .iter()
-                    .filter_map(|exact_assignment| {
-                        proven_slow_lazy_cell_resolver_index(
+            let mut resolver_proofs = Vec::new();
+            if let (Some(update), Some(phase_value)) = (&update, phase_value) {
+                for accessor in &accessors {
+                    for exact_assignment in &exact_assignments {
+                        if let Some(proof) = proven_slow_lazy_cell_resolver_index(
                             &source,
                             &parsed.program,
                             &semantic.semantic,
@@ -285,11 +308,12 @@ fn main() -> Result<()> {
                                 exact_assignment,
                                 phase_value,
                             },
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-                _ => Vec::new(),
-            };
+                        ) {
+                            resolver_proofs.push(proof);
+                        }
+                    }
+                }
+            }
             let mut resolved_handlers = Vec::new();
             for resolver in &resolver_proofs {
                 for captured in &captured_handlers {
@@ -298,11 +322,11 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            let mut read_results = Vec::new();
+            let mut read_compatibilities = Vec::new();
             for resolved in &resolved_handlers {
                 for carrier in &carrier_proofs {
-                    if let Some(proof) = proven_slow_lazy_cell_read_result(resolved, carrier) {
-                        read_results.push(proof);
+                    if let Some(proof) = structurally_compatible_slow_lazy_cell_read(resolved, carrier) {
+                        read_compatibilities.push(proof);
                     }
                 }
             }
@@ -405,7 +429,7 @@ fn main() -> Result<()> {
                         proof.captured_handler.install.install.handler_end,
                     ],
                 })).collect::<Vec<_>>(),
-                "read_results": read_results.iter().map(|proof| json!({
+                "read_compatibilities": read_compatibilities.iter().map(|proof| json!({
                     "exact_key_value": proof.resolved_handler.resolver.exact_key_value,
                     "handler_slot": proof.resolved_handler.resolver.handler_slot,
                     "logical_handler": [
@@ -437,28 +461,35 @@ fn main() -> Result<()> {
         .iter()
         .map(|call| call["resolved_handlers"].as_array().map_or(0, Vec::len))
         .sum::<usize>();
-    let read_result_proofs = candidate_calls
+    let read_compatibility_count = candidate_calls
         .iter()
-        .map(|call| call["read_results"].as_array().map_or(0, Vec::len))
+        .map(|call| call["read_compatibilities"].as_array().map_or(0, Vec::len))
         .sum::<usize>();
-    let accessor_json = accessor.map(|accessor| {
-        json!({
-            "call_count": lazy_reads.len(),
-            "function": [accessor.accessor_function_start, accessor.accessor_function_end],
-            "registry_path": accessor.read.registry_path,
-            "update_property": accessor.update_property,
-            "projection_property": accessor.projection_property,
-            "selector": [accessor.selector_start, accessor.selector_end],
-            "selector_source": snippet(&source, accessor.selector_start, accessor.selector_end),
-            "selector_key_symbol": scoping.symbol_name(accessor.selector_key_symbol),
+    let accessor_families_json = accessors
+        .iter()
+        .map(|accessor| {
+            json!({
+                "call_count": lazy_reads.iter().filter(|read| {
+                    read.accessor_function_start == accessor.accessor_function_start
+                        && read.accessor_function_end == accessor.accessor_function_end
+                }).count(),
+                "function": [accessor.accessor_function_start, accessor.accessor_function_end],
+                "registry_path": accessor.read.registry_path,
+                "fast_probe_property": accessor.probe_property,
+                "update_property": accessor.update_property,
+                "projection_property": accessor.projection_property,
+                "selector": [accessor.selector_start, accessor.selector_end],
+                "selector_source": snippet(&source, accessor.selector_start, accessor.selector_end),
+                "selector_key_symbol": scoping.symbol_name(accessor.selector_key_symbol),
+            })
         })
-    });
+        .collect::<Vec<_>>();
 
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
             "phase_value": phase_value,
-            "lazy_accessor": accessor_json,
+            "lazy_accessor_families": accessor_families_json,
             "shapes": shape_json,
             "fast_shapes": fast_shape_json,
             "fast_calls": fast_calls,
@@ -470,8 +501,65 @@ fn main() -> Result<()> {
             "state_field_proven_calls": state_field_proven_calls,
             "resolver_proven_calls": resolver_proven_calls,
             "resolved_handler_proofs": resolved_handler_proofs,
-            "read_result_proofs": read_result_proofs,
+            "read_compatibility_count": read_compatibility_count,
         }))?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::distinct_lazy_accessor_families;
+    use jsvm_lift::forwarding_semantics::structurally_proven_lazy_registry_read_calls;
+    use oxc_allocator::Allocator;
+    use oxc_semantic::SemanticBuilder;
+    use oxc_span::SourceType;
+    use rolldown_redox::ecmascript::parse_program;
+    use work_budget::{BudgetLimits, WorkBudget};
+
+    #[test]
+    fn distinct_lazy_accessor_families_preserve_two_shapes_and_deduplicate_calls() {
+        let source = r#"
+            function first(s,k,v) {
+                v=s.T[k];
+                if(v.ready) return v.refresh();
+                return (v.refresh(k*2+1),v).current;
+            }
+            function second(s,k,v) {
+                v=s.T[k];
+                switch(!v.ready) {
+                    case false: return v.refresh();
+                }
+                return (v.refresh(k*3+1),v).current;
+            }
+            first(state,12);
+            second(state,20);
+            first(state,30);
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let budget = WorkBudget::unlimited("lazy families");
+        let reads = structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &budget,
+        )
+        .expect("lazy registry reads");
+        assert_eq!(reads.len(), 3);
+        let families =
+            distinct_lazy_accessor_families(&reads, &budget).expect("distinct accessor families");
+        assert_eq!(families.len(), 2);
+        assert_ne!(
+            families[0].accessor_function_start,
+            families[1].accessor_function_start
+        );
+        assert_eq!(families[0].read.registry_path, ["T"]);
+        assert_eq!(families[1].read.registry_path, ["T"]);
+
+        let exhausted = WorkBudget::new("exhausted families", BudgetLimits::work(0));
+        assert!(distinct_lazy_accessor_families(&reads, &exhausted).is_err());
+    }
 }
