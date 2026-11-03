@@ -58,6 +58,12 @@ fn source_call(e: &Expression<'_>, sites: &HashSet<(u32, u32)>) -> Option<Span> 
         _ => None,
     }
 }
+/// Bindings captured from outer functions are not local to this invocation.
+/// Ask Oxc for the declaration node instead of approximating scope ownership
+/// with a file-global set of declared symbols.
+fn locally_owned_symbol(s: &Semantic<'_>, symbol: SymbolId, context: NodeId) -> bool {
+    owner(s, s.scoping().symbol_declaration(symbol)) == Some(context)
+}
 fn is_direct_eval_callee(expression: &Expression<'_>) -> bool {
     match expression {
         Expression::Identifier(id) => id.name == "eval",
@@ -160,7 +166,6 @@ pub fn analyze(
         .iter()
         .map(|r| (r.call_start, r.call_end))
         .collect::<HashSet<_>>();
-    let mut locals = HashSet::new();
     let mut defs = Vec::new();
     let mut calls = Vec::new();
     for (id, n) in s.nodes().iter_enumerated() {
@@ -176,7 +181,6 @@ pub fn analyze(
                 let Some(symbol) = b.symbol_id.get() else {
                     continue;
                 };
-                locals.insert(symbol);
                 if let Some(accessor) = d.init.as_ref().and_then(|e| source_call(e, &sites)) {
                     defs.push(Source {
                         symbol,
@@ -232,7 +236,7 @@ pub fn analyze(
                 accessor_call_end: d.accessor.end,
                 indirect_call_start: call.start,
                 indirect_call_end: call.end,
-                definite_accessor_result: locals.contains(&symbol)
+                definite_accessor_result: locally_owned_symbol(s, symbol, context)
                     && is_definite(s, d, call, budget)?,
             });
         }
@@ -333,6 +337,24 @@ mod tests {
         )?;
         assert_eq!(e.len(), 1);
         assert!(e[0].definite_accessor_result);
+        Ok(())
+    }
+
+    #[test]
+    fn definite_source_accepts_locally_owned_parameter() -> TestResult {
+        let e = inspect("function run(h,s,k){ h=read(s,k); h(); }")?;
+        assert_eq!(e.len(), 1);
+        assert!(e[0].definite_accessor_result);
+        Ok(())
+    }
+
+    #[test]
+    fn outer_binding_is_not_local_to_nested_assignment() -> TestResult {
+        let e = inspect(
+            "function outer(){let h=other; function inner(s,k){h=read(s,k);h();} inner(x,y);}",
+        )?;
+        assert_eq!(e.len(), 1);
+        assert!(!e[0].definite_accessor_result);
         Ok(())
     }
 
