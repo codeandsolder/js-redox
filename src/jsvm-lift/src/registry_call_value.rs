@@ -58,6 +58,13 @@ fn source_call(e: &Expression<'_>, sites: &HashSet<(u32, u32)>) -> Option<Span> 
         _ => None,
     }
 }
+fn is_direct_eval_callee(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::Identifier(id) => id.name == "eval",
+        Expression::ParenthesizedExpression(p) => is_direct_eval_callee(&p.expression),
+        _ => false,
+    }
+}
 fn has_dynamic_scope(
     s: &Semantic<'_>,
     context: NodeId,
@@ -65,14 +72,19 @@ fn has_dynamic_scope(
 ) -> Result<bool, BudgetExceeded> {
     for (id, n) in s.nodes().iter_enumerated() {
         budget.consume(1)?;
-        if owner(s, id) != Some(context) {
+        // A nested function can run direct eval and mutate a captured
+        // local without producing a resolved write reference. Scan the
+        // entire lexical subtree, not only this function's immediate body.
+        if !s
+            .nodes()
+            .ancestor_ids(id)
+            .any(|ancestor| ancestor == context)
+        {
             continue;
         }
         match n.kind() {
             AstKind::WithStatement(_) => return Ok(true),
-            AstKind::CallExpression(c) if matches!(&c.callee,Expression::Identifier(i) if i.name=="eval") => {
-                return Ok(true)
-            }
+            AstKind::CallExpression(c) if is_direct_eval_callee(&c.callee) => return Ok(true),
             _ => {}
         }
     }
@@ -89,14 +101,38 @@ fn is_definite(
     {
         return Ok(false);
     }
+    // Sloppy parameter/var redeclarations can alias mapped arguments
+    // entries. A write to arguments[index] is not a symbol write.
+    let parameter_binding = match s.nodes().kind(d.context) {
+        AstKind::Function(f) => f.params.items.iter().any(|p| {
+            matches!(&p.pattern, BindingPattern::BindingIdentifier(id) if id.symbol_id.get() == Some(d.symbol))
+        }),
+        AstKind::ArrowFunctionExpression(f) => f.params.items.iter().any(|p| {
+            matches!(&p.pattern, BindingPattern::BindingIdentifier(id) if id.symbol_id.get() == Some(d.symbol))
+        }),
+        _ => false,
+    };
+    if parameter_binding {
+        for (id, node) in s.nodes().iter_enumerated() {
+            budget.consume(1)?;
+            if s.nodes()
+                .ancestor_ids(id)
+                .any(|ancestor| ancestor == d.context)
+                && matches!(node.kind(), AstKind::IdentifierReference(name) if name.name == "arguments")
+            {
+                return Ok(false);
+            }
+        }
+    }
     for id in s.scoping().get_resolved_reference_ids(d.symbol) {
         budget.consume(1)?;
         let r = s.scoping().get_reference(*id);
-        if owner(s, r.node_id()) != Some(d.context) {
-            return Ok(false);
-        }
         if !r.is_write() {
             continue;
+        }
+        if owner(s, r.node_id()) != Some(d.context) {
+            // Captured writes are unsafe. Captured reads alone are fine.
+            return Ok(false);
         }
         let barrier = s.nodes().get_node(r.node_id()).kind().span();
         if Some(barrier) == d.target {
@@ -238,7 +274,7 @@ mod tests {
             structurally_proven_registry_read_calls(&parsed.program, ret.semantic.scoping(), &b)
                 .test_value("reads")?;
         assert!(!reads.is_empty());
-        Ok(analyze(&ret.semantic, &reads, &b).test_value("edges")?)
+        analyze(&ret.semantic, &reads, &b).test_value("edges")
     }
     #[test]
     fn stable_result_is_definite() -> TestResult {
@@ -267,6 +303,39 @@ mod tests {
         assert!(!e[0].definite_accessor_result);
         Ok(())
     }
+    #[test]
+    fn nested_dynamic_scope_is_not_a_definite_source() -> TestResult {
+        let e = inspect(
+            "function run(s,k){ let h=read(s,k); function change(){eval('h=other')} change(); h(); }"
+        )?;
+        assert_eq!(e.len(), 1);
+        assert!(!e[0].definite_accessor_result);
+        let e = inspect(
+            "function run(s,k){ let h=read(s,k); function change(){(eval)('h=other')} change(); h(); }"
+        )?;
+        assert_eq!(e.len(), 1);
+        assert!(!e[0].definite_accessor_result);
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_arguments_parameter_alias_is_not_definite() -> TestResult {
+        let e = inspect("function run(h,s,k){ var h=read(s,k); arguments[0]=other; h(); }")?;
+        assert_eq!(e.len(), 1);
+        assert!(!e[0].definite_accessor_result);
+        Ok(())
+    }
+
+    #[test]
+    fn nested_read_only_capture_is_preserved() -> TestResult {
+        let e = inspect(
+            "function run(s,k){ let h=read(s,k); function peek(){return h;} peek(); h(); }",
+        )?;
+        assert_eq!(e.len(), 1);
+        assert!(e[0].definite_accessor_result);
+        Ok(())
+    }
+
     #[test]
     fn budget_is_enforced() -> TestResult {
         let alloc = Allocator::default();
