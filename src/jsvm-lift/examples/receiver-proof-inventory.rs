@@ -250,6 +250,8 @@ fn main() -> Result<()> {
                 "assignment": [edge.result.assignment_start, edge.result.assignment_end],
                 "indirect_call": [edge.result.indirect_call_start, edge.result.indirect_call_end],
                 "definite_accessor_result": edge.result.definite_accessor_result,
+                "registry_receiver": [edge.registry_receiver_start, edge.registry_receiver_end],
+                "registry_key": [edge.registry_key_start, edge.registry_key_end],
                 "registry_path": edge.registry_path,
                 "fast_probe_property": edge.fast_probe_property,
                 "update_method": edge.update_method,

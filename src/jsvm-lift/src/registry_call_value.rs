@@ -34,6 +34,10 @@ pub struct RegistryAccessorResultUse {
 pub struct LazyRegistryAccessorResultUse {
     pub result: RegistryAccessorResultUse,
     pub registry_path: Vec<String>,
+    pub registry_receiver_start: u32,
+    pub registry_receiver_end: u32,
+    pub registry_key_start: u32,
+    pub registry_key_end: u32,
     pub fast_probe_property: String,
     pub update_method: String,
     pub slow_projection_property: String,
@@ -64,6 +68,10 @@ pub fn join_lazy_accessor_results(
         result.push(LazyRegistryAccessorResultUse {
             result: use_site.clone(),
             registry_path: read.read.registry_path.clone(),
+            registry_receiver_start: read.read.receiver_start,
+            registry_receiver_end: read.read.receiver_end,
+            registry_key_start: read.read.key_start,
+            registry_key_end: read.read.key_end,
             fast_probe_property: read.probe_property.clone(),
             update_method: read.update_property.clone(),
             slow_projection_property: read.projection_property.clone(),
@@ -104,7 +112,7 @@ pub fn join_exact_origin_lazy_accessor_results(
                 entry.insert(Some(origin));
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                if entry.get().is_some_and(|previous| *previous != origin) {
+                if entry.get().is_some_and(|previous| previous != origin) {
                     entry.insert(None);
                 }
             }
@@ -120,7 +128,14 @@ pub fn join_exact_origin_lazy_accessor_results(
         let Some(origin) = by_call.get(&site).and_then(|entry| *entry) else {
             continue;
         };
-        if origin.read.registry_path != lazy.registry_path {
+        // Same function invocation alone does not prove the receiver and
+        // key roles agree across independently discovered accessor shapes.
+        if origin.read.registry_path != lazy.registry_path
+            || origin.read.receiver_start != lazy.registry_receiver_start
+            || origin.read.receiver_end != lazy.registry_receiver_end
+            || origin.read.key_start != lazy.registry_key_start
+            || origin.read.key_end != lazy.registry_key_end
+        {
             continue;
         }
         joined.push(ExactOriginLazyAccessorResultUse {
@@ -577,6 +592,10 @@ mod tests {
                 definite_accessor_result: false,
             },
             registry_path: vec!["handlers".into()],
+            registry_receiver_start: 7,
+            registry_receiver_end: 8,
+            registry_key_start: 9,
+            registry_key_end: 10,
             fast_probe_property: "loaded".into(),
             update_method: "refresh".into(),
             slow_projection_property: "current".into(),
@@ -620,6 +639,24 @@ mod tests {
             &budget,
         )
         .test_value("path reject")?
+        .is_empty());
+        let mut wrong_receiver = origin.clone();
+        wrong_receiver.read.receiver_start = 6;
+        assert!(join_exact_origin_lazy_accessor_results(
+            std::slice::from_ref(&lazy),
+            &[wrong_receiver],
+            &budget,
+        )
+        .test_value("receiver reject")?
+        .is_empty());
+        let mut wrong_key = origin.clone();
+        wrong_key.read.key_end = 11;
+        assert!(join_exact_origin_lazy_accessor_results(
+            std::slice::from_ref(&lazy),
+            &[wrong_key],
+            &budget,
+        )
+        .test_value("key reject")?
         .is_empty());
         let mut wrong_call = origin.clone();
         wrong_call.read.call_start = 6;
