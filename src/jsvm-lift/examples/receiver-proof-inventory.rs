@@ -124,7 +124,7 @@ fn main() -> Result<()> {
         let event = phase_event_start
             .zip(phase_event_end)
             .map(|(start, end)| Span::new(start, end));
-        let closures = structurally_proven_prototype_method_phase_closures(&parsed.program, scoping)
+        let closures = structurally_proven_prototype_method_phase_closures(&parsed.program, scoping, &budget)?
             .into_iter()
             .map(|closure| {
                 let phase = event.as_ref().and_then(|event| {
@@ -184,7 +184,7 @@ fn main() -> Result<()> {
         let property = field_property
             .as_deref()
             .context("--exact-field-call-start requires --field=NAME")?;
-        let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+        let flow = structurally_proven_origin_flow(&parsed.program, scoping, &budget)?;
         let mut targets = flow
             .direct_calls
             .iter()
@@ -199,7 +199,8 @@ fn main() -> Result<()> {
             &semantic.semantic,
             property,
             target,
-        )
+            &budget,
+        )?
         .into_iter()
         .map(|proof| {
             json!({
@@ -218,17 +219,18 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if prototype_strings_only {
-        let strings = structurally_proven_prototype_string_assignments(&parsed.program, scoping)
-            .into_iter()
-            .map(|assignment| {
-                json!({
-                    "constructor": [assignment.constructor_start, assignment.constructor_end],
-                    "property": assignment.property,
-                    "value": assignment.value,
-                    "assignment": [assignment.assignment_start, assignment.assignment_end],
+        let strings =
+            structurally_proven_prototype_string_assignments(&parsed.program, scoping, &budget)?
+                .into_iter()
+                .map(|assignment| {
+                    json!({
+                        "constructor": [assignment.constructor_start, assignment.constructor_end],
+                        "property": assignment.property,
+                        "value": assignment.value,
+                        "assignment": [assignment.assignment_start, assignment.assignment_end],
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
         println!("{}", serde_json::to_string_pretty(&strings)?);
         return Ok(());
     }
@@ -236,7 +238,8 @@ fn main() -> Result<()> {
         let mut targets = structurally_proven_prototype_method_calls_at_runtime(
             &parsed.program,
             &semantic.semantic,
-        )
+            &budget,
+        )?
         .into_iter()
         .filter(|proof| proof.candidate.call.call_start == call_start);
         let target = targets
@@ -246,79 +249,61 @@ fn main() -> Result<()> {
             targets.next().is_none(),
             "ambiguous runtime method call start"
         );
-        let seeded =
-            propagate_proven_prototype_method_call_origins(&parsed.program, scoping, &target);
-        let base = structurally_proven_origin_flow(&parsed.program, scoping);
+        let seeded = propagate_proven_prototype_method_call_origins(
+            &parsed.program,
+            scoping,
+            &target,
+            &budget,
+        )?;
+        let base = structurally_proven_origin_flow(&parsed.program, scoping, &budget)?;
         let target_origin = (
             target.candidate.call.allocation_start,
             target.candidate.call.allocation_end,
             target.candidate.call.constructor_start,
             target.candidate.call.constructor_end,
         );
-        let prototype_strings_at_allocation = structurally_proven_prototype_string_assignments(
-            &parsed.program,
-            scoping,
-        )
-        .into_iter()
-        .filter(|assignment| {
+        let prototype_string_assignments =
+            structurally_proven_prototype_string_assignments(&parsed.program, scoping, &budget)?;
+        let mut prototype_strings_at_allocation = Vec::new();
+        let mut prototype_string_direct_calls = Vec::new();
+        for assignment in prototype_string_assignments.iter().filter(|assignment| {
             assignment.constructor_start == target_origin.2
                 && assignment.constructor_end == target_origin.3
-        })
-        .filter_map(|assignment| {
-            proven_prototype_string_at_allocation(
+        }) {
+            let Some(string) = proven_prototype_string_at_allocation(
                 &parsed.program,
                 &semantic.semantic,
                 target_origin.2,
                 target_origin.3,
                 Span::new(target_origin.0, target_origin.1),
                 &assignment.property,
-            )
-        })
-        .map(|proof| {
-            json!({
-                "property": proof.assignment.property,
-                "value": proof.assignment.value,
-                "assignment": [proof.assignment.assignment_start, proof.assignment.assignment_end],
-            })
-        })
-        .collect::<Vec<_>>();
-        let prototype_string_direct_calls =
-            structurally_proven_prototype_string_assignments(&parsed.program, scoping)
-                .into_iter()
-                .filter(|assignment| {
-                    assignment.constructor_start == target_origin.2
-                        && assignment.constructor_end == target_origin.3
-                })
-                .filter_map(|assignment| {
-                    proven_prototype_string_at_allocation(
-                        &parsed.program,
-                        &semantic.semantic,
-                        target_origin.2,
-                        target_origin.3,
-                        Span::new(target_origin.0, target_origin.1),
-                        &assignment.property,
-                    )
-                })
-                .flat_map(|string| {
-                    proven_prototype_string_at_direct_calls(
+                &budget,
+            )?
+            else {
+                continue;
+            };
+            prototype_strings_at_allocation.push(json!({
+                "property": string.assignment.property,
+                "value": string.assignment.value,
+                "assignment": [string.assignment.assignment_start, string.assignment.assignment_end],
+            }));
+            for proof in proven_prototype_string_at_direct_calls(
                 &source,
                 &parsed.program,
                 &semantic.semantic,
                 &string,
-            )
-            .into_iter()
-            .map(move |proof| {
-                json!({
+                &budget,
+            )? {
+                prototype_string_direct_calls.push(json!({
                     "property": proof.string.assignment.property,
                     "value": proof.string.assignment.value,
                     "call": [proof.call.call_start, proof.call.call_end],
                     "caller": [proof.call.caller.function_start, proof.call.caller.function_end],
                     "callee": [proof.call.callee.function_start, proof.call.callee.function_end],
                     "exact_integer_arguments": proof.call.exact_integer_arguments,
-                })
-            })
-                })
-                .collect::<Vec<_>>();
+                }));
+            }
+        }
         let reads = proven_origin_registry_read_calls(&parsed.program, scoping, &seeded, &budget)?
             .into_iter()
             .filter(|proof| {
@@ -431,7 +416,8 @@ fn main() -> Result<()> {
         let mut targets = structurally_proven_prototype_method_calls_at_runtime(
             &parsed.program,
             &semantic.semantic,
-        )
+            &budget,
+        )?
         .into_iter()
         .filter(|proof| proof.candidate.call.call_start == call_start);
         let target = targets
@@ -446,7 +432,8 @@ fn main() -> Result<()> {
             &parsed.program,
             &semantic.semantic,
             &target,
-        )
+            &budget,
+        )?
         .map(|proof| {
             json!({
                 "call": [proof.candidate.call.call_start, proof.candidate.call.call_end],
@@ -473,7 +460,8 @@ fn main() -> Result<()> {
         let mut targets = structurally_proven_prototype_method_calls_at_runtime(
             &parsed.program,
             &semantic.semantic,
-        )
+            &budget,
+        )?
         .into_iter()
         .filter(|proof| proof.candidate.call.call_start == call_start);
         let target = targets
@@ -489,7 +477,8 @@ fn main() -> Result<()> {
             &semantic.semantic,
             &target,
             property,
-        )
+            &budget,
+        )?
         .map(|proof| {
             let call = &proof.call_target.candidate.call;
             json!({
@@ -519,7 +508,8 @@ fn main() -> Result<()> {
         let mut matches = structurally_proven_prototype_method_calls_at_runtime(
             &parsed.program,
             &semantic.semantic,
-        )
+            &budget,
+        )?
         .into_iter()
         .filter(|proof| proof.candidate.call.call_start == call_start);
         let target = matches
@@ -534,7 +524,8 @@ fn main() -> Result<()> {
             &parsed.program,
             &semantic.semantic,
             &target,
-        )
+            &budget,
+        )?
         .map(|summary| {
             let candidate = &summary.call_target.candidate;
             json!({
@@ -554,7 +545,8 @@ fn main() -> Result<()> {
         let runtime_method_calls = structurally_proven_prototype_method_calls_at_runtime(
             &parsed.program,
             &semantic.semantic,
-        )
+            &budget,
+        )?
         .into_iter()
         .map(|proof| {
             let candidate = proof.candidate;
@@ -578,27 +570,32 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
-    let flow = structurally_proven_origin_flow(&parsed.program, scoping);
-    let matched = structurally_matched_prototype_method_calls(&parsed.program, scoping);
+    let flow = structurally_proven_origin_flow(&parsed.program, scoping, &budget)?;
+    let matched = structurally_matched_prototype_method_calls(&parsed.program, scoping, &budget)?;
     let lookup_targets =
-        structurally_proven_prototype_method_lookup_targets(&parsed.program, scoping);
-    let runtime_method_calls =
-        structurally_proven_prototype_method_calls_at_runtime(&parsed.program, &semantic.semantic);
+        structurally_proven_prototype_method_lookup_targets(&parsed.program, scoping, &budget)?;
+    let runtime_method_calls = structurally_proven_prototype_method_calls_at_runtime(
+        &parsed.program,
+        &semantic.semantic,
+        &budget,
+    )?;
     let receiver_effects =
-        structurally_proven_prototype_method_receiver_effects(&parsed.program, scoping);
+        structurally_proven_prototype_method_receiver_effects(&parsed.program, scoping, &budget)?;
     let own_data_fields =
-        structurally_proven_own_data_field_initializations(&parsed.program, scoping);
+        structurally_proven_own_data_field_initializations(&parsed.program, scoping, &budget)?;
     let own_data_fields_at_member_calls = structurally_proven_own_data_fields_at_member_calls(
         &source,
         &parsed.program,
         &semantic.semantic,
-    );
+        &budget,
+    )?;
     let receiver_preserving_method_calls =
         structurally_proven_receiver_preserving_prototype_method_calls(
             &source,
             &parsed.program,
             &semantic.semantic,
-        );
+            &budget,
+        )?;
     let runtime_method_calls = runtime_method_calls
         .iter()
         .map(|proof| {
@@ -619,12 +616,13 @@ fn main() -> Result<()> {
     } else {
         matched
         .iter()
-        .map(|candidate| {
+        .map(|candidate| -> Result<Value> {
             let seeded = propagate_matched_prototype_method_call_origins(
                 &parsed.program,
                 scoping,
                 candidate,
-            );
+                &budget,
+            )?;
             let direct_call_effect_checks = seeded
                 .direct_calls
                 .iter()
@@ -671,7 +669,7 @@ fn main() -> Result<()> {
                     })
                 })
                 .collect::<Vec<_>>();
-            json!({
+            Ok(json!({
                 "call": [candidate.call.call_start, candidate.call.call_end],
                 "property": candidate.call.property,
                 "direct_call_effect_checks": direct_call_effect_checks,
@@ -709,9 +707,9 @@ fn main() -> Result<()> {
                     "context": {"this_origin": exposure.context.this_origin, "parameter_indices": exposure.context.parameter_indices},
                     "kind": exposure.kind,
                 })).collect::<Vec<_>>(),
-            })
+            }))
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>>>()?
     };
 
     let mut own_data_field_entry_dominance = Vec::new();
