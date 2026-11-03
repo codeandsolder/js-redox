@@ -141,7 +141,7 @@
       "pretty_path": "google-knitsail/current-live-vm-20260927.pretty.js",
       "expect_scan_signals_min": {
         "embedded": 1,
-        "if_ladder_state_machines_recursive": 4
+        "if_ladder_state_machines_recursive": 40
       }
     },
     {

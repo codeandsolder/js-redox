@@ -1,3 +1,4 @@
+use crate::symbolic_integer::{normalize_integer_polynomial, IntegerPolynomial};
 use jsvm_safe_core::{exact_u32, string_literal_value};
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, CallExpression, Expression,
@@ -5,13 +6,97 @@ use oxc_ast::ast::{
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
+use oxc_span::GetSpan;
 use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use std::collections::{HashMap, HashSet};
+use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ExprKey {
     Symbol(SymbolId),
     Index(Box<ExprKey>, u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenRegistryForwardingCall {
+    pub call_start: u32,
+    pub call_end: u32,
+    pub receiver_start: u32,
+    pub receiver_end: u32,
+    pub key_start: u32,
+    pub key_end: u32,
+    pub registry_path: Vec<String>,
+    /// Every direct access to this registry path in the proven forwarder chain
+    /// is indexed by the forwarded key; the registry object is not otherwise
+    /// exposed by those forwarder bodies.
+    pub registry_key_confined: bool,
+    pub handler_start: u32,
+    pub handler_end: u32,
+    pub handler_params: usize,
+    pub handler_async: bool,
+}
+
+/// Structural proof that a call feeds one evaluated value through a proven
+/// registry forwarder. Unlike [`ProvenRegistryForwardingCall`], this does not
+/// require the value expression itself to be a function literal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenRegistryForwardingValueCall {
+    pub call_start: u32,
+    pub call_end: u32,
+    pub receiver_start: u32,
+    pub receiver_end: u32,
+    pub key_start: u32,
+    pub key_end: u32,
+    pub value_start: u32,
+    pub value_end: u32,
+    pub registry_path: Vec<String>,
+    /// Every direct access to this registry path in the proven forwarder chain
+    /// is indexed by the forwarded key; the registry object is not otherwise
+    /// exposed by those forwarder bodies.
+    pub registry_key_confined: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenRegistryReadCall {
+    pub call_start: u32,
+    pub call_end: u32,
+    pub receiver_start: u32,
+    pub receiver_end: u32,
+    pub key_start: u32,
+    pub key_end: u32,
+    pub registry_path: Vec<String>,
+}
+
+/// Structural proof that a registry accessor routes the loaded cell through a
+/// truthiness probe, an update method, and a projected property on the same
+/// symbol. This intentionally does not assign semantics to those properties; a
+/// lazy-cell theorem must separately prove what the cell object does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenLazyRegistryReadCall {
+    pub read: ProvenRegistryReadCall,
+    pub accessor_function_start: u32,
+    pub accessor_function_end: u32,
+    pub cell_assignment_start: u32,
+    pub cell_assignment_end: u32,
+    pub probe_property: String,
+    pub update_property: String,
+    pub projection_property: String,
+    pub selector_start: u32,
+    pub selector_end: u32,
+    /// Key-parameter symbol in the accessor function's semantic scope.
+    pub selector_key_symbol: SymbolId,
+    /// Canonical selector polynomial. It is guaranteed to reference no symbol
+    /// other than `selector_key_symbol` (or none for a constant selector).
+    pub selector_polynomial: IntegerPolynomial,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryForwarderProof {
+    receiver_argument: u32,
+    key_argument: u32,
+    value_argument: u32,
+    registry_path: Vec<String>,
+    registry_key_confined: bool,
 }
 
 fn reference_symbol(scoping: &Scoping, expression: &Expression<'_>) -> Option<SymbolId> {
@@ -21,6 +106,13 @@ fn reference_symbol(scoping: &Scoping, expression: &Expression<'_>) -> Option<Sy
     scoping
         .get_reference(identifier.reference_id.get()?)
         .symbol_id()
+}
+
+fn symbol_binding_is_stable(scoping: &Scoping, symbol: SymbolId) -> bool {
+    scoping
+        .get_resolved_reference_ids(symbol)
+        .iter()
+        .all(|reference_id| !scoping.get_reference(*reference_id).is_write())
 }
 
 fn expr_key(scoping: &Scoping, expression: &Expression<'_>) -> Option<ExprKey> {
@@ -98,9 +190,17 @@ fn parameter_symbols(function: &Function<'_>) -> Option<Vec<SymbolId>> {
 #[derive(Default)]
 struct ArgumentsBoxCollector {
     boxes: HashMap<SymbolId, u32>,
+    poller: Option<BudgetPoller>,
 }
 
 impl<'a> Visit<'a> for ArgumentsBoxCollector {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.poller.as_mut().is_some_and(|poller| !poller.poll(1)) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
         for declarator in &declaration.declarations {
             let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
@@ -133,14 +233,28 @@ impl<'a> Visit<'a> for ArgumentsBoxCollector {
     }
 }
 
-fn argument_box_declarations(body: &FunctionBody<'_>) -> HashMap<SymbolId, u32> {
-    let mut collector = ArgumentsBoxCollector::default();
+fn argument_box_declarations_budgeted(
+    body: &FunctionBody<'_>,
+    budget: &WorkBudget,
+) -> Result<HashMap<SymbolId, u32>, BudgetExceeded> {
+    let mut collector = ArgumentsBoxCollector {
+        boxes: HashMap::new(),
+        poller: Some(BudgetPoller::new(budget, 256)),
+    };
     collector.visit_function_body(body);
-    collector.boxes
+    if let Some(poller) = collector.poller.as_mut() {
+        poller.finish()?;
+    }
+    Ok(collector.boxes)
 }
 
-fn argument_boxes(body: &FunctionBody<'_>) -> HashSet<SymbolId> {
-    argument_box_declarations(body).into_keys().collect()
+fn argument_boxes_budgeted(
+    body: &FunctionBody<'_>,
+    budget: &WorkBudget,
+) -> Result<HashSet<SymbolId>, BudgetExceeded> {
+    Ok(argument_box_declarations_budgeted(body, budget)?
+        .into_keys()
+        .collect())
 }
 
 fn expression_access_path(
@@ -256,9 +370,24 @@ struct ArgumentRoleSafety<'c, 'r> {
     boxes: &'r HashSet<SymbolId>,
     declarations: HashMap<SymbolId, u32>,
     valid: bool,
+    poller: Option<BudgetPoller>,
 }
 
 impl<'a> Visit<'a> for ArgumentRoleSafety<'_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.poller.as_mut().is_some_and(|poller| !poller.poll(1)) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.poller.as_mut().is_some_and(|poller| !poller.poll(1)) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
         let Some(symbol) = identifier
             .reference_id
@@ -338,22 +467,59 @@ impl<'a> Visit<'a> for ArgumentRoleSafety<'_, '_> {
     }
 }
 
-fn argument_roles_are_stable(
+fn argument_roles_are_stable_budgeted(
     scoping: &Scoping,
     body: &FunctionBody<'_>,
     parameters: &[SymbolId],
     boxes: &HashSet<SymbolId>,
-) -> bool {
-    let declarations = argument_box_declarations(body);
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    let declarations = argument_box_declarations_budgeted(body, budget)?;
     let mut safety = ArgumentRoleSafety {
         scoping,
         parameters: parameters.iter().copied().collect(),
         boxes,
         declarations,
         valid: true,
+        poller: Some(BudgetPoller::new(budget, 256)),
     };
     safety.visit_function_body(body);
-    safety.valid
+    if let Some(poller) = safety.poller.as_mut() {
+        poller.finish()?;
+    }
+    Ok(safety.valid)
+}
+
+fn selected_argument_roles_are_stable_budgeted(
+    scoping: &Scoping,
+    body: &FunctionBody<'_>,
+    parameters: &[SymbolId],
+    boxes: &HashSet<SymbolId>,
+    indices: &[u32],
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    let selected = indices
+        .iter()
+        .filter_map(|index| usize::try_from(*index).ok())
+        .filter_map(|index| parameters.get(index).copied())
+        .collect::<HashSet<_>>();
+    if selected.len() != indices.len() {
+        return Ok(false);
+    }
+    let declarations = argument_box_declarations_budgeted(body, budget)?;
+    let mut safety = ArgumentRoleSafety {
+        scoping,
+        parameters: selected,
+        boxes,
+        declarations,
+        valid: true,
+        poller: Some(BudgetPoller::new(budget, 256)),
+    };
+    safety.visit_function_body(body);
+    if let Some(poller) = safety.poller.as_mut() {
+        poller.finish()?;
+    }
+    Ok(safety.valid)
 }
 
 fn argument_index_expr(
@@ -446,6 +612,28 @@ fn last_sequence_expression<'a>(expression: &'a Expression<'a>) -> &'a Expressio
             .map_or(expression, last_sequence_expression)
     } else {
         expression
+    }
+}
+
+fn stable_receiver_expression<'a>(
+    scoping: &Scoping,
+    expression: &'a Expression<'a>,
+) -> Option<&'a Expression<'a>> {
+    match expression {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            stable_receiver_expression(scoping, &parenthesized.expression)
+        }
+        Expression::SequenceExpression(sequence) => {
+            let receiver = stable_receiver_expression(scoping, sequence.expressions.last()?)?;
+            match receiver {
+                Expression::Identifier(_) => reference_symbol(scoping, receiver)
+                    .filter(|symbol| symbol_binding_is_stable(scoping, *symbol))
+                    .map(|_| receiver),
+                Expression::ThisExpression(_) => Some(receiver),
+                _ => None,
+            }
+        }
+        _ => Some(expression),
     }
 }
 
@@ -633,9 +821,17 @@ struct SetterProbe<'c, 'o, 'b> {
     inner_boxes: HashSet<SymbolId>,
     good_writes: usize,
     bad_writes: usize,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for SetterProbe<'_, '_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
         if assignment_is_forwarded_member(
             self.scoping,
@@ -676,22 +872,23 @@ fn setter_forwards(
     target: &ExprKey,
     outer_parameters: &[SymbolId],
     outer_boxes: &HashSet<SymbolId>,
-) -> bool {
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
     if function.r#async || function.generator {
-        return false;
+        return Ok(false);
     }
     let Some(parameters) = parameter_symbols(function) else {
-        return false;
+        return Ok(false);
     };
     if parameters.len() != 1 {
-        return false;
+        return Ok(false);
     }
     let Some(body) = &function.body else {
-        return false;
+        return Ok(false);
     };
-    let boxes = argument_boxes(body);
-    if !argument_roles_are_stable(scoping, body, &parameters, &boxes) {
-        return false;
+    let boxes = argument_boxes_budgeted(body, budget)?;
+    if !argument_roles_are_stable_budgeted(scoping, body, &parameters, &boxes, budget)? {
+        return Ok(false);
     }
     let mut probe = SetterProbe {
         scoping,
@@ -702,9 +899,11 @@ fn setter_forwards(
         inner_boxes: boxes,
         good_writes: 0,
         bad_writes: 0,
+        poller: BudgetPoller::new(budget, 256),
     };
     probe.visit_function_body(body);
-    probe.good_writes == 1 && probe.bad_writes == 0
+    probe.poller.finish()?;
+    Ok(probe.good_writes == 1 && probe.bad_writes == 0)
 }
 
 struct GetterProbe<'c, 'o, 'b> {
@@ -714,9 +913,17 @@ struct GetterProbe<'c, 'o, 'b> {
     outer_boxes: &'b HashSet<SymbolId>,
     returns: usize,
     invalid: bool,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for GetterProbe<'_, '_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
     fn visit_return_statement(&mut self, statement: &oxc_ast::ast::ReturnStatement<'a>) {
         self.returns += 1;
         let Some(expression) = &statement.argument else {
@@ -749,12 +956,13 @@ fn getter_forwards(
     target: &ExprKey,
     outer_parameters: &[SymbolId],
     outer_boxes: &HashSet<SymbolId>,
-) -> bool {
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
     if function.r#async || function.generator || !function.params.items.is_empty() {
-        return false;
+        return Ok(false);
     }
     let Some(body) = &function.body else {
-        return false;
+        return Ok(false);
     };
     let mut probe = GetterProbe {
         scoping,
@@ -763,9 +971,11 @@ fn getter_forwards(
         outer_boxes,
         returns: 0,
         invalid: false,
+        poller: BudgetPoller::new(budget, 256),
     };
     probe.visit_function_body(body);
-    probe.returns == 1 && !probe.invalid
+    probe.poller.finish()?;
+    Ok(probe.returns == 1 && !probe.invalid)
 }
 
 fn is_object_constructor(
@@ -838,6 +1048,9 @@ struct HelperProbe<'c> {
     define_pairs: Vec<PairEvidence>,
     strings: HashMap<ExprKey, String>,
     branch_path: BranchPath,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
 }
 
 impl HelperProbe<'_> {
@@ -933,7 +1146,24 @@ impl HelperProbe<'_> {
 }
 
 impl<'a> Visit<'a> for HelperProbe<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if self.budget_error.is_some() {
+            return;
+        }
         self.record_string_assignment(assignment);
 
         if assignment.operator.as_str() == "=" {
@@ -993,30 +1223,37 @@ impl<'a> Visit<'a> for HelperProbe<'_> {
                                 path: self.branch_path.clone(),
                                 start: assignment.span.start,
                             };
-                            match member.property.name.as_str() {
-                                "set"
-                                    if setter_forwards(
-                                        self.scoping,
-                                        function,
-                                        target,
-                                        &self.parameters,
-                                        &self.boxes,
-                                    ) =>
-                                {
+                            let forwarding = match member.property.name.as_str() {
+                                "set" => setter_forwards(
+                                    self.scoping,
+                                    function,
+                                    target,
+                                    &self.parameters,
+                                    &self.boxes,
+                                    &self.budget,
+                                ),
+                                "get" => getter_forwards(
+                                    self.scoping,
+                                    function,
+                                    target,
+                                    &self.parameters,
+                                    &self.boxes,
+                                    &self.budget,
+                                ),
+                                _ => Ok(false),
+                            };
+                            match forwarding {
+                                Ok(true) if member.property.name.as_str() == "set" => {
                                     self.setter_pairs.push(evidence);
                                 }
-                                "get"
-                                    if getter_forwards(
-                                        self.scoping,
-                                        function,
-                                        target,
-                                        &self.parameters,
-                                        &self.boxes,
-                                    ) =>
-                                {
+                                Ok(true) if member.property.name.as_str() == "get" => {
                                     self.getter_pairs.push(evidence);
                                 }
-                                _ => {}
+                                Ok(_) => {}
+                                Err(error) => {
+                                    self.budget_error = Some(error);
+                                    return;
+                                }
                             }
                         }
                     }
@@ -1028,6 +1265,9 @@ impl<'a> Visit<'a> for HelperProbe<'_> {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if self.budget_error.is_some() {
+            return;
+        }
         if !call.optional
             && call.arguments.len() == 3
             && self.callee_is_define_property(&call.callee)
@@ -1054,6 +1294,9 @@ impl<'a> Visit<'a> for HelperProbe<'_> {
     }
 
     fn visit_if_statement(&mut self, statement: &IfStatement<'a>) {
+        if self.budget_error.is_some() {
+            return;
+        }
         walk::walk_expression(self, &statement.test);
         let base_strings = self.strings.clone();
         let marker = statement.span.start;
@@ -1088,18 +1331,57 @@ impl<'a> Visit<'a> for HelperProbe<'_> {
 struct HelperCollector<'c> {
     scoping: &'c Scoping,
     helpers: HashSet<SymbolId>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
 }
 
 impl<'a> Visit<'a> for HelperCollector<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if self.budget_error.is_some() {
+            return;
+        }
         if !function.r#async && !function.generator {
             if let (Some(identifier), Some(body), Some(parameters)) =
                 (&function.id, &function.body, parameter_symbols(function))
             {
                 if parameters.len() == 5 {
                     if let Some(symbol) = identifier.symbol_id.get() {
-                        let boxes = argument_boxes(body);
-                        if !argument_roles_are_stable(self.scoping, body, &parameters, &boxes) {
+                        let boxes = match argument_boxes_budgeted(body, &self.budget) {
+                            Ok(boxes) => boxes,
+                            Err(error) => {
+                                self.budget_error = Some(error);
+                                return;
+                            }
+                        };
+                        let stable = match argument_roles_are_stable_budgeted(
+                            self.scoping,
+                            body,
+                            &parameters,
+                            &boxes,
+                            &self.budget,
+                        ) {
+                            Ok(stable) => stable,
+                            Err(error) => {
+                                self.budget_error = Some(error);
+                                return;
+                            }
+                        };
+                        if !stable {
                             walk::walk_function(self, function, flags);
                             return;
                         }
@@ -1115,8 +1397,19 @@ impl<'a> Visit<'a> for HelperCollector<'_> {
                             define_pairs: Vec::new(),
                             strings: HashMap::new(),
                             branch_path: Vec::new(),
+                            budget: self.budget.clone(),
+                            poller: BudgetPoller::new(&self.budget, 256),
+                            budget_error: None,
                         };
                         probe.visit_function_body(body);
+                        if let Err(error) = probe.poller.finish() {
+                            self.budget_error = Some(error);
+                            return;
+                        }
+                        if let Some(error) = probe.budget_error.take() {
+                            self.budget_error = Some(error);
+                            return;
+                        }
                         if probe.proven() {
                             self.helpers.insert(symbol);
                         }
@@ -1128,16 +1421,28 @@ impl<'a> Visit<'a> for HelperCollector<'_> {
     }
 }
 
-fn only_unconditional_statements(statements: &[Statement<'_>]) -> bool {
-    statements.iter().all(|statement| match statement {
-        Statement::BlockStatement(block) => only_unconditional_statements(&block.body),
-        Statement::VariableDeclaration(_)
-        | Statement::ExpressionStatement(_)
-        | Statement::ReturnStatement(_)
-        | Statement::EmptyStatement(_)
-        | Statement::DebuggerStatement(_) => true,
-        _ => false,
-    })
+fn only_unconditional_statements_budgeted(
+    statements: &[Statement<'_>],
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    for statement in statements {
+        budget.consume(1)?;
+        let valid = match statement {
+            Statement::BlockStatement(block) => {
+                only_unconditional_statements_budgeted(&block.body, budget)?
+            }
+            Statement::VariableDeclaration(_)
+            | Statement::ExpressionStatement(_)
+            | Statement::ReturnStatement(_)
+            | Statement::EmptyStatement(_)
+            | Statement::DebuggerStatement(_) => true,
+            _ => false,
+        };
+        if !valid {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 struct DelegateProbe<'c, 'h> {
@@ -1146,11 +1451,19 @@ struct DelegateProbe<'c, 'h> {
     parameters: Vec<SymbolId>,
     boxes: HashSet<SymbolId>,
     matches: usize,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for DelegateProbe<'_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        let Expression::Identifier(callee) = &call.callee else {
+        let Expression::Identifier(callee) = last_sequence_expression(&call.callee) else {
             walk::walk_call_expression(self, call);
             return;
         };
@@ -1158,6 +1471,7 @@ impl<'a> Visit<'a> for DelegateProbe<'_, '_> {
             .reference_id
             .get()
             .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+            .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
         else {
             walk::walk_call_expression(self, call);
             return;
@@ -1191,21 +1505,54 @@ struct InstallerCollector<'c, 'h> {
     scoping: &'c Scoping,
     helpers: &'h HashSet<SymbolId>,
     installers: HashSet<SymbolId>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
 }
 
 impl InstallerCollector<'_, '_> {
     fn analyze_function(&mut self, symbol: SymbolId, function: &Function<'_>) {
-        if function.r#async || function.generator {
+        if self.budget_error.is_some() || function.r#async || function.generator {
             return;
         }
         let (Some(body), Some(parameters)) = (&function.body, parameter_symbols(function)) else {
             return;
         };
-        if parameters.len() != 4 || !only_unconditional_statements(&body.statements) {
+        if parameters.len() != 4 {
             return;
         }
-        let boxes = argument_boxes(body);
-        if !argument_roles_are_stable(self.scoping, body, &parameters, &boxes) {
+        let unconditional =
+            match only_unconditional_statements_budgeted(&body.statements, &self.budget) {
+                Ok(unconditional) => unconditional,
+                Err(error) => {
+                    self.budget_error = Some(error);
+                    return;
+                }
+            };
+        if !unconditional {
+            return;
+        }
+        let boxes = match argument_boxes_budgeted(body, &self.budget) {
+            Ok(boxes) => boxes,
+            Err(error) => {
+                self.budget_error = Some(error);
+                return;
+            }
+        };
+        let stable = match argument_roles_are_stable_budgeted(
+            self.scoping,
+            body,
+            &parameters,
+            &boxes,
+            &self.budget,
+        ) {
+            Ok(stable) => stable,
+            Err(error) => {
+                self.budget_error = Some(error);
+                return;
+            }
+        };
+        if !stable {
             return;
         }
         let mut probe = DelegateProbe {
@@ -1214,8 +1561,13 @@ impl InstallerCollector<'_, '_> {
             parameters,
             boxes,
             matches: 0,
+            poller: BudgetPoller::new(&self.budget, 256),
         };
         probe.visit_function_body(body);
+        if let Err(error) = probe.poller.finish() {
+            self.budget_error = Some(error);
+            return;
+        }
         if probe.matches == 1 {
             self.installers.insert(symbol);
         }
@@ -1223,13 +1575,672 @@ impl InstallerCollector<'_, '_> {
 }
 
 impl<'a> Visit<'a> for InstallerCollector<'_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if self.budget_error.is_some() {
+            return;
+        }
         if let Some(symbol) = function
             .id
             .as_ref()
             .and_then(|identifier| identifier.symbol_id.get())
         {
             self.analyze_function(symbol, function);
+        }
+        if self.budget_error.is_none() {
+            walk::walk_function(self, function, flags);
+        }
+    }
+
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        if self.budget_error.is_some() {
+            return;
+        }
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            let Some(Expression::FunctionExpression(function)) = &declarator.init else {
+                continue;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+            self.analyze_function(symbol, function);
+            if self.budget_error.is_some() {
+                return;
+            }
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
+fn parameter_member_path(
+    scoping: &Scoping,
+    expression: &Expression<'_>,
+    parameters: &[SymbolId],
+    boxes: &HashSet<SymbolId>,
+) -> Option<(u32, Vec<String>)> {
+    if let Some(argument) = argument_index_expr(scoping, expression, parameters, boxes) {
+        return Some((argument, Vec::new()));
+    }
+    match expression {
+        Expression::ParenthesizedExpression(parenthesized) => {
+            parameter_member_path(scoping, &parenthesized.expression, parameters, boxes)
+        }
+        Expression::StaticMemberExpression(member) if !member.optional => {
+            let (argument, mut path) =
+                parameter_member_path(scoping, &member.object, parameters, boxes)?;
+            path.push(member.property.name.to_string());
+            Some((argument, path))
+        }
+        Expression::ComputedMemberExpression(member) if !member.optional => {
+            let Expression::StringLiteral(property) = &member.expression else {
+                return None;
+            };
+            let (argument, mut path) =
+                parameter_member_path(scoping, &member.object, parameters, boxes)?;
+            path.push(string_literal_value(property)?);
+            Some((argument, path))
+        }
+        _ => None,
+    }
+}
+
+struct ParameterReferenceCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    arguments: HashSet<u32>,
+    poller: Option<BudgetPoller>,
+}
+
+impl<'a> Visit<'a> for ParameterReferenceCollector<'_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.poller.as_mut().is_some_and(|poller| !poller.poll(1)) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
+        let Some(symbol) = identifier
+            .reference_id
+            .get()
+            .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+        else {
+            return;
+        };
+        if let Some(index) = self
+            .parameters
+            .iter()
+            .position(|parameter| *parameter == symbol)
+        {
+            if let Ok(index) = u32::try_from(index) {
+                self.arguments.insert(index);
+            }
+        }
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn parameter_references_budgeted(
+    scoping: &Scoping,
+    expression: &Expression<'_>,
+    parameters: &[SymbolId],
+    budget: &WorkBudget,
+) -> Result<HashSet<u32>, BudgetExceeded> {
+    let mut collector = ParameterReferenceCollector {
+        scoping,
+        parameters,
+        arguments: HashSet::new(),
+        poller: Some(BudgetPoller::new(budget, 256)),
+    };
+    collector.visit_expression(expression);
+    if let Some(poller) = collector.poller.as_mut() {
+        poller.finish()?;
+    }
+    Ok(collector.arguments)
+}
+
+struct RegistryWriteCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    boxes: &'p HashSet<SymbolId>,
+    proofs: Vec<RegistryForwarderProof>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
+}
+
+impl<'a> Visit<'a> for RegistryWriteCollector<'_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment.operator.is_assign() {
+            if let AssignmentTarget::ComputedMemberExpression(member) = &assignment.left {
+                if !member.optional {
+                    if let (Some((receiver_argument, registry_path)), Some(key_argument)) = (
+                        parameter_member_path(
+                            self.scoping,
+                            &member.object,
+                            self.parameters,
+                            self.boxes,
+                        ),
+                        argument_index_expr(
+                            self.scoping,
+                            &member.expression,
+                            self.parameters,
+                            self.boxes,
+                        ),
+                    ) {
+                        let mut references = match parameter_references_budgeted(
+                            self.scoping,
+                            &assignment.right,
+                            self.parameters,
+                            &self.budget,
+                        ) {
+                            Ok(references) => references,
+                            Err(error) => {
+                                self.budget_error = Some(error);
+                                return;
+                            }
+                        };
+                        references.remove(&receiver_argument);
+                        references.remove(&key_argument);
+                        if references.len() == 1 {
+                            if let Some(value_argument) = references.iter().next().copied() {
+                                if value_argument != receiver_argument
+                                    && value_argument != key_argument
+                                {
+                                    self.proofs.push(RegistryForwarderProof {
+                                        receiver_argument,
+                                        key_argument,
+                                        value_argument,
+                                        registry_path,
+                                        registry_key_confined: false,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn registry_key_confined_in_body(
+    scoping: &Scoping,
+    body: &FunctionBody<'_>,
+    parameters: &[SymbolId],
+    boxes: &HashSet<SymbolId>,
+    proof: &RegistryForwarderProof,
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    if proof.registry_path.is_empty() {
+        return Ok(false);
+    }
+
+    #[derive(Default)]
+    struct Probe {
+        allowed_path_uses: HashSet<(u32, u32)>,
+        path_uses: HashSet<(u32, u32)>,
+        invalid_index: bool,
+    }
+
+    struct Walker<'c, 'p, 'b> {
+        scoping: &'c Scoping,
+        parameters: &'p [SymbolId],
+        boxes: &'b HashSet<SymbolId>,
+        receiver_argument: u32,
+        key_argument: u32,
+        registry_path: &'p [String],
+        probe: Probe,
+        poller: BudgetPoller,
+    }
+
+    impl Walker<'_, '_, '_> {
+        fn record_extended_path(
+            &mut self,
+            object: &Expression<'_>,
+            property: Option<String>,
+            span: oxc_span::Span,
+        ) {
+            let Some(property) = property else {
+                return;
+            };
+            let Some((receiver, mut path)) =
+                parameter_member_path(self.scoping, object, self.parameters, self.boxes)
+            else {
+                return;
+            };
+            path.push(property);
+            if receiver == self.receiver_argument && path == self.registry_path {
+                self.probe.path_uses.insert((span.start, span.end));
+            }
+        }
+    }
+
+    impl<'a> Visit<'a> for Walker<'_, '_, '_> {
+        fn visit_expression(&mut self, expression: &Expression<'a>) {
+            if !self.poller.poll(1) {
+                return;
+            }
+            walk::walk_expression(self, expression);
+        }
+
+        fn visit_static_member_expression(
+            &mut self,
+            member: &oxc_ast::ast::StaticMemberExpression<'a>,
+        ) {
+            self.record_extended_path(
+                &member.object,
+                Some(member.property.name.to_string()),
+                member.span,
+            );
+            walk::walk_static_member_expression(self, member);
+        }
+
+        fn visit_computed_member_expression(
+            &mut self,
+            member: &oxc_ast::ast::ComputedMemberExpression<'a>,
+        ) {
+            if parameter_member_path(self.scoping, &member.object, self.parameters, self.boxes)
+                .is_some_and(|(receiver, path)| {
+                    receiver == self.receiver_argument && path == self.registry_path
+                })
+            {
+                let object_span = member.object.span();
+                self.probe
+                    .allowed_path_uses
+                    .insert((object_span.start, object_span.end));
+                if member.optional
+                    || argument_index_expr(
+                        self.scoping,
+                        &member.expression,
+                        self.parameters,
+                        self.boxes,
+                    ) != Some(self.key_argument)
+                {
+                    self.probe.invalid_index = true;
+                }
+            }
+            let property = match &member.expression {
+                Expression::StringLiteral(value) => string_literal_value(value),
+                _ => None,
+            };
+            self.record_extended_path(&member.object, property, member.span);
+            walk::walk_computed_member_expression(self, member);
+        }
+    }
+
+    let mut walker = Walker {
+        scoping,
+        parameters,
+        boxes,
+        receiver_argument: proof.receiver_argument,
+        key_argument: proof.key_argument,
+        registry_path: &proof.registry_path,
+        probe: Probe::default(),
+        poller: BudgetPoller::new(budget, 256),
+    };
+    walker.visit_function_body(body);
+    walker.poller.finish()?;
+    Ok(!walker.probe.invalid_index
+        && walker
+            .probe
+            .path_uses
+            .iter()
+            .all(|span| walker.probe.allowed_path_uses.contains(span)))
+}
+
+fn registry_forwarder_proof(
+    scoping: &Scoping,
+    function: &Function<'_>,
+    budget: &WorkBudget,
+) -> Result<Option<RegistryForwarderProof>, BudgetExceeded> {
+    budget.checkpoint()?;
+    if function.r#async || function.generator {
+        return Ok(None);
+    }
+    let (Some(body), Some(parameters)) = (&function.body, parameter_symbols(function)) else {
+        return Ok(None);
+    };
+    if parameters.len() < 3 {
+        return Ok(None);
+    }
+    let boxes = argument_boxes_budgeted(body, budget)?;
+    let mut collector = RegistryWriteCollector {
+        scoping,
+        parameters: &parameters,
+        boxes: &boxes,
+        proofs: Vec::new(),
+        budget: budget.clone(),
+        poller: BudgetPoller::new(budget, 256),
+        budget_error: None,
+    };
+    collector.visit_function_body(body);
+    collector.poller.finish()?;
+    if let Some(error) = collector.budget_error.take() {
+        return Err(error);
+    }
+    let Some(mut first) = collector.proofs.first().cloned() else {
+        return Ok(None);
+    };
+    if !collector.proofs.iter().all(|proof| proof == &first) {
+        return Ok(None);
+    }
+    first.registry_key_confined =
+        registry_key_confined_in_body(scoping, body, &parameters, &boxes, &first, budget)?;
+    if !selected_argument_roles_are_stable_budgeted(
+        scoping,
+        body,
+        &parameters,
+        &boxes,
+        &[
+            first.receiver_argument,
+            first.key_argument,
+            first.value_argument,
+        ],
+        budget,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(first))
+}
+
+struct RegistryForwarderCollector<'c> {
+    scoping: &'c Scoping,
+    proofs: HashMap<SymbolId, RegistryForwarderProof>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
+}
+impl RegistryForwarderCollector<'_> {
+    fn record(&mut self, symbol: SymbolId, function: &Function<'_>) {
+        if self.budget_error.is_some() {
+            return;
+        }
+        if let Err(error) = self.budget.checkpoint() {
+            self.budget_error = Some(error);
+            return;
+        }
+        match registry_forwarder_proof(self.scoping, function, &self.budget) {
+            Ok(Some(proof)) => {
+                self.proofs.insert(symbol, proof);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.budget_error = Some(error);
+                return;
+            }
+        }
+        if let Err(error) = self.budget.checkpoint() {
+            self.budget_error = Some(error);
+        }
+    }
+}
+impl<'a> Visit<'a> for RegistryForwarderCollector<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some(symbol) = function
+            .id
+            .as_ref()
+            .and_then(|identifier| identifier.symbol_id.get())
+        {
+            self.record(symbol, function);
+        }
+        walk::walk_function(self, function, flags);
+    }
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            let Some(Expression::FunctionExpression(function)) = &declarator.init else {
+                continue;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+            self.record(symbol, function);
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
+struct RegistryDelegateProbe<'c, 'p, 'k> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    boxes: &'p HashSet<SymbolId>,
+    known: &'k HashMap<SymbolId, RegistryForwarderProof>,
+    proofs: Vec<RegistryForwarderProof>,
+    poller: BudgetPoller,
+}
+
+impl<'a> Visit<'a> for RegistryDelegateProbe<'_, '_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            if let Expression::Identifier(callee) = last_sequence_expression(&call.callee) {
+                if let Some(symbol) = callee
+                    .reference_id
+                    .get()
+                    .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                    .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
+                {
+                    if let Some(delegate) = self.known.get(&symbol) {
+                        let mapped = [
+                            delegate.receiver_argument,
+                            delegate.key_argument,
+                            delegate.value_argument,
+                        ]
+                        .map(|role| {
+                            usize::try_from(role)
+                                .ok()
+                                .and_then(|index| call.arguments.get(index))
+                                .and_then(|argument| {
+                                    argument_index_arg(
+                                        self.scoping,
+                                        argument,
+                                        self.parameters,
+                                        self.boxes,
+                                    )
+                                })
+                        });
+                        if let [Some(receiver_argument), Some(key_argument), Some(value_argument)] =
+                            mapped
+                        {
+                            if receiver_argument != key_argument
+                                && receiver_argument != value_argument
+                                && key_argument != value_argument
+                            {
+                                self.proofs.push(RegistryForwarderProof {
+                                    receiver_argument,
+                                    key_argument,
+                                    value_argument,
+                                    registry_path: delegate.registry_path.clone(),
+                                    registry_key_confined: delegate.registry_key_confined,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn registry_delegate_proof(
+    scoping: &Scoping,
+    function: &Function<'_>,
+    known: &HashMap<SymbolId, RegistryForwarderProof>,
+    budget: &WorkBudget,
+) -> Result<Option<RegistryForwarderProof>, BudgetExceeded> {
+    budget.checkpoint()?;
+    if function.r#async || function.generator {
+        return Ok(None);
+    }
+    let (Some(body), Some(parameters)) = (&function.body, parameter_symbols(function)) else {
+        return Ok(None);
+    };
+    if parameters.len() < 3 {
+        return Ok(None);
+    }
+    let boxes = argument_boxes_budgeted(body, budget)?;
+    let mut probe = RegistryDelegateProbe {
+        scoping,
+        parameters: &parameters,
+        boxes: &boxes,
+        known,
+        proofs: Vec::new(),
+        poller: BudgetPoller::new(budget, 256),
+    };
+    probe.visit_function_body(body);
+    probe.poller.finish()?;
+    let Some(mut first) = probe.proofs.first().cloned() else {
+        return Ok(None);
+    };
+    if !probe.proofs.iter().all(|proof| {
+        proof.receiver_argument == first.receiver_argument
+            && proof.key_argument == first.key_argument
+            && proof.value_argument == first.value_argument
+            && proof.registry_path == first.registry_path
+    }) {
+        return Ok(None);
+    }
+    first.registry_key_confined = probe.proofs.iter().all(|proof| proof.registry_key_confined)
+        && registry_key_confined_in_body(scoping, body, &parameters, &boxes, &first, budget)?;
+    if !selected_argument_roles_are_stable_budgeted(
+        scoping,
+        body,
+        &parameters,
+        &boxes,
+        &[
+            first.receiver_argument,
+            first.key_argument,
+            first.value_argument,
+        ],
+        budget,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(first))
+}
+
+struct RegistryDelegateCollector<'c, 'k> {
+    scoping: &'c Scoping,
+    known: &'k HashMap<SymbolId, RegistryForwarderProof>,
+    proofs: HashMap<SymbolId, RegistryForwarderProof>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
+}
+
+impl RegistryDelegateCollector<'_, '_> {
+    fn record(&mut self, symbol: SymbolId, function: &Function<'_>) {
+        if self.known.contains_key(&symbol) || self.budget_error.is_some() {
+            return;
+        }
+        if let Err(error) = self.budget.checkpoint() {
+            self.budget_error = Some(error);
+            return;
+        }
+        match registry_delegate_proof(self.scoping, function, self.known, &self.budget) {
+            Ok(Some(proof)) => {
+                self.proofs.insert(symbol, proof);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.budget_error = Some(error);
+                return;
+            }
+        }
+        if let Err(error) = self.budget.checkpoint() {
+            self.budget_error = Some(error);
+        }
+    }
+}
+
+impl<'a> Visit<'a> for RegistryDelegateCollector<'_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some(symbol) = function
+            .id
+            .as_ref()
+            .and_then(|identifier| identifier.symbol_id.get())
+        {
+            self.record(symbol, function);
         }
         walk::walk_function(self, function, flags);
     }
@@ -1245,40 +2256,1198 @@ impl<'a> Visit<'a> for InstallerCollector<'_, '_> {
             let Some(symbol) = identifier.symbol_id.get() else {
                 continue;
             };
-            self.analyze_function(symbol, function);
+            self.record(symbol, function);
         }
         walk::walk_variable_declaration(self, declaration);
     }
 }
 
-#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryAccessorProof {
+    receiver_argument: u32,
+    key_argument: u32,
+    registry_path: Vec<String>,
+}
+
+struct RegistryReadProbe<'c, 'p> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    boxes: &'p HashSet<SymbolId>,
+    proofs: Vec<RegistryAccessorProof>,
+    poller: BudgetPoller,
+}
+
+impl<'a> Visit<'a> for RegistryReadProbe<'_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment.operator.is_assign() {
+            if let Expression::ComputedMemberExpression(member) = &assignment.right {
+                if !member.optional {
+                    if let (Some((receiver_argument, registry_path)), Some(key_argument)) = (
+                        parameter_member_path(
+                            self.scoping,
+                            &member.object,
+                            self.parameters,
+                            self.boxes,
+                        ),
+                        argument_index_expr(
+                            self.scoping,
+                            &member.expression,
+                            self.parameters,
+                            self.boxes,
+                        ),
+                    ) {
+                        if receiver_argument != key_argument {
+                            self.proofs.push(RegistryAccessorProof {
+                                receiver_argument,
+                                key_argument,
+                                registry_path,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn registry_accessor_proof(
+    scoping: &Scoping,
+    function: &Function<'_>,
+    budget: &WorkBudget,
+) -> Result<Option<RegistryAccessorProof>, BudgetExceeded> {
+    budget.checkpoint()?;
+    if function.r#async || function.generator {
+        return Ok(None);
+    }
+    let (Some(body), Some(parameters)) = (&function.body, parameter_symbols(function)) else {
+        return Ok(None);
+    };
+    if parameters.len() < 2 {
+        return Ok(None);
+    }
+    let boxes = argument_boxes_budgeted(body, budget)?;
+    let mut probe = RegistryReadProbe {
+        scoping,
+        parameters: &parameters,
+        boxes: &boxes,
+        proofs: Vec::new(),
+        poller: BudgetPoller::new(budget, 256),
+    };
+    probe.visit_function_body(body);
+    probe.poller.finish()?;
+    let Some(first) = probe.proofs.first().cloned() else {
+        return Ok(None);
+    };
+    if !probe.proofs.iter().all(|proof| proof == &first) {
+        return Ok(None);
+    }
+    if !selected_argument_roles_are_stable_budgeted(
+        scoping,
+        body,
+        &parameters,
+        &boxes,
+        &[first.receiver_argument, first.key_argument],
+        budget,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(first))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LazyRegistryAccessorProof {
+    accessor: RegistryAccessorProof,
+    function_start: u32,
+    function_end: u32,
+    cell_assignment_start: u32,
+    cell_assignment_end: u32,
+    probe_property: String,
+    update_property: String,
+    projection_property: String,
+    selector_start: u32,
+    selector_end: u32,
+    selector_key_symbol: SymbolId,
+    selector_polynomial: IntegerPolynomial,
+}
+
+struct RegistryCellAssignmentProbe<'c, 'p> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    boxes: &'p HashSet<SymbolId>,
+    accessor: &'p RegistryAccessorProof,
+    matches: Vec<(SymbolId, u32, u32)>,
+    poller: BudgetPoller,
+}
+
+impl<'a> Visit<'a> for RegistryCellAssignmentProbe<'_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment.operator.is_assign() {
+            if let (
+                AssignmentTarget::AssignmentTargetIdentifier(target),
+                Expression::ComputedMemberExpression(member),
+            ) = (&assignment.left, &assignment.right)
+            {
+                if !member.optional {
+                    let receiver = parameter_member_path(
+                        self.scoping,
+                        &member.object,
+                        self.parameters,
+                        self.boxes,
+                    );
+                    let key = argument_index_expr(
+                        self.scoping,
+                        &member.expression,
+                        self.parameters,
+                        self.boxes,
+                    );
+                    if receiver.as_ref().is_some_and(|(argument, path)| {
+                        *argument == self.accessor.receiver_argument
+                            && *path == self.accessor.registry_path
+                    }) && key == Some(self.accessor.key_argument)
+                    {
+                        if let Some(symbol) = target.reference_id.get().and_then(|reference_id| {
+                            self.scoping.get_reference(reference_id).symbol_id()
+                        }) {
+                            self.matches
+                                .push((symbol, assignment.span.start, assignment.span.end));
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn static_member_on_symbol(
+    scoping: &Scoping,
+    expression: &Expression<'_>,
+    symbol: SymbolId,
+) -> Option<String> {
+    let Expression::StaticMemberExpression(member) = last_sequence_expression(expression) else {
+        return None;
+    };
+    if member.optional
+        || reference_symbol(scoping, last_sequence_expression(&member.object)) != Some(symbol)
+    {
+        return None;
+    }
+    Some(member.property.name.to_string())
+}
+
+fn static_method_call_on_symbol<'a>(
+    scoping: &Scoping,
+    expression: &'a Expression<'a>,
+    symbol: SymbolId,
+) -> Option<(String, &'a CallExpression<'a>)> {
+    let Expression::CallExpression(call) = last_sequence_expression(expression) else {
+        return None;
+    };
+    if call.optional {
+        return None;
+    }
+    let Expression::StaticMemberExpression(member) = last_sequence_expression(&call.callee) else {
+        return None;
+    };
+    if member.optional
+        || reference_symbol(scoping, last_sequence_expression(&member.object)) != Some(symbol)
+    {
+        return None;
+    }
+    Some((member.property.name.to_string(), call))
+}
+
+fn first_return_expression<'a>(statement: &'a Statement<'a>) -> Option<&'a Expression<'a>> {
+    match statement {
+        Statement::ReturnStatement(ret) => ret.argument.as_ref(),
+        Statement::BlockStatement(block) => {
+            let Statement::ReturnStatement(ret) = block.body.first()? else {
+                return None;
+            };
+            ret.argument.as_ref()
+        }
+        _ => None,
+    }
+}
+
+fn fast_cell_branch_parts(
+    scoping: &Scoping,
+    test: &Expression<'_>,
+    consequent: &Statement<'_>,
+    cell: SymbolId,
+) -> Option<(String, String)> {
+    let probe_property = static_member_on_symbol(scoping, test, cell)?;
+    let return_expression = first_return_expression(consequent)?;
+    let (update_property, call) = static_method_call_on_symbol(scoping, return_expression, cell)?;
+    call.arguments
+        .is_empty()
+        .then_some((probe_property, update_property))
+}
+
+fn one_effect_then_symbol<'a>(
+    scoping: &Scoping,
+    expression: &'a Expression<'a>,
+    symbol: SymbolId,
+) -> Option<&'a Expression<'a>> {
+    let expression = match expression {
+        Expression::ParenthesizedExpression(parenthesized) => &parenthesized.expression,
+        expression => expression,
+    };
+    let Expression::SequenceExpression(sequence) = expression else {
+        return None;
+    };
+    let [effect, value] = sequence.expressions.as_slice() else {
+        return None;
+    };
+    if reference_symbol(scoping, last_sequence_expression(value)) != Some(symbol) {
+        return None;
+    }
+    Some(effect)
+}
+
+fn slow_cell_projection<'a>(
+    scoping: &Scoping,
+    expression: &'a Expression<'a>,
+    cell: SymbolId,
+) -> Option<(String, String, &'a Expression<'a>)> {
+    let expression = match expression {
+        Expression::ParenthesizedExpression(parenthesized) => &parenthesized.expression,
+        expression => expression,
+    };
+    let Expression::StaticMemberExpression(projection) = expression else {
+        return None;
+    };
+    if projection.optional {
+        return None;
+    }
+    let effect = one_effect_then_symbol(scoping, &projection.object, cell)?;
+    let (update_property, call) = static_method_call_on_symbol(scoping, effect, cell)?;
+    let [argument] = call.arguments.as_slice() else {
+        return None;
+    };
+    let selector = argument.as_expression().map(last_sequence_expression)?;
+    Some((
+        update_property,
+        projection.property.name.to_string(),
+        selector,
+    ))
+}
+
+fn function_body_has_dynamic_scope(
+    body: &FunctionBody<'_>,
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    struct Probe {
+        dynamic: bool,
+        poller: BudgetPoller,
+    }
+    impl<'a> Visit<'a> for Probe {
+        fn visit_statement(&mut self, statement: &Statement<'a>) {
+            if !self.poller.poll(1) {
+                return;
+            }
+            walk::walk_statement(self, statement);
+        }
+
+        fn visit_expression(&mut self, expression: &Expression<'a>) {
+            if !self.poller.poll(1) {
+                return;
+            }
+            walk::walk_expression(self, expression);
+        }
+
+        fn visit_with_statement(&mut self, _statement: &oxc_ast::ast::WithStatement<'a>) {
+            self.dynamic = true;
+        }
+
+        fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+            if matches!(
+                last_sequence_expression(&call.callee),
+                Expression::Identifier(identifier) if identifier.name.as_str() == "eval"
+            ) {
+                self.dynamic = true;
+            }
+            walk::walk_call_expression(self, call);
+        }
+    }
+
+    let mut probe = Probe {
+        dynamic: false,
+        poller: BudgetPoller::new(budget, 256),
+    };
+    probe.visit_function_body(body);
+    probe.poller.finish()?;
+    Ok(probe.dynamic)
+}
+
+#[derive(Debug, Clone)]
+struct LazyAccessorFastCandidate {
+    span_start: u32,
+    probe_property: String,
+    update_property: String,
+}
+
+#[derive(Debug, Clone)]
+struct LazyAccessorSlowCandidate {
+    span_start: u32,
+    update_property: String,
+    projection_property: String,
+    selector_start: u32,
+    selector_end: u32,
+    selector_polynomial: IntegerPolynomial,
+}
+
+struct LazyAccessorShapeCollector<'c> {
+    scoping: &'c Scoping,
+    cell: SymbolId,
+    key: SymbolId,
+    after: u32,
+    fast: Vec<LazyAccessorFastCandidate>,
+    slow: Vec<LazyAccessorSlowCandidate>,
+    poller: BudgetPoller,
+}
+
+impl<'a> Visit<'a> for LazyAccessorShapeCollector<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
+        if statement.span.start > self.after {
+            if let Some((probe_property, update_property)) = fast_cell_branch_parts(
+                self.scoping,
+                &statement.test,
+                &statement.consequent,
+                self.cell,
+            ) {
+                self.fast.push(LazyAccessorFastCandidate {
+                    span_start: statement.span.start,
+                    probe_property,
+                    update_property,
+                });
+            }
+        }
+        walk::walk_if_statement(self, statement);
+    }
+
+    fn visit_while_statement(&mut self, statement: &oxc_ast::ast::WhileStatement<'a>) {
+        if statement.span.start > self.after {
+            if let Some((probe_property, update_property)) =
+                fast_cell_branch_parts(self.scoping, &statement.test, &statement.body, self.cell)
+            {
+                self.fast.push(LazyAccessorFastCandidate {
+                    span_start: statement.span.start,
+                    probe_property,
+                    update_property,
+                });
+            }
+        }
+        walk::walk_while_statement(self, statement);
+    }
+
+    fn visit_return_statement(&mut self, statement: &oxc_ast::ast::ReturnStatement<'a>) {
+        if statement.span.start > self.after {
+            if let Some(argument) = statement.argument.as_ref() {
+                if let Some((update_property, projection_property, selector)) =
+                    slow_cell_projection(self.scoping, argument, self.cell)
+                {
+                    if let Some(selector_polynomial) = normalize_integer_polynomial(
+                        selector,
+                        self.scoping,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        &HashSet::new(),
+                    ) {
+                        if selector_polynomial
+                            .variables()
+                            .into_iter()
+                            .all(|symbol| symbol == self.key)
+                        {
+                            self.slow.push(LazyAccessorSlowCandidate {
+                                span_start: statement.span.start,
+                                update_property,
+                                projection_property,
+                                selector_start: selector.span().start,
+                                selector_end: selector.span().end,
+                                selector_polynomial,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_return_statement(self, statement);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+fn lazy_registry_accessor_proof(
+    scoping: &Scoping,
+    function: &Function<'_>,
+    budget: &WorkBudget,
+) -> Result<Option<LazyRegistryAccessorProof>, BudgetExceeded> {
+    let Some(accessor) = registry_accessor_proof(scoping, function, budget)? else {
+        return Ok(None);
+    };
+    let (Some(body), Some(parameters)) = (&function.body, parameter_symbols(function)) else {
+        return Ok(None);
+    };
+    if function_body_has_dynamic_scope(body, budget)? {
+        return Ok(None);
+    }
+    let boxes = argument_boxes_budgeted(body, budget)?;
+    let mut assignments = RegistryCellAssignmentProbe {
+        scoping,
+        parameters: &parameters,
+        boxes: &boxes,
+        accessor: &accessor,
+        matches: Vec::new(),
+        poller: BudgetPoller::new(budget, 256),
+    };
+    assignments.visit_function_body(body);
+    assignments.poller.finish()?;
+    let [(cell, cell_assignment_start, cell_assignment_end)] = assignments.matches.as_slice()
+    else {
+        return Ok(None);
+    };
+    let Ok(receiver_index) = usize::try_from(accessor.receiver_argument) else {
+        return Ok(None);
+    };
+    let Ok(key_index) = usize::try_from(accessor.key_argument) else {
+        return Ok(None);
+    };
+    let Some(receiver_symbol) = parameters.get(receiver_index) else {
+        return Ok(None);
+    };
+    let Some(key_symbol) = parameters.get(key_index) else {
+        return Ok(None);
+    };
+    if cell == receiver_symbol || cell == key_symbol || boxes.contains(cell) {
+        return Ok(None);
+    }
+    budget.consume(1)?;
+    let write_count = scoping
+        .get_resolved_reference_ids(*cell)
+        .iter()
+        .filter(|reference_id| scoping.get_reference(**reference_id).is_write())
+        .count();
+    if write_count != 1 {
+        return Ok(None);
+    }
+
+    let selector_key_symbol = *key_symbol;
+    let mut shapes = LazyAccessorShapeCollector {
+        scoping,
+        cell: *cell,
+        key: selector_key_symbol,
+        after: *cell_assignment_end,
+        fast: Vec::new(),
+        slow: Vec::new(),
+        poller: BudgetPoller::new(budget, 256),
+    };
+    shapes.visit_function_body(body);
+    shapes.poller.finish()?;
+    let [fast] = shapes.fast.as_slice() else {
+        return Ok(None);
+    };
+    let [slow] = shapes.slow.as_slice() else {
+        return Ok(None);
+    };
+    if fast.span_start >= slow.span_start || fast.update_property != slow.update_property {
+        return Ok(None);
+    }
+    Ok(Some(LazyRegistryAccessorProof {
+        accessor,
+        function_start: function.span.start,
+        function_end: function.span.end,
+        cell_assignment_start: *cell_assignment_start,
+        cell_assignment_end: *cell_assignment_end,
+        probe_property: fast.probe_property.clone(),
+        update_property: fast.update_property.clone(),
+        projection_property: slow.projection_property.clone(),
+        selector_start: slow.selector_start,
+        selector_end: slow.selector_end,
+        selector_key_symbol,
+        selector_polynomial: slow.selector_polynomial.clone(),
+    }))
+}
+
+struct RegistryAccessorCollector<'c> {
+    scoping: &'c Scoping,
+    proofs: HashMap<SymbolId, RegistryAccessorProof>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
+}
+impl RegistryAccessorCollector<'_> {
+    fn record(&mut self, symbol: SymbolId, function: &Function<'_>) {
+        if self.budget_error.is_some() {
+            return;
+        }
+        if let Err(error) = self.budget.checkpoint() {
+            self.budget_error = Some(error);
+            return;
+        }
+        match registry_accessor_proof(self.scoping, function, &self.budget) {
+            Ok(Some(proof)) => {
+                self.proofs.insert(symbol, proof);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.budget_error = Some(error);
+                return;
+            }
+        }
+        if let Err(error) = self.budget.checkpoint() {
+            self.budget_error = Some(error);
+        }
+    }
+}
+impl<'a> Visit<'a> for RegistryAccessorCollector<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some(symbol) = function
+            .id
+            .as_ref()
+            .and_then(|identifier| identifier.symbol_id.get())
+        {
+            self.record(symbol, function);
+        }
+        walk::walk_function(self, function, flags);
+    }
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            let Some(Expression::FunctionExpression(function)) = &declarator.init else {
+                continue;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+            self.record(symbol, function);
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
+struct RegistryReadCallCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    proofs: &'p HashMap<SymbolId, RegistryAccessorProof>,
+    calls: Vec<ProvenRegistryReadCall>,
+    poller: BudgetPoller,
+}
+impl<'a> Visit<'a> for RegistryReadCallCollector<'_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            if let Expression::Identifier(callee) = last_sequence_expression(&call.callee) {
+                if let Some(symbol) = callee
+                    .reference_id
+                    .get()
+                    .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                    .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
+                {
+                    if let Some(proof) = self.proofs.get(&symbol) {
+                        let receiver = usize::try_from(proof.receiver_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .and_then(|expression| {
+                                stable_receiver_expression(self.scoping, expression)
+                            });
+                        let key = usize::try_from(proof.key_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .map(last_sequence_expression);
+                        if let (Some(receiver), Some(key)) = (receiver, key) {
+                            self.calls.push(ProvenRegistryReadCall {
+                                call_start: call.span.start,
+                                call_end: call.span.end,
+                                receiver_start: receiver.span().start,
+                                receiver_end: receiver.span().end,
+                                key_start: key.span().start,
+                                key_end: key.span().end,
+                                registry_path: proof.registry_path.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+pub fn structurally_proven_registry_read_calls(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenRegistryReadCall>, BudgetExceeded> {
+    budget.checkpoint()?;
+    let mut accessors = RegistryAccessorCollector {
+        scoping,
+        proofs: HashMap::new(),
+        budget: budget.clone(),
+        poller: BudgetPoller::new(budget, 256),
+        budget_error: None,
+    };
+    accessors.visit_program(program);
+    accessors.poller.finish()?;
+    if let Some(error) = accessors.budget_error.take() {
+        return Err(error);
+    }
+    let mut calls = RegistryReadCallCollector {
+        scoping,
+        proofs: &accessors.proofs,
+        calls: Vec::new(),
+        poller: BudgetPoller::new(budget, 256),
+    };
+    calls.visit_program(program);
+    calls.poller.finish()?;
+    calls
+        .calls
+        .sort_by_key(|call| (call.call_start, call.call_end));
+    calls
+        .calls
+        .dedup_by_key(|call| (call.call_start, call.call_end));
+    Ok(calls.calls)
+}
+
+struct LazyRegistryAccessorCollector<'c> {
+    scoping: &'c Scoping,
+    proofs: HashMap<SymbolId, LazyRegistryAccessorProof>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
+}
+
+impl LazyRegistryAccessorCollector<'_> {
+    fn record(&mut self, symbol: SymbolId, function: &Function<'_>) {
+        if self.budget_error.is_some() {
+            return;
+        }
+        match lazy_registry_accessor_proof(self.scoping, function, &self.budget) {
+            Ok(Some(proof)) => {
+                self.proofs.insert(symbol, proof);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.budget_error = Some(error);
+            }
+        }
+    }
+}
+
+impl<'a> Visit<'a> for LazyRegistryAccessorCollector<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if let Some(symbol) = function
+            .id
+            .as_ref()
+            .and_then(|identifier| identifier.symbol_id.get())
+        {
+            self.record(symbol, function);
+        }
+        walk::walk_function(self, function, flags);
+    }
+
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            let Some(Expression::FunctionExpression(function)) = &declarator.init else {
+                continue;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                continue;
+            };
+            self.record(symbol, function);
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
+struct LazyRegistryReadCallCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    proofs: &'p HashMap<SymbolId, LazyRegistryAccessorProof>,
+    calls: Vec<ProvenLazyRegistryReadCall>,
+    poller: BudgetPoller,
+}
+
+impl<'a> Visit<'a> for LazyRegistryReadCallCollector<'_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            if let Expression::Identifier(callee) = last_sequence_expression(&call.callee) {
+                if let Some(symbol) = callee
+                    .reference_id
+                    .get()
+                    .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                    .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
+                {
+                    if let Some(proof) = self.proofs.get(&symbol) {
+                        let receiver = usize::try_from(proof.accessor.receiver_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .and_then(|expression| {
+                                stable_receiver_expression(self.scoping, expression)
+                            });
+                        let key = usize::try_from(proof.accessor.key_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .map(last_sequence_expression);
+                        if let (Some(receiver), Some(key)) = (receiver, key) {
+                            self.calls.push(ProvenLazyRegistryReadCall {
+                                read: ProvenRegistryReadCall {
+                                    call_start: call.span.start,
+                                    call_end: call.span.end,
+                                    receiver_start: receiver.span().start,
+                                    receiver_end: receiver.span().end,
+                                    key_start: key.span().start,
+                                    key_end: key.span().end,
+                                    registry_path: proof.accessor.registry_path.clone(),
+                                },
+                                accessor_function_start: proof.function_start,
+                                accessor_function_end: proof.function_end,
+                                cell_assignment_start: proof.cell_assignment_start,
+                                cell_assignment_end: proof.cell_assignment_end,
+                                probe_property: proof.probe_property.clone(),
+                                update_property: proof.update_property.clone(),
+                                projection_property: proof.projection_property.clone(),
+                                selector_start: proof.selector_start,
+                                selector_end: proof.selector_end,
+                                selector_key_symbol: proof.selector_key_symbol,
+                                selector_polynomial: proof.selector_polynomial.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+/// Find call sites of registry accessors whose loaded cell follows one proven
+/// lazy-accessor shape. The returned selector span belongs to the accessor
+/// function body; callers may feed it into symbolic normalization separately.
+pub fn structurally_proven_lazy_registry_read_calls(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenLazyRegistryReadCall>, BudgetExceeded> {
+    budget.checkpoint()?;
+    let mut accessors = LazyRegistryAccessorCollector {
+        scoping,
+        proofs: HashMap::new(),
+        budget: budget.clone(),
+        poller: BudgetPoller::new(budget, 256),
+        budget_error: None,
+    };
+    accessors.visit_program(program);
+    accessors.poller.finish()?;
+    if let Some(error) = accessors.budget_error.take() {
+        return Err(error);
+    }
+    let mut calls = LazyRegistryReadCallCollector {
+        scoping,
+        proofs: &accessors.proofs,
+        calls: Vec::new(),
+        poller: BudgetPoller::new(budget, 256),
+    };
+    calls.visit_program(program);
+    calls.poller.finish()?;
+    calls
+        .calls
+        .sort_by_key(|call| (call.read.call_start, call.read.call_end));
+    calls
+        .calls
+        .dedup_by_key(|call| (call.read.call_start, call.read.call_end));
+    Ok(calls.calls)
+}
+
+fn registry_forwarder_proofs(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    budget: &WorkBudget,
+) -> Result<HashMap<SymbolId, RegistryForwarderProof>, BudgetExceeded> {
+    budget.checkpoint()?;
+    let mut forwarders = RegistryForwarderCollector {
+        scoping,
+        proofs: HashMap::new(),
+        budget: budget.clone(),
+        poller: BudgetPoller::new(budget, 256),
+        budget_error: None,
+    };
+    forwarders.visit_program(program);
+    forwarders.poller.finish()?;
+    if let Some(error) = forwarders.budget_error.take() {
+        return Err(error);
+    }
+    loop {
+        budget.consume(1)?;
+        let mut delegates = RegistryDelegateCollector {
+            scoping,
+            known: &forwarders.proofs,
+            proofs: HashMap::new(),
+            budget: budget.clone(),
+            poller: BudgetPoller::new(budget, 256),
+            budget_error: None,
+        };
+        delegates.visit_program(program);
+        delegates.poller.finish()?;
+        if let Some(error) = delegates.budget_error.take() {
+            return Err(error);
+        }
+        if delegates.proofs.is_empty() {
+            break;
+        }
+        forwarders.proofs.extend(delegates.proofs);
+    }
+    Ok(forwarders.proofs)
+}
+
+struct RegistryForwardingValueCallCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    proofs: &'p HashMap<SymbolId, RegistryForwarderProof>,
+    calls: Vec<ProvenRegistryForwardingValueCall>,
+    poller: BudgetPoller,
+}
+
+impl<'a> Visit<'a> for RegistryForwardingValueCallCollector<'_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            if let Expression::Identifier(callee) = last_sequence_expression(&call.callee) {
+                if let Some(symbol) = callee
+                    .reference_id
+                    .get()
+                    .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                    .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
+                {
+                    if let Some(proof) = self.proofs.get(&symbol) {
+                        let receiver = usize::try_from(proof.receiver_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .and_then(|expression| {
+                                stable_receiver_expression(self.scoping, expression)
+                            });
+                        let key = usize::try_from(proof.key_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .map(last_sequence_expression);
+                        let value = usize::try_from(proof.value_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .map(last_sequence_expression);
+                        if let (Some(receiver), Some(key), Some(value)) = (receiver, key, value) {
+                            self.calls.push(ProvenRegistryForwardingValueCall {
+                                call_start: call.span.start,
+                                call_end: call.span.end,
+                                receiver_start: receiver.span().start,
+                                receiver_end: receiver.span().end,
+                                key_start: key.span().start,
+                                key_end: key.span().end,
+                                value_start: value.span().start,
+                                value_end: value.span().end,
+                                registry_path: proof.registry_path.clone(),
+                                registry_key_confined: proof.registry_key_confined,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+/// Find all calls through structurally proven registry forwarders, preserving
+/// the exact source span of the evaluated value that enters the forwarder.
+pub fn structurally_proven_registry_forwarding_value_calls(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenRegistryForwardingValueCall>, BudgetExceeded> {
+    let proofs = registry_forwarder_proofs(program, scoping, budget)?;
+    let mut calls = RegistryForwardingValueCallCollector {
+        scoping,
+        proofs: &proofs,
+        calls: Vec::new(),
+        poller: BudgetPoller::new(budget, 256),
+    };
+    calls.visit_program(program);
+    calls.poller.finish()?;
+    calls
+        .calls
+        .sort_by_key(|call| (call.call_start, call.call_end));
+    calls
+        .calls
+        .dedup_by_key(|call| (call.call_start, call.call_end));
+    Ok(calls.calls)
+}
+
+struct RegistryForwardingCallCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    proofs: &'p HashMap<SymbolId, RegistryForwarderProof>,
+    calls: Vec<ProvenRegistryForwardingCall>,
+    poller: BudgetPoller,
+}
+impl<'a> Visit<'a> for RegistryForwardingCallCollector<'_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            if let Expression::Identifier(callee) = last_sequence_expression(&call.callee) {
+                if let Some(symbol) = callee
+                    .reference_id
+                    .get()
+                    .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+                    .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
+                {
+                    if let Some(proof) = self.proofs.get(&symbol) {
+                        let receiver = usize::try_from(proof.receiver_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .and_then(|expression| {
+                                stable_receiver_expression(self.scoping, expression)
+                            });
+                        let key = usize::try_from(proof.key_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .map(last_sequence_expression);
+                        let value = usize::try_from(proof.value_argument)
+                            .ok()
+                            .and_then(|index| call.arguments.get(index))
+                            .and_then(Argument::as_expression)
+                            .map(last_sequence_expression);
+                        if let (Some(receiver), Some(key), Some(value)) = (receiver, key, value) {
+                            let handler = match value {
+                                Expression::FunctionExpression(function) => Some((
+                                    function.span.start,
+                                    function.span.end,
+                                    function.params.items.len(),
+                                    function.r#async,
+                                )),
+                                Expression::ArrowFunctionExpression(function) => Some((
+                                    function.span.start,
+                                    function.span.end,
+                                    function.params.items.len(),
+                                    function.r#async,
+                                )),
+                                _ => None,
+                            };
+                            if let Some((
+                                handler_start,
+                                handler_end,
+                                handler_params,
+                                handler_async,
+                            )) = handler
+                            {
+                                self.calls.push(ProvenRegistryForwardingCall {
+                                    call_start: call.span.start,
+                                    call_end: call.span.end,
+                                    receiver_start: receiver.span().start,
+                                    receiver_end: receiver.span().end,
+                                    key_start: key.span().start,
+                                    key_end: key.span().end,
+                                    registry_path: proof.registry_path.clone(),
+                                    registry_key_confined: proof.registry_key_confined,
+                                    handler_start,
+                                    handler_end,
+                                    handler_params,
+                                    handler_async,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+pub fn structurally_proven_registry_forwarding_calls(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenRegistryForwardingCall>, BudgetExceeded> {
+    let proofs = registry_forwarder_proofs(program, scoping, budget)?;
+    let mut calls = RegistryForwardingCallCollector {
+        scoping,
+        proofs: &proofs,
+        calls: Vec::new(),
+        poller: BudgetPoller::new(budget, 256),
+    };
+    calls.visit_program(program);
+    calls.poller.finish()?;
+    calls
+        .calls
+        .sort_by_key(|call| (call.call_start, call.call_end));
+    calls
+        .calls
+        .dedup_by_key(|call| (call.call_start, call.call_end));
+    Ok(calls.calls)
+}
+
 pub fn structurally_proven_forwarding_installers(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> HashSet<SymbolId> {
+    budget: &WorkBudget,
+) -> Result<HashSet<SymbolId>, BudgetExceeded> {
+    budget.checkpoint()?;
     let mut helpers = HelperCollector {
         scoping,
         helpers: HashSet::new(),
+        budget: budget.clone(),
+        poller: BudgetPoller::new(budget, 256),
+        budget_error: None,
     };
     helpers.visit_program(program);
+    helpers.poller.finish()?;
+    if let Some(error) = helpers.budget_error.take() {
+        return Err(error);
+    }
     let mut installers = InstallerCollector {
         scoping,
         helpers: &helpers.helpers,
         installers: HashSet::new(),
+        budget: budget.clone(),
+        poller: BudgetPoller::new(budget, 256),
+        budget_error: None,
     };
     installers.visit_program(program);
-    installers.installers
+    installers.poller.finish()?;
+    if let Some(error) = installers.budget_error.take() {
+        return Err(error);
+    }
+    Ok(installers.installers)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::structurally_proven_forwarding_installers;
+    use super::{
+        structurally_proven_forwarding_installers, structurally_proven_registry_forwarding_calls,
+        structurally_proven_registry_forwarding_value_calls,
+        structurally_proven_registry_read_calls,
+    };
+    use crate::test_support::{source_slice, TestFailure, TestResult, TestValue};
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
+    use work_budget::{BudgetExceededKind, BudgetLimits, WorkBudget};
 
-    fn proven_count(source: &str) -> usize {
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("forwarding-test")
+    }
+
+    fn proven_count(source: &str) -> Result<usize, TestFailure> {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -1286,12 +3455,591 @@ mod tests {
             .with_check_syntax_error(true)
             .build(&parsed.program);
         assert!(semantic_ret.diagnostics.is_empty());
-        structurally_proven_forwarding_installers(&parsed.program, semantic_ret.semantic.scoping())
-            .len()
+        structurally_proven_forwarding_installers(
+            &parsed.program,
+            semantic_ret.semantic.scoping(),
+            &test_budget(),
+        )
+        .map(|installers| installers.len())
+        .test_value("forwarding installer proof")
+    }
+
+    fn registry_calls(
+        source: &str,
+    ) -> Result<Vec<super::ProvenRegistryForwardingCall>, TestFailure> {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic_ret = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic_ret.diagnostics.is_empty());
+        structurally_proven_registry_forwarding_calls(
+            &parsed.program,
+            semantic_ret.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("registry forwarding proof")
     }
 
     #[test]
-    fn proves_live_accessor_forwarding_through_argument_boxes() {
+    fn proves_non_function_registry_value_forwarding() -> TestResult {
+        let allocator = Allocator::default();
+        let source = r#"
+            function write(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            function install(receiver, key, value) {
+                write(receiver, key, value);
+            }
+            install(state, 7, "payload");
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let proven = structurally_proven_registry_forwarding_value_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("registry value forwarding proof")?;
+        assert_eq!(proven.len(), 2);
+        let root = proven
+            .iter()
+            .find(|proof| {
+                source_slice(
+                    source,
+                    proof.value_start,
+                    proof.value_end,
+                    "registry value span",
+                )
+                .is_ok_and(|value| value == "\"payload\"")
+            })
+            .test_value("outer literal value")?;
+        assert_eq!(root.registry_path, vec!["handlers"]);
+        assert!(root.registry_key_confined);
+        assert!(structurally_proven_registry_forwarding_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("registry function forwarding proof")?
+        .is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn proves_parameter_forwarding_into_computed_registry_write() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            const wrap = (value) => ({ value });
+            const install = function(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            };
+            const state = { handlers: {} };
+            install(state, 7, function(a) { return a + 1; });
+        "#,
+        )?;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].registry_path, vec!["handlers"]);
+        assert_eq!(calls[0].handler_params, 1);
+        assert!(calls[0].registry_key_confined);
+
+        Ok(())
+    }
+
+    #[test]
+    fn registry_key_confinement_allows_same_key_reads_and_writes() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                const previous = receiver.handlers[key];
+                receiver.handlers[key] = wrap(receiver, key, value, previous);
+            }
+            install(state, 7, function(a) { return a + 1; });
+        "#,
+        )?;
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].registry_key_confined);
+
+        Ok(())
+    }
+
+    #[test]
+    fn registry_key_confinement_rejects_other_key_access() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                const other = receiver.handlers[0];
+                receiver.handlers[key] = wrap(receiver, key, value, other);
+            }
+            install(state, 7, function(a) { return a + 1; });
+        "#,
+        )?;
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].registry_key_confined);
+
+        Ok(())
+    }
+
+    #[test]
+    fn registry_key_confinement_rejects_registry_object_escape() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                observe(receiver.handlers);
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            install(state, 7, function(a) { return a + 1; });
+        "#,
+        )?;
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].registry_key_confined);
+
+        Ok(())
+    }
+
+    #[test]
+    fn registry_key_confinement_rejects_nested_cross_key_capture() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                later(function() { return receiver.handlers[0]; });
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            install(state, 7, function(a) { return a + 1; });
+        "#,
+        )?;
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].registry_key_confined);
+
+        Ok(())
+    }
+
+    #[test]
+    fn registry_delegate_preserves_forwarding_when_only_some_targets_are_confined() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            function good(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            function bad(receiver, key, value) {
+                observe(receiver.handlers);
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            function install(receiver, key, value, choose_good) {
+                if (choose_good) good(receiver, key, value);
+                else bad(receiver, key, value);
+            }
+            install(state, 7, function(a) { return a + 1; }, flag);
+        "#,
+        )?;
+        let outer = calls
+            .iter()
+            .find(|call| call.call_start > 0 && call.handler_params == 1)
+            .test_value("outer forwarding call")?;
+        assert_eq!(outer.registry_path, vec!["handlers"]);
+        assert!(!outer.registry_key_confined);
+
+        Ok(())
+    }
+
+    #[test]
+    fn proves_registry_forwarding_through_sequence_callee() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            (0, install)(state, 7, function(a) { return a + 1; });
+        "#,
+        )?;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].registry_path, vec!["handlers"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_sequence_callee_when_binding_can_be_reassigned() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            let install = function(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            };
+            function replace() { install = other; }
+            (replace(), install)(state, 7, function(a) { return a + 1; });
+        "#,
+        )?;
+        assert!(calls.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn proves_registry_forwarding_through_sequence_arguments() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            install(state, (side(), 7), (other(), function(a) { return a + 1; }));
+        "#,
+        )?;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].registry_path, vec!["handlers"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn proves_registry_forwarding_through_stable_sequence_receiver() -> TestResult {
+        let source = r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            const state = {};
+            install((side(), state), 7, function(a) { return a + 1; });
+        "#;
+        let calls = registry_calls(source)?;
+        assert_eq!(calls.len(), 1);
+        let receiver = source_slice(
+            source,
+            calls[0].receiver_start,
+            calls[0].receiver_end,
+            "registry receiver span",
+        )?;
+        assert_eq!(receiver, "state");
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_registry_forwarding_through_mutable_sequence_receiver() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            let state = {};
+            function swap() { state = other; }
+            install((swap(), state), 7, function(a) { return a + 1; });
+        "#,
+        )?;
+        assert!(calls.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_registry_write_when_value_does_not_reach_rhs() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = make(receiver, key);
+            }
+            install(state, 7, function(a) { return a; });
+        "#,
+        )?;
+        assert!(calls.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_registry_write_with_ambiguous_extra_parameter_flow() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value, salt) {
+                receiver.handlers[key] = make(receiver, key, value, salt);
+            }
+            install(state, 7, function(a) { return a; }, 12);
+        "#,
+        )?;
+        assert!(calls.is_empty());
+
+        Ok(())
+    }
+
+    fn registry_reads(source: &str) -> Result<Vec<super::ProvenRegistryReadCall>, TestFailure> {
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic_ret = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic_ret.diagnostics.is_empty());
+        structurally_proven_registry_read_calls(
+            &parsed.program,
+            semantic_ret.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("registry read proof")
+    }
+
+    #[test]
+    fn proves_computed_registry_accessor_calls() -> TestResult {
+        let reads = registry_reads(
+            r#"
+            function get(receiver, key, cell) {
+                cell = receiver.handlers[key];
+                if (cell.value) return cell.create();
+                return cell.prototype;
+            }
+            const a = get(state, opcode);
+            const b = get(other, 17);
+        "#,
+        )?;
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].registry_path, vec!["handlers"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn proves_lazy_registry_accessor_shape() -> TestResult {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell) {
+                if (cell = receiver.handlers[key], cell === undefined) throw Error();
+                while (cell.value) { return cell.create(); }
+                return (cell.create(key * key + 3), cell).prototype;
+            }
+            get(state, opcode);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let proven = super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("lazy registry proof")?;
+        assert_eq!(proven.len(), 1);
+        assert_eq!(proven[0].read.registry_path, vec!["handlers"]);
+        assert_eq!(proven[0].probe_property, "value");
+        assert_eq!(proven[0].update_property, "create");
+        assert_eq!(proven[0].projection_property, "prototype");
+        assert_eq!(
+            source_slice(
+                source,
+                proven[0].selector_start,
+                proven[0].selector_end,
+                "lazy selector span",
+            )?,
+            "key * key + 3"
+        );
+        assert_eq!(
+            proven[0].selector_polynomial.variables(),
+            vec![proven[0].selector_key_symbol]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_registry_accessor_rejects_selector_with_extra_symbol() -> TestResult {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell, salt) {
+                cell = receiver.handlers[key];
+                if (cell.value) return cell.create();
+                return (cell.create(key + salt), cell).prototype;
+            }
+            get(state, opcode, null, runtimeSalt);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("lazy registry proof")?
+        .is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_registry_accessor_rejects_multiple_slow_projections() -> TestResult {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell) {
+                cell = receiver.handlers[key];
+                if (cell.value) return cell.create();
+                if (flag) return (cell.create(key), cell).prototype;
+                return (cell.create(key + 1), cell).prototype;
+            }
+            get(state, opcode);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("lazy registry proof")?
+        .is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_registry_accessor_rejects_dynamic_scope() -> TestResult {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell) {
+                cell = receiver.handlers[key];
+                eval("cell = other");
+                if (cell.value) return cell.create();
+                return (cell.create(key), cell).prototype;
+            }
+            get(state, opcode);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("lazy registry proof")?
+        .is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_registry_accessor_rejects_mismatched_update_method() -> TestResult {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell) {
+                cell = receiver.handlers[key];
+                if (cell.value) return cell.fast();
+                return (cell.slow(key), cell).prototype;
+            }
+            get(state, opcode);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("lazy registry proof")?
+        .is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_registry_accessor_rejects_cell_reassignment() -> TestResult {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell) {
+                cell = receiver.handlers[key];
+                cell = other;
+                if (cell.value) return cell.create();
+                return (cell.create(key), cell).prototype;
+            }
+            get(state, opcode);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("lazy registry proof")?
+        .is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn proves_registry_read_through_sequence_callee() -> TestResult {
+        let reads = registry_reads(
+            r#"
+            function get(receiver, key, cell) {
+                cell = receiver.handlers[key];
+                return cell;
+            }
+            const result = (0, get)(state, opcode);
+        "#,
+        )?;
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].registry_path, vec!["handlers"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_accessor_when_receiver_role_is_reassigned() -> TestResult {
+        let reads = registry_reads(
+            r#"
+            function get(receiver, key, cell) {
+                receiver = other;
+                cell = receiver.handlers[key];
+                return cell;
+            }
+            get(state, opcode);
+        "#,
+        )?;
+        assert!(reads.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn proves_registry_forwarding_through_delegate_fixed_point() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            function delegate(selector, receiver, value, key) {
+                if (selector) install(receiver, key, value);
+            }
+            function outer(receiver, value, key, selector) {
+                delegate(selector, receiver, value, key);
+            }
+            outer(state, function(a) { return a; }, 9, true);
+        "#,
+        )?;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].registry_path, vec!["handlers"]);
+        assert_eq!(calls[0].handler_params, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_delegate_when_forwarded_value_role_is_reassigned() -> TestResult {
+        let calls = registry_calls(
+            r#"
+            function install(receiver, key, value) {
+                receiver.handlers[key] = wrap(receiver, key, value);
+            }
+            function delegate(receiver, key, value) {
+                value = replacement;
+                install(receiver, key, value);
+            }
+            delegate(state, 9, function(a) { return a; });
+        "#,
+        )?;
+        assert!(calls.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn proves_live_accessor_forwarding_through_argument_boxes() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -1316,11 +4064,13 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 1);
+        assert_eq!(proven_count(source)?, 1);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_non_forwarding_getter() {
+    fn rejects_non_forwarding_getter() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -1339,11 +4089,13 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             }
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_non_forwarding_setter() {
+    fn rejects_non_forwarding_setter() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -1360,11 +4112,13 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_wrong_definition_method() {
+    fn rejects_wrong_definition_method() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -1382,11 +4136,13 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_mutated_argument_role_box() {
+    fn rejects_mutated_argument_role_box() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -1404,11 +4160,13 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_reassigned_role_parameter() {
+    fn rejects_reassigned_role_parameter() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 resolver = evil;
@@ -1426,11 +4184,13 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_argument_box_escape() {
+    fn rejects_argument_box_escape() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -1448,11 +4208,13 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_argument_box_use_before_initialization() {
+    fn rejects_argument_box_use_before_initialization() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var owner; owner = (1, r[0][1])(r[0][0]);
@@ -1469,11 +4231,13 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_mutually_exclusive_descriptor_halves() {
+    fn rejects_mutually_exclusive_descriptor_halves() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -1493,6 +4257,50 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
+
+        Ok(())
+    }
+    #[test]
+    fn forwarding_installers_propagate_work_budget_exhaustion() -> TestResult {
+        let allocator = Allocator::default();
+        let source = "function helper(a, b, c, d, e) { return a; }";
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let budget = WorkBudget::new("forwarding-installer-fuel", BudgetLimits::work(0));
+        let error = structurally_proven_forwarding_installers(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &budget,
+        )
+        .err()
+        .test_value("forwarding installer budget exhaustion")?;
+        assert_eq!(error.kind(), BudgetExceededKind::Work);
+        assert_eq!(error.scope(), "forwarding-installer-fuel");
+        Ok(())
+    }
+
+    #[test]
+    fn registry_forwarding_propagates_work_budget_exhaustion() -> TestResult {
+        let allocator = Allocator::default();
+        let source = "function install(receiver,key,value){receiver.handlers[key]=value;} install(state,7,function(){});";
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let budget = WorkBudget::new("forwarding-fuel", BudgetLimits::work(0));
+        assert!(matches!(
+            structurally_proven_registry_forwarding_calls(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &budget,
+            ),
+            Err(ref error)
+                if error.kind() == BudgetExceededKind::Work
+                    && error.scope() == "forwarding-fuel"
+        ));
+
+        Ok(())
     }
 }

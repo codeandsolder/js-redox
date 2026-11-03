@@ -17,7 +17,11 @@ pub mod scanner;
 pub mod source_text;
 pub mod state_flatten;
 pub mod string_recovery;
+pub mod symbolic_integer;
 pub mod table_vm;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 mod har_project;
 pub mod js_format;
@@ -27,6 +31,7 @@ pub mod bundle_materialize;
 pub mod bundle_unpack;
 
 pub mod browser_decode;
+pub mod cfg_order;
 
 pub mod effect_shape;
 
@@ -74,6 +79,9 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 pub mod forwarding_alias;
 
 pub mod forwarding_semantics;
+pub mod lazy_cell;
+pub mod receiver_identity;
+pub mod registry_identity;
 
 pub(crate) mod global_builtin;
 

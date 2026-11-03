@@ -10,7 +10,7 @@ use crate::{
         DirectSwitchMapCandidate, HandlerTableCandidate,
     },
     embedded::{
-        detect_function_constructor, detect_literal_string_join, detect_packer_eval,
+        detect_function_constructor, detect_packer_eval, detect_static_string_join,
         EmbeddedCodeCandidate,
     },
     function_analysis::{
@@ -19,13 +19,13 @@ use crate::{
     safe_deob::SourceMode,
     source_text::preview,
     state_flatten::{
-        self, detect_for_state_machines, IfLadderStateMachineCandidate, OpcodeMapCandidate,
-        StateMachineCandidate, StateMachineInfo,
+        self, detect_for_state_machines, detect_while_state_machine, IfLadderStateMachineCandidate,
+        OpcodeMapCandidate, StateMachineCandidate, StateMachineInfo,
     },
     table_vm,
 };
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{ArrayExpressionElement, Expression};
+use oxc_ast::ast::{ArrayExpressionElement, Expression, FunctionBody, Statement};
 use oxc_ast_visit::{walk, Visit};
 use oxc_syntax::scope::ScopeFlags;
 use rolldown_redox::ecmascript::parse_program;
@@ -51,7 +51,9 @@ fn indexed_access(source: &str, expr: &Expression<'_>) -> Option<IndexedAccess> 
 
 struct Scanner<'s> {
     source: &'s str,
+    budget: WorkBudget,
     budget_poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
     arrays: Vec<ArrayCandidate>,
     push_builders: Vec<PushBuilderCandidate>,
     decoder_candidates: Vec<DecoderCandidate>,
@@ -69,7 +71,9 @@ impl<'s> Scanner<'s> {
     fn new(source: &'s str, budget: &WorkBudget) -> Self {
         Self {
             source,
+            budget: budget.clone(),
             budget_poller: BudgetPoller::new(budget, 256),
+            budget_error: None,
             arrays: Vec::new(),
             push_builders: Vec::new(),
             decoder_candidates: Vec::new(),
@@ -85,10 +89,13 @@ impl<'s> Scanner<'s> {
     }
 
     fn poll_budget(&mut self, units: u64) -> bool {
-        self.budget_poller.poll(units)
+        self.budget_error.is_none() && self.budget_poller.poll(units)
     }
 
     fn finish_budget(&mut self) -> Result<(), BudgetExceeded> {
+        if let Some(error) = self.budget_error.take() {
+            return Err(error);
+        }
         self.budget_poller.finish()
     }
 
@@ -97,6 +104,9 @@ impl<'s> Scanner<'s> {
     }
 
     fn analyze_opcode_maps(&mut self, function: &oxc_ast::ast::Function<'_>) {
+        if self.budget_error.is_some() {
+            return;
+        }
         let Some(current) = self.stack.last() else {
             return;
         };
@@ -124,14 +134,17 @@ impl<'s> Scanner<'s> {
             return;
         }
 
-        let mut maps = state_flatten::analyze_function(
+        match state_flatten::analyze_function(
             self.source,
             function,
             &parent_function_id,
             &decoders,
             &machines,
-        );
-        self.opcode_maps.append(&mut maps);
+            &self.budget,
+        ) {
+            Ok(mut maps) => self.opcode_maps.append(&mut maps),
+            Err(error) => self.budget_error = Some(error),
+        }
     }
 
     fn finish_function(&mut self) {
@@ -211,6 +224,22 @@ impl<'s> Scanner<'s> {
     fn record_handler_table(&mut self, object: &oxc_ast::ast::ObjectExpression<'_>) {
         if let Some(candidate) = detect_object_handler_table(self.source, object) {
             self.handler_tables.push(candidate);
+        }
+    }
+
+    fn record_while_state_machines(&mut self, statements: &[Statement<'_>]) {
+        let Some(function_id) = self.stack.last().map(|current| current.m.id.clone()) else {
+            return;
+        };
+        for pair in statements.windows(2) {
+            let [init, Statement::WhileStatement(while_statement)] = pair else {
+                continue;
+            };
+            if let Some(machine) =
+                detect_while_state_machine(self.source, &function_id, init, while_statement)
+            {
+                self.if_ladder_state_machines.push(machine);
+            }
         }
     }
 
@@ -301,6 +330,16 @@ impl<'a> Visit<'a> for Scanner<'_> {
                 .push(expression_evidence(self.source, &switch.discriminant));
         }
         walk::walk_switch_statement(self, switch);
+    }
+
+    fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+        self.record_while_state_machines(&body.statements);
+        walk::walk_function_body(self, body);
+    }
+
+    fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+        self.record_while_state_machines(&block.body);
+        walk::walk_block_statement(self, block);
     }
 
     fn visit_for_statement(&mut self, statement: &oxc_ast::ast::ForStatement<'a>) {
@@ -442,7 +481,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
         if let Some(candidate) = detect_packer_eval(call) {
             self.embedded_code.push(candidate);
         }
-        if let Some(candidate) = detect_literal_string_join(call) {
+        if let Some(candidate) = detect_static_string_join(call) {
             self.embedded_code.push(candidate);
         }
         let is_function_ctor = matches!(

@@ -567,7 +567,7 @@ mod tests {
                     );
                     assert_ne!(recovered["analysis_path"], recovered["raw_path"]);
                 }
-                _ => unreachable!(),
+                _ => return Err(anyhow::anyhow!("unexpected VM fixture case {name}")),
             }
 
             let graph = artifact(&project, SOURCE_GRAPH)?;
@@ -613,7 +613,7 @@ mod tests {
                             .get("child_scan_id")
                             .is_some_and(|value| !value.is_null())));
                 }
-                _ => unreachable!(),
+                _ => return Err(anyhow::anyhow!("unexpected VM fixture case {name}")),
             }
         }
         Ok(())

@@ -153,7 +153,7 @@ pub fn deobfuscate_source(
     let source_recovery = result.source_recovery.map(SafeSourceRecovery::as_str);
     let analysis_source_sha256 = sha256_hex(result.source.as_bytes());
     let static_alias_installer_calls =
-        forwarding_alias::static_alias_installer_calls(&result.source)
+        forwarding_alias::static_alias_installer_calls(&result.source, budget)?
             .into_iter()
             .map(|call| {
                 let target_hint = match (&call.resolver_member, call.target_selector) {
