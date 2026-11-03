@@ -173,6 +173,11 @@ fn main() -> Result<()> {
             structurally_proven_registry_forwarding_calls(&parsed.program, scoping, &budget)?;
         let structural_reads =
             structurally_proven_registry_read_calls(&parsed.program, scoping, &budget)?;
+        let accessor_result_calls = jsvm_lift::registry_call_value::analyze(
+            &semantic.semantic,
+            &structural_reads,
+            &budget,
+        )?;
         let origin_installs =
             proven_origin_registry_handler_installs(&parsed.program, scoping, &runtime, &budget)?;
         let origin_reads =
@@ -210,6 +215,16 @@ fn main() -> Result<()> {
                 "looped_dynamic_call_sites": table.looped_dynamic_call_sites,
             })).collect::<Vec<_>>(),
             "table_vm_candidates": table_analysis.table_vms.len(),
+            "accessor_result_indirect_call_candidates": accessor_result_calls.len(),
+            "accessor_result_indirect_call_definite": accessor_result_calls.iter()
+                .filter(|edge| edge.definite_accessor_result).count(),
+            "accessor_result_indirect_call_examples": accessor_result_calls.iter().take(48).map(|edge| json!({
+                "binding": edge.binding,
+                "assignment": [edge.assignment_start, edge.assignment_end],
+                "accessor_call": [edge.accessor_call_start, edge.accessor_call_end],
+                "indirect_call": [edge.indirect_call_start, edge.indirect_call_end],
+                "definite_accessor_result": edge.definite_accessor_result,
+            })).collect::<Vec<_>>(),
             "structural_registry_handler_installs": structural_installs.len(),
                 "structural_registry_reads": structural_reads.len(),
                 "exact_origin_handler_installs": origin_installs.iter().map(|proof| json!({
