@@ -61,3 +61,21 @@ pub(crate) fn source_slice<'a>(
     let end = usize::try_from(end).map_err(|error| TestFailure::error(context, error))?;
     source.get(start..end).test_value(context)
 }
+
+pub(crate) fn source_offset(
+    source: &str,
+    needle: &str,
+    context: &'static str,
+) -> Result<u32, TestFailure> {
+    let offset = source.find(needle).test_value(context)?;
+    u32::try_from(offset).map_err(|error| TestFailure::error(context, error))
+}
+
+pub(crate) fn source_rfind(
+    source: &str,
+    needle: &str,
+    context: &'static str,
+) -> Result<u32, TestFailure> {
+    let offset = source.rfind(needle).test_value(context)?;
+    u32::try_from(offset).map_err(|error| TestFailure::error(context, error))
+}

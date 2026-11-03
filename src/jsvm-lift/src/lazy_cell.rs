@@ -4376,6 +4376,9 @@ mod tests {
         proven_slow_lazy_cell_state_fields_for_exact_assignment,
         proven_slow_lazy_cell_update_state, structurally_proven_slow_lazy_cell_factory_shapes,
     };
+    use crate::test_support::{
+        source_offset, source_rfind, source_slice, TestFailure, TestResult, TestValue,
+    };
     use crate::{
         forwarding_semantics::structurally_proven_lazy_registry_read_calls,
         receiver_identity::structurally_proven_origin_flow,
@@ -4407,7 +4410,7 @@ mod tests {
     }
 
     #[test]
-    fn proves_structural_slow_cell_factory_shape() {
+    fn proves_structural_slow_cell_factory_shape() -> TestResult {
         let source = r#"
             let phase;
             function make(mode, state, handler, s, q, cell, out) {
@@ -4431,10 +4434,12 @@ mod tests {
         assert_eq!(shape.prototype_field, "base");
         assert_eq!(shape.method_key_field, "method");
         assert_eq!(shape.resolver_property, "resolve");
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_factory_when_handler_is_not_captured_directly() {
+    fn rejects_factory_when_handler_is_not_captured_directly() -> TestResult {
         assert!(shapes(
             r#"
             let phase;
@@ -4451,9 +4456,11 @@ mod tests {
             "#,
         )
         .is_empty());
+
+        Ok(())
     }
 
-    fn specialized_call(source: &str, needle: &str) -> bool {
+    fn specialized_call(source: &str, needle: &str) -> Result<bool, TestFailure> {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -4463,20 +4470,22 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
-        let start = source.find(needle).expect("call") as u32;
+        let start = source_offset(source, needle, "call")?;
         let Some(call) = flow
             .direct_calls
             .iter()
             .find(|call| call.call_start == start)
         else {
-            return false;
+            return Ok(false);
         };
-        proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
-            .is_some()
+        Ok(
+            proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
+                .is_some(),
+        )
     }
 
     #[test]
-    fn specializes_slow_cell_call_with_unreachable_handler_write() {
+    fn specializes_slow_cell_call_with_unreachable_handler_write() -> TestResult {
         let source = r#"
             let phase;
             const C = function() { enter(this); };
@@ -4497,11 +4506,13 @@ mod tests {
             }
             new C();
         "#;
-        assert!(specialized_call(source, "make(48"));
+        assert!(specialized_call(source, "make(48")?);
+
+        Ok(())
     }
 
     #[test]
-    fn proves_exact_state_fields_at_slow_cell_factory_call() {
+    fn proves_exact_state_fields_at_slow_cell_factory_call() -> TestResult {
         let source = r#"
             let outer_phase;
             const C = function() {
@@ -4534,28 +4545,30 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
-        let start = source.find("make(48").expect("factory call") as u32;
+        let start = source_offset(source, "make(48", "factory call")?;
         let call = flow
             .direct_calls
             .iter()
             .find(|call| call.call_start == start)
-            .expect("origin factory call");
+            .test_value("origin factory call")?;
         let factory =
             proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
-                .expect("slow-cell factory");
+                .test_value("slow-cell factory")?;
         let fields = proven_slow_lazy_cell_state_fields(
             source,
             &parsed.program,
             &semantic.semantic,
             &factory,
         )
-        .expect("state fields");
+        .test_value("state fields")?;
         assert_eq!(fields.method_key.string.assignment.value, "create");
         assert_eq!(fields.prototype_field.initialization.property, "base");
+
+        Ok(())
     }
 
     #[test]
-    fn proves_state_fields_along_concrete_forwarding_chain() {
+    fn proves_state_fields_along_concrete_forwarding_chain() -> TestResult {
         let source = r#"
             let outer_phase;
             const C = function() {
@@ -4593,23 +4606,21 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
-        let start = source
-            .find("make(\n                    48")
-            .expect("factory call") as u32;
+        let start = source_offset(source, "make(\n                    48", "factory call")?;
         let call = flow
             .direct_calls
             .iter()
             .find(|call| call.call_start == start)
-            .expect("origin factory call");
+            .test_value("origin factory call")?;
         let factory =
             proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
-                .expect("slow-cell factory");
+                .test_value("slow-cell factory")?;
         let registry = proven_slow_lazy_cell_registry_assignment(
             &parsed.program,
             &semantic.semantic,
             &factory,
         )
-        .expect("registry assignment");
+        .test_value("registry assignment")?;
         let exact = proven_slow_lazy_cell_exact_registry_assignments(
             source,
             &parsed.program,
@@ -4619,7 +4630,7 @@ mod tests {
         )
         .into_iter()
         .find(|proof| proof.exact_key_value == 7)
-        .expect("exact assignment");
+        .test_value("exact assignment")?;
         assert_eq!(exact.provenance_calls.len(), 2);
         let fields = proven_slow_lazy_cell_state_fields_for_exact_assignment(
             source,
@@ -4627,7 +4638,7 @@ mod tests {
             &semantic.semantic,
             &exact,
         )
-        .expect("path state fields");
+        .test_value("path state fields")?;
         assert_eq!(fields.fields.method_key.string.assignment.value, "create");
         assert_eq!(
             fields.fields.prototype_field.initialization.property,
@@ -4639,15 +4650,20 @@ mod tests {
             &flow,
             &test_budget(),
         )
-        .expect("proven_origin_registry_value_installs");
+        .test_value("proven_origin_registry_value_installs")?;
         let value = values
             .iter()
             .find(|proof| {
                 proof.exact_key == 7
-                    && &source[proof.install.value_start as usize..proof.install.value_end as usize]
-                        == "\"payload\""
+                    && source_slice(
+                        source,
+                        proof.install.value_start,
+                        proof.install.value_end,
+                        "logical value span",
+                    )
+                    .is_ok_and(|value| value == "\"payload\"")
             })
-            .expect("logical value install");
+            .test_value("logical value install")?;
         let captured = proven_slow_lazy_cell_captured_value_install(
             source,
             &parsed.program,
@@ -4655,12 +4671,14 @@ mod tests {
             &exact,
             value,
         )
-        .expect("captured non-function value");
+        .test_value("captured non-function value")?;
         assert_eq!(captured.exact_assignment.exact_key_value, 7);
+
+        Ok(())
     }
 
     #[test]
-    fn proves_exact_mode_fast_lazy_cell_factory_call() {
+    fn proves_exact_mode_fast_lazy_cell_factory_call() -> TestResult {
         let source = r#"
             const Maker = Object;
             const C = function() {
@@ -4701,7 +4719,8 @@ mod tests {
             .direct_calls
             .iter()
             .filter(|call| {
-                source[call.call_start as usize..call.call_end as usize].starts_with("make(")
+                source_slice(source, call.call_start, call.call_end, "make call span")
+                    .is_ok_and(|call_source| call_source.starts_with("make("))
             })
             .collect::<Vec<_>>();
         assert_eq!(calls.len(), 2);
@@ -4725,10 +4744,12 @@ mod tests {
         assert_eq!(proven[0].shape.prototype_field, "base");
         assert_eq!(proven[0].shape.updater_property, "concat");
         assert!(proven[0].shape.standard_object_create_semantics_required);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_fast_lazy_cell_updater_that_transforms_capture() {
+    fn rejects_fast_lazy_cell_updater_that_transforms_capture() -> TestResult {
         let source = r#"
             const Maker = Object;
             function make(value, mode, state) {
@@ -4751,10 +4772,12 @@ mod tests {
             semantic.semantic.scoping(),
         )
         .is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_fast_lazy_cell_cell_escape_before_return() {
+    fn rejects_fast_lazy_cell_cell_escape_before_return() -> TestResult {
         let source = r#"
             const Maker = Object;
             const C = function() { make("payload", 11, this); };
@@ -4784,9 +4807,10 @@ mod tests {
             .direct_calls
             .iter()
             .find(|call| {
-                source[call.call_start as usize..call.call_end as usize].starts_with("make(")
+                source_slice(source, call.call_start, call.call_end, "make call span")
+                    .is_ok_and(|call_source| call_source.starts_with("make("))
             })
-            .expect("make call");
+            .test_value("make call")?;
         assert!(proven_fast_lazy_cell_factory_call(
             source,
             &parsed.program,
@@ -4794,10 +4818,12 @@ mod tests {
             call
         )
         .is_none());
+
+        Ok(())
     }
 
     #[test]
-    fn proves_object_create_carrier_getter_delegation() {
+    fn proves_object_create_carrier_getter_delegation() -> TestResult {
         let source = r#"
             let outer_phase;
             const Seed = {};
@@ -4883,23 +4909,21 @@ mod tests {
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
         let flow = structurally_proven_origin_flow(&parsed.program, scoping);
-        let start = source
-            .find("make(\n                    48")
-            .expect("factory call") as u32;
+        let start = source_offset(source, "make(\n                    48", "factory call")?;
         let call = flow
             .direct_calls
             .iter()
             .find(|call| call.call_start == start)
-            .expect("origin factory call");
+            .test_value("origin factory call")?;
         let factory =
             proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
-                .expect("slow-cell factory");
+                .test_value("slow-cell factory")?;
         let registry = proven_slow_lazy_cell_registry_assignment(
             &parsed.program,
             &semantic.semantic,
             &factory,
         )
-        .expect("registry assignment");
+        .test_value("registry assignment")?;
         let exact = proven_slow_lazy_cell_exact_registry_assignments(
             source,
             &parsed.program,
@@ -4909,18 +4933,18 @@ mod tests {
         )
         .into_iter()
         .find(|proof| proof.exact_key_value == 7)
-        .expect("exact assignment");
+        .test_value("exact assignment")?;
         let fields = proven_slow_lazy_cell_state_fields_for_exact_assignment(
             source,
             &parsed.program,
             &semantic.semantic,
             &exact,
         )
-        .expect("path state fields");
+        .test_value("path state fields")?;
         let reads =
             structurally_proven_lazy_registry_read_calls(&parsed.program, scoping, &test_budget())
-                .expect("lazy registry proof");
-        let accessor = reads.first().expect("lazy accessor");
+                .test_value("lazy registry proof")?;
+        let accessor = reads.first().test_value("lazy accessor")?;
         let carrier = proven_slow_lazy_cell_prototype_carrier(
             source,
             &parsed.program,
@@ -4928,7 +4952,7 @@ mod tests {
             &fields,
             accessor,
         )
-        .expect("prototype carrier");
+        .test_value("prototype carrier")?;
         assert_eq!(carrier.method_name, "create");
         assert_eq!(carrier.projection_property, "prototype");
         assert_eq!(carrier.resolver_property, "resolve");
@@ -4936,18 +4960,18 @@ mod tests {
 
         let update =
             proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, &factory)
-                .expect("update state");
+                .test_value("update state")?;
         let installs = proven_origin_registry_handler_installs(
             &parsed.program,
             scoping,
             &flow,
             &test_budget(),
         )
-        .expect("proven_origin_registry_handler_installs");
+        .test_value("proven_origin_registry_handler_installs")?;
         let install = installs
             .iter()
             .find(|install| install.exact_key == 7)
-            .expect("logical handler install");
+            .test_value("logical handler install")?;
         let captured = proven_slow_lazy_cell_captured_handler_install(
             source,
             &parsed.program,
@@ -4955,10 +4979,10 @@ mod tests {
             &exact,
             install,
         )
-        .expect("captured handler");
+        .test_value("captured handler")?;
         let values =
             proven_origin_registry_value_installs(&parsed.program, scoping, &flow, &test_budget())
-                .expect("proven_origin_registry_value_installs");
+                .test_value("proven_origin_registry_value_installs")?;
         let value = values
             .iter()
             .find(|value| {
@@ -4968,7 +4992,7 @@ mod tests {
                     && value.install.value_start == install.install.handler_start
                     && value.install.value_end == install.install.handler_end
             })
-            .expect("same generic value install");
+            .test_value("same generic value install")?;
         let captured_value = proven_slow_lazy_cell_captured_value_install(
             source,
             &parsed.program,
@@ -4976,10 +5000,10 @@ mod tests {
             &exact,
             value,
         )
-        .expect("captured generic handler value");
+        .test_value("captured generic handler value")?;
         let specialized =
             proven_slow_lazy_cell_captured_handler_from_value(&captured_value, install)
-                .expect("handler specialization");
+                .test_value("handler specialization")?;
         assert_eq!(specialized, captured);
         let resolver = proven_slow_lazy_cell_resolver_index(
             source,
@@ -4992,17 +5016,19 @@ mod tests {
             &exact,
             23,
         )
-        .expect("resolver slot");
-        let resolved =
-            proven_slow_lazy_cell_resolved_handler(&resolver, &captured).expect("resolved handler");
-        let read =
-            proven_slow_lazy_cell_read_result(&resolved, &carrier).expect("end-to-end lazy read");
+        .test_value("resolver slot")?;
+        let resolved = proven_slow_lazy_cell_resolved_handler(&resolver, &captured)
+            .test_value("resolved handler")?;
+        let read = proven_slow_lazy_cell_read_result(&resolved, &carrier)
+            .test_value("end-to-end lazy read")?;
         assert_eq!(read.resolved_handler.resolver.exact_key_value, 7);
         assert_eq!(read.resolved_handler.resolver.handler_slot, 6);
+
+        Ok(())
     }
 
     #[test]
-    fn proves_exact_slow_cell_update_state_and_selector_capture() {
+    fn proves_exact_slow_cell_update_state_and_selector_capture() -> TestResult {
         let source = r#"
             let outer_phase;
             const C = function() { enter(this); };
@@ -5033,18 +5059,18 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
-        let start = source.find("make(48").expect("call") as u32;
+        let start = source_offset(source, "make(48", "call")?;
         let call = flow
             .direct_calls
             .iter()
             .find(|call| call.call_start == start)
-            .expect("origin call");
+            .test_value("origin call")?;
         let factory =
             proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
-                .expect("factory proof");
+                .test_value("factory proof")?;
         let update =
             proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, &factory)
-                .expect("update proof");
+                .test_value("update proof")?;
         assert_eq!(update.initial_state_value, 1);
         assert_eq!(update.post_update_state_value, 6);
         assert_eq!(
@@ -5061,10 +5087,12 @@ mod tests {
                 .symbol_name(update.update_parameter_symbol),
             "value"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn proves_real_style_resolver_index_cancellation() {
+    fn proves_real_style_resolver_index_cancellation() -> TestResult {
         let source = r#"
             let outer_phase;
             const C = function() { enter(this); };
@@ -5124,25 +5152,25 @@ mod tests {
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
         let flow = structurally_proven_origin_flow(&parsed.program, scoping);
-        let start = source.find("make(\n                    48").expect("call") as u32;
+        let start = source_offset(source, "make(\n                    48", "call")?;
         let call = flow
             .direct_calls
             .iter()
             .find(|call| call.call_start == start)
-            .expect("origin call");
+            .test_value("origin call")?;
         let factory =
             proven_slow_lazy_cell_factory_call(source, &parsed.program, &semantic.semantic, call)
-                .expect("factory proof");
+                .test_value("factory proof")?;
         let update =
             proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, &factory)
-                .expect("update proof");
+                .test_value("update proof")?;
 
         let registry = proven_slow_lazy_cell_registry_assignment(
             &parsed.program,
             &semantic.semantic,
             &factory,
         )
-        .expect("registry assignment");
+        .test_value("registry assignment")?;
         assert_eq!(registry.registry_path, vec!["T"]);
         assert_eq!(registry.factory_key_parameter_index, 4);
         let exact_assignments = proven_slow_lazy_cell_exact_registry_assignments(
@@ -5162,22 +5190,22 @@ mod tests {
         let exact_seven = exact_assignments
             .iter()
             .find(|proof| proof.exact_key_value == 7)
-            .expect("small exact key");
+            .test_value("small exact key")?;
         let exact_large = exact_assignments
             .iter()
             .find(|proof| proof.exact_key_value == 1_000_000)
-            .expect("large exact key");
+            .test_value("large exact key")?;
         let origin_installs = proven_origin_registry_handler_installs(
             &parsed.program,
             scoping,
             &flow,
             &test_budget(),
         )
-        .expect("proven_origin_registry_handler_installs");
+        .test_value("proven_origin_registry_handler_installs")?;
         let install_seven = origin_installs
             .iter()
             .find(|install| install.exact_key == 7)
-            .expect("logical install");
+            .test_value("logical install")?;
         let captured_handler = proven_slow_lazy_cell_captured_handler_install(
             source,
             &parsed.program,
@@ -5185,7 +5213,7 @@ mod tests {
             exact_seven,
             install_seven,
         )
-        .expect("captured logical handler");
+        .test_value("captured logical handler")?;
 
         let selector = parsed
             .program
@@ -5202,17 +5230,23 @@ mod tests {
                 }
                 _ => None,
             })
-            .expect("selector function");
-        let BindingPattern::BindingIdentifier(selector_key) = &selector.params.items[0].pattern
-        else {
-            panic!("selector key binding");
-        };
-        let selector_key_symbol = selector_key.symbol_id.get().expect("selector key symbol");
-        let body = selector.body.as_ref().expect("selector body");
-        let [Statement::ReturnStatement(ret)] = body.statements.as_slice() else {
-            panic!("selector return");
-        };
-        let selector_expression = ret.argument.as_ref().expect("selector expression");
+            .test_value("selector function")?;
+        let selector_key = match &selector.params.items[0].pattern {
+            BindingPattern::BindingIdentifier(selector_key) => Some(selector_key),
+            _ => None,
+        }
+        .test_value("selector key binding")?;
+        let selector_key_symbol = selector_key
+            .symbol_id
+            .get()
+            .test_value("selector key symbol")?;
+        let body = selector.body.as_ref().test_value("selector body")?;
+        let ret = match body.statements.as_slice() {
+            [Statement::ReturnStatement(ret)] => Some(ret),
+            _ => None,
+        }
+        .test_value("selector return")?;
+        let selector_expression = ret.argument.as_ref().test_value("selector expression")?;
         let selector_span = selector_expression.span();
 
         let proof = proven_slow_lazy_cell_resolver_index(
@@ -5226,10 +5260,10 @@ mod tests {
             exact_seven,
             23,
         )
-        .expect("resolver cancellation");
+        .test_value("resolver cancellation")?;
         assert_eq!(proof.handler_slot, 6);
         let resolved = proven_slow_lazy_cell_resolved_handler(&proof, &captured_handler)
-            .expect("resolved original handler");
+            .test_value("resolved original handler")?;
         assert_eq!(resolved.captured_handler.install.exact_key, 7);
         assert!(proven_slow_lazy_cell_resolver_index(
             source,
@@ -5255,10 +5289,12 @@ mod tests {
             23,
         )
         .is_none());
+
+        Ok(())
     }
 
     #[test]
-    fn forwarding_order_allows_flattened_use_after_forward() {
+    fn forwarding_order_allows_flattened_use_after_forward() -> TestResult {
         let source = r#"
             const C = function() { install(this, 7, function handler() {}); };
             function install(state, key, handler, pc) {
@@ -5282,26 +5318,24 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
-        let call_start = source
-            .find("write(state, key, handler)")
-            .expect("write call") as u32;
+        let call_start = source_offset(source, "write(state, key, handler)", "write call")?;
         let call = flow
             .direct_calls
             .iter()
             .find(|call| call.call_start == call_start)
-            .expect("exact forwarding call");
+            .test_value("exact forwarding call")?;
         let parameters = super::function_parameter_symbols_at(
             &parsed.program,
             call.caller.function_start,
             call.caller.function_end,
         )
-        .expect("installer parameters");
+        .test_value("installer parameters")?;
         let handler = parameters[2];
         let incoming = flow
             .direct_calls
             .iter()
             .find(|edge| edge.callee == call.caller)
-            .expect("exact installer entry");
+            .test_value("exact installer entry")?;
         assert!(super::symbol_only_forwarded_at_direct_call(
             source,
             &parsed.program,
@@ -5313,10 +5347,12 @@ mod tests {
             call,
             2,
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn forwarding_order_uses_recovered_key_across_delegate_edge() {
+    fn forwarding_order_uses_recovered_key_across_delegate_edge() -> TestResult {
         let source = r#"
             const C = function() { install(this, 7, function handler() {}); };
             function install(state, key, handler) {
@@ -5341,24 +5377,24 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
-        let call_start = source.find("sink(state, key, handler)").expect("sink call") as u32;
+        let call_start = source_offset(source, "sink(state, key, handler)", "sink call")?;
         let call = flow
             .direct_calls
             .iter()
             .find(|call| call.call_start == call_start)
-            .expect("inner forwarding call");
+            .test_value("inner forwarding call")?;
         let incoming = flow
             .direct_calls
             .iter()
             .find(|edge| edge.callee == call.caller)
-            .expect("delegate entry");
+            .test_value("delegate entry")?;
         assert_eq!(incoming.exact_integer_arguments, vec![None, None, None]);
         let parameters = super::function_parameter_symbols_at(
             &parsed.program,
             call.caller.function_start,
             call.caller.function_end,
         )
-        .expect("write parameters");
+        .test_value("write parameters")?;
         assert!(super::symbol_only_forwarded_at_direct_call(
             source,
             &parsed.program,
@@ -5370,10 +5406,12 @@ mod tests {
             call,
             2,
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn forwarding_order_rejects_handler_invocation_before_forward() {
+    fn forwarding_order_rejects_handler_invocation_before_forward() -> TestResult {
         let source = r#"
             const C = function() { install(this, 7, function handler() {}); };
             function install(state, key, handler) {
@@ -5392,26 +5430,24 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
-        let call_start = source
-            .find("write(state, key, handler)")
-            .expect("write call") as u32;
+        let call_start = source_offset(source, "write(state, key, handler)", "write call")?;
         let call = flow
             .direct_calls
             .iter()
             .find(|call| call.call_start == call_start)
-            .expect("exact forwarding call");
+            .test_value("exact forwarding call")?;
         let parameters = super::function_parameter_symbols_at(
             &parsed.program,
             call.caller.function_start,
             call.caller.function_end,
         )
-        .expect("installer parameters");
+        .test_value("installer parameters")?;
         let handler = parameters[2];
         let incoming = flow
             .direct_calls
             .iter()
             .find(|edge| edge.callee == call.caller)
-            .expect("exact installer entry");
+            .test_value("exact installer entry")?;
         assert!(!super::symbol_only_forwarded_at_direct_call(
             source,
             &parsed.program,
@@ -5423,10 +5459,12 @@ mod tests {
             call,
             2,
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn exact_registry_assignment_rejects_call_specialized_unreachable_branch() {
+    fn exact_registry_assignment_rejects_call_specialized_unreachable_branch() -> TestResult {
         let source = r#"
             let phase;
             const C = function() { enter(this); };
@@ -5465,8 +5503,8 @@ mod tests {
         let scoping = semantic.semantic.scoping();
         let flow = structurally_proven_origin_flow(&parsed.program, scoping);
         let starts = [
-            source.find("make(48, 19, 49").expect("first make") as u32,
-            source.rfind("make(48, 19, 49").expect("second make") as u32,
+            source_offset(source, "make(48, 19, 49", "first make")?,
+            source_rfind(source, "make(48, 19, 49", "second make")?,
         ];
         let mut keys_by_site = Vec::new();
         for start in starts {
@@ -5474,20 +5512,20 @@ mod tests {
                 .direct_calls
                 .iter()
                 .find(|call| call.call_start == start)
-                .expect("origin call");
+                .test_value("origin call")?;
             let factory = proven_slow_lazy_cell_factory_call(
                 source,
                 &parsed.program,
                 &semantic.semantic,
                 call,
             )
-            .expect("factory proof");
+            .test_value("factory proof")?;
             let registry = proven_slow_lazy_cell_registry_assignment(
                 &parsed.program,
                 &semantic.semantic,
                 &factory,
             )
-            .expect("registry assignment");
+            .test_value("registry assignment")?;
             keys_by_site.push(
                 proven_slow_lazy_cell_exact_registry_assignments(
                     source,
@@ -5502,10 +5540,12 @@ mod tests {
             );
         }
         assert_eq!(keys_by_site, vec![vec![7], vec![8]]);
+
+        Ok(())
     }
 
     #[test]
-    fn specialization_rejects_reachable_handler_write() {
+    fn specialization_rejects_reachable_handler_write() -> TestResult {
         let source = r#"
             let phase;
             const C = function() { enter(this); };
@@ -5526,11 +5566,13 @@ mod tests {
             }
             new C();
         "#;
-        assert!(!specialized_call(source, "make(48"));
+        assert!(!specialized_call(source, "make(48")?);
+
+        Ok(())
     }
 
     #[test]
-    fn specialization_rejects_outer_arguments_parameter_alias() {
+    fn specialization_rejects_outer_arguments_parameter_alias() -> TestResult {
         let source = r#"
             let phase;
             const C = function() { enter(this); };
@@ -5551,11 +5593,13 @@ mod tests {
             }
             new C();
         "#;
-        assert!(!specialized_call(source, "make(48"));
+        assert!(!specialized_call(source, "make(48")?);
+
+        Ok(())
     }
 
     #[test]
-    fn specialization_rejects_false_slow_guard() {
+    fn specialization_rejects_false_slow_guard() -> TestResult {
         let source = r#"
             let phase;
             const C = function() { enter(this); };
@@ -5575,11 +5619,13 @@ mod tests {
             }
             new C();
         "#;
-        assert!(!specialized_call(source, "make(7"));
+        assert!(!specialized_call(source, "make(7")?);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_factory_when_phase_value_is_local() {
+    fn rejects_factory_when_phase_value_is_local() -> TestResult {
         assert!(shapes(
             r#"
             function make(mode, state, handler, phase, q, cell, out) {
@@ -5595,5 +5641,7 @@ mod tests {
             "#,
         )
         .is_empty());
+
+        Ok(())
     }
 }
