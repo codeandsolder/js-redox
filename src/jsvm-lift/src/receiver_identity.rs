@@ -1128,7 +1128,6 @@ fn analyze_origin_contexts(
     Ok(flow)
 }
 
-#[must_use]
 pub fn structurally_proven_origin_flow(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -1155,7 +1154,6 @@ pub fn structurally_proven_origin_flow(
 /// function and that its parameter indices are in range, but it deliberately
 /// does not re-prove the seed itself. Callers must only construct seeds from
 /// already-proven object identity and call-target facts.
-#[must_use]
 pub fn propagate_proven_origin_contexts(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -1240,7 +1238,6 @@ fn origin_prefix_is_fresh(
         })
 }
 
-#[must_use]
 pub fn structurally_proven_own_data_field_initializations(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -1506,7 +1503,6 @@ fn direct_call_preserves_field(
 ///
 /// Call-site-specialized unreachable effects are ignored only when independently
 /// proven unreachable; recursive cycles and unsupported reachable effects fail closed.
-#[must_use]
 pub fn proven_origin_direct_call_preserves_own_field(
     source: &str,
     program: &Program<'_>,
@@ -1539,7 +1535,6 @@ pub fn proven_origin_direct_call_preserves_own_field(
 /// Prove that one exact-origin direct call preserves the exact current value of
 /// a named receiver property. Any reachable write, update, or delete of that
 /// property invalidates the theorem.
-#[must_use]
 pub fn proven_origin_direct_call_preserves_exact_property(
     source: &str,
     program: &Program<'_>,
@@ -1575,7 +1570,6 @@ pub fn proven_origin_direct_call_preserves_exact_property(
 /// Unlike the whole-call preservation theorem, effects after `before` are
 /// irrelevant. This is useful for concrete provenance chains through helpers
 /// that may legitimately mutate unrelated state later in the invocation.
-#[must_use]
 pub fn proven_origin_direct_call_prefix_preserves_exact_property_before_direct_call(
     source: &str,
     program: &Program<'_>,
@@ -1797,7 +1791,6 @@ fn direct_call_prefix_preserves_field(
 /// This is intentionally a prefix theorem. Receiver method calls are barriers;
 /// nested direct calls are recursively summarized, and call-site-specialized
 /// unreachable events are ignored only when independently proven unreachable.
-#[must_use]
 pub fn structurally_proven_own_data_fields_at_member_calls(
     source: &str,
     program: &Program<'_>,
@@ -1894,7 +1887,6 @@ pub fn structurally_proven_own_data_fields_at_member_calls(
 ///
 /// Both segments use the same fail-closed exact-property preservation theorem.
 /// The initialization must dominate the incoming call in the semantic CFG.
-#[must_use]
 pub fn proven_exact_own_data_field_at_direct_call(
     source: &str,
     program: &Program<'_>,
@@ -2369,7 +2361,6 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
 /// This focused form requires exactly one matching initialization fact for the
 /// concrete allocation and constructor. Ambiguous initialization histories fail
 /// closed rather than selecting by source order.
-#[must_use]
 pub fn proven_own_data_field_at_runtime_method_call(
     source: &str,
     program: &Program<'_>,
@@ -2428,7 +2419,6 @@ pub fn proven_own_data_field_at_runtime_method_call(
 /// may be crossed when all their own-data requirements are the field currently
 /// being tracked. Ambiguous call paths, dynamic property effects and unresolved
 /// barriers fail closed.
-#[must_use]
 pub fn structurally_proven_own_data_fields_at_runtime_method_calls(
     source: &str,
     program: &Program<'_>,
@@ -2695,7 +2685,6 @@ fn exact_origin_property_reachability(
 /// from a valid context and its caller prefix preserves the exact property
 /// value. Cycles that cannot be established from already-proven predecessors
 /// remain unproven.
-#[must_use]
 pub fn proven_prototype_string_at_direct_calls(
     source: &str,
     program: &Program<'_>,
@@ -2754,7 +2743,6 @@ pub fn proven_prototype_string_at_direct_calls(
     Ok(proven)
 }
 
-#[must_use]
 pub fn structurally_proven_member_receiver_origins(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -2763,7 +2751,6 @@ pub fn structurally_proven_member_receiver_origins(
     Ok(structurally_proven_origin_flow(program, scoping, budget)?.member_calls)
 }
 
-#[must_use]
 pub fn structurally_proven_member_read_origins(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -2772,7 +2759,6 @@ pub fn structurally_proven_member_read_origins(
     Ok(structurally_proven_origin_flow(program, scoping, budget)?.member_reads)
 }
 
-#[must_use]
 pub fn structurally_proven_member_write_origins(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -2781,7 +2767,6 @@ pub fn structurally_proven_member_write_origins(
     Ok(structurally_proven_origin_flow(program, scoping, budget)?.member_writes)
 }
 
-#[must_use]
 pub fn structurally_proven_origin_exposures(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -2790,7 +2775,6 @@ pub fn structurally_proven_origin_exposures(
     Ok(structurally_proven_origin_flow(program, scoping, budget)?.exposures)
 }
 
-#[must_use]
 pub fn structurally_proven_origin_direct_calls(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -3316,7 +3300,6 @@ fn phase_closure_for_method_assignment(
 
 /// Find prototype methods whose exact method body and a pure captured phase
 /// closure are installed by the same guaranteed zero-argument IIFE return.
-#[must_use]
 pub fn structurally_proven_prototype_method_phase_closures(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -4366,7 +4349,6 @@ impl<'a> Visit<'a> for PrototypeMethodCollector<'_, '_> {
     }
 }
 
-#[must_use]
 fn collect_prototype_method_proof<'c, 'f>(
     program: &Program<'_>,
     scoping: &'c Scoping,
@@ -4384,7 +4366,6 @@ fn collect_prototype_method_proof<'c, 'f>(
     Ok(collector.proof)
 }
 
-#[must_use]
 pub fn structurally_proven_prototype_method_assignments(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -4412,7 +4393,6 @@ pub fn structurally_proven_prototype_method_assignments(
     Ok(methods)
 }
 
-#[must_use]
 pub fn structurally_proven_prototype_string_assignments(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -4440,7 +4420,6 @@ pub fn structurally_proven_prototype_string_assignments(
     Ok(strings)
 }
 
-#[must_use]
 pub fn proven_prototype_string_at_allocation(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
@@ -4479,7 +4458,6 @@ pub fn proven_prototype_string_at_allocation(
     }))
 }
 
-#[must_use]
 pub fn structurally_proven_stable_constructor_prototypes(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -4515,7 +4493,6 @@ pub fn structurally_proven_stable_constructor_prototypes(
     Ok(constructors)
 }
 
-#[must_use]
 pub fn structurally_proven_prototype_method_lookup_targets(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -4943,7 +4920,6 @@ impl<'a> Visit<'a> for FunctionEffectCollector<'_> {
     }
 }
 
-#[must_use]
 pub fn structurally_proven_prototype_method_receiver_effects(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -5088,7 +5064,6 @@ fn match_prototype_method_calls(
     Ok(matched)
 }
 
-#[must_use]
 pub fn structurally_matched_prototype_method_calls(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -5105,7 +5080,6 @@ pub fn structurally_matched_prototype_method_calls(
 /// Match prototype method calls found in an independently seeded exact-origin
 /// flow. This reuses the same constructor/property identity and ambiguity rules
 /// as the global origin flow; the caller is responsible only for the seed proof.
-#[must_use]
 pub fn structurally_matched_prototype_method_calls_in_flow(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -5164,7 +5138,6 @@ fn prove_runtime_prototype_method_call_targets(
 /// the installed target valid through the later member call. The ordering proof
 /// supports same-function allocations and allocations inside later-created
 /// function expressions/arrows; unsupported interprocedural timing fails closed.
-#[must_use]
 pub fn structurally_proven_prototype_method_calls_at_runtime(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
@@ -5179,7 +5152,6 @@ pub fn structurally_proven_prototype_method_calls_at_runtime(
 
 /// Upgrade prototype calls from an independently seeded exact-origin flow to
 /// runtime lookup targets for the same concrete allocation.
-#[must_use]
 pub fn structurally_proven_prototype_method_calls_at_runtime_in_flow(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
@@ -5205,7 +5177,6 @@ pub fn structurally_proven_prototype_method_calls_at_runtime_in_flow(
 /// callers must separately prove that the matched lookup is valid at the call.
 /// Given that premise, each possible regular method body receives the same
 /// concrete allocation as `this`, and ordinary exact-origin propagation applies.
-#[must_use]
 pub fn propagate_matched_prototype_method_call_origins(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -5231,7 +5202,6 @@ pub fn propagate_matched_prototype_method_call_origins(
 }
 
 /// Propagate exact receiver origin from a runtime-proven prototype method call.
-#[must_use]
 pub fn propagate_proven_prototype_method_call_origins(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -5508,7 +5478,6 @@ fn summarize_runtime_prototype_method_preservation(
 /// The result is conditional on the listed ordinary own-data fields existing
 /// at method entry. This focused form is useful to consumers that already hold
 /// the exact call target and avoids recomputing summaries for unrelated calls.
-#[must_use]
 pub fn proven_prototype_method_receiver_preservation_summary(
     source: &str,
     program: &Program<'_>,
@@ -5543,7 +5512,6 @@ pub fn proven_prototype_method_receiver_preservation_summary(
 /// already existing at method entry. Exact direct-call scalar facts discharge
 /// unreachable effects; nested runtime-proven prototype calls are summarized
 /// recursively. Cycles and unresolved receiver effects fail closed.
-#[must_use]
 pub fn structurally_proven_prototype_method_receiver_preservation_summaries(
     source: &str,
     program: &Program<'_>,
@@ -5597,7 +5565,6 @@ pub fn structurally_proven_prototype_method_receiver_preservation_summaries(
 /// Prove one runtime-targeted prototype method call fully receiver-preserving,
 /// including liveness of every ordinary own-data field required by its
 /// transitive preservation summary.
-#[must_use]
 pub fn proven_receiver_preserving_prototype_method_call(
     source: &str,
     program: &Program<'_>,
@@ -5627,7 +5594,6 @@ pub fn proven_receiver_preserving_prototype_method_call(
     }))
 }
 
-#[must_use]
 pub fn structurally_proven_receiver_preserving_prototype_method_calls(
     source: &str,
     program: &Program<'_>,

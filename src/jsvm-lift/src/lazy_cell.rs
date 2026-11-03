@@ -3382,7 +3382,6 @@ pub fn proven_slow_lazy_cell_resolver_index(
 /// This theorem deliberately does not interpret the carrier object itself. A
 /// separate object-model proof must establish what the exact carrier value does
 /// when used as the prototype of the newly created cell.
-#[must_use]
 pub fn proven_slow_lazy_cell_state_fields(
     source: &str,
     program: &Program<'_>,
@@ -3461,7 +3460,6 @@ pub fn proven_slow_lazy_cell_state_fields(
 /// allocation is required to preserve both properties. This is intentionally a
 /// path theorem: unrelated incoming edges to a shared installer do not weaken a
 /// proof for this concrete constructor path.
-#[must_use]
 pub fn proven_slow_lazy_cell_state_fields_for_exact_assignment(
     source: &str,
     program: &Program<'_>,
@@ -4316,7 +4314,6 @@ fn slow_cell_object_constructor_symbol(
 /// requires the M-style factory to use the same Object-constructor alias when it
 /// creates the cell from `ST`. It deliberately records, rather than hides, the
 /// ordinary/untampered built-in Object + prototype + accessor semantics premise.
-#[must_use]
 pub fn proven_slow_lazy_cell_prototype_carrier(
     source: &str,
     program: &Program<'_>,
