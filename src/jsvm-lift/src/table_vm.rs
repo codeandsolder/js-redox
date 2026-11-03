@@ -4,7 +4,7 @@ use crate::forwarding_semantics::{
     ProvenRegistryForwardingCall, ProvenRegistryReadCall,
 };
 use crate::numeric::exact_u64;
-use crate::receiver_identity::ProvenOriginFlow;
+use crate::receiver_identity::{structurally_proven_runtime_origin_flow, ProvenOriginFlow};
 use crate::registry_identity::{
     proven_origin_registry_handler_installs, proven_origin_registry_read_calls,
     ProvenRegistryObjectOrigin,
@@ -1303,33 +1303,51 @@ pub fn analyze(
 ) -> Result<TableVmAnalysis, BudgetExceeded> {
     budget.checkpoint()?;
     let semantic_ret = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .with_cfg(true)
         .with_check_syntax_error(true)
         .build(program);
     budget.checkpoint()?;
-    let (forwarded_calls, read_calls) = if semantic_ret.diagnostics.is_empty() {
-        (
-            structurally_proven_registry_forwarding_calls(
-                program,
-                semantic_ret.semantic.scoping(),
-                budget,
-            )?,
-            structurally_proven_registry_read_calls(
-                program,
-                semantic_ret.semantic.scoping(),
-                budget,
-            )?,
-        )
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let (forwarded_calls, read_calls, forwarded_registry_origins, registry_read_origins) =
+        if semantic_ret.diagnostics.is_empty() {
+            let scoping = semantic_ret.semantic.scoping();
+            let forwarded_calls =
+                structurally_proven_registry_forwarding_calls(program, scoping, budget)?;
+            let read_calls = structurally_proven_registry_read_calls(program, scoping, budget)?;
+            let flow =
+                structurally_proven_runtime_origin_flow(program, &semantic_ret.semantic, budget)?;
+            let forwarded_registry_origins =
+                proven_origin_registry_handler_installs(program, scoping, &flow, budget)?
+                    .into_iter()
+                    .map(|proof| {
+                        (
+                            (proof.install.call_start, proof.install.call_end),
+                            proof.origin,
+                        )
+                    })
+                    .collect();
+            let registry_read_origins =
+                proven_origin_registry_read_calls(program, scoping, &flow, budget)?
+                    .into_iter()
+                    .map(|proof| ((proof.read.call_start, proof.read.call_end), proof.origin))
+                    .collect();
+            (
+                forwarded_calls,
+                read_calls,
+                forwarded_registry_origins,
+                registry_read_origins,
+            )
+        } else {
+            (Vec::new(), Vec::new(), HashMap::new(), HashMap::new())
+        };
     budget.checkpoint()?;
     let mut analyzer = Analyzer::new(
         source,
         budget,
         forwarded_calls,
         read_calls,
-        HashMap::new(),
-        HashMap::new(),
+        forwarded_registry_origins,
+        registry_read_origins,
     );
     analyzer.visit_program(program);
     analyzer.finish()
@@ -1429,8 +1447,10 @@ mod tests {
         assert!(parsed.is_clean());
         let semantic = SemanticBuilder::new().build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
         let budget = test_budget();
+        let flow =
+            structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping(), &budget)
+                .test_value("origin flow")?;
         let analysis =
             analyze_with_registry_origins(source, &parsed.program, &flow, &flow, &budget)
                 .test_value("origin-aware table analysis")?;
@@ -1444,6 +1464,38 @@ mod tests {
         assert_eq!(table.read_sites, 1);
         assert_eq!(table.dynamic_read_sites, 1);
         assert!(analysis.table_vms.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn production_origin_flow_joins_prototype_method_registry_read() -> TestResult {
+        let source = r#"
+            function install(state, key, value) { state.T[key] = value; }
+            function read(state, key) { return state.T[key]; }
+            function C(key) {
+                install(this, 1, function a() {});
+                install(this, 2, function b() {});
+                install(this, 3, function c() {});
+                install(this, 4, function d() {});
+                return this.run(key);
+            }
+            C.prototype.run = function(key) { return read(this, key); };
+            new C(window.dynamicKey);
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let budget = test_budget();
+        let analysis = analyze(source, &parsed.program, &budget).test_value("table analysis")?;
+        let table = analysis
+            .handler_function_tables
+            .iter()
+            .find(|table| table.binding.starts_with("origin@"))
+            .test_value("origin-canonical registry")?;
+        assert_eq!(table.entries, 4);
+        assert_eq!(table.function_values, 4);
+        assert_eq!(table.read_sites, 1);
+        assert_eq!(table.dynamic_read_sites, 1);
         Ok(())
     }
 

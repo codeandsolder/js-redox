@@ -239,7 +239,8 @@ mod tests {
         let semantic = SemanticBuilder::new().build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+        let flow = structurally_proven_origin_flow(&parsed.program, scoping, &test_budget())
+            .test_value("origin flow")?;
         let installs = proven_origin_registry_handler_installs(
             &parsed.program,
             scoping,
@@ -278,7 +279,8 @@ mod tests {
         let semantic = SemanticBuilder::new().build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+        let flow = structurally_proven_origin_flow(&parsed.program, scoping, &test_budget())
+            .test_value("origin flow")?;
         let values =
             proven_origin_registry_value_installs(&parsed.program, scoping, &flow, &test_budget())
                 .test_value("proven_origin_registry_value_installs")?;
@@ -322,7 +324,8 @@ mod tests {
         let semantic = SemanticBuilder::new().build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+        let flow = structurally_proven_origin_flow(&parsed.program, scoping, &test_budget())
+            .test_value("origin flow")?;
         let reads =
             proven_origin_registry_read_calls(&parsed.program, scoping, &flow, &test_budget())
                 .test_value("proven_origin_registry_read_calls")?;
@@ -350,7 +353,8 @@ mod tests {
         let semantic = SemanticBuilder::new().build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+        let flow = structurally_proven_origin_flow(&parsed.program, scoping, &test_budget())
+            .test_value("origin flow")?;
         let installs = proven_origin_registry_handler_installs(
             &parsed.program,
             scoping,

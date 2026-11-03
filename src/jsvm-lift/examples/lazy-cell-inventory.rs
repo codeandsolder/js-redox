@@ -140,7 +140,7 @@ fn main() -> Result<()> {
         }))
         .collect::<Vec<_>>();
 
-    let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+    let flow = structurally_proven_origin_flow(&parsed.program, scoping, &budget)?;
     let fast_calls = flow
         .direct_calls
         .iter()
@@ -181,7 +181,7 @@ fn main() -> Result<()> {
                     && shape.function_end == call.callee.function_end
             })
         })
-        .map(|call| {
+        .map(|call| -> Result<_> {
             let specialized = proven_slow_lazy_cell_factory_call(
                 &source,
                 &parsed.program,
@@ -191,14 +191,17 @@ fn main() -> Result<()> {
             let update = specialized.as_ref().and_then(|factory| {
                 proven_slow_lazy_cell_update_state(&parsed.program, &semantic.semantic, factory)
             });
-            let state_fields = specialized.as_ref().and_then(|factory| {
+            let state_fields = if let Some(factory) = specialized.as_ref() {
                 proven_slow_lazy_cell_state_fields(
                     &source,
                     &parsed.program,
                     &semantic.semantic,
                     factory,
-                )
-            });
+                    &budget,
+                )?
+            } else {
+                None
+            };
             let registry = specialized.as_ref().and_then(|factory| {
                 proven_slow_lazy_cell_registry_assignment(
                     &parsed.program,
@@ -218,33 +221,33 @@ fn main() -> Result<()> {
                     )
                 })
                 .unwrap_or_default();
-            let path_state_fields = exact_assignments
-                .iter()
-                .filter_map(|exact_assignment| {
-                    proven_slow_lazy_cell_state_fields_for_exact_assignment(
+            let mut path_state_fields = Vec::new();
+            for exact_assignment in &exact_assignments {
+                if let Some(fields) = proven_slow_lazy_cell_state_fields_for_exact_assignment(
+                    &source,
+                    &parsed.program,
+                    &semantic.semantic,
+                    exact_assignment,
+                    &budget,
+                )? {
+                    path_state_fields.push(fields);
+                }
+            }
+            let mut carrier_proofs = Vec::new();
+            if let Some(accessor) = accessor {
+                for fields in &path_state_fields {
+                    if let Some(proof) = proven_slow_lazy_cell_prototype_carrier(
                         &source,
                         &parsed.program,
                         &semantic.semantic,
-                        exact_assignment,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let carrier_proofs = accessor
-                .map(|accessor| {
-                    path_state_fields
-                        .iter()
-                        .filter_map(|fields| {
-                            proven_slow_lazy_cell_prototype_carrier(
-                                &source,
-                                &parsed.program,
-                                &semantic.semantic,
-                                fields,
-                                accessor,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+                        fields,
+                        accessor,
+                        &budget,
+                    )? {
+                        carrier_proofs.push(proof);
+                    }
+                }
+            }
             let mut captured_values = Vec::new();
             for exact_assignment in &exact_assignments {
                 for install in &origin_value_installs {
@@ -303,7 +306,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            json!({
+            Ok(json!({
                 "call": [call.call_start, call.call_end],
                 "call_source": snippet(&source, call.call_start, call.call_end),
                 "caller": [call.caller.function_start, call.caller.function_end],
@@ -410,9 +413,9 @@ fn main() -> Result<()> {
                         proof.resolved_handler.captured_handler.install.install.handler_end,
                     ],
                 })).collect::<Vec<_>>(),
-            })
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let specialized_calls = candidate_calls
         .iter()
         .filter(|call| call["specialized"] == true)

@@ -32,6 +32,7 @@ use oxc_semantic::{Scoping, Semantic};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use work_budget::{BudgetExceeded, WorkBudget};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlowLazyCellFactoryShape {
@@ -3381,59 +3382,73 @@ pub fn proven_slow_lazy_cell_resolver_index(
 /// This theorem deliberately does not interpret the carrier object itself. A
 /// separate object-model proof must establish what the exact carrier value does
 /// when used as the prototype of the newly created cell.
-#[must_use]
 pub fn proven_slow_lazy_cell_state_fields(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     factory_call: &ProvenSlowLazyCellFactoryCall,
-) -> Option<ProvenSlowLazyCellStateFields> {
+    budget: &WorkBudget,
+) -> Result<Option<ProvenSlowLazyCellStateFields>, BudgetExceeded> {
     let call = &factory_call.call;
     let shape = &factory_call.shape;
     let allocation = Span::new(call.callee.allocation_start, call.callee.allocation_end);
 
-    let string_at_allocation = proven_prototype_string_at_allocation(
+    let Some(string_at_allocation) = proven_prototype_string_at_allocation(
         program,
         semantic,
         call.callee.constructor_start,
         call.callee.constructor_end,
         allocation,
         &shape.method_key_field,
+        budget,
+    )?
+    else {
+        return Ok(None);
+    };
+    let method_key_proofs = proven_prototype_string_at_direct_calls(
+        source,
+        program,
+        semantic,
+        &string_at_allocation,
+        budget,
     )?;
-    let mut method_keys =
-        proven_prototype_string_at_direct_calls(source, program, semantic, &string_at_allocation)
-            .into_iter()
-            .filter(|proof| proof.call == *call);
-    let method_key = method_keys.next()?;
+    let mut method_keys = method_key_proofs
+        .into_iter()
+        .filter(|proof| proof.call == *call);
+    let Some(method_key) = method_keys.next() else {
+        return Ok(None);
+    };
     if method_keys.next().is_some() {
-        return None;
+        return Ok(None);
     }
 
-    let mut prototype_fields = proven_exact_own_data_field_at_direct_call(
+    let prototype_field_proofs = proven_exact_own_data_field_at_direct_call(
         source,
         program,
         semantic,
         &shape.prototype_field,
         call,
-    )
-    .into_iter()
-    .filter(|proof| {
+        budget,
+    )?;
+    let mut prototype_fields = prototype_field_proofs.into_iter().filter(|proof| {
         proof.direct_call == *call
             && proof.initialization.allocation_start == call.callee.allocation_start
             && proof.initialization.allocation_end == call.callee.allocation_end
             && proof.initialization.constructor_start == call.callee.constructor_start
             && proof.initialization.constructor_end == call.callee.constructor_end
     });
-    let prototype_field = prototype_fields.next()?;
+    let Some(prototype_field) = prototype_fields.next() else {
+        return Ok(None);
+    };
     if prototype_fields.next().is_some() {
-        return None;
+        return Ok(None);
     }
 
-    Some(ProvenSlowLazyCellStateFields {
+    Ok(Some(ProvenSlowLazyCellStateFields {
         factory_call: factory_call.clone(),
         prototype_field,
         method_key,
-    })
+    }))
 }
 
 /// Prove the same slow-cell state facts along one concrete exact-assignment
@@ -3445,101 +3460,127 @@ pub fn proven_slow_lazy_cell_state_fields(
 /// allocation is required to preserve both properties. This is intentionally a
 /// path theorem: unrelated incoming edges to a shared installer do not weaken a
 /// proof for this concrete constructor path.
-#[must_use]
 pub fn proven_slow_lazy_cell_state_fields_for_exact_assignment(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     exact_assignment: &ProvenSlowLazyCellExactRegistryAssignment,
-) -> Option<ProvenSlowLazyCellExactStateFields> {
+    budget: &WorkBudget,
+) -> Result<Option<ProvenSlowLazyCellExactStateFields>, BudgetExceeded> {
     let factory_call = &exact_assignment.assignment.factory_call;
     let shape = &factory_call.shape;
     let chain = &exact_assignment.provenance_calls;
-    let root = chain.first()?;
-    if chain.last()? != &exact_assignment.caller
+    let Some(root) = chain.first() else {
+        return Ok(None);
+    };
+    let Some(last) = chain.last() else {
+        return Ok(None);
+    };
+    if last != &exact_assignment.caller
         || exact_assignment.caller.callee != factory_call.call.caller
         || crate::registry_identity::ProvenRegistryObjectOrigin::from(&root.callee)
             != crate::registry_identity::ProvenRegistryObjectOrigin::from(&factory_call.call.callee)
     {
-        return None;
+        return Ok(None);
     }
 
     let allocation = Span::new(root.callee.allocation_start, root.callee.allocation_end);
-    let string_at_allocation = proven_prototype_string_at_allocation(
+    let Some(string_at_allocation) = proven_prototype_string_at_allocation(
         program,
         semantic,
         root.callee.constructor_start,
         root.callee.constructor_end,
         allocation,
         &shape.method_key_field,
+        budget,
+    )?
+    else {
+        return Ok(None);
+    };
+    let method_key_proofs = proven_prototype_string_at_direct_calls(
+        source,
+        program,
+        semantic,
+        &string_at_allocation,
+        budget,
     )?;
-    let mut method_keys =
-        proven_prototype_string_at_direct_calls(source, program, semantic, &string_at_allocation)
-            .into_iter()
-            .filter(|proof| proof.call == *root);
-    let method_key = method_keys.next()?;
+    let mut method_keys = method_key_proofs
+        .into_iter()
+        .filter(|proof| proof.call == *root);
+    let Some(method_key) = method_keys.next() else {
+        return Ok(None);
+    };
     if method_keys.next().is_some() {
-        return None;
+        return Ok(None);
     }
 
-    let mut prototype_fields = proven_exact_own_data_field_at_direct_call(
+    let prototype_field_proofs = proven_exact_own_data_field_at_direct_call(
         source,
         program,
         semantic,
         &shape.prototype_field,
         root,
-    )
-    .into_iter()
-    .filter(|proof| {
+        budget,
+    )?;
+    let mut prototype_fields = prototype_field_proofs.into_iter().filter(|proof| {
         proof.direct_call == *root
             && proof.initialization.allocation_start == root.callee.allocation_start
             && proof.initialization.allocation_end == root.callee.allocation_end
             && proof.initialization.constructor_start == root.callee.constructor_start
             && proof.initialization.constructor_end == root.callee.constructor_end
     });
-    let prototype_field = prototype_fields.next()?;
+    let Some(prototype_field) = prototype_fields.next() else {
+        return Ok(None);
+    };
     if prototype_fields.next().is_some() {
-        return None;
+        return Ok(None);
     }
 
-    let preserves_until = |entry: &ProvenOriginDirectCall, before: &ProvenOriginDirectCall| {
-        proven_origin_direct_call_prefix_preserves_exact_property_before_direct_call(
-            source,
-            program,
-            semantic.scoping(),
-            entry,
-            before,
-            &shape.prototype_field,
-        ) && proven_origin_direct_call_prefix_preserves_exact_property_before_direct_call(
-            source,
-            program,
-            semantic.scoping(),
-            entry,
-            before,
-            &shape.method_key_field,
+    let preserves_until = |entry: &ProvenOriginDirectCall,
+                           before: &ProvenOriginDirectCall|
+     -> Result<bool, BudgetExceeded> {
+        Ok(
+            proven_origin_direct_call_prefix_preserves_exact_property_before_direct_call(
+                source,
+                program,
+                semantic.scoping(),
+                entry,
+                before,
+                &shape.prototype_field,
+                budget,
+            )? && proven_origin_direct_call_prefix_preserves_exact_property_before_direct_call(
+                source,
+                program,
+                semantic.scoping(),
+                entry,
+                before,
+                &shape.method_key_field,
+                budget,
+            )?,
         )
     };
     for pair in chain.windows(2) {
         let [entry, before] = pair else {
-            return None;
+            return Ok(None);
         };
-        if !preserves_until(entry, before) {
-            return None;
+        if !preserves_until(entry, before)? {
+            return Ok(None);
         }
     }
-    if !preserves_until(chain.last()?, &factory_call.call) {
-        return None;
+    if !preserves_until(last, &factory_call.call)? {
+        return Ok(None);
     }
 
-    Some(ProvenSlowLazyCellExactStateFields {
+    Ok(Some(ProvenSlowLazyCellExactStateFields {
         exact_assignment: exact_assignment.clone(),
         fields: ProvenSlowLazyCellStateFields {
             factory_call: factory_call.clone(),
             prototype_field,
             method_key,
         },
-    })
+    }))
 }
+
 #[derive(Debug, Clone)]
 struct CarrierInitializerShape {
     helper_symbol: SymbolId,
@@ -4273,19 +4314,19 @@ fn slow_cell_object_constructor_symbol(
 /// requires the M-style factory to use the same Object-constructor alias when it
 /// creates the cell from `ST`. It deliberately records, rather than hides, the
 /// ordinary/untampered built-in Object + prototype + accessor semantics premise.
-#[must_use]
 pub fn proven_slow_lazy_cell_prototype_carrier(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     state_fields: &ProvenSlowLazyCellExactStateFields,
     accessor: &ProvenLazyRegistryReadCall,
-) -> Option<ProvenSlowLazyCellPrototypeCarrier> {
+    budget: &WorkBudget,
+) -> Result<Option<ProvenSlowLazyCellPrototypeCarrier>, BudgetExceeded> {
     let scoping = semantic.scoping();
     let fields = &state_fields.fields;
     let factory_call = &fields.factory_call;
     if state_fields.exact_assignment.assignment.factory_call != *factory_call {
-        return None;
+        return Ok(None);
     }
     let shape = &factory_call.shape;
     let method_name = fields.method_key.string.assignment.value.clone();
@@ -4293,7 +4334,7 @@ pub fn proven_slow_lazy_cell_prototype_carrier(
         || fields.prototype_field.initialization.property != shape.prototype_field
         || fields.method_key.string.assignment.property != shape.method_key_field
     {
-        return None;
+        return Ok(None);
     }
     if !proven_origin_direct_call_preserves_exact_property(
         source,
@@ -4301,83 +4342,88 @@ pub fn proven_slow_lazy_cell_prototype_carrier(
         scoping,
         &factory_call.call,
         &shape.prototype_field,
-    ) || !proven_origin_direct_call_preserves_exact_property(
+        budget,
+    )? || !proven_origin_direct_call_preserves_exact_property(
         source,
         program,
         scoping,
         &factory_call.call,
         &shape.method_key_field,
-    ) {
-        return None;
+        budget,
+    )? {
+        return Ok(None);
     }
 
-    let initializer = carrier_initializer_shape(
-        program,
-        scoping,
-        &fields.prototype_field.initialization,
-        &shape.method_key_field,
-        &shape.resolver_property,
-    )?;
-    let helper = carrier_helper_shape(
-        source,
-        program,
-        scoping,
-        initializer.helper_symbol,
-        &accessor.projection_property,
-    )?;
-    if initializer.method_key_argument_index != helper.method_key_parameter_index
-        || initializer.getter_argument_index != helper.descriptor_parameter_index
-        || !symbol_binding_has_no_writes(
+    let proven = (|| -> Option<ProvenSlowLazyCellPrototypeCarrier> {
+        let initializer = carrier_initializer_shape(
+            program,
             scoping,
-            parameter_symbols_for_span(program, helper.function)?
-                .get(helper.method_key_parameter_index)
-                .copied()?,
-        )
-        || !symbol_binding_has_no_writes(
-            scoping,
-            parameter_symbols_for_span(program, helper.function)?
-                .get(helper.descriptor_parameter_index)
-                .copied()?,
-        )
-        || !prove_function_if_ladder_states_before_event_with_integer_parameters(
+            &fields.prototype_field.initialization,
+            &shape.method_key_field,
+            &shape.resolver_property,
+        )?;
+        let helper = carrier_helper_shape(
             source,
             program,
             scoping,
-            &[helper.create_state],
-            IntegerParameterEvent {
-                function: helper.function,
-                event: helper.return_event,
-                parameter_bindings: &initializer.exact_integer_arguments,
-            },
-        )
-    {
-        return None;
-    }
+            initializer.helper_symbol,
+            &accessor.projection_property,
+        )?;
+        if initializer.method_key_argument_index != helper.method_key_parameter_index
+            || initializer.getter_argument_index != helper.descriptor_parameter_index
+            || !symbol_binding_has_no_writes(
+                scoping,
+                parameter_symbols_for_span(program, helper.function)?
+                    .get(helper.method_key_parameter_index)
+                    .copied()?,
+            )
+            || !symbol_binding_has_no_writes(
+                scoping,
+                parameter_symbols_for_span(program, helper.function)?
+                    .get(helper.descriptor_parameter_index)
+                    .copied()?,
+            )
+            || !prove_function_if_ladder_states_before_event_with_integer_parameters(
+                source,
+                program,
+                scoping,
+                &[helper.create_state],
+                IntegerParameterEvent {
+                    function: helper.function,
+                    event: helper.return_event,
+                    parameter_bindings: &initializer.exact_integer_arguments,
+                },
+            )
+        {
+            return None;
+        }
 
-    let cell_constructor = slow_cell_object_constructor_symbol(program, scoping, factory_call)?;
-    if cell_constructor != helper.object_constructor_symbol
-        || !symbol_is_ordinary_object_constructor_alias(program, scoping, cell_constructor)
-    {
-        return None;
-    }
+        let cell_constructor = slow_cell_object_constructor_symbol(program, scoping, factory_call)?;
+        if cell_constructor != helper.object_constructor_symbol
+            || !symbol_is_ordinary_object_constructor_alias(program, scoping, cell_constructor)
+        {
+            return None;
+        }
 
-    Some(ProvenSlowLazyCellPrototypeCarrier {
-        state_fields: state_fields.clone(),
-        accessor: accessor.clone(),
-        helper_function_start: helper.function.start,
-        helper_function_end: helper.function.end,
-        helper_call_start: initializer.helper_call.start,
-        helper_call_end: initializer.helper_call.end,
-        helper_create_start: helper.create_assignment.start,
-        helper_create_end: helper.create_assignment.end,
-        getter_function_start: initializer.getter_function.start,
-        getter_function_end: initializer.getter_function.end,
-        object_constructor_symbol: cell_constructor,
-        method_name,
-        projection_property: accessor.projection_property.clone(),
-        resolver_property: shape.resolver_property.clone(),
-        standard_object_prototype_semantics_required: true,
-    })
+        Some(ProvenSlowLazyCellPrototypeCarrier {
+            state_fields: state_fields.clone(),
+            accessor: accessor.clone(),
+            helper_function_start: helper.function.start,
+            helper_function_end: helper.function.end,
+            helper_call_start: initializer.helper_call.start,
+            helper_call_end: initializer.helper_call.end,
+            helper_create_start: helper.create_assignment.start,
+            helper_create_end: helper.create_assignment.end,
+            getter_function_start: initializer.getter_function.start,
+            getter_function_end: initializer.getter_function.end,
+            object_constructor_symbol: cell_constructor,
+            method_name,
+            projection_property: accessor.projection_property.clone(),
+            resolver_property: shape.resolver_property.clone(),
+            standard_object_prototype_semantics_required: true,
+        })
+    })();
+    Ok(proven)
 }
 
 fn parameter_symbols_for_span(program: &Program<'_>, span: Span) -> Option<Vec<SymbolId>> {
@@ -4539,7 +4585,12 @@ mod tests {
             .with_cfg(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("origin flow")?;
         let start = source_offset(source, needle, "call")?;
         let Some(call) = flow
             .direct_calls
@@ -4614,7 +4665,12 @@ mod tests {
             .with_cfg(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("origin flow")?;
         let start = source_offset(source, "make(48", "factory call")?;
         let call = flow
             .direct_calls
@@ -4629,7 +4685,9 @@ mod tests {
             &parsed.program,
             &semantic.semantic,
             &factory,
+            &test_budget(),
         )
+        .test_value("state fields budget")?
         .test_value("state fields")?;
         assert_eq!(fields.method_key.string.assignment.value, "create");
         assert_eq!(fields.prototype_field.initialization.property, "base");
@@ -4675,7 +4733,12 @@ mod tests {
             .with_cfg(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("origin flow")?;
         let start = source_offset(source, "make(\n                    48", "factory call")?;
         let call = flow
             .direct_calls
@@ -4707,7 +4770,9 @@ mod tests {
             &parsed.program,
             &semantic.semantic,
             &exact,
+            &test_budget(),
         )
+        .test_value("path state fields budget")?
         .test_value("path state fields")?;
         assert_eq!(fields.fields.method_key.string.assignment.value, "create");
         assert_eq!(
@@ -4784,7 +4849,12 @@ mod tests {
             .with_cfg(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("origin flow")?;
         let calls = flow
             .direct_calls
             .iter()
@@ -4872,7 +4942,12 @@ mod tests {
             .with_cfg(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("origin flow")?;
         let call = flow
             .direct_calls
             .iter()
@@ -4978,7 +5053,8 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+        let flow = structurally_proven_origin_flow(&parsed.program, scoping, &test_budget())
+            .test_value("origin flow")?;
         let start = source_offset(source, "make(\n                    48", "factory call")?;
         let call = flow
             .direct_calls
@@ -5009,7 +5085,9 @@ mod tests {
             &parsed.program,
             &semantic.semantic,
             &exact,
+            &test_budget(),
         )
+        .test_value("path state fields budget")?
         .test_value("path state fields")?;
         let reads =
             structurally_proven_lazy_registry_read_calls(&parsed.program, scoping, &test_budget())
@@ -5021,7 +5099,9 @@ mod tests {
             &semantic.semantic,
             &fields,
             accessor,
+            &test_budget(),
         )
+        .test_value("prototype carrier budget")?
         .test_value("prototype carrier")?;
         assert_eq!(carrier.method_name, "create");
         assert_eq!(carrier.projection_property, "prototype");
@@ -5129,7 +5209,12 @@ mod tests {
             .with_cfg(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("origin flow")?;
         let start = source_offset(source, "make(48", "call")?;
         let call = flow
             .direct_calls
@@ -5222,7 +5307,8 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+        let flow = structurally_proven_origin_flow(&parsed.program, scoping, &test_budget())
+            .test_value("origin flow")?;
         let start = source_offset(source, "make(\n                    48", "call")?;
         let call = flow
             .direct_calls
@@ -5391,7 +5477,12 @@ mod tests {
             .with_cfg(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("origin flow")?;
         let call_start = source_offset(source, "write(state, key, handler)", "write call")?;
         let call = flow
             .direct_calls
@@ -5452,7 +5543,12 @@ mod tests {
             .with_cfg(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("origin flow")?;
         let call_start = source_offset(source, "sink(state, key, handler)", "sink call")?;
         let call = flow
             .direct_calls
@@ -5507,7 +5603,12 @@ mod tests {
             .with_cfg(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("origin flow")?;
         let call_start = source_offset(source, "write(state, key, handler)", "write call")?;
         let call = flow
             .direct_calls
@@ -5581,7 +5682,8 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
-        let flow = structurally_proven_origin_flow(&parsed.program, scoping);
+        let flow = structurally_proven_origin_flow(&parsed.program, scoping, &test_budget())
+            .test_value("origin flow")?;
         let starts = [
             source_offset(source, "make(48, 19, 49", "first make")?,
             source_rfind(source, "make(48, 19, 49", "second make")?,

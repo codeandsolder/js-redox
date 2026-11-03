@@ -25,6 +25,7 @@ use oxc_semantic::{Scoping, Semantic};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FunctionKey {
@@ -251,14 +252,20 @@ fn has_dynamic_scope(body: &FunctionBody<'_>) -> bool {
 struct FunctionCollector {
     by_key: HashMap<FunctionKey, FunctionInfo>,
     by_symbol: HashMap<SymbolId, FunctionKey>,
+    poller: BudgetPoller,
 }
 
 impl FunctionCollector {
-    fn new() -> Self {
+    fn new(budget: &WorkBudget) -> Self {
         Self {
             by_key: HashMap::new(),
             by_symbol: HashMap::new(),
+            poller: BudgetPoller::new(budget, 256),
         }
+    }
+
+    fn finish(&mut self) -> Result<(), BudgetExceeded> {
+        self.poller.finish()
     }
 
     fn record(&mut self, function: &Function<'_>) {
@@ -284,6 +291,20 @@ impl FunctionCollector {
 }
 
 impl<'a> Visit<'a> for FunctionCollector {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
         self.record(function);
         walk::walk_function(self, function, flags);
@@ -342,9 +363,24 @@ struct AllocationCollector<'c, 'f> {
     scoping: &'c Scoping,
     functions: &'f HashMap<SymbolId, FunctionKey>,
     contexts: Vec<FunctionContext>,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for AllocationCollector<'_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_new_expression(&mut self, expression: &NewExpression<'a>) {
         let callee = last_sequence_expression(&expression.callee);
         if let Some(symbol) = reference_symbol(self.scoping, callee)
@@ -385,6 +421,7 @@ struct ContextProbe<'c, 'f> {
     evaluation_order: u64,
     target: FunctionKey,
     active: bool,
+    poller: BudgetPoller,
 }
 
 impl<'c, 'f> ContextProbe<'c, 'f> {
@@ -395,6 +432,7 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
         property_keys: &'f HashMap<SymbolId, String>,
         context: &'f FunctionContext,
         info: &FunctionInfo,
+        budget: &WorkBudget,
     ) -> Self {
         let parameter_origins = info
             .parameters
@@ -420,7 +458,12 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
             evaluation_order: 0,
             target: context.function,
             active: false,
+            poller: BudgetPoller::new(budget, 256),
         }
+    }
+
+    fn finish(&mut self) -> Result<(), BudgetExceeded> {
+        self.poller.finish()
     }
 
     fn next_evaluation_order(&mut self) -> u64 {
@@ -638,6 +681,20 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
 }
 
 impl<'a> Visit<'a> for ContextProbe<'_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
         let key = FunctionKey::of(function);
         if self.active {
@@ -980,12 +1037,14 @@ fn analyze_origin_contexts(
     scoping: &Scoping,
     functions: &FunctionCollector,
     initial_contexts: impl IntoIterator<Item = FunctionContext>,
-) -> ProvenOriginFlow {
-    let property_keys = collect_property_key_bindings(program, scoping);
+    budget: &WorkBudget,
+) -> Result<ProvenOriginFlow, BudgetExceeded> {
+    let property_keys = collect_property_key_bindings(program, scoping, budget)?;
     let mut queue = initial_contexts.into_iter().collect::<VecDeque<_>>();
     let mut seen = HashSet::new();
     let mut flow = ProvenOriginFlow::default();
     while let Some(mut context) = queue.pop_front() {
+        budget.checkpoint()?;
         let Some(info) = functions.by_key.get(&context.function) else {
             continue;
         };
@@ -1007,8 +1066,10 @@ fn analyze_origin_contexts(
             &property_keys,
             &context,
             info,
+            budget,
         );
         probe.visit_program(program);
+        probe.finish()?;
         queue.extend(probe.discovered);
         flow.member_calls.extend(probe.member_calls);
         flow.member_reads.extend(probe.member_reads);
@@ -1064,24 +1125,27 @@ fn analyze_origin_contexts(
         )
     });
     flow.direct_calls.dedup();
-    flow
+    Ok(flow)
 }
 
-#[must_use]
 pub fn structurally_proven_origin_flow(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> ProvenOriginFlow {
-    let mut functions = FunctionCollector::new();
+    budget: &WorkBudget,
+) -> Result<ProvenOriginFlow, BudgetExceeded> {
+    let mut functions = FunctionCollector::new(budget);
     functions.visit_program(program);
+    functions.finish()?;
 
     let mut allocations = AllocationCollector {
         scoping,
         functions: &functions.by_symbol,
         contexts: Vec::new(),
+        poller: BudgetPoller::new(budget, 256),
     };
     allocations.visit_program(program);
-    analyze_origin_contexts(program, scoping, &functions, allocations.contexts)
+    allocations.poller.finish()?;
+    analyze_origin_contexts(program, scoping, &functions, allocations.contexts, budget)
 }
 
 /// Continue exact-origin propagation from contexts proven by another theorem.
@@ -1090,14 +1154,15 @@ pub fn structurally_proven_origin_flow(
 /// function and that its parameter indices are in range, but it deliberately
 /// does not re-prove the seed itself. Callers must only construct seeds from
 /// already-proven object identity and call-target facts.
-#[must_use]
 pub fn propagate_proven_origin_contexts(
     program: &Program<'_>,
     scoping: &Scoping,
     seeds: &[ProvenOriginContext],
-) -> ProvenOriginFlow {
-    let mut functions = FunctionCollector::new();
+    budget: &WorkBudget,
+) -> Result<ProvenOriginFlow, BudgetExceeded> {
+    let mut functions = FunctionCollector::new(budget);
     functions.visit_program(program);
+    functions.finish()?;
 
     let initial_contexts = seeds.iter().filter_map(|seed| {
         let function = FunctionKey {
@@ -1133,7 +1198,7 @@ pub fn propagate_proven_origin_contexts(
         })
     });
 
-    analyze_origin_contexts(program, scoping, &functions, initial_contexts)
+    analyze_origin_contexts(program, scoping, &functions, initial_contexts, budget)
 }
 
 fn origin_prefix_is_fresh(
@@ -1173,13 +1238,13 @@ fn origin_prefix_is_fresh(
         })
 }
 
-#[must_use]
 pub fn structurally_proven_own_data_field_initializations(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenOwnDataFieldInitialization> {
-    let flow = structurally_proven_origin_flow(program, scoping);
-    let stable = structurally_proven_stable_constructor_prototypes(program, scoping)
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenOwnDataFieldInitialization>, BudgetExceeded> {
+    let flow = structurally_proven_origin_flow(program, scoping, budget)?;
+    let stable = structurally_proven_stable_constructor_prototypes(program, scoping, budget)?
         .into_iter()
         .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
         .collect::<HashSet<_>>();
@@ -1263,7 +1328,8 @@ pub fn structurally_proven_own_data_field_initializations(
         )
     });
     proven.dedup();
-    proven
+    budget.checkpoint()?;
+    Ok(proven)
 }
 
 fn static_member_read_is_getter_free(
@@ -1437,20 +1503,22 @@ fn direct_call_preserves_field(
 ///
 /// Call-site-specialized unreachable effects are ignored only when independently
 /// proven unreachable; recursive cycles and unsupported reachable effects fail closed.
-#[must_use]
 pub fn proven_origin_direct_call_preserves_own_field(
     source: &str,
     program: &Program<'_>,
     scoping: &Scoping,
     call: &ProvenOriginDirectCall,
     property: &str,
-) -> bool {
-    let flow = structurally_proven_origin_flow(program, scoping);
-    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
-        .into_iter()
-        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
-        .collect::<HashSet<_>>();
-    direct_call_preserves_field(
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    let flow = structurally_proven_origin_flow(program, scoping, budget)?;
+    let stable_prototypes =
+        structurally_proven_stable_constructor_prototypes(program, scoping, budget)?
+            .into_iter()
+            .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+            .collect::<HashSet<_>>();
+    budget.checkpoint()?;
+    Ok(direct_call_preserves_field(
         source,
         program,
         scoping,
@@ -1461,26 +1529,28 @@ pub fn proven_origin_direct_call_preserves_own_field(
         false,
         &mut HashMap::new(),
         &mut HashSet::new(),
-    )
+    ))
 }
 
 /// Prove that one exact-origin direct call preserves the exact current value of
 /// a named receiver property. Any reachable write, update, or delete of that
 /// property invalidates the theorem.
-#[must_use]
 pub fn proven_origin_direct_call_preserves_exact_property(
     source: &str,
     program: &Program<'_>,
     scoping: &Scoping,
     call: &ProvenOriginDirectCall,
     property: &str,
-) -> bool {
-    let flow = structurally_proven_origin_flow(program, scoping);
-    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
-        .into_iter()
-        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
-        .collect::<HashSet<_>>();
-    direct_call_preserves_field(
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    let flow = structurally_proven_origin_flow(program, scoping, budget)?;
+    let stable_prototypes =
+        structurally_proven_stable_constructor_prototypes(program, scoping, budget)?
+            .into_iter()
+            .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+            .collect::<HashSet<_>>();
+    budget.checkpoint()?;
+    Ok(direct_call_preserves_field(
         source,
         program,
         scoping,
@@ -1491,7 +1561,7 @@ pub fn proven_origin_direct_call_preserves_exact_property(
         true,
         &mut HashMap::new(),
         &mut HashSet::new(),
-    )
+    ))
 }
 
 /// Prove that an exact receiver property keeps its current value from one
@@ -1500,7 +1570,6 @@ pub fn proven_origin_direct_call_preserves_exact_property(
 /// Unlike the whole-call preservation theorem, effects after `before` are
 /// irrelevant. This is useful for concrete provenance chains through helpers
 /// that may legitimately mutate unrelated state later in the invocation.
-#[must_use]
 pub fn proven_origin_direct_call_prefix_preserves_exact_property_before_direct_call(
     source: &str,
     program: &Program<'_>,
@@ -1508,19 +1577,22 @@ pub fn proven_origin_direct_call_prefix_preserves_exact_property_before_direct_c
     entry: &ProvenOriginDirectCall,
     before: &ProvenOriginDirectCall,
     property: &str,
-) -> bool {
-    let flow = structurally_proven_origin_flow(program, scoping);
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    let flow = structurally_proven_origin_flow(program, scoping, budget)?;
     if !flow.direct_calls.contains(entry)
         || !flow.direct_calls.contains(before)
         || before.caller != entry.callee
     {
-        return false;
+        return Ok(false);
     }
-    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
-        .into_iter()
-        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
-        .collect::<HashSet<_>>();
-    direct_call_prefix_preserves_field(
+    let stable_prototypes =
+        structurally_proven_stable_constructor_prototypes(program, scoping, budget)?
+            .into_iter()
+            .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+            .collect::<HashSet<_>>();
+    budget.checkpoint()?;
+    Ok(direct_call_prefix_preserves_field(
         source,
         program,
         scoping,
@@ -1532,7 +1604,7 @@ pub fn proven_origin_direct_call_prefix_preserves_exact_property_before_direct_c
         true,
         &mut HashMap::new(),
         &mut HashSet::new(),
-    )
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1719,19 +1791,21 @@ fn direct_call_prefix_preserves_field(
 /// This is intentionally a prefix theorem. Receiver method calls are barriers;
 /// nested direct calls are recursively summarized, and call-site-specialized
 /// unreachable events are ignored only when independently proven unreachable.
-#[must_use]
 pub fn structurally_proven_own_data_fields_at_member_calls(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
-) -> Vec<ProvenOwnDataFieldAtMemberCall> {
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenOwnDataFieldAtMemberCall>, BudgetExceeded> {
     let scoping = semantic.scoping();
-    let flow = structurally_proven_origin_flow(program, scoping);
-    let initializations = structurally_proven_own_data_field_initializations(program, scoping);
-    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
-        .into_iter()
-        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
-        .collect::<HashSet<_>>();
+    let flow = structurally_proven_origin_flow(program, scoping, budget)?;
+    let initializations =
+        structurally_proven_own_data_field_initializations(program, scoping, budget)?;
+    let stable_prototypes =
+        structurally_proven_stable_constructor_prototypes(program, scoping, budget)?
+            .into_iter()
+            .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+            .collect::<HashSet<_>>();
     let mut memo = HashMap::new();
     let mut visiting = HashSet::new();
     let mut proven = Vec::new();
@@ -1798,7 +1872,8 @@ pub fn structurally_proven_own_data_fields_at_member_calls(
         )
     });
     proven.dedup();
-    proven
+    budget.checkpoint()?;
+    Ok(proven)
 }
 
 /// Prove that the exact value written by a fresh ordinary own-data field
@@ -1812,24 +1887,26 @@ pub fn structurally_proven_own_data_fields_at_member_calls(
 ///
 /// Both segments use the same fail-closed exact-property preservation theorem.
 /// The initialization must dominate the incoming call in the semantic CFG.
-#[must_use]
 pub fn proven_exact_own_data_field_at_direct_call(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     property: &str,
     target: &ProvenOriginDirectCall,
-) -> Vec<ProvenExactOwnDataFieldAtDirectCall> {
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenExactOwnDataFieldAtDirectCall>, BudgetExceeded> {
     let scoping = semantic.scoping();
-    let flow = structurally_proven_origin_flow(program, scoping);
+    let flow = structurally_proven_origin_flow(program, scoping, budget)?;
     if !flow.direct_calls.contains(target) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let initializations = structurally_proven_own_data_field_initializations(program, scoping);
-    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
-        .into_iter()
-        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
-        .collect::<HashSet<_>>();
+    let initializations =
+        structurally_proven_own_data_field_initializations(program, scoping, budget)?;
+    let stable_prototypes =
+        structurally_proven_stable_constructor_prototypes(program, scoping, budget)?
+            .into_iter()
+            .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+            .collect::<HashSet<_>>();
     let mut memo = HashMap::new();
     let mut visiting = HashSet::new();
     let mut proven = Vec::new();
@@ -1932,7 +2009,8 @@ pub fn proven_exact_own_data_field_at_direct_call(
         )
     });
     proven.dedup();
-    proven
+    budget.checkpoint()?;
+    Ok(proven)
 }
 
 fn collect_unique_direct_call_path(
@@ -2004,7 +2082,8 @@ fn context_field_prefix_before_event(
     property: &str,
     discharged_preserving_method_calls: &mut Vec<ProvenMemberReceiverOrigin>,
     standard_function_call_semantics_required: &mut bool,
-) -> bool {
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
     if proven_origin_direct_call_event_unreachable(
         source,
         program,
@@ -2012,8 +2091,9 @@ fn context_field_prefix_before_event(
         entry,
         event,
     ) {
-        return false;
+        return Ok(false);
     }
+    budget.checkpoint()?;
     let unreachable = |start, end| {
         proven_origin_direct_call_event_unreachable(
             source,
@@ -2079,8 +2159,9 @@ fn context_field_prefix_before_event(
             continue;
         }
         let Some(summary) = proven_prototype_method_receiver_preservation_summary(
-            source, program, semantic, target,
-        ) else {
+            source, program, semantic, target, budget,
+        )?
+        else {
             barriers.push(Span::new(member_call.call_start, member_call.call_end));
             continue;
         };
@@ -2129,9 +2210,10 @@ fn context_field_prefix_before_event(
     barriers.sort_by_key(|barrier| (barrier.start, barrier.end));
     barriers.dedup();
     if barriers.is_empty() {
-        return true;
+        return Ok(true);
     }
-    prove_event_before_barriers(semantic, event, &barriers)
+    budget.checkpoint()?;
+    Ok(prove_event_before_barriers(semantic, event, &barriers)
         || prove_function_if_ladder_event_before_barriers(
             source,
             program,
@@ -2139,7 +2221,7 @@ fn context_field_prefix_before_event(
             context.function_end,
             event,
             &barriers,
-        )
+        ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2152,7 +2234,8 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
     runtime_calls: &[ProvenPrototypeMethodCallTarget],
     initialization: &ProvenOwnDataFieldInitialization,
     target: &ProvenPrototypeMethodCallTarget,
-) -> Option<ProvenOwnDataFieldAtRuntimeMethodCall> {
+    budget: &WorkBudget,
+) -> Result<Option<ProvenOwnDataFieldAtRuntimeMethodCall>, BudgetExceeded> {
     let scoping = semantic.scoping();
     let call = &target.candidate.call;
     if initialization.allocation_start != call.allocation_start
@@ -2160,9 +2243,12 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
         || initialization.constructor_start != call.constructor_start
         || initialization.constructor_end != call.constructor_end
     {
-        return None;
+        return Ok(None);
     }
-    let path = collect_unique_direct_call_path(flow, &initialization.context, &call.context)?;
+    let Some(path) = collect_unique_direct_call_path(flow, &initialization.context, &call.context)
+    else {
+        return Ok(None);
+    };
     let mut discharged_preserving_method_calls = Vec::new();
     let mut standard_function_call_semantics_required = false;
 
@@ -2185,7 +2271,7 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
             &mut HashMap::new(),
             &mut HashSet::new(),
         ) {
-            return None;
+            return Ok(None);
         }
     } else {
         let first = &path[0];
@@ -2211,7 +2297,7 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
                 &mut HashSet::new(),
             )
         {
-            return None;
+            return Ok(None);
         }
         standard_function_call_semantics_required |=
             first.standard_function_call_semantics_required;
@@ -2221,12 +2307,12 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
             let (event, event_direct_call, event_member_call) =
                 if let Some(next) = path.get(index + 1) {
                     if next.caller != *context {
-                        return None;
+                        return Ok(None);
                     }
                     (Span::new(next.call_start, next.call_end), Some(next), None)
                 } else {
                     if call.context != *context {
-                        return None;
+                        return Ok(None);
                     }
                     (Span::new(call.call_start, call.call_end), None, Some(call))
                 };
@@ -2245,8 +2331,9 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
                 &initialization.property,
                 &mut discharged_preserving_method_calls,
                 &mut standard_function_call_semantics_required,
-            ) {
-                return None;
+                budget,
+            )? {
+                return Ok(None);
             }
             if let Some(next) = path.get(index + 1) {
                 standard_function_call_semantics_required |=
@@ -2258,13 +2345,14 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
     discharged_preserving_method_calls
         .sort_by_key(|call| (call.call_start, call.call_end, call.property.clone()));
     discharged_preserving_method_calls.dedup();
-    Some(ProvenOwnDataFieldAtRuntimeMethodCall {
+    budget.checkpoint()?;
+    Ok(Some(ProvenOwnDataFieldAtRuntimeMethodCall {
         initialization: initialization.clone(),
         call_target: target.clone(),
         direct_call_path: path,
         discharged_preserving_method_calls,
         standard_function_call_semantics_required,
-    })
+    }))
 }
 
 /// Prove one named ordinary own-data field live at one already runtime-proven
@@ -2273,38 +2361,43 @@ fn prove_own_data_field_at_runtime_method_call_with_facts(
 /// This focused form requires exactly one matching initialization fact for the
 /// concrete allocation and constructor. Ambiguous initialization histories fail
 /// closed rather than selecting by source order.
-#[must_use]
 pub fn proven_own_data_field_at_runtime_method_call(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     target: &ProvenPrototypeMethodCallTarget,
     property: &str,
-) -> Option<ProvenOwnDataFieldAtRuntimeMethodCall> {
+    budget: &WorkBudget,
+) -> Result<Option<ProvenOwnDataFieldAtRuntimeMethodCall>, BudgetExceeded> {
     let scoping = semantic.scoping();
-    let flow = structurally_proven_origin_flow(program, scoping);
-    let mut initializations = structurally_proven_own_data_field_initializations(program, scoping)
-        .into_iter()
-        .filter(|initialization| {
-            let call = &target.candidate.call;
-            initialization.property == property
-                && initialization.allocation_start == call.allocation_start
-                && initialization.allocation_end == call.allocation_end
-                && initialization.constructor_start == call.constructor_start
-                && initialization.constructor_end == call.constructor_end
-        });
-    let initialization = initializations.next()?;
+    let flow = structurally_proven_origin_flow(program, scoping, budget)?;
+    let mut initializations =
+        structurally_proven_own_data_field_initializations(program, scoping, budget)?
+            .into_iter()
+            .filter(|initialization| {
+                let call = &target.candidate.call;
+                initialization.property == property
+                    && initialization.allocation_start == call.allocation_start
+                    && initialization.allocation_end == call.allocation_end
+                    && initialization.constructor_start == call.constructor_start
+                    && initialization.constructor_end == call.constructor_end
+            });
+    let Some(initialization) = initializations.next() else {
+        return Ok(None);
+    };
     if initializations.next().is_some() {
-        return None;
+        return Ok(None);
     }
-    let runtime_calls = structurally_proven_prototype_method_calls_at_runtime(program, semantic);
+    let runtime_calls =
+        structurally_proven_prototype_method_calls_at_runtime(program, semantic, budget)?;
     if !runtime_calls.iter().any(|candidate| candidate == target) {
-        return None;
+        return Ok(None);
     }
-    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
-        .into_iter()
-        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
-        .collect::<HashSet<_>>();
+    let stable_prototypes =
+        structurally_proven_stable_constructor_prototypes(program, scoping, budget)?
+            .into_iter()
+            .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+            .collect::<HashSet<_>>();
     prove_own_data_field_at_runtime_method_call_with_facts(
         source,
         program,
@@ -2314,6 +2407,7 @@ pub fn proven_own_data_field_at_runtime_method_call(
         &runtime_calls,
         &initialization,
         target,
+        budget,
     )
 }
 
@@ -2325,20 +2419,23 @@ pub fn proven_own_data_field_at_runtime_method_call(
 /// may be crossed when all their own-data requirements are the field currently
 /// being tracked. Ambiguous call paths, dynamic property effects and unresolved
 /// barriers fail closed.
-#[must_use]
 pub fn structurally_proven_own_data_fields_at_runtime_method_calls(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
-) -> Vec<ProvenOwnDataFieldAtRuntimeMethodCall> {
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenOwnDataFieldAtRuntimeMethodCall>, BudgetExceeded> {
     let scoping = semantic.scoping();
-    let flow = structurally_proven_origin_flow(program, scoping);
-    let initializations = structurally_proven_own_data_field_initializations(program, scoping);
-    let runtime_calls = structurally_proven_prototype_method_calls_at_runtime(program, semantic);
-    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
-        .into_iter()
-        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
-        .collect::<HashSet<_>>();
+    let flow = structurally_proven_origin_flow(program, scoping, budget)?;
+    let initializations =
+        structurally_proven_own_data_field_initializations(program, scoping, budget)?;
+    let runtime_calls =
+        structurally_proven_prototype_method_calls_at_runtime(program, semantic, budget)?;
+    let stable_prototypes =
+        structurally_proven_stable_constructor_prototypes(program, scoping, budget)?
+            .into_iter()
+            .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+            .collect::<HashSet<_>>();
     let mut proven = Vec::new();
 
     for initialization in &initializations {
@@ -2352,7 +2449,8 @@ pub fn structurally_proven_own_data_fields_at_runtime_method_calls(
                 &runtime_calls,
                 initialization,
                 target,
-            ) {
+                budget,
+            )? {
                 proven.push(proof);
             }
         }
@@ -2365,7 +2463,8 @@ pub fn structurally_proven_own_data_fields_at_runtime_method_calls(
         )
     });
     proven.dedup();
-    proven
+    budget.checkpoint()?;
+    Ok(proven)
 }
 
 fn context_entry_has_no_prior_property_write(
@@ -2586,19 +2685,20 @@ fn exact_origin_property_reachability(
 /// from a valid context and its caller prefix preserves the exact property
 /// value. Cycles that cannot be established from already-proven predecessors
 /// remain unproven.
-#[must_use]
 pub fn proven_prototype_string_at_direct_calls(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     string: &ProvenPrototypeStringAtAllocation,
-) -> Vec<ProvenPrototypeStringAtDirectCall> {
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenPrototypeStringAtDirectCall>, BudgetExceeded> {
     let scoping = semantic.scoping();
-    let flow = structurally_proven_origin_flow(program, scoping);
-    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
-        .into_iter()
-        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
-        .collect::<HashSet<_>>();
+    let flow = structurally_proven_origin_flow(program, scoping, budget)?;
+    let stable_prototypes =
+        structurally_proven_stable_constructor_prototypes(program, scoping, budget)?
+            .into_iter()
+            .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+            .collect::<HashSet<_>>();
     let Some(reachability) = exact_origin_property_reachability(
         source,
         program,
@@ -2611,7 +2711,7 @@ pub fn proven_prototype_string_at_direct_calls(
         &string.assignment.property,
         &stable_prototypes,
     ) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let ProvenOriginPropertyReachability {
         calls,
@@ -2639,47 +2739,48 @@ pub fn proven_prototype_string_at_direct_calls(
         )
     });
     proven.dedup();
-    proven
+    budget.checkpoint()?;
+    Ok(proven)
 }
 
-#[must_use]
 pub fn structurally_proven_member_receiver_origins(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenMemberReceiverOrigin> {
-    structurally_proven_origin_flow(program, scoping).member_calls
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenMemberReceiverOrigin>, BudgetExceeded> {
+    Ok(structurally_proven_origin_flow(program, scoping, budget)?.member_calls)
 }
 
-#[must_use]
 pub fn structurally_proven_member_read_origins(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenMemberReadOrigin> {
-    structurally_proven_origin_flow(program, scoping).member_reads
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenMemberReadOrigin>, BudgetExceeded> {
+    Ok(structurally_proven_origin_flow(program, scoping, budget)?.member_reads)
 }
 
-#[must_use]
 pub fn structurally_proven_member_write_origins(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenMemberWriteOrigin> {
-    structurally_proven_origin_flow(program, scoping).member_writes
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenMemberWriteOrigin>, BudgetExceeded> {
+    Ok(structurally_proven_origin_flow(program, scoping, budget)?.member_writes)
 }
 
-#[must_use]
 pub fn structurally_proven_origin_exposures(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenOriginExposure> {
-    structurally_proven_origin_flow(program, scoping).exposures
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenOriginExposure>, BudgetExceeded> {
+    Ok(structurally_proven_origin_flow(program, scoping, budget)?.exposures)
 }
 
-#[must_use]
 pub fn structurally_proven_origin_direct_calls(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenOriginDirectCall> {
-    structurally_proven_origin_flow(program, scoping).direct_calls
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenOriginDirectCall>, BudgetExceeded> {
+    Ok(structurally_proven_origin_flow(program, scoping, budget)?.direct_calls)
 }
 
 /// Prove that one event in the callee of an exact-origin direct call cannot
@@ -3199,12 +3300,12 @@ fn phase_closure_for_method_assignment(
 
 /// Find prototype methods whose exact method body and a pure captured phase
 /// closure are installed by the same guaranteed zero-argument IIFE return.
-#[must_use]
 pub fn structurally_proven_prototype_method_phase_closures(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenPrototypeMethodPhaseClosure> {
-    let methods = structurally_proven_prototype_method_assignments(program, scoping);
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenPrototypeMethodPhaseClosure>, BudgetExceeded> {
+    let methods = structurally_proven_prototype_method_assignments(program, scoping, budget)?;
     let by_span = methods
         .into_iter()
         .map(|method| ((method.assignment_start, method.assignment_end), method))
@@ -3214,8 +3315,16 @@ pub fn structurally_proven_prototype_method_phase_closures(
         scoping: &'c Scoping,
         methods: &'m HashMap<(u32, u32), ProvenPrototypeMethodAssignment>,
         proven: Vec<ProvenPrototypeMethodPhaseClosure>,
+        poller: BudgetPoller,
     }
     impl<'a> Visit<'a> for Collector<'_, '_> {
+        fn visit_expression(&mut self, expression: &Expression<'a>) {
+            if !self.poller.poll(1) {
+                return;
+            }
+            walk::walk_expression(self, expression);
+        }
+
         fn visit_assignment_expression(
             &mut self,
             assignment: &oxc_ast::ast::AssignmentExpression<'a>,
@@ -3238,8 +3347,10 @@ pub fn structurally_proven_prototype_method_phase_closures(
         scoping,
         methods: &by_span,
         proven: Vec::new(),
+        poller: BudgetPoller::new(budget, 256),
     };
     collector.visit_program(program);
+    collector.poller.finish()?;
     collector.proven.sort_by_key(|proof| {
         (
             proof.constructor_start,
@@ -3249,7 +3360,7 @@ pub fn structurally_proven_prototype_method_phase_closures(
         )
     });
     collector.proven.dedup();
-    collector.proven
+    Ok(collector.proven)
 }
 
 /// Join a structural phase closure to an independently proven lexical equality
@@ -3306,9 +3417,24 @@ fn proof_property_key(
 struct PropertyKeyCollector<'c> {
     scoping: &'c Scoping,
     bindings: HashMap<SymbolId, String>,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for PropertyKeyCollector<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
         for declarator in &declaration.declarations {
             let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
@@ -3334,13 +3460,16 @@ impl<'a> Visit<'a> for PropertyKeyCollector<'_> {
 fn collect_property_key_bindings(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> HashMap<SymbolId, String> {
+    budget: &WorkBudget,
+) -> Result<HashMap<SymbolId, String>, BudgetExceeded> {
     let mut collector = PropertyKeyCollector {
         scoping,
         bindings: HashMap::new(),
+        poller: BudgetPoller::new(budget, 256),
     };
     collector.visit_program(program);
-    collector.bindings
+    collector.poller.finish()?;
+    Ok(collector.bindings)
 }
 
 fn static_member_name<'a>(expression: &'a Expression<'a>) -> Option<(&'a Expression<'a>, String)> {
@@ -3364,9 +3493,24 @@ struct PrototypeMentionProbe<'c, 'f, 'a> {
     constructors: &'f HashMap<SymbolId, FunctionKey>,
     aliases: &'a HashMap<SymbolId, FunctionKey>,
     owners: HashSet<FunctionKey>,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for PrototypeMentionProbe<'_, '_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
         if let Some(symbol) = identifier
             .reference_id
@@ -3401,6 +3545,7 @@ struct ConstructorEscapeProbe<'c, 'f, 'k> {
     constructors: &'f HashMap<SymbolId, FunctionKey>,
     property_keys: &'k HashMap<SymbolId, String>,
     owners: HashSet<FunctionKey>,
+    poller: BudgetPoller,
 }
 
 impl ConstructorEscapeProbe<'_, '_, '_> {
@@ -3413,6 +3558,20 @@ impl ConstructorEscapeProbe<'_, '_, '_> {
 }
 
 impl<'a> Visit<'a> for ConstructorEscapeProbe<'_, '_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
 
     fn visit_arrow_function_expression(
@@ -3494,6 +3653,9 @@ struct PrototypeMethodProof<'c, 'f> {
     scoping: &'c Scoping,
     constructors: &'f HashMap<SymbolId, FunctionKey>,
     property_keys: &'f HashMap<SymbolId, String>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
     aliases: HashMap<SymbolId, FunctionKey>,
     methods: HashMap<(FunctionKey, String), ProvenPrototypeMethodAssignment>,
     strings: HashMap<(FunctionKey, String), ProvenPrototypeStringAssignment>,
@@ -3507,11 +3669,15 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
         scoping: &'c Scoping,
         constructors: &'f HashMap<SymbolId, FunctionKey>,
         property_keys: &'f HashMap<SymbolId, String>,
+        budget: &WorkBudget,
     ) -> Self {
         Self {
             scoping,
             constructors,
             property_keys,
+            budget: budget.clone(),
+            poller: BudgetPoller::new(budget, 256),
+            budget_error: None,
             aliases: HashMap::new(),
             methods: HashMap::new(),
             strings: HashMap::new(),
@@ -3769,6 +3935,9 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
     fn process_statement_list(&mut self, statements: &[Statement<'_>]) {
         self.aliases.clear();
         for statement in statements {
+            if self.budget_error.is_some() || !self.poller.poll(1) {
+                return;
+            }
             match statement {
                 Statement::ExpressionStatement(statement) => {
                     self.process_expression(&statement.expression);
@@ -3808,8 +3977,13 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                         constructors: self.constructors,
                         aliases: &self.aliases,
                         owners: HashSet::new(),
+                        poller: BudgetPoller::new(&self.budget, 256),
                     };
                     probe.visit_statement(statement);
+                    if let Err(error) = probe.poller.finish() {
+                        self.budget_error = Some(error);
+                        return;
+                    }
                     for owner in probe.owners {
                         self.invalidate_lookup(owner);
                     }
@@ -3818,8 +3992,13 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                         constructors: self.constructors,
                         property_keys: self.property_keys,
                         owners: HashSet::new(),
+                        poller: BudgetPoller::new(&self.budget, 256),
                     };
                     constructor_probe.visit_statement(statement);
+                    if let Err(error) = constructor_probe.poller.finish() {
+                        self.budget_error = Some(error);
+                        return;
+                    }
                     for owner in constructor_probe.owners {
                         self.invalidate_constructor(owner);
                     }
@@ -3880,6 +4059,9 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
     }
 
     fn process_expression(&mut self, expression: &Expression<'_>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
         match expression {
             Expression::ParenthesizedExpression(parenthesized) => {
                 self.process_expression(&parenthesized.expression);
@@ -4147,6 +4329,13 @@ struct PrototypeMethodCollector<'c, 'f> {
 }
 
 impl<'a> Visit<'a> for PrototypeMethodCollector<'_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.proof.budget_error.is_some() || !self.proof.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_program(&mut self, program: &Program<'a>) {
         self.proof.process_statement_list(&program.body);
         walk::walk_program(self, program);
@@ -4160,29 +4349,39 @@ impl<'a> Visit<'a> for PrototypeMethodCollector<'_, '_> {
     }
 }
 
-#[must_use]
 fn collect_prototype_method_proof<'c, 'f>(
     program: &Program<'_>,
     scoping: &'c Scoping,
     constructors: &'f HashMap<SymbolId, FunctionKey>,
     property_keys: &'f HashMap<SymbolId, String>,
-) -> PrototypeMethodProof<'c, 'f> {
-    let proof = PrototypeMethodProof::new(scoping, constructors, property_keys);
+    budget: &WorkBudget,
+) -> Result<PrototypeMethodProof<'c, 'f>, BudgetExceeded> {
+    let proof = PrototypeMethodProof::new(scoping, constructors, property_keys, budget);
     let mut collector = PrototypeMethodCollector { proof };
     collector.visit_program(program);
-    collector.proof
+    collector.proof.poller.finish()?;
+    if let Some(error) = collector.proof.budget_error.take() {
+        return Err(error);
+    }
+    Ok(collector.proof)
 }
 
-#[must_use]
 pub fn structurally_proven_prototype_method_assignments(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenPrototypeMethodAssignment> {
-    let mut functions = FunctionCollector::new();
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenPrototypeMethodAssignment>, BudgetExceeded> {
+    let mut functions = FunctionCollector::new(budget);
     functions.visit_program(program);
-    let property_keys = collect_property_key_bindings(program, scoping);
-    let proof =
-        collect_prototype_method_proof(program, scoping, &functions.by_symbol, &property_keys);
+    functions.finish()?;
+    let property_keys = collect_property_key_bindings(program, scoping, budget)?;
+    let proof = collect_prototype_method_proof(
+        program,
+        scoping,
+        &functions.by_symbol,
+        &property_keys,
+        budget,
+    )?;
     let mut methods = proof.methods.into_values().collect::<Vec<_>>();
     methods.sort_by_key(|method| {
         (
@@ -4191,19 +4390,25 @@ pub fn structurally_proven_prototype_method_assignments(
             method.assignment_start,
         )
     });
-    methods
+    Ok(methods)
 }
 
-#[must_use]
 pub fn structurally_proven_prototype_string_assignments(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenPrototypeStringAssignment> {
-    let mut functions = FunctionCollector::new();
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenPrototypeStringAssignment>, BudgetExceeded> {
+    let mut functions = FunctionCollector::new(budget);
     functions.visit_program(program);
-    let property_keys = collect_property_key_bindings(program, scoping);
-    let proof =
-        collect_prototype_method_proof(program, scoping, &functions.by_symbol, &property_keys);
+    functions.finish()?;
+    let property_keys = collect_property_key_bindings(program, scoping, budget)?;
+    let proof = collect_prototype_method_proof(
+        program,
+        scoping,
+        &functions.by_symbol,
+        &property_keys,
+        budget,
+    )?;
     let mut strings = proof.strings.into_values().collect::<Vec<_>>();
     strings.sort_by_key(|assignment| {
         (
@@ -4212,10 +4417,9 @@ pub fn structurally_proven_prototype_string_assignments(
             assignment.assignment_start,
         )
     });
-    strings
+    Ok(strings)
 }
 
-#[must_use]
 pub fn proven_prototype_string_at_allocation(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
@@ -4223,42 +4427,53 @@ pub fn proven_prototype_string_at_allocation(
     constructor_end: u32,
     allocation: Span,
     property: &str,
-) -> Option<ProvenPrototypeStringAtAllocation> {
+    budget: &WorkBudget,
+) -> Result<Option<ProvenPrototypeStringAtAllocation>, BudgetExceeded> {
     let mut assignments =
-        structurally_proven_prototype_string_assignments(program, semantic.scoping())
+        structurally_proven_prototype_string_assignments(program, semantic.scoping(), budget)?
             .into_iter()
             .filter(|assignment| {
                 assignment.constructor_start == constructor_start
                     && assignment.constructor_end == constructor_end
                     && assignment.property == property
             });
-    let assignment = assignments.next()?;
+    let Some(assignment) = assignments.next() else {
+        return Ok(None);
+    };
     if assignments.next().is_some()
         || !prove_event_completion_before_nested_event(
             semantic,
             Span::new(assignment.assignment_start, assignment.assignment_end),
             allocation,
-        )
+            budget,
+        )?
     {
-        return None;
+        return Ok(None);
     }
-    Some(ProvenPrototypeStringAtAllocation {
+    budget.checkpoint()?;
+    Ok(Some(ProvenPrototypeStringAtAllocation {
         assignment,
         allocation_start: allocation.start,
         allocation_end: allocation.end,
-    })
+    }))
 }
 
-#[must_use]
 pub fn structurally_proven_stable_constructor_prototypes(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenStableConstructorPrototype> {
-    let mut functions = FunctionCollector::new();
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenStableConstructorPrototype>, BudgetExceeded> {
+    let mut functions = FunctionCollector::new(budget);
     functions.visit_program(program);
-    let property_keys = collect_property_key_bindings(program, scoping);
-    let proof =
-        collect_prototype_method_proof(program, scoping, &functions.by_symbol, &property_keys);
+    functions.finish()?;
+    let property_keys = collect_property_key_bindings(program, scoping, budget)?;
+    let proof = collect_prototype_method_proof(
+        program,
+        scoping,
+        &functions.by_symbol,
+        &property_keys,
+        budget,
+    )?;
     let invalid = proof.lookup_invalid_constructors;
     let mut constructors = functions
         .by_symbol
@@ -4275,19 +4490,25 @@ pub fn structurally_proven_stable_constructor_prototypes(
         .collect::<Vec<_>>();
     constructors
         .sort_by_key(|constructor| (constructor.constructor_start, constructor.constructor_end));
-    constructors
+    Ok(constructors)
 }
 
-#[must_use]
 pub fn structurally_proven_prototype_method_lookup_targets(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenPrototypeMethodLookupTarget> {
-    let mut functions = FunctionCollector::new();
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenPrototypeMethodLookupTarget>, BudgetExceeded> {
+    let mut functions = FunctionCollector::new(budget);
     functions.visit_program(program);
-    let property_keys = collect_property_key_bindings(program, scoping);
-    let proof =
-        collect_prototype_method_proof(program, scoping, &functions.by_symbol, &property_keys);
+    functions.finish()?;
+    let property_keys = collect_property_key_bindings(program, scoping, budget)?;
+    let proof = collect_prototype_method_proof(
+        program,
+        scoping,
+        &functions.by_symbol,
+        &property_keys,
+        budget,
+    )?;
     let invalid = proof.lookup_invalid_constructors;
     let mut targets = proof
         .methods
@@ -4316,7 +4537,149 @@ pub fn structurally_proven_prototype_method_lookup_targets(
             target.assignment_start,
         )
     });
-    targets
+    Ok(targets)
+}
+
+fn merge_origin_flow(target: &mut ProvenOriginFlow, mut extension: ProvenOriginFlow) {
+    target.member_calls.append(&mut extension.member_calls);
+    target.member_calls.sort_by_key(|call| {
+        (
+            call.call_start,
+            call.call_end,
+            call.context.allocation_start,
+            call.context.function_start,
+        )
+    });
+    target.member_calls.dedup();
+
+    target.member_reads.append(&mut extension.member_reads);
+    target.member_reads.sort_by_key(|read| {
+        (
+            read.read_start,
+            read.read_end,
+            read.context.allocation_start,
+            read.context.function_start,
+        )
+    });
+    target.member_reads.dedup();
+
+    target.member_writes.append(&mut extension.member_writes);
+    target.member_writes.sort_by_key(|write| {
+        (
+            write.write_start,
+            write.write_end,
+            write.context.allocation_start,
+            write.context.function_start,
+        )
+    });
+    target.member_writes.dedup();
+
+    target.exposures.append(&mut extension.exposures);
+    target.exposures.sort_by_key(|exposure| {
+        (
+            exposure.exposure_start,
+            exposure.exposure_end,
+            exposure.context.allocation_start,
+            exposure.context.function_start,
+            exposure.kind,
+        )
+    });
+    target.exposures.dedup();
+
+    target.direct_calls.append(&mut extension.direct_calls);
+    target.direct_calls.sort_by_key(|call| {
+        (
+            call.call_start,
+            call.call_end,
+            call.caller.allocation_start,
+            call.caller.function_start,
+            call.callee.function_start,
+        )
+    });
+    target.direct_calls.dedup();
+}
+
+/// Prove the exact-origin flow reachable through ordinary direct calls and
+/// through runtime-resolved prototype method calls on those exact receivers.
+///
+/// Prototype lookup must be globally stable and its assignment must complete
+/// before the concrete allocation. Once those facts hold, every finite regular
+/// method body receives the same concrete receiver as `this`; repeating this
+/// join reaches nested runtime prototype calls without assuming receiver field
+/// values or method purity.
+pub fn structurally_proven_runtime_origin_flow(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    budget: &WorkBudget,
+) -> Result<ProvenOriginFlow, BudgetExceeded> {
+    budget.checkpoint()?;
+    let scoping = semantic.scoping();
+    let mut flow = structurally_proven_origin_flow(program, scoping, budget)?;
+    let lookup_targets =
+        structurally_proven_prototype_method_lookup_targets(program, scoping, budget)?;
+
+    type MethodKey = (u32, u32, String);
+    let mut targets = HashMap::<MethodKey, Vec<ProvenPrototypeMethodLookupTarget>>::new();
+    for target in lookup_targets {
+        targets
+            .entry((
+                target.constructor_start,
+                target.constructor_end,
+                target.property.clone(),
+            ))
+            .or_default()
+            .push(target);
+    }
+
+    let mut expanded = HashSet::<ProvenOriginContext>::new();
+    loop {
+        budget.checkpoint()?;
+        let mut poller = BudgetPoller::new(budget, 128);
+        let mut seeds = Vec::new();
+        for call in &flow.member_calls {
+            if !poller.poll(1) {
+                break;
+            }
+            let key = (
+                call.constructor_start,
+                call.constructor_end,
+                call.property.clone(),
+            );
+            let Some([target]) = targets.get(&key).map(Vec::as_slice) else {
+                continue;
+            };
+            if !prove_event_completion_before_nested_event(
+                semantic,
+                Span::new(target.assignment_start, target.assignment_end),
+                Span::new(call.allocation_start, call.allocation_end),
+                budget,
+            )? {
+                continue;
+            }
+            for function in &target.possible_functions {
+                let seed = ProvenOriginContext {
+                    function_start: function.function_start,
+                    function_end: function.function_end,
+                    allocation_start: call.allocation_start,
+                    allocation_end: call.allocation_end,
+                    constructor_start: call.constructor_start,
+                    constructor_end: call.constructor_end,
+                    this_origin: true,
+                    parameter_indices: Vec::new(),
+                };
+                if expanded.insert(seed.clone()) {
+                    seeds.push(seed);
+                }
+            }
+        }
+        poller.finish()?;
+        if seeds.is_empty() {
+            break;
+        }
+        let extension = propagate_proven_origin_contexts(program, scoping, &seeds, budget)?;
+        merge_origin_flow(&mut flow, extension);
+    }
+    Ok(flow)
 }
 
 fn direct_this(expression: &Expression<'_>) -> bool {
@@ -4334,16 +4697,47 @@ fn assignment_target_direct_this_member(target: &AssignmentTarget<'_>) -> bool {
     }
 }
 
-#[derive(Default)]
 struct ReceiverEffectProbe {
     reads: HashSet<String>,
     calls: HashSet<String>,
     mutates: bool,
     exposes: bool,
     dynamic_access: bool,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
+}
+
+impl ReceiverEffectProbe {
+    fn new(budget: &WorkBudget) -> Self {
+        Self {
+            reads: HashSet::new(),
+            calls: HashSet::new(),
+            mutates: false,
+            exposes: false,
+            dynamic_access: false,
+            budget: budget.clone(),
+            poller: BudgetPoller::new(budget, 256),
+            budget_error: None,
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), BudgetExceeded> {
+        if let Some(error) = self.budget_error.clone() {
+            return Err(error);
+        }
+        self.poller.finish()
+    }
 }
 
 impl<'a> Visit<'a> for ReceiverEffectProbe {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
 
     fn visit_arrow_function_expression(
@@ -4352,8 +4746,12 @@ impl<'a> Visit<'a> for ReceiverEffectProbe {
     ) {
         // Arrow bodies capture the surrounding `this`. Treat any such closure as
         // an exposure obligation instead of recursively pretending it executes now.
-        let mut nested = ReceiverEffectProbe::default();
+        let mut nested = ReceiverEffectProbe::new(&self.budget);
         walk::walk_arrow_function_expression(&mut nested, function);
+        if let Err(error) = nested.finish() {
+            self.budget_error = Some(error);
+            return;
+        }
         if !nested.reads.is_empty()
             || !nested.calls.is_empty()
             || nested.mutates
@@ -4484,15 +4882,36 @@ impl<'a> Visit<'a> for ReceiverEffectProbe {
 struct FunctionEffectCollector<'e> {
     targets: &'e HashSet<FunctionKey>,
     effects: HashMap<FunctionKey, ReceiverEffectProbe>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
 }
 
 impl<'a> Visit<'a> for FunctionEffectCollector<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
         let key = FunctionKey::of(function);
         if self.targets.contains(&key) {
-            let mut effect = ReceiverEffectProbe::default();
+            let mut effect = ReceiverEffectProbe::new(&self.budget);
             if let Some(body) = &function.body {
                 effect.visit_function_body(body);
+            }
+            if let Err(error) = effect.finish() {
+                self.budget_error = Some(error);
+                return;
             }
             self.effects.insert(key, effect);
             return;
@@ -4501,12 +4920,12 @@ impl<'a> Visit<'a> for FunctionEffectCollector<'_> {
     }
 }
 
-#[must_use]
 pub fn structurally_proven_prototype_method_receiver_effects(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<ProvenPrototypeMethodReceiverEffects> {
-    let assignments = structurally_proven_prototype_method_assignments(program, scoping);
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenPrototypeMethodReceiverEffects>, BudgetExceeded> {
+    let assignments = structurally_proven_prototype_method_assignments(program, scoping, budget)?;
     let targets = assignments
         .iter()
         .flat_map(|assignment| assignment.possible_functions.iter())
@@ -4518,10 +4937,17 @@ pub fn structurally_proven_prototype_method_receiver_effects(
     let mut collector = FunctionEffectCollector {
         targets: &targets,
         effects: HashMap::new(),
+        budget: budget.clone(),
+        poller: BudgetPoller::new(budget, 256),
+        budget_error: None,
     };
     collector.visit_program(program);
+    collector.poller.finish()?;
+    if let Some(error) = collector.budget_error.take() {
+        return Err(error);
+    }
 
-    assignments
+    let proven = assignments
         .into_iter()
         .filter_map(|assignment| {
             let mut reads = HashSet::new();
@@ -4559,7 +4985,9 @@ pub fn structurally_proven_prototype_method_receiver_effects(
                 dynamic_receiver_access: dynamic_access,
             })
         })
-        .collect()
+        .collect();
+    budget.checkpoint()?;
+    Ok(proven)
 }
 
 /// Match exact-origin member calls to independently proven stable prototype
@@ -4572,11 +5000,12 @@ fn match_prototype_method_calls(
     program: &Program<'_>,
     scoping: &Scoping,
     calls: impl IntoIterator<Item = ProvenMemberReceiverOrigin>,
-) -> Vec<PrototypeMethodCallCandidate> {
+    budget: &WorkBudget,
+) -> Result<Vec<PrototypeMethodCallCandidate>, BudgetExceeded> {
     type MethodKey = (u32, u32, String);
 
     let mut targets = HashMap::<MethodKey, Vec<ProvenPrototypeMethodLookupTarget>>::new();
-    for target in structurally_proven_prototype_method_lookup_targets(program, scoping) {
+    for target in structurally_proven_prototype_method_lookup_targets(program, scoping, budget)? {
         targets
             .entry((
                 target.constructor_start,
@@ -4587,7 +5016,7 @@ fn match_prototype_method_calls(
             .push(target);
     }
     let mut effects = HashMap::<MethodKey, Vec<ProvenPrototypeMethodReceiverEffects>>::new();
-    for effect in structurally_proven_prototype_method_receiver_effects(program, scoping) {
+    for effect in structurally_proven_prototype_method_receiver_effects(program, scoping, budget)? {
         effects
             .entry((
                 effect.constructor_start,
@@ -4631,57 +5060,65 @@ fn match_prototype_method_calls(
         )
     });
     matched.dedup();
-    matched
+    budget.checkpoint()?;
+    Ok(matched)
 }
 
-#[must_use]
 pub fn structurally_matched_prototype_method_calls(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<PrototypeMethodCallCandidate> {
+    budget: &WorkBudget,
+) -> Result<Vec<PrototypeMethodCallCandidate>, BudgetExceeded> {
     match_prototype_method_calls(
         program,
         scoping,
-        structurally_proven_member_receiver_origins(program, scoping),
+        structurally_proven_member_receiver_origins(program, scoping, budget)?,
+        budget,
     )
 }
 
 /// Match prototype method calls found in an independently seeded exact-origin
 /// flow. This reuses the same constructor/property identity and ambiguity rules
 /// as the global origin flow; the caller is responsible only for the seed proof.
-#[must_use]
 pub fn structurally_matched_prototype_method_calls_in_flow(
     program: &Program<'_>,
     scoping: &Scoping,
     flow: &ProvenOriginFlow,
-) -> Vec<PrototypeMethodCallCandidate> {
-    match_prototype_method_calls(program, scoping, flow.member_calls.iter().cloned())
+    budget: &WorkBudget,
+) -> Result<Vec<PrototypeMethodCallCandidate>, BudgetExceeded> {
+    match_prototype_method_calls(program, scoping, flow.member_calls.iter().cloned(), budget)
 }
 
 fn prove_runtime_prototype_method_call_targets(
     semantic: &Semantic<'_>,
     candidates: impl IntoIterator<Item = PrototypeMethodCallCandidate>,
-) -> Vec<ProvenPrototypeMethodCallTarget> {
-    let mut proven = candidates
-        .into_iter()
-        .filter_map(|candidate| {
-            prove_event_completion_before_nested_event(
-                semantic,
-                Span::new(
-                    candidate.lookup_target.assignment_start,
-                    candidate.lookup_target.assignment_end,
-                ),
-                Span::new(
-                    candidate.call.allocation_start,
-                    candidate.call.allocation_end,
-                ),
-            )
-            .then_some(ProvenPrototypeMethodCallTarget {
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenPrototypeMethodCallTarget>, BudgetExceeded> {
+    let mut proven = Vec::new();
+    let mut poller = BudgetPoller::new(budget, 128);
+    for candidate in candidates {
+        if !poller.poll(1) {
+            break;
+        }
+        if prove_event_completion_before_nested_event(
+            semantic,
+            Span::new(
+                candidate.lookup_target.assignment_start,
+                candidate.lookup_target.assignment_end,
+            ),
+            Span::new(
+                candidate.call.allocation_start,
+                candidate.call.allocation_end,
+            ),
+            budget,
+        )? {
+            proven.push(ProvenPrototypeMethodCallTarget {
                 candidate,
                 standard_prototype_semantics_required: true,
-            })
-        })
-        .collect::<Vec<_>>();
+            });
+        }
+    }
+    poller.finish()?;
     proven.sort_by_key(|proof| {
         (
             proof.candidate.call.call_start,
@@ -4690,7 +5127,7 @@ fn prove_runtime_prototype_method_call_targets(
         )
     });
     proven.dedup();
-    proven
+    Ok(proven)
 }
 
 /// Upgrade structural prototype-call matches to runtime lookup targets for a
@@ -4701,28 +5138,35 @@ fn prove_runtime_prototype_method_call_targets(
 /// the installed target valid through the later member call. The ordering proof
 /// supports same-function allocations and allocations inside later-created
 /// function expressions/arrows; unsupported interprocedural timing fails closed.
-#[must_use]
 pub fn structurally_proven_prototype_method_calls_at_runtime(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
-) -> Vec<ProvenPrototypeMethodCallTarget> {
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenPrototypeMethodCallTarget>, BudgetExceeded> {
     prove_runtime_prototype_method_call_targets(
         semantic,
-        structurally_matched_prototype_method_calls(program, semantic.scoping()),
+        structurally_matched_prototype_method_calls(program, semantic.scoping(), budget)?,
+        budget,
     )
 }
 
 /// Upgrade prototype calls from an independently seeded exact-origin flow to
 /// runtime lookup targets for the same concrete allocation.
-#[must_use]
 pub fn structurally_proven_prototype_method_calls_at_runtime_in_flow(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     flow: &ProvenOriginFlow,
-) -> Vec<ProvenPrototypeMethodCallTarget> {
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenPrototypeMethodCallTarget>, BudgetExceeded> {
     prove_runtime_prototype_method_call_targets(
         semantic,
-        structurally_matched_prototype_method_calls_in_flow(program, semantic.scoping(), flow),
+        structurally_matched_prototype_method_calls_in_flow(
+            program,
+            semantic.scoping(),
+            flow,
+            budget,
+        )?,
+        budget,
     )
 }
 
@@ -4733,12 +5177,12 @@ pub fn structurally_proven_prototype_method_calls_at_runtime_in_flow(
 /// callers must separately prove that the matched lookup is valid at the call.
 /// Given that premise, each possible regular method body receives the same
 /// concrete allocation as `this`, and ordinary exact-origin propagation applies.
-#[must_use]
 pub fn propagate_matched_prototype_method_call_origins(
     program: &Program<'_>,
     scoping: &Scoping,
     candidate: &PrototypeMethodCallCandidate,
-) -> ProvenOriginFlow {
+    budget: &WorkBudget,
+) -> Result<ProvenOriginFlow, BudgetExceeded> {
     let seeds = candidate
         .lookup_target
         .possible_functions
@@ -4754,17 +5198,17 @@ pub fn propagate_matched_prototype_method_call_origins(
             parameter_indices: Vec::new(),
         })
         .collect::<Vec<_>>();
-    propagate_proven_origin_contexts(program, scoping, &seeds)
+    propagate_proven_origin_contexts(program, scoping, &seeds, budget)
 }
 
 /// Propagate exact receiver origin from a runtime-proven prototype method call.
-#[must_use]
 pub fn propagate_proven_prototype_method_call_origins(
     program: &Program<'_>,
     scoping: &Scoping,
     proof: &ProvenPrototypeMethodCallTarget,
-) -> ProvenOriginFlow {
-    propagate_matched_prototype_method_call_origins(program, scoping, &proof.candidate)
+    budget: &WorkBudget,
+) -> Result<ProvenOriginFlow, BudgetExceeded> {
+    propagate_matched_prototype_method_call_origins(program, scoping, &proof.candidate, budget)
 }
 
 #[derive(Clone, Default)]
@@ -4815,13 +5259,15 @@ fn summarize_receiver_context(
     method_memo: &mut HashMap<MethodPreservationKey, Option<ReceiverPreservationRequirements>>,
     method_visiting: &mut HashSet<MethodPreservationKey>,
     context_visiting: &mut HashSet<ContextPreservationKey>,
-) -> Option<ReceiverPreservationRequirements> {
+    budget: &WorkBudget,
+) -> Result<Option<ReceiverPreservationRequirements>, BudgetExceeded> {
+    budget.checkpoint()?;
     let key = (
         context.clone(),
         entry.map(|call| (call.call_start, call.call_end)),
     );
     if !context_visiting.insert(key.clone()) {
-        return None;
+        return Ok(None);
     }
     let scoping = semantic.scoping();
     let unreachable = |start, end| {
@@ -4837,63 +5283,93 @@ fn summarize_receiver_context(
         .any(|event| event.context == *context && !unreachable(event.write_start, event.write_end))
     {
         context_visiting.remove(&key);
-        return None;
+        return Ok(None);
     }
 
+    let mut poller = BudgetPoller::new(budget, 128);
     for read in flow
         .member_reads
         .iter()
         .filter(|event| event.context == *context)
     {
+        if !poller.poll(1) {
+            break;
+        }
         if unreachable(read.read_start, read.read_end) {
             continue;
         }
-        let property = read.property.as_ref()?;
+        let Some(property) = read.property.as_ref() else {
+            context_visiting.remove(&key);
+            poller.finish()?;
+            return Ok(None);
+        };
         if property == "__proto__" {
             context_visiting.remove(&key);
-            return None;
+            poller.finish()?;
+            return Ok(None);
         }
         requirements.own_data_fields.insert(property.clone());
     }
+    poller.finish()?;
 
+    let mut poller = BudgetPoller::new(budget, 128);
     for member_call in flow
         .member_calls
         .iter()
         .filter(|event| event.context == *context)
     {
+        if !poller.poll(1) {
+            break;
+        }
         if unreachable(member_call.call_start, member_call.call_end) {
             continue;
         }
         let mut matches = runtime_calls
             .iter()
             .filter(|proof| proof.candidate.call == *member_call);
-        let nested = matches.next()?;
+        let Some(nested) = matches.next() else {
+            context_visiting.remove(&key);
+            poller.finish()?;
+            return Ok(None);
+        };
         if matches.next().is_some() {
             context_visiting.remove(&key);
-            return None;
+            poller.finish()?;
+            return Ok(None);
         }
-        let nested_requirements = summarize_runtime_prototype_method_preservation(
+        let Some(nested_requirements) = summarize_runtime_prototype_method_preservation(
             source,
             program,
             semantic,
             nested,
             method_memo,
             method_visiting,
-        )?;
+            budget,
+        )?
+        else {
+            context_visiting.remove(&key);
+            poller.finish()?;
+            return Ok(None);
+        };
         requirements.merge(nested_requirements);
     }
+    poller.finish()?;
 
+    let mut poller = BudgetPoller::new(budget, 128);
     for direct in flow
         .direct_calls
         .iter()
         .filter(|call| call.caller == *context)
     {
+        if !poller.poll(1) {
+            break;
+        }
         if unreachable(direct.call_start, direct.call_end) {
             continue;
         }
         requirements.standard_function_call_semantics_required |=
             direct.standard_function_call_semantics_required;
-        let nested = summarize_receiver_context(
+        let Some(nested) = summarize_receiver_context(
             source,
             program,
             semantic,
@@ -4904,12 +5380,19 @@ fn summarize_receiver_context(
             method_memo,
             method_visiting,
             context_visiting,
-        )?;
+            budget,
+        )?
+        else {
+            context_visiting.remove(&key);
+            poller.finish()?;
+            return Ok(None);
+        };
         requirements.merge(nested);
     }
+    poller.finish()?;
 
     context_visiting.remove(&key);
-    Some(requirements)
+    Ok(Some(requirements))
 }
 
 fn summarize_runtime_prototype_method_preservation(
@@ -4919,7 +5402,9 @@ fn summarize_runtime_prototype_method_preservation(
     target: &ProvenPrototypeMethodCallTarget,
     memo: &mut HashMap<MethodPreservationKey, Option<ReceiverPreservationRequirements>>,
     visiting: &mut HashSet<MethodPreservationKey>,
-) -> Option<ReceiverPreservationRequirements> {
+    budget: &WorkBudget,
+) -> Result<Option<ReceiverPreservationRequirements>, BudgetExceeded> {
+    budget.checkpoint()?;
     let candidate = &target.candidate;
     let key = (
         candidate.call.call_start,
@@ -4929,19 +5414,29 @@ fn summarize_runtime_prototype_method_preservation(
         candidate.call.property.clone(),
     );
     if let Some(cached) = memo.get(&key) {
-        return cached.clone();
+        return Ok(cached.clone());
     }
     if !visiting.insert(key.clone()) {
-        return None;
+        return Ok(None);
     }
 
-    let flow = propagate_proven_prototype_method_call_origins(program, semantic.scoping(), target);
-    let runtime_calls =
-        structurally_proven_prototype_method_calls_at_runtime_in_flow(program, semantic, &flow);
+    let flow = propagate_proven_prototype_method_call_origins(
+        program,
+        semantic.scoping(),
+        target,
+        budget,
+    )?;
+    let runtime_calls = structurally_proven_prototype_method_calls_at_runtime_in_flow(
+        program, semantic, &flow, budget,
+    )?;
     let mut requirements = ReceiverPreservationRequirements::default();
     let mut context_visiting = HashSet::new();
     let mut success = true;
+    let mut poller = BudgetPoller::new(budget, 64);
     for function in &candidate.lookup_target.possible_functions {
+        if !poller.poll(1) {
+            break;
+        }
         let context = ProvenOriginContext {
             function_start: function.function_start,
             function_end: function.function_end,
@@ -4963,16 +5458,19 @@ fn summarize_runtime_prototype_method_preservation(
             memo,
             visiting,
             &mut context_visiting,
-        ) else {
+            budget,
+        )?
+        else {
             success = false;
             break;
         };
         requirements.merge(summary);
     }
+    poller.finish()?;
     visiting.remove(&key);
     let result = success.then_some(requirements);
     memo.insert(key, result.clone());
-    result
+    Ok(result)
 }
 
 /// Summarize one already runtime-proven prototype method call.
@@ -4980,29 +5478,33 @@ fn summarize_runtime_prototype_method_preservation(
 /// The result is conditional on the listed ordinary own-data fields existing
 /// at method entry. This focused form is useful to consumers that already hold
 /// the exact call target and avoids recomputing summaries for unrelated calls.
-#[must_use]
 pub fn proven_prototype_method_receiver_preservation_summary(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     target: &ProvenPrototypeMethodCallTarget,
-) -> Option<ProvenPrototypeMethodReceiverPreservationSummary> {
-    let requirements = summarize_runtime_prototype_method_preservation(
+    budget: &WorkBudget,
+) -> Result<Option<ProvenPrototypeMethodReceiverPreservationSummary>, BudgetExceeded> {
+    let Some(requirements) = summarize_runtime_prototype_method_preservation(
         source,
         program,
         semantic,
         target,
         &mut HashMap::new(),
         &mut HashSet::new(),
-    )?;
+        budget,
+    )?
+    else {
+        return Ok(None);
+    };
     let mut required_own_data_fields = requirements.own_data_fields.into_iter().collect::<Vec<_>>();
     required_own_data_fields.sort();
-    Some(ProvenPrototypeMethodReceiverPreservationSummary {
+    Ok(Some(ProvenPrototypeMethodReceiverPreservationSummary {
         call_target: target.clone(),
         required_own_data_fields,
         standard_function_call_semantics_required: requirements
             .standard_function_call_semantics_required,
-    })
+    }))
 }
 
 /// Prove runtime-targeted prototype methods that preserve receiver identity and
@@ -5010,16 +5512,22 @@ pub fn proven_prototype_method_receiver_preservation_summary(
 /// already existing at method entry. Exact direct-call scalar facts discharge
 /// unreachable effects; nested runtime-proven prototype calls are summarized
 /// recursively. Cycles and unresolved receiver effects fail closed.
-#[must_use]
 pub fn structurally_proven_prototype_method_receiver_preservation_summaries(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
-) -> Vec<ProvenPrototypeMethodReceiverPreservationSummary> {
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenPrototypeMethodReceiverPreservationSummary>, BudgetExceeded> {
     let mut memo = HashMap::new();
     let mut visiting = HashSet::new();
     let mut proven = Vec::new();
-    for target in structurally_proven_prototype_method_calls_at_runtime(program, semantic) {
+    let runtime_calls =
+        structurally_proven_prototype_method_calls_at_runtime(program, semantic, budget)?;
+    let mut poller = BudgetPoller::new(budget, 64);
+    for target in runtime_calls {
+        if !poller.poll(1) {
+            break;
+        }
         let Some(requirements) = summarize_runtime_prototype_method_preservation(
             source,
             program,
@@ -5027,7 +5535,9 @@ pub fn structurally_proven_prototype_method_receiver_preservation_summaries(
             &target,
             &mut memo,
             &mut visiting,
-        ) else {
+            budget,
+        )?
+        else {
             continue;
         };
         let mut required_own_data_fields =
@@ -5040,6 +5550,7 @@ pub fn structurally_proven_prototype_method_receiver_preservation_summaries(
                 .standard_function_call_semantics_required,
         });
     }
+    poller.finish()?;
     proven.sort_by_key(|proof| {
         (
             proof.call_target.candidate.call.call_start,
@@ -5048,57 +5559,63 @@ pub fn structurally_proven_prototype_method_receiver_preservation_summaries(
         )
     });
     proven.dedup();
-    proven
+    Ok(proven)
 }
 
-/// Prove exact-origin prototype method calls that preserve receiver identity and
-/// shape on every normal-return path represented by the supported effect model.
-/// Static receiver reads must be discharged as ordinary own-data fields at the
-/// exact call site; mutation, receiver exposure, dynamic access, or recursive
-/// receiver-method calls remain barriers.
 /// Prove one runtime-targeted prototype method call fully receiver-preserving,
 /// including liveness of every ordinary own-data field required by its
 /// transitive preservation summary.
-#[must_use]
 pub fn proven_receiver_preserving_prototype_method_call(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     target: &ProvenPrototypeMethodCallTarget,
-) -> Option<ProvenReceiverPreservingPrototypeMethodCall> {
-    let summary =
-        proven_prototype_method_receiver_preservation_summary(source, program, semantic, target)?;
+    budget: &WorkBudget,
+) -> Result<Option<ProvenReceiverPreservingPrototypeMethodCall>, BudgetExceeded> {
+    let Some(summary) = proven_prototype_method_receiver_preservation_summary(
+        source, program, semantic, target, budget,
+    )?
+    else {
+        return Ok(None);
+    };
     let mut reads = Vec::new();
     for property in &summary.required_own_data_fields {
-        reads.push(proven_own_data_field_at_runtime_method_call(
-            source, program, semantic, target, property,
-        )?);
+        let Some(read) = proven_own_data_field_at_runtime_method_call(
+            source, program, semantic, target, property, budget,
+        )?
+        else {
+            return Ok(None);
+        };
+        reads.push(read);
     }
-    Some(ProvenReceiverPreservingPrototypeMethodCall {
+    Ok(Some(ProvenReceiverPreservingPrototypeMethodCall {
         candidate: target.candidate.clone(),
         own_data_reads: reads,
-    })
+    }))
 }
 
-#[must_use]
 pub fn structurally_proven_receiver_preserving_prototype_method_calls(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
-) -> Vec<ProvenReceiverPreservingPrototypeMethodCall> {
+    budget: &WorkBudget,
+) -> Result<Vec<ProvenReceiverPreservingPrototypeMethodCall>, BudgetExceeded> {
     let scoping = semantic.scoping();
-    let flow = structurally_proven_origin_flow(program, scoping);
-    let initializations = structurally_proven_own_data_field_initializations(program, scoping);
-    let runtime_calls = structurally_proven_prototype_method_calls_at_runtime(program, semantic);
-    let stable_prototypes = structurally_proven_stable_constructor_prototypes(program, scoping)
-        .into_iter()
-        .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
-        .collect::<HashSet<_>>();
+    let flow = structurally_proven_origin_flow(program, scoping, budget)?;
+    let initializations =
+        structurally_proven_own_data_field_initializations(program, scoping, budget)?;
+    let runtime_calls =
+        structurally_proven_prototype_method_calls_at_runtime(program, semantic, budget)?;
+    let stable_prototypes =
+        structurally_proven_stable_constructor_prototypes(program, scoping, budget)?
+            .into_iter()
+            .map(|prototype| (prototype.constructor_start, prototype.constructor_end))
+            .collect::<HashSet<_>>();
     let mut proven = Vec::new();
 
     for summary in structurally_proven_prototype_method_receiver_preservation_summaries(
-        source, program, semantic,
-    ) {
+        source, program, semantic, budget,
+    )? {
         let target = summary.call_target;
         let call = &target.candidate.call;
         let mut reads = Vec::new();
@@ -5128,7 +5645,9 @@ pub fn structurally_proven_receiver_preserving_prototype_method_calls(
                 &runtime_calls,
                 initialization,
                 &target,
-            ) else {
+                budget,
+            )?
+            else {
                 all_reads_proven = false;
                 break;
             };
@@ -5149,7 +5668,7 @@ pub fn structurally_proven_receiver_preserving_prototype_method_calls(
         )
     });
     proven.dedup();
-    proven
+    Ok(proven)
 }
 
 #[cfg(test)]
@@ -5176,6 +5695,20 @@ mod tests {
     use oxc_span::{SourceType, Span};
     use rolldown_redox::ecmascript::parse_program;
     use std::collections::HashSet;
+    use work_budget::WorkBudget;
+
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("receiver-identity-test")
+    }
+
+    fn test_proof<T: Default, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+        assert!(
+            result.is_ok(),
+            "budgeted proof failed: {:?}",
+            result.as_ref().err()
+        );
+        result.unwrap_or_default()
+    }
 
     fn prototype_strings(source: &str) -> Vec<super::ProvenPrototypeStringAssignment> {
         let allocator = Allocator::default();
@@ -5183,10 +5716,11 @@ mod tests {
         assert!(parsed.is_clean());
         let semantic = SemanticBuilder::new().build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        structurally_proven_prototype_string_assignments(
+        test_proof(structurally_proven_prototype_string_assignments(
             &parsed.program,
             semantic.semantic.scoping(),
-        )
+            &test_budget(),
+        ))
     }
 
     fn method_assignments(source: &str) -> Vec<super::ProvenPrototypeMethodAssignment> {
@@ -5197,10 +5731,11 @@ mod tests {
             .with_check_syntax_error(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        structurally_proven_prototype_method_assignments(
+        test_proof(structurally_proven_prototype_method_assignments(
             &parsed.program,
             semantic.semantic.scoping(),
-        )
+            &test_budget(),
+        ))
     }
 
     fn lookup_targets(source: &str) -> Vec<super::ProvenPrototypeMethodLookupTarget> {
@@ -5211,10 +5746,11 @@ mod tests {
             .with_check_syntax_error(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        structurally_proven_prototype_method_lookup_targets(
+        test_proof(structurally_proven_prototype_method_lookup_targets(
             &parsed.program,
             semantic.semantic.scoping(),
-        )
+            &test_budget(),
+        ))
     }
 
     fn calls(source: &str) -> Vec<super::ProvenMemberReceiverOrigin> {
@@ -5225,7 +5761,11 @@ mod tests {
             .with_check_syntax_error(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        structurally_proven_member_receiver_origins(&parsed.program, semantic.semantic.scoping())
+        test_proof(structurally_proven_member_receiver_origins(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ))
     }
 
     fn writes(source: &str) -> Vec<super::ProvenMemberWriteOrigin> {
@@ -5236,7 +5776,11 @@ mod tests {
             .with_check_syntax_error(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping())
+        test_proof(structurally_proven_member_write_origins(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ))
     }
 
     #[test]
@@ -5257,22 +5801,27 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let outer = structurally_proven_prototype_method_calls_at_runtime(
+        let outer = test_proof(structurally_proven_prototype_method_calls_at_runtime(
             &parsed.program,
             &semantic.semantic,
-        )
+            &test_budget(),
+        ))
         .into_iter()
         .find(|proof| proof.candidate.call.property == "outer")
         .test_value("runtime outer call")?;
-        let seeded = super::propagate_proven_prototype_method_call_origins(
+        let seeded = test_proof(super::propagate_proven_prototype_method_call_origins(
             &parsed.program,
             semantic.semantic.scoping(),
             &outer,
-        );
-        let nested = structurally_proven_prototype_method_calls_at_runtime_in_flow(
-            &parsed.program,
-            &semantic.semantic,
-            &seeded,
+            &test_budget(),
+        ));
+        let nested = test_proof(
+            structurally_proven_prototype_method_calls_at_runtime_in_flow(
+                &parsed.program,
+                &semantic.semantic,
+                &seeded,
+                &test_budget(),
+            ),
         );
         assert!(nested
             .iter()
@@ -5297,10 +5846,11 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let proven = structurally_proven_prototype_method_calls_at_runtime(
+        let proven = test_proof(structurally_proven_prototype_method_calls_at_runtime(
             &parsed.program,
             &semantic.semantic,
-        );
+            &test_budget(),
+        ));
         assert!(proven
             .iter()
             .any(|proof| proof.candidate.call.property == "run"));
@@ -5322,10 +5872,11 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let proven = structurally_proven_prototype_method_calls_at_runtime(
+        let proven = test_proof(structurally_proven_prototype_method_calls_at_runtime(
             &parsed.program,
             &semantic.semantic,
-        );
+            &test_budget(),
+        ));
         assert!(proven
             .iter()
             .any(|proof| proof.candidate.call.property == "run"));
@@ -5347,12 +5898,15 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        assert!(structurally_proven_prototype_method_calls_at_runtime(
-            &parsed.program,
-            &semantic.semantic,
-        )
-        .iter()
-        .all(|proof| proof.candidate.call.property != "run"));
+        assert!(
+            test_proof(structurally_proven_prototype_method_calls_at_runtime(
+                &parsed.program,
+                &semantic.semantic,
+                &test_budget()
+            ))
+            .iter()
+            .all(|proof| proof.candidate.call.property != "run")
+        );
     }
 
     #[test]
@@ -5372,12 +5926,15 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        assert!(structurally_proven_prototype_method_calls_at_runtime(
-            &parsed.program,
-            &semantic.semantic,
-        )
-        .iter()
-        .all(|proof| proof.candidate.call.property != "run"));
+        assert!(
+            test_proof(structurally_proven_prototype_method_calls_at_runtime(
+                &parsed.program,
+                &semantic.semantic,
+                &test_budget()
+            ))
+            .iter()
+            .all(|proof| proof.candidate.call.property != "run")
+        );
     }
 
     #[test]
@@ -5416,14 +5973,15 @@ mod tests {
         let allocation_start = source_offset(source, "new C()", "allocation")?;
         let allocation_end =
             allocation_start + u32::try_from("new C()".len()).test_value("allocation length")?;
-        let proof = proven_prototype_string_at_allocation(
+        let proof = test_proof(proven_prototype_string_at_allocation(
             &parsed.program,
             &semantic.semantic,
             assignment.constructor_start,
             assignment.constructor_end,
             Span::new(allocation_start, allocation_end),
             "factory",
-        )
+            &test_budget(),
+        ))
         .test_value("runtime prototype string")?;
         assert_eq!(proof.assignment.value, "create");
 
@@ -5455,18 +6013,20 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let candidate = structurally_matched_prototype_method_calls(
+        let candidate = test_proof(structurally_matched_prototype_method_calls(
             &parsed.program,
             semantic.semantic.scoping(),
-        )
+            &test_budget(),
+        ))
         .into_iter()
         .find(|candidate| candidate.call.property == "run")
         .test_value("run lookup target")?;
-        let flow = super::propagate_matched_prototype_method_call_origins(
+        let flow = test_proof(super::propagate_matched_prototype_method_call_origins(
             &parsed.program,
             semantic.semantic.scoping(),
             &candidate,
-        );
+            &test_budget(),
+        ));
         let edge = flow
             .direct_calls
             .iter()
@@ -5507,11 +6067,12 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let proofs = structurally_proven_own_data_fields_at_runtime_method_calls(
+        let proofs = test_proof(structurally_proven_own_data_fields_at_runtime_method_calls(
             source,
             &parsed.program,
             &semantic.semantic,
-        );
+            &test_budget(),
+        ));
         let proof = proofs
             .iter()
             .find(|proof| {
@@ -5549,16 +6110,19 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        assert!(structurally_proven_own_data_fields_at_runtime_method_calls(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-        )
-        .iter()
-        .all(|proof| {
-            proof.initialization.property != "value"
-                || proof.call_target.candidate.call.property != "target"
-        }));
+        assert!(
+            test_proof(structurally_proven_own_data_fields_at_runtime_method_calls(
+                source,
+                &parsed.program,
+                &semantic.semantic,
+                &test_budget()
+            ))
+            .iter()
+            .all(|proof| {
+                proof.initialization.property != "value"
+                    || proof.call_target.candidate.call.property != "target"
+            })
+        );
     }
 
     #[test]
@@ -5584,16 +6148,19 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        assert!(structurally_proven_own_data_fields_at_runtime_method_calls(
-            source,
-            &parsed.program,
-            &semantic.semantic,
-        )
-        .iter()
-        .all(|proof| {
-            proof.initialization.property != "value"
-                || proof.call_target.candidate.call.property != "target"
-        }));
+        assert!(
+            test_proof(structurally_proven_own_data_fields_at_runtime_method_calls(
+                source,
+                &parsed.program,
+                &semantic.semantic,
+                &test_budget()
+            ))
+            .iter()
+            .all(|proof| {
+                proof.initialization.property != "value"
+                    || proof.call_target.candidate.call.property != "target"
+            })
+        );
     }
 
     #[test]
@@ -5623,10 +6190,13 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let summaries = structurally_proven_prototype_method_receiver_preservation_summaries(
-            source,
-            &parsed.program,
-            &semantic.semantic,
+        let summaries = test_proof(
+            structurally_proven_prototype_method_receiver_preservation_summaries(
+                source,
+                &parsed.program,
+                &semantic.semantic,
+                &test_budget(),
+            ),
         );
         let outer = summaries
             .iter()
@@ -5663,15 +6233,16 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        assert!(
+        assert!(test_proof(
             structurally_proven_prototype_method_receiver_preservation_summaries(
                 source,
                 &parsed.program,
                 &semantic.semantic,
+                &test_budget()
             )
-            .iter()
-            .all(|summary| summary.call_target.candidate.call.property != "outer")
-        );
+        )
+        .iter()
+        .all(|summary| summary.call_target.candidate.call.property != "outer"));
     }
 
     #[test]
@@ -5690,15 +6261,16 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        assert!(
+        assert!(test_proof(
             structurally_proven_prototype_method_receiver_preservation_summaries(
                 source,
                 &parsed.program,
                 &semantic.semantic,
+                &test_budget()
             )
-            .iter()
-            .all(|summary| summary.call_target.candidate.call.property != "loop")
-        );
+        )
+        .iter()
+        .all(|summary| summary.call_target.candidate.call.property != "loop"));
     }
 
     #[test]
@@ -5715,10 +6287,13 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let calls = super::structurally_proven_receiver_preserving_prototype_method_calls(
-            source,
-            &parsed.program,
-            &semantic.semantic,
+        let calls = test_proof(
+            super::structurally_proven_receiver_preserving_prototype_method_calls(
+                source,
+                &parsed.program,
+                &semantic.semantic,
+                &test_budget(),
+            ),
         );
         assert!(calls.iter().any(|call| {
             call.candidate.call.property == "read"
@@ -5743,15 +6318,16 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        assert!(
+        assert!(test_proof(
             super::structurally_proven_receiver_preserving_prototype_method_calls(
                 source,
                 &parsed.program,
                 &semantic.semantic,
+                &test_budget()
             )
-            .iter()
-            .all(|call| call.candidate.call.property != "read")
-        );
+        )
+        .iter()
+        .all(|call| call.candidate.call.property != "read"));
     }
 
     #[test]
@@ -5769,10 +6345,11 @@ mod tests {
             .with_check_syntax_error(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        let matched = structurally_matched_prototype_method_calls(
+        let matched = test_proof(structurally_matched_prototype_method_calls(
             &parsed.program,
             semantic.semantic.scoping(),
-        );
+            &test_budget(),
+        ));
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].call.property, "run");
         assert_eq!(matched[0].receiver_effects.receiver_reads, vec!["value"]);
@@ -5795,10 +6372,11 @@ mod tests {
             .with_check_syntax_error(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        assert!(structurally_matched_prototype_method_calls(
+        assert!(test_proof(structurally_matched_prototype_method_calls(
             &parsed.program,
             semantic.semantic.scoping(),
-        )
+            &test_budget()
+        ))
         .is_empty());
     }
 
@@ -5818,15 +6396,19 @@ mod tests {
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
 
-        let origin =
-            structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping())
-                .into_iter()
-                .find(|write| write.property.as_deref() == Some("marker"))
-                .test_value("constructor-origin write")?;
-        let method = structurally_proven_prototype_method_assignments(
+        let origin = test_proof(structurally_proven_member_write_origins(
             &parsed.program,
             semantic.semantic.scoping(),
-        )
+            &test_budget(),
+        ))
+        .into_iter()
+        .find(|write| write.property.as_deref() == Some("marker"))
+        .test_value("constructor-origin write")?;
+        let method = test_proof(structurally_proven_prototype_method_assignments(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ))
         .into_iter()
         .find(|method| method.property == "run")
         .test_value("run assignment")?;
@@ -5846,8 +6428,12 @@ mod tests {
             parameter_indices: Vec::new(),
         };
 
-        let flow =
-            propagate_proven_origin_contexts(&parsed.program, semantic.semantic.scoping(), &[seed]);
+        let flow = test_proof(propagate_proven_origin_contexts(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &[seed],
+            &test_budget(),
+        ));
         assert_eq!(flow.direct_calls.len(), 1);
         assert_eq!(flow.member_calls.len(), 1);
         assert_eq!(flow.member_calls[0].property, "finish");
@@ -5869,10 +6455,12 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(
-            structurally_proven_origin_exposures(&parsed.program, semantic.semantic.scoping(),)
-                .is_empty()
-        );
+        assert!(test_proof(structurally_proven_origin_exposures(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget()
+        ))
+        .is_empty());
     }
 
     #[test]
@@ -5891,7 +6479,11 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = test_proof(structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ));
         let read_properties = flow
             .member_reads
             .iter()
@@ -5931,10 +6523,11 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let reads = super::structurally_proven_member_read_origins(
+        let reads = test_proof(super::structurally_proven_member_read_origins(
             &parsed.program,
             semantic.semantic.scoping(),
-        );
+            &test_budget(),
+        ));
         assert!(reads
             .iter()
             .any(|read| read.property.as_deref() == Some("")));
@@ -5956,10 +6549,11 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let fields = super::structurally_proven_own_data_field_initializations(
+        let fields = test_proof(super::structurally_proven_own_data_field_initializations(
             &parsed.program,
             semantic.semantic.scoping(),
-        );
+            &test_budget(),
+        ));
         let names = fields
             .iter()
             .map(|field| field.property.as_str())
@@ -5989,11 +6583,12 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let proofs = super::structurally_proven_own_data_fields_at_member_calls(
+        let proofs = test_proof(super::structurally_proven_own_data_fields_at_member_calls(
             source,
             &parsed.program,
             &semantic.semantic,
-        );
+            &test_budget(),
+        ));
         assert!(proofs.iter().any(|proof| {
             proof.initialization.property == "field" && proof.member_call.property == "read"
         }));
@@ -6020,10 +6615,11 @@ mod tests {
             .with_cfg(true)
             .build(&parsed.program);
         let proofs = {
-            let flow = super::structurally_proven_origin_flow(
+            let flow = test_proof(super::structurally_proven_origin_flow(
                 &parsed.program,
                 semantic.semantic.scoping(),
-            );
+                &test_budget(),
+            ));
             let target = flow
                 .direct_calls
                 .iter()
@@ -6032,13 +6628,14 @@ mod tests {
                         .is_ok_and(|call| call == "helper(state)")
                 })
                 .test_value("helper call must be in exact-origin flow")?;
-            super::proven_exact_own_data_field_at_direct_call(
+            test_proof(super::proven_exact_own_data_field_at_direct_call(
                 source,
                 &parsed.program,
                 &semantic.semantic,
                 "cell",
                 target,
-            )
+                &test_budget(),
+            ))
         };
         assert!(proofs.iter().any(|proof| {
             proof.initialization.property == "cell"
@@ -6070,8 +6667,11 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let flow =
-            super::structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = test_proof(super::structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ));
         let target = flow
             .direct_calls
             .iter()
@@ -6080,13 +6680,14 @@ mod tests {
                     .is_ok_and(|call| call == "helper(this)")
             })
             .test_value("helper call must be in exact-origin flow")?;
-        let proofs = super::proven_exact_own_data_field_at_direct_call(
+        let proofs = test_proof(super::proven_exact_own_data_field_at_direct_call(
             source,
             &parsed.program,
             &semantic.semantic,
             "cell",
             target,
-        );
+            &test_budget(),
+        ));
         let proof = proofs
             .iter()
             .find(|proof| proof.initialization.property == "cell")
@@ -6119,10 +6720,11 @@ mod tests {
             .with_cfg(true)
             .build(&parsed.program);
         let proofs = {
-            let flow = super::structurally_proven_origin_flow(
+            let flow = test_proof(super::structurally_proven_origin_flow(
                 &parsed.program,
                 semantic.semantic.scoping(),
-            );
+                &test_budget(),
+            ));
             let target = flow
                 .direct_calls
                 .iter()
@@ -6131,13 +6733,14 @@ mod tests {
                         .is_ok_and(|call| call == "helper(state)")
                 })
                 .test_value("helper call must be in exact-origin flow")?;
-            super::proven_exact_own_data_field_at_direct_call(
+            test_proof(super::proven_exact_own_data_field_at_direct_call(
                 source,
                 &parsed.program,
                 &semantic.semantic,
                 "cell",
                 target,
-            )
+                &test_budget(),
+            ))
         };
         assert!(!proofs.iter().any(|proof| {
             proof.initialization.property == "cell"
@@ -6170,11 +6773,12 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let proofs = super::structurally_proven_own_data_fields_at_member_calls(
+        let proofs = test_proof(super::structurally_proven_own_data_fields_at_member_calls(
             source,
             &parsed.program,
             &semantic.semantic,
-        );
+            &test_budget(),
+        ));
         assert!(!proofs.iter().any(|proof| {
             proof.initialization.property == "field" && proof.member_call.property == "read"
         }));
@@ -6199,11 +6803,12 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let proofs = super::structurally_proven_own_data_fields_at_member_calls(
+        let proofs = test_proof(super::structurally_proven_own_data_fields_at_member_calls(
             source,
             &parsed.program,
             &semantic.semantic,
-        );
+            &test_budget(),
+        ));
         assert!(proofs.iter().any(|proof| {
             proof.initialization.property == "field" && proof.member_call.property == "read"
         }));
@@ -6228,11 +6833,12 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let proofs = super::structurally_proven_own_data_fields_at_member_calls(
+        let proofs = test_proof(super::structurally_proven_own_data_fields_at_member_calls(
             source,
             &parsed.program,
             &semantic.semantic,
-        );
+            &test_budget(),
+        ));
         assert!(!proofs.iter().any(|proof| {
             proof.initialization.property == "field" && proof.member_call.property == "read"
         }));
@@ -6257,11 +6863,12 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let proofs = super::structurally_proven_own_data_fields_at_member_calls(
+        let proofs = test_proof(super::structurally_proven_own_data_fields_at_member_calls(
             source,
             &parsed.program,
             &semantic.semantic,
-        );
+            &test_budget(),
+        ));
         assert!(!proofs.iter().any(|proof| {
             proof.initialization.property == "field" && proof.member_call.property == "read"
         }));
@@ -6280,12 +6887,15 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(super::structurally_proven_own_data_field_initializations(
-            &parsed.program,
-            semantic.semantic.scoping(),
-        )
-        .iter()
-        .all(|field| field.property != "field"));
+        assert!(
+            test_proof(super::structurally_proven_own_data_field_initializations(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget()
+            ))
+            .iter()
+            .all(|field| field.property != "field")
+        );
     }
 
     #[test]
@@ -6297,12 +6907,17 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(
-            structurally_proven_origin_exposures(&parsed.program, semantic.semantic.scoping())
-                .is_empty()
-        );
-        let writes =
-            structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping());
+        assert!(test_proof(structurally_proven_origin_exposures(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget()
+        ))
+        .is_empty());
+        let writes = test_proof(structurally_proven_member_write_origins(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ));
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].property.as_deref(), Some("self"));
     }
@@ -6316,8 +6931,11 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let exposures =
-            structurally_proven_origin_exposures(&parsed.program, semantic.semantic.scoping());
+        let exposures = test_proof(structurally_proven_origin_exposures(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ));
         assert_eq!(exposures.len(), 1);
         assert_eq!(exposures[0].kind, "call_argument");
     }
@@ -6331,8 +6949,11 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let exposures =
-            structurally_proven_origin_exposures(&parsed.program, semantic.semantic.scoping());
+        let exposures = test_proof(structurally_proven_origin_exposures(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ));
         assert_eq!(exposures.len(), 1);
         assert_eq!(exposures[0].kind, "return");
     }
@@ -6347,7 +6968,11 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = test_proof(structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ));
         let edge = flow
             .direct_calls
             .iter()
@@ -6375,10 +7000,11 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(structurally_proven_origin_direct_calls(
+        assert!(test_proof(structurally_proven_origin_direct_calls(
             &parsed.program,
             semantic.semantic.scoping(),
-        )
+            &test_budget()
+        ))
         .is_empty());
     }
 
@@ -6392,8 +7018,11 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let calls =
-            structurally_proven_origin_direct_calls(&parsed.program, semantic.semantic.scoping());
+        let calls = test_proof(structurally_proven_origin_direct_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ));
         let call = calls
             .iter()
             .find(|call| call.exact_integer_arguments.len() == 4)
@@ -6502,21 +7131,23 @@ mod tests {
             .pop()
             .test_value("prototype string")?;
         let allocation_start = source_offset(source, "new C()", "allocation")?;
-        let string = proven_prototype_string_at_allocation(
+        let string = test_proof(proven_prototype_string_at_allocation(
             &parsed.program,
             &semantic.semantic,
             assignment.constructor_start,
             assignment.constructor_end,
             Span::new(allocation_start, allocation_start + 7),
             "factory",
-        )
+            &test_budget(),
+        ))
         .test_value("runtime string")?;
-        let calls = proven_prototype_string_at_direct_calls(
+        let calls = test_proof(proven_prototype_string_at_direct_calls(
             source,
             &parsed.program,
             &semantic.semantic,
             &string,
-        );
+            &test_budget(),
+        ));
         assert!(calls.iter().any(|proof| {
             source_slice(
                 source,
@@ -6551,21 +7182,23 @@ mod tests {
             .pop()
             .test_value("prototype string")?;
         let allocation_start = source_offset(source, "new C()", "allocation")?;
-        let string = proven_prototype_string_at_allocation(
+        let string = test_proof(proven_prototype_string_at_allocation(
             &parsed.program,
             &semantic.semantic,
             assignment.constructor_start,
             assignment.constructor_end,
             Span::new(allocation_start, allocation_start + 7),
             "factory",
-        )
+            &test_budget(),
+        ))
         .test_value("runtime string")?;
-        let calls = proven_prototype_string_at_direct_calls(
+        let calls = test_proof(proven_prototype_string_at_direct_calls(
             source,
             &parsed.program,
             &semantic.semantic,
             &string,
-        );
+            &test_budget(),
+        ));
         assert!(!calls.iter().any(|proof| {
             source_slice(
                 source,
@@ -6589,17 +7222,23 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let call =
-            structurally_proven_origin_direct_calls(&parsed.program, semantic.semantic.scoping())
-                .into_iter()
-                .next()
-                .test_value("direct origin call")?;
-        assert!(proven_origin_direct_call_preserves_exact_property(
-            source,
+        let call = test_proof(structurally_proven_origin_direct_calls(
             &parsed.program,
             semantic.semantic.scoping(),
-            &call,
-            "token",
+            &test_budget(),
+        ))
+        .into_iter()
+        .next()
+        .test_value("direct origin call")?;
+        assert!(test_proof(
+            proven_origin_direct_call_preserves_exact_property(
+                source,
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &call,
+                "token",
+                &test_budget()
+            )
         ));
 
         Ok(())
@@ -6615,24 +7254,31 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let call =
-            structurally_proven_origin_direct_calls(&parsed.program, semantic.semantic.scoping())
-                .into_iter()
-                .next()
-                .test_value("direct origin call")?;
-        assert!(proven_origin_direct_call_preserves_own_field(
+        let call = test_proof(structurally_proven_origin_direct_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ))
+        .into_iter()
+        .next()
+        .test_value("direct origin call")?;
+        assert!(test_proof(proven_origin_direct_call_preserves_own_field(
             source,
             &parsed.program,
             semantic.semantic.scoping(),
             &call,
             "token",
-        ));
-        assert!(!proven_origin_direct_call_preserves_exact_property(
-            source,
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &call,
-            "token",
+            &test_budget()
+        )));
+        assert!(!test_proof(
+            proven_origin_direct_call_preserves_exact_property(
+                source,
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &call,
+                "token",
+                &test_budget()
+            )
         ));
 
         Ok(())
@@ -6652,8 +7298,11 @@ mod tests {
         let semantic = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&parsed.program);
-        let calls =
-            structurally_proven_origin_direct_calls(&parsed.program, semantic.semantic.scoping());
+        let calls = test_proof(structurally_proven_origin_direct_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ));
         assert_eq!(calls.len(), 2);
         assert!(calls[0].caller.this_origin);
         assert!(calls[0].caller.parameter_indices.is_empty());
@@ -6686,8 +7335,11 @@ mod tests {
         let semantic = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&parsed.program);
-        let calls =
-            structurally_proven_origin_direct_calls(&parsed.program, semantic.semantic.scoping());
+        let calls = test_proof(structurally_proven_origin_direct_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ));
         let helper_contexts = calls
             .iter()
             .filter(|call| call.callee.parameter_indices.len() == 1)
@@ -6753,10 +7405,11 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let closures = super::structurally_proven_prototype_method_phase_closures(
+        let closures = test_proof(super::structurally_proven_prototype_method_phase_closures(
             &parsed.program,
             semantic.semantic.scoping(),
-        );
+            &test_budget(),
+        ));
         assert_eq!(closures.len(), 1);
         assert_eq!(closures[0].property, "run");
         assert_eq!(closures[0].equal_value, 23);
@@ -6788,11 +7441,14 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(super::structurally_proven_prototype_method_phase_closures(
-            &parsed.program,
-            semantic.semantic.scoping(),
-        )
-        .is_empty());
+        assert!(
+            test_proof(super::structurally_proven_prototype_method_phase_closures(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget()
+            ))
+            .is_empty()
+        );
     }
 
     #[test]
@@ -6809,10 +7465,11 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let closures = super::structurally_proven_prototype_method_phase_closures(
+        let closures = test_proof(super::structurally_proven_prototype_method_phase_closures(
             &parsed.program,
             semantic.semantic.scoping(),
-        );
+            &test_budget(),
+        ));
         assert_eq!(closures.len(), 1);
         assert_eq!(closures[0].equal_value, 3);
         assert_eq!(closures[0].unequal_value, 4);
@@ -6831,11 +7488,14 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(super::structurally_proven_prototype_method_phase_closures(
-            &parsed.program,
-            semantic.semantic.scoping(),
-        )
-        .is_empty());
+        assert!(
+            test_proof(super::structurally_proven_prototype_method_phase_closures(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget()
+            ))
+            .is_empty()
+        );
     }
 
     #[test]
@@ -7037,10 +7697,11 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let stable = super::structurally_proven_stable_constructor_prototypes(
+        let stable = test_proof(super::structurally_proven_stable_constructor_prototypes(
             &parsed.program,
             semantic.semantic.scoping(),
-        );
+            &test_budget(),
+        ));
         assert!(stable.is_empty());
     }
 
@@ -7140,7 +7801,11 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let flow = structurally_proven_origin_flow(&parsed.program, semantic.semantic.scoping());
+        let flow = test_proof(structurally_proven_origin_flow(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        ));
         let t = flow
             .member_writes
             .iter()
@@ -7227,10 +7892,11 @@ mod tests {
         let semantic = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&parsed.program);
-        let effects = structurally_proven_prototype_method_receiver_effects(
+        let effects = test_proof(structurally_proven_prototype_method_receiver_effects(
             &parsed.program,
             semantic.semantic.scoping(),
-        );
+            &test_budget(),
+        ));
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].receiver_reads, vec!["base"]);
         assert!(effects[0].receiver_calls.is_empty());
@@ -7256,10 +7922,11 @@ mod tests {
         let semantic = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&parsed.program);
-        let effects = structurally_proven_prototype_method_receiver_effects(
+        let effects = test_proof(structurally_proven_prototype_method_receiver_effects(
             &parsed.program,
             semantic.semantic.scoping(),
-        );
+            &test_budget(),
+        ));
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].receiver_calls, vec!["step"]);
         assert!(effects[0].mutates_receiver);

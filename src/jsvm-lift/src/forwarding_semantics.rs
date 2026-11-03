@@ -2277,6 +2277,32 @@ struct RegistryReadProbe<'c, 'p> {
     poller: BudgetPoller,
 }
 
+impl RegistryReadProbe<'_, '_> {
+    fn record_read(&mut self, member: &oxc_ast::ast::ComputedMemberExpression<'_>) {
+        if member.optional {
+            return;
+        }
+        let (Some((receiver_argument, registry_path)), Some(key_argument)) = (
+            parameter_member_path(self.scoping, &member.object, self.parameters, self.boxes),
+            argument_index_expr(
+                self.scoping,
+                &member.expression,
+                self.parameters,
+                self.boxes,
+            ),
+        ) else {
+            return;
+        };
+        if receiver_argument != key_argument {
+            self.proofs.push(RegistryAccessorProof {
+                receiver_argument,
+                key_argument,
+                registry_path,
+            });
+        }
+    }
+}
+
 impl<'a> Visit<'a> for RegistryReadProbe<'_, '_> {
     fn visit_expression(&mut self, expression: &Expression<'a>) {
         if !self.poller.poll(1) {
@@ -2288,35 +2314,23 @@ impl<'a> Visit<'a> for RegistryReadProbe<'_, '_> {
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
         if assignment.operator.is_assign() {
             if let Expression::ComputedMemberExpression(member) = &assignment.right {
-                if !member.optional {
-                    if let (Some((receiver_argument, registry_path)), Some(key_argument)) = (
-                        parameter_member_path(
-                            self.scoping,
-                            &member.object,
-                            self.parameters,
-                            self.boxes,
-                        ),
-                        argument_index_expr(
-                            self.scoping,
-                            &member.expression,
-                            self.parameters,
-                            self.boxes,
-                        ),
-                    ) {
-                        if receiver_argument != key_argument {
-                            self.proofs.push(RegistryAccessorProof {
-                                receiver_argument,
-                                key_argument,
-                                registry_path,
-                            });
-                        }
-                    }
-                }
+                self.record_read(member);
             }
         }
         walk::walk_assignment_expression(self, assignment);
     }
+
+    fn visit_return_statement(&mut self, statement: &oxc_ast::ast::ReturnStatement<'a>) {
+        if let Some(Expression::ComputedMemberExpression(member)) =
+            statement.argument.as_ref().map(last_sequence_expression)
+        {
+            self.record_read(member);
+        }
+        walk::walk_return_statement(self, statement);
+    }
+
     fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+
     fn visit_arrow_function_expression(
         &mut self,
         _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,

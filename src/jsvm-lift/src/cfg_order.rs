@@ -10,6 +10,7 @@ use oxc_semantic::Semantic;
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::node::NodeId;
 use std::collections::{HashMap, HashSet, VecDeque};
+use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 
 fn deepest_exact_span_node(semantic: &Semantic<'_>, span: Span) -> Option<NodeId> {
     let nodes = semantic.nodes();
@@ -326,6 +327,174 @@ fn function_value_is_runtime_expression(kind: AstKind<'_>) -> bool {
         || matches!(kind, AstKind::ArrowFunctionExpression(_))
 }
 
+/// Find the deepest exact-span AST node while charging the caller's work budget.
+fn deepest_exact_span_node_budgeted(
+    semantic: &Semantic<'_>,
+    span: Span,
+    budget: &WorkBudget,
+) -> Result<Option<NodeId>, BudgetExceeded> {
+    let nodes = semantic.nodes();
+    let mut deepest = None::<(NodeId, usize)>;
+    let mut poller = BudgetPoller::new(budget, 128);
+    for (node_id, node) in nodes.iter_enumerated() {
+        if !poller.poll(1) {
+            break;
+        }
+        if node.kind().span() != span {
+            continue;
+        }
+        let mut depth = 0usize;
+        for _ in nodes.ancestor_ids(node_id) {
+            if !poller.poll(1) {
+                break;
+            }
+            depth = depth.saturating_add(1);
+        }
+        if deepest.is_none_or(|(_, current_depth)| depth > current_depth) {
+            deepest = Some((node_id, depth));
+        }
+    }
+    poller.finish()?;
+    Ok(deepest.map(|(node_id, _)| node_id))
+}
+
+fn enclosing_execution_context_budgeted(
+    semantic: &Semantic<'_>,
+    node_id: NodeId,
+    budget: &WorkBudget,
+) -> Result<Option<NodeId>, BudgetExceeded> {
+    let mut poller = BudgetPoller::new(budget, 128);
+    let mut found = None;
+    for (ancestor_id, node) in semantic.nodes().ancestors_enumerated(node_id) {
+        if !poller.poll(1) {
+            break;
+        }
+        if matches!(
+            node.kind(),
+            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) | AstKind::Program(_)
+        ) {
+            found = Some(ancestor_id);
+            break;
+        }
+    }
+    poller.finish()?;
+    Ok(found)
+}
+
+fn has_enclosing_try_before_execution_context_budgeted(
+    semantic: &Semantic<'_>,
+    node_id: NodeId,
+    execution_context: NodeId,
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    let mut poller = BudgetPoller::new(budget, 128);
+    let mut found = false;
+    for (ancestor_id, node) in semantic.nodes().ancestors_enumerated(node_id) {
+        if !poller.poll(1) {
+            break;
+        }
+        if ancestor_id == execution_context {
+            break;
+        }
+        if matches!(node.kind(), AstKind::TryStatement(_)) {
+            found = true;
+            break;
+        }
+    }
+    poller.finish()?;
+    Ok(found)
+}
+
+fn prove_required_before_node_budgeted(
+    semantic: &Semantic<'_>,
+    execution_context: NodeId,
+    event_node: NodeId,
+    event: Span,
+    required: Span,
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    let Some(cfg) = semantic.cfg() else {
+        return Ok(false);
+    };
+    let nodes = semantic.nodes();
+    let event_block = nodes.cfg_id(event_node);
+    let Some(required_node) = deepest_exact_span_node_budgeted(semantic, required, budget)? else {
+        return Ok(false);
+    };
+    if enclosing_execution_context_budgeted(semantic, required_node, budget)?
+        != Some(execution_context)
+    {
+        return Ok(false);
+    }
+    let required_block = nodes.cfg_id(required_node);
+    let function_entry = nodes.cfg_id(execution_context);
+
+    // Precompute the blocks that can reach the event once, rather than
+    // re-running a graph search from every path-state below.
+    let mut reaches_event = HashSet::new();
+    let mut reverse_queue = VecDeque::from([event_block]);
+    let mut reverse_poller = BudgetPoller::new(budget, 128);
+    while let Some(block) = reverse_queue.pop_front() {
+        if !reverse_poller.poll(1) {
+            break;
+        }
+        if !reaches_event.insert(block) {
+            continue;
+        }
+        for edge in cfg.graph().edges_directed(block, Direction::Incoming) {
+            if !reverse_poller.poll(1) {
+                break;
+            }
+            if usable_edge(edge.weight()) {
+                reverse_queue.push_back(edge.source());
+            }
+        }
+    }
+    reverse_poller.finish()?;
+    if !reaches_event.contains(&function_entry) {
+        return Ok(false);
+    }
+
+    let mut queue = VecDeque::from([(function_entry, false)]);
+    let mut seen = HashSet::new();
+    let mut reached_event = false;
+    let mut poller = BudgetPoller::new(budget, 128);
+
+    while let Some((block, crossed_required)) = queue.pop_front() {
+        if !poller.poll(1) {
+            break;
+        }
+        if !seen.insert((block, crossed_required)) {
+            continue;
+        }
+        if !reaches_event.contains(&block) {
+            continue;
+        }
+        if block == event_block {
+            reached_event = true;
+            let required_here_before =
+                required_block == event_block && required.start < event.start;
+            if !crossed_required && !required_here_before {
+                poller.finish()?;
+                return Ok(false);
+            }
+            continue;
+        }
+
+        let crossed_required = crossed_required || block == required_block;
+        for edge in cfg.graph().edges_directed(block, Direction::Outgoing) {
+            if !poller.poll(1) {
+                break;
+            }
+            if usable_edge(edge.weight()) {
+                queue.push_back((edge.target(), crossed_required));
+            }
+        }
+    }
+    poller.finish()?;
+    Ok(reached_event)
+}
+
 /// Prove that a required operation has completed before execution of an event
 /// inside a later-created nested function value.
 ///
@@ -336,37 +505,66 @@ fn function_value_is_runtime_expression(kind: AstKind<'_>) -> bool {
 /// expression begins before the function object can be created, so proving the
 /// required operation complete before that parent is a sufficient premise for
 /// every later execution of the nested body.
+///
+/// All AST/ancestor/CFG traversal on this production-facing path is charged to
+/// the caller's shared work budget.
 pub fn prove_event_completion_before_nested_event(
     semantic: &Semantic<'_>,
     required: Span,
     nested_event: Span,
-) -> bool {
-    let Some(required_node) = deepest_exact_span_node(semantic, required) else {
-        return false;
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    budget.checkpoint()?;
+    let Some(required_node) = deepest_exact_span_node_budgeted(semantic, required, budget)? else {
+        return Ok(false);
     };
-    let Some(nested_event_node) = deepest_exact_span_node(semantic, nested_event) else {
-        return false;
+    let Some(nested_event_node) = deepest_exact_span_node_budgeted(semantic, nested_event, budget)?
+    else {
+        return Ok(false);
     };
-    let Some(required_context) = enclosing_execution_context(semantic, required_node) else {
-        return false;
+    let Some(required_context) =
+        enclosing_execution_context_budgeted(semantic, required_node, budget)?
+    else {
+        return Ok(false);
     };
-    let Some(nested_context) = enclosing_execution_context(semantic, nested_event_node) else {
-        return false;
+    let Some(nested_context) =
+        enclosing_execution_context_budgeted(semantic, nested_event_node, budget)?
+    else {
+        return Ok(false);
     };
     if nested_context == required_context {
-        return prove_event_completion_before_event(semantic, required, nested_event);
+        if has_enclosing_try_before_execution_context_budgeted(
+            semantic,
+            required_node,
+            required_context,
+            budget,
+        )? {
+            return Ok(false);
+        }
+        return Ok(required != nested_event
+            && prove_required_before_node_budgeted(
+                semantic,
+                required_context,
+                nested_event_node,
+                nested_event,
+                required,
+                budget,
+            )?);
     }
 
     let mut bridge_function = nested_context;
     loop {
+        budget.checkpoint()?;
         if !matches!(
             semantic.nodes().kind(bridge_function),
             AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
         ) {
-            return false;
+            return Ok(false);
         }
-        let Some(parent_context) = enclosing_execution_context(semantic, bridge_function) else {
-            return false;
+        let Some(parent_context) =
+            enclosing_execution_context_budgeted(semantic, bridge_function, budget)?
+        else {
+            return Ok(false);
         };
         if parent_context == required_context {
             break;
@@ -376,24 +574,32 @@ pub fn prove_event_completion_before_nested_event(
 
     let nodes = semantic.nodes();
     if !function_value_is_runtime_expression(nodes.kind(bridge_function)) {
-        return false;
+        return Ok(false);
     }
     let creation_anchor = nodes.parent_id(bridge_function);
-    if enclosing_execution_context(semantic, creation_anchor) != Some(required_context) {
-        return false;
+    if enclosing_execution_context_budgeted(semantic, creation_anchor, budget)?
+        != Some(required_context)
+    {
+        return Ok(false);
     }
     let anchor_span = nodes.kind(creation_anchor).span();
-    if has_enclosing_try_before_execution_context(semantic, required_node, required_context) {
-        return false;
+    if has_enclosing_try_before_execution_context_budgeted(
+        semantic,
+        required_node,
+        required_context,
+        budget,
+    )? {
+        return Ok(false);
     }
-    required != anchor_span
-        && prove_required_before_node(
+    Ok(required != anchor_span
+        && prove_required_before_node_budgeted(
             semantic,
             required_context,
             creation_anchor,
             anchor_span,
             required,
-        )
+            budget,
+        )?)
 }
 
 #[cfg(test)]
@@ -408,6 +614,11 @@ mod tests {
     use oxc_semantic::{Semantic, SemanticBuilder};
     use oxc_span::{SourceType, Span};
     use rolldown_redox::ecmascript::parse_program;
+    use work_budget::{BudgetExceededKind, BudgetLimits, WorkBudget};
+
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("cfg-order-test")
+    }
 
     fn semantic<'a>(program: &'a Program<'a>) -> Semantic<'a> {
         let ret = SemanticBuilder::new()
@@ -530,8 +741,12 @@ mod tests {
         let install = assignment_span(&semantic, source, "proto.run = function() {}")?;
         let target = call_span(&semantic, source, "target()")?;
         assert!(prove_event_completion_before_nested_event(
-            &semantic, install, target
-        ));
+            &semantic,
+            install,
+            target,
+            &test_budget(),
+        )
+        .test_value("nested completion proof")?);
 
         Ok(())
     }
@@ -546,8 +761,12 @@ mod tests {
         let install = assignment_span(&semantic, source, "proto.run = function() {}")?;
         let target = call_span(&semantic, source, "target()")?;
         assert!(!prove_event_completion_before_nested_event(
-            &semantic, install, target
-        ));
+            &semantic,
+            install,
+            target,
+            &test_budget(),
+        )
+        .test_value("nested completion proof")?);
 
         Ok(())
     }
@@ -562,7 +781,31 @@ mod tests {
         let install = assignment_span(&semantic, source, "proto.run = function() {}")?;
         let target = call_span(&semantic, source, "target()")?;
         assert!(!prove_event_completion_before_nested_event(
-            &semantic, install, target
+            &semantic,
+            install,
+            target,
+            &test_budget(),
+        )
+        .test_value("nested completion proof")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn nested_completion_propagates_work_budget_exhaustion() -> TestResult {
+        let source =
+            "function outer() { proto.run = function() {}; holder.f = function() { target(); }; }";
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        let semantic = semantic(&parsed.program);
+        let install = assignment_span(&semantic, source, "proto.run = function() {}")?;
+        let target = call_span(&semantic, source, "target()")?;
+        let budget = WorkBudget::new("cfg-order-fuel", BudgetLimits::work(0));
+        assert!(matches!(
+            prove_event_completion_before_nested_event(&semantic, install, target, &budget),
+            Err(ref error)
+                if error.kind() == BudgetExceededKind::Work
+                    && error.scope() == "cfg-order-fuel"
         ));
 
         Ok(())
