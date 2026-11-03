@@ -2,12 +2,12 @@ use crate::symbolic_integer::{normalize_integer_polynomial, IntegerPolynomial};
 use jsvm_safe_core::{exact_u32, string_literal_value};
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, AssignmentTarget, BindingPattern, CallExpression, Expression,
-    Function, FunctionBody, IfStatement, Program, Statement, VariableDeclaration,
+    Function, FunctionBody, IfStatement, Program, Statement, SwitchStatement, VariableDeclaration,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
 use oxc_span::GetSpan;
-use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
+use oxc_syntax::{operator::UnaryOperator, scope::ScopeFlags, symbol::SymbolId};
 use std::collections::{HashMap, HashSet};
 use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 
@@ -2526,6 +2526,54 @@ fn fast_cell_branch_parts(
         .then_some((probe_property, update_property))
 }
 
+/// A switch over a boolean-coerced cell property can encode the same fast
+/// return as an if/while probe. The logical-not chain guarantees a boolean
+/// discriminant; a direct switch over cell.flag cannot be treated as a
+/// truthiness probe because strict case equality only matches booleans.
+fn switch_fast_cell_branch_parts(
+    scoping: &Scoping,
+    statement: &SwitchStatement<'_>,
+    cell: SymbolId,
+) -> Option<(String, String)> {
+    let mut value = &statement.discriminant;
+    let mut negations = 0;
+    loop {
+        value = match value {
+            Expression::ParenthesizedExpression(parenthesized) => &parenthesized.expression,
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
+                negations += 1;
+                &unary.argument
+            }
+            _ => break,
+        };
+    }
+    if negations == 0 {
+        return None;
+    }
+    let probe_property = static_member_on_symbol(scoping, value, cell)?;
+    let fast_match = negations % 2 == 0;
+    for case in &statement.cases {
+        let Some(Expression::BooleanLiteral(test)) = &case.test else {
+            continue;
+        };
+        if test.value != fast_match {
+            continue;
+        }
+        // A case that starts with an unconditional return has no intra-case
+        // fallthrough. Reject other statements and update calls with args.
+        let Statement::ReturnStatement(ret) = case.consequent.first()? else {
+            return None;
+        };
+        let (update_property, call) =
+            static_method_call_on_symbol(scoping, ret.argument.as_ref()?, cell)?;
+        return call
+            .arguments
+            .is_empty()
+            .then_some((probe_property, update_property));
+    }
+    None
+}
+
 fn one_effect_then_symbol<'a>(
     scoping: &Scoping,
     expression: &'a Expression<'a>,
@@ -2695,6 +2743,21 @@ impl<'a> Visit<'a> for LazyAccessorShapeCollector<'_> {
             }
         }
         walk::walk_while_statement(self, statement);
+    }
+
+    fn visit_switch_statement(&mut self, statement: &SwitchStatement<'a>) {
+        if statement.span.start > self.after {
+            if let Some((probe_property, update_property)) =
+                switch_fast_cell_branch_parts(self.scoping, statement, self.cell)
+            {
+                self.fast.push(LazyAccessorFastCandidate {
+                    span_start: statement.span.start,
+                    probe_property,
+                    update_property,
+                });
+            }
+        }
+        walk::walk_switch_statement(self, statement);
     }
 
     fn visit_return_statement(&mut self, statement: &oxc_ast::ast::ReturnStatement<'a>) {
@@ -3850,6 +3913,105 @@ mod tests {
             vec![proven[0].selector_key_symbol]
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn proves_switch_negated_truthiness_lazy_accessor() -> TestResult {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver, key, cell) {
+                if (cell = receiver.handlers[key], cell === undefined) throw Error();
+                switch (!cell.value) {
+                    case true: break;
+                    case false: return cell.create();
+                }
+                return (cell.create(key * key + 3), cell).prototype;
+            }
+            get(state, opcode);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let proven = super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("switch lazy registry proof")?;
+        assert_eq!(proven.len(), 1);
+        assert_eq!(proven[0].read.registry_path, ["handlers"]);
+        assert_eq!(proven[0].probe_property, "value");
+        assert_eq!(proven[0].update_property, "create");
+        assert_eq!(proven[0].projection_property, "prototype");
+        Ok(())
+    }
+
+    #[test]
+    fn switch_fast_probe_requires_boolean_coercion_and_matching_case() -> TestResult {
+        let sources = [
+            // Direct property value uses strict equality, not truthiness.
+            "switch (cell.value) { case true: return cell.create(); }",
+            // Negation requires the false case for a truthy value.
+            "switch (!cell.value) { case true: return cell.create(); }",
+            // A fast update must be called with zero arguments.
+            "switch (!cell.value) { case false: return cell.create(key); }",
+            // Falling into a return is not a guarded fast-path return.
+            "switch (!cell.value) { case false: sideEffect(); return cell.create(); }",
+            // Alternative branch not proven to be the same update method.
+            "switch (!cell.value) { case false: return cell.replace(); }",
+        ];
+        for statement in sources {
+            let allocator = Allocator::default();
+            let source = format!(
+                "function get(receiver,key,cell) {{
+                    cell=receiver.handlers[key];
+                    {statement}
+                    return (cell.create(key*key+3),cell).prototype;
+                 }}
+                 get(state,opcode);"
+            );
+            let parsed = parse_program(&allocator, &source, SourceType::cjs());
+            assert!(parsed.is_clean(), "source: {source}");
+            let semantic = SemanticBuilder::new().build(&parsed.program);
+            let proven = super::structurally_proven_lazy_registry_read_calls(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget(),
+            )
+            .test_value("negative switch lazy registry proof")?;
+            assert!(proven.is_empty(), "source: {source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn proves_double_negated_switch_truthiness() -> TestResult {
+        let allocator = Allocator::default();
+        let source = r#"
+            function get(receiver,key,cell) {
+                cell=receiver.handlers[key];
+                switch (!!cell.ready) {
+                    case true: return cell.update();
+                    case false: break;
+                }
+                return (cell.update(key*2+1),cell).handler;
+            }
+            get(state,opcode);
+        "#;
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let proven = super::structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &test_budget(),
+        )
+        .test_value("double-not switch lazy registry proof")?;
+        assert_eq!(proven.len(), 1);
+        assert_eq!(proven[0].probe_property, "ready");
+        assert_eq!(proven[0].update_property, "update");
+        assert_eq!(proven[0].projection_property, "handler");
         Ok(())
     }
 
