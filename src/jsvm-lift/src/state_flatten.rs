@@ -6230,8 +6230,10 @@ mod tests {
         }"#;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
-        let mut harness = DetectorHarness::default();
-        harness.source = source;
+        let mut harness = DetectorHarness {
+            source,
+            ..DetectorHarness::default()
+        };
         harness.visit_program(&parsed.program);
         let machine = harness
             .detected
@@ -6500,7 +6502,7 @@ mod tests {
                 semantic.semantic.scoping(),
                 IntegerParameterEvent {
                     function: Span::new(function.span.start, function.span.end),
-                    event: event,
+                    event,
                     parameter_bindings: &[(0usize, 14i64)].into_iter().collect(),
                 },
             )
@@ -6551,7 +6553,7 @@ mod tests {
                 &[48],
                 IntegerParameterEvent {
                     function: Span::new(function.span.start, function.span.end),
-                    event: event,
+                    event,
                     parameter_bindings: &BTreeMap::from([(0, 0), (1, 17)]),
                 },
             )
@@ -6564,7 +6566,7 @@ mod tests {
                 &[48],
                 IntegerParameterEvent {
                     function: Span::new(function.span.start, function.span.end),
-                    event: event,
+                    event,
                     parameter_bindings: &BTreeMap::from([(0, 0), (1, 0)]),
                 },
             )
@@ -6608,7 +6610,7 @@ mod tests {
                 semantic.semantic.scoping(),
                 IntegerParameterEvent {
                     function: Span::new(function.start, function.end),
-                    event: event,
+                    event,
                     parameter_bindings: &BTreeMap::from([(0, 15)]),
                 },
             )
@@ -6620,7 +6622,7 @@ mod tests {
                 semantic.semantic.scoping(),
                 IntegerParameterEvent {
                     function: Span::new(function.start, function.end),
-                    event: event,
+                    event,
                     parameter_bindings: &BTreeMap::from([(0, 14)]),
                 },
             )
@@ -6932,7 +6934,7 @@ mod tests {
                 semantic.semantic.scoping(),
                 IntegerParameterEvent {
                     function: Span::new(function.start, function.end),
-                    event: event,
+                    event,
                     parameter_bindings: &BTreeMap::from([(1, 47)]),
                 },
             )
@@ -6944,7 +6946,7 @@ mod tests {
                 semantic.semantic.scoping(),
                 IntegerParameterEvent {
                     function: Span::new(function.start, function.end),
-                    event: event,
+                    event,
                     parameter_bindings: &BTreeMap::from([(1, 46)]),
                 },
             )

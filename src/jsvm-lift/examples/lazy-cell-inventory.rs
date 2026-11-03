@@ -10,7 +10,7 @@ use jsvm_lift::{
         proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_state_fields,
         proven_slow_lazy_cell_state_fields_for_exact_assignment,
         proven_slow_lazy_cell_update_state, structurally_proven_fast_lazy_cell_factory_shapes,
-        structurally_proven_slow_lazy_cell_factory_shapes,
+        structurally_proven_slow_lazy_cell_factory_shapes, SlowLazyCellResolverIndexFacts,
     },
     receiver_identity::structurally_proven_origin_flow,
     registry_identity::{
@@ -19,7 +19,7 @@ use jsvm_lift::{
 };
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
-use oxc_span::SourceType;
+use oxc_span::{SourceType, Span};
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::json;
 use std::{env, fs, path::PathBuf};
@@ -276,11 +276,12 @@ fn main() -> Result<()> {
                             &parsed.program,
                             &semantic.semantic,
                             update,
-                            accessor.selector_start,
-                            accessor.selector_end,
-                            accessor.selector_key_symbol,
-                            exact_assignment,
-                            phase_value,
+                            SlowLazyCellResolverIndexFacts {
+                                selector: Span::new(accessor.selector_start, accessor.selector_end),
+                                selector_key_symbol: accessor.selector_key_symbol,
+                                exact_assignment,
+                                phase_value,
+                            },
                         )
                     })
                     .collect::<Vec<_>>(),

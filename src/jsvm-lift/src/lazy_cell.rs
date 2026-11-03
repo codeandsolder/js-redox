@@ -171,6 +171,14 @@ pub struct ProvenSlowLazyCellExactRegistryAssignment {
     pub exact_key_value: i64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SlowLazyCellResolverIndexFacts<'a> {
+    pub selector: Span,
+    pub selector_key_symbol: SymbolId,
+    pub exact_assignment: &'a ProvenSlowLazyCellExactRegistryAssignment,
+    pub phase_value: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenSlowLazyCellResolverIndex {
     pub update_state: ProvenSlowLazyCellUpdateState,
@@ -2050,17 +2058,46 @@ fn call_argument_symbol_at(
     output.flatten()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ForwardedSymbolQuery<'a> {
+    symbol: SymbolId,
+    function_span: Span,
+    incoming: &'a ProvenOriginDirectCall,
+    exact_integer_parameter: (usize, i64),
+    call: &'a ProvenOriginDirectCall,
+    argument_index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IntegerParameterReachability {
+    function: Span,
+    event: Span,
+    parameter_index: usize,
+    value: i64,
+    provided_argument_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IntegerProvenanceQuery<'a> {
+    context: &'a crate::receiver_identity::ProvenOriginContext,
+    symbol: SymbolId,
+    event: Span,
+}
+
 fn symbol_only_forwarded_at_direct_call(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
-    symbol: SymbolId,
-    function_span: Span,
-    incoming: &ProvenOriginDirectCall,
-    exact_integer_parameter: (usize, i64),
-    call: &ProvenOriginDirectCall,
-    argument_index: usize,
+    query: ForwardedSymbolQuery<'_>,
 ) -> bool {
+    let ForwardedSymbolQuery {
+        symbol,
+        function_span,
+        incoming,
+        exact_integer_parameter,
+        call,
+        argument_index,
+    } = query;
     let Some((argument_start, argument_end)) = call.argument_spans.get(argument_index).copied()
     else {
         return false;
@@ -2125,35 +2162,37 @@ fn event_unreachable_with_integer_parameter(
     source: &str,
     program: &Program<'_>,
     scoping: &Scoping,
-    function_start: u32,
-    function_end: u32,
-    event: Span,
-    parameter_index: usize,
-    value: i64,
-    provided_argument_count: usize,
+    facts: IntegerParameterReachability,
 ) -> bool {
+    let IntegerParameterReachability {
+        function,
+        event,
+        parameter_index,
+        value,
+        provided_argument_count,
+    } = facts;
     let bindings = BTreeMap::from([(parameter_index, value)]);
     prove_function_if_ladder_event_unreachable_with_integer_parameters(
         source,
         program,
         scoping,
         IntegerParameterEvent {
-            function: Span::new(function_start, function_end),
+            function,
             event,
             parameter_bindings: &bindings,
         },
     ) || prove_function_switch_event_unreachable_with_integer_parameters(
         program,
         scoping,
-        function_start,
-        function_end,
+        function.start,
+        function.end,
         event,
         &bindings,
     ) || prove_function_structured_branch_event_unreachable_with_integer_parameters(
         program,
         scoping,
-        function_start,
-        function_end,
+        function.start,
+        function.end,
         event,
         &bindings,
     ) || prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
@@ -2161,7 +2200,7 @@ fn event_unreachable_with_integer_parameter(
         program,
         scoping,
         CallArgumentEvent {
-            function: Span::new(function_start, function_end),
+            function,
             event,
             provided_argument_count,
             parameter_bindings: &bindings,
@@ -2174,11 +2213,14 @@ fn exact_integer_parameter_provenance(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     flow: &crate::receiver_identity::ProvenOriginFlow,
-    context: &crate::receiver_identity::ProvenOriginContext,
-    symbol: SymbolId,
-    event: Span,
+    query: IntegerProvenanceQuery<'_>,
     visiting: &mut HashSet<(crate::receiver_identity::ProvenOriginContext, SymbolId)>,
 ) -> Vec<(i64, Vec<ProvenOriginDirectCall>)> {
+    let IntegerProvenanceQuery {
+        context,
+        symbol,
+        event,
+    } = query;
     if !visiting.insert((context.clone(), symbol)) {
         return Vec::new();
     }
@@ -2246,21 +2288,24 @@ fn exact_integer_parameter_provenance(
             program,
             semantic,
             flow,
-            &incoming.caller,
-            parent_symbol,
-            parent_event,
+            IntegerProvenanceQuery {
+                context: &incoming.caller,
+                symbol: parent_symbol,
+                event: parent_event,
+            },
             visiting,
         ) {
             if event_unreachable_with_integer_parameter(
                 source,
                 program,
                 semantic.scoping(),
-                context.function_start,
-                context.function_end,
-                event,
-                *parameter_index,
-                value,
-                incoming.argument_spans.len(),
+                IntegerParameterReachability {
+                    function: Span::new(context.function_start, context.function_end),
+                    event,
+                    parameter_index: *parameter_index,
+                    value,
+                    provided_argument_count: incoming.argument_spans.len(),
+                },
             ) {
                 continue;
             }
@@ -2314,9 +2359,11 @@ pub fn proven_slow_lazy_cell_exact_registry_assignments(
         program,
         semantic,
         flow,
-        caller_context,
-        assignment.registry_key_symbol,
-        event,
+        IntegerProvenanceQuery {
+            context: caller_context,
+            symbol: assignment.registry_key_symbol,
+            event,
+        },
         &mut visiting,
     )
     .into_iter()
@@ -2326,12 +2373,13 @@ pub fn proven_slow_lazy_cell_exact_registry_assignments(
             source,
             program,
             semantic.scoping(),
-            caller_context.function_start,
-            caller_context.function_end,
-            event,
-            *key_parameter_index,
-            exact_key_value,
-            caller.argument_spans.len(),
+            IntegerParameterReachability {
+                function: Span::new(caller_context.function_start, caller_context.function_end),
+                event,
+                parameter_index: *key_parameter_index,
+                value: exact_key_value,
+                provided_argument_count: caller.argument_spans.len(),
+            },
         ) {
             return None;
         }
@@ -2373,26 +2421,36 @@ fn unique_argument_containing(
     matches.next().is_none().then_some(first)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RegistryInstallFacts<'a> {
+    call: Span,
+    key: Span,
+    value: Span,
+    registry_path: &'a [String],
+    origin: &'a crate::registry_identity::ProvenRegistryObjectOrigin,
+    exact_key: i64,
+}
+
 fn proven_slow_lazy_cell_captured_value_path(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     exact_assignment: &ProvenSlowLazyCellExactRegistryAssignment,
-    install_call_start: u32,
-    install_call_end: u32,
-    install_key_start: u32,
-    install_key_end: u32,
-    install_value_start: u32,
-    install_value_end: u32,
-    install_registry_path: &[String],
-    install_origin: &crate::registry_identity::ProvenRegistryObjectOrigin,
-    install_exact_key: i64,
+    install: RegistryInstallFacts<'_>,
 ) -> Option<(usize, SymbolId)> {
+    let RegistryInstallFacts {
+        call: install_call,
+        key: install_key,
+        value: install_value,
+        registry_path: install_registry_path,
+        origin: install_origin,
+        exact_key: install_exact_key,
+    } = install;
     let chain = &exact_assignment.provenance_calls;
     let root = chain.first()?;
     let final_call = chain.last()?;
     if final_call != &exact_assignment.caller
-        || (root.call_start, root.call_end) != (install_call_start, install_call_end)
+        || (root.call_start, root.call_end) != (install_call.start, install_call.end)
         || exact_assignment.exact_key_value != install_exact_key
         || exact_assignment.assignment.registry_path != install_registry_path
         || crate::registry_identity::ProvenRegistryObjectOrigin::from(&root.callee)
@@ -2402,9 +2460,9 @@ fn proven_slow_lazy_cell_captured_value_path(
     }
 
     let root_value_parameter_index =
-        unique_argument_containing(&root.argument_spans, install_value_start, install_value_end)?;
+        unique_argument_containing(&root.argument_spans, install_value.start, install_value.end)?;
     let root_key_parameter_index =
-        unique_argument_containing(&root.argument_spans, install_key_start, install_key_end)?;
+        unique_argument_containing(&root.argument_spans, install_key.start, install_key.end)?;
     let root_parameters = function_parameter_symbols_at(
         program,
         root.callee.function_start,
@@ -2450,15 +2508,20 @@ fn proven_slow_lazy_cell_captured_value_path(
             source,
             program,
             semantic,
-            current_symbol,
-            Span::new(current_context.function_start, current_context.function_end),
-            &incoming,
-            (
-                current_key_parameter_index,
-                exact_assignment.exact_key_value,
-            ),
-            next,
-            *next_parameter_index,
+            ForwardedSymbolQuery {
+                symbol: current_symbol,
+                function_span: Span::new(
+                    current_context.function_start,
+                    current_context.function_end,
+                ),
+                incoming: &incoming,
+                exact_integer_parameter: (
+                    current_key_parameter_index,
+                    exact_assignment.exact_key_value,
+                ),
+                call: next,
+                argument_index: *next_parameter_index,
+            },
         ) {
             return None;
         }
@@ -2531,19 +2594,24 @@ fn proven_slow_lazy_cell_captured_value_path(
             source,
             program,
             semantic,
-            current_symbol,
-            Span::new(factory_caller.function_start, factory_caller.function_end),
-            &incoming,
-            (
-                current_key_parameter_index,
-                exact_assignment.exact_key_value,
-            ),
-            &exact_assignment.assignment.factory_call.call,
-            exact_assignment
-                .assignment
-                .factory_call
-                .shape
-                .handler_parameter_index,
+            ForwardedSymbolQuery {
+                symbol: current_symbol,
+                function_span: Span::new(
+                    factory_caller.function_start,
+                    factory_caller.function_end,
+                ),
+                incoming: &incoming,
+                exact_integer_parameter: (
+                    current_key_parameter_index,
+                    exact_assignment.exact_key_value,
+                ),
+                call: &exact_assignment.assignment.factory_call.call,
+                argument_index: exact_assignment
+                    .assignment
+                    .factory_call
+                    .shape
+                    .handler_parameter_index,
+            },
         )
     {
         return None;
@@ -2586,15 +2654,14 @@ pub fn proven_slow_lazy_cell_captured_value_install(
             program,
             semantic,
             exact_assignment,
-            install.install.call_start,
-            install.install.call_end,
-            install.install.key_start,
-            install.install.key_end,
-            install.install.value_start,
-            install.install.value_end,
-            &install.install.registry_path,
-            &install.origin,
-            install.exact_key,
+            RegistryInstallFacts {
+                call: Span::new(install.install.call_start, install.install.call_end),
+                key: Span::new(install.install.key_start, install.install.key_end),
+                value: Span::new(install.install.value_start, install.install.value_end),
+                registry_path: &install.install.registry_path,
+                origin: &install.origin,
+                exact_key: install.exact_key,
+            },
         )?;
     Some(ProvenSlowLazyCellCapturedValueInstall {
         exact_assignment: exact_assignment.clone(),
@@ -2661,15 +2728,14 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
             program,
             semantic,
             exact_assignment,
-            install.install.call_start,
-            install.install.call_end,
-            install.install.key_start,
-            install.install.key_end,
-            install.install.handler_start,
-            install.install.handler_end,
-            &install.install.registry_path,
-            &install.origin,
-            install.exact_key,
+            RegistryInstallFacts {
+                call: Span::new(install.install.call_start, install.install.call_end),
+                key: Span::new(install.install.key_start, install.install.key_end),
+                value: Span::new(install.install.handler_start, install.install.handler_end),
+                registry_path: &install.install.registry_path,
+                origin: &install.origin,
+                exact_key: install.exact_key,
+            },
         )?;
     Some(ProvenSlowLazyCellCapturedHandlerInstall {
         exact_assignment: exact_assignment.clone(),
@@ -3094,12 +3160,14 @@ fn analyze_slow_lazy_cell_resolver_index(
     semantic: &Semantic<'_>,
     function: &Function<'_>,
     update_state: &ProvenSlowLazyCellUpdateState,
-    selector_start: u32,
-    selector_end: u32,
-    selector_key_symbol: SymbolId,
-    exact_assignment: &ProvenSlowLazyCellExactRegistryAssignment,
-    phase_value: i64,
+    facts: SlowLazyCellResolverIndexFacts<'_>,
 ) -> Option<ProvenSlowLazyCellResolverIndex> {
+    let SlowLazyCellResolverIndexFacts {
+        selector,
+        selector_key_symbol,
+        exact_assignment,
+        phase_value,
+    } = facts;
     let factory_call = &update_state.factory_call;
     if exact_assignment.assignment.factory_call != *factory_call {
         return None;
@@ -3158,8 +3226,8 @@ fn analyze_slow_lazy_cell_resolver_index(
     let selector_value = exact_selector_value(
         program,
         semantic.scoping(),
-        selector_start,
-        selector_end,
+        selector.start,
+        selector.end,
         selector_key_symbol,
         exact_key_value,
     )?;
@@ -3213,8 +3281,8 @@ fn analyze_slow_lazy_cell_resolver_index(
         update_state: update_state.clone(),
         exact_assignment: exact_assignment.clone(),
         selector_key_symbol,
-        selector_start,
-        selector_end,
+        selector_start: selector.start,
+        selector_end: selector.end,
         factory_key_symbol,
         exact_key_value,
         phase_value,
@@ -3242,12 +3310,14 @@ pub fn proven_slow_lazy_cell_resolver_index(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
     update_state: &ProvenSlowLazyCellUpdateState,
-    selector_start: u32,
-    selector_end: u32,
-    selector_key_symbol: SymbolId,
-    exact_assignment: &ProvenSlowLazyCellExactRegistryAssignment,
-    phase_value: i64,
+    facts: SlowLazyCellResolverIndexFacts<'_>,
 ) -> Option<ProvenSlowLazyCellResolverIndex> {
+    let SlowLazyCellResolverIndexFacts {
+        selector,
+        selector_key_symbol,
+        exact_assignment,
+        phase_value,
+    } = facts;
     struct Harness<'s, 'p, 'm, 'u> {
         source: &'s str,
         program: &'p Program<'p>,
@@ -3275,11 +3345,12 @@ pub fn proven_slow_lazy_cell_resolver_index(
                     self.semantic,
                     function,
                     self.update_state,
-                    self.selector_start,
-                    self.selector_end,
-                    self.selector_key_symbol,
-                    self.exact_assignment,
-                    self.phase_value,
+                    SlowLazyCellResolverIndexFacts {
+                        selector: Span::new(self.selector_start, self.selector_end),
+                        selector_key_symbol: self.selector_key_symbol,
+                        exact_assignment: self.exact_assignment,
+                        phase_value: self.phase_value,
+                    },
                 ));
                 return;
             }
@@ -3292,8 +3363,8 @@ pub fn proven_slow_lazy_cell_resolver_index(
         program,
         semantic,
         update_state,
-        selector_start,
-        selector_end,
+        selector_start: selector.start,
+        selector_end: selector.end,
         selector_key_symbol,
         exact_assignment,
         phase_value,
@@ -3780,9 +3851,7 @@ fn descriptor_parameter_for_projection(
         let ObjectPropertyKind::ObjectProperty(property) = item else {
             return None;
         };
-        let Some(name) = property.key.static_name() else {
-            return None;
-        };
+        let name = property.key.static_name()?;
         if property.computed && property.key.static_name().is_none() {
             return None;
         }
@@ -4375,6 +4444,7 @@ mod tests {
         proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_state_fields,
         proven_slow_lazy_cell_state_fields_for_exact_assignment,
         proven_slow_lazy_cell_update_state, structurally_proven_slow_lazy_cell_factory_shapes,
+        ForwardedSymbolQuery, SlowLazyCellResolverIndexFacts,
     };
     use crate::test_support::{
         source_offset, source_rfind, source_slice, TestFailure, TestResult, TestValue,
@@ -4389,7 +4459,7 @@ mod tests {
     use oxc_allocator::Allocator;
     use oxc_ast::ast::{BindingPattern, Statement};
     use oxc_semantic::SemanticBuilder;
-    use oxc_span::{GetSpan, SourceType};
+    use oxc_span::{GetSpan, SourceType, Span};
     use rolldown_redox::ecmascript::parse_program;
     use work_budget::WorkBudget;
 
@@ -5010,11 +5080,12 @@ mod tests {
             &parsed.program,
             &semantic.semantic,
             &update,
-            accessor.selector_start,
-            accessor.selector_end,
-            accessor.selector_key_symbol,
-            &exact,
-            23,
+            SlowLazyCellResolverIndexFacts {
+                selector: Span::new(accessor.selector_start, accessor.selector_end),
+                selector_key_symbol: accessor.selector_key_symbol,
+                exact_assignment: &exact,
+                phase_value: 23,
+            },
         )
         .test_value("resolver slot")?;
         let resolved = proven_slow_lazy_cell_resolved_handler(&resolver, &captured)
@@ -5254,11 +5325,12 @@ mod tests {
             &parsed.program,
             &semantic.semantic,
             &update,
-            selector_span.start,
-            selector_span.end,
-            selector_key_symbol,
-            exact_seven,
-            23,
+            SlowLazyCellResolverIndexFacts {
+                selector: selector_span,
+                selector_key_symbol,
+                exact_assignment: exact_seven,
+                phase_value: 23,
+            },
         )
         .test_value("resolver cancellation")?;
         assert_eq!(proof.handler_slot, 6);
@@ -5270,11 +5342,12 @@ mod tests {
             &parsed.program,
             &semantic.semantic,
             &update,
-            selector_span.start,
-            selector_span.end,
-            selector_key_symbol,
-            exact_seven,
-            50,
+            SlowLazyCellResolverIndexFacts {
+                selector: selector_span,
+                selector_key_symbol,
+                exact_assignment: exact_seven,
+                phase_value: 50,
+            },
         )
         .is_none());
         assert!(proven_slow_lazy_cell_resolver_index(
@@ -5282,11 +5355,12 @@ mod tests {
             &parsed.program,
             &semantic.semantic,
             &update,
-            selector_span.start,
-            selector_span.end,
-            selector_key_symbol,
-            exact_large,
-            23,
+            SlowLazyCellResolverIndexFacts {
+                selector: selector_span,
+                selector_key_symbol,
+                exact_assignment: exact_large,
+                phase_value: 23,
+            },
         )
         .is_none());
 
@@ -5340,12 +5414,14 @@ mod tests {
             source,
             &parsed.program,
             &semantic.semantic,
-            handler,
-            oxc_span::Span::new(call.caller.function_start, call.caller.function_end),
-            incoming,
-            (1, 7),
-            call,
-            2,
+            ForwardedSymbolQuery {
+                symbol: handler,
+                function_span: Span::new(call.caller.function_start, call.caller.function_end),
+                incoming,
+                exact_integer_parameter: (1, 7),
+                call,
+                argument_index: 2,
+            },
         ));
 
         Ok(())
@@ -5399,12 +5475,14 @@ mod tests {
             source,
             &parsed.program,
             &semantic.semantic,
-            parameters[2],
-            oxc_span::Span::new(call.caller.function_start, call.caller.function_end),
-            incoming,
-            (1, 7),
-            call,
-            2,
+            ForwardedSymbolQuery {
+                symbol: parameters[2],
+                function_span: Span::new(call.caller.function_start, call.caller.function_end),
+                incoming,
+                exact_integer_parameter: (1, 7),
+                call,
+                argument_index: 2,
+            },
         ));
 
         Ok(())
@@ -5452,12 +5530,14 @@ mod tests {
             source,
             &parsed.program,
             &semantic.semantic,
-            handler,
-            oxc_span::Span::new(call.caller.function_start, call.caller.function_end),
-            incoming,
-            (1, 7),
-            call,
-            2,
+            ForwardedSymbolQuery {
+                symbol: handler,
+                function_span: Span::new(call.caller.function_start, call.caller.function_end),
+                incoming,
+                exact_integer_parameter: (1, 7),
+                call,
+                argument_index: 2,
+            },
         ));
 
         Ok(())
