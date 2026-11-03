@@ -5170,6 +5170,7 @@ mod tests {
         structurally_proven_prototype_method_receiver_preservation_summaries,
         structurally_proven_prototype_string_assignments,
     };
+    use crate::test_support::{source_offset, source_slice, TestResult, TestValue};
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
     use oxc_span::{SourceType, Span};
@@ -5239,7 +5240,7 @@ mod tests {
     }
 
     #[test]
-    fn proves_seeded_nested_method_call_runtime_target() {
+    fn proves_seeded_nested_method_call_runtime_target() -> TestResult {
         let source = r#"
             (function() {
                 const C = function() { use(this); };
@@ -5262,7 +5263,7 @@ mod tests {
         )
         .into_iter()
         .find(|proof| proof.candidate.call.property == "outer")
-        .expect("runtime outer call");
+        .test_value("runtime outer call")?;
         let seeded = super::propagate_proven_prototype_method_call_origins(
             &parsed.program,
             semantic.semantic.scoping(),
@@ -5276,6 +5277,8 @@ mod tests {
         assert!(nested
             .iter()
             .any(|proof| proof.candidate.call.property == "read"));
+
+        Ok(())
     }
 
     #[test]
@@ -5393,7 +5396,7 @@ mod tests {
     }
 
     #[test]
-    fn proves_prototype_string_before_nested_allocation() {
+    fn proves_prototype_string_before_nested_allocation() -> TestResult {
         let source = r#"
             const C = function() {};
             C.prototype.factory = "create";
@@ -5407,9 +5410,12 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let assignment = prototype_strings(source).pop().expect("prototype string");
-        let allocation_start = source.find("new C()").expect("allocation") as u32;
-        let allocation_end = allocation_start + u32::try_from("new C()".len()).unwrap();
+        let assignment = prototype_strings(source)
+            .pop()
+            .test_value("prototype string")?;
+        let allocation_start = source_offset(source, "new C()", "allocation")?;
+        let allocation_end =
+            allocation_start + u32::try_from("new C()".len()).test_value("allocation length")?;
         let proof = proven_prototype_string_at_allocation(
             &parsed.program,
             &semantic.semantic,
@@ -5418,8 +5424,10 @@ mod tests {
             Span::new(allocation_start, allocation_end),
             "factory",
         )
-        .expect("runtime prototype string");
+        .test_value("runtime prototype string")?;
         assert_eq!(proof.assignment.value, "create");
+
+        Ok(())
     }
 
     #[test]
@@ -5436,7 +5444,7 @@ mod tests {
     }
 
     #[test]
-    fn propagates_matched_method_this_through_function_call() {
+    fn propagates_matched_method_this_through_function_call() -> TestResult {
         let source = r#"
             const C = function() { use(this); };
             C.prototype.run = function() { bridge.call(this, 7); };
@@ -5453,7 +5461,7 @@ mod tests {
         )
         .into_iter()
         .find(|candidate| candidate.call.property == "run")
-        .unwrap();
+        .test_value("run lookup target")?;
         let flow = super::propagate_matched_prototype_method_call_origins(
             &parsed.program,
             semantic.semantic.scoping(),
@@ -5463,7 +5471,7 @@ mod tests {
             .direct_calls
             .iter()
             .find(|call| call.standard_function_call_semantics_required)
-            .expect(".call edge from method body");
+            .test_value(".call edge from method body")?;
         assert!(edge.caller.this_origin);
         assert!(edge.callee.this_origin);
         assert_eq!(edge.exact_integer_arguments, vec![Some(7)]);
@@ -5471,10 +5479,12 @@ mod tests {
             .member_calls
             .iter()
             .any(|call| { call.context == edge.callee && call.property == "finish" }));
+
+        Ok(())
     }
 
     #[test]
-    fn proves_own_field_across_unique_direct_path_and_preserving_method() {
+    fn proves_own_field_across_unique_direct_path_and_preserving_method() -> TestResult {
         let source = r#"
             (function() {
                 const C = function() {
@@ -5508,12 +5518,14 @@ mod tests {
                 proof.initialization.property == "value"
                     && proof.call_target.candidate.call.property == "target"
             })
-            .expect("value live at target call");
+            .test_value("value live at target call")?;
         assert_eq!(proof.direct_call_path.len(), 2);
         assert!(proof
             .discharged_preserving_method_calls
             .iter()
             .any(|call| call.property == "read"));
+
+        Ok(())
     }
 
     #[test]
@@ -5585,7 +5597,7 @@ mod tests {
     }
 
     #[test]
-    fn summarizes_transitive_receiver_preservation_requirements() {
+    fn summarizes_transitive_receiver_preservation_requirements() -> TestResult {
         let source = r#"
             (function() {
                 const C = function() { this.value = 1; use(this); };
@@ -5619,9 +5631,11 @@ mod tests {
         let outer = summaries
             .iter()
             .find(|summary| summary.call_target.candidate.call.property == "outer")
-            .expect("preserving outer summary");
+            .test_value("preserving outer summary")?;
         assert_eq!(outer.required_own_data_fields, vec!["value"]);
         assert!(outer.standard_function_call_semantics_required);
+
+        Ok(())
     }
 
     #[test]
@@ -5789,7 +5803,7 @@ mod tests {
     }
 
     #[test]
-    fn propagates_already_proven_method_this_through_direct_calls() {
+    fn propagates_already_proven_method_this_through_direct_calls() -> TestResult {
         let source = r#"
             const C = function() { this.marker = 1; };
             C.prototype.run = function() { bridge(this); };
@@ -5808,17 +5822,19 @@ mod tests {
             structurally_proven_member_write_origins(&parsed.program, semantic.semantic.scoping())
                 .into_iter()
                 .find(|write| write.property.as_deref() == Some("marker"))
-                .expect("constructor-origin write");
+                .test_value("constructor-origin write")?;
         let method = structurally_proven_prototype_method_assignments(
             &parsed.program,
             semantic.semantic.scoping(),
         )
         .into_iter()
         .find(|method| method.property == "run")
-        .expect("run assignment");
-        let [function] = method.possible_functions.as_slice() else {
-            panic!("one run body");
-        };
+        .test_value("run assignment")?;
+        let function = match method.possible_functions.as_slice() {
+            [function] => Some(function),
+            _ => None,
+        }
+        .test_value("one run body")?;
         let seed = super::ProvenOriginContext {
             function_start: function.function_start,
             function_end: function.function_end,
@@ -5836,6 +5852,8 @@ mod tests {
         assert_eq!(flow.member_calls.len(), 1);
         assert_eq!(flow.member_calls[0].property, "finish");
         assert_eq!(flow.member_calls[0].context.parameter_indices, vec![0]);
+
+        Ok(())
     }
 
     #[test]
@@ -5892,8 +5910,13 @@ mod tests {
         );
         assert!(flow.exposures.iter().any(|exposure| {
             exposure.kind == "unresolved_member_call"
-                && &source[exposure.exposure_start as usize..exposure.exposure_end as usize]
-                    == "state[key]()"
+                && source_slice(
+                    source,
+                    exposure.exposure_start,
+                    exposure.exposure_end,
+                    "exposure span",
+                )
+                .is_ok_and(|text| text == "state[key]()")
         }));
     }
 
@@ -5977,7 +6000,7 @@ mod tests {
     }
 
     #[test]
-    fn proves_exact_own_data_field_value_at_nested_direct_call() {
+    fn proves_exact_own_data_field_value_at_nested_direct_call() -> TestResult {
         let source = r#"
             const C = function() { init(this); };
             function init(state) {
@@ -6005,11 +6028,10 @@ mod tests {
                 .direct_calls
                 .iter()
                 .find(|call| {
-                    source
-                        .get(call.call_start as usize..call.call_end as usize)
-                        .is_some_and(|call| call == "helper(state)")
+                    source_slice(source, call.call_start, call.call_end, "helper call span")
+                        .is_ok_and(|call| call == "helper(state)")
                 })
-                .expect("helper call must be in exact-origin flow");
+                .test_value("helper call must be in exact-origin flow")?;
             super::proven_exact_own_data_field_at_direct_call(
                 source,
                 &parsed.program,
@@ -6020,14 +6042,20 @@ mod tests {
         };
         assert!(proofs.iter().any(|proof| {
             proof.initialization.property == "cell"
-                && source
-                    .get(proof.direct_call.call_start as usize..proof.direct_call.call_end as usize)
-                    .is_some_and(|call| call == "helper(state)")
+                && source_slice(
+                    source,
+                    proof.direct_call.call_start,
+                    proof.direct_call.call_end,
+                    "direct call span",
+                )
+                .is_ok_and(|call| call == "helper(state)")
         }));
+
+        Ok(())
     }
 
     #[test]
-    fn exact_own_data_field_value_proves_direct_root_call() {
+    fn exact_own_data_field_value_proves_direct_root_call() -> TestResult {
         let source = r#"
             const C = function() {
                 this.cell = {};
@@ -6048,11 +6076,10 @@ mod tests {
             .direct_calls
             .iter()
             .find(|call| {
-                source
-                    .get(call.call_start as usize..call.call_end as usize)
-                    .is_some_and(|call| call == "helper(this)")
+                source_slice(source, call.call_start, call.call_end, "helper call span")
+                    .is_ok_and(|call| call == "helper(this)")
             })
-            .expect("helper call must be in exact-origin flow");
+            .test_value("helper call must be in exact-origin flow")?;
         let proofs = super::proven_exact_own_data_field_at_direct_call(
             source,
             &parsed.program,
@@ -6063,13 +6090,15 @@ mod tests {
         let proof = proofs
             .iter()
             .find(|proof| proof.initialization.property == "cell")
-            .expect("direct root proof");
+            .test_value("direct root proof")?;
         assert_eq!(proof.entry_call, *target);
         assert_eq!(proof.direct_call, *target);
+
+        Ok(())
     }
 
     #[test]
-    fn exact_own_data_field_value_rejects_nested_prior_write() {
+    fn exact_own_data_field_value_rejects_nested_prior_write() -> TestResult {
         let source = r#"
             const C = function() { init(this); };
             function init(state) {
@@ -6098,11 +6127,10 @@ mod tests {
                 .direct_calls
                 .iter()
                 .find(|call| {
-                    source
-                        .get(call.call_start as usize..call.call_end as usize)
-                        .is_some_and(|call| call == "helper(state)")
+                    source_slice(source, call.call_start, call.call_end, "helper call span")
+                        .is_ok_and(|call| call == "helper(state)")
                 })
-                .expect("helper call must be in exact-origin flow");
+                .test_value("helper call must be in exact-origin flow")?;
             super::proven_exact_own_data_field_at_direct_call(
                 source,
                 &parsed.program,
@@ -6113,10 +6141,16 @@ mod tests {
         };
         assert!(!proofs.iter().any(|proof| {
             proof.initialization.property == "cell"
-                && source
-                    .get(proof.direct_call.call_start as usize..proof.direct_call.call_end as usize)
-                    .is_some_and(|call| call == "helper(state)")
+                && source_slice(
+                    source,
+                    proof.direct_call.call_start,
+                    proof.direct_call.call_end,
+                    "direct call span",
+                )
+                .is_ok_and(|call| call == "helper(state)")
         }));
+
+        Ok(())
     }
 
     #[test]
@@ -6304,7 +6338,7 @@ mod tests {
     }
 
     #[test]
-    fn propagates_exact_origin_through_function_prototype_call() {
+    fn propagates_exact_origin_through_function_prototype_call() -> TestResult {
         let source = r#"
             const C = function() { bridge.call(this, 7); };
             function bridge(selector) { this.finish(); }
@@ -6318,7 +6352,7 @@ mod tests {
             .direct_calls
             .iter()
             .find(|call| call.standard_function_call_semantics_required)
-            .expect("Function.prototype.call edge");
+            .test_value("Function.prototype.call edge")?;
         assert!(edge.callee.this_origin);
         assert_eq!(edge.callee.parameter_indices, Vec::<usize>::new());
         assert_eq!(edge.exact_integer_arguments, vec![Some(7)]);
@@ -6327,6 +6361,8 @@ mod tests {
             .iter()
             .any(|call| { call.context == edge.callee && call.property == "finish" }));
         assert!(flow.exposures.is_empty());
+
+        Ok(())
     }
 
     #[test]
@@ -6347,7 +6383,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_call_records_static_final_sequence_argument_value() {
+    fn direct_call_records_static_final_sequence_argument_value() -> TestResult {
         let source = r#"
             const C = function() { helper(this, (unknown(), 47), null, true); };
             function helper(state, selector, nullable, flag) { state.done(); }
@@ -6361,15 +6397,17 @@ mod tests {
         let call = calls
             .iter()
             .find(|call| call.exact_integer_arguments.len() == 4)
-            .unwrap();
+            .test_value("four-argument direct call")?;
         assert_eq!(
             call.exact_integer_arguments,
             vec![None, Some(47), None, None]
         );
+
+        Ok(())
     }
 
     #[test]
-    fn propagates_constructor_this_through_direct_calls() {
+    fn propagates_constructor_this_through_direct_calls() -> TestResult {
         let source = r#"
             const C = function() { start(this); };
             function start(state) { bridge(state); }
@@ -6380,9 +6418,16 @@ mod tests {
         assert_eq!(proven.len(), 1);
         assert_eq!(proven[0].property, "run");
         assert_eq!(
-            &source[proven[0].receiver_start as usize..proven[0].receiver_end as usize],
+            source_slice(
+                source,
+                proven[0].receiver_start,
+                proven[0].receiver_end,
+                "receiver span",
+            )?,
             "state"
         );
+
+        Ok(())
     }
 
     #[test]
@@ -6437,7 +6482,7 @@ mod tests {
     }
 
     #[test]
-    fn propagates_exact_prototype_string_through_all_incoming_edges() {
+    fn propagates_exact_prototype_string_through_all_incoming_edges() -> TestResult {
         let source = r#"
             const C = function() { first(this); second(this); };
             C.prototype.factory = "create";
@@ -6453,8 +6498,10 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let assignment = prototype_strings(source).pop().expect("prototype string");
-        let allocation_start = source.find("new C()").expect("allocation") as u32;
+        let assignment = prototype_strings(source)
+            .pop()
+            .test_value("prototype string")?;
+        let allocation_start = source_offset(source, "new C()", "allocation")?;
         let string = proven_prototype_string_at_allocation(
             &parsed.program,
             &semantic.semantic,
@@ -6463,7 +6510,7 @@ mod tests {
             Span::new(allocation_start, allocation_start + 7),
             "factory",
         )
-        .expect("runtime string");
+        .test_value("runtime string")?;
         let calls = proven_prototype_string_at_direct_calls(
             source,
             &parsed.program,
@@ -6471,13 +6518,20 @@ mod tests {
             &string,
         );
         assert!(calls.iter().any(|proof| {
-            source[proof.call.call_start as usize..proof.call.call_end as usize]
-                .starts_with("sink(")
+            source_slice(
+                source,
+                proof.call.call_start,
+                proof.call.call_end,
+                "sink call span",
+            )
+            .is_ok_and(|call| call.starts_with("sink("))
         }));
+
+        Ok(())
     }
 
     #[test]
-    fn exact_prototype_string_join_rejects_one_mutating_incoming_path() {
+    fn exact_prototype_string_join_rejects_one_mutating_incoming_path() -> TestResult {
         let source = r#"
             const C = function() { clean(this); dirty(this); };
             C.prototype.factory = "create";
@@ -6493,8 +6547,10 @@ mod tests {
             .with_build_nodes(true)
             .with_cfg(true)
             .build(&parsed.program);
-        let assignment = prototype_strings(source).pop().expect("prototype string");
-        let allocation_start = source.find("new C()").expect("allocation") as u32;
+        let assignment = prototype_strings(source)
+            .pop()
+            .test_value("prototype string")?;
+        let allocation_start = source_offset(source, "new C()", "allocation")?;
         let string = proven_prototype_string_at_allocation(
             &parsed.program,
             &semantic.semantic,
@@ -6503,7 +6559,7 @@ mod tests {
             Span::new(allocation_start, allocation_start + 7),
             "factory",
         )
-        .expect("runtime string");
+        .test_value("runtime string")?;
         let calls = proven_prototype_string_at_direct_calls(
             source,
             &parsed.program,
@@ -6511,13 +6567,20 @@ mod tests {
             &string,
         );
         assert!(!calls.iter().any(|proof| {
-            source[proof.call.call_start as usize..proof.call.call_end as usize]
-                .starts_with("sink(")
+            source_slice(
+                source,
+                proof.call.call_start,
+                proof.call.call_end,
+                "sink call span",
+            )
+            .is_ok_and(|call| call.starts_with("sink("))
         }));
+
+        Ok(())
     }
 
     #[test]
-    fn exact_property_preservation_allows_other_static_writes() {
+    fn exact_property_preservation_allows_other_static_writes() -> TestResult {
         let source = r#"
             const C = function() { helper(this); };
             function helper(state) { state.other = 2; }
@@ -6530,7 +6593,7 @@ mod tests {
             structurally_proven_origin_direct_calls(&parsed.program, semantic.semantic.scoping())
                 .into_iter()
                 .next()
-                .expect("direct origin call");
+                .test_value("direct origin call")?;
         assert!(proven_origin_direct_call_preserves_exact_property(
             source,
             &parsed.program,
@@ -6538,10 +6601,12 @@ mod tests {
             &call,
             "token",
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn exact_property_preservation_rejects_same_property_assignment() {
+    fn exact_property_preservation_rejects_same_property_assignment() -> TestResult {
         let source = r#"
             const C = function() { helper(this); };
             function helper(state) { state.token = "changed"; }
@@ -6554,7 +6619,7 @@ mod tests {
             structurally_proven_origin_direct_calls(&parsed.program, semantic.semantic.scoping())
                 .into_iter()
                 .next()
-                .expect("direct origin call");
+                .test_value("direct origin call")?;
         assert!(proven_origin_direct_call_preserves_own_field(
             source,
             &parsed.program,
@@ -6569,6 +6634,8 @@ mod tests {
             &call,
             "token",
         ));
+
+        Ok(())
     }
 
     #[test]
@@ -6663,7 +6730,7 @@ mod tests {
     }
 
     #[test]
-    fn proves_iife_method_phase_closure_and_event_value() {
+    fn proves_iife_method_phase_closure_and_event_value() -> TestResult {
         let source = r#"
             const C = function() {};
             let phase;
@@ -6694,7 +6761,7 @@ mod tests {
         assert_eq!(closures[0].property, "run");
         assert_eq!(closures[0].equal_value, 23);
         assert_eq!(closures[0].unequal_value, 50);
-        let event_start = source.find("event()").expect("event") as u32;
+        let event_start = source_offset(source, "event()", "event")?;
         let phase = super::proven_prototype_method_phase_at_event(
             source,
             &parsed.program,
@@ -6702,8 +6769,10 @@ mod tests {
             &closures[0],
             Span::new(event_start, event_start + 7),
         )
-        .expect("phase at event");
+        .test_value("phase at event")?;
         assert_eq!(phase.value, 23);
+
+        Ok(())
     }
 
     #[test]
@@ -6770,7 +6839,7 @@ mod tests {
     }
 
     #[test]
-    fn proves_straight_line_prototype_alias_iife_method() {
+    fn proves_straight_line_prototype_alias_iife_method() -> TestResult {
         let source = r#"
             const C = function() {};
             var p;
@@ -6783,11 +6852,15 @@ mod tests {
         assert_eq!(proven.len(), 1);
         assert_eq!(proven[0].property, "run");
         assert!(proven[0].standard_prototype_semantics_required);
-        assert!(
-            source[proven[0].possible_functions[0].function_start as usize
-                ..proven[0].possible_functions[0].function_end as usize]
-                .starts_with("function(value)")
-        );
+        assert!(source_slice(
+            source,
+            proven[0].possible_functions[0].function_start,
+            proven[0].possible_functions[0].function_end,
+            "method function span",
+        )?
+        .starts_with("function(value)"));
+
+        Ok(())
     }
 
     #[test]
@@ -7056,7 +7129,7 @@ mod tests {
     }
 
     #[test]
-    fn records_exact_origin_effects_in_evaluation_order() {
+    fn records_exact_origin_effects_in_evaluation_order() -> TestResult {
         let source = r#"
             const C = function() {
                 this.n0 = (this.T = [], 1);
@@ -7072,19 +7145,21 @@ mod tests {
             .member_writes
             .iter()
             .find(|write| write.property.as_deref() == Some("T"))
-            .unwrap();
+            .test_value("T member write")?;
         let n0 = flow
             .member_writes
             .iter()
             .find(|write| write.property.as_deref() == Some("n0"))
-            .unwrap();
+            .test_value("n0 member write")?;
         let exposure = flow
             .exposures
             .iter()
             .find(|exposure| exposure.kind == "call_argument")
-            .unwrap();
+            .test_value("call-argument exposure")?;
         assert!(t.evaluation_order < n0.evaluation_order);
         assert!(n0.evaluation_order < exposure.evaluation_order);
+
+        Ok(())
     }
 
     #[test]
