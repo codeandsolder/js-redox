@@ -253,6 +253,7 @@ pub fn normalize_integer_polynomial(
 #[cfg(test)]
 mod tests {
     use super::{normalize_integer_polynomial, IntegerPolynomial};
+    use crate::test_support::{TestResult, TestValue};
     use oxc_allocator::Allocator;
     use oxc_ast::{ast::Statement, AstKind};
     use oxc_ast_visit::Visit;
@@ -290,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn reduces_selector_polynomial_to_captured_slot() {
+    fn reduces_selector_polynomial_to_captured_slot() -> TestResult {
         let source = r#"
             function f(v, T, H, q, U) {
                 return 6 + (q() | 0) * T - T * H + 61 * H * H
@@ -309,34 +310,49 @@ mod tests {
             symbols: HashMap::new(),
         };
         probe.visit_program(&parsed.program);
-        let v = probe.symbols["v"];
-        let h = probe.symbols["H"];
+        let v = probe.symbols.get("v").copied().test_value("v symbol")?;
+        let h = probe.symbols.get("H").copied().test_value("H symbol")?;
         let v_poly = IntegerPolynomial::variable(v);
         let h_poly = IntegerPolynomial::constant(5)
             .mul(&v_poly)
             .and_then(|p| p.mul(&v_poly))
             .and_then(|p| p.sub(&IntegerPolynomial::constant(39).mul(&v_poly)?))
             .and_then(|p| p.add(&IntegerPolynomial::constant(23)))
-            .expect("seed polynomial");
+            .test_value("seed polynomial")?;
         let bindings = HashMap::from([(h, h_poly)]);
         let mut constants = HashMap::new();
-        constants.insert(probe.calls[0], 23);
-        constants.insert(probe.members[0], -39);
-        let Statement::FunctionDeclaration(function) = &parsed.program.body[0] else {
-            panic!("function declaration");
-        };
-        let body = function.body.as_ref().expect("function body");
-        let Statement::ReturnStatement(ret) = &body.statements[0] else {
-            panic!("return statement");
-        };
+        constants.insert(probe.calls.first().copied().test_value("call span")?, 23);
+        constants.insert(
+            probe.members.first().copied().test_value("member span")?,
+            -39,
+        );
+        let function = parsed
+            .program
+            .body
+            .first()
+            .and_then(|statement| match statement {
+                Statement::FunctionDeclaration(function) => Some(function),
+                _ => None,
+            })
+            .test_value("function declaration")?;
+        let body = function.body.as_ref().test_value("function body")?;
+        let ret = body
+            .statements
+            .first()
+            .and_then(|statement| match statement {
+                Statement::ReturnStatement(ret) => Some(ret),
+                _ => None,
+            })
+            .test_value("return statement")?;
         let polynomial = normalize_integer_polynomial(
-            ret.argument.as_ref().expect("return expression"),
+            ret.argument.as_ref().test_value("return expression")?,
             semantic.semantic.scoping(),
             &bindings,
             &constants,
             &HashSet::new(),
         )
-        .expect("supported polynomial");
+        .test_value("supported polynomial")?;
         assert_eq!(polynomial.constant_value(), Some(6));
+        Ok(())
     }
 }

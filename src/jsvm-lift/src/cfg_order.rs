@@ -402,6 +402,7 @@ mod tests {
         prove_event_before_barriers, prove_event_completion_before_event,
         prove_event_completion_before_nested_event, prove_events_before_event,
     };
+    use crate::test_support::{source_slice, TestFailure, TestResult, TestValue};
     use oxc_allocator::Allocator;
     use oxc_ast::{ast::Program, AstKind};
     use oxc_semantic::{Semantic, SemanticBuilder};
@@ -418,7 +419,7 @@ mod tests {
         ret.semantic
     }
 
-    fn call_span(semantic: &Semantic<'_>, source: &str, needle: &str) -> Span {
+    fn call_span(semantic: &Semantic<'_>, source: &str, needle: &str) -> Result<Span, TestFailure> {
         semantic
             .nodes()
             .iter()
@@ -426,11 +427,18 @@ mod tests {
                 AstKind::CallExpression(call) => Some(call.span),
                 _ => None,
             })
-            .find(|span| &source[span.start as usize..span.end as usize] == needle)
-            .unwrap_or_else(|| panic!("missing call {needle}"))
+            .find(|span| {
+                source_slice(source, span.start, span.end, "call span")
+                    .is_ok_and(|text| text == needle)
+            })
+            .test_value("matching call span")
     }
 
-    fn assignment_span(semantic: &Semantic<'_>, source: &str, needle: &str) -> Span {
+    fn assignment_span(
+        semantic: &Semantic<'_>,
+        source: &str,
+        needle: &str,
+    ) -> Result<Span, TestFailure> {
         semantic
             .nodes()
             .iter()
@@ -438,213 +446,254 @@ mod tests {
                 AstKind::AssignmentExpression(assignment) => Some(assignment.span),
                 _ => None,
             })
-            .find(|span| &source[span.start as usize..span.end as usize] == needle)
-            .unwrap_or_else(|| panic!("missing assignment {needle}"))
+            .find(|span| {
+                source_slice(source, span.start, span.end, "assignment span")
+                    .is_ok_and(|text| text == needle)
+            })
+            .test_value("matching assignment span")
     }
 
-    fn prove(source: &str, event: &str, barriers: &[&str]) -> bool {
+    fn prove(source: &str, event: &str, barriers: &[&str]) -> Result<bool, TestFailure> {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
         let semantic = semantic(&parsed.program);
-        let event = call_span(&semantic, source, event);
+        let event = call_span(&semantic, source, event)?;
         let barriers = barriers
             .iter()
             .map(|barrier| call_span(&semantic, source, barrier))
-            .collect::<Vec<_>>();
-        prove_event_before_barriers(&semantic, event, &barriers)
+            .collect::<Result<Vec<_>, TestFailure>>()?;
+        Ok(prove_event_before_barriers(&semantic, event, &barriers))
     }
 
     #[test]
-    fn sequence_completion_orders_later_barrier_across_loop_backedge() {
+    fn sequence_completion_orders_later_barrier_across_loop_backedge() -> TestResult {
         let source = "function f() { for (;;) { event(), barrier(); if (stop) break; } }";
-        assert!(prove(source, "event()", &["barrier()"]));
+        assert!(prove(source, "event()", &["barrier()"])?);
+
+        Ok(())
     }
 
     #[test]
-    fn sequence_completion_rejects_earlier_barrier() {
+    fn sequence_completion_rejects_earlier_barrier() -> TestResult {
         let source = "function f() { for (;;) { barrier(), event(); if (stop) break; } }";
-        assert!(!prove(source, "event()", &["barrier()"]));
+        assert!(!prove(source, "event()", &["barrier()"])?);
+
+        Ok(())
     }
 
     #[test]
-    fn sequence_completion_rejects_conditionally_skipped_event_item() {
+    fn sequence_completion_rejects_conditionally_skipped_event_item() -> TestResult {
         let source = "function f() { for (;;) { (flag && event()), barrier(); if (stop) break; } }";
-        assert!(!prove(source, "event()", &["barrier()"]));
+        assert!(!prove(source, "event()", &["barrier()"])?);
+
+        Ok(())
     }
 
     #[test]
-    fn proves_completed_assignment_before_later_event() {
+    fn proves_completed_assignment_before_later_event() -> TestResult {
         let source = "function f() { state.value = 1; target(); }";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = semantic(&parsed.program);
-        let assignment = assignment_span(&semantic, source, "state.value = 1");
-        let target = call_span(&semantic, source, "target()");
+        let assignment = assignment_span(&semantic, source, "state.value = 1")?;
+        let target = call_span(&semantic, source, "target()")?;
         assert!(prove_event_completion_before_event(
             &semantic, assignment, target
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn completed_event_rejects_enclosing_try() {
+    fn completed_event_rejects_enclosing_try() -> TestResult {
         let source = "function f() { try { state.value = explode(); } catch (_) {} target(); }";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = semantic(&parsed.program);
-        let assignment = assignment_span(&semantic, source, "state.value = explode()");
-        let target = call_span(&semantic, source, "target()");
+        let assignment = assignment_span(&semantic, source, "state.value = explode()")?;
+        let target = call_span(&semantic, source, "target()")?;
         assert!(!prove_event_completion_before_event(
             &semantic, assignment, target
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn proves_completed_event_before_nested_function_expression_execution() {
+    fn proves_completed_event_before_nested_function_expression_execution() -> TestResult {
         let source =
             "function outer() { proto.run = function() {}; holder.f = function() { target(); }; }";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = semantic(&parsed.program);
-        let install = assignment_span(&semantic, source, "proto.run = function() {}");
-        let target = call_span(&semantic, source, "target()");
+        let install = assignment_span(&semantic, source, "proto.run = function() {}")?;
+        let target = call_span(&semantic, source, "target()")?;
         assert!(prove_event_completion_before_nested_event(
             &semantic, install, target
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn nested_completion_rejects_function_declaration_bridge() {
+    fn nested_completion_rejects_function_declaration_bridge() -> TestResult {
         let source =
             "function outer() { proto.run = function() {}; function later() { target(); } }";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = semantic(&parsed.program);
-        let install = assignment_span(&semantic, source, "proto.run = function() {}");
-        let target = call_span(&semantic, source, "target()");
+        let install = assignment_span(&semantic, source, "proto.run = function() {}")?;
+        let target = call_span(&semantic, source, "target()")?;
         assert!(!prove_event_completion_before_nested_event(
             &semantic, install, target
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn nested_completion_rejects_function_value_created_before_required_event() {
+    fn nested_completion_rejects_function_value_created_before_required_event() -> TestResult {
         let source =
             "function outer() { holder.f = function() { target(); }; proto.run = function() {}; }";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = semantic(&parsed.program);
-        let install = assignment_span(&semantic, source, "proto.run = function() {}");
-        let target = call_span(&semantic, source, "target()");
+        let install = assignment_span(&semantic, source, "proto.run = function() {}")?;
+        let target = call_span(&semantic, source, "target()")?;
         assert!(!prove_event_completion_before_nested_event(
             &semantic, install, target
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn proves_required_event_before_target() {
+    fn proves_required_event_before_target() -> TestResult {
         let source = "function f() { init(); target(); }";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = semantic(&parsed.program);
-        let init = call_span(&semantic, source, "init()");
-        let target = call_span(&semantic, source, "target()");
+        let init = call_span(&semantic, source, "init()")?;
+        let target = call_span(&semantic, source, "target()")?;
         assert!(prove_events_before_event(&semantic, &[init], target));
+
+        Ok(())
     }
 
     #[test]
-    fn proves_required_event_before_target_inside_loop() {
+    fn proves_required_event_before_target_inside_loop() -> TestResult {
         let source = "function f(flag) { while (flag) { init(); target(); } }";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = semantic(&parsed.program);
-        let init = call_span(&semantic, source, "init()");
-        let target = call_span(&semantic, source, "target()");
+        let init = call_span(&semantic, source, "init()")?;
+        let target = call_span(&semantic, source, "target()")?;
         assert!(prove_events_before_event(&semantic, &[init], target));
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_target_before_required_event_inside_loop() {
+    fn rejects_target_before_required_event_inside_loop() -> TestResult {
         let source = "function f(flag) { while (flag) { target(); init(); } }";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = semantic(&parsed.program);
-        let init = call_span(&semantic, source, "init()");
-        let target = call_span(&semantic, source, "target()");
+        let init = call_span(&semantic, source, "init()")?;
+        let target = call_span(&semantic, source, "target()")?;
         assert!(!prove_events_before_event(&semantic, &[init], target));
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_optional_required_event_before_target() {
+    fn rejects_optional_required_event_before_target() -> TestResult {
         let source = "function f(flag) { if (flag) init(); target(); }";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = semantic(&parsed.program);
-        let init = call_span(&semantic, source, "init()");
-        let target = call_span(&semantic, source, "target()");
+        let init = call_span(&semantic, source, "init()")?;
+        let target = call_span(&semantic, source, "target()")?;
         assert!(!prove_events_before_event(&semantic, &[init], target));
+
+        Ok(())
     }
 
     #[test]
-    fn proves_straight_line_event_before_later_barrier() {
+    fn proves_straight_line_event_before_later_barrier() -> TestResult {
         assert!(prove(
             "function f() { target(); barrier(); }",
             "target()",
             &["barrier()"]
-        ));
+        )?);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_straight_line_barrier_before_event() {
+    fn rejects_straight_line_barrier_before_event() -> TestResult {
         assert!(!prove(
             "function f() { barrier(); target(); }",
             "target()",
             &["barrier()"]
-        ));
+        )?);
+
+        Ok(())
     }
 
     #[test]
-    fn proves_mutually_exclusive_barrier_cannot_precede_event() {
+    fn proves_mutually_exclusive_barrier_cannot_precede_event() -> TestResult {
         assert!(prove(
             "function f(flag) { if (flag) { barrier(); } else { target(); } }",
             "target()",
             &["barrier()"]
-        ));
+        )?);
+
+        Ok(())
     }
 
     #[test]
-    fn proves_mutually_exclusive_switch_case_barrier_cannot_precede_event() {
+    fn proves_mutually_exclusive_switch_case_barrier_cannot_precede_event() -> TestResult {
         assert!(prove(
             "function f(value) { switch (value) { case 1: barrier(); break; case 2: target(); break; default: break; } }",
             "target()",
             &["barrier()"]
-        ));
+        )?);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_relevant_loop_backedge() {
+    fn rejects_relevant_loop_backedge() -> TestResult {
         assert!(!prove(
             "function f(flag) { while (flag) { barrier(); flag = false; } target(); }",
             "target()",
             &["barrier()"]
-        ));
+        )?);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_optional_barrier_that_can_precede_event() {
+    fn rejects_optional_barrier_that_can_precede_event() -> TestResult {
         assert!(!prove(
             "function f(flag) { if (flag) barrier(); target(); }",
             "target()",
             &["barrier()"]
-        ));
+        )?);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_barrier_from_nested_function() {
+    fn rejects_barrier_from_nested_function() -> TestResult {
         assert!(!prove(
             "function f() { function nested() { barrier(); } target(); }",
             "target()",
             &["barrier()"]
-        ));
+        )?);
+
+        Ok(())
     }
 }
