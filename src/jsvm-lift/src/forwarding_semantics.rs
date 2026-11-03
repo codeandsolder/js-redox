@@ -233,12 +233,6 @@ impl<'a> Visit<'a> for ArgumentsBoxCollector {
     }
 }
 
-fn argument_box_declarations(body: &FunctionBody<'_>) -> HashMap<SymbolId, u32> {
-    let mut collector = ArgumentsBoxCollector::default();
-    collector.visit_function_body(body);
-    collector.boxes
-}
-
 fn argument_box_declarations_budgeted(
     body: &FunctionBody<'_>,
     budget: &WorkBudget,
@@ -252,10 +246,6 @@ fn argument_box_declarations_budgeted(
         poller.finish()?;
     }
     Ok(collector.boxes)
-}
-
-fn argument_boxes(body: &FunctionBody<'_>) -> HashSet<SymbolId> {
-    argument_box_declarations(body).into_keys().collect()
 }
 
 fn argument_boxes_budgeted(
@@ -477,23 +467,27 @@ impl<'a> Visit<'a> for ArgumentRoleSafety<'_, '_> {
     }
 }
 
-fn argument_roles_are_stable(
+fn argument_roles_are_stable_budgeted(
     scoping: &Scoping,
     body: &FunctionBody<'_>,
     parameters: &[SymbolId],
     boxes: &HashSet<SymbolId>,
-) -> bool {
-    let declarations = argument_box_declarations(body);
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    let declarations = argument_box_declarations_budgeted(body, budget)?;
     let mut safety = ArgumentRoleSafety {
         scoping,
         parameters: parameters.iter().copied().collect(),
         boxes,
         declarations,
         valid: true,
-        poller: None,
+        poller: Some(BudgetPoller::new(budget, 256)),
     };
     safety.visit_function_body(body);
-    safety.valid
+    if let Some(poller) = safety.poller.as_mut() {
+        poller.finish()?;
+    }
+    Ok(safety.valid)
 }
 
 fn selected_argument_roles_are_stable_budgeted(
@@ -827,9 +821,17 @@ struct SetterProbe<'c, 'o, 'b> {
     inner_boxes: HashSet<SymbolId>,
     good_writes: usize,
     bad_writes: usize,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for SetterProbe<'_, '_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
         if assignment_is_forwarded_member(
             self.scoping,
@@ -870,22 +872,23 @@ fn setter_forwards(
     target: &ExprKey,
     outer_parameters: &[SymbolId],
     outer_boxes: &HashSet<SymbolId>,
-) -> bool {
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
     if function.r#async || function.generator {
-        return false;
+        return Ok(false);
     }
     let Some(parameters) = parameter_symbols(function) else {
-        return false;
+        return Ok(false);
     };
     if parameters.len() != 1 {
-        return false;
+        return Ok(false);
     }
     let Some(body) = &function.body else {
-        return false;
+        return Ok(false);
     };
-    let boxes = argument_boxes(body);
-    if !argument_roles_are_stable(scoping, body, &parameters, &boxes) {
-        return false;
+    let boxes = argument_boxes_budgeted(body, budget)?;
+    if !argument_roles_are_stable_budgeted(scoping, body, &parameters, &boxes, budget)? {
+        return Ok(false);
     }
     let mut probe = SetterProbe {
         scoping,
@@ -896,9 +899,11 @@ fn setter_forwards(
         inner_boxes: boxes,
         good_writes: 0,
         bad_writes: 0,
+        poller: BudgetPoller::new(budget, 256),
     };
     probe.visit_function_body(body);
-    probe.good_writes == 1 && probe.bad_writes == 0
+    probe.poller.finish()?;
+    Ok(probe.good_writes == 1 && probe.bad_writes == 0)
 }
 
 struct GetterProbe<'c, 'o, 'b> {
@@ -908,9 +913,17 @@ struct GetterProbe<'c, 'o, 'b> {
     outer_boxes: &'b HashSet<SymbolId>,
     returns: usize,
     invalid: bool,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for GetterProbe<'_, '_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
     fn visit_return_statement(&mut self, statement: &oxc_ast::ast::ReturnStatement<'a>) {
         self.returns += 1;
         let Some(expression) = &statement.argument else {
@@ -943,12 +956,13 @@ fn getter_forwards(
     target: &ExprKey,
     outer_parameters: &[SymbolId],
     outer_boxes: &HashSet<SymbolId>,
-) -> bool {
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
     if function.r#async || function.generator || !function.params.items.is_empty() {
-        return false;
+        return Ok(false);
     }
     let Some(body) = &function.body else {
-        return false;
+        return Ok(false);
     };
     let mut probe = GetterProbe {
         scoping,
@@ -957,9 +971,11 @@ fn getter_forwards(
         outer_boxes,
         returns: 0,
         invalid: false,
+        poller: BudgetPoller::new(budget, 256),
     };
     probe.visit_function_body(body);
-    probe.returns == 1 && !probe.invalid
+    probe.poller.finish()?;
+    Ok(probe.returns == 1 && !probe.invalid)
 }
 
 fn is_object_constructor(
@@ -1032,6 +1048,9 @@ struct HelperProbe<'c> {
     define_pairs: Vec<PairEvidence>,
     strings: HashMap<ExprKey, String>,
     branch_path: BranchPath,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
 }
 
 impl HelperProbe<'_> {
@@ -1127,7 +1146,24 @@ impl HelperProbe<'_> {
 }
 
 impl<'a> Visit<'a> for HelperProbe<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if self.budget_error.is_some() {
+            return;
+        }
         self.record_string_assignment(assignment);
 
         if assignment.operator.as_str() == "=" {
@@ -1187,30 +1223,37 @@ impl<'a> Visit<'a> for HelperProbe<'_> {
                                 path: self.branch_path.clone(),
                                 start: assignment.span.start,
                             };
-                            match member.property.name.as_str() {
-                                "set"
-                                    if setter_forwards(
-                                        self.scoping,
-                                        function,
-                                        target,
-                                        &self.parameters,
-                                        &self.boxes,
-                                    ) =>
-                                {
+                            let forwarding = match member.property.name.as_str() {
+                                "set" => setter_forwards(
+                                    self.scoping,
+                                    function,
+                                    target,
+                                    &self.parameters,
+                                    &self.boxes,
+                                    &self.budget,
+                                ),
+                                "get" => getter_forwards(
+                                    self.scoping,
+                                    function,
+                                    target,
+                                    &self.parameters,
+                                    &self.boxes,
+                                    &self.budget,
+                                ),
+                                _ => Ok(false),
+                            };
+                            match forwarding {
+                                Ok(true) if member.property.name.as_str() == "set" => {
                                     self.setter_pairs.push(evidence);
                                 }
-                                "get"
-                                    if getter_forwards(
-                                        self.scoping,
-                                        function,
-                                        target,
-                                        &self.parameters,
-                                        &self.boxes,
-                                    ) =>
-                                {
+                                Ok(true) if member.property.name.as_str() == "get" => {
                                     self.getter_pairs.push(evidence);
                                 }
-                                _ => {}
+                                Ok(_) => {}
+                                Err(error) => {
+                                    self.budget_error = Some(error);
+                                    return;
+                                }
                             }
                         }
                     }
@@ -1222,6 +1265,9 @@ impl<'a> Visit<'a> for HelperProbe<'_> {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if self.budget_error.is_some() {
+            return;
+        }
         if !call.optional
             && call.arguments.len() == 3
             && self.callee_is_define_property(&call.callee)
@@ -1248,6 +1294,9 @@ impl<'a> Visit<'a> for HelperProbe<'_> {
     }
 
     fn visit_if_statement(&mut self, statement: &IfStatement<'a>) {
+        if self.budget_error.is_some() {
+            return;
+        }
         walk::walk_expression(self, &statement.test);
         let base_strings = self.strings.clone();
         let marker = statement.span.start;
@@ -1282,18 +1331,57 @@ impl<'a> Visit<'a> for HelperProbe<'_> {
 struct HelperCollector<'c> {
     scoping: &'c Scoping,
     helpers: HashSet<SymbolId>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
 }
 
 impl<'a> Visit<'a> for HelperCollector<'_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if self.budget_error.is_some() {
+            return;
+        }
         if !function.r#async && !function.generator {
             if let (Some(identifier), Some(body), Some(parameters)) =
                 (&function.id, &function.body, parameter_symbols(function))
             {
                 if parameters.len() == 5 {
                     if let Some(symbol) = identifier.symbol_id.get() {
-                        let boxes = argument_boxes(body);
-                        if !argument_roles_are_stable(self.scoping, body, &parameters, &boxes) {
+                        let boxes = match argument_boxes_budgeted(body, &self.budget) {
+                            Ok(boxes) => boxes,
+                            Err(error) => {
+                                self.budget_error = Some(error);
+                                return;
+                            }
+                        };
+                        let stable = match argument_roles_are_stable_budgeted(
+                            self.scoping,
+                            body,
+                            &parameters,
+                            &boxes,
+                            &self.budget,
+                        ) {
+                            Ok(stable) => stable,
+                            Err(error) => {
+                                self.budget_error = Some(error);
+                                return;
+                            }
+                        };
+                        if !stable {
                             walk::walk_function(self, function, flags);
                             return;
                         }
@@ -1309,8 +1397,19 @@ impl<'a> Visit<'a> for HelperCollector<'_> {
                             define_pairs: Vec::new(),
                             strings: HashMap::new(),
                             branch_path: Vec::new(),
+                            budget: self.budget.clone(),
+                            poller: BudgetPoller::new(&self.budget, 256),
+                            budget_error: None,
                         };
                         probe.visit_function_body(body);
+                        if let Err(error) = probe.poller.finish() {
+                            self.budget_error = Some(error);
+                            return;
+                        }
+                        if let Some(error) = probe.budget_error.take() {
+                            self.budget_error = Some(error);
+                            return;
+                        }
                         if probe.proven() {
                             self.helpers.insert(symbol);
                         }
@@ -1322,16 +1421,28 @@ impl<'a> Visit<'a> for HelperCollector<'_> {
     }
 }
 
-fn only_unconditional_statements(statements: &[Statement<'_>]) -> bool {
-    statements.iter().all(|statement| match statement {
-        Statement::BlockStatement(block) => only_unconditional_statements(&block.body),
-        Statement::VariableDeclaration(_)
-        | Statement::ExpressionStatement(_)
-        | Statement::ReturnStatement(_)
-        | Statement::EmptyStatement(_)
-        | Statement::DebuggerStatement(_) => true,
-        _ => false,
-    })
+fn only_unconditional_statements_budgeted(
+    statements: &[Statement<'_>],
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    for statement in statements {
+        budget.consume(1)?;
+        let valid = match statement {
+            Statement::BlockStatement(block) => {
+                only_unconditional_statements_budgeted(&block.body, budget)?
+            }
+            Statement::VariableDeclaration(_)
+            | Statement::ExpressionStatement(_)
+            | Statement::ReturnStatement(_)
+            | Statement::EmptyStatement(_)
+            | Statement::DebuggerStatement(_) => true,
+            _ => false,
+        };
+        if !valid {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 struct DelegateProbe<'c, 'h> {
@@ -1340,9 +1451,17 @@ struct DelegateProbe<'c, 'h> {
     parameters: Vec<SymbolId>,
     boxes: HashSet<SymbolId>,
     matches: usize,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for DelegateProbe<'_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         let Expression::Identifier(callee) = last_sequence_expression(&call.callee) else {
             walk::walk_call_expression(self, call);
@@ -1386,21 +1505,54 @@ struct InstallerCollector<'c, 'h> {
     scoping: &'c Scoping,
     helpers: &'h HashSet<SymbolId>,
     installers: HashSet<SymbolId>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
 }
 
 impl InstallerCollector<'_, '_> {
     fn analyze_function(&mut self, symbol: SymbolId, function: &Function<'_>) {
-        if function.r#async || function.generator {
+        if self.budget_error.is_some() || function.r#async || function.generator {
             return;
         }
         let (Some(body), Some(parameters)) = (&function.body, parameter_symbols(function)) else {
             return;
         };
-        if parameters.len() != 4 || !only_unconditional_statements(&body.statements) {
+        if parameters.len() != 4 {
             return;
         }
-        let boxes = argument_boxes(body);
-        if !argument_roles_are_stable(self.scoping, body, &parameters, &boxes) {
+        let unconditional =
+            match only_unconditional_statements_budgeted(&body.statements, &self.budget) {
+                Ok(unconditional) => unconditional,
+                Err(error) => {
+                    self.budget_error = Some(error);
+                    return;
+                }
+            };
+        if !unconditional {
+            return;
+        }
+        let boxes = match argument_boxes_budgeted(body, &self.budget) {
+            Ok(boxes) => boxes,
+            Err(error) => {
+                self.budget_error = Some(error);
+                return;
+            }
+        };
+        let stable = match argument_roles_are_stable_budgeted(
+            self.scoping,
+            body,
+            &parameters,
+            &boxes,
+            &self.budget,
+        ) {
+            Ok(stable) => stable,
+            Err(error) => {
+                self.budget_error = Some(error);
+                return;
+            }
+        };
+        if !stable {
             return;
         }
         let mut probe = DelegateProbe {
@@ -1409,8 +1561,13 @@ impl InstallerCollector<'_, '_> {
             parameters,
             boxes,
             matches: 0,
+            poller: BudgetPoller::new(&self.budget, 256),
         };
         probe.visit_function_body(body);
+        if let Err(error) = probe.poller.finish() {
+            self.budget_error = Some(error);
+            return;
+        }
         if probe.matches == 1 {
             self.installers.insert(symbol);
         }
@@ -1418,7 +1575,24 @@ impl InstallerCollector<'_, '_> {
 }
 
 impl<'a> Visit<'a> for InstallerCollector<'_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if self.budget_error.is_some() {
+            return;
+        }
         if let Some(symbol) = function
             .id
             .as_ref()
@@ -1426,10 +1600,15 @@ impl<'a> Visit<'a> for InstallerCollector<'_, '_> {
         {
             self.analyze_function(symbol, function);
         }
-        walk::walk_function(self, function, flags);
+        if self.budget_error.is_none() {
+            walk::walk_function(self, function, flags);
+        }
     }
 
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        if self.budget_error.is_some() {
+            return;
+        }
         for declarator in &declaration.declarations {
             let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
                 continue;
@@ -1441,6 +1620,9 @@ impl<'a> Visit<'a> for InstallerCollector<'_, '_> {
                 continue;
             };
             self.analyze_function(symbol, function);
+            if self.budget_error.is_some() {
+                return;
+            }
         }
         walk::walk_variable_declaration(self, declaration);
     }
@@ -3213,23 +3395,38 @@ pub fn structurally_proven_registry_forwarding_calls(
     Ok(calls.calls)
 }
 
-#[must_use]
 pub fn structurally_proven_forwarding_installers(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> HashSet<SymbolId> {
+    budget: &WorkBudget,
+) -> Result<HashSet<SymbolId>, BudgetExceeded> {
+    budget.checkpoint()?;
     let mut helpers = HelperCollector {
         scoping,
         helpers: HashSet::new(),
+        budget: budget.clone(),
+        poller: BudgetPoller::new(budget, 256),
+        budget_error: None,
     };
     helpers.visit_program(program);
+    helpers.poller.finish()?;
+    if let Some(error) = helpers.budget_error.take() {
+        return Err(error);
+    }
     let mut installers = InstallerCollector {
         scoping,
         helpers: &helpers.helpers,
         installers: HashSet::new(),
+        budget: budget.clone(),
+        poller: BudgetPoller::new(budget, 256),
+        budget_error: None,
     };
     installers.visit_program(program);
-    installers.installers
+    installers.poller.finish()?;
+    if let Some(error) = installers.budget_error.take() {
+        return Err(error);
+    }
+    Ok(installers.installers)
 }
 
 #[cfg(test)]
@@ -3250,7 +3447,7 @@ mod tests {
         WorkBudget::unlimited("forwarding-test")
     }
 
-    fn proven_count(source: &str) -> usize {
+    fn proven_count(source: &str) -> Result<usize, TestFailure> {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -3258,8 +3455,13 @@ mod tests {
             .with_check_syntax_error(true)
             .build(&parsed.program);
         assert!(semantic_ret.diagnostics.is_empty());
-        structurally_proven_forwarding_installers(&parsed.program, semantic_ret.semantic.scoping())
-            .len()
+        structurally_proven_forwarding_installers(
+            &parsed.program,
+            semantic_ret.semantic.scoping(),
+            &test_budget(),
+        )
+        .map(|installers| installers.len())
+        .test_value("forwarding installer proof")
     }
 
     fn registry_calls(
@@ -3862,7 +4064,7 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 1);
+        assert_eq!(proven_count(source)?, 1);
 
         Ok(())
     }
@@ -3887,7 +4089,7 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             }
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
 
         Ok(())
     }
@@ -3910,7 +4112,7 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
 
         Ok(())
     }
@@ -3934,7 +4136,7 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
 
         Ok(())
     }
@@ -3958,7 +4160,7 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
 
         Ok(())
     }
@@ -3982,7 +4184,7 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
 
         Ok(())
     }
@@ -4006,7 +4208,7 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
 
         Ok(())
     }
@@ -4029,7 +4231,7 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
 
         Ok(())
     }
@@ -4055,10 +4257,30 @@ mod tests {
                 helper(globalThis, q[0][0], q[0][1], q[0][2], q[0][3]);
             };
         "#;
-        assert_eq!(proven_count(source), 0);
+        assert_eq!(proven_count(source)?, 0);
 
         Ok(())
     }
+    #[test]
+    fn forwarding_installers_propagate_work_budget_exhaustion() -> TestResult {
+        let allocator = Allocator::default();
+        let source = "function helper(a, b, c, d, e) { return a; }";
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let budget = WorkBudget::new("forwarding-installer-fuel", BudgetLimits::work(0));
+        let error = structurally_proven_forwarding_installers(
+            &parsed.program,
+            semantic.semantic.scoping(),
+            &budget,
+        )
+        .err()
+        .test_value("forwarding installer budget exhaustion")?;
+        assert_eq!(error.kind(), BudgetExceededKind::Work);
+        assert_eq!(error.scope(), "forwarding-installer-fuel");
+        Ok(())
+    }
+
     #[test]
     fn registry_forwarding_propagates_work_budget_exhaustion() -> TestResult {
         let allocator = Allocator::default();

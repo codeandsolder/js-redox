@@ -11,6 +11,7 @@ use oxc_span::SourceType;
 use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use rolldown_redox::ecmascript::parse_program;
 use std::collections::{HashMap, HashSet};
+use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticAliasInstallerCall {
@@ -35,13 +36,27 @@ struct ResolverShape {
     member: Option<String>,
 }
 
-#[derive(Default)]
 struct ArgumentsBoxCollector {
     boxes: HashMap<SymbolId, u32>,
     arguments_references: usize,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for ArgumentsBoxCollector {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_variable_declaration(&mut self, it: &VariableDeclaration<'a>) {
         for declaration in &it.declarations {
             let BindingPattern::BindingIdentifier(id) = &declaration.id else {
@@ -78,25 +93,44 @@ impl<'a> Visit<'a> for ArgumentsBoxCollector {
     }
 }
 
-fn only_unconditional_statements(statements: &[Statement<'_>]) -> bool {
-    statements.iter().all(|statement| match statement {
-        Statement::BlockStatement(block) => only_unconditional_statements(&block.body),
-        Statement::VariableDeclaration(_)
-        | Statement::ExpressionStatement(_)
-        | Statement::ReturnStatement(_)
-        | Statement::EmptyStatement(_)
-        | Statement::DebuggerStatement(_) => true,
-        _ => false,
-    })
+fn only_unconditional_statements_budgeted(
+    statements: &[Statement<'_>],
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    for statement in statements {
+        budget.consume(1)?;
+        let valid = match statement {
+            Statement::BlockStatement(block) => {
+                only_unconditional_statements_budgeted(&block.body, budget)?
+            }
+            Statement::VariableDeclaration(_)
+            | Statement::ExpressionStatement(_)
+            | Statement::ReturnStatement(_)
+            | Statement::EmptyStatement(_)
+            | Statement::DebuggerStatement(_) => true,
+            _ => false,
+        };
+        if !valid {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
-#[derive(Default)]
 struct ReturnLocationCollector {
     count: usize,
     start: Option<u32>,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for ReturnLocationCollector {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
     fn visit_return_statement(&mut self, it: &ReturnStatement<'a>) {
         self.count += 1;
         if self.count == 1 {
@@ -173,9 +207,17 @@ struct ReturnShapeCollector<'c, 'b> {
     returns: usize,
     member: Option<Option<String>>,
     invalid: bool,
+    poller: BudgetPoller,
 }
 
 impl<'a> Visit<'a> for ReturnShapeCollector<'_, '_> {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_statement(self, statement);
+    }
+
     fn visit_return_statement(&mut self, it: &ReturnStatement<'a>) {
         self.returns += 1;
         let Some(argument) = &it.argument else {
@@ -204,94 +246,167 @@ impl<'a> Visit<'a> for ReturnShapeCollector<'_, '_> {
 struct ResolverCollector<'c> {
     scoping: &'c Scoping,
     resolvers: HashMap<SymbolId, ResolverShape>,
+    budget: WorkBudget,
+    poller: BudgetPoller,
+    budget_error: Option<BudgetExceeded>,
+}
+
+impl ResolverCollector<'_> {
+    fn analyze_function(&mut self, it: &Function<'_>) {
+        if self.budget_error.is_some()
+            || it.r#async
+            || it.generator
+            || it.params.rest.is_some()
+            || it.params.items.len() != 1
+        {
+            return;
+        }
+        let (Some(id), Some(body)) = (&it.id, &it.body) else {
+            return;
+        };
+        let Some(function_symbol) = id.symbol_id.get() else {
+            return;
+        };
+        let BindingPattern::BindingIdentifier(parameter) = &it.params.items[0].pattern else {
+            return;
+        };
+        let Some(parameter_symbol) = parameter.symbol_id.get() else {
+            return;
+        };
+
+        let unconditional =
+            match only_unconditional_statements_budgeted(&body.statements, &self.budget) {
+                Ok(unconditional) => unconditional,
+                Err(error) => {
+                    self.budget_error = Some(error);
+                    return;
+                }
+            };
+        if !unconditional {
+            return;
+        }
+
+        let mut return_locations = ReturnLocationCollector {
+            count: 0,
+            start: None,
+            poller: BudgetPoller::new(&self.budget, 256),
+        };
+        return_locations.visit_function_body(body);
+        if let Err(error) = return_locations.poller.finish() {
+            self.budget_error = Some(error);
+            return;
+        }
+        if return_locations.count != 1 {
+            return;
+        }
+        let Some(return_start) = return_locations.start else {
+            return;
+        };
+
+        let mut box_collector = ArgumentsBoxCollector {
+            boxes: HashMap::new(),
+            arguments_references: 0,
+            poller: BudgetPoller::new(&self.budget, 256),
+        };
+        box_collector.visit_function_body(body);
+        if let Err(error) = box_collector.poller.finish() {
+            self.budget_error = Some(error);
+            return;
+        }
+        let declared_boxes = box_collector.boxes.len();
+        let mut argument_boxes = HashSet::new();
+        for (symbol, declaration_start) in box_collector.boxes {
+            if let Err(error) = self.budget.consume(1) {
+                self.budget_error = Some(error);
+                return;
+            }
+            if declaration_start >= return_start {
+                continue;
+            }
+            let references = self.scoping.get_resolved_reference_ids(symbol);
+            if references.len() != 1 {
+                continue;
+            }
+            if let Err(error) = self.budget.consume(1) {
+                self.budget_error = Some(error);
+                return;
+            }
+            let reference = self.scoping.get_reference(references[0]);
+            if reference.is_read()
+                && !reference.is_write()
+                && !reference.flags().is_member_write_target()
+            {
+                argument_boxes.insert(symbol);
+            }
+        }
+
+        let mut parameter_is_read_only = true;
+        for reference_id in self.scoping.get_resolved_reference_ids(parameter_symbol) {
+            if let Err(error) = self.budget.consume(1) {
+                self.budget_error = Some(error);
+                return;
+            }
+            let reference = self.scoping.get_reference(*reference_id);
+            if reference.is_write() || reference.flags().is_member_write_target() {
+                parameter_is_read_only = false;
+                break;
+            }
+        }
+        if !parameter_is_read_only || box_collector.arguments_references != declared_boxes {
+            return;
+        }
+
+        let mut return_collector = ReturnShapeCollector {
+            scoping: self.scoping,
+            parameter: parameter_symbol,
+            argument_boxes: &argument_boxes,
+            returns: 0,
+            member: None,
+            invalid: false,
+            poller: BudgetPoller::new(&self.budget, 256),
+        };
+        return_collector.visit_function_body(body);
+        if let Err(error) = return_collector.poller.finish() {
+            self.budget_error = Some(error);
+            return;
+        }
+        if !return_collector.invalid && return_collector.returns == 1 {
+            if let Some(member) = return_collector.member {
+                self.resolvers.insert(
+                    function_symbol,
+                    ResolverShape {
+                        name: id.name.to_string(),
+                        member,
+                    },
+                );
+            }
+        }
+    }
 }
 
 impl<'a> Visit<'a> for ResolverCollector<'_> {
-    fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
-        if !it.r#async && !it.generator && it.params.rest.is_none() && it.params.items.len() == 1 {
-            if let (Some(id), Some(body)) = (&it.id, &it.body) {
-                let Some(function_symbol) = id.symbol_id.get() else {
-                    walk::walk_function(self, it, flags);
-                    return;
-                };
-                let BindingPattern::BindingIdentifier(parameter) = &it.params.items[0].pattern
-                else {
-                    walk::walk_function(self, it, flags);
-                    return;
-                };
-                let Some(parameter_symbol) = parameter.symbol_id.get() else {
-                    walk::walk_function(self, it, flags);
-                    return;
-                };
-
-                if !only_unconditional_statements(&body.statements) {
-                    walk::walk_function(self, it, flags);
-                    return;
-                }
-                let mut return_locations = ReturnLocationCollector::default();
-                return_locations.visit_function_body(body);
-                if return_locations.count != 1 {
-                    walk::walk_function(self, it, flags);
-                    return;
-                }
-                let Some(return_start) = return_locations.start else {
-                    walk::walk_function(self, it, flags);
-                    return;
-                };
-
-                let mut box_collector = ArgumentsBoxCollector::default();
-                box_collector.visit_function_body(body);
-                let declared_boxes = box_collector.boxes.len();
-                box_collector.boxes.retain(|symbol, declaration_start| {
-                    if *declaration_start >= return_start {
-                        return false;
-                    }
-                    let references = self.scoping.get_resolved_reference_ids(*symbol);
-                    if references.len() != 1 {
-                        return false;
-                    }
-                    let reference = self.scoping.get_reference(references[0]);
-                    reference.is_read()
-                        && !reference.is_write()
-                        && !reference.flags().is_member_write_target()
-                });
-                let argument_boxes = box_collector.boxes.keys().copied().collect::<HashSet<_>>();
-                let parameter_is_read_only = self
-                    .scoping
-                    .get_resolved_reference_ids(parameter_symbol)
-                    .iter()
-                    .all(|reference_id| {
-                        let reference = self.scoping.get_reference(*reference_id);
-                        !reference.is_write() && !reference.flags().is_member_write_target()
-                    });
-                if !parameter_is_read_only || box_collector.arguments_references != declared_boxes {
-                    walk::walk_function(self, it, flags);
-                    return;
-                }
-                let mut return_collector = ReturnShapeCollector {
-                    scoping: self.scoping,
-                    parameter: parameter_symbol,
-                    argument_boxes: &argument_boxes,
-                    returns: 0,
-                    member: None,
-                    invalid: false,
-                };
-                return_collector.visit_function_body(body);
-
-                if !return_collector.invalid && return_collector.returns == 1 {
-                    if let Some(member) = return_collector.member {
-                        self.resolvers.insert(
-                            function_symbol,
-                            ResolverShape {
-                                name: id.name.to_string(),
-                                member,
-                            },
-                        );
-                    }
-                }
-            }
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
         }
-        walk::walk_function(self, it, flags);
+        walk::walk_statement(self, statement);
+    }
+
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.budget_error.is_some() || !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+        if self.budget_error.is_some() {
+            return;
+        }
+        self.analyze_function(it);
+        if self.budget_error.is_none() {
+            walk::walk_function(self, it, flags);
+        }
     }
 }
 
@@ -300,6 +415,7 @@ struct CallCollector<'c> {
     resolvers: &'c HashMap<SymbolId, ResolverShape>,
     proven_installers: &'c HashSet<SymbolId>,
     calls: Vec<StaticAliasInstallerCall>,
+    poller: BudgetPoller,
 }
 
 impl CallCollector<'_> {
@@ -313,6 +429,13 @@ impl CallCollector<'_> {
 }
 
 impl<'a> Visit<'a> for CallCollector<'_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
     fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
         if !it.optional && it.arguments.len() == 4 && !it.arguments.iter().any(Argument::is_spread)
         {
@@ -378,46 +501,62 @@ impl<'a> Visit<'a> for CallCollector<'_> {
     }
 }
 
-#[must_use]
-pub fn static_alias_installer_calls(source: &str) -> Vec<StaticAliasInstallerCall> {
+pub fn static_alias_installer_calls(
+    source: &str,
+    budget: &WorkBudget,
+) -> Result<Vec<StaticAliasInstallerCall>, BudgetExceeded> {
     for source_type in [SourceType::mjs(), SourceType::cjs()] {
+        budget.checkpoint()?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, source_type);
+        budget.checkpoint()?;
         if !parsed.is_clean() {
             continue;
         }
         let semantic_ret = SemanticBuilder::new()
             .with_check_syntax_error(true)
             .build(&parsed.program);
+        budget.checkpoint()?;
         if !semantic_ret.diagnostics.is_empty() {
             continue;
         }
         let semantic = semantic_ret.semantic;
         let proven_installers =
-            structurally_proven_forwarding_installers(&parsed.program, semantic.scoping());
+            structurally_proven_forwarding_installers(&parsed.program, semantic.scoping(), budget)?;
         let mut resolver_collector = ResolverCollector {
             scoping: semantic.scoping(),
             resolvers: HashMap::new(),
+            budget: budget.clone(),
+            poller: BudgetPoller::new(budget, 256),
+            budget_error: None,
         };
         resolver_collector.visit_program(&parsed.program);
+        resolver_collector.poller.finish()?;
+        if let Some(error) = resolver_collector.budget_error.take() {
+            return Err(error);
+        }
         let mut call_collector = CallCollector {
             scoping: semantic.scoping(),
             resolvers: &resolver_collector.resolvers,
             proven_installers: &proven_installers,
             calls: Vec::new(),
+            poller: BudgetPoller::new(budget, 256),
         };
         call_collector.visit_program(&parsed.program);
-        return call_collector.calls;
+        call_collector.poller.finish()?;
+        return Ok(call_collector.calls);
     }
-    Vec::new()
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::static_alias_installer_calls;
+    use crate::test_support::{TestResult, TestValue};
+    use work_budget::{BudgetExceededKind, BudgetLimits, WorkBudget};
 
     #[test]
-    fn finds_only_proven_first_argument_resolvers() {
+    fn finds_only_proven_first_argument_resolvers() -> TestResult {
         let source = r#"
             function getArray(root) { return root.Array; }
             function boxed(root) {
@@ -466,7 +605,8 @@ mod tests {
             install(lateBox, "then", 1, "bad6");
             install(getArray, dynamicName, 1, "nope");
         "#;
-        let calls = static_alias_installer_calls(source);
+        let calls = static_alias_installer_calls(source, &WorkBudget::unlimited("alias-test"))
+            .test_value("static alias installer calls")?;
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].resolver_member.as_deref(), Some("Array"));
         assert_eq!(calls[0].source_property, "push");
@@ -476,5 +616,18 @@ mod tests {
         assert_eq!(calls[1].source_property, "apply");
         assert_eq!(calls[2].resolver_member, None);
         assert_eq!(calls[2].source_property, "__residual");
+        Ok(())
+    }
+
+    #[test]
+    fn propagates_work_budget_exhaustion() -> TestResult {
+        let budget = WorkBudget::new("alias-fuel", BudgetLimits::work(0));
+        let error =
+            static_alias_installer_calls("function resolver(root) { return root.Array; }", &budget)
+                .err()
+                .test_value("alias budget exhaustion")?;
+        assert_eq!(error.kind(), BudgetExceededKind::Work);
+        assert_eq!(error.scope(), "alias-fuel");
+        Ok(())
     }
 }
