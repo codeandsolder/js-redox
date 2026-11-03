@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use jsvm_lift::cfg_order::prove_event_before_barriers;
 use jsvm_lift::{
     cfg_order::prove_events_before_event,
+    forwarding_semantics::{
+        structurally_proven_registry_forwarding_calls, structurally_proven_registry_read_calls,
+    },
     receiver_identity::{
         propagate_matched_prototype_method_call_origins,
         propagate_proven_prototype_method_call_origins, proven_exact_own_data_field_at_direct_call,
@@ -19,6 +22,7 @@ use jsvm_lift::{
         structurally_proven_prototype_method_receiver_effects,
         structurally_proven_prototype_string_assignments,
         structurally_proven_receiver_preserving_prototype_method_calls,
+        structurally_proven_runtime_origin_flow,
     },
     registry_identity::{
         proven_origin_registry_handler_installs, proven_origin_registry_read_calls,
@@ -30,8 +34,8 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType, Span};
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, env, fs, path::PathBuf};
-use work_budget::WorkBudget;
+use std::{collections::BTreeMap, env, fs, path::PathBuf, time::Duration};
+use work_budget::{BudgetLimits, WorkBudget};
 
 fn snippet(source: &str, start: u32, end: u32) -> String {
     source
@@ -43,8 +47,34 @@ fn snippet(source: &str, start: u32, end: u32) -> String {
 }
 
 fn main() -> Result<()> {
-    let budget = WorkBudget::unlimited("receiver-proof-inventory");
     let args = env::args_os().skip(1).collect::<Vec<_>>();
+    let origin_only = args.iter().any(|arg| arg == "--origin-only");
+    let origin_work = args
+        .iter()
+        .find_map(|arg| arg.to_str()?.strip_prefix("--origin-work="));
+    let origin_secs = args
+        .iter()
+        .find_map(|arg| arg.to_str()?.strip_prefix("--origin-secs="));
+    let budget = if origin_only {
+        let work = origin_work
+            .unwrap_or("20000000")
+            .parse::<u64>()
+            .context("invalid --origin-work")?;
+        let seconds = origin_secs
+            .unwrap_or("90")
+            .parse::<u64>()
+            .context("invalid --origin-secs")?;
+        WorkBudget::new(
+            "receiver-origin-inventory",
+            BudgetLimits::wall_time(Duration::from_secs(seconds)).with_work(work),
+        )
+    } else {
+        anyhow::ensure!(
+            origin_work.is_none() && origin_secs.is_none(),
+            "--origin-work and --origin-secs require --origin-only"
+        );
+        WorkBudget::unlimited("receiver-proof-inventory")
+    };
     let summary = args.iter().any(|arg| arg == "--summary");
     let runtime_only = args.iter().any(|arg| arg == "--runtime-only");
     let prototype_strings_only = args.iter().any(|arg| arg == "--prototype-strings");
@@ -99,7 +129,7 @@ fn main() -> Result<()> {
         .find(|arg| !arg.to_string_lossy().starts_with("--"))
         .map(PathBuf::from)
         .context(
-            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--runtime-only] [--phase-closures [--phase-event-start=N --phase-event-end=N]] [--preserve-call-start=N] [--fully-preserve-call-start=N] [--field-runtime-call-start=N --field=NAME] [--exact-field-call-start=N --field=NAME] [--registry-origin-call-start=N]",
+            "usage: cargo run -p jsvm-lift --example receiver-proof-inventory -- <file.js> [--summary] [--origin-only [--origin-work=N] [--origin-secs=N]] [--runtime-only] [--phase-closures [--phase-event-start=N --phase-event-end=N]] [--preserve-call-start=N] [--fully-preserve-call-start=N] [--field-runtime-call-start=N --field=NAME] [--exact-field-call-start=N --field=NAME] [--registry-origin-call-start=N]",
         )?;
     let source =
         fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -116,6 +146,92 @@ fn main() -> Result<()> {
         .build(&parsed.program);
     anyhow::ensure!(semantic.diagnostics.is_empty(), "semantic diagnostics");
     let scoping = semantic.semantic.scoping();
+    if origin_only {
+        let timer = std::time::Instant::now();
+        let base = structurally_proven_origin_flow(&parsed.program, scoping, &budget)?;
+        let base_elapsed_ms = timer.elapsed().as_millis();
+        eprintln!(
+            "base exact-origin flow: {} calls, {} reads, {} ms",
+            base.direct_calls.len(),
+            base.member_reads.len(),
+            base_elapsed_ms
+        );
+        let runtime =
+            structurally_proven_runtime_origin_flow(&parsed.program, &semantic.semantic, &budget)?;
+        let runtime_elapsed_ms = timer.elapsed().as_millis();
+        eprintln!(
+            "runtime exact-origin flow: {} calls, {} reads, {} ms",
+            runtime.direct_calls.len(),
+            runtime.member_reads.len(),
+            runtime_elapsed_ms
+        );
+        let structural_installs =
+            structurally_proven_registry_forwarding_calls(&parsed.program, scoping, &budget)?;
+        let structural_reads =
+            structurally_proven_registry_read_calls(&parsed.program, scoping, &budget)?;
+        let origin_installs =
+            proven_origin_registry_handler_installs(&parsed.program, scoping, &runtime, &budget)?;
+        let origin_reads =
+            proven_origin_registry_read_calls(&parsed.program, scoping, &runtime, &budget)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "file": path,
+                "source_bytes": source.len(),
+                "elapsed_ms": timer.elapsed().as_millis(),
+                "base": {
+                    "direct_calls": base.direct_calls.len(),
+                    "member_calls": base.member_calls.len(),
+                    "member_reads": base.member_reads.len(),
+                    "member_writes": base.member_writes.len(),
+                    "exposures": base.exposures.len(),
+                },
+                "runtime": {
+                    "direct_calls": runtime.direct_calls.len(),
+                    "member_calls": runtime.member_calls.len(),
+                    "member_reads": runtime.member_reads.len(),
+                    "member_writes": runtime.member_writes.len(),
+                    "exposures": runtime.exposures.len(),
+                },
+                "structural_registry_handler_installs": structural_installs.len(),
+                "structural_registry_reads": structural_reads.len(),
+                "exact_origin_handler_installs": origin_installs.iter().map(|proof| json!({
+                    "call": [proof.install.call_start, proof.install.call_end],
+                    "call_source": snippet(&source, proof.install.call_start, proof.install.call_end),
+                    "origin": {
+                    "allocation": [proof.origin.allocation_start, proof.origin.allocation_end],
+                    "constructor": [proof.origin.constructor_start, proof.origin.constructor_end],
+                },
+                    "key": proof.exact_key,
+                    "path": proof.install.registry_path,
+                    "handler": [proof.install.handler_start, proof.install.handler_end],
+                })).collect::<Vec<_>>(),
+                "exact_origin_registry_reads": origin_reads.iter().map(|proof| json!({
+                    "call": [proof.read.call_start, proof.read.call_end],
+                    "call_source": snippet(&source, proof.read.call_start, proof.read.call_end),
+                    "origin": {
+                    "allocation": [proof.origin.allocation_start, proof.origin.allocation_end],
+                    "constructor": [proof.origin.constructor_start, proof.origin.constructor_end],
+                },
+                    "key": proof.exact_key,
+                    "path": proof.read.registry_path,
+                })).collect::<Vec<_>>(),
+                "structural_registry_reads_examples": structural_reads.iter().take(32).map(|proof| json!({
+                    "call": [proof.call_start,proof.call_end],
+                    "source": snippet(&source,proof.call_start,proof.call_end),
+                    "path": proof.registry_path,
+                })).collect::<Vec<_>>(),
+                "runtime_direct_calls_examples": runtime.direct_calls.iter().take(64).map(|proof| json!({
+                    "call": [proof.call_start,proof.call_end],
+                    "source": snippet(&source,proof.call_start,proof.call_end),
+                    "allocation": [proof.callee.allocation_start,proof.callee.allocation_end],
+                    "caller": [proof.caller.function_start,proof.caller.function_end],
+                    "callee": [proof.callee.function_start,proof.callee.function_end],
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
     if phase_closures_only {
         anyhow::ensure!(
             phase_event_start.is_some() == phase_event_end.is_some(),
