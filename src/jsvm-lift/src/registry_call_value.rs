@@ -2,6 +2,7 @@
 //! An accessor may project a lazy cell: its result is NOT necessarily a handler.
 use crate::cfg_order::{prove_event_before_barriers, prove_event_completion_before_event};
 use crate::forwarding_semantics::{ProvenLazyRegistryReadCall, ProvenRegistryReadCall};
+use crate::registry_identity::ProvenOriginRegistryReadCall;
 use oxc_ast::{
     ast::{AssignmentTarget, BindingPattern, Expression},
     AstKind,
@@ -71,6 +72,67 @@ pub fn join_lazy_accessor_results(
         });
     }
     Ok(result)
+}
+
+/// A structural lazy accessor-to-call relation whose registry receiver also
+/// has an exact allocation/constructor origin at the SAME accessor call.
+/// The dynamic key may remain unknown. This does NOT prove a returned handler.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExactOriginLazyAccessorResultUse {
+    pub lazy: LazyRegistryAccessorResultUse,
+    pub origin_allocation_start: u32,
+    pub origin_allocation_end: u32,
+    pub origin_constructor_start: u32,
+    pub origin_constructor_end: u32,
+    pub exact_key: Option<i64>,
+}
+
+/// Require unique, nonconflicting exact-origin facts for a specific call, and
+/// preserve the registry path established by the independent lazy analysis.
+pub fn join_exact_origin_lazy_accessor_results(
+    lazy_uses: &[LazyRegistryAccessorResultUse],
+    origin_reads: &[ProvenOriginRegistryReadCall],
+    budget: &WorkBudget,
+) -> Result<Vec<ExactOriginLazyAccessorResultUse>, BudgetExceeded> {
+    budget.checkpoint()?;
+    let mut by_call = HashMap::new();
+    for origin in origin_reads {
+        budget.consume(1)?;
+        let site = (origin.read.call_start, origin.read.call_end);
+        match by_call.entry(site) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(origin));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().is_some_and(|previous| *previous != origin) {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    let mut joined = Vec::new();
+    for lazy in lazy_uses {
+        budget.consume(1)?;
+        let site = (
+            lazy.result.accessor_call_start,
+            lazy.result.accessor_call_end,
+        );
+        let Some(origin) = by_call.get(&site).and_then(|entry| *entry) else {
+            continue;
+        };
+        if origin.read.registry_path != lazy.registry_path {
+            continue;
+        }
+        joined.push(ExactOriginLazyAccessorResultUse {
+            lazy: lazy.clone(),
+            origin_allocation_start: origin.origin.allocation_start,
+            origin_allocation_end: origin.origin.allocation_end,
+            origin_constructor_start: origin.origin.constructor_start,
+            origin_constructor_end: origin.origin.constructor_end,
+            exact_key: origin.exact_key,
+        });
+    }
+    Ok(joined)
 }
 
 struct Source {
@@ -492,6 +554,97 @@ mod tests {
         let joined = join_lazy_accessor_results(&uses, &lazy, &b).test_value("joined")?;
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].result.binding, "a");
+        Ok(())
+    }
+
+    #[test]
+    fn exact_origin_lazy_join_requires_same_call_and_registry_path() -> TestResult {
+        use super::{
+            join_exact_origin_lazy_accessor_results, LazyRegistryAccessorResultUse,
+            RegistryAccessorResultUse,
+        };
+        use crate::forwarding_semantics::ProvenRegistryReadCall;
+        use crate::registry_identity::{ProvenOriginRegistryReadCall, ProvenRegistryObjectOrigin};
+        let lazy = LazyRegistryAccessorResultUse {
+            result: RegistryAccessorResultUse {
+                binding: "callable".into(),
+                assignment_start: 1,
+                assignment_end: 15,
+                accessor_call_start: 5,
+                accessor_call_end: 15,
+                indirect_call_start: 30,
+                indirect_call_end: 40,
+                definite_accessor_result: false,
+            },
+            registry_path: vec!["handlers".into()],
+            fast_probe_property: "loaded".into(),
+            update_method: "refresh".into(),
+            slow_projection_property: "current".into(),
+            slow_selector_start: 100,
+            slow_selector_end: 120,
+        };
+        let origin = ProvenOriginRegistryReadCall {
+            read: ProvenRegistryReadCall {
+                call_start: 5,
+                call_end: 15,
+                receiver_start: 7,
+                receiver_end: 8,
+                key_start: 9,
+                key_end: 10,
+                registry_path: vec!["handlers".into()],
+            },
+            origin: ProvenRegistryObjectOrigin {
+                allocation_start: 500,
+                allocation_end: 520,
+                constructor_start: 400,
+                constructor_end: 450,
+            },
+            exact_key: None,
+        };
+        let budget = WorkBudget::unlimited("origin lazy join");
+        let joined = join_exact_origin_lazy_accessor_results(
+            std::slice::from_ref(&lazy),
+            std::slice::from_ref(&origin),
+            &budget,
+        )
+        .test_value("origin joined")?;
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].lazy, lazy);
+        assert_eq!(joined[0].origin_allocation_start, 500);
+        assert_eq!(joined[0].exact_key, None);
+        let mut wrong_path = origin.clone();
+        wrong_path.read.registry_path = vec!["unrelated".into()];
+        assert!(join_exact_origin_lazy_accessor_results(
+            std::slice::from_ref(&lazy),
+            &[wrong_path],
+            &budget,
+        )
+        .test_value("path reject")?
+        .is_empty());
+        let mut wrong_call = origin.clone();
+        wrong_call.read.call_start = 6;
+        assert!(join_exact_origin_lazy_accessor_results(
+            std::slice::from_ref(&lazy),
+            &[wrong_call],
+            &budget,
+        )
+        .test_value("call reject")?
+        .is_empty());
+        let mut conflict = origin.clone();
+        conflict.origin.allocation_start = 501;
+        assert!(join_exact_origin_lazy_accessor_results(
+            std::slice::from_ref(&lazy),
+            &[origin.clone(), conflict],
+            &budget,
+        )
+        .test_value("ambiguous origin reject")?
+        .is_empty());
+        let duplicate =
+            join_exact_origin_lazy_accessor_results(&[lazy], &[origin.clone(), origin], &budget)
+                .test_value("duplicate same proof")?;
+        assert_eq!(duplicate.len(), 1);
+        let empty_budget = WorkBudget::new("exhausted", BudgetLimits::work(0));
+        assert!(join_exact_origin_lazy_accessor_results(&[], &[], &empty_budget,).is_err());
         Ok(())
     }
 

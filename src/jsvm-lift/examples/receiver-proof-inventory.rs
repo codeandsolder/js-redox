@@ -190,6 +190,12 @@ fn main() -> Result<()> {
             proven_origin_registry_handler_installs(&parsed.program, scoping, &runtime, &budget)?;
         let origin_reads =
             proven_origin_registry_read_calls(&parsed.program, scoping, &runtime, &budget)?;
+        let exact_origin_lazy_results =
+            jsvm_lift::registry_call_value::join_exact_origin_lazy_accessor_results(
+                &lazy_result_calls,
+                &origin_reads,
+                &budget,
+            )?;
         let table_analysis = table_vm::analyze(&source, &parsed.program, &budget)?;
         println!(
             "{}",
@@ -224,6 +230,17 @@ fn main() -> Result<()> {
             })).collect::<Vec<_>>(),
             "table_vm_candidates": table_analysis.table_vms.len(),
             "structural_lazy_registry_reads": lazy_reads.len(),
+            "exact_origin_lazy_accessor_result_indirect_call_candidates": exact_origin_lazy_results.len(),
+            "exact_origin_lazy_accessor_result_indirect_call_examples": exact_origin_lazy_results.iter().take(48).map(|proof| json!({
+                "binding": proof.lazy.result.binding,
+                "accessor_call": [proof.lazy.result.accessor_call_start, proof.lazy.result.accessor_call_end],
+                "indirect_call": [proof.lazy.result.indirect_call_start, proof.lazy.result.indirect_call_end],
+                "definite_accessor_result": proof.lazy.result.definite_accessor_result,
+                "origin_allocation": [proof.origin_allocation_start, proof.origin_allocation_end],
+                "origin_constructor": [proof.origin_constructor_start, proof.origin_constructor_end],
+                "exact_key": proof.exact_key,
+                "registry_path": proof.lazy.registry_path,
+            })).collect::<Vec<_>>(),
             "lazy_accessor_result_indirect_call_candidates": lazy_result_calls.len(),
             "lazy_accessor_result_indirect_call_definite": lazy_result_calls.iter()
                 .filter(|edge| edge.result.definite_accessor_result).count(),
