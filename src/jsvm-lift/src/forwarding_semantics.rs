@@ -3239,6 +3239,7 @@ mod tests {
         structurally_proven_registry_forwarding_value_calls,
         structurally_proven_registry_read_calls,
     };
+    use crate::test_support::{source_slice, TestFailure, TestResult, TestValue};
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
@@ -3261,7 +3262,9 @@ mod tests {
             .len()
     }
 
-    fn registry_calls(source: &str) -> Vec<super::ProvenRegistryForwardingCall> {
+    fn registry_calls(
+        source: &str,
+    ) -> Result<Vec<super::ProvenRegistryForwardingCall>, TestFailure> {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -3274,11 +3277,11 @@ mod tests {
             semantic_ret.semantic.scoping(),
             &test_budget(),
         )
-        .expect("registry forwarding proof")
+        .test_value("registry forwarding proof")
     }
 
     #[test]
-    fn proves_non_function_registry_value_forwarding() {
+    fn proves_non_function_registry_value_forwarding() -> TestResult {
         let allocator = Allocator::default();
         let source = r#"
             function write(receiver, key, value) {
@@ -3297,14 +3300,20 @@ mod tests {
             semantic.semantic.scoping(),
             &test_budget(),
         )
-        .expect("registry value forwarding proof");
+        .test_value("registry value forwarding proof")?;
         assert_eq!(proven.len(), 2);
         let root = proven
             .iter()
             .find(|proof| {
-                &source[proof.value_start as usize..proof.value_end as usize] == "\"payload\""
+                source_slice(
+                    source,
+                    proof.value_start,
+                    proof.value_end,
+                    "registry value span",
+                )
+                .is_ok_and(|value| value == "\"payload\"")
             })
-            .expect("outer literal value");
+            .test_value("outer literal value")?;
         assert_eq!(root.registry_path, vec!["handlers"]);
         assert!(root.registry_key_confined);
         assert!(structurally_proven_registry_forwarding_calls(
@@ -3312,12 +3321,14 @@ mod tests {
             semantic.semantic.scoping(),
             &test_budget(),
         )
-        .expect("registry function forwarding proof")
+        .test_value("registry function forwarding proof")?
         .is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn proves_parameter_forwarding_into_computed_registry_write() {
+    fn proves_parameter_forwarding_into_computed_registry_write() -> TestResult {
         let calls = registry_calls(
             r#"
             const wrap = (value) => ({ value });
@@ -3327,15 +3338,17 @@ mod tests {
             const state = { handlers: {} };
             install(state, 7, function(a) { return a + 1; });
         "#,
-        );
+        )?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].registry_path, vec!["handlers"]);
         assert_eq!(calls[0].handler_params, 1);
         assert!(calls[0].registry_key_confined);
+
+        Ok(())
     }
 
     #[test]
-    fn registry_key_confinement_allows_same_key_reads_and_writes() {
+    fn registry_key_confinement_allows_same_key_reads_and_writes() -> TestResult {
         let calls = registry_calls(
             r#"
             function install(receiver, key, value) {
@@ -3344,13 +3357,15 @@ mod tests {
             }
             install(state, 7, function(a) { return a + 1; });
         "#,
-        );
+        )?;
         assert_eq!(calls.len(), 1);
         assert!(calls[0].registry_key_confined);
+
+        Ok(())
     }
 
     #[test]
-    fn registry_key_confinement_rejects_other_key_access() {
+    fn registry_key_confinement_rejects_other_key_access() -> TestResult {
         let calls = registry_calls(
             r#"
             function install(receiver, key, value) {
@@ -3359,13 +3374,15 @@ mod tests {
             }
             install(state, 7, function(a) { return a + 1; });
         "#,
-        );
+        )?;
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].registry_key_confined);
+
+        Ok(())
     }
 
     #[test]
-    fn registry_key_confinement_rejects_registry_object_escape() {
+    fn registry_key_confinement_rejects_registry_object_escape() -> TestResult {
         let calls = registry_calls(
             r#"
             function install(receiver, key, value) {
@@ -3374,13 +3391,15 @@ mod tests {
             }
             install(state, 7, function(a) { return a + 1; });
         "#,
-        );
+        )?;
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].registry_key_confined);
+
+        Ok(())
     }
 
     #[test]
-    fn registry_key_confinement_rejects_nested_cross_key_capture() {
+    fn registry_key_confinement_rejects_nested_cross_key_capture() -> TestResult {
         let calls = registry_calls(
             r#"
             function install(receiver, key, value) {
@@ -3389,13 +3408,15 @@ mod tests {
             }
             install(state, 7, function(a) { return a + 1; });
         "#,
-        );
+        )?;
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].registry_key_confined);
+
+        Ok(())
     }
 
     #[test]
-    fn registry_delegate_preserves_forwarding_when_only_some_targets_are_confined() {
+    fn registry_delegate_preserves_forwarding_when_only_some_targets_are_confined() -> TestResult {
         let calls = registry_calls(
             r#"
             function good(receiver, key, value) {
@@ -3411,17 +3432,19 @@ mod tests {
             }
             install(state, 7, function(a) { return a + 1; }, flag);
         "#,
-        );
+        )?;
         let outer = calls
             .iter()
             .find(|call| call.call_start > 0 && call.handler_params == 1)
-            .expect("outer forwarding call");
+            .test_value("outer forwarding call")?;
         assert_eq!(outer.registry_path, vec!["handlers"]);
         assert!(!outer.registry_key_confined);
+
+        Ok(())
     }
 
     #[test]
-    fn proves_registry_forwarding_through_sequence_callee() {
+    fn proves_registry_forwarding_through_sequence_callee() -> TestResult {
         let calls = registry_calls(
             r#"
             function install(receiver, key, value) {
@@ -3429,13 +3452,15 @@ mod tests {
             }
             (0, install)(state, 7, function(a) { return a + 1; });
         "#,
-        );
+        )?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].registry_path, vec!["handlers"]);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_sequence_callee_when_binding_can_be_reassigned() {
+    fn rejects_sequence_callee_when_binding_can_be_reassigned() -> TestResult {
         let calls = registry_calls(
             r#"
             let install = function(receiver, key, value) {
@@ -3444,12 +3469,14 @@ mod tests {
             function replace() { install = other; }
             (replace(), install)(state, 7, function(a) { return a + 1; });
         "#,
-        );
+        )?;
         assert!(calls.is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn proves_registry_forwarding_through_sequence_arguments() {
+    fn proves_registry_forwarding_through_sequence_arguments() -> TestResult {
         let calls = registry_calls(
             r#"
             function install(receiver, key, value) {
@@ -3457,13 +3484,15 @@ mod tests {
             }
             install(state, (side(), 7), (other(), function(a) { return a + 1; }));
         "#,
-        );
+        )?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].registry_path, vec!["handlers"]);
+
+        Ok(())
     }
 
     #[test]
-    fn proves_registry_forwarding_through_stable_sequence_receiver() {
+    fn proves_registry_forwarding_through_stable_sequence_receiver() -> TestResult {
         let source = r#"
             function install(receiver, key, value) {
                 receiver.handlers[key] = wrap(receiver, key, value);
@@ -3471,14 +3500,21 @@ mod tests {
             const state = {};
             install((side(), state), 7, function(a) { return a + 1; });
         "#;
-        let calls = registry_calls(source);
+        let calls = registry_calls(source)?;
         assert_eq!(calls.len(), 1);
-        let receiver = &source[calls[0].receiver_start as usize..calls[0].receiver_end as usize];
+        let receiver = source_slice(
+            source,
+            calls[0].receiver_start,
+            calls[0].receiver_end,
+            "registry receiver span",
+        )?;
         assert_eq!(receiver, "state");
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_registry_forwarding_through_mutable_sequence_receiver() {
+    fn rejects_registry_forwarding_through_mutable_sequence_receiver() -> TestResult {
         let calls = registry_calls(
             r#"
             function install(receiver, key, value) {
@@ -3488,12 +3524,14 @@ mod tests {
             function swap() { state = other; }
             install((swap(), state), 7, function(a) { return a + 1; });
         "#,
-        );
+        )?;
         assert!(calls.is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_registry_write_when_value_does_not_reach_rhs() {
+    fn rejects_registry_write_when_value_does_not_reach_rhs() -> TestResult {
         let calls = registry_calls(
             r#"
             function install(receiver, key, value) {
@@ -3501,12 +3539,14 @@ mod tests {
             }
             install(state, 7, function(a) { return a; });
         "#,
-        );
+        )?;
         assert!(calls.is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_registry_write_with_ambiguous_extra_parameter_flow() {
+    fn rejects_registry_write_with_ambiguous_extra_parameter_flow() -> TestResult {
         let calls = registry_calls(
             r#"
             function install(receiver, key, value, salt) {
@@ -3514,11 +3554,13 @@ mod tests {
             }
             install(state, 7, function(a) { return a; }, 12);
         "#,
-        );
+        )?;
         assert!(calls.is_empty());
+
+        Ok(())
     }
 
-    fn registry_reads(source: &str) -> Vec<super::ProvenRegistryReadCall> {
+    fn registry_reads(source: &str) -> Result<Vec<super::ProvenRegistryReadCall>, TestFailure> {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -3531,11 +3573,11 @@ mod tests {
             semantic_ret.semantic.scoping(),
             &test_budget(),
         )
-        .expect("registry read proof")
+        .test_value("registry read proof")
     }
 
     #[test]
-    fn proves_computed_registry_accessor_calls() {
+    fn proves_computed_registry_accessor_calls() -> TestResult {
         let reads = registry_reads(
             r#"
             function get(receiver, key, cell) {
@@ -3546,13 +3588,15 @@ mod tests {
             const a = get(state, opcode);
             const b = get(other, 17);
         "#,
-        );
+        )?;
         assert_eq!(reads.len(), 2);
         assert_eq!(reads[0].registry_path, vec!["handlers"]);
+
+        Ok(())
     }
 
     #[test]
-    fn proves_lazy_registry_accessor_shape() {
+    fn proves_lazy_registry_accessor_shape() -> TestResult {
         let allocator = Allocator::default();
         let source = r#"
             function get(receiver, key, cell) {
@@ -3570,24 +3614,31 @@ mod tests {
             semantic.semantic.scoping(),
             &test_budget(),
         )
-        .expect("lazy registry proof");
+        .test_value("lazy registry proof")?;
         assert_eq!(proven.len(), 1);
         assert_eq!(proven[0].read.registry_path, vec!["handlers"]);
         assert_eq!(proven[0].probe_property, "value");
         assert_eq!(proven[0].update_property, "create");
         assert_eq!(proven[0].projection_property, "prototype");
         assert_eq!(
-            &source[proven[0].selector_start as usize..proven[0].selector_end as usize],
+            source_slice(
+                source,
+                proven[0].selector_start,
+                proven[0].selector_end,
+                "lazy selector span",
+            )?,
             "key * key + 3"
         );
         assert_eq!(
             proven[0].selector_polynomial.variables(),
             vec![proven[0].selector_key_symbol]
         );
+
+        Ok(())
     }
 
     #[test]
-    fn lazy_registry_accessor_rejects_selector_with_extra_symbol() {
+    fn lazy_registry_accessor_rejects_selector_with_extra_symbol() -> TestResult {
         let allocator = Allocator::default();
         let source = r#"
             function get(receiver, key, cell, salt) {
@@ -3604,12 +3655,14 @@ mod tests {
             semantic.semantic.scoping(),
             &test_budget(),
         )
-        .expect("lazy registry proof")
+        .test_value("lazy registry proof")?
         .is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn lazy_registry_accessor_rejects_multiple_slow_projections() {
+    fn lazy_registry_accessor_rejects_multiple_slow_projections() -> TestResult {
         let allocator = Allocator::default();
         let source = r#"
             function get(receiver, key, cell) {
@@ -3627,12 +3680,14 @@ mod tests {
             semantic.semantic.scoping(),
             &test_budget(),
         )
-        .expect("lazy registry proof")
+        .test_value("lazy registry proof")?
         .is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn lazy_registry_accessor_rejects_dynamic_scope() {
+    fn lazy_registry_accessor_rejects_dynamic_scope() -> TestResult {
         let allocator = Allocator::default();
         let source = r#"
             function get(receiver, key, cell) {
@@ -3650,12 +3705,14 @@ mod tests {
             semantic.semantic.scoping(),
             &test_budget(),
         )
-        .expect("lazy registry proof")
+        .test_value("lazy registry proof")?
         .is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn lazy_registry_accessor_rejects_mismatched_update_method() {
+    fn lazy_registry_accessor_rejects_mismatched_update_method() -> TestResult {
         let allocator = Allocator::default();
         let source = r#"
             function get(receiver, key, cell) {
@@ -3672,12 +3729,14 @@ mod tests {
             semantic.semantic.scoping(),
             &test_budget(),
         )
-        .expect("lazy registry proof")
+        .test_value("lazy registry proof")?
         .is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn lazy_registry_accessor_rejects_cell_reassignment() {
+    fn lazy_registry_accessor_rejects_cell_reassignment() -> TestResult {
         let allocator = Allocator::default();
         let source = r#"
             function get(receiver, key, cell) {
@@ -3695,12 +3754,14 @@ mod tests {
             semantic.semantic.scoping(),
             &test_budget(),
         )
-        .expect("lazy registry proof")
+        .test_value("lazy registry proof")?
         .is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn proves_registry_read_through_sequence_callee() {
+    fn proves_registry_read_through_sequence_callee() -> TestResult {
         let reads = registry_reads(
             r#"
             function get(receiver, key, cell) {
@@ -3709,13 +3770,15 @@ mod tests {
             }
             const result = (0, get)(state, opcode);
         "#,
-        );
+        )?;
         assert_eq!(reads.len(), 1);
         assert_eq!(reads[0].registry_path, vec!["handlers"]);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_accessor_when_receiver_role_is_reassigned() {
+    fn rejects_accessor_when_receiver_role_is_reassigned() -> TestResult {
         let reads = registry_reads(
             r#"
             function get(receiver, key, cell) {
@@ -3725,12 +3788,14 @@ mod tests {
             }
             get(state, opcode);
         "#,
-        );
+        )?;
         assert!(reads.is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn proves_registry_forwarding_through_delegate_fixed_point() {
+    fn proves_registry_forwarding_through_delegate_fixed_point() -> TestResult {
         let calls = registry_calls(
             r#"
             function install(receiver, key, value) {
@@ -3744,14 +3809,16 @@ mod tests {
             }
             outer(state, function(a) { return a; }, 9, true);
         "#,
-        );
+        )?;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].registry_path, vec!["handlers"]);
         assert_eq!(calls[0].handler_params, 1);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_delegate_when_forwarded_value_role_is_reassigned() {
+    fn rejects_delegate_when_forwarded_value_role_is_reassigned() -> TestResult {
         let calls = registry_calls(
             r#"
             function install(receiver, key, value) {
@@ -3763,12 +3830,14 @@ mod tests {
             }
             delegate(state, 9, function(a) { return a; });
         "#,
-        );
+        )?;
         assert!(calls.is_empty());
+
+        Ok(())
     }
 
     #[test]
-    fn proves_live_accessor_forwarding_through_argument_boxes() {
+    fn proves_live_accessor_forwarding_through_argument_boxes() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -3794,10 +3863,12 @@ mod tests {
             };
         "#;
         assert_eq!(proven_count(source), 1);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_non_forwarding_getter() {
+    fn rejects_non_forwarding_getter() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -3817,10 +3888,12 @@ mod tests {
             }
         "#;
         assert_eq!(proven_count(source), 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_non_forwarding_setter() {
+    fn rejects_non_forwarding_setter() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -3838,10 +3911,12 @@ mod tests {
             };
         "#;
         assert_eq!(proven_count(source), 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_wrong_definition_method() {
+    fn rejects_wrong_definition_method() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -3860,10 +3935,12 @@ mod tests {
             };
         "#;
         assert_eq!(proven_count(source), 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_mutated_argument_role_box() {
+    fn rejects_mutated_argument_role_box() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -3882,10 +3959,12 @@ mod tests {
             };
         "#;
         assert_eq!(proven_count(source), 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_reassigned_role_parameter() {
+    fn rejects_reassigned_role_parameter() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 resolver = evil;
@@ -3904,10 +3983,12 @@ mod tests {
             };
         "#;
         assert_eq!(proven_count(source), 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_argument_box_escape() {
+    fn rejects_argument_box_escape() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -3926,10 +4007,12 @@ mod tests {
             };
         "#;
         assert_eq!(proven_count(source), 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_argument_box_use_before_initialization() {
+    fn rejects_argument_box_use_before_initialization() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var owner; owner = (1, r[0][1])(r[0][0]);
@@ -3947,10 +4030,12 @@ mod tests {
             };
         "#;
         assert_eq!(proven_count(source), 0);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_mutually_exclusive_descriptor_halves() {
+    fn rejects_mutually_exclusive_descriptor_halves() -> TestResult {
         let source = r#"
             function helper(root, resolver, source, selector, alias) {
                 var r = [arguments];
@@ -3971,9 +4056,11 @@ mod tests {
             };
         "#;
         assert_eq!(proven_count(source), 0);
+
+        Ok(())
     }
     #[test]
-    fn registry_forwarding_propagates_work_budget_exhaustion() {
+    fn registry_forwarding_propagates_work_budget_exhaustion() -> TestResult {
         let allocator = Allocator::default();
         let source = "function install(receiver,key,value){receiver.handlers[key]=value;} install(state,7,function(){});";
         let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -3991,5 +4078,7 @@ mod tests {
                 if error.kind() == BudgetExceededKind::Work
                     && error.scope() == "forwarding-fuel"
         ));
+
+        Ok(())
     }
 }

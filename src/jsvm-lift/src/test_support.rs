@@ -50,3 +50,14 @@ impl<T, E: Debug> TestValue<T> for Result<T, E> {
         self.map_err(|error| TestFailure::error(context, error))
     }
 }
+
+pub(crate) fn source_slice<'a>(
+    source: &'a str,
+    start: u32,
+    end: u32,
+    context: &'static str,
+) -> Result<&'a str, TestFailure> {
+    let start = usize::try_from(start).map_err(|error| TestFailure::error(context, error))?;
+    let end = usize::try_from(end).map_err(|error| TestFailure::error(context, error))?;
+    source.get(start..end).test_value(context)
+}
