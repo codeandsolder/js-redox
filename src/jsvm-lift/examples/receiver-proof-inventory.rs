@@ -3,6 +3,7 @@ use jsvm_lift::cfg_order::prove_event_before_barriers;
 use jsvm_lift::{
     cfg_order::prove_events_before_event,
     forwarding_semantics::{
+        structurally_proven_lazy_registry_read_calls,
         structurally_proven_registry_forwarding_calls, structurally_proven_registry_read_calls,
     },
     receiver_identity::{
@@ -178,6 +179,13 @@ fn main() -> Result<()> {
             &structural_reads,
             &budget,
         )?;
+        let lazy_reads =
+            structurally_proven_lazy_registry_read_calls(&parsed.program, scoping, &budget)?;
+        let lazy_result_calls = jsvm_lift::registry_call_value::join_lazy_accessor_results(
+            &accessor_result_calls,
+            &lazy_reads,
+            &budget,
+        )?;
         let origin_installs =
             proven_origin_registry_handler_installs(&parsed.program, scoping, &runtime, &budget)?;
         let origin_reads =
@@ -215,6 +223,22 @@ fn main() -> Result<()> {
                 "looped_dynamic_call_sites": table.looped_dynamic_call_sites,
             })).collect::<Vec<_>>(),
             "table_vm_candidates": table_analysis.table_vms.len(),
+            "structural_lazy_registry_reads": lazy_reads.len(),
+            "lazy_accessor_result_indirect_call_candidates": lazy_result_calls.len(),
+            "lazy_accessor_result_indirect_call_definite": lazy_result_calls.iter()
+                .filter(|edge| edge.result.definite_accessor_result).count(),
+            "lazy_accessor_result_indirect_call_examples": lazy_result_calls.iter().take(48).map(|edge| json!({
+                "binding": edge.result.binding,
+                "accessor_call": [edge.result.accessor_call_start, edge.result.accessor_call_end],
+                "assignment": [edge.result.assignment_start, edge.result.assignment_end],
+                "indirect_call": [edge.result.indirect_call_start, edge.result.indirect_call_end],
+                "definite_accessor_result": edge.result.definite_accessor_result,
+                "registry_path": edge.registry_path,
+                "fast_probe_property": edge.fast_probe_property,
+                "update_method": edge.update_method,
+                "slow_projection_property": edge.slow_projection_property,
+                "slow_selector": [edge.slow_selector_start, edge.slow_selector_end],
+            })).collect::<Vec<_>>(),
             "accessor_result_indirect_call_candidates": accessor_result_calls.len(),
             "accessor_result_indirect_call_definite": accessor_result_calls.iter()
                 .filter(|edge| edge.definite_accessor_result).count(),

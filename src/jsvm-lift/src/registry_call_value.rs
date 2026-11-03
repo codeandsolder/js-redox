@@ -1,7 +1,7 @@
 //! Proven registry-accessor call results flowing into local indirect invocations.
 //! An accessor may project a lazy cell: its result is NOT necessarily a handler.
 use crate::cfg_order::{prove_event_before_barriers, prove_event_completion_before_event};
-use crate::forwarding_semantics::ProvenRegistryReadCall;
+use crate::forwarding_semantics::{ProvenLazyRegistryReadCall, ProvenRegistryReadCall};
 use oxc_ast::{
     ast::{AssignmentTarget, BindingPattern, Expression},
     AstKind,
@@ -10,7 +10,7 @@ use oxc_semantic::Semantic;
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::{node::NodeId, symbol::SymbolId};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use work_budget::{BudgetExceeded, WorkBudget};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -25,6 +25,54 @@ pub struct RegistryAccessorResultUse {
     /// Only proves retention of the accessor's return value, not handler identity.
     pub definite_accessor_result: bool,
 }
+/// A proven lazy-registry *accessor shape* whose returned value might reach
+/// an indirect call. The fast path calls the cell update method; the slow path
+/// returns a property of that cell after an update. This is NOT a proof that
+/// either result equals the registered handler.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LazyRegistryAccessorResultUse {
+    pub result: RegistryAccessorResultUse,
+    pub registry_path: Vec<String>,
+    pub fast_probe_property: String,
+    pub update_method: String,
+    pub slow_projection_property: String,
+    pub slow_selector_start: u32,
+    pub slow_selector_end: u32,
+}
+
+/// Join independent, span-exact proofs. No structural candidate is promoted
+/// to a definite result merely because its accessor has a lazy-cell shape.
+pub fn join_lazy_accessor_results(
+    uses: &[RegistryAccessorResultUse],
+    lazy_reads: &[ProvenLazyRegistryReadCall],
+    budget: &WorkBudget,
+) -> Result<Vec<LazyRegistryAccessorResultUse>, BudgetExceeded> {
+    budget.checkpoint()?;
+    let mut sites = HashMap::new();
+    for read in lazy_reads {
+        budget.consume(1)?;
+        sites.insert((read.read.call_start, read.read.call_end), read);
+    }
+    let mut result = Vec::new();
+    for use_site in uses {
+        budget.consume(1)?;
+        let Some(read) = sites.get(&(use_site.accessor_call_start, use_site.accessor_call_end))
+        else {
+            continue;
+        };
+        result.push(LazyRegistryAccessorResultUse {
+            result: use_site.clone(),
+            registry_path: read.read.registry_path.clone(),
+            fast_probe_property: read.probe_property.clone(),
+            update_method: read.update_property.clone(),
+            slow_projection_property: read.projection_property.clone(),
+            slow_selector_start: read.selector_start,
+            slow_selector_end: read.selector_end,
+        });
+    }
+    Ok(result)
+}
+
 struct Source {
     symbol: SymbolId,
     assignment: Span,
@@ -355,6 +403,95 @@ mod tests {
         )?;
         assert_eq!(e.len(), 1);
         assert!(!e[0].definite_accessor_result);
+        Ok(())
+    }
+
+    #[test]
+    fn joins_lazy_shape_without_inventing_handler_identity() -> TestResult {
+        use super::join_lazy_accessor_results;
+        use crate::forwarding_semantics::structurally_proven_lazy_registry_read_calls;
+        let source = r#"
+            function get(state, index, cell) {
+                if (cell = state.T[index], cell === undefined) throw Error();
+                if (cell.value) return cell.create();
+                return (cell.create(index * index + 3), cell).prototype;
+            }
+            function run(s, n, flag) {
+                let h = get(s, n);
+                if (flag) h = fallback;
+                h();
+            }
+        "#;
+        let alloc = Allocator::default();
+        let parsed = parse_program(&alloc, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let built = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(built.diagnostics.is_empty());
+        let b = WorkBudget::unlimited("lazy-result-join");
+        let reads =
+            structurally_proven_registry_read_calls(&parsed.program, built.semantic.scoping(), &b)
+                .test_value("structural reads")?;
+        let lazy = structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            built.semantic.scoping(),
+            &b,
+        )
+        .test_value("lazy reads")?;
+        assert_eq!(lazy.len(), 1);
+        let uses = analyze(&built.semantic, &reads, &b).test_value("result uses")?;
+        assert_eq!(uses.len(), 1);
+        let joined = join_lazy_accessor_results(&uses, &lazy, &b).test_value("joined")?;
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].registry_path, ["T"]);
+        assert_eq!(joined[0].fast_probe_property, "value");
+        assert_eq!(joined[0].update_method, "create");
+        assert_eq!(joined[0].slow_projection_property, "prototype");
+        assert!(!joined[0].result.definite_accessor_result);
+        let b = WorkBudget::new("zero-lazy-join", BudgetLimits::work(0));
+        assert!(join_lazy_accessor_results(&uses, &lazy, &b).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unrelated_accessor_does_not_inherit_lazy_shape() -> TestResult {
+        use super::join_lazy_accessor_results;
+        use crate::forwarding_semantics::structurally_proven_lazy_registry_read_calls;
+        let source = r#"
+            function get(state, index, cell) {
+                if (cell = state.T[index], cell === undefined) throw Error();
+                if (cell.value) return cell.create();
+                return (cell.create(index * index + 3), cell).prototype;
+            }
+            function plain(state, index) { return state.T[index]; }
+            function run(s, n) { let a = get(s, n); let b = plain(s, n); a(); b(); }
+        "#;
+        let alloc = Allocator::default();
+        let parsed = parse_program(&alloc, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let built = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .with_cfg(true)
+            .build(&parsed.program);
+        assert!(built.diagnostics.is_empty());
+        let b = WorkBudget::unlimited("lazy-result-mismatch");
+        let reads =
+            structurally_proven_registry_read_calls(&parsed.program, built.semantic.scoping(), &b)
+                .test_value("structural reads")?;
+        let lazy = structurally_proven_lazy_registry_read_calls(
+            &parsed.program,
+            built.semantic.scoping(),
+            &b,
+        )
+        .test_value("lazy reads")?;
+        assert_eq!(lazy.len(), 1);
+        let uses = analyze(&built.semantic, &reads, &b).test_value("result uses")?;
+        assert_eq!(uses.len(), 2);
+        let joined = join_lazy_accessor_results(&uses, &lazy, &b).test_value("joined")?;
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].result.binding, "a");
         Ok(())
     }
 
