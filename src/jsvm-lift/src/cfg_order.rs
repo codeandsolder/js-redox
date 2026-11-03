@@ -504,6 +504,11 @@ fn prove_required_before_node_budgeted(
 /// the same execution context. Oxc's NewFunction and Unreachable edges are
 /// ignored; graph cycles are handled with a visited set.
 ///
+/// Only normal, jump, loop and finalizer traversal is considered; exception
+/// edges are excluded because they may leave an AST assignment before its
+/// side effect completes. This is a soundly scoped witness, not an exhaustive
+/// list of possible JavaScript paths.
+///
 /// Every span lookup and graph traversal is charged to the caller's budget.
 pub fn cfg_has_write_free_path(
     semantic: &Semantic<'_>,
@@ -574,7 +579,7 @@ pub fn cfg_has_write_free_path(
         }
         for edge in cfg.graph().edges_directed(block, Direction::Outgoing) {
             budget.consume(1)?;
-            if usable_edge(edge.weight()) {
+            if usable_edge(edge.weight()) && !matches!(edge.weight(), EdgeType::Error(_)) {
                 queue.push_back(edge.target());
             }
         }
