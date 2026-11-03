@@ -1,6 +1,8 @@
 //! Proven registry-accessor call results flowing into local indirect invocations.
 //! An accessor may project a lazy cell: its result is NOT necessarily a handler.
-use crate::cfg_order::{prove_event_before_barriers, prove_event_completion_before_event};
+use crate::cfg_order::{
+    cfg_has_write_free_path, prove_event_before_barriers, prove_event_completion_before_event,
+};
 use crate::forwarding_semantics::{ProvenLazyRegistryReadCall, ProvenRegistryReadCall};
 use crate::registry_identity::ProvenOriginRegistryReadCall;
 use oxc_ast::{
@@ -25,6 +27,10 @@ pub struct RegistryAccessorResultUse {
     pub indirect_call_end: u32,
     /// Only proves retention of the accessor's return value, not handler identity.
     pub definite_accessor_result: bool,
+    /// An existential, syntactic CFG path with no intervening symbol write.
+    /// This is NOT proof that the path is feasible at runtime or that the
+    /// accessor returned a registered handler.
+    pub cfg_write_free_path: bool,
 }
 /// A proven lazy-registry *accessor shape* whose returned value might reach
 /// an indirect call. The fast path calls the cell update method; the slow path
@@ -221,16 +227,13 @@ fn has_dynamic_scope(
     }
     Ok(false)
 }
-fn is_definite(
+fn eligible_write_barriers(
     s: &Semantic<'_>,
     d: &Source,
-    call: Span,
     budget: &WorkBudget,
-) -> Result<bool, BudgetExceeded> {
-    if !prove_event_completion_before_event(s, d.assignment, call)
-        || has_dynamic_scope(s, d.context, budget)?
-    {
-        return Ok(false);
+) -> Result<Option<Vec<Span>>, BudgetExceeded> {
+    if !locally_owned_symbol(s, d.symbol, d.context) || has_dynamic_scope(s, d.context, budget)? {
+        return Ok(None);
     }
     // Sloppy parameter/var redeclarations can alias mapped arguments
     // entries. A write to arguments[index] is not a symbol write.
@@ -251,10 +254,11 @@ fn is_definite(
                 .any(|ancestor| ancestor == d.context)
                 && matches!(node.kind(), AstKind::IdentifierReference(name) if name.name == "arguments")
             {
-                return Ok(false);
+                return Ok(None);
             }
         }
     }
+    let mut writes = Vec::new();
     for id in s.scoping().get_resolved_reference_ids(d.symbol) {
         budget.consume(1)?;
         let r = s.scoping().get_reference(*id);
@@ -263,20 +267,23 @@ fn is_definite(
         }
         if owner(s, r.node_id()) != Some(d.context) {
             // Captured writes are unsafe. Captured reads alone are fine.
-            return Ok(false);
+            return Ok(None);
         }
         let barrier = s.nodes().get_node(r.node_id()).kind().span();
         if Some(barrier) == d.target {
             continue;
         }
-        budget.consume(1)?;
-        if !prove_event_completion_before_event(s, barrier, d.assignment)
-            && !prove_event_before_barriers(s, call, &[barrier])
-        {
-            return Ok(false);
-        }
+        writes.push(barrier);
     }
-    Ok(true)
+    Ok(Some(writes))
+}
+
+fn is_definite(s: &Semantic<'_>, d: &Source, call: Span, writes: &[Span]) -> bool {
+    prove_event_completion_before_event(s, d.assignment, call)
+        && writes.iter().all(|&barrier| {
+            prove_event_completion_before_event(s, barrier, d.assignment)
+                || prove_event_before_barriers(s, call, &[barrier])
+        })
 }
 /// Non-definite edges are structural candidates, never confirmed dispatch.
 /// Definite edges prove a local call-result reaching definition, but do not
@@ -353,6 +360,14 @@ pub fn analyze(
             if d.symbol != symbol || d.context != context || d.assignment.end > call.start {
                 continue;
             }
+            let guards = eligible_write_barriers(s, d, budget)?;
+            let (definite_accessor_result, cfg_write_free_path) = match guards {
+                Some(ref writes) => (
+                    is_definite(s, d, call, writes),
+                    cfg_has_write_free_path(s, d.assignment, call, writes, budget)?,
+                ),
+                None => (false, false),
+            };
             edges.push(RegistryAccessorResultUse {
                 binding: binding.clone(),
                 assignment_start: d.assignment.start,
@@ -361,8 +376,8 @@ pub fn analyze(
                 accessor_call_end: d.accessor.end,
                 indirect_call_start: call.start,
                 indirect_call_end: call.end,
-                definite_accessor_result: locally_owned_symbol(s, symbol, context)
-                    && is_definite(s, d, call, budget)?,
+                definite_accessor_result,
+                cfg_write_free_path,
             });
         }
     }
@@ -410,6 +425,7 @@ mod tests {
         let e = inspect("function run(s,k) { let h=read(s,k); h(); }")?;
         assert_eq!(e.len(), 1);
         assert!(e[0].definite_accessor_result);
+        assert!(e[0].cfg_write_free_path);
         Ok(())
     }
     #[test]
@@ -422,6 +438,104 @@ mod tests {
         assert!(!e[0].definite_accessor_result);
         Ok(())
     }
+    #[test]
+    fn cfg_path_distinguishes_competing_branch_from_mandatory_overwrite() -> TestResult {
+        let e = inspect(
+            "function run(s,k,c) {
+                let h;
+                if (c) h=read(s,k); else h=other;
+                h();
+            }",
+        )?;
+        assert_eq!(e.len(), 1);
+        assert!(!e[0].definite_accessor_result);
+        assert!(e[0].cfg_write_free_path);
+
+        let e = inspect(
+            "function run(s,k) {
+                let h=read(s,k);
+                h=other;
+                h();
+            }",
+        )?;
+        assert_eq!(e.len(), 1);
+        assert!(!e[0].definite_accessor_result);
+        assert!(!e[0].cfg_write_free_path);
+
+        let e = inspect(
+            "function run(s,k,c) {
+                let h=read(s,k);
+                if (c) h=other;
+                h();
+            }",
+        )?;
+        assert_eq!(e.len(), 1);
+        assert!(!e[0].definite_accessor_result);
+        assert!(e[0].cfg_write_free_path);
+        Ok(())
+    }
+
+    #[test]
+    fn cfg_path_respects_writes_before_assignment_and_alternate_branches() -> TestResult {
+        let e = inspect(
+            "function run(s,k) {
+                let h=other;
+                h=read(s,k);
+                h();
+            }",
+        )?;
+        assert_eq!(e.len(), 1);
+        assert!(e[0].definite_accessor_result);
+        assert!(e[0].cfg_write_free_path);
+
+        let e = inspect(
+            "function run(s,k,c) {
+                let h=read(s,k);
+                if(c)h=other; else h=another;
+                h();
+            }",
+        )?;
+        assert_eq!(e.len(), 1);
+        assert!(!e[0].definite_accessor_result);
+        assert!(!e[0].cfg_write_free_path);
+        Ok(())
+    }
+
+    #[test]
+    fn cfg_path_rejects_alias_and_dynamic_scope_ambiguity() -> TestResult {
+        let e = inspect(
+            "function run(s,k) {
+                let h=read(s,k);
+                function rewrite(){h=other;}
+                rewrite();
+                h();
+            }",
+        )?;
+        assert_eq!(e.len(), 1);
+        assert!(!e[0].cfg_write_free_path);
+
+        let e = inspect(
+            "function run(s,k) {
+                let h=read(s,k);
+                eval('h=other');
+                h();
+            }",
+        )?;
+        assert_eq!(e.len(), 1);
+        assert!(!e[0].cfg_write_free_path);
+
+        let e = inspect(
+            "function run(h,s,k) {
+                var h=read(s,k);
+                arguments[0]=other;
+                h();
+            }",
+        )?;
+        assert_eq!(e.len(), 1);
+        assert!(!e[0].cfg_write_free_path);
+        Ok(())
+    }
+
     #[test]
     fn shadowing_and_eval_do_not_prove_dispatch() -> TestResult {
         assert!(
@@ -590,6 +704,7 @@ mod tests {
                 indirect_call_start: 30,
                 indirect_call_end: 40,
                 definite_accessor_result: false,
+                cfg_write_free_path: false,
             },
             registry_path: vec!["handlers".into()],
             registry_receiver_start: 7,

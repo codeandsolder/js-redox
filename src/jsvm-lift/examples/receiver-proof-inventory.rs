@@ -236,6 +236,7 @@ fn main() -> Result<()> {
                 "accessor_call": [proof.lazy.result.accessor_call_start, proof.lazy.result.accessor_call_end],
                 "indirect_call": [proof.lazy.result.indirect_call_start, proof.lazy.result.indirect_call_end],
                 "definite_accessor_result": proof.lazy.result.definite_accessor_result,
+                "cfg_write_free_path": proof.lazy.result.cfg_write_free_path,
                 "origin_allocation": [proof.origin_allocation_start, proof.origin_allocation_end],
                 "origin_constructor": [proof.origin_constructor_start, proof.origin_constructor_end],
                 "exact_key": proof.exact_key,
@@ -244,12 +245,15 @@ fn main() -> Result<()> {
             "lazy_accessor_result_indirect_call_candidates": lazy_result_calls.len(),
             "lazy_accessor_result_indirect_call_definite": lazy_result_calls.iter()
                 .filter(|edge| edge.result.definite_accessor_result).count(),
+            "lazy_accessor_result_indirect_call_cfg_write_free_paths": lazy_result_calls.iter()
+                .filter(|edge| edge.result.cfg_write_free_path).count(),
             "lazy_accessor_result_indirect_call_examples": lazy_result_calls.iter().take(48).map(|edge| json!({
                 "binding": edge.result.binding,
                 "accessor_call": [edge.result.accessor_call_start, edge.result.accessor_call_end],
                 "assignment": [edge.result.assignment_start, edge.result.assignment_end],
                 "indirect_call": [edge.result.indirect_call_start, edge.result.indirect_call_end],
                 "definite_accessor_result": edge.result.definite_accessor_result,
+                "cfg_write_free_path": edge.result.cfg_write_free_path,
                 "registry_receiver": [edge.registry_receiver_start, edge.registry_receiver_end],
                 "registry_key": [edge.registry_key_start, edge.registry_key_end],
                 "registry_path": edge.registry_path,
@@ -261,12 +265,15 @@ fn main() -> Result<()> {
             "accessor_result_indirect_call_candidates": accessor_result_calls.len(),
             "accessor_result_indirect_call_definite": accessor_result_calls.iter()
                 .filter(|edge| edge.definite_accessor_result).count(),
+            "accessor_result_indirect_call_cfg_write_free_paths": accessor_result_calls.iter()
+                .filter(|edge| edge.cfg_write_free_path).count(),
             "accessor_result_indirect_call_examples": accessor_result_calls.iter().take(48).map(|edge| json!({
                 "binding": edge.binding,
                 "assignment": [edge.assignment_start, edge.assignment_end],
                 "accessor_call": [edge.accessor_call_start, edge.accessor_call_end],
                 "indirect_call": [edge.indirect_call_start, edge.indirect_call_end],
                 "definite_accessor_result": edge.definite_accessor_result,
+                "cfg_write_free_path": edge.cfg_write_free_path,
             })).collect::<Vec<_>>(),
             "structural_registry_handler_installs": structural_installs.len(),
                 "structural_registry_reads": structural_reads.len(),
