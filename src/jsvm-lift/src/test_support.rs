@@ -79,3 +79,14 @@ pub(crate) fn source_rfind(
     let offset = source.rfind(needle).test_value(context)?;
     u32::try_from(offset).map_err(|error| TestFailure::error(context, error))
 }
+
+pub(crate) fn source_span(
+    source: &str,
+    needle: &str,
+    context: &'static str,
+) -> Result<oxc_span::Span, TestFailure> {
+    let start = source_offset(source, needle, context)?;
+    let len = u32::try_from(needle.len()).map_err(|error| TestFailure::error(context, error))?;
+    let end = start.checked_add(len).test_value(context)?;
+    Ok(oxc_span::Span::new(start, end))
+}

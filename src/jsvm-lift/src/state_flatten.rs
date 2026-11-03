@@ -5392,6 +5392,9 @@ pub fn analyze_function(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        source_offset, source_rfind, source_span, TestFailure, TestResult, TestValue,
+    };
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
@@ -5599,7 +5602,11 @@ mod tests {
         assert_eq!(detected.if_ladder_machines[0].init_state, 3);
     }
 
-    fn prove_order(source: &str, event_text: &str, barrier_texts: &[&str]) -> bool {
+    fn prove_order(
+        source: &str,
+        event_text: &str,
+        barrier_texts: &[&str],
+    ) -> Result<bool, TestFailure> {
         struct Harness<'s> {
             source: &'s str,
             event: Span,
@@ -5622,15 +5629,11 @@ mod tests {
             }
         }
 
-        let event_start = source.find(event_text).expect("event text") as u32;
-        let event = Span::new(event_start, event_start + event_text.len() as u32);
+        let event = source_span(source, event_text, "event text")?;
         let barriers = barrier_texts
             .iter()
-            .map(|text| {
-                let start = source.find(text).expect("barrier text") as u32;
-                Span::new(start, start + text.len() as u32)
-            })
-            .collect();
+            .map(|text| source_span(source, text, "barrier text"))
+            .collect::<Result<Vec<_>, TestFailure>>()?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let mut harness = Harness {
@@ -5640,7 +5643,7 @@ mod tests {
             result: None,
         };
         harness.visit_program(&parsed.program);
-        harness.result.unwrap_or(false)
+        Ok(harness.result.unwrap_or(false))
     }
 
     #[test]
@@ -5670,7 +5673,7 @@ mod tests {
     }
 
     #[test]
-    fn proves_identifier_equality_live_at_event() {
+    fn proves_identifier_equality_live_at_event() -> TestResult {
         let source = r#"
             function flattened(left, right, flag) {
                 let state;
@@ -5682,7 +5685,7 @@ mod tests {
                 }
             }
         "#;
-        let target_start = source.find("target()").unwrap() as u32;
+        let target_start = source_offset(source, "target()", "target() offset")?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -5692,15 +5695,19 @@ mod tests {
             source,
             &parsed.program,
             &semantic.semantic,
-            source.find("function flattened").unwrap() as u32,
-            source.rfind('}').unwrap() as u32 + 1,
+            source_offset(source, "function flattened", "function flattened offset")?,
+            source_rfind(source, "}", "function end")?
+                .checked_add(1)
+                .test_value("function end")?,
             Span::new(target_start, target_start + 8),
         );
         assert!(proven.iter().any(|proof| proof.state == 0));
+
+        Ok(())
     }
 
     #[test]
-    fn proves_identifier_equality_inside_nested_alternate_dispatch_chunk() {
+    fn proves_identifier_equality_inside_nested_alternate_dispatch_chunk() -> TestResult {
         let source = r#"
             function flattened(left, right, other) {
                 let state;
@@ -5715,7 +5722,7 @@ mod tests {
                 }
             }
         "#;
-        let target_start = source.find("target()").unwrap() as u32;
+        let target_start = source_offset(source, "target()", "target() offset")?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -5725,15 +5732,19 @@ mod tests {
             source,
             &parsed.program,
             &semantic.semantic,
-            source.find("function flattened").unwrap() as u32,
-            source.rfind('}').unwrap() as u32 + 1,
+            source_offset(source, "function flattened", "function flattened offset")?,
+            source_rfind(source, "}", "function end")?
+                .checked_add(1)
+                .test_value("function end")?,
             Span::new(target_start, target_start + 8),
         );
         assert!(proven.iter().any(|proof| proof.state == 1));
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_identifier_equality_invalidated_before_event() {
+    fn rejects_identifier_equality_invalidated_before_event() -> TestResult {
         let source = r#"
             function flattened(left, right, flag) {
                 let state;
@@ -5745,7 +5756,7 @@ mod tests {
                 }
             }
         "#;
-        let target_start = source.find("target()").unwrap() as u32;
+        let target_start = source_offset(source, "target()", "target() offset")?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -5755,15 +5766,20 @@ mod tests {
             source,
             &parsed.program,
             &semantic.semantic,
-            source.find("function flattened").unwrap() as u32,
-            source.rfind('}').unwrap() as u32 + 1,
+            source_offset(source, "function flattened", "function flattened offset")?,
+            source_rfind(source, "}", "function end")?
+                .checked_add(1)
+                .test_value("function end")?,
             Span::new(target_start, target_start + 8),
         );
         assert!(!proven.iter().any(|proof| proof.state == 0));
+
+        Ok(())
     }
 
     #[test]
-    fn proves_protected_identifier_equality_when_barrier_suffix_cannot_return_to_event() {
+    fn proves_protected_identifier_equality_when_barrier_suffix_cannot_return_to_event(
+    ) -> TestResult {
         let source = r#"
             function flattened(left, right, other) {
                 let outer, state, phase;
@@ -5779,7 +5795,7 @@ mod tests {
                 }
             }
         "#;
-        let target_start = source.find("target()").unwrap() as u32;
+        let target_start = source_offset(source, "target()", "target() offset")?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -5789,15 +5805,19 @@ mod tests {
             source,
             &parsed.program,
             &semantic.semantic,
-            source.find("function flattened").unwrap() as u32,
-            source.rfind('}').unwrap() as u32 + 1,
+            source_offset(source, "function flattened", "function flattened offset")?,
+            source_rfind(source, "}", "function end")?
+                .checked_add(1)
+                .test_value("function end")?,
             Span::new(target_start, target_start + 8),
         );
         assert!(proven.iter().any(|proof| proof.state == 0));
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_protected_identifier_equality_when_barrier_suffix_returns_to_event() {
+    fn rejects_protected_identifier_equality_when_barrier_suffix_returns_to_event() -> TestResult {
         let source = r#"
             function flattened(left, right, other) {
                 let state;
@@ -5812,7 +5832,7 @@ mod tests {
                 }
             }
         "#;
-        let target_start = source.find("target()").unwrap() as u32;
+        let target_start = source_offset(source, "target()", "target() offset")?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -5822,15 +5842,19 @@ mod tests {
             source,
             &parsed.program,
             &semantic.semantic,
-            source.find("function flattened").unwrap() as u32,
-            source.rfind('}').unwrap() as u32 + 1,
+            source_offset(source, "function flattened", "function flattened offset")?,
+            source_rfind(source, "}", "function end")?
+                .checked_add(1)
+                .test_value("function end")?,
             Span::new(target_start, target_start + 8),
         );
         assert!(!proven.iter().any(|proof| proof.state == 0));
+
+        Ok(())
     }
 
     #[test]
-    fn proves_required_state_before_event() {
+    fn proves_required_state_before_event() -> TestResult {
         let source = r#"
             function flattened() {
                 let state;
@@ -5842,12 +5866,15 @@ mod tests {
                 }
             }
         "#;
-        let target_start = source.find("target()").unwrap() as u32;
+        let target_start = source_offset(source, "target()", "target() offset")?;
         let target = Span::new(target_start, target_start + 8);
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
-        let function_start = source.find("function flattened").unwrap() as u32;
-        let function_end = source.rfind('}').unwrap() as u32 + 1;
+        let function_start =
+            source_offset(source, "function flattened", "function flattened offset")?;
+        let function_end = source_rfind(source, "}", "function end")?
+            .checked_add(1)
+            .test_value("function end")?;
         assert!(prove_function_if_ladder_states_before_event(
             source,
             &parsed.program,
@@ -5856,10 +5883,12 @@ mod tests {
             &[1],
             target,
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn allows_unresolved_transition_after_required_state() {
+    fn allows_unresolved_transition_after_required_state() -> TestResult {
         let source = r#"
             function flattened(flag, unknown) {
                 let state;
@@ -5872,12 +5901,15 @@ mod tests {
                 }
             }
         "#;
-        let target_start = source.find("target()").unwrap() as u32;
+        let target_start = source_offset(source, "target()", "target() offset")?;
         let target = Span::new(target_start, target_start + 8);
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
-        let function_start = source.find("function flattened").unwrap() as u32;
-        let function_end = source.rfind('}').unwrap() as u32 + 1;
+        let function_start =
+            source_offset(source, "function flattened", "function flattened offset")?;
+        let function_end = source_rfind(source, "}", "function end")?
+            .checked_add(1)
+            .test_value("function end")?;
         assert!(prove_function_if_ladder_states_before_event(
             source,
             &parsed.program,
@@ -5886,10 +5918,12 @@ mod tests {
             &[1],
             target,
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_unresolved_transition_before_required_state() {
+    fn rejects_unresolved_transition_before_required_state() -> TestResult {
         let source = r#"
             function flattened(flag, unknown) {
                 let state;
@@ -5901,12 +5935,15 @@ mod tests {
                 }
             }
         "#;
-        let target_start = source.find("target()").unwrap() as u32;
+        let target_start = source_offset(source, "target()", "target() offset")?;
         let target = Span::new(target_start, target_start + 8);
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
-        let function_start = source.find("function flattened").unwrap() as u32;
-        let function_end = source.rfind('}').unwrap() as u32 + 1;
+        let function_start =
+            source_offset(source, "function flattened", "function flattened offset")?;
+        let function_end = source_rfind(source, "}", "function end")?
+            .checked_add(1)
+            .test_value("function end")?;
         assert!(!prove_function_if_ladder_states_before_event(
             source,
             &parsed.program,
@@ -5915,10 +5952,12 @@ mod tests {
             &[1],
             target,
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_required_state_bypassed_on_path_to_event() {
+    fn rejects_required_state_bypassed_on_path_to_event() -> TestResult {
         let source = r#"
             function flattened(flag) {
                 let state;
@@ -5930,12 +5969,15 @@ mod tests {
                 }
             }
         "#;
-        let target_start = source.find("target()").unwrap() as u32;
+        let target_start = source_offset(source, "target()", "target() offset")?;
         let target = Span::new(target_start, target_start + 8);
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
-        let function_start = source.find("function flattened").unwrap() as u32;
-        let function_end = source.rfind('}').unwrap() as u32 + 1;
+        let function_start =
+            source_offset(source, "function flattened", "function flattened offset")?;
+        let function_end = source_rfind(source, "}", "function end")?
+            .checked_add(1)
+            .test_value("function end")?;
         assert!(!prove_function_if_ladder_states_before_event(
             source,
             &parsed.program,
@@ -5944,10 +5986,12 @@ mod tests {
             &[1],
             target,
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn proves_if_ladder_event_before_later_barrier_state() {
+    fn proves_if_ladder_event_before_later_barrier_state() -> TestResult {
         let source = r#"
             function flattened() {
                 for (let state = 0; state !== 99;) {
@@ -5958,11 +6002,13 @@ mod tests {
                 }
             }
         "#;
-        assert!(prove_order(source, "target()", &["barrier()"]))
+        assert!(prove_order(source, "target()", &["barrier()"])?);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_if_ladder_barrier_on_path_before_event() {
+    fn rejects_if_ladder_barrier_on_path_before_event() -> TestResult {
         let source = r#"
             function flattened() {
                 for (let state = 0; state !== 99;) {
@@ -5973,11 +6019,13 @@ mod tests {
                 }
             }
         "#;
-        assert!(!prove_order(source, "target()", &["barrier()"]))
+        assert!(!prove_order(source, "target()", &["barrier()"])?);
+
+        Ok(())
     }
 
     #[test]
-    fn orders_barriers_within_target_state() {
+    fn orders_barriers_within_target_state() -> TestResult {
         let before = r#"
             function flattened() {
                 for (let state = 0; state !== 99;) {
@@ -5988,14 +6036,16 @@ mod tests {
                 }
             }
         "#;
-        assert!(!prove_order(before, "target()", &["barrier()"]));
+        assert!(!prove_order(before, "target()", &["barrier()"])?);
 
         let after = before.replace("barrier(); target();", "target(); barrier();");
-        assert!(prove_order(&after, "target()", &["barrier()"]));
+        assert!(prove_order(&after, "target()", &["barrier()"])?);
+
+        Ok(())
     }
 
     #[test]
-    fn allows_known_alternate_path_that_exits_without_event() {
+    fn allows_known_alternate_path_that_exits_without_event() -> TestResult {
         let source = r#"
             function flattened(flag) {
                 for (let state = 0; state !== 99;) {
@@ -6006,11 +6056,13 @@ mod tests {
                 }
             }
         "#;
-        assert!(prove_order(source, "target()", &["barrier()"]))
+        assert!(prove_order(source, "target()", &["barrier()"])?);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_reachable_unresolved_transition_before_event() {
+    fn rejects_reachable_unresolved_transition_before_event() -> TestResult {
         let source = r#"
             function flattened(next) {
                 for (let state = 0; state !== 99;) {
@@ -6021,10 +6073,16 @@ mod tests {
                 }
             }
         "#;
-        assert!(!prove_order(source, "target()", &[]))
+        assert!(!prove_order(source, "target()", &[])?);
+
+        Ok(())
     }
 
-    fn prove_while_order(source: &str, event_text: &str, barrier_texts: &[&str]) -> bool {
+    fn prove_while_order(
+        source: &str,
+        event_text: &str,
+        barrier_texts: &[&str],
+    ) -> Result<bool, TestFailure> {
         struct Harness<'s> {
             source: &'s str,
             event: Span,
@@ -6068,15 +6126,11 @@ mod tests {
             }
         }
 
-        let event_start = source.find(event_text).expect("event text") as u32;
-        let event = Span::new(event_start, event_start + event_text.len() as u32);
+        let event = source_span(source, event_text, "event text")?;
         let barriers = barrier_texts
             .iter()
-            .map(|text| {
-                let start = source.find(text).expect("barrier text") as u32;
-                Span::new(start, start + text.len() as u32)
-            })
-            .collect();
+            .map(|text| source_span(source, text, "barrier text"))
+            .collect::<Result<Vec<_>, TestFailure>>()?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let mut harness = Harness {
@@ -6086,11 +6140,11 @@ mod tests {
             result: None,
         };
         harness.visit_program(&parsed.program);
-        harness.result.unwrap_or(false)
+        Ok(harness.result.unwrap_or(false))
     }
 
     #[test]
-    fn proves_while_if_ladder_event_before_later_same_state_barrier() {
+    fn proves_while_if_ladder_event_before_later_same_state_barrier() -> TestResult {
         let source = r#"
             function flattened() {
                 let state;
@@ -6103,11 +6157,13 @@ mod tests {
                 }
             }
         "#;
-        assert!(prove_while_order(source, "target()", &["barrier()"]));
+        assert!(prove_while_order(source, "target()", &["barrier()"])?);
+
+        Ok(())
     }
 
     #[test]
-    fn proves_order_from_pre_detected_while_machine() {
+    fn proves_order_from_pre_detected_while_machine() -> TestResult {
         let source = r#"
             function flattened() {
                 let state = 0;
@@ -6146,19 +6202,21 @@ mod tests {
             machine: None,
         };
         finder.visit_program(&parsed.program);
-        let machine = finder.machine.expect("machine");
-        let event_start = source.find("target()").expect("event") as u32;
-        let barrier_start = source.find("barrier()").expect("barrier") as u32;
+        let machine = finder.machine.test_value("machine")?;
+        let event_start = source_offset(source, "target()", "event")?;
+        let barrier_start = source_offset(source, "barrier()", "barrier")?;
         assert!(prove_detected_if_ladder_event_before_barriers(
             &parsed.program,
             &machine,
             Span::new(event_start, event_start + 8),
             &[Span::new(barrier_start, barrier_start + 9)],
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn proves_selector_specialized_branch_unreachable() {
+    fn proves_selector_specialized_branch_unreachable() -> TestResult {
         let source = r#"function f(Q) {
             for (H = 28; H != 74;) {
                 if (H == 55) { sink(); H = 62; }
@@ -6175,8 +6233,12 @@ mod tests {
         let mut harness = DetectorHarness::default();
         harness.source = source;
         harness.visit_program(&parsed.program);
-        let machine = harness.detected.if_ladder_machines.first().unwrap();
-        let start = u32::try_from(source.find("sink()").unwrap()).unwrap();
+        let machine = harness
+            .detected
+            .if_ladder_machines
+            .first()
+            .test_value("detected if-ladder machine")?;
+        let start = source_offset(source, "sink()", "sink() offset")?;
         let event = Span::new(start, start + 6);
         let safe = BTreeMap::from([("Q".to_string(), 47)]);
         let unsafe_binding = BTreeMap::from([("Q".to_string(), 46)]);
@@ -6196,10 +6258,12 @@ mod tests {
                 &unsafe_binding,
             )
         );
+
+        Ok(())
     }
 
     #[test]
-    fn proves_switch_event_unreachable_by_parameter_index() {
+    fn proves_switch_event_unreachable_by_parameter_index() -> TestResult {
         let source = r#"const x = function(J, Q, Y) {
             switch (!(Q == 410 || Q == 387)) {
                 case true:
@@ -6223,8 +6287,8 @@ mod tests {
         }
         let mut function = FunctionSpan { span: None };
         function.visit_program(&parsed.program);
-        let function = function.span.unwrap();
-        let start = u32::try_from(source.find("sink(Y)").unwrap()).unwrap();
+        let function = function.span.test_value("function span")?;
+        let start = source_offset(source, "sink(Y)", "sink(Y) offset")?;
         let event = Span::new(start, start + 7);
         assert!(
             prove_function_switch_event_unreachable_with_integer_parameters(
@@ -6246,10 +6310,12 @@ mod tests {
                 &BTreeMap::from([(1, 410)]),
             )
         );
+
+        Ok(())
     }
 
     #[test]
-    fn proves_switch_target_mismatch_past_opaque_terminating_case() {
+    fn proves_switch_target_mismatch_past_opaque_terminating_case() -> TestResult {
         let source = r#"const x = function(Q, Y) {
             switch (!(Q == 410 || Q == 387)) {
                 case opaque():
@@ -6273,8 +6339,8 @@ mod tests {
         }
         let mut function = FunctionSpan { span: None };
         function.visit_program(&parsed.program);
-        let function = function.span.unwrap();
-        let start = u32::try_from(source.find("sink(Y)").unwrap()).unwrap();
+        let function = function.span.test_value("function span")?;
+        let start = source_offset(source, "sink(Y)", "sink(Y) offset")?;
         let event = Span::new(start, start + 7);
         assert!(
             prove_function_switch_event_unreachable_with_integer_parameters(
@@ -6286,10 +6352,12 @@ mod tests {
                 &BTreeMap::from([(0, 294)]),
             )
         );
+
+        Ok(())
     }
 
     #[test]
-    fn switch_target_mismatch_rejects_possible_prior_fallthrough() {
+    fn switch_target_mismatch_rejects_possible_prior_fallthrough() -> TestResult {
         let source = r#"const x = function(Q, Y) {
             switch (!(Q == 410 || Q == 387)) {
                 case opaque():
@@ -6312,8 +6380,8 @@ mod tests {
         }
         let mut function = FunctionSpan { span: None };
         function.visit_program(&parsed.program);
-        let function = function.span.unwrap();
-        let start = u32::try_from(source.find("sink(Y)").unwrap()).unwrap();
+        let function = function.span.test_value("function span")?;
+        let start = source_offset(source, "sink(Y)", "sink(Y) offset")?;
         let event = Span::new(start, start + 7);
         assert!(
             !prove_function_switch_event_unreachable_with_integer_parameters(
@@ -6325,10 +6393,12 @@ mod tests {
                 &BTreeMap::from([(0, 294)]),
             )
         );
+
+        Ok(())
     }
 
     #[test]
-    fn function_ordering_falls_back_to_detected_while_machine() {
+    fn function_ordering_falls_back_to_detected_while_machine() -> TestResult {
         let source = r#"
             function target() {
                 let state = 5;
@@ -6351,24 +6421,30 @@ mod tests {
                 Statement::FunctionDeclaration(function) => Some(function),
                 _ => None,
             })
-            .expect("target function");
-        let event_start = source.find("event()").unwrap() as u32;
-        let barrier_start = source.find("barrier()").unwrap() as u32;
+            .test_value("target function")?;
+        let event_start = source_offset(source, "event()", "event() offset")?;
+        let barrier_start = source_offset(source, "barrier()", "barrier() offset")?;
         assert!(prove_function_if_ladder_event_before_barriers(
             source,
             &parsed.program,
             function.span.start,
             function.span.end,
-            Span::new(event_start, event_start + "event()".len() as u32),
+            Span::new(
+                event_start,
+                event_start + u32::try_from("event()".len()).test_value("fixture text length")?
+            ),
             &[Span::new(
                 barrier_start,
-                barrier_start + "barrier()".len() as u32,
+                barrier_start
+                    + u32::try_from("barrier()".len()).test_value("fixture text length")?,
             )],
         ));
+
+        Ok(())
     }
 
     #[test]
-    fn function_specializer_maps_logical_and_state_guard() {
+    fn function_specializer_maps_logical_and_state_guard() -> TestResult {
         let source = r#"
             function target(selector) {
                 let state = 5;
@@ -6393,15 +6469,20 @@ mod tests {
                 Statement::FunctionDeclaration(function) => Some(function),
                 _ => None,
             })
-            .expect("target function");
-        let body = function.body.as_ref().expect("function body");
-        let [init, Statement::WhileStatement(while_statement)] = body.statements.as_slice() else {
-            panic!("expected init + while");
-        };
+            .test_value("target function")?;
+        let body = function.body.as_ref().test_value("function body")?;
+        let (init, while_statement) = match body.statements.as_slice() {
+            [init, Statement::WhileStatement(while_statement)] => Some((init, while_statement)),
+            _ => None,
+        }
+        .test_value("expected init + while")?;
         let machine = detect_while_state_machine(source, "test", init, while_statement)
-            .expect("detected while machine");
-        let event_start = source.find("sideEffect()").unwrap() as u32;
-        let event = Span::new(event_start, event_start + "sideEffect()".len() as u32);
+            .test_value("detected while machine")?;
+        let event_start = source_offset(source, "sideEffect()", "sideEffect() offset")?;
+        let event = Span::new(
+            event_start,
+            event_start + u32::try_from("sideEffect()".len()).test_value("fixture text length")?,
+        );
         assert_eq!(
             branch_state_for_span(&while_statement.body, "state", event),
             Some(92)
@@ -6424,10 +6505,12 @@ mod tests {
                 },
             )
         );
+
+        Ok(())
     }
 
     #[test]
-    fn exact_parameter_specializer_proves_required_state_before_event() {
+    fn exact_parameter_specializer_proves_required_state_before_event() -> TestResult {
         let source = r#"
             function helper(j, q) {
                 let out;
@@ -6453,9 +6536,12 @@ mod tests {
                 Statement::FunctionDeclaration(function) => Some(function),
                 _ => None,
             })
-            .expect("helper function");
-        let start = u32::try_from(source.find("return out").expect("return event")).unwrap();
-        let event = Span::new(start, start + u32::try_from("return out".len()).unwrap());
+            .test_value("helper function")?;
+        let start = source_offset(source, "return out", "return event")?;
+        let event = Span::new(
+            start,
+            start + u32::try_from("return out".len()).test_value("return event length")?,
+        );
 
         assert!(
             super::prove_function_if_ladder_states_before_event_with_integer_parameters(
@@ -6483,10 +6569,12 @@ mod tests {
                 },
             )
         );
+
+        Ok(())
     }
 
     #[test]
-    fn function_specializer_handles_preceding_init_while_machine() {
+    fn function_specializer_handles_preceding_init_while_machine() -> TestResult {
         let source = r#"
             const f = function(selector) {
                 state = 5;
@@ -6510,8 +6598,8 @@ mod tests {
         }
         let mut function = FunctionSpan(None);
         function.visit_program(&parsed.program);
-        let function = function.0.unwrap();
-        let start = u32::try_from(source.find("target()").unwrap()).unwrap();
+        let function = function.0.test_value("function span")?;
+        let start = source_offset(source, "target()", "target() offset")?;
         let event = Span::new(start, start + 8);
         assert!(
             prove_function_if_ladder_event_unreachable_with_integer_parameters(
@@ -6537,10 +6625,12 @@ mod tests {
                 },
             )
         );
+
+        Ok(())
     }
 
     #[test]
-    fn structured_branch_keeps_unrelated_stable_exact_parameter() {
+    fn structured_branch_keeps_unrelated_stable_exact_parameter() -> TestResult {
         let source = r#"
             function f(selector, scratch) {
                 if (selector === 99) target();
@@ -6558,8 +6648,8 @@ mod tests {
         }
         let mut function = FunctionSpan(None);
         function.visit_program(&parsed.program);
-        let function = function.0.unwrap();
-        let start = u32::try_from(source.find("target()").unwrap()).unwrap();
+        let function = function.0.test_value("function span")?;
+        let start = source_offset(source, "target()", "target() offset")?;
         assert!(
             prove_function_structured_branch_event_unreachable_with_integer_parameters(
                 &parsed.program,
@@ -6570,10 +6660,12 @@ mod tests {
                 &BTreeMap::from([(0, 48), (1, 0)]),
             )
         );
+
+        Ok(())
     }
 
     #[test]
-    fn proves_false_while_body_unreachable_with_integer_parameters() {
+    fn proves_false_while_body_unreachable_with_integer_parameters() -> TestResult {
         let source = r#"
             function f(mode, cell) {
                 while ((mode ^ 48) < 10 && mode << 2 >= 2) {
@@ -6592,9 +6684,10 @@ mod tests {
         }
         let mut function = FunctionSpan(None);
         function.visit_program(&parsed.program);
-        let function = function.0.unwrap();
-        let event_start =
-            u32::try_from(source.find("observe(cell)").unwrap() + "observe(".len()).unwrap();
+        let function = function.0.test_value("function span")?;
+        let event_start = source_offset(source, "observe(cell)", "observe call")?
+            .checked_add(u32::try_from("observe(".len()).test_value("observe prefix length")?)
+            .test_value("observe argument offset")?;
         assert!(
             prove_function_structured_branch_event_unreachable_with_integer_parameters(
                 &parsed.program,
@@ -6605,21 +6698,30 @@ mod tests {
                 &BTreeMap::from([(0, 11)]),
             )
         );
+
+        Ok(())
     }
 
     #[test]
-    fn branch_truthiness_materializes_logical_not_of_truthy_literal() {
+    fn branch_truthiness_materializes_logical_not_of_truthy_literal() -> TestResult {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, "![] == 0;", SourceType::cjs());
-        let expression = match &parsed.program.body[0] {
-            Statement::ExpressionStatement(statement) => &statement.expression,
-            _ => unreachable!(),
-        };
+        let expression = parsed
+            .program
+            .body
+            .first()
+            .and_then(|statement| match statement {
+                Statement::ExpressionStatement(statement) => Some(&statement.expression),
+                _ => None,
+            })
+            .test_value("expression statement")?;
         assert_eq!(branch_truthiness(expression, &HashMap::new()), Some(true));
+
+        Ok(())
     }
 
     #[test]
-    fn branch_truthiness_proves_real_m_style_guard_false() {
+    fn branch_truthiness_proves_real_m_style_guard_false() -> TestResult {
         let source = r#"
             J - 6 << 1 < J
                 && J + 9 >> 1 >= J
@@ -6639,30 +6741,46 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
-        let Statement::ExpressionStatement(statement) = parsed.program.body.first().unwrap() else {
-            panic!("expression");
-        };
+        let statement = parsed
+            .program
+            .body
+            .first()
+            .and_then(|statement| match statement {
+                Statement::ExpressionStatement(statement) => Some(statement),
+                _ => None,
+            })
+            .test_value("expression statement")?;
         let env = HashMap::from([
             (String::from("J"), Scalar::Int(48)),
             (String::from("Q"), Scalar::Int(19)),
         ]);
         assert_eq!(branch_truthiness(&statement.expression, &env), Some(false));
+
+        Ok(())
     }
 
     #[test]
-    fn branch_truthiness_proves_false_left_associated_guard() {
+    fn branch_truthiness_proves_false_left_associated_guard() -> TestResult {
         let source = r#"J - 6 << 1 < J && J + 9 >> 1 >= J && (u = 3, J & 100) == J;"#;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
-        let Statement::ExpressionStatement(statement) = parsed.program.body.first().unwrap() else {
-            panic!("expression");
-        };
+        let statement = parsed
+            .program
+            .body
+            .first()
+            .and_then(|statement| match statement {
+                Statement::ExpressionStatement(statement) => Some(statement),
+                _ => None,
+            })
+            .test_value("expression statement")?;
         let env = HashMap::from([(String::from("J"), Scalar::Int(48))]);
         assert_eq!(branch_truthiness(&statement.expression, &env), Some(false));
+
+        Ok(())
     }
 
     #[test]
-    fn proves_nested_sequence_short_circuit_event_unreachable() {
+    fn proves_nested_sequence_short_circuit_event_unreachable() -> TestResult {
         let source = r#"
             function f(J, Q, L, U, v) {
                 ((J & 100) == J && (
@@ -6683,8 +6801,8 @@ mod tests {
         }
         let mut function = FunctionSpan(None);
         function.visit_program(&parsed.program);
-        let function = function.0.unwrap();
-        let start = u32::try_from(source.find("L = U & Q").unwrap()).unwrap();
+        let function = function.0.test_value("function span")?;
+        let start = source_offset(source, "L = U & Q", "L = U & Q offset")?;
         assert!(
             prove_function_structured_branch_event_unreachable_with_integer_parameters(
                 &parsed.program,
@@ -6695,10 +6813,12 @@ mod tests {
                 &BTreeMap::from([(0, 48), (1, 19)]),
             )
         );
+
+        Ok(())
     }
 
     #[test]
-    fn proves_left_associated_short_circuit_with_opaque_prefix() {
+    fn proves_left_associated_short_circuit_with_opaque_prefix() -> TestResult {
         let source = r#"
             function f(selector, state) {
                 (opaque() && (selector & 100) == selector) && (state = 1);
@@ -6715,8 +6835,8 @@ mod tests {
         }
         let mut function = FunctionSpan(None);
         function.visit_program(&parsed.program);
-        let function = function.0.unwrap();
-        let start = u32::try_from(source.find("state = 1").unwrap()).unwrap();
+        let function = function.0.test_value("function span")?;
+        let start = source_offset(source, "state = 1", "state = 1 offset")?;
         assert!(
             prove_function_structured_branch_event_unreachable_with_integer_parameters(
                 &parsed.program,
@@ -6727,10 +6847,12 @@ mod tests {
                 &BTreeMap::from([(0, 48)]),
             )
         );
+
+        Ok(())
     }
 
     #[test]
-    fn proves_structured_short_circuit_event_unreachable() {
+    fn proves_structured_short_circuit_event_unreachable() -> TestResult {
         let source = r#"
             const f = function(selector) {
                 selector == 449 && target();
@@ -6747,8 +6869,8 @@ mod tests {
         }
         let mut function = FunctionSpan(None);
         function.visit_program(&parsed.program);
-        let function = function.0.unwrap();
-        let start = u32::try_from(source.find("target()").unwrap()).unwrap();
+        let function = function.0.test_value("function span")?;
+        let start = source_offset(source, "target()", "target() offset")?;
         let event = Span::new(start, start + 8);
         assert!(
             prove_function_structured_branch_event_unreachable_with_integer_parameters(
@@ -6770,10 +6892,12 @@ mod tests {
                 &BTreeMap::from([(0, 449)]),
             )
         );
+
+        Ok(())
     }
 
     #[test]
-    fn proves_selector_specialization_by_parameter_index() {
+    fn proves_selector_specialization_by_parameter_index() -> TestResult {
         let source = r#"const g = function(J, Q) {
             for (H = 28; H != 74;) {
                 if (H == 55) { sink(J); H = 62; }
@@ -6798,8 +6922,8 @@ mod tests {
         }
         let mut function = FunctionSpan { span: None };
         function.visit_program(&parsed.program);
-        let function = function.span.unwrap();
-        let start = u32::try_from(source.find("sink(J)").unwrap()).unwrap();
+        let function = function.span.test_value("function span")?;
+        let start = source_offset(source, "sink(J)", "sink(J) offset")?;
         let event = Span::new(start, start + 7);
         assert!(
             prove_function_if_ladder_event_unreachable_with_integer_parameters(
@@ -6825,9 +6949,11 @@ mod tests {
                 },
             )
         );
+
+        Ok(())
     }
 
-    fn protected_call_proof(source: &str, provided: usize) -> bool {
+    fn protected_call_proof(source: &str, provided: usize) -> Result<bool, TestFailure> {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
@@ -6841,23 +6967,25 @@ mod tests {
         }
         let mut function = FunctionSpan { span: None };
         function.visit_program(&parsed.program);
-        let function = function.span.unwrap();
-        let start = u32::try_from(source.find("target()").unwrap()).unwrap();
-        prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
-            source,
-            &parsed.program,
-            semantic.semantic.scoping(),
-            CallArgumentEvent {
-                function: Span::new(function.start, function.end),
-                event: Span::new(start, start + 8),
-                provided_argument_count: provided,
-                parameter_bindings: &BTreeMap::new(),
-            },
+        let function = function.span.test_value("protected function span")?;
+        let event = source_span(source, "target()", "protected target event")?;
+        Ok(
+            prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
+                source,
+                &parsed.program,
+                semantic.semantic.scoping(),
+                CallArgumentEvent {
+                    function: Span::new(function.start, function.end),
+                    event,
+                    provided_argument_count: provided,
+                    parameter_bindings: &BTreeMap::new(),
+                },
+            ),
         )
     }
 
     #[test]
-    fn protected_ladder_proves_omitted_plain_parameter_exception_terminal() {
+    fn protected_ladder_proves_omitted_plain_parameter_exception_terminal() -> TestResult {
         let source = r#"
             const y = function(J, Q, Y, L, v, U, H, S, q, R, l, u, r, n) {
                 r = 57;
@@ -6876,11 +7004,13 @@ mod tests {
                 }
             };
         "#;
-        assert!(protected_call_proof(source, 4));
+        assert!(protected_call_proof(source, 4)?);
+
+        Ok(())
     }
 
     #[test]
-    fn protected_ladder_fails_closed_for_supplied_unknown_parameter() {
+    fn protected_ladder_fails_closed_for_supplied_unknown_parameter() -> TestResult {
         let source = r#"
             const y = function(J, Q, Y, L, v, U, H, S, q, R, l, u, r, n) {
                 r = 57;
@@ -6899,11 +7029,13 @@ mod tests {
                 }
             };
         "#;
-        assert!(!protected_call_proof(source, 7));
+        assert!(!protected_call_proof(source, 7)?);
+
+        Ok(())
     }
 
     #[test]
-    fn protected_ladder_rejects_nested_state_capture() {
+    fn protected_ladder_rejects_nested_state_capture() -> TestResult {
         let source = r#"
             const y = function(J, Q, Y, L, v, U, H, S, q, R, l, u, r, n) {
                 r = 57;
@@ -6916,11 +7048,13 @@ mod tests {
                 } catch (m) { throw m; }
             };
         "#;
-        assert!(!protected_call_proof(source, 4));
+        assert!(!protected_call_proof(source, 4)?);
+
+        Ok(())
     }
 
     #[test]
-    fn protected_ladder_rejects_recoverable_exception_path_to_event() {
+    fn protected_ladder_rejects_recoverable_exception_path_to_event() -> TestResult {
         let source = r#"
             const y = function(J, Q, Y, L, v, U, H, S, q, R, l, u, r, n) {
                 r = 57;
@@ -6938,11 +7072,13 @@ mod tests {
                 }
             };
         "#;
-        assert!(!protected_call_proof(source, 4));
+        assert!(!protected_call_proof(source, 4)?);
+
+        Ok(())
     }
 
     #[test]
-    fn while_detector_matches_condition_state_in_mixed_sequence_init() {
+    fn while_detector_matches_condition_state_in_mixed_sequence_init() -> TestResult {
         let source = r#"
             function flattened() {
                 let state, noise;
@@ -6955,11 +7091,13 @@ mod tests {
                 }
             }
         "#;
-        assert!(prove_while_order(source, "target()", &[]));
+        assert!(prove_while_order(source, "target()", &[])?);
+
+        Ok(())
     }
 
     #[test]
-    fn while_detector_matches_condition_state_in_multi_declarator_init() {
+    fn while_detector_matches_condition_state_in_multi_declarator_init() -> TestResult {
         let source = r#"
             function flattened() {
                 let noise = 7, state = 0, tail = 9;
@@ -6971,11 +7109,13 @@ mod tests {
                 }
             }
         "#;
-        assert!(prove_while_order(source, "target()", &[]));
+        assert!(prove_while_order(source, "target()", &[])?);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_while_if_ladder_barrier_before_event() {
+    fn rejects_while_if_ladder_barrier_before_event() -> TestResult {
         let source = r#"
             function flattened() {
                 let state;
@@ -6988,7 +7128,9 @@ mod tests {
                 }
             }
         "#;
-        assert!(!prove_while_order(source, "target()", &["barrier()"]));
+        assert!(!prove_while_order(source, "target()", &["barrier()"])?);
+
+        Ok(())
     }
 
     #[test]
@@ -6998,7 +7140,7 @@ mod tests {
         assert!(detected.if_ladder_machines.is_empty());
     }
     #[test]
-    fn state_flatten_propagates_work_budget_exhaustion() {
+    fn state_flatten_propagates_work_budget_exhaustion() -> TestResult {
         let allocator = Allocator::default();
         let source = "function target() {}";
         let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -7011,7 +7153,7 @@ mod tests {
                 Statement::FunctionDeclaration(function) => Some(function),
                 _ => None,
             })
-            .expect("target function");
+            .test_value("target function")?;
         let decoder = DecoderControlInfo {
             function_id: "decoder".into(),
             selector_var: "selector".into(),
@@ -7025,5 +7167,7 @@ mod tests {
                 if error.kind() == BudgetExceededKind::Work
                     && error.scope() == "state-flatten-fuel"
         ));
+
+        Ok(())
     }
 }
