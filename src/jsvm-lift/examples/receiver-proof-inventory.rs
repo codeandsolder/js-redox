@@ -46,6 +46,10 @@ fn snippet(source: &str, start: u32, end: u32) -> String {
         .join(" ")
 }
 
+fn compact_snippet(source: &str, start: u32, end: u32) -> String {
+    snippet(source, start, end).chars().take(160).collect()
+}
+
 fn main() -> Result<()> {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let origin_only = args.iter().any(|arg| arg == "--origin-only");
@@ -173,6 +177,7 @@ fn main() -> Result<()> {
             proven_origin_registry_handler_installs(&parsed.program, scoping, &runtime, &budget)?;
         let origin_reads =
             proven_origin_registry_read_calls(&parsed.program, scoping, &runtime, &budget)?;
+        let table_analysis = table_vm::analyze(&source, &parsed.program, &budget)?;
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -193,11 +198,23 @@ fn main() -> Result<()> {
                     "member_writes": runtime.member_writes.len(),
                     "exposures": runtime.exposures.len(),
                 },
-                "structural_registry_handler_installs": structural_installs.len(),
+                "tables": table_analysis.handler_function_tables.iter().map(|table| json!({
+                "binding": table.binding,
+                "kind": table.container_kind,
+                "entries": table.entries,
+                "function_values": table.function_values,
+                "read_sites": table.read_sites,
+                "dynamic_read_sites": table.dynamic_read_sites,
+                "looped_dynamic_read_sites": table.looped_dynamic_read_sites,
+                "dynamic_call_sites": table.dynamic_call_sites,
+                "looped_dynamic_call_sites": table.looped_dynamic_call_sites,
+            })).collect::<Vec<_>>(),
+            "table_vm_candidates": table_analysis.table_vms.len(),
+            "structural_registry_handler_installs": structural_installs.len(),
                 "structural_registry_reads": structural_reads.len(),
                 "exact_origin_handler_installs": origin_installs.iter().map(|proof| json!({
                     "call": [proof.install.call_start, proof.install.call_end],
-                    "call_source": snippet(&source, proof.install.call_start, proof.install.call_end),
+                    "call_source": compact_snippet(&source, proof.install.call_start, proof.install.call_end),
                     "origin": {
                     "allocation": [proof.origin.allocation_start, proof.origin.allocation_end],
                     "constructor": [proof.origin.constructor_start, proof.origin.constructor_end],
@@ -208,7 +225,7 @@ fn main() -> Result<()> {
                 })).collect::<Vec<_>>(),
                 "exact_origin_registry_reads": origin_reads.iter().map(|proof| json!({
                     "call": [proof.read.call_start, proof.read.call_end],
-                    "call_source": snippet(&source, proof.read.call_start, proof.read.call_end),
+                    "call_source": compact_snippet(&source, proof.read.call_start, proof.read.call_end),
                     "origin": {
                     "allocation": [proof.origin.allocation_start, proof.origin.allocation_end],
                     "constructor": [proof.origin.constructor_start, proof.origin.constructor_end],
@@ -218,12 +235,12 @@ fn main() -> Result<()> {
                 })).collect::<Vec<_>>(),
                 "structural_registry_reads_examples": structural_reads.iter().take(32).map(|proof| json!({
                     "call": [proof.call_start,proof.call_end],
-                    "source": snippet(&source,proof.call_start,proof.call_end),
+                    "source": compact_snippet(&source,proof.call_start,proof.call_end),
                     "path": proof.registry_path,
                 })).collect::<Vec<_>>(),
                 "runtime_direct_calls_examples": runtime.direct_calls.iter().take(64).map(|proof| json!({
                     "call": [proof.call_start,proof.call_end],
-                    "source": snippet(&source,proof.call_start,proof.call_end),
+                    "source": compact_snippet(&source,proof.call_start,proof.call_end),
                     "allocation": [proof.callee.allocation_start,proof.callee.allocation_end],
                     "caller": [proof.caller.function_start,proof.caller.function_end],
                     "callee": [proof.callee.function_start,proof.callee.function_end],
