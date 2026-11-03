@@ -81,6 +81,7 @@ pub mod forwarding_alias;
 pub mod forwarding_semantics;
 pub mod lazy_cell;
 pub mod receiver_identity;
+pub mod registry_call_value;
 pub mod registry_identity;
 
 pub(crate) mod global_builtin;
