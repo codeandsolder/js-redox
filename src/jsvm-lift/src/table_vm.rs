@@ -1303,6 +1303,8 @@ pub fn analyze(
 ) -> Result<TableVmAnalysis, BudgetExceeded> {
     budget.checkpoint()?;
     let semantic_ret = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .with_cfg(true)
         .with_check_syntax_error(true)
         .build(program);
     budget.checkpoint()?;

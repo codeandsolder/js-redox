@@ -6557,10 +6557,11 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        let reads = super::structurally_proven_member_read_origins(
+        let reads = test_proof(super::structurally_proven_member_read_origins(
             &parsed.program,
             semantic.semantic.scoping(),
-        );
+            &test_budget(),
+        ));
         assert!(reads
             .iter()
             .any(|read| read.property.as_deref() == Some("")));
