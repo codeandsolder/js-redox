@@ -495,6 +495,98 @@ fn prove_required_before_node_budgeted(
     Ok(reached_event)
 }
 
+/// Witness a possible path in the *syntactic CFG* from a completed source
+/// assignment to a later call without crossing any write to that binding.
+///
+/// This is an existential graph fact, NOT input-feasibility, branch reachability,
+/// dispatcher identity, or must-reach value provenance. Feasible JavaScript
+/// execution is an independent obligation. The source and sink must resolve to
+/// the same execution context. Oxc's NewFunction and Unreachable edges are
+/// ignored; graph cycles are handled with a visited set.
+///
+/// Only normal, jump, loop and finalizer traversal is considered; exception
+/// edges are excluded because they may leave an AST assignment before its
+/// side effect completes. This is a soundly scoped witness, not an exhaustive
+/// list of possible JavaScript paths.
+///
+/// Every span lookup and graph traversal is charged to the caller's budget.
+pub fn cfg_has_write_free_path(
+    semantic: &Semantic<'_>,
+    source: Span,
+    sink: Span,
+    barriers: &[Span],
+    budget: &WorkBudget,
+) -> Result<bool, BudgetExceeded> {
+    budget.checkpoint()?;
+    if source.end > sink.start {
+        return Ok(false);
+    }
+    let Some(cfg) = semantic.cfg() else {
+        return Ok(false);
+    };
+    let Some(source_node) = deepest_exact_span_node_budgeted(semantic, source, budget)? else {
+        return Ok(false);
+    };
+    let Some(sink_node) = deepest_exact_span_node_budgeted(semantic, sink, budget)? else {
+        return Ok(false);
+    };
+    let Some(context) = enclosing_execution_context_budgeted(semantic, source_node, budget)? else {
+        return Ok(false);
+    };
+    if enclosing_execution_context_budgeted(semantic, sink_node, budget)? != Some(context) {
+        return Ok(false);
+    }
+    let nodes = semantic.nodes();
+    let source_block = nodes.cfg_id(source_node);
+    let sink_block = nodes.cfg_id(sink_node);
+    let mut barriers_by_block = HashMap::<BlockNodeId, Vec<Span>>::new();
+    for &barrier in barriers {
+        budget.consume(1)?;
+        let Some(barrier_node) = deepest_exact_span_node_budgeted(semantic, barrier, budget)?
+        else {
+            return Ok(false);
+        };
+        if enclosing_execution_context_budgeted(semantic, barrier_node, budget)? != Some(context) {
+            return Ok(false);
+        }
+        barriers_by_block
+            .entry(nodes.cfg_id(barrier_node))
+            .or_default()
+            .push(barrier);
+    }
+
+    let mut queue = VecDeque::from([source_block]);
+    let mut visited = HashSet::new();
+    while let Some(block) = queue.pop_front() {
+        budget.consume(1)?;
+        if !visited.insert(block) {
+            continue;
+        }
+        // The source assignment has completed before traversal begins.
+        // An intervening write in the same block is ordered by byte span;
+        // writes in other blocks conservatively block the entire block.
+        let killed = barriers_by_block.get(&block).is_some_and(|writes| {
+            writes.iter().any(|write| {
+                (block != source_block || write.start >= source.end)
+                    && (block != sink_block || write.start < sink.start)
+            })
+        });
+        if killed {
+            continue;
+        }
+        if block == sink_block {
+            return Ok(true);
+        }
+        for edge in cfg.graph().edges_directed(block, Direction::Outgoing) {
+            budget.consume(1)?;
+            if usable_edge(edge.weight()) && !matches!(edge.weight(), EdgeType::Error(_)) {
+                queue.push_back(edge.target());
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Prove that a required operation has completed before execution of an event
 /// inside a later-created nested function value.
 ///
