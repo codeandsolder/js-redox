@@ -681,7 +681,12 @@ mod tests {
                 .test_value("duplicate same proof")?;
         assert_eq!(duplicate.len(), 1);
         let empty_budget = WorkBudget::new("exhausted", BudgetLimits::work(0));
-        assert!(join_exact_origin_lazy_accessor_results(&[], &[], &empty_budget,).is_err());
+        assert!(join_exact_origin_lazy_accessor_results(
+            std::slice::from_ref(&duplicate[0].lazy),
+            &[],
+            &empty_budget,
+        )
+        .is_err());
         Ok(())
     }
 
