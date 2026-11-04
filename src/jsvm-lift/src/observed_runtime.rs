@@ -78,7 +78,7 @@ fn observed_execution_counts(source: &Value) -> (u64, u64, usize) {
     (functions, ranges, instances)
 }
 
-fn classification_heading(classification: &str) -> &str {
+fn classification_heading(classification: &str) -> &'static str {
     match classification {
         "network_response" | "network_observed" => "Network scripts",
         "inline_script" => "Inline scripts",
