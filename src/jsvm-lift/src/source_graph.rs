@@ -1,8 +1,8 @@
 use crate::{
     analysis_artifacts::{
         load_artifact, write_artifact, API_SURFACE, BUNDLES, DEOBFUSCATION, IMPORT_MAPS,
-        JSVM_INDEX, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCEMAPS, SOURCE_GRAPH, SOURCE_INDEX,
-        WASM_INDEX, WASM_RESOURCE_PROVENANCE,
+        JSVM_INDEX, JS_REFERENCES, RUNTIME_SCRIPTS, SELECTIVE_TRACE, SOURCEMAPS, SOURCE_GRAPH,
+        SOURCE_INDEX, WASM_INDEX, WASM_RESOURCE_PROVENANCE,
     },
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::load_manifest,
@@ -186,6 +186,11 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
         &project,
         RUNTIME_SCRIPTS,
         json!({"sources":[], "alpine_families":[], "gtm_families":[]}),
+    )?;
+    let selective_trace = optional_artifact(
+        &project,
+        SELECTIVE_TRACE,
+        json!({"hits":[], "errors":[], "summary":{}}),
     )?;
     let import_maps = optional_artifact(
         &project,
@@ -638,6 +643,61 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
         }
     }
 
+    // Concrete debugger pauses are observed state witnesses, not static edges.
+    // Only verified (CDP session, script ID, captured source SHA) triples
+    // receive a provenance edge to the matching runtime script instance.
+    for (ordinal, hit) in array_field(&selective_trace, "hits").iter().enumerate() {
+        budget.checkpoint()?;
+        let node_id = format!("observed-invocation:{ordinal}");
+        graph.add_node(
+            node_id.clone(),
+            json!({
+                "type":"observed_invocation",
+                "point_id":field(hit,"pointId"),
+                "cdp_session":field(hit,"cdpSession"),
+                "at":field(hit,"at"),
+                "reason":field(hit,"reason"),
+                "frames":field(hit,"frames"),
+                "scopes":field(hit,"scopes"),
+                "expressions":field(hit,"expressions"),
+                "concrete_observation_only":true,
+            }),
+        )?;
+        let session = nonempty_string_field(hit, "cdpSession").unwrap_or("main");
+        for (depth, frame) in array_field(hit, "frames").iter().enumerate() {
+            if nonempty_string_field(frame, "source_identity") != Some("exact") {
+                continue;
+            }
+            let Some(script_id) = frame
+                .get("location")
+                .and_then(|location| location.get("scriptId"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let Some(sha) = nonempty_string_field(frame, "sourceSha256") else {
+                continue;
+            };
+            let expected = format!("runtime:{}", &sha[..sha.len().min(20)]);
+            let key = (session.to_owned(), script_id.to_owned());
+            if runtime_node_by_instance.get(&key) != Some(&expected) {
+                continue;
+            }
+            graph.add_edge(
+                &expected,
+                &node_id,
+                "observed_paused_call_frame",
+                json!({
+                    "stack_depth":depth,
+                    "cdp_session":session,
+                    "script_id":script_id,
+                    "source_sha256":sha,
+                    "identity_basis":"exact_session_script_hash",
+                    "concrete_observation_only":true,
+                }),
+            )?;
+        }
+    }
     // Runtime-observed WASM requests are capture evidence, not universal static control flow.
     for observation in array_field(&wasm_resource_provenance, "observations") {
         budget.checkpoint()?;

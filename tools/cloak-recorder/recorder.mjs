@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { evaluateDuringScroll, isTerminalTargetClosedError } from "./scroll-retry.mjs";
 import { classifyRelevantBodies } from "./network-completeness.mjs";
 import { normalizePreciseCoverage, summarizePreciseCoverage } from "./precise-coverage.mjs";
+import { validateTraceSpec, breakpointParams, captureAndResume } from "./selective-trace.mjs";
 import {
   WORKER_TARGET_FILTER,
   createNestedCdpRouter,
@@ -44,6 +45,7 @@ Options:
       --keep-cache          Do not disable the HTTP cache
       --no-consent          Do not inject AutoConsent or click fallback buttons
       --no-screenshot       Skip final full-page screenshot
+      --trace-points <json>  Opt-in bounded V8 debugger value/stack witnesses at specified breakpoints
       --help                Show this help
 
 The recorder always keeps JS/HTML/CSS/JSON/fetch/XHR/WASM/other unknown bodies,
@@ -70,6 +72,7 @@ function parseArgs(argv) {
     keepCache: false,
     consent: true,
     screenshot: true,
+    tracePointsPath: null,
   };
 
   const take = (i, flag) => {
@@ -122,6 +125,10 @@ function parseArgs(argv) {
         break;
       case "--timeout-ms":
         opts.timeoutMs = Number(take(i, arg));
+        i += 1;
+        break;
+      case "--trace-points":
+        opts.tracePointsPath = take(i, arg);
         i += 1;
         break;
       case "--all-bodies":
@@ -562,6 +569,9 @@ function buildHar(records, bodyMemory) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  const traceSpec = opts.tracePointsPath
+    ? validateTraceSpec(JSON.parse(await readFile(opts.tracePointsPath, "utf8")))
+    : null;
   const out = path.resolve(
     opts.output || path.join(ROOT, "work", "captures", `${sanitizeHost(opts.url)}-${timestamp()}`),
   );
@@ -600,6 +610,10 @@ async function main() {
   const runtimeEvents = [];
   const runtimeScripts = new Map();
   const coverageSessions = new Map();
+  const traceBreakpoints = new Map();
+  const traceHits = [];
+  const traceErrors = [];
+  let traceHitSlots = 0;
   const streamed = new Map();
   const frameCdpStates = new WeakMap();
   let nextFrameCdpSession = 1;
@@ -1053,6 +1067,27 @@ async function main() {
       })(), `script-source ${cdpSessionName} ${url || script.scriptId}`);
     });
 
+    if (traceSpec) {
+      cdpSession.on("Debugger.paused", (event) => {
+        queueJob((async () => {
+          const byId = traceBreakpoints.get(cdpSessionName);
+          const hitId = (event.hitBreakpoints || []).find((id) => byId?.has(id));
+          const point = hitId ? byId.get(hitId) : null;
+          if (!point || traceHitSlots >= traceSpec.maxHits) {
+            await cdpSession.send("Debugger.resume");
+            return;
+          }
+          traceHitSlots += 1;
+          try {
+            const witness = await captureAndResume(cdpSession, event, point, traceSpec);
+            traceHits.push({ ...witness, cdpSession: cdpSessionName, at: Date.now() });
+          } catch (error) {
+            traceErrors.push({ cdpSession: cdpSessionName, pointId: point.id, error: String(error) });
+          }
+        })(), "selective-trace " + cdpSessionName);
+      });
+    }
+
     // Register every event handler before enabling domains. A worker paused by
     // Target auto-attach can begin progressing while Debugger/Runtime are enabled,
     // so late listener registration would lose its first fetch/scriptParsed events.
@@ -1071,6 +1106,23 @@ async function main() {
     ];
     if (enablePage) enables.push(cdpSession.send("Page.enable"));
     await Promise.all(enables);
+    if (traceSpec) {
+      const byId = new Map();
+      traceBreakpoints.set(cdpSessionName, byId);
+      try {
+        await cdpSession.send("HeapProfiler.enable");
+      } catch (error) {
+        traceErrors.push({ cdpSession: cdpSessionName, stage: "HeapProfiler.enable", error: String(error) });
+      }
+      for (const point of traceSpec.points) {
+        try {
+          const result = await cdpSession.send("Debugger.setBreakpointByUrl", breakpointParams(point));
+          byId.set(result.breakpointId, point);
+        } catch (error) {
+          traceErrors.push({ cdpSession: cdpSessionName, pointId: point.id, stage: "setBreakpointByUrl", error: String(error) });
+        }
+      }
+    }
     // Start before navigation or before resuming a newly attached worker.
     // Coverage belongs to a CDP target session, not just a script URL.
     try {
@@ -1459,6 +1511,33 @@ async function main() {
     sessions: coverageRows,
     summary: summarizePreciseCoverage(coverageRows),
   };
+  // CDP session and V8 script ID are the identity; URLs alone are not.
+  // Resolve captured source hashes without guessing between script instances.
+  const capturedScriptById = new Map();
+  for (const item of runtimeScripts.values()) {
+    const key = item.cdpSession + ":" + item.scriptId;
+    if (!capturedScriptById.has(key)) capturedScriptById.set(key, item.captured?.sha256 || null);
+    else if (capturedScriptById.get(key) !== item.captured?.sha256) capturedScriptById.set(key, null);
+  }
+  const selectiveTrace = traceSpec ? {
+    schema: "js-redox/selective-breakpoint-trace/v1",
+    config: traceSpec,
+    hits: traceHits.map((hit) => ({
+      ...hit,
+      frames: hit.frames.map((frame) => ({
+        ...frame,
+        sourceSha256: capturedScriptById.get(hit.cdpSession + ":" + frame.location?.scriptId) || null,
+      })),
+    })),
+    errors: traceErrors,
+    summary: {
+      configuredPoints: traceSpec.points.length,
+      capturedHits: traceHits.length,
+      attemptedHits: traceHitSlots,
+      errors: traceErrors.length,
+      completeExecutionPath: false,
+    },
+  } : null;
   finalCaptureComplete = true;
 
   // Recover a body missed by Playwright from the independent early CDP stream,
@@ -1535,6 +1614,7 @@ async function main() {
     runtimeScriptsSeen: runtimeScripts.size,
     runtimeScriptsCaptured: [...runtimeScripts.values()].filter((r) => r.captured).length,
     executionCoverage: executionCoverage.summary,
+    ...(selectiveTrace ? { selectiveTrace: selectiveTrace.summary } : {}),
     websocketEvents: websocketEvents.length,
     eventSourceEvents: eventSourceEvents.length,
     frames: frameRows.length,
@@ -1547,6 +1627,7 @@ async function main() {
     writeFile(path.join(out, "cdp-streams.json"), JSON.stringify(streamRows, null, 2)),
     writeFile(path.join(out, "runtime-scripts.json"), JSON.stringify([...runtimeScripts.values()], null, 2)),
     writeFile(path.join(out, "execution-coverage.json"), JSON.stringify(executionCoverage, null, 2)),
+    ...(selectiveTrace ? [writeFile(path.join(out, "selective-trace.json"), JSON.stringify(selectiveTrace, null, 2))] : []),
     writeFile(path.join(out, "websockets.json"), JSON.stringify(websocketEvents, null, 2)),
     writeFile(path.join(out, "eventsource.json"), JSON.stringify(eventSourceEvents, null, 2)),
     writeFile(path.join(out, "runtime-events.json"), JSON.stringify(runtimeEvents, null, 2)),
@@ -1613,6 +1694,7 @@ async function main() {
       runtimeScripts: "runtime-scripts/",
       runtimeScriptManifest: "runtime-scripts.json",
       executionCoverage: "execution-coverage.json",
+      ...(selectiveTrace ? { selectiveTrace: "selective-trace.json" } : {}),
       frames: "frames/",
       frameManifest: "frames.json",
       mhtml,
@@ -1632,6 +1714,7 @@ async function main() {
         `${workerCdpSessionsUnpausedAtAttach} worker target(s) were already running when recursively attached; observed evidence is exact, but early CDP-event completeness is not claimed for those targets.`,
       ] : []),
       "Precise V8 counters prove only observed executed code ranges; missing or zero-count coverage does not prove code is unreachable, and the snapshot covers only the recorded browser interval.",
+      ...(selectiveTrace ? ["Selective debugger witness capture is opt-in, bounded and may perturb timing. Positive breakpoint hits are actual observed paused states, not exhaustive execution paths or branch/handler proofs. Inspector heap IDs are session-local and may become invalid after collection."] : []),
       "Bodies larger than maxBodyMiB are intentionally reported but not persisted unless the limit is increased.",
       "Image/media/font bodies are intentionally omitted unless --all-bodies is used.",
     ],

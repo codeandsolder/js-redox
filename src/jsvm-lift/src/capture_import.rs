@@ -1,6 +1,7 @@
 mod execution_coverage;
 mod runtime_scripts;
 mod saved_page;
+mod selective_trace;
 
 use crate::{
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
@@ -10,6 +11,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use runtime_scripts::analyze_recorder_runtime_scripts;
 use saved_page::{import_saved_page, SavedPageOptions};
+use selective_trace::import_selective_trace;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -172,6 +174,7 @@ pub fn import_capture_project(
                 add_recorder_navigation(&mut manifest, &recorder_metadata);
                 write_manifest(&options.output.join("capture-manifest.json"), &manifest)?;
                 analyze_recorder_runtime_scripts(&input, &options.output, &manifest, &budget)?;
+                import_selective_trace(&input, &options.output, budgets)?;
             }
             Ok(CaptureImportSummary {
                 kind,
