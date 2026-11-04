@@ -74,7 +74,6 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
     let manifest = read_manifest(&project.join(MANIFEST_NAME))?;
 
     let source = materialize_capture_source(project, options.jobs, &options.budgets)?;
-    let observed_sources = materialize_observed_runtime_sources(project, &options.budgets)?;
 
     let wasm = options
         .wasm_analysis
@@ -109,6 +108,10 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
         .bundle_materialization
         .then(|| materialize_bundle_modules(project, options.jobs, &options.budgets))
         .transpose()?;
+
+    // Reuse proof-gated static reconstruction for CDP-observed script views
+    // after it has processed runtime source units as ordinary JS inputs.
+    let observed_sources = materialize_observed_runtime_sources(project, &options.budgets)?;
 
     let wasm_js_boundary = if options.wasm_analysis && options.safe_deobfuscation {
         Some(correlate_wasm_js_boundary(project, &options.budgets)?)

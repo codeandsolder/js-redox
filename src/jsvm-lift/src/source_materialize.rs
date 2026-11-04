@@ -1,10 +1,11 @@
 use crate::{
-    analysis_artifacts::{write_artifact, SOURCE_INDEX},
+    analysis_artifacts::{load_artifact, write_artifact, RUNTIME_SCRIPTS, SOURCE_INDEX},
     analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     browser_script_types::{inline_script_kind, InlineScriptKind},
     capture_project::load_manifest,
     content_dedup::{default_jobs, link_or_copy, sha256_path, Materialization},
     js_format::format_source,
+    sha256_hex,
 };
 use anyhow::{bail, Context, Result};
 use encoding_rs::{Encoding, WINDOWS_1252};
@@ -34,7 +35,7 @@ struct Unit {
     origin: &'static str,
     ordinal: Option<u64>,
     raw_path: String,
-    resource_id: u64,
+    resource_id: Option<u64>,
     url: String,
     resource: Option<Value>,
 }
@@ -313,7 +314,7 @@ pub fn materialize_capture_source(
                 origin: "resource",
                 ordinal: None,
                 raw_path,
-                resource_id,
+                resource_id: Some(resource_id),
                 url,
                 resource: None,
             });
@@ -326,7 +327,7 @@ pub fn materialize_capture_source(
             origin: "resource",
             ordinal: None,
             raw_path,
-            resource_id,
+            resource_id: Some(resource_id),
             url,
             resource: Some(resource.clone()),
         });
@@ -356,10 +357,72 @@ pub fn materialize_capture_source(
             origin: "inline_script",
             ordinal: Some(object_u64(script, "ordinal")?),
             raw_path,
-            resource_id: parent_id,
+            resource_id: Some(parent_id),
             url: object_string(parent, "url").unwrap_or_default(),
             resource: None,
         });
+    }
+
+    // CDP runtime sources are real script bodies, not synthetic HTTP responses.
+    // Materialize them as separate code units, retaining the recorder's exact
+    // content-addressed bytes and their independent source-graph provenance.
+    if manifest.source.kind == "recorder" {
+        if let Some(runtime) = load_artifact(project, RUNTIME_SCRIPTS, false)? {
+            let sources = runtime
+                .get("sources")
+                .and_then(Value::as_array)
+                .context("recorder runtime source index missing sources[]")?;
+            let capture = Path::new(&manifest.source.input);
+            for source in sources {
+                stage_budget.checkpoint()?;
+                if source.get("classification").and_then(Value::as_str)
+                    == Some("capture_instrumentation")
+                {
+                    continue;
+                }
+                let digest = source
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .context("runtime source missing sha256")?;
+                if digest.len() != 64 || !digest.bytes().all(|ch| ch.is_ascii_hexdigit()) {
+                    bail!("invalid runtime script SHA-256");
+                }
+                let capture_path = format!("runtime-scripts/{digest}.js");
+                if source.get("path").and_then(Value::as_str) != Some(capture_path.as_str()) {
+                    bail!("runtime script path is not content-addressed");
+                }
+                let raw_path = format!("resources/{capture_path}");
+                if !seen.insert(raw_path.clone()) {
+                    bail!("duplicate runtime script input path");
+                }
+                let bytes = fs::read(capture.join(&capture_path))
+                    .with_context(|| format!("reading captured runtime script {digest}"))?;
+                if sha256_hex(&bytes) != digest {
+                    bail!("runtime script digest mismatch {digest}");
+                }
+                let output = project.join(&raw_path);
+                if let Some(parent) = output.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&output, bytes)?;
+                units.push(Unit {
+                    kind: "javascript".into(),
+                    captured_kind: "javascript".into(),
+                    transport_kind: "cdp_runtime_script".into(),
+                    origin: "runtime_script",
+                    ordinal: None,
+                    raw_path,
+                    resource_id: None,
+                    url: source
+                        .get("urls")
+                        .and_then(Value::as_array)
+                        .and_then(|urls| urls.iter().find_map(Value::as_str))
+                        .unwrap_or("")
+                        .to_owned(),
+                    resource: None,
+                });
+            }
+        }
     }
 
     let mut rows = Vec::<Value>::new();
@@ -528,7 +591,9 @@ pub fn materialize_capture_source(
         .filter(|row| row.get("kind").and_then(Value::as_str) == Some("incomplete"))
         .count();
     let summary = json!({
-        "units": rows.len(), "javascript_units": js_units, "captured_javascript_units": captured_js_units,
+        "units": rows.len(), "javascript_units": js_units,
+        "runtime_javascript_units": rows.iter().filter(|row| row["origin"] == "runtime_script").count(),
+        "captured_javascript_units": captured_js_units,
         "unparsed_javascript_units": unparsed_js_units, "unique_javascript_inputs": unique_js_inputs,
         "captured_unique_javascript_inputs": groups.len(),
         "deduplicated_javascript_units": js_units.saturating_sub(unique_js_inputs),
@@ -557,6 +622,77 @@ mod tests {
             std::env::temp_dir().join(format!("source-materialize-{}-{nonce}", std::process::id()));
         fs::create_dir_all(path.join("resources"))?;
         Ok(path)
+    }
+
+    #[test]
+    fn recorder_runtime_scripts_share_general_source_and_deob_inputs() -> Result<()> {
+        let project = test_project()?;
+        let result = (|| -> Result<()> {
+            let capture = project.join("recorder-capture");
+            fs::create_dir_all(capture.join("runtime-scripts"))?;
+            let body = b"const answer = 21 + 21;\n";
+            let digest = sha256_hex(body);
+            let capture_path = format!("runtime-scripts/{digest}.js");
+            fs::write(capture.join(&capture_path), body)?;
+            fs::write(project.join("resources/network.js"), body)?;
+            let manifest = validate_manifest_value(
+                &json!({
+                    "schema": "capture-project/v1",
+                    "source": {"kind": "recorder", "input": capture.display().to_string(),
+                               "salvaged": false},
+                    "pages": [],
+                    "resources": [{"id": 7, "kind": "javascript", "url": "https://example.test/a.js",
+                        "output_path": "resources/network.js"}],
+                    "inline_scripts": [],
+                    "counts": {}
+                }),
+                "runtime test",
+            )?;
+            write_manifest(&project.join("capture-manifest.json"), &manifest)?;
+            write_artifact(
+                &project,
+                RUNTIME_SCRIPTS,
+                &json!({
+                    "schema": RUNTIME_SCRIPTS.schema,
+                    "sources": [
+                        {"sha256": digest, "path": capture_path,
+                         "classification": "network_response", "urls": ["https://example.test/a.js"],
+                         "observed_executed": true},
+                        {"sha256": "x", "classification": "capture_instrumentation"}
+                    ],
+                    "summary": {}, "alpine_families": [], "gtm_families": []
+                }),
+            )?;
+            let summary = materialize_capture_source(
+                &project,
+                Some(2),
+                &AnalysisBudgets::standard("runtime-source-unit-test"),
+            )?;
+            assert_eq!(summary.javascript_units, 2);
+            assert_eq!(summary.unique_javascript_inputs, 1);
+            let raw_path = format!("resources/runtime-scripts/{digest}.js");
+            let copied = fs::read(project.join(&raw_path))?;
+            assert_eq!(copied, body);
+            let index = crate::analysis_artifacts::load_artifact(&project, SOURCE_INDEX, false)?
+                .context("source index")?;
+            assert_eq!(index["summary"]["runtime_javascript_units"], 1);
+            let runtime = index["units"]
+                .as_array()
+                .context("source units")?
+                .iter()
+                .find(|item| item["origin"] == "runtime_script")
+                .context("runtime source missing")?;
+            assert_eq!(runtime["resource_id"], Value::Null);
+            assert_eq!(runtime["input_sha256"], digest);
+            assert_eq!(runtime["raw_path"], raw_path);
+            assert!(runtime["source_path"]
+                .as_str()
+                .is_some_and(|path| project.join(path).is_file()));
+            Ok(())
+        })();
+        let cleanup = fs::remove_dir_all(project);
+        cleanup?;
+        result
     }
 
     #[test]

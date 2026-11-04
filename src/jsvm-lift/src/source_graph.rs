@@ -379,6 +379,28 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
             ))
         })
         .collect::<BTreeMap<_, _>>();
+    let runtime_general_paths = array_field(&source_index, "units")
+        .iter()
+        .filter(|unit| string_field(unit, "origin") == Some("runtime_script"))
+        .filter_map(|unit| {
+            Some((
+                nonempty_string_field(unit, "input_sha256")?.to_owned(),
+                nonempty_string_field(unit, "source_path")?.to_owned(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let runtime_readable_paths = array_field(&deobfuscation, "units")
+        .iter()
+        .filter_map(|unit| {
+            let digest = nonempty_string_field(unit, "raw_path")?
+                .strip_prefix("resources/runtime-scripts/")?
+                .strip_suffix(".js")?;
+            let readable = nonempty_string_field(unit, "readable_output_path")?;
+            (readable == format!("src/_readable/runtime-scripts/{digest}.js"))
+                .then(|| (digest.to_owned(), readable.to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
     let mut runtime_node_by_instance = BTreeMap::<(String, String), String>::new();
     let mut runtime_instance_conflicts = BTreeSet::<(String, String)>::new();
 
@@ -407,6 +429,8 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                 "script_instances":source.get("script_instances").cloned().unwrap_or_else(|| json!([])),
                 "observed_executed":field(source,"observed_executed"),
                 "observed_source_path":field(source,"observed_source_path"),
+                "general_source_path":runtime_general_paths.get(digest),
+                "safe_readable_source_path":runtime_readable_paths.get(digest),
                 "urls":source.get("urls").cloned().unwrap_or_else(|| json!([])),
                 "instrumentation_kind":field(source,"instrumentation_kind"),
                 "generated_root_sha256s":generated.get("root_sha256s").cloned().unwrap_or_else(|| json!([])),
