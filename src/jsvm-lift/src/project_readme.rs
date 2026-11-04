@@ -319,7 +319,13 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         format!("Generated from {source_capture}. Input kind: **{source_kind}**. Capture state: **{capture_state}**."),
     ];
     if let Some(url) = original_url {
-        lines.push(format!("Observed browser entrypoint URL: {url}."));
+        if source_kind == "saved_page" {
+            lines.push(format!(
+                "Original page URL recorded by the saved page: {url}."
+            ));
+        } else {
+            lines.push(format!("Observed browser entrypoint URL: {url}."));
+        }
     }
     if let Some(url) = final_url {
         lines.push(format!("Browser final navigation URL: {url}."));
