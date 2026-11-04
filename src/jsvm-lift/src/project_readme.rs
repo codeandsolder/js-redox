@@ -319,7 +319,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         format!("Generated from {source_capture}. Input kind: **{source_kind}**. Capture state: **{capture_state}**."),
     ];
     if let Some(url) = original_url {
-        if source_kind == "saved_page" {
+        if source_kind.starts_with("saved_page_") {
             lines.push(format!(
                 "Original page URL recorded by the saved page: {url}."
             ));
