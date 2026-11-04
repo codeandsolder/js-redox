@@ -641,6 +641,8 @@ pub(super) fn analyze_recorder_runtime_scripts(
                 "cdp_session": event_session(event),
                 "script_id": event.get("scriptId").cloned().unwrap_or(Value::Null),
                 "execution_context_id": event.get("executionContextId").cloned().unwrap_or(Value::Null),
+                "start_line": event.get("startLine").cloned().unwrap_or(Value::Null),
+                "start_column": event.get("startColumn").cloned().unwrap_or(Value::Null),
                 "execution": execution,
             }));
         }

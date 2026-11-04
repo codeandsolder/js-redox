@@ -24,6 +24,7 @@ pub mod table_vm;
 pub(crate) mod test_support;
 
 mod har_project;
+pub mod invocation_views;
 pub mod js_format;
 pub mod js_refs;
 

@@ -363,6 +363,12 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         lines.push("- [analysis/execution-coverage.json](analysis/execution-coverage.json) — per-session execution witnesses and V8 source offsets.".into());
         lines.push("- [analysis/observed-source.json](analysis/observed-source.json) — observed source identity, provenance, and formatting status.".into());
     }
+    if project
+        .join("src/_observed/invocations/README.md")
+        .is_file()
+    {
+        lines.push("- [src/_observed/invocations/README.md](src/_observed/invocations/README.md) — concrete breakpoint call stacks and bounded observed values with links to exact captured and safe-readable code; these are invocation-specific facts.".into());
+    }
     if wasm_resource_provenance.is_some() {
         lines.push("- [analysis/wasm-resource-provenance.json](analysis/wasm-resource-provenance.json) — runtime-observed exact WASM responses linked to their CDP script initiators.".into());
     }
