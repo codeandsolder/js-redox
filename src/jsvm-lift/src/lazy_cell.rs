@@ -217,14 +217,14 @@ pub struct ProvenSlowLazyCellResolvedHandler {
     pub captured_handler: ProvenSlowLazyCellCapturedHandlerInstall,
 }
 
-/// End-to-end proof that one exact slow-cell registry assignment is observed by
-/// the structural lazy accessor as the original logical handler.
+/// Structural compatibility between one exact slow-cell wrapper, its
+/// resolver/captured handler, and a lazy accessor's projection shape.
 ///
-/// The proof joins the same exact wrapper assignment across update-before-
-/// projection accessor semantics, inherited prototype getter delegation,
-/// resolver slot selection, and captured-handler provenance.
+/// This does NOT establish that the accessor read this registry *instance* or
+/// exact key, that the slot remained unchanged between installation and read,
+/// or that an indirect invocation actually returned this captured handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProvenSlowLazyCellReadResult {
+pub struct SlowLazyCellReadCompatibility {
     pub resolved_handler: ProvenSlowLazyCellResolvedHandler,
     pub carrier: ProvenSlowLazyCellPrototypeCarrier,
 }
@@ -2762,12 +2762,14 @@ pub fn proven_slow_lazy_cell_resolved_handler(
     })
 }
 
-/// Join all independently proven slow-cell obligations for one exact wrapper.
+/// Join independent slow-cell structure proofs. This is not a read-site
+/// identity theorem: receiver/key origin and registry-slot preservation
+/// must be supplied by distinct proofs before a handler can be named.
 #[must_use]
-pub fn proven_slow_lazy_cell_read_result(
+pub fn structurally_compatible_slow_lazy_cell_read(
     resolved_handler: &ProvenSlowLazyCellResolvedHandler,
     carrier: &ProvenSlowLazyCellPrototypeCarrier,
-) -> Option<ProvenSlowLazyCellReadResult> {
+) -> Option<SlowLazyCellReadCompatibility> {
     let resolver = &resolved_handler.resolver;
     let exact_assignment = &resolver.exact_assignment;
     let factory_call = &resolver.update_state.factory_call;
@@ -2786,7 +2788,7 @@ pub fn proven_slow_lazy_cell_read_result(
     {
         return None;
     }
-    Some(ProvenSlowLazyCellReadResult {
+    Some(SlowLazyCellReadCompatibility {
         resolved_handler: resolved_handler.clone(),
         carrier: carrier.clone(),
     })
@@ -4485,12 +4487,13 @@ mod tests {
         proven_slow_lazy_cell_captured_handler_install,
         proven_slow_lazy_cell_captured_value_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
-        proven_slow_lazy_cell_prototype_carrier, proven_slow_lazy_cell_read_result,
-        proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_resolved_handler,
-        proven_slow_lazy_cell_resolver_index, proven_slow_lazy_cell_state_fields,
+        proven_slow_lazy_cell_prototype_carrier, proven_slow_lazy_cell_registry_assignment,
+        proven_slow_lazy_cell_resolved_handler, proven_slow_lazy_cell_resolver_index,
+        proven_slow_lazy_cell_state_fields,
         proven_slow_lazy_cell_state_fields_for_exact_assignment,
-        proven_slow_lazy_cell_update_state, structurally_proven_slow_lazy_cell_factory_shapes,
-        ForwardedSymbolQuery, SlowLazyCellResolverIndexFacts,
+        proven_slow_lazy_cell_update_state, structurally_compatible_slow_lazy_cell_read,
+        structurally_proven_slow_lazy_cell_factory_shapes, ForwardedSymbolQuery,
+        SlowLazyCellResolverIndexFacts,
     };
     use crate::test_support::{
         source_offset, source_rfind, source_slice, TestFailure, TestResult, TestValue,
@@ -5170,7 +5173,7 @@ mod tests {
         .test_value("resolver slot")?;
         let resolved = proven_slow_lazy_cell_resolved_handler(&resolver, &captured)
             .test_value("resolved handler")?;
-        let read = proven_slow_lazy_cell_read_result(&resolved, &carrier)
+        let read = structurally_compatible_slow_lazy_cell_read(&resolved, &carrier)
             .test_value("end-to-end lazy read")?;
         assert_eq!(read.resolved_handler.resolver.exact_key_value, 7);
         assert_eq!(read.resolved_handler.resolver.handler_slot, 6);
