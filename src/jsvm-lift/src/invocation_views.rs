@@ -66,9 +66,15 @@ fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
     fence(excerpt.trim_end(), "js")
 }
 
-fn runtime_identity_index(
-    runtime: &Value,
-) -> HashMap<(String, String), Option<(String, Option<u64>)>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeSourceIdentity {
+    sha256: String,
+    start_line: Option<u64>,
+}
+
+type RuntimeIdentityIndex = HashMap<(String, String), Option<RuntimeSourceIdentity>>;
+
+fn runtime_identity_index(runtime: &Value) -> RuntimeIdentityIndex {
     let mut found = HashMap::new();
     for source in runtime
         .get("sources")
@@ -91,10 +97,10 @@ fn runtime_identity_index(
             let Some(script) = instance.get("script_id").and_then(Value::as_str) else {
                 continue;
             };
-            let next = (
-                sha.to_owned(),
-                instance.get("start_line").and_then(Value::as_u64),
-            );
+            let next = RuntimeSourceIdentity {
+                sha256: sha.to_owned(),
+                start_line: instance.get("start_line").and_then(Value::as_u64),
+            };
             let key = (session.to_owned(), script.to_owned());
             match found.get(&key) {
                 Some(Some(previous)) if previous != &next => {
@@ -193,7 +199,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             let identity_verified = frame.get("source_identity").and_then(Value::as_str)
                 == Some("exact")
                 && expected.is_some()
-                && actual.is_some_and(|(sha, _)| Some(sha.as_str()) == expected);
+                && actual.is_some_and(|source| Some(source.sha256.as_str()) == expected);
             if !identity_verified {
                 view.push_str("Source identity **unresolved**; no source code excerpt or provenance link is asserted.\n\n");
                 continue;
@@ -210,6 +216,38 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             view.push_str(&format!(
                 "Exact captured source SHA-256: **{sha}**. [Raw recorded code](../../../resources/runtime-scripts/{sha}.js).\n\n"
             ));
+            // The per-instance CDP origin is stronger context than a URL
+            // pooled across unrelated identical source bodies.
+            let matched_instance = runtime
+                .get("sources")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|source| source.get("sha256").and_then(Value::as_str) == Some(sha))
+                .flat_map(|source| {
+                    source
+                        .get("script_instances")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .find(|instance| {
+                    instance.get("cdp_session").and_then(Value::as_str) == Some(session.as_str())
+                        && instance.get("script_id").and_then(Value::as_str) == Some(script)
+                });
+            if let Some(instance) = matched_instance {
+                if let Some(url) = instance.get("script_url").and_then(Value::as_str) {
+                    if let Ok(mut parsed) = url::Url::parse(url) {
+                        parsed.set_query(None);
+                        parsed.set_fragment(None);
+                        view.push_str(&format!("Script origin (query omitted): {}\n\n", parsed));
+                    }
+                }
+                if let Some(context) = instance.get("execution_context_id") {
+                    view.push_str(&format!("V8 execution context ID: {}\n\n", context));
+                }
+            }
+
             for (target, label) in [
                 (format!("src/runtime-scripts/{sha}.js"), "General source"),
                 (
@@ -227,7 +265,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                 view.push_str(&source_excerpt(
                     &raw,
                     line,
-                    actual.and_then(|(_, start)| *start),
+                    actual.and_then(|source| source.start_line),
                 ));
                 view.push('\n');
             }
