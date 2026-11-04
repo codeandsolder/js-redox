@@ -298,7 +298,9 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
     };
     let source_capture = str_field(source, "input").unwrap_or("browser capture");
     let source_kind = str_field(source, "kind").unwrap_or("unknown");
-    let original_url = str_field(source, "original_page_url");
+    let original_url =
+        str_field(source, "original_page_url").or_else(|| str_field(source, "requested_url"));
+    let final_url = str_field(source, "final_url");
     let source_summary = source_index.get("summary").unwrap_or(&Value::Null);
     let jsref_summary = jsrefs.get("summary").unwrap_or(&Value::Null);
     let import_summary = import_maps.get("summary").unwrap_or(&Value::Null);
@@ -317,9 +319,10 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         format!("Generated from {source_capture}. Input kind: **{source_kind}**. Capture state: **{capture_state}**."),
     ];
     if let Some(url) = original_url {
-        lines.push(format!(
-            "Original page URL recorded by the saved page: {url}."
-        ));
+        lines.push(format!("Observed browser entrypoint URL: {url}."));
+    }
+    if let Some(url) = final_url {
+        lines.push(format!("Browser final navigation URL: {url}."));
     }
     lines.extend([
         String::new(),

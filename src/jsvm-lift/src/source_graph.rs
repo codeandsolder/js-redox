@@ -244,6 +244,36 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
         }
     }
 
+    // A recorder may lack HAR log.pages, but its navigation URL still
+    // establishes an HTML/browser root for the captured resource graph.
+    // Only link a browser page to resource URLs exactly observed in the
+    // manifest; redirects and script references remain distinct edges.
+    for (index, page) in manifest.pages.iter().enumerate() {
+        budget.checkpoint()?;
+        if nonempty_string_field(page, "kind") != Some("recorder_navigation") {
+            continue;
+        }
+        let page_id = format!("page:{index}");
+        graph.add_node(
+            page_id.clone(),
+            json!({
+                "type": "browser_entrypoint",
+                "requested_url": field(page, "requested_url"),
+                "final_url": field(page, "final_url"),
+            }),
+        )?;
+        for (key, edge_kind) in [
+            ("requested_url", "requested_navigation"),
+            ("final_url", "observed_navigation"),
+        ] {
+            if let Some(url) = nonempty_string_field(page, key) {
+                for target in graph.targets_for(url)? {
+                    graph.add_edge(&page_id, &target, edge_kind, json!({"url":url}))?;
+                }
+            }
+        }
+    }
+
     // HAR-extracted HTML/script/source-map references and redirects.
     for resource in &manifest.resources {
         budget.checkpoint()?;
