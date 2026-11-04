@@ -145,6 +145,14 @@ artifact!(
     objects = ["summary"]
 );
 artifact!(
+    SELECTIVE_TRACE,
+    "concrete debugger invocation witnesses",
+    "analysis/selective-trace.json",
+    "capture-selective-trace/v1",
+    arrays = ["hits", "errors"],
+    objects = ["summary"]
+);
+artifact!(
     RUNTIME_SCRIPTS,
     "runtime scripts",
     "analysis/runtime-scripts.json",
@@ -176,6 +184,7 @@ pub const ALL_ARTIFACTS: &[ArtifactSpec] = &[
     JSVM_INDEX,
     SOURCE_GRAPH,
     RUNTIME_SCRIPTS,
+    SELECTIVE_TRACE,
     EXECUTION_COVERAGE,
     OBSERVED_SOURCE,
     API_SURFACE,
