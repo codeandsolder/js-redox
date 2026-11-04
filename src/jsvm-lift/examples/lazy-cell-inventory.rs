@@ -46,8 +46,10 @@ fn distinct_lazy_accessor_families<'a>(
     let mut families: Vec<&ProvenLazyRegistryReadCall> = Vec::new();
     for read in reads {
         budget.consume(1)?;
-        if families.iter().any(|prior| {
-            prior.accessor_function_start == read.accessor_function_start
+        let mut already_seen = false;
+        for prior in &families {
+            budget.consume(1)?;
+            if prior.accessor_function_start == read.accessor_function_start
                 && prior.accessor_function_end == read.accessor_function_end
                 && prior.cell_assignment_start == read.cell_assignment_start
                 && prior.cell_assignment_end == read.cell_assignment_end
@@ -59,7 +61,12 @@ fn distinct_lazy_accessor_families<'a>(
                 && prior.selector_end == read.selector_end
                 && prior.selector_key_symbol == read.selector_key_symbol
                 && prior.selector_polynomial == read.selector_polynomial
-        }) {
+            {
+                already_seen = true;
+                break;
+            }
+        }
+        if already_seen {
             continue;
         }
         families.push(read);
