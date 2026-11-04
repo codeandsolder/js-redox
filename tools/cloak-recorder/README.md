@@ -117,3 +117,19 @@ that code executed during the observed interval; missing or zero counters do
 not imply that other code cannot execute. The Rust project stage joins script
 IDs and CDP sessions to exact body hashes and emits src/_observed/ for
 counter-positive JavaScript plus analysis/observed-source.json.
+
+## Selective concrete execution trace
+
+Use --trace-points PATH with a JSON configuration containing 1-24 points.
+Each point specifies a zero-based lineNumber, one of url, urlRegex, or
+scriptHash, and up to eight side-effect-checked expressions. maxHits limits
+actual debugger stops, and maxScopeProperties bounds recorded locals.
+
+Example: {"maxHits":8,"points":[{"url":"https://example.test/app.js",
+"lineNumber":2,"expressions":["opcode","handler"]}]}
+
+The optional selective-trace.json preserves CDP target/script identity,
+actual paused call stacks, local and closure variable descriptors, expression
+results and session-local heap object identities when available. V8 is resumed
+after every attempted capture. These are observations from selected executions,
+not proofs of all possible branches or handlers. Tracing affects timing.
