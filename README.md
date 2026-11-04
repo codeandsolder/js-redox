@@ -63,6 +63,14 @@ Coverage is intentionally measured separately from generic suspicion scoring. On
 
 The target is a provenance-preserving **browser capture -> readable source project** pipeline, with VM devirtualization as one transformation stage rather than the whole product.
 
+Live recorder captures can additionally include V8 precise execution coverage
+per CDP target session. When available, the project emits a readable view under
+src/_observed/ and joins positive execution witnesses to exact runtime script
+IDs, sessions, execution contexts, source bytes, and graph nodes. Scripts with
+no positive counter remain in the general source tree: zero or missing coverage
+does not prove non-execution. V8 ranges use UTF-16 rather than UTF-8 offsets.
+
+
 ```text
 HAR or browser "Webpage, Complete" capture
   ↓

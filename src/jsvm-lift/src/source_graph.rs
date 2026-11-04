@@ -375,6 +375,8 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                 "cdp_sessions":source.get("cdp_sessions").cloned().unwrap_or_else(|| json!([])),
                 "execution_context_ids":source.get("execution_context_ids").cloned().unwrap_or_else(|| json!([])),
                 "script_instances":source.get("script_instances").cloned().unwrap_or_else(|| json!([])),
+                "observed_executed":field(source,"observed_executed"),
+                "observed_source_path":field(source,"observed_source_path"),
                 "urls":source.get("urls").cloned().unwrap_or_else(|| json!([])),
                 "instrumentation_kind":field(source,"instrumentation_kind"),
                 "generated_root_sha256s":generated.get("root_sha256s").cloned().unwrap_or_else(|| json!([])),

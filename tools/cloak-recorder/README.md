@@ -106,3 +106,14 @@ installed; those sessions are still captured, but the manifest counts them as
 them. Observed events remain exact evidence. Playwright response capture remains
 the cross-target byte fallback when Chromium does not expose a corresponding
 target/session.
+
+## Observed execution evidence
+
+The recorder samples precise V8 function/block coverage from each CDP session,
+starting before page navigation or worker resume and finishing before browser
+shutdown. execution-coverage.json contains per-script source ranges (UTF-16
+code unit offsets), counters and capture availability. Positive counters show
+that code executed during the observed interval; missing or zero counters do
+not imply that other code cannot execute. The Rust project stage joins script
+IDs and CDP sessions to exact body hashes and emits src/_observed/ for
+counter-positive JavaScript plus analysis/observed-source.json.

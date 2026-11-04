@@ -3,6 +3,7 @@ use crate::{
     bundle_materialize::{materialize_bundle_modules, BundleMaterializeSummary},
     capture_import::{import_capture_project, CaptureImportOptions, CaptureImportSummary},
     capture_project::{read_manifest, MANIFEST_NAME},
+    observed_runtime::{materialize_observed_runtime_sources, ObservedSourceSummary},
     project_api_surface::analyze_project_api_surface,
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions, ProjectDeobSummary},
     project_js_refs::{scan_project_references, ReferenceScanSummary},
@@ -37,6 +38,7 @@ pub struct CapturePipelineOptions {
 pub struct CapturePipelineSummary {
     pub import: CaptureImportSummary,
     pub source: SourceMaterializeSummary,
+    pub observed_sources: ObservedSourceSummary,
     pub sourcemaps: ProjectSourcemapSummary,
     pub references: ReferenceScanSummary,
     pub deobfuscation: Option<ProjectDeobSummary>,
@@ -72,6 +74,7 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
     let manifest = read_manifest(&project.join(MANIFEST_NAME))?;
 
     let source = materialize_capture_source(project, options.jobs, &options.budgets)?;
+    let observed_sources = materialize_observed_runtime_sources(project, &options.budgets)?;
 
     let wasm = options
         .wasm_analysis
@@ -134,6 +137,7 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
     Ok(CapturePipelineSummary {
         import,
         source,
+        observed_sources,
         sourcemaps,
         references,
         deobfuscation,

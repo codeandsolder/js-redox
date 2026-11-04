@@ -3,8 +3,8 @@ use clap::Parser;
 use jsvm_lift::{
     analysis_artifacts::{
         load_artifact, ArtifactSpec, API_SURFACE, BUNDLES, DEOBFUSCATION, GENERATED_RECOVERY,
-        JSVM_INDEX, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCEMAPS, SOURCE_GRAPH, SOURCE_INDEX,
-        WASM_INDEX, WASM_JS_BOUNDARY, WASM_RESOURCE_PROVENANCE,
+        JSVM_INDEX, JS_REFERENCES, OBSERVED_SOURCE, RUNTIME_SCRIPTS, SOURCEMAPS, SOURCE_GRAPH,
+        SOURCE_INDEX, WASM_INDEX, WASM_JS_BOUNDARY, WASM_RESOURCE_PROVENANCE,
     },
     analysis_budget::AnalysisBudgets,
     capture_pipeline::{recover_capture_project, CapturePipelineOptions},
@@ -85,6 +85,7 @@ fn print_summary(
     let api = required_artifact(project, API_SURFACE)?;
     let graph = required_artifact(project, SOURCE_GRAPH)?;
     let runtime = optional_artifact(project, RUNTIME_SCRIPTS)?;
+    let observed = optional_artifact(project, OBSERVED_SOURCE)?;
 
     let javascript_units = source_index
         .get("units")
@@ -213,6 +214,13 @@ fn print_summary(
     }
     if runtime_events != 0 {
         println!("  runtime scripts:      {runtime_events} events -> {runtime_sources} unique");
+    }
+    if !observed.is_null() {
+        println!(
+            "  observed JS sources:  {} positive witness(es), {} formatted",
+            summary_u64(&observed, "witnessed_sources"),
+            summary_u64(&observed, "formatted_sources")
+        );
     }
     println!("  source graph:         {graph_nodes} nodes / {graph_edges} edges");
     Ok(())

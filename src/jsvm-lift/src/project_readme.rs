@@ -349,6 +349,11 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
     {
         lines.push("- [analysis/runtime-scripts.json](analysis/runtime-scripts.json) — Debugger runtime-script provenance, generated-expression recovery, and capture-instrumentation classification.".into());
     }
+    if project.join("analysis/observed-source.json").is_file() {
+        lines.push("- [src/_observed/](src/_observed/) — Oxc-formatted runtime sources with positive V8 execution counters; unlisted code is not necessarily unexecuted.".into());
+        lines.push("- [analysis/execution-coverage.json](analysis/execution-coverage.json) — per-session execution witnesses and V8 source offsets.".into());
+        lines.push("- [analysis/observed-source.json](analysis/observed-source.json) — observed source identity, provenance, and formatting status.".into());
+    }
     if wasm_resource_provenance.is_some() {
         lines.push("- [analysis/wasm-resource-provenance.json](analysis/wasm-resource-provenance.json) — runtime-observed exact WASM responses linked to their CDP script initiators.".into());
     }

@@ -1,3 +1,4 @@
+mod execution_coverage;
 mod runtime_scripts;
 mod saved_page;
 

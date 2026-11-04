@@ -129,6 +129,22 @@ artifact!(
     objects = ["summary"]
 );
 artifact!(
+    OBSERVED_SOURCE,
+    "observed runtime source tree",
+    "analysis/observed-source.json",
+    "capture-observed-sources/v1",
+    arrays = ["sources"],
+    objects = ["summary"]
+);
+artifact!(
+    EXECUTION_COVERAGE,
+    "precise browser execution coverage",
+    "analysis/execution-coverage.json",
+    "capture-execution-coverage/v1",
+    arrays = ["scripts"],
+    objects = ["summary"]
+);
+artifact!(
     RUNTIME_SCRIPTS,
     "runtime scripts",
     "analysis/runtime-scripts.json",
@@ -160,6 +176,8 @@ pub const ALL_ARTIFACTS: &[ArtifactSpec] = &[
     JSVM_INDEX,
     SOURCE_GRAPH,
     RUNTIME_SCRIPTS,
+    EXECUTION_COVERAGE,
+    OBSERVED_SOURCE,
     API_SURFACE,
 ];
 

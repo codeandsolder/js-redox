@@ -1,3 +1,4 @@
+use super::execution_coverage::CoverageIndex;
 use crate::{
     analysis_artifacts::{write_artifact, RUNTIME_SCRIPTS},
     capture_project::CaptureManifest,
@@ -559,6 +560,7 @@ pub(super) fn analyze_recorder_runtime_scripts(
     let events = events_value
         .as_array()
         .context("runtime-scripts.json must contain an array")?;
+    let coverage = CoverageIndex::load(capture, project, budget)?;
     let patterns = RuntimePatterns::new()?;
     let directives = frame_directives(capture)?;
     budget.checkpoint()?;
@@ -631,10 +633,15 @@ pub(super) fn analyze_recorder_runtime_scripts(
             if let Some(value) = event.get("executionContextId") {
                 execution_context_values.push(value);
             }
+            let execution = coverage.as_ref().map_or_else(
+                || json!({"status":"unavailable"}),
+                |index| index.for_script(&event_session(event), &stringish(event.get("scriptId"))),
+            );
             script_instances.push(json!({
                 "cdp_session": event_session(event),
                 "script_id": event.get("scriptId").cloned().unwrap_or(Value::Null),
                 "execution_context_id": event.get("executionContextId").cloned().unwrap_or(Value::Null),
+                "execution": execution,
             }));
         }
 
@@ -657,6 +664,13 @@ pub(super) fn analyze_recorder_runtime_scripts(
             Value::Array(sorted_unique_values(execution_context_values.into_iter())),
         );
         row.insert("script_instances".into(), Value::Array(script_instances));
+        let observed_executed = row
+            .get("script_instances")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|instance| instance["execution"]["status"] == "positive");
+        row.insert("observed_executed".into(), json!(observed_executed));
         row.insert("urls".into(), json!(urls));
         if !document_origins.is_empty() {
             row.insert(
