@@ -12,13 +12,79 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ObservedSourceSummary {
     pub witnessed_sources: usize,
     pub formatted_sources: usize,
     pub unformatted_sources: usize,
+}
+
+/// A compact human-facing locator, not a replacement for the recorded URL.
+/// Keep original query strings and complete generation chains in JSON provenance.
+fn display_origin(source: &Value) -> Option<String> {
+    let urls = source
+        .get("urls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    let generation_roots = source
+        .get("generated")
+        .and_then(|generated| generated.get("root_urls"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    urls.chain(generation_roots).find_map(|raw| {
+        let url = url::Url::parse(raw).ok()?;
+        let host = url.host_str()?;
+        let path = url.path();
+        let short_path = path.chars().take(88).collect::<String>();
+        let truncated = if path.chars().count() > 88 { "…" } else { "" };
+        Some(format!("{host}{short_path}{truncated}"))
+    })
+}
+
+fn observed_execution_counts(source: &Value) -> (u64, u64, usize) {
+    let mut functions = 0_u64;
+    let mut ranges = 0_u64;
+    let mut instances = 0;
+    for instance in source
+        .get("script_instances")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let execution = &instance["execution"];
+        if execution.get("status").and_then(Value::as_str) != Some("positive") {
+            continue;
+        }
+        instances += 1;
+        functions = functions.saturating_add(
+            execution
+                .get("positive_functions")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        ranges = ranges.saturating_add(
+            execution
+                .get("positive_ranges")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+    }
+    (functions, ranges, instances)
+}
+
+fn classification_heading(classification: &str) -> &str {
+    match classification {
+        "network_response" | "network_observed" => "Network scripts",
+        "inline_script" => "Inline scripts",
+        "generated_runtime" => "Generated runtime scripts",
+        _ => "Other observed scripts",
+    }
 }
 
 /// Recovered source bytes are checked against their capture CAS identities.
@@ -65,6 +131,7 @@ pub fn materialize_observed_runtime_sources(
          See analysis/observed-source.json and analysis/runtime-scripts.json for \
          provenance, script IDs, sessions, and original URLs.\n\n",
     );
+    let mut grouped_links = BTreeMap::<&str, Vec<String>>::new();
     let mut summary = ObservedSourceSummary::default();
     for source in sources {
         if source.get("observed_executed") != Some(&Value::Bool(true))
@@ -142,14 +209,27 @@ pub fn materialize_observed_runtime_sources(
             .to_owned();
         source["observed_source_path"] = json!(target);
         source["observed_source_formatted"] = json!(was_formatted);
-        readme.push_str(&format!(
-            "- [{digest}](./{digest}.js) - {category}{}\n",
-            if was_formatted {
-                ""
-            } else {
-                " (raw parse fallback)"
-            }
-        ));
+        let origin = display_origin(source).unwrap_or_else(|| category.clone());
+        let (functions, ranges, instances) = observed_execution_counts(source);
+        let (status, readable_link) = match &safe_deob {
+            Some(info) if info["changed"] == true => (
+                "safe transform",
+                format!(" · [general readable source](../_readable/runtime-scripts/{digest}.js)"),
+            ),
+            Some(_) => (
+                "safe unchanged",
+                format!(" · [general readable source](../_readable/runtime-scripts/{digest}.js)"),
+            ),
+            None => ("formatted only", String::new()),
+        };
+        grouped_links
+            .entry(classification_heading(&category))
+            .or_default()
+            .push(format!(
+                "- [{origin} · {}](./{digest}.js) — {status}; {instances} witnessed script instance(s), {functions} positive functions, {ranges} positive ranges{readable_link}{}",
+                &digest[..12],
+                if was_formatted { "" } else { "; unformatted fallback" },
+            ));
         entries.push(json!({
             "sha256":digest,
             "source_path":target,
@@ -163,6 +243,14 @@ pub fn materialize_observed_runtime_sources(
         }));
     }
     if summary.witnessed_sources > 0 {
+        for (heading, links) in grouped_links {
+            readme.push_str(&format!("## {heading} ({})\n\n", links.len()));
+            for link in links {
+                readme.push_str(&link);
+                readme.push('\n');
+            }
+            readme.push('\n');
+        }
         fs::write(project.join("src/_observed/README.md"), readme)?;
     }
     let doc = json!({
@@ -187,6 +275,30 @@ mod tests {
     use serde_json::Map;
     use std::collections::BTreeMap;
     use tempfile::TempDir;
+
+    #[test]
+    fn visible_navigation_uses_urls_without_including_query_tokens() {
+        let source = json!({
+            "urls": ["https://example.test/assets/app.js?session=secret"],
+        });
+        assert_eq!(
+            display_origin(&source).as_deref(),
+            Some("example.test/assets/app.js")
+        );
+        let generated = json!({
+            "urls": [],
+            "generated": {"root_urls": ["https://example.test/boot?q=secret"]},
+        });
+        assert_eq!(
+            display_origin(&generated).as_deref(),
+            Some("example.test/boot")
+        );
+        assert_eq!(
+            classification_heading("generated_runtime"),
+            "Generated runtime scripts"
+        );
+        assert_eq!(classification_heading("inline_script"), "Inline scripts");
+    }
 
     #[test]
     fn observed_tree_requires_positive_counters_and_keeps_raw_bytes() -> Result<()> {
@@ -239,6 +351,10 @@ mod tests {
         )?;
         assert_eq!(result.witnessed_sources, 1);
         assert_eq!(result.formatted_sources, 1);
+        let readme = fs::read_to_string(project.join("src/_observed/README.md"))?;
+        assert!(readme.contains("## Network scripts (1)"));
+        assert!(readme.contains("1 witnessed script instance(s)"));
+        assert!(readme.contains(&digest[..12]));
         assert!(project.join(format!("src/_observed/{digest}.js")).is_file());
         assert_eq!(fs::read_to_string(capture.join(rel))?, script);
         let runtime = load_artifact(&project, RUNTIME_SCRIPTS, false)?.context("index")?;
