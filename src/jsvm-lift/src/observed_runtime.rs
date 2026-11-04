@@ -2,7 +2,8 @@
 //! Parsed, absent, or zero-count scripts are not proof of non-execution.
 use crate::{
     analysis_artifacts::{
-        load_artifact, write_artifact, EXECUTION_COVERAGE, OBSERVED_SOURCE, RUNTIME_SCRIPTS,
+        load_artifact, write_artifact, DEOBFUSCATION, EXECUTION_COVERAGE, OBSERVED_SOURCE,
+        RUNTIME_SCRIPTS,
     },
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::read_manifest,
@@ -35,6 +36,22 @@ pub fn materialize_observed_runtime_sources(
     let Some(mut index) = load_artifact(project, RUNTIME_SCRIPTS, true)? else {
         return Ok(ObservedSourceSummary::default());
     };
+    let deob = load_artifact(project, DEOBFUSCATION, true)?;
+    let safe_views = deob
+        .as_ref()
+        .and_then(|report| report.get("units"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|unit| {
+            let raw = unit.get("raw_path")?.as_str()?;
+            let readable = unit.get("readable_output_path")?.as_str()?;
+            if unit.get("exit").and_then(Value::as_i64) != Some(0) {
+                return None;
+            }
+            Some((raw.to_owned(), (readable.to_owned(), unit.clone())))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     let capture = Path::new(&manifest.source.input);
     let sources = index
         .get_mut("sources")
@@ -75,11 +92,36 @@ pub fn materialize_observed_runtime_sources(
         }
         let code = std::str::from_utf8(&raw)
             .with_context(|| format!("runtime source not UTF-8: {rel}"))?;
-        let budget = budgets.operation(AnalysisOperation::Format, &rel);
-        let formatted = format_source(code, &budget);
-        let (text, was_formatted, error) = match formatted {
-            Ok(text) => (text, true, None),
-            Err(error) => (code.to_owned(), false, Some(error.to_string())),
+        let staged_raw = format!("resources/{rel}");
+        // A safe-deob result in the central general code-unit pipeline is
+        // authoritative over separately formatting the unchanged runtime body.
+        // Only accept this exact content-addressed runtime path.
+        let safe = safe_views
+            .get(&staged_raw)
+            .filter(|(path, _)| *path == format!("src/_readable/{rel}"));
+        let (text, was_formatted, error, safe_deob) = if let Some((readable, record)) = safe {
+            let text = fs::read_to_string(project.join(readable))
+                .with_context(|| format!("reading proven-safe source view {readable}"))?;
+            (
+                text,
+                record
+                    .get("readable_formatted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                None,
+                Some(json!({
+                    "readable_path": readable,
+                    "changed": record.get("changed").cloned().unwrap_or(Value::Null),
+                    "transforms": record.get("transforms").cloned().unwrap_or(Value::Null),
+                    "proof_report_path": record.get("report_path").cloned().unwrap_or(Value::Null),
+                })),
+            )
+        } else {
+            let budget = budgets.operation(AnalysisOperation::Format, &rel);
+            match format_source(code, &budget) {
+                Ok(text) => (text, true, None, None),
+                Err(error) => (code.to_owned(), false, Some(error.to_string()), None),
+            }
         };
         let target = format!("src/_observed/{digest}.js");
         let absolute = project.join(&target);
@@ -117,6 +159,7 @@ pub fn materialize_observed_runtime_sources(
             "script_instances":source.get("script_instances").cloned().unwrap_or(Value::Null),
             "formatted":was_formatted,
             "format_error":error,
+            "safe_deob": safe_deob,
         }));
     }
     if summary.witnessed_sources > 0 {

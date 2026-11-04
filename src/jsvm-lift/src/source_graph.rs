@@ -379,6 +379,28 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
             ))
         })
         .collect::<BTreeMap<_, _>>();
+    let runtime_general_paths = array_field(&source_index, "units")
+        .iter()
+        .filter(|unit| string_field(unit, "origin") == Some("runtime_script"))
+        .filter_map(|unit| {
+            Some((
+                nonempty_string_field(unit, "input_sha256")?.to_owned(),
+                nonempty_string_field(unit, "source_path")?.to_owned(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let runtime_readable_paths = array_field(&deobfuscation, "units")
+        .iter()
+        .filter_map(|unit| {
+            let digest = nonempty_string_field(unit, "raw_path")?
+                .strip_prefix("resources/runtime-scripts/")?
+                .strip_suffix(".js")?;
+            let readable = nonempty_string_field(unit, "readable_output_path")?;
+            (readable == format!("src/_readable/runtime-scripts/{digest}.js"))
+                .then(|| (digest.to_owned(), readable.to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
     let mut runtime_node_by_instance = BTreeMap::<(String, String), String>::new();
     let mut runtime_instance_conflicts = BTreeSet::<(String, String)>::new();
 
@@ -407,6 +429,8 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                 "script_instances":source.get("script_instances").cloned().unwrap_or_else(|| json!([])),
                 "observed_executed":field(source,"observed_executed"),
                 "observed_source_path":field(source,"observed_source_path"),
+                "general_source_path":runtime_general_paths.get(digest),
+                "safe_readable_source_path":runtime_readable_paths.get(digest),
                 "urls":source.get("urls").cloned().unwrap_or_else(|| json!([])),
                 "instrumentation_kind":field(source,"instrumentation_kind"),
                 "generated_root_sha256s":generated.get("root_sha256s").cloned().unwrap_or_else(|| json!([])),
@@ -754,7 +778,23 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
             }),
         )?;
         let parent = string_field(unit, "raw_path")
-            .and_then(|raw| inline_node_by_raw.get(raw).cloned())
+            .and_then(|raw| {
+                inline_node_by_raw.get(raw).cloned().or_else(|| {
+                    // CDP runtime source bodies are not synthetic HTTP
+                    // resources. Connect their deobfuscation result to the
+                    // independently captured runtime-script node by exact
+                    // content-addressed identity, not a guessed URL.
+                    let digest = raw
+                        .strip_prefix("resources/runtime-scripts/")?
+                        .strip_suffix(".js")?;
+                    if string_field(unit, "input_sha256") != Some(digest)
+                        || !runtime_general_paths.contains_key(digest)
+                    {
+                        return None;
+                    }
+                    Some(format!("runtime:{}", &digest[..digest.len().min(20)]))
+                })
+            })
             .or_else(|| {
                 u64_field(unit, "resource_id").map(|resource_id| format!("resource:{resource_id}"))
             });
@@ -1601,6 +1641,96 @@ mod tests {
         analysis_artifacts::{load_artifact, SOURCE_GRAPH},
         capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME},
     };
+
+    #[test]
+    fn runtime_script_exact_source_identity_connects_to_safe_deob_result() -> Result<()> {
+        use crate::analysis_artifacts::{
+            write_artifact, DEOBFUSCATION, RUNTIME_SCRIPTS, SOURCE_INDEX,
+        };
+
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        let digest = "c".repeat(64);
+        let raw_path = format!("resources/runtime-scripts/{digest}.js");
+        let view = format!("src/runtime-scripts/{digest}.js");
+        let readable = format!("src/_readable/runtime-scripts/{digest}.js");
+        let manifest = CaptureManifest {
+            schema: "capture-project/v1".into(),
+            source: CaptureSource {
+                kind: "recorder".into(),
+                input: "fixture-recorder".into(),
+                salvaged: false,
+                extra: Map::new(),
+            },
+            pages: vec![],
+            resources: vec![],
+            inline_scripts: vec![],
+            counts: BTreeMap::new(),
+            extra: Map::new(),
+        };
+        write_manifest(&project.join(MANIFEST_NAME), &manifest)?;
+        write_artifact(
+            &project,
+            RUNTIME_SCRIPTS,
+            &json!({
+                "schema": RUNTIME_SCRIPTS.schema,
+                "sources": [{
+                    "sha256": digest, "path": format!("runtime-scripts/{digest}.js"),
+                    "classification":"generated_runtime",
+                }],
+                "alpine_families":[], "gtm_families":[], "summary":{},
+            }),
+        )?;
+        write_artifact(
+            &project,
+            SOURCE_INDEX,
+            &json!({
+                "schema": SOURCE_INDEX.schema,
+                "units": [{
+                    "origin":"runtime_script", "kind":"javascript",
+                    "raw_path":raw_path, "source_path":view,
+                    "input_sha256":digest, "resource_id":Value::Null,
+                }],
+                "summary":{},
+            }),
+        )?;
+        write_artifact(
+            &project,
+            DEOBFUSCATION,
+            &json!({
+                "schema": DEOBFUSCATION.schema,
+                "units": [{
+                    "ordinal":0, "raw_path":raw_path,
+                    "input_sha256":digest, "readable_output_path":readable,
+                    "output_path":format!("src/_deobfuscated/runtime-scripts/{digest}.js"),
+                    "exit":0, "changed":true,
+                }],
+                "summary":{},
+            }),
+        )?;
+        build_source_graph(
+            &project,
+            &AnalysisBudgets::standard("runtime-origin-graph-test"),
+        )?;
+        let graph = load_artifact(&project, SOURCE_GRAPH, false)?.context("missing graph")?;
+        assert!(graph["edges"]
+            .as_array()
+            .is_some_and(|edges| edges
+                .iter()
+                .any(|edge| edge["from"] == format!("runtime:{}", &digest[..20])
+                    && edge["to"] == "deobfuscated:0"
+                    && edge["kind"] == "safe_deobfuscation")));
+        let runtime = graph["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|node| node["id"] == format!("runtime:{}", &digest[..20]))
+            .context("missing runtime node")?;
+        assert_eq!(runtime["general_source_path"], view);
+        assert_eq!(runtime["safe_readable_source_path"], readable);
+        Ok(())
+    }
 
     #[test]
     fn sparse_resource_ids_and_redirects_remain_first_class_graph_edges() -> Result<()> {
