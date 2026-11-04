@@ -15,6 +15,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { evaluateDuringScroll, isTerminalTargetClosedError } from "./scroll-retry.mjs";
 import { classifyRelevantBodies } from "./network-completeness.mjs";
+import { normalizePreciseCoverage, summarizePreciseCoverage } from "./precise-coverage.mjs";
 import {
   WORKER_TARGET_FILTER,
   createNestedCdpRouter,
@@ -598,6 +599,7 @@ async function main() {
   const eventSourceEvents = [];
   const runtimeEvents = [];
   const runtimeScripts = new Map();
+  const coverageSessions = new Map();
   const streamed = new Map();
   const frameCdpStates = new WeakMap();
   let nextFrameCdpSession = 1;
@@ -1069,6 +1071,15 @@ async function main() {
     ];
     if (enablePage) enables.push(cdpSession.send("Page.enable"));
     await Promise.all(enables);
+    // Start before navigation or before resuming a newly attached worker.
+    // Coverage belongs to a CDP target session, not just a script URL.
+    try {
+      await cdpSession.send("Profiler.enable");
+      await cdpSession.send("Profiler.startPreciseCoverage", { callCount: true, detailed: true });
+      coverageSessions.set(cdpSessionName, { session: cdpSession, status: "started" });
+    } catch (error) {
+      coverageSessions.set(cdpSessionName, { status: "unavailable", error: String(error) });
+    }
   }
 
   const cdp = await context.newCDPSession(page);
@@ -1417,6 +1428,37 @@ async function main() {
   }
 
   await drainJobs();
+
+  // Snapshot per-target V8 execution counters BEFORE closing the browser.
+  // A parsed source is not proof of execution; positive counters are.
+  const coverageRows = [];
+  for (const [name, state] of coverageSessions) {
+    if (state.status !== "started") {
+      coverageRows.push({ cdpSession: name, status: "unavailable", error: state.error, scripts: [] });
+      continue;
+    }
+    try {
+      const snapshot = await withTimeout(
+        state.session.send("Profiler.takePreciseCoverage"),
+        Math.min(opts.timeoutMs, 15_000),
+        "takePreciseCoverage",
+      );
+      coverageRows.push({
+        cdpSession: name,
+        status: "captured",
+        timestamp: snapshot.timestamp,
+        scripts: normalizePreciseCoverage(snapshot),
+      });
+    } catch (error) {
+      coverageRows.push({ cdpSession: name, status: "unavailable", error: String(error), scripts: [] });
+    }
+  }
+  const executionCoverage = {
+    schema: "js-redox/precise-execution-coverage/v1",
+    offsetUnits: "utf16",
+    sessions: coverageRows,
+    summary: summarizePreciseCoverage(coverageRows),
+  };
   finalCaptureComplete = true;
 
   // Recover a body missed by Playwright from the independent early CDP stream,
@@ -1492,6 +1534,7 @@ async function main() {
     capturedCdpStreams: streamRows.filter((r) => r.body).length,
     runtimeScriptsSeen: runtimeScripts.size,
     runtimeScriptsCaptured: [...runtimeScripts.values()].filter((r) => r.captured).length,
+    executionCoverage: executionCoverage.summary,
     websocketEvents: websocketEvents.length,
     eventSourceEvents: eventSourceEvents.length,
     frames: frameRows.length,
@@ -1503,6 +1546,7 @@ async function main() {
     writeFile(path.join(out, "network.json"), JSON.stringify(networkRecords, null, 2)),
     writeFile(path.join(out, "cdp-streams.json"), JSON.stringify(streamRows, null, 2)),
     writeFile(path.join(out, "runtime-scripts.json"), JSON.stringify([...runtimeScripts.values()], null, 2)),
+    writeFile(path.join(out, "execution-coverage.json"), JSON.stringify(executionCoverage, null, 2)),
     writeFile(path.join(out, "websockets.json"), JSON.stringify(websocketEvents, null, 2)),
     writeFile(path.join(out, "eventsource.json"), JSON.stringify(eventSourceEvents, null, 2)),
     writeFile(path.join(out, "runtime-events.json"), JSON.stringify(runtimeEvents, null, 2)),
@@ -1568,6 +1612,7 @@ async function main() {
       cdpStreams: "cdp-streams.json",
       runtimeScripts: "runtime-scripts/",
       runtimeScriptManifest: "runtime-scripts.json",
+      executionCoverage: "execution-coverage.json",
       frames: "frames/",
       frameManifest: "frames.json",
       mhtml,
@@ -1586,6 +1631,7 @@ async function main() {
       ...(workerCdpSessionsUnpausedAtAttach ? [
         `${workerCdpSessionsUnpausedAtAttach} worker target(s) were already running when recursively attached; observed evidence is exact, but early CDP-event completeness is not claimed for those targets.`,
       ] : []),
+      "Precise V8 counters prove only observed executed code ranges; missing or zero-count coverage does not prove code is unreachable, and the snapshot covers only the recorded browser interval.",
       "Bodies larger than maxBodyMiB are intentionally reported but not persisted unless the limit is increased.",
       "Image/media/font bodies are intentionally omitted unless --all-bodies is used.",
     ],

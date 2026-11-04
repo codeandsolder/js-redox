@@ -36,6 +36,7 @@ pub mod cfg_order;
 pub mod effect_shape;
 
 pub mod numeric;
+pub mod observed_runtime;
 pub mod parse_int;
 pub mod project_api_surface;
 pub mod project_deob;
