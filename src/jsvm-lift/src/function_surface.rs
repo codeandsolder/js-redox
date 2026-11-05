@@ -92,11 +92,14 @@ fn member_target_kind(target: &oxc_ast::ast::AssignmentTarget<'_>) -> Option<&'s
     }
 }
 
+type ExternalRefKey = (String, Option<(u32, u32)>);
+type ExternalRefCounts = (usize, usize);
+
 #[derive(Debug)]
 struct SurfaceAccumulator {
     span: Span,
     nested_functions: Vec<[u32; 2]>,
-    references: BTreeMap<(String, Option<(u32, u32)>), (usize, usize)>,
+    references: BTreeMap<ExternalRefKey, ExternalRefCounts>,
     calls: Vec<FunctionSurfaceEvent>,
     effects: Vec<FunctionSurfaceEvent>,
 }
@@ -387,7 +390,7 @@ mod tests {
     use work_budget::WorkBudget;
 
     #[test]
-    fn batch_preserves_exact_function_order_and_nested_semantics() {
+    fn batch_preserves_exact_function_order_and_nested_semantics() -> anyhow::Result<()> {
         let source = r#"
             const x = 1;
             function outer(a) {
@@ -421,17 +424,16 @@ mod tests {
                         .is_some_and(|text| text.starts_with(name))
                 })
                 .copied()
-                .expect("named exact function")
+                .ok_or_else(|| anyhow::anyhow!("named exact function"))
         };
-        let inner_span = named_span("function inner");
-        let outer_span = named_span("function outer");
-        let unrelated_span = named_span("function unrelated");
+        let inner_span = named_span("function inner")?;
+        let outer_span = named_span("function outer")?;
+        let unrelated_span = named_span("function unrelated")?;
         let missing = oxc_span::Span::new(1, 2);
         let requested = [inner_span, outer_span, missing, outer_span, unrelated_span];
         let budget = WorkBudget::unlimited("function-surface-batch-test");
         let batch =
-            analyze_function_source_surfaces(source, &semantic.semantic, &requested, &budget)
-                .expect("batch proof");
+            analyze_function_source_surfaces(source, &semantic.semantic, &requested, &budget)?;
         assert_eq!(batch.len(), requested.len());
         assert!(batch[2].is_none());
         assert_eq!(
@@ -439,11 +441,11 @@ mod tests {
             "duplicate span preserves identical evidence"
         );
         for (span, item) in requested.into_iter().zip(batch.iter()) {
-            let single = analyze_function_source_surface(source, &semantic.semantic, span, &budget)
-                .expect("single proof");
+            let single =
+                analyze_function_source_surface(source, &semantic.semantic, span, &budget)?;
             assert_eq!(&single, item, "batch and singleton must agree");
         }
-        let inner = batch[0].as_ref().expect("inner");
+        let inner = batch[0].as_ref().ok_or_else(|| anyhow::anyhow!("inner"))?;
         assert_eq!(inner.function, [inner_span.start, inner_span.end]);
         assert_eq!(
             inner
@@ -453,7 +455,7 @@ mod tests {
                 .count(),
             1
         );
-        let outer = batch[1].as_ref().expect("outer");
+        let outer = batch[1].as_ref().ok_or_else(|| anyhow::anyhow!("outer"))?;
         assert_eq!(
             outer
                 .effects
@@ -464,7 +466,9 @@ mod tests {
         );
         assert!(outer.external_references.iter().any(|r| r.name == "x"));
         assert!(!outer.external_references.iter().any(|r| r.name == "a"));
-        let unrelated = batch[4].as_ref().expect("unrelated");
+        let unrelated = batch[4]
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("unrelated"))?;
         assert_eq!(
             unrelated
                 .effects
@@ -475,14 +479,13 @@ mod tests {
         );
         assert!(unrelated.nested_functions.is_empty());
         assert!(
-            analyze_function_source_surfaces(source, &semantic.semantic, &[], &budget)
-                .expect("empty batch")
-                .is_empty()
+            analyze_function_source_surfaces(source, &semantic.semantic, &[], &budget)?.is_empty()
         );
+        Ok(())
     }
 
     #[test]
-    fn separates_nested_effects_and_external_binding_identity() {
+    fn separates_nested_effects_and_external_binding_identity() -> anyhow::Result<()> {
         let source = r#"
             let external;
             const handler = function(arg) {
@@ -515,15 +518,14 @@ mod tests {
                 }
                 None
             })
-            .expect("handler");
+            .ok_or_else(|| anyhow::anyhow!("handler"))?;
         let result = analyze_function_source_surface(
             source,
             &semantic.semantic,
             target,
             &WorkBudget::unlimited("function-surface-test"),
-        )
-        .expect("budget")
-        .expect("exact function");
+        )?
+        .ok_or_else(|| anyhow::anyhow!("exact function"))?;
         let evals = result
             .effects
             .iter()
@@ -559,5 +561,6 @@ mod tests {
         assert!(!result.external_references.iter().any(|r| r.name == "arg"));
         assert_eq!(result.nested_functions.len(), 1);
         assert!(!result.executed_behavior_proven);
+        Ok(())
     }
 }
