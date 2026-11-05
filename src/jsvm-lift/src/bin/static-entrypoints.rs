@@ -2,8 +2,13 @@
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use jsvm_lift::{
-    capture_project::read_manifest, document_entrypoints::captured_document_entrypoints,
-    safe_deob::SourceMode, sha256_hex, static_calls::analyze_static_calls,
+    analysis_artifacts::{load_artifact, JS_REFERENCES, SOURCE_INDEX},
+    capture_project::read_manifest,
+    document_entrypoints::captured_document_entrypoints,
+    safe_deob::SourceMode,
+    sha256_hex,
+    static_calls::analyze_static_calls,
+    static_module_graph::link_static_modules,
 };
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
@@ -116,6 +121,23 @@ fn main() -> Result<()> {
             }),
         );
     }
+    let module_graph = match (
+        load_artifact(&project, SOURCE_INDEX, true)?,
+        load_artifact(&project, JS_REFERENCES, true)?,
+    ) {
+        (Some(source_index), Some(js_references)) => json!({
+            "status":"available",
+            "analysis":link_static_modules(
+                &project, &documents, &source_index, &js_references, &budget,
+            )?,
+            "references_schema": JS_REFERENCES.schema,
+            "source_index_schema": SOURCE_INDEX.schema,
+        }),
+        _ => json!({
+            "status":"unavailable",
+            "reason":"Existing source-index and JS-reference artifacts are both required for contextual module resolution",
+        }),
+    };
     let root_count: usize = documents
         .iter()
         .map(|document| {
@@ -131,19 +153,22 @@ fn main() -> Result<()> {
         .filter(|value| value["analysis"]["status"] == "analyzed")
         .count();
     let output = json!({
-        "schema":"jsvm-document-static-entrypoints/v1",
+        "schema":"jsvm-document-static-entrypoints/v2",
         "capture_project":project,
         "document_count":documents.len(),
         "executable_parser_script_roots":root_count,
         "source_graphs_analyzed":analyzed_count,
         "documents":documents,
         "source_graphs":source_graphs,
+        "static_module_dependencies":module_graph,
         "limitations":[
             "HTML script ordinals and scheduler classes are source-level candidates, not observed completion order.",
             "Async, defer, module, nomodule, dynamic script insertions and module imports require independent browser-semantic and input-dependent resolution.",
             "Direct JS function-call edges are source-local candidates, including conditional branches; they are not actual invocation witnesses.",
             "Calls through properties, dynamic lexical bindings, callbacks, and unobserved network resources remain unresolved; no missing source is invented.",
-            "Source identities are SHA-256-bound to captured bytes and matched by URL rather than filename."
+            "Source identities are SHA-256-bound to captured bytes and matched by URL rather than filename.",
+            "Static module resolution composes the existing import-map-aware JS-reference analysis and explicitly distinguishes original raw from transformed analysis SHA and offsets.",
+            "Import-map resolution timing and module loading/order are not proven by source-only analysis."
         ]
     });
     fs::write(&args.output, serde_json::to_vec_pretty(&output)?)
