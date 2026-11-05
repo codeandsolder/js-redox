@@ -670,6 +670,7 @@ pub struct ScanCore {
     pub(crate) handler_function_tables: Vec<table_vm::DetailedHandlerTableCandidate>,
     pub(crate) byte_transducers: Vec<table_vm::ByteTransducerCandidate>,
     pub(crate) table_vms: Vec<table_vm::TableVmCandidate>,
+    pub(crate) lazy_registry_indirect_calls: Vec<table_vm::LazyRegistryIndirectCallCandidate>,
     pub(crate) functions: Vec<FunctionMetrics>,
     pub(crate) embedded_code: Vec<EmbeddedCodeCandidate>,
 }
@@ -884,6 +885,7 @@ pub fn scan_source_core(
         handler_function_tables: table_analysis.handler_function_tables,
         byte_transducers: table_analysis.byte_transducers,
         table_vms: table_analysis.table_vms,
+        lazy_registry_indirect_calls: table_analysis.lazy_registry_indirect_calls,
         functions: scanner.functions,
         embedded_code: scanner.embedded_code,
     })

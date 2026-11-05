@@ -1,13 +1,17 @@
 use crate::ast_utils::target_ident;
 use crate::forwarding_semantics::{
-    structurally_proven_registry_forwarding_calls, structurally_proven_registry_read_calls,
-    ProvenRegistryForwardingCall, ProvenRegistryReadCall,
+    structurally_proven_lazy_registry_read_calls, structurally_proven_registry_forwarding_calls,
+    structurally_proven_registry_read_calls, ProvenRegistryForwardingCall, ProvenRegistryReadCall,
 };
 use crate::numeric::exact_u64;
 use crate::receiver_identity::{structurally_proven_runtime_origin_flow, ProvenOriginFlow};
+use crate::registry_call_value::{
+    analyze as analyze_accessor_results, join_exact_origin_lazy_accessor_results,
+    join_lazy_accessor_results,
+};
 use crate::registry_identity::{
     proven_origin_registry_handler_installs, proven_origin_registry_read_calls,
-    ProvenRegistryObjectOrigin,
+    ProvenOriginRegistryReadCall, ProvenRegistryObjectOrigin,
 };
 use jsvm_safe_core::string_literal_value;
 use oxc_ast::{
@@ -82,11 +86,35 @@ pub struct TableVmCandidate {
     pub architecture: String,
 }
 
+/// A call can consume a lazy registry-accessor result on a write-free CFG
+/// path, and both sites can refer to the same proven registry allocation.
+/// This is deliberately NOT a confirmed handler dispatch: the accessor may
+/// return a wrapper/projection rather than the originally installed function,
+/// and a CFG path does not prove that branch is feasible at runtime.
+#[derive(Debug, Clone, Serialize)]
+pub struct LazyRegistryIndirectCallCandidate {
+    pub table_binding: String,
+    pub table_handler_count: usize,
+    pub local_binding: String,
+    pub accessor_call_start: u32,
+    pub accessor_call_end: u32,
+    pub assignment_start: u32,
+    pub assignment_end: u32,
+    pub indirect_call_start: u32,
+    pub indirect_call_end: u32,
+    pub definite_accessor_result: bool,
+    pub cfg_write_free_path: bool,
+    pub origin_allocation_start: u32,
+    pub origin_allocation_end: u32,
+    pub exact_key: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct TableVmAnalysis {
     pub handler_function_tables: Vec<DetailedHandlerTableCandidate>,
     pub byte_transducers: Vec<ByteTransducerCandidate>,
     pub table_vms: Vec<TableVmCandidate>,
+    pub lazy_registry_indirect_calls: Vec<LazyRegistryIndirectCallCandidate>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +196,115 @@ struct Analyzer<'s> {
     forwarded_registry_spans: HashMap<(u32, u32, String), (u32, u32)>,
     transducers: Vec<ByteTransducerCandidate>,
     functions: Vec<FunctionSummary>,
+}
+
+fn origin_prefix(origin: &ProvenRegistryObjectOrigin) -> String {
+    format!(
+        "origin@{}-{}:{}-{}",
+        origin.allocation_start,
+        origin.allocation_end,
+        origin.constructor_start,
+        origin.constructor_end
+    )
+}
+
+fn append_registry_path(mut binding: String, registry_path: &[String]) -> String {
+    for property in registry_path {
+        let identifier = property.chars().enumerate().all(|(index, character)| {
+            character == '_'
+                || character == '$'
+                || (index == 0 && character.is_ascii_alphabetic())
+                || (index > 0 && character.is_ascii_alphanumeric())
+        });
+        if identifier {
+            binding.push('.');
+            binding.push_str(property);
+        } else {
+            binding.push('[');
+            binding.push_str(&format!("{property:?}"));
+            binding.push(']');
+        }
+    }
+    binding
+}
+
+/// Compose existing independent proofs only after the concrete handler table
+/// has been materialized. Never promote these edges to table_vms.
+fn collect_lazy_registry_indirect_calls(
+    program: &oxc_ast::ast::Program<'_>,
+    semantic: &oxc_semantic::Semantic<'_>,
+    reads: &[ProvenRegistryReadCall],
+    origins: &[ProvenOriginRegistryReadCall],
+    tables: &[DetailedHandlerTableCandidate],
+    budget: &WorkBudget,
+) -> Result<Vec<LazyRegistryIndirectCallCandidate>, BudgetExceeded> {
+    if reads.is_empty() || origins.is_empty() || tables.is_empty() {
+        return Ok(Vec::new());
+    }
+    let uses = analyze_accessor_results(semantic, reads, budget)?;
+    if uses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lazy_reads =
+        structurally_proven_lazy_registry_read_calls(program, semantic.scoping(), budget)?;
+    let lazy_uses = join_lazy_accessor_results(&uses, &lazy_reads, budget)?;
+    let exact_uses = join_exact_origin_lazy_accessor_results(&lazy_uses, origins, budget)?;
+    let mut candidates = Vec::new();
+    for proof in exact_uses {
+        budget.consume(1)?;
+        let result = &proof.lazy.result;
+        if !result.cfg_write_free_path {
+            continue;
+        }
+        let origin = ProvenRegistryObjectOrigin {
+            allocation_start: proof.origin_allocation_start,
+            allocation_end: proof.origin_allocation_end,
+            constructor_start: proof.origin_constructor_start,
+            constructor_end: proof.origin_constructor_end,
+        };
+        let binding = append_registry_path(origin_prefix(&origin), &proof.lazy.registry_path);
+        let mut matching = tables.iter().filter(|table| table.binding == binding);
+        let Some(table) = matching.next() else {
+            continue;
+        };
+        if matching.next().is_some() {
+            continue;
+        }
+        candidates.push(LazyRegistryIndirectCallCandidate {
+            table_binding: binding,
+            table_handler_count: table.function_values,
+            local_binding: result.binding.clone(),
+            accessor_call_start: result.accessor_call_start,
+            accessor_call_end: result.accessor_call_end,
+            assignment_start: result.assignment_start,
+            assignment_end: result.assignment_end,
+            indirect_call_start: result.indirect_call_start,
+            indirect_call_end: result.indirect_call_end,
+            definite_accessor_result: result.definite_accessor_result,
+            cfg_write_free_path: result.cfg_write_free_path,
+            origin_allocation_start: origin.allocation_start,
+            origin_allocation_end: origin.allocation_end,
+            exact_key: proof.exact_key,
+        });
+    }
+    candidates.sort_by(|a, b| {
+        (
+            a.indirect_call_start,
+            a.accessor_call_start,
+            &a.table_binding,
+        )
+            .cmp(&(
+                b.indirect_call_start,
+                b.accessor_call_start,
+                &b.table_binding,
+            ))
+    });
+    candidates.dedup_by(|a, b| {
+        a.indirect_call_start == b.indirect_call_start
+            && a.accessor_call_start == b.accessor_call_start
+            && a.table_binding == b.table_binding
+    });
+    Ok(candidates)
 }
 
 fn fragment(source: &str, span: Span) -> String {
@@ -397,35 +534,11 @@ impl<'s> Analyzer<'s> {
         registry_path: &[String],
         origin: Option<&ProvenRegistryObjectOrigin>,
     ) -> String {
-        let mut binding = origin.map_or_else(
+        let binding = origin.map_or_else(
             || fragment(self.source, Span::new(receiver_start, receiver_end)),
-            |origin| {
-                format!(
-                    "origin@{}-{}:{}-{}",
-                    origin.allocation_start,
-                    origin.allocation_end,
-                    origin.constructor_start,
-                    origin.constructor_end
-                )
-            },
+            origin_prefix,
         );
-        for property in registry_path {
-            let identifier = property.chars().enumerate().all(|(index, character)| {
-                character == '_'
-                    || character == '$'
-                    || (index == 0 && character.is_ascii_alphabetic())
-                    || (index > 0 && character.is_ascii_alphanumeric())
-            });
-            if identifier {
-                binding.push('.');
-                binding.push_str(property);
-            } else {
-                binding.push('[');
-                binding.push_str(&format!("{property:?}"));
-                binding.push(']');
-            }
-        }
-        binding
+        append_registry_path(binding, registry_path)
     }
 
     fn record_forwarded_registry_call(&mut self, call: &CallExpression<'_>) {
@@ -1233,6 +1346,7 @@ impl<'s> Analyzer<'s> {
             handler_function_tables: self.tables,
             byte_transducers: self.transducers,
             table_vms,
+            lazy_registry_indirect_calls: Vec::new(),
         })
     }
 }
@@ -1308,39 +1422,58 @@ pub fn analyze(
         .with_check_syntax_error(true)
         .build(program);
     budget.checkpoint()?;
-    let (forwarded_calls, read_calls, forwarded_registry_origins, registry_read_origins) =
-        if semantic_ret.diagnostics.is_empty() {
-            let scoping = semantic_ret.semantic.scoping();
-            let forwarded_calls =
-                structurally_proven_registry_forwarding_calls(program, scoping, budget)?;
-            let read_calls = structurally_proven_registry_read_calls(program, scoping, budget)?;
-            let flow =
-                structurally_proven_runtime_origin_flow(program, &semantic_ret.semantic, budget)?;
-            let forwarded_registry_origins =
-                proven_origin_registry_handler_installs(program, scoping, &flow, budget)?
-                    .into_iter()
-                    .map(|proof| {
-                        (
-                            (proof.install.call_start, proof.install.call_end),
-                            proof.origin,
-                        )
-                    })
-                    .collect();
-            let registry_read_origins =
-                proven_origin_registry_read_calls(program, scoping, &flow, budget)?
-                    .into_iter()
-                    .map(|proof| ((proof.read.call_start, proof.read.call_end), proof.origin))
-                    .collect();
-            (
-                forwarded_calls,
-                read_calls,
-                forwarded_registry_origins,
-                registry_read_origins,
-            )
-        } else {
-            (Vec::new(), Vec::new(), HashMap::new(), HashMap::new())
-        };
+    let (
+        forwarded_calls,
+        read_calls,
+        forwarded_registry_origins,
+        registry_read_origins,
+        origin_read_proofs,
+    ) = if semantic_ret.diagnostics.is_empty() {
+        let scoping = semantic_ret.semantic.scoping();
+        let forwarded_calls =
+            structurally_proven_registry_forwarding_calls(program, scoping, budget)?;
+        let read_calls = structurally_proven_registry_read_calls(program, scoping, budget)?;
+        let flow =
+            structurally_proven_runtime_origin_flow(program, &semantic_ret.semantic, budget)?;
+        let forwarded_registry_origins =
+            proven_origin_registry_handler_installs(program, scoping, &flow, budget)?
+                .into_iter()
+                .map(|proof| {
+                    (
+                        (proof.install.call_start, proof.install.call_end),
+                        proof.origin,
+                    )
+                })
+                .collect();
+        let origin_read_proofs =
+            proven_origin_registry_read_calls(program, scoping, &flow, budget)?;
+        let registry_read_origins = origin_read_proofs
+            .iter()
+            .map(|proof| {
+                (
+                    (proof.read.call_start, proof.read.call_end),
+                    proof.origin.clone(),
+                )
+            })
+            .collect();
+        (
+            forwarded_calls,
+            read_calls,
+            forwarded_registry_origins,
+            registry_read_origins,
+            origin_read_proofs,
+        )
+    } else {
+        (
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+        )
+    };
     budget.checkpoint()?;
+    let read_proofs = read_calls.clone();
     let mut analyzer = Analyzer::new(
         source,
         budget,
@@ -1350,7 +1483,18 @@ pub fn analyze(
         registry_read_origins,
     );
     analyzer.visit_program(program);
-    analyzer.finish()
+    let mut analysis = analyzer.finish()?;
+    if semantic_ret.diagnostics.is_empty() {
+        analysis.lazy_registry_indirect_calls = collect_lazy_registry_indirect_calls(
+            program,
+            &semantic_ret.semantic,
+            &read_proofs,
+            &origin_read_proofs,
+            &analysis.handler_function_tables,
+            budget,
+        )?;
+    }
+    Ok(analysis)
 }
 
 /// Analyze handler tables while canonicalizing proven registry receivers by
@@ -1366,39 +1510,60 @@ pub fn analyze_with_registry_origins(
 ) -> Result<TableVmAnalysis, BudgetExceeded> {
     budget.checkpoint()?;
     let semantic_ret = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .with_cfg(true)
         .with_check_syntax_error(true)
         .build(program);
-    let (forwarded_calls, read_calls, forwarded_registry_origins, registry_read_origins) =
-        if semantic_ret.diagnostics.is_empty() {
-            let scoping = semantic_ret.semantic.scoping();
-            let forwarded_calls =
-                structurally_proven_registry_forwarding_calls(program, scoping, budget)?;
-            let read_calls = structurally_proven_registry_read_calls(program, scoping, budget)?;
-            let forwarded_registry_origins =
-                proven_origin_registry_handler_installs(program, scoping, install_flow, budget)?
-                    .into_iter()
-                    .map(|proof| {
-                        (
-                            (proof.install.call_start, proof.install.call_end),
-                            proof.origin,
-                        )
-                    })
-                    .collect();
-            let registry_read_origins =
-                proven_origin_registry_read_calls(program, scoping, read_flow, budget)?
-                    .into_iter()
-                    .map(|proof| ((proof.read.call_start, proof.read.call_end), proof.origin))
-                    .collect();
-            (
-                forwarded_calls,
-                read_calls,
-                forwarded_registry_origins,
-                registry_read_origins,
-            )
-        } else {
-            (Vec::new(), Vec::new(), HashMap::new(), HashMap::new())
-        };
+    let (
+        forwarded_calls,
+        read_calls,
+        forwarded_registry_origins,
+        registry_read_origins,
+        origin_read_proofs,
+    ) = if semantic_ret.diagnostics.is_empty() {
+        let scoping = semantic_ret.semantic.scoping();
+        let forwarded_calls =
+            structurally_proven_registry_forwarding_calls(program, scoping, budget)?;
+        let read_calls = structurally_proven_registry_read_calls(program, scoping, budget)?;
+        let forwarded_registry_origins =
+            proven_origin_registry_handler_installs(program, scoping, install_flow, budget)?
+                .into_iter()
+                .map(|proof| {
+                    (
+                        (proof.install.call_start, proof.install.call_end),
+                        proof.origin,
+                    )
+                })
+                .collect();
+        let origin_read_proofs =
+            proven_origin_registry_read_calls(program, scoping, read_flow, budget)?;
+        let registry_read_origins = origin_read_proofs
+            .iter()
+            .map(|proof| {
+                (
+                    (proof.read.call_start, proof.read.call_end),
+                    proof.origin.clone(),
+                )
+            })
+            .collect();
+        (
+            forwarded_calls,
+            read_calls,
+            forwarded_registry_origins,
+            registry_read_origins,
+            origin_read_proofs,
+        )
+    } else {
+        (
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            Vec::new(),
+        )
+    };
     budget.checkpoint()?;
+    let read_proofs = read_calls.clone();
     let mut analyzer = Analyzer::new(
         source,
         budget,
@@ -1408,7 +1573,18 @@ pub fn analyze_with_registry_origins(
         registry_read_origins,
     );
     analyzer.visit_program(program);
-    analyzer.finish()
+    let mut analysis = analyzer.finish()?;
+    if semantic_ret.diagnostics.is_empty() {
+        analysis.lazy_registry_indirect_calls = collect_lazy_registry_indirect_calls(
+            program,
+            &semantic_ret.semantic,
+            &read_proofs,
+            &origin_read_proofs,
+            &analysis.handler_function_tables,
+            budget,
+        )?;
+    }
+    Ok(analysis)
 }
 
 #[cfg(test)]
@@ -1496,6 +1672,55 @@ mod tests {
         assert_eq!(table.function_values, 4);
         assert_eq!(table.read_sites, 1);
         assert_eq!(table.dynamic_read_sites, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn lazy_accessor_indirect_call_requires_same_origin_and_write_free_path() -> TestResult {
+        let setup = r#"
+            function install(receiver, key, value) { receiver.T[key] = value; }
+            function read(receiver, key, cell) {
+                if (cell = receiver.T[key], cell === undefined) throw Error();
+                if (cell.value) return cell.create();
+                return (cell.create(key * key + 3), cell).prototype;
+            }
+            function C(key) {
+                install(this, 1, function a() {});
+                install(this, 2, function b() {});
+                install(this, 3, function c() {});
+                install(this, 4, function d() {});
+                return this.run(key);
+            }
+            C.prototype.run = function(key) {
+                let handler = read(this, key);
+                if (key > 0) handler();
+            };
+            new C(window.dynamicKey);
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, setup, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let analysis = analyze(setup, &parsed.program, &test_budget())
+            .test_value("positive lazy registry analysis")?;
+        let candidates = &analysis.lazy_registry_indirect_calls;
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].table_binding.starts_with("origin@"));
+        assert_eq!(candidates[0].table_handler_count, 4);
+        assert!(candidates[0].cfg_write_free_path);
+        assert!(analysis.table_vms.is_empty());
+
+        // The accessor's return cannot be the called value when overwritten
+        // on every path. A matching handler table elsewhere is insufficient.
+        let negative = setup.replace(
+            "if (key > 0) handler();",
+            "handler = unrelated; if (key > 0) handler();",
+        );
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, &negative, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let analysis = analyze(&negative, &parsed.program, &test_budget())
+            .test_value("overwritten lazy registry analysis")?;
+        assert!(analysis.lazy_registry_indirect_calls.is_empty());
         Ok(())
     }
 

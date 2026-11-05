@@ -34,6 +34,7 @@ pub struct EmbeddedScanReport {
     pub handler_function_tables: Vec<table_vm::DetailedHandlerTableCandidate>,
     pub byte_transducers: Vec<table_vm::ByteTransducerCandidate>,
     pub table_vms: Vec<table_vm::TableVmCandidate>,
+    pub lazy_registry_indirect_calls: Vec<table_vm::LazyRegistryIndirectCallCandidate>,
     pub functions: Vec<FunctionMetrics>,
     pub embedded: Vec<Self>,
 }
@@ -55,6 +56,7 @@ pub struct ScanReport {
     pub handler_function_tables: Vec<table_vm::DetailedHandlerTableCandidate>,
     pub byte_transducers: Vec<table_vm::ByteTransducerCandidate>,
     pub table_vms: Vec<table_vm::TableVmCandidate>,
+    pub lazy_registry_indirect_calls: Vec<table_vm::LazyRegistryIndirectCallCandidate>,
     pub functions: Vec<FunctionMetrics>,
     pub embedded: Vec<EmbeddedScanReport>,
 }
@@ -112,6 +114,7 @@ fn scan_embedded_candidate(
         handler_function_tables: core.handler_function_tables,
         byte_transducers: core.byte_transducers,
         table_vms: core.table_vms,
+        lazy_registry_indirect_calls: core.lazy_registry_indirect_calls,
         functions: core.functions,
         embedded,
     })
@@ -147,6 +150,7 @@ pub fn scan_source(
         handler_function_tables: core.handler_function_tables,
         byte_transducers: core.byte_transducers,
         table_vms: core.table_vms,
+        lazy_registry_indirect_calls: core.lazy_registry_indirect_calls,
         functions: core.functions,
         embedded,
     })
