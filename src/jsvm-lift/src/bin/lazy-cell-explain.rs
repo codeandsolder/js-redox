@@ -2,6 +2,7 @@ use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use jsvm_lift::{
     forwarding_semantics::structurally_proven_lazy_registry_read_calls,
+    function_surface::analyze_function_source_surface,
     lazy_cell::{
         proven_slow_lazy_cell_captured_handler_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
@@ -18,6 +19,7 @@ use jsvm_lift::{
 use jsvm_lift::{js_format::format_source, safe_deob::SourceMode, sha256_hex};
 use oxc_allocator::Allocator;
 use oxc_semantic::SemanticBuilder;
+use oxc_span::Span;
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use serde_json::json;
@@ -193,9 +195,25 @@ fn main() -> Result<()> {
     }
     captured_handlers.sort();
     captured_handlers.dedup();
+
+    // Source behavior annotations are deliberately independent of the proof
+    // that the original function is captured or ever executed. All nested
+    // effects are tagged with their lexical function depth.
+    let mut handler_surfaces = Vec::new();
+    for capture in &captured_handlers {
+        budget.consume(1)?;
+        let [start, end] = capture.handler;
+        let surface =
+            analyze_function_source_surface(&source, semantic, Span::new(start, end), &budget)?
+                .with_context(|| {
+                    format!("handler source is not an exact unique function at {start}..{end}")
+                })?;
+        handler_surfaces.push(surface);
+    }
+
     let source_sha256 = sha256_hex(source.as_bytes());
     let report = json!({
-        "schema": "jsvm-lazy-cell-proof/v1",
+        "schema": "jsvm-lazy-cell-proof/v2",
         "input": args.input,
         "source_sha256": source_sha256,
         "source_bytes": source.len(),
@@ -211,6 +229,9 @@ fn main() -> Result<()> {
         "registry_bindings_count":with_registry.len(),"registry_bindings":with_registry,
         "update_state_count":with_update.len(),"update_state":with_update,
         "captured_handler_count":captured_handlers.len(), "captured_handlers":captured_handlers,
+        "handler_source_surfaces": captured_handlers.iter().zip(&handler_surfaces)
+            .map(|(capture, surface)| json!({"exact_key": capture.exact_key, "surface":surface}))
+            .collect::<Vec<_>>(),
         "exact_assignment_count":exact.len(),"exact_assignments":exact,
         "lazy_read_count":reads.len(),"origin_handler_installs_count":installs.len(),
         "phase_binding_mutation_audits": phase_mutation_audits,
@@ -219,6 +240,7 @@ fn main() -> Result<()> {
             "No assertion that an indirect call executed or a selected branch was taken.",
             "No proof of registry-slot persistence from installation to read.",
             "No proof that a lazy-cell returned the captured original handler at a particular runtime phase.",
+            "Function-surface evidence includes non-executed branches and nested closures; syntax is not observed behavior.",
             "Source spans refer to the exact SHA-256 input, not the formatted view."
         ]
     });
@@ -251,15 +273,33 @@ Readable files are views, not executable devirtualizations.
 See the phase binding mutation audits in analysis.json before asserting an interpreter phase.
 A syntactically unique assignment is not sufficient when direct eval can reach the binding.
 
-| Exact key | Handler function | Original source bytes | Factory call bytes |
-|---:|---|---|---|
+Source behavior inventories show syntactic call sites, external lexical references,
+and possible effects for every recovered function. The exact original source spans
+are retained; nested closures are marked by lexical depth, not treated as executed.
+For the complete evidence, see the per-handler evidence JSON files and analysis.json.
+
+| Exact key | Handler function | Evidence | Direct eval sites (including nested) | External bindings | Original source bytes | Factory call bytes |
+|---:|---|---|---:|---:|---|---|
 "#,
     );
     let mut written = std::collections::BTreeSet::new();
-    for capture in &captured_handlers {
+    for (capture, surface) in captured_handlers.iter().zip(&handler_surfaces) {
         budget.consume(1)?;
         let [start, end] = capture.handler;
         let name = format!("key-{}-source-{}-{}.js", capture.exact_key, start, end);
+        let evidence_name = format!(
+            "key-{}-source-{}-{}-evidence.json",
+            capture.exact_key, start, end
+        );
+        let eval_sites = surface
+            .effects
+            .iter()
+            .filter(|effect| effect.kind == "direct_eval_candidate")
+            .count();
+        fs::write(
+            handlers_dir.join(&evidence_name),
+            serde_json::to_vec_pretty(surface)?,
+        )?;
         if written.insert(name.clone()) {
             let source_code = source
                 .get(start as usize..end as usize)
@@ -274,8 +314,16 @@ A syntactically unique assignment is not sufficient when direct eval can reach t
             fs::write(handlers_dir.join(&name), format!("{header}{readable}"))?;
         }
         index.push_str(&format!(
-            "| {} | [view](handlers/{}) | {}..{} | {}..{} |\n",
-            capture.exact_key, name, start, end, capture.factory_call[0], capture.factory_call[1]
+            "| {} | [view](handlers/{}) | [evidence](handlers/{}) | {} | {} | {}..{} | {}..{} |\n",
+            capture.exact_key,
+            name,
+            evidence_name,
+            eval_sites,
+            surface.external_references.len(),
+            start,
+            end,
+            capture.factory_call[0],
+            capture.factory_call[1]
         ));
     }
     fs::write(args.output.join("README.md"), index)?;
