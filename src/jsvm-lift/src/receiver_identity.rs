@@ -7509,6 +7509,12 @@ mod tests {
                 true,
             ),
             (
+                "function nested(phase, source) { return eval(source); }",
+                true,
+                0,
+                true,
+            ),
+            (
                 "phase = function altered() { return 50; };",
                 false,
                 0,
