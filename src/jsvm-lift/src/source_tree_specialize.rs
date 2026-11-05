@@ -7,13 +7,13 @@
 use anyhow::{ensure, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, BindingPattern, CallExpression, Expression, IdentifierReference, Statement,
+    Argument, BindingPattern, CallExpression, Expression, Function, IdentifierReference, Statement,
     WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
-use oxc_syntax::{operator::UnaryOperator, symbol::SymbolId};
+use oxc_syntax::{operator::UnaryOperator, scope::ScopeFlags, symbol::SymbolId};
 use rolldown_redox::ecmascript::parse_program;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -144,11 +144,15 @@ struct ParameterReferences<'s> {
     target: BTreeMap<SymbolId, String>,
     edits: Vec<(Span, String)>,
     unsafe_dynamic_scope: bool,
+    // Nested ordinary functions own a distinct arguments object. Arrows
+    // inherit the nearest enclosing non-arrow function's binding.
+    // The initial helper function is at depth one.
+    ordinary_function_depth: usize,
 }
 
 impl<'a> Visit<'a> for ParameterReferences<'_> {
     fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
-        if matches!(id.name.as_str(), "eval" | "arguments") {
+        if id.name == "eval" || (id.name == "arguments" && self.ordinary_function_depth <= 1) {
             self.unsafe_dynamic_scope = true;
         }
         if let Some(symbol) = id
@@ -164,6 +168,12 @@ impl<'a> Visit<'a> for ParameterReferences<'_> {
 
     fn visit_with_statement(&mut self, _statement: &WithStatement<'a>) {
         self.unsafe_dynamic_scope = true;
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        self.ordinary_function_depth += 1;
+        walk::walk_function(self, function, flags);
+        self.ordinary_function_depth -= 1;
     }
 }
 
@@ -199,6 +209,7 @@ pub fn specialize_function(source: &str, constants: &[(usize, String)]) -> Resul
         target: replacements,
         edits: Vec::new(),
         unsafe_dynamic_scope: false,
+        ordinary_function_depth: 0,
     };
     visitor.visit_program(&parsed.program);
     if visitor.unsafe_dynamic_scope || visitor.edits.is_empty() {
@@ -291,6 +302,27 @@ mod tests {
         assert!(output.contains("const f=(Q)=>Q+1"));
         assert!(!output.contains("return Q*2"));
         assert!(output.contains("return (16)*2"));
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_arguments_of_nested_ordinary_function_but_not_arrow() -> Result<()> {
+        let own_arguments =
+            "const M=function(selector,value){const nested=function(){return arguments[0];};return selector+nested(value);};";
+        let fixed = specialize_function(own_arguments, &[(0, "68".into())])?
+            .ok_or_else(|| anyhow!("nested arguments should not alias outer parameters"))?;
+        assert!(fixed.contains("return (68)+nested(value)"), "{fixed}");
+        assert!(fixed.contains("return arguments[0]"), "{fixed}");
+
+        let inherited_arguments =
+            "const M=function(selector){const nested=()=>arguments[0];return selector+nested();};";
+        assert!(specialize_function(inherited_arguments, &[(0, "68".into())])?.is_none());
+
+        // A nested direct eval can still resolve or modify an enclosing
+        // function parameter. Preserve the previous dynamic-scope veto.
+        let nested_eval =
+            "const M=function(selector){const nested=function(){eval('selector=9')};return selector+nested();};";
+        assert!(specialize_function(nested_eval, &[(0, "68".into())])?.is_none());
         Ok(())
     }
 

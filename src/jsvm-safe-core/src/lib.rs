@@ -11,6 +11,7 @@ mod pure_function;
 mod rewrite;
 mod selector;
 mod string_exposure;
+mod trivial_loops;
 mod value_eval;
 
 pub use browser_legacy::{
@@ -1071,6 +1072,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
+        if let Some(text) = trivial_loops::single_iteration_for(it, self.source) {
+            self.push(it.span, text, "single_iteration_for");
+            return;
+        }
         if let Some(text) = if_ladder_structure::reconstruct_for(it, self.source) {
             self.push(it.span, text, "if_ladder_structured");
             return;
@@ -1091,6 +1096,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_while_statement(&mut self, it: &oxc_ast::ast::WhileStatement<'a>) {
+        if let Some(text) = trivial_loops::never_entered_while(it) {
+            self.push(it.span, text, "never_entered_loop");
+            return;
+        }
         if let Some(text) = self.ordered_switch_while_replacement(it) {
             self.push(it.span, text, "ordered_switch_unflatten");
             return;
@@ -1116,6 +1125,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_expression_statement(&mut self, it: &ExpressionStatement<'a>) {
+        if trivial_loops::inert_literal_statement(&it.expression) {
+            self.push(it.span, String::new(), "remove_inert_literal_statement");
+            return;
+        }
         if self.dead_numeric_assignment(&it.expression) {
             self.push(it.span, ";".to_owned(), "dead_numeric_state_write");
             return;
