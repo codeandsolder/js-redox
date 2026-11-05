@@ -76,7 +76,21 @@ try {
   assert.ok(hit.expressions.some((row) => row.expression === "handler" &&
     row.value?.type === "function"), "expected handler value observation");
   assert.ok(hit.expressions.some((row) => row.expression === "handler === registry[opcode]" && row.value?.value === true), "handler identity must match registry slot");
-  console.log("PASS: live Chrome breakpoint records opcode 34, handler, source SHA and call stack");
+  const handlerDefinition = hit.expressions.find((row) => row.expression === "handler")?.value?.functionDefinition;
+  const registryDefinition = hit.expressions.find((row) => row.expression === "registry[opcode]")?.value?.functionDefinition;
+  const scopeDefinition = hit.scopes.flatMap((scope) => scope.variables)
+    .find((variable) => variable.name === "handler")?.value?.functionDefinition;
+  assert.ok(handlerDefinition, "inspector did not provide handler [[FunctionLocation]]");
+  assert.equal(handlerDefinition.scriptId, hit.frames[0].location.scriptId);
+  assert.equal(handlerDefinition.lineNumber, 0);
+  assert.ok(Number.isSafeInteger(handlerDefinition.columnNumber));
+  assert.deepEqual(registryDefinition, handlerDefinition,
+    "the two observed functions should resolve to the same code definition");
+  assert.deepEqual(scopeDefinition, handlerDefinition,
+    "the handler local must resolve to the same code definition");
+  assert.equal(hit.frames[0].functionLocation?.scriptId, hit.frames[0].location.scriptId);
+
+  console.log("PASS: live Chrome captured opcode 34, registry-selected handler, exact definition and call stack");
   console.log("capture: " + output);
 } finally {
   await new Promise((resolve) => server.close(resolve));

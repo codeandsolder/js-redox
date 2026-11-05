@@ -7,7 +7,11 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+    path::Path,
+};
 
 fn fence(value: &str, language: &str) -> String {
     let longest = value.split(|ch| ch != '~').map(str::len).max().unwrap_or(0);
@@ -114,6 +118,125 @@ fn runtime_identity_index(runtime: &Value) -> RuntimeIdentityIndex {
         }
     }
     found
+}
+
+/// Group source definitions by exact script and original coordinate, not by
+/// display name or inspector handle. Multiple function objects may share one
+/// definition site; observations remain separate from reference equality.
+fn append_observed_callable_definitions(
+    page: &mut String,
+    project: &Path,
+    identities: &RuntimeIdentityIndex,
+    session: &str,
+    hit: &Value,
+) -> Result<()> {
+    let mut sites = BTreeMap::<(String, String, u64, u64), Vec<Value>>::new();
+    let mut add = |value: &Value, seen_as: Value| {
+        let Some(definition) = value.get("functionDefinition") else {
+            return;
+        };
+        if definition.get("source_identity").and_then(Value::as_str) != Some("exact") {
+            return;
+        }
+        let Some(script) = definition.get("scriptId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(sha) = definition.get("sourceSha256").and_then(verified_sha) else {
+            return;
+        };
+        let (Some(line), Some(column)) = (
+            definition.get("lineNumber").and_then(Value::as_u64),
+            definition.get("columnNumber").and_then(Value::as_u64),
+        ) else {
+            return;
+        };
+        if identities
+            .get(&(session.to_owned(), script.to_owned()))
+            .and_then(Option::as_ref)
+            .is_none_or(|identity| identity.sha256 != sha)
+        {
+            return;
+        }
+        sites
+            .entry((script.to_owned(), sha.to_owned(), line, column))
+            .or_default()
+            .push(seen_as);
+    };
+    for scope in hit
+        .get("scopes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for variable in scope
+            .get("variables")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            add(
+                &variable["value"],
+                json!({
+                    "kind":"scope",
+                    "scope_type":scope.get("type"),
+                    "variable":variable.get("name"),
+                }),
+            );
+        }
+    }
+    for expression in hit
+        .get("expressions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if expression.get("status").and_then(Value::as_str) != Some("observed") {
+            continue;
+        }
+        add(
+            &expression["value"],
+            json!({
+                "kind":"expression", "expression":expression.get("expression")
+            }),
+        );
+    }
+    if sites.is_empty() {
+        return Ok(());
+    }
+    page.push_str("## Verified observed callable definitions\n\n");
+    page.push_str("These are source definitions of function values **observed at this pause**, not proof that a function was called or is selected for every input.\n\n");
+    for ((script, sha, line, column), seen_as) in sites {
+        let location = identities
+            .get(&(session.to_owned(), script.clone()))
+            .and_then(Option::as_ref)
+            .context("missing verified runtime source location")?;
+        let raw_path = format!("resources/runtime-scripts/{sha}.js");
+        let bytes = fs::read(project.join(&raw_path))
+            .with_context(|| format!("missing original callable definition source {sha}"))?;
+        if sha256_hex(&bytes) != sha {
+            bail!("original callable definition hash mismatch: {sha}");
+        }
+        let source = String::from_utf8(bytes)
+            .with_context(|| format!("non-UTF8 callable definition source: {sha}"))?;
+        page.push_str(&format!(
+            "### V8 script {script}, original line {}, column {} (1-based)\n\n",
+            line.saturating_add(1),
+            column.saturating_add(1),
+        ));
+        page.push_str(&format!(
+            "Source SHA-256: **{sha}**. [Original code](../../../resources/runtime-scripts/{sha}.js).\n\n"
+        ));
+        let readable = format!("src/_readable/runtime-scripts/{sha}.js");
+        if project.join(&readable).is_file() {
+            page.push_str(&format!("[Shared readable code](../../../{readable}) — original V8 coordinates do not apply to transformed code.\n\n"));
+        }
+        page.push_str("Observed references to this **definition site**:\n\n");
+        page.push_str(&display_json(&json!(seen_as))?);
+        page.push('\n');
+        page.push_str(&source_excerpt(&source, line, location.start_line));
+        page.push('\n');
+    }
+    Ok(())
 }
 
 /// Render every recorded invocation, including unresolved frames, without
@@ -270,6 +393,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                 view.push('\n');
             }
         }
+        append_observed_callable_definitions(&mut view, project, &identities, &session, hit)?;
         view.push_str("## Observed bindings and expression results\n\n");
         view.push_str("Only values captured at this pause. Expressions were requested with side-effect checks; rejected or unavailable evaluations are not facts.\n\n");
         view.push_str(&display_json(&json!({
@@ -355,7 +479,12 @@ mod tests {
                     {"functionName":"dispatch","location":{"scriptId":"6","lineNumber":2,"columnNumber":2},
                      "sourceSha256":digest,"source_identity":"exact"},
                     {"location":{"scriptId":"missing","lineNumber":42},"source_identity":"unresolved"},
-                ],"scopes":[{"type":"local","variables":[{"name":"opcode","value":{"type":"number","value":34}}]}],
+                ],"scopes":[{"type":"local","variables":[
+                    {"name":"opcode","value":{"type":"number","value":34}},
+                    {"name":"handler","value":{"type":"function","functionDefinition":{
+                        "scriptId":"6","lineNumber":0,"columnNumber":9,
+                        "sourceSha256":digest,"source_identity":"exact"}}}
+                ]}],
                 "expressions":[{"expression":"handler === registry[opcode]","status":"observed",
                     "value":{"type":"boolean","value":true}}]}]
             }),
@@ -369,6 +498,10 @@ mod tests {
         assert!(page.contains("handler === registry[opcode]"));
         assert!(page.contains("Raw recorded code"));
         assert!(page.contains("Source identity **unresolved**"));
+        assert!(page.contains("Verified observed callable definitions"));
+        assert!(page.contains("original line 1, column 10"));
+        assert!(page.contains("function dispatch(opcode)"));
+
         let trace = load_artifact(project, SELECTIVE_TRACE, false)?.context("trace")?;
         assert_eq!(
             trace["hits"][0]["readable_view_path"],

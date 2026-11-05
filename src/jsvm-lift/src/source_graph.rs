@@ -155,6 +155,60 @@ fn optional_artifact(
     Ok(load_artifact(project, spec, true)?.unwrap_or(fallback))
 }
 
+/// Connect an inspector-observed function value to its precise definition
+/// only after the importer verified session + script ID + captured source hash.
+/// Definition identity is not proof that the call was executed.
+fn add_observed_callable_definition(
+    graph: &mut GraphBuilder,
+    runtime_nodes: &BTreeMap<(String, String), String>,
+    invocation_id: &str,
+    session: &str,
+    value: &Value,
+    observed_as: &str,
+    label: &str,
+) -> Result<()> {
+    let Some(definition) = value.get("functionDefinition") else {
+        return Ok(());
+    };
+    if nonempty_string_field(definition, "source_identity") != Some("exact") {
+        return Ok(());
+    }
+    let Some(script_id) = nonempty_string_field(definition, "scriptId") else {
+        return Ok(());
+    };
+    let Some(sha) = nonempty_string_field(definition, "sourceSha256") else {
+        return Ok(());
+    };
+    let (Some(line), Some(column)) = (
+        u64_field(definition, "lineNumber"),
+        u64_field(definition, "columnNumber"),
+    ) else {
+        return Ok(());
+    };
+    let expected = format!("runtime:{}", &sha[..sha.len().min(20)]);
+    if runtime_nodes.get(&(session.to_owned(), script_id.to_owned())) != Some(&expected) {
+        return Ok(());
+    }
+    graph.add_edge(
+        &expected,
+        invocation_id,
+        "observed_callable_definition",
+        json!({
+            "observed_as": observed_as,
+            "observed_label": label,
+            "cdp_session":session,
+            "script_id":script_id,
+            "source_sha256":sha,
+            "line_number":line,
+            "column_number":column,
+            "identity_basis":"inspector_internal_function_location_and_exact_runtime_source",
+            "concrete_observation_only":true,
+            "not_call_proof":true
+        }),
+    )?;
+    Ok(())
+}
+
 pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<SourceGraphSummary> {
     let budget = budgets.operation(
         AnalysisOperation::SourceGraph,
@@ -697,6 +751,42 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                     "concrete_observation_only":true,
                 }),
             )?;
+        }
+        for scope in array_field(hit, "scopes") {
+            budget.checkpoint()?;
+            let scope_type = nonempty_string_field(scope, "type").unwrap_or("unknown");
+            for variable in array_field(scope, "variables") {
+                budget.checkpoint()?;
+                let label = nonempty_string_field(variable, "name").unwrap_or("");
+                if let Some(value) = variable.get("value") {
+                    add_observed_callable_definition(
+                        &mut graph,
+                        &runtime_node_by_instance,
+                        &node_id,
+                        session,
+                        value,
+                        scope_type,
+                        label,
+                    )?;
+                }
+            }
+        }
+        for expression in array_field(hit, "expressions") {
+            budget.checkpoint()?;
+            if nonempty_string_field(expression, "status") != Some("observed") {
+                continue;
+            }
+            if let Some(value) = expression.get("value") {
+                add_observed_callable_definition(
+                    &mut graph,
+                    &runtime_node_by_instance,
+                    &node_id,
+                    session,
+                    value,
+                    "expression",
+                    nonempty_string_field(expression, "expression").unwrap_or(""),
+                )?;
+            }
         }
     }
     // Runtime-observed WASM requests are capture evidence, not universal static control flow.

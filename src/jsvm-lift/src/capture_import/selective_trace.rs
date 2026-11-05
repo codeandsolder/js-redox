@@ -7,6 +7,45 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs, path::Path};
 
+/// Verify an inspector-provided definition against the captured script
+/// inventory. This proves the code location of one observed function value,
+/// not that the function was invoked or selected for every possible input.
+fn verify_function_definition(
+    value: &mut Value,
+    session: &str,
+    identities: &HashMap<(String, String), Option<String>>,
+    verified: &mut u64,
+    unresolved: &mut u64,
+) {
+    let Some(definition) = value.get_mut("functionDefinition") else {
+        return;
+    };
+    let script = definition.get("scriptId").and_then(Value::as_str);
+    let evidence = definition.get("evidence").and_then(Value::as_str);
+    let line = definition.get("lineNumber").and_then(Value::as_u64);
+    let column = definition.get("columnNumber").and_then(Value::as_u64);
+    let exact = (|| {
+        if evidence != Some("Runtime.getProperties.internalProperties.[[FunctionLocation]]")
+            || line.is_none()
+            || column.is_none()
+        {
+            return None;
+        }
+        let script = script?;
+        identities
+            .get(&(session.to_owned(), script.to_owned()))
+            .and_then(Option::as_deref)
+    })();
+    if let Some(sha) = exact {
+        definition["source_identity"] = json!("exact");
+        definition["sourceSha256"] = json!(sha);
+        *verified += 1;
+    } else {
+        definition["source_identity"] = json!("unresolved");
+        *unresolved += 1;
+    }
+}
+
 pub(super) fn import_selective_trace(
     capture: &Path,
     project: &Path,
@@ -63,6 +102,8 @@ pub(super) fn import_selective_trace(
     }
     let mut verified = 0_u64;
     let mut unresolved = 0_u64;
+    let mut verified_definitions = 0_u64;
+    let mut unresolved_definitions = 0_u64;
     let hits = trace
         .get_mut("hits")
         .and_then(Value::as_array_mut)
@@ -96,10 +137,57 @@ pub(super) fn import_selective_trace(
                 unresolved += 1;
             }
         }
+        for scope in hit
+            .get_mut("scopes")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            budget.consume(1)?;
+            for variable in scope
+                .get_mut("variables")
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                budget.consume(1)?;
+                if let Some(value) = variable.get_mut("value") {
+                    verify_function_definition(
+                        value,
+                        &session,
+                        &identities,
+                        &mut verified_definitions,
+                        &mut unresolved_definitions,
+                    );
+                }
+            }
+        }
+        for expression in hit
+            .get_mut("expressions")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            budget.consume(1)?;
+            if expression.get("status").and_then(Value::as_str) != Some("observed") {
+                continue;
+            }
+            if let Some(value) = expression.get_mut("value") {
+                verify_function_definition(
+                    value,
+                    &session,
+                    &identities,
+                    &mut verified_definitions,
+                    &mut unresolved_definitions,
+                );
+            }
+        }
     }
     trace["schema"] = json!(SELECTIVE_TRACE.schema);
     trace["summary"]["verifiedSourceFrames"] = json!(verified);
     trace["summary"]["unresolvedSourceFrames"] = json!(unresolved);
+    trace["summary"]["verifiedFunctionDefinitions"] = json!(verified_definitions);
+    trace["summary"]["unresolvedFunctionDefinitions"] = json!(unresolved_definitions);
     write_artifact(project, SELECTIVE_TRACE, &trace)?;
     Ok(())
 }
@@ -134,6 +222,23 @@ mod tests {
                     {"location":{"scriptId":"6"},"sourceSha256":"abc"},
                     {"location":{"scriptId":"6"},"sourceSha256":"other"},
                     {"location":{"scriptId":"8"},"sourceSha256":"abc"}
+                ], "scopes":[{"type":"local","variables":[
+                    {"name":"handler","value":{"type":"function","functionDefinition":{
+                        "scriptId":"6","lineNumber":0,"columnNumber":21,
+                        "evidence":"Runtime.getProperties.internalProperties.[[FunctionLocation]]"}}},
+                    {"name":"ambiguous","value":{"type":"function","functionDefinition":{
+                        "scriptId":"8","lineNumber":0,"columnNumber":0,
+                        "evidence":"Runtime.getProperties.internalProperties.[[FunctionLocation]]"}}}
+                ]}], "expressions":[
+                    {"expression":"handler","status":"observed","value":{"type":"function",
+                        "functionDefinition":{"scriptId":"6","lineNumber":0,"columnNumber":21,
+                        "evidence":"Runtime.getProperties.internalProperties.[[FunctionLocation]]"}}},
+                    {"expression":"ignored","status":"evaluation_rejected","value":{"type":"function",
+                        "functionDefinition":{"scriptId":"6","lineNumber":0,"columnNumber":0,
+                        "evidence":"Runtime.getProperties.internalProperties.[[FunctionLocation]]"}}},
+                    {"expression":"fabricated","status":"observed","value":{"type":"function",
+                        "functionDefinition":{"scriptId":"6","lineNumber":0,"columnNumber":0,
+                        "evidence":"unsupported"}}}
                 ]}]
             }))?,
         )?;
@@ -142,6 +247,28 @@ mod tests {
         assert_eq!(result["summary"]["verifiedSourceFrames"], 1);
         assert_eq!(result["summary"]["unresolvedSourceFrames"], 2);
         assert_eq!(result["hits"][0]["frames"][0]["source_identity"], "exact");
+        assert_eq!(result["summary"]["verifiedFunctionDefinitions"], 2);
+        assert_eq!(result["summary"]["unresolvedFunctionDefinitions"], 2);
+        assert_eq!(
+            result["hits"][0]["scopes"][0]["variables"][0]["value"]["functionDefinition"]
+                ["source_identity"],
+            "exact"
+        );
+        assert_eq!(
+            result["hits"][0]["scopes"][0]["variables"][0]["value"]["functionDefinition"]
+                ["sourceSha256"],
+            "abc"
+        );
+        assert_eq!(
+            result["hits"][0]["scopes"][0]["variables"][1]["value"]["functionDefinition"]
+                ["source_identity"],
+            "unresolved"
+        );
+        assert!(
+            result["hits"][0]["expressions"][0]["value"]["functionDefinition"]["sourceSha256"]
+                .as_str()
+                .is_some()
+        );
         Ok(())
     }
 }
