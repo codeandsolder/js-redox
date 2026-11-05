@@ -149,7 +149,8 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
     );
     let budgets = AnalysisBudgets::standard("deobfuscate-safe-source-tree");
     let mut total_transforms = BTreeMap::<String, usize>::new();
-    let mut changed = 0usize;
+    let mut semantically_changed = 0usize;
+    let mut presentation_only = 0usize;
     let mut failed = 0usize;
     let mut rows = Vec::new();
     let mut md = String::from("# Reconstructed JavaScript source tree\n\n");
@@ -191,17 +192,16 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             Option<String>,
         ) = match result {
             Ok(outcome) => {
-                if outcome.report.changed {
-                    changed += 1;
-                }
                 let had_semantic_rewrite = outcome
                     .report
                     .transforms
                     .iter()
                     .any(|(kind, count)| kind != "presentation_codegen" && *count > 0);
                 let status = if had_semantic_rewrite {
+                    semantically_changed += 1;
                     "transformed"
                 } else if outcome.report.changed {
+                    presentation_only += 1;
                     "formatted"
                 } else {
                     "unchanged"
@@ -237,7 +237,8 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
     let summary = json!({
         "schema": "jsvm-source-tree-reconstruction/v1",
         "source_count": rows.len(),
-        "changed_count": changed,
+        "semantically_changed_count": semantically_changed,
+        "presentation_only_count": presentation_only,
         "unrecovered_count": failed,
         "transforms": total_transforms,
         "files": rows,
@@ -252,7 +253,8 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
         "{}",
         json!({
             "source_count": summary["source_count"],
-            "changed_count": changed,
+            "semantically_changed_count": semantically_changed,
+        "presentation_only_count": presentation_only,
             "unrecovered_count": failed,
             "transforms": summary["transforms"],
             "output": out.display().to_string(),
@@ -365,6 +367,8 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(output.join("reconstruction.json"))?)?;
         assert_eq!(index["source_count"], 2);
         assert_eq!(index["unrecovered_count"], 0);
+        assert_eq!(index["semantically_changed_count"], 1);
+        assert_eq!(index["presentation_only_count"], 0);
         assert!(index["transforms"]["if_ladder_structured"]
             .as_u64()
             .is_some());
