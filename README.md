@@ -46,6 +46,10 @@ For source files whose structural scan reports a lazy-registry indirect-call can
   --output work/lazy-cell-explained
 ```
 
+For any JavaScript file, the standalone source-surface command lists exact original-function byte spans when called with only a path. Add one or more --function START:END arguments to inspect calls, external references, member writes, direct eval candidates, dynamic imports, and nested lexical depth for those functions. This is an opt-in and source-independent syntactic inventory, not a runtime-effects analysis; all event offsets are SHA-256-bound to the input. Usage: cargo +1.99.1 run --locked -p jsvm-lift --bin source-surface -- path/to/code.js [--function START:END].
+
+The analyst-facing handler project also emits a generic, source-mapped behavior inventory for every captured function: exact call expressions, member writes, potential direct eval/Function constructors, dynamic imports, nested-function depths, and external lexical references with resolved declaration identities. The per-handler evidence JSON is explicitly syntactic, not proof of executed effects. This makes exact handler-key attribution and cross-file navigation possible without executing untrusted code.
+
 The separate research-grade `lazy-resolver-probe` example can derive *possible* phase values from proven prototype-method phase closures and check each exact handler capture against independently proven state-field, prototype-carrier, and resolver-index semantics. It is intentionally opt-in and keeps its output distinct from the source project:
 
 ```sh

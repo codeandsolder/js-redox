@@ -12,6 +12,7 @@ pub mod decoder;
 pub mod dispatch;
 pub mod embedded;
 pub mod function_analysis;
+pub mod function_surface;
 pub mod scan_report;
 pub mod scanner;
 pub mod source_text;
