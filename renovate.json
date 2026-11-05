@@ -86,6 +86,19 @@
       ],
       "groupName": "Rust toolchain",
       "automerge": false
+    },
+    {
+      "description": "Trusted shared CI/strict policy updates bypass ordinary release age but never inherit broad automerge rules",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "/^codeandsolder\\/(?:ci-workflows|rust-skills2)(?:\\/|$)/"
+      ],
+      "minimumReleaseAge": null,
+      "groupName": "Shared CI trust roots",
+      "groupSlug": "shared-ci-trust-roots",
+      "automerge": false
     }
   ],
   "customManagers": [
