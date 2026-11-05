@@ -394,7 +394,13 @@ mod tests {
         );
 
         // A side-effect-checked value alone is not a witnessed taken arm.
-        let none = observe(project, &identities, "main", std::slice::from_ref(&guard), &budget)?;
+        let none = observe(
+            project,
+            &identities,
+            "main",
+            std::slice::from_ref(&guard),
+            &budget,
+        )?;
         assert!(none[0]["next_pause_in_selected_arm"].is_null());
 
         // Inspector expressions unrelated to the actual AST test are not guards.
