@@ -19,6 +19,7 @@ pub mod scanner;
 pub mod source_text;
 pub mod state_flatten;
 pub mod static_calls;
+pub mod static_module_graph;
 pub mod string_recovery;
 pub mod symbolic_integer;
 pub mod table_vm;
