@@ -7537,10 +7537,8 @@ mod tests {
 
     #[test]
     fn phase_binding_audit_distinguishes_lexical_eval_and_explicit_writes() -> TestResult {
-        use super::{
-            audit_prototype_method_phase_binding_mutation,
-            structurally_proven_prototype_method_phase_closures,
-        };
+        use super::structurally_proven_prototype_method_phase_closures;
+        use crate::lexical_mutation::audit_lexical_binding_mutation;
 
         // The other IIFE has a same-name binding but cannot mutate ours.
         // A nested eval in our IIFE *can*, even though Oxc sees only the
@@ -7599,19 +7597,20 @@ mod tests {
                 &test_budget(),
             ));
             assert_eq!(closures.len(), 1, "case: {injected}");
-            let audit = test_proof(audit_prototype_method_phase_binding_mutation(
+            let audit = test_proof(audit_lexical_binding_mutation(
                 &semantic.semantic,
-                &closures[0],
+                closures[0].phase_binding_symbol,
+                Span::new(
+                    closures[0].phase_assignment_start,
+                    closures[0].phase_assignment_end,
+                ),
                 &test_budget(),
             ));
             assert_eq!(
                 audit.source_mutation_isolated, expected_isolated,
                 "{injected}"
             );
-            assert_eq!(
-                audit.unique_initialization_write, expected_unique,
-                "{injected}"
-            );
+            assert_eq!(audit.unique_expected_write, expected_unique, "{injected}");
             assert_eq!(
                 audit.lexical_direct_eval_calls.len(),
                 expected_eval,
