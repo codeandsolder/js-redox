@@ -10,8 +10,8 @@ use jsvm_lift::{
         proven_slow_lazy_cell_update_state, structurally_compatible_slow_lazy_cell_read,
         structurally_proven_slow_lazy_cell_factory_shapes, SlowLazyCellResolverIndexFacts,
     },
+    lexical_mutation::audit_lexical_binding_mutation,
     receiver_identity::{
-        audit_prototype_method_phase_binding_mutation,
         structurally_proven_prototype_method_phase_closures,
         structurally_proven_runtime_origin_flow,
     },
@@ -57,14 +57,25 @@ fn main() -> Result<()> {
         structurally_proven_prototype_method_phase_closures(&parsed.program, scoping, &budget)?;
     let mut phase_binding_mutation_audits = Vec::new();
     for closure in &phase_closures {
-        let audit = audit_prototype_method_phase_binding_mutation(semantic, closure, &budget)?;
+        let audit = audit_lexical_binding_mutation(
+            semantic,
+            closure.phase_binding_symbol,
+            Span::new(closure.phase_assignment_start, closure.phase_assignment_end),
+            &budget,
+        )?;
         phase_binding_mutation_audits.push(json!({
             "phase_assignment":[closure.phase_assignment_start,closure.phase_assignment_end],
-            "unique_initialization_write":audit.unique_initialization_write,
+            "unique_expected_write":audit.unique_expected_write,
             "lexical_direct_eval_calls":audit.lexical_direct_eval_calls.iter()
-                .map(|span|[span.start,span.end]).collect::<Vec<_>>(),
+                .map(|site|json!({
+                    "span":[site.span.start,site.span.end],
+                    "enclosing_function":site.enclosing_function.map(|span|[span.start,span.end])
+                })).collect::<Vec<_>>(),
             "lexical_with_statements":audit.lexical_with_statements.iter()
-                .map(|span|[span.start,span.end]).collect::<Vec<_>>(),
+                .map(|site|json!({
+                    "span":[site.span.start,site.span.end],
+                    "enclosing_function":site.enclosing_function.map(|span|[span.start,span.end])
+                })).collect::<Vec<_>>(),
             "root_scope_binding":audit.root_scope_binding,
             "source_mutation_isolated":audit.source_mutation_isolated,
         }));

@@ -6,8 +6,8 @@ use jsvm_lift::{
         structurally_proven_lazy_registry_read_calls,
         structurally_proven_registry_forwarding_calls, structurally_proven_registry_read_calls,
     },
+    lexical_mutation::audit_lexical_binding_mutation,
     receiver_identity::{
-        audit_prototype_method_phase_binding_mutation,
         propagate_matched_prototype_method_call_origins,
         propagate_proven_prototype_method_call_origins, proven_exact_own_data_field_at_direct_call,
         proven_origin_direct_call_event_unreachable, proven_own_data_field_at_runtime_method_call,
@@ -326,8 +326,11 @@ fn main() -> Result<()> {
         let closures = structurally_proven_prototype_method_phase_closures(&parsed.program, scoping, &budget)?
             .into_iter()
             .map(|closure| -> Result<Value> {
-                let hazard = audit_prototype_method_phase_binding_mutation(
-                    &semantic.semantic, &closure, &budget,
+                let hazard = audit_lexical_binding_mutation(
+                    &semantic.semantic,
+                    closure.phase_binding_symbol,
+                    Span::new(closure.phase_assignment_start, closure.phase_assignment_end),
+                    &budget,
                 )?;
                 let phase = event.as_ref().and_then(|event| {
                     proven_prototype_method_phase_at_event(
@@ -368,11 +371,17 @@ fn main() -> Result<()> {
                     "phase_binding_declaration": [phase_binding.start, phase_binding.end],
                     "phase_binding_writes": phase_binding_writes,
                     "binding_mutation_audit": {
-                        "unique_initialization_write": hazard.unique_initialization_write,
+                        "unique_expected_write": hazard.unique_expected_write,
                         "lexical_direct_eval_calls": hazard.lexical_direct_eval_calls.iter()
-                            .map(|span| [span.start, span.end]).collect::<Vec<_>>(),
+                            .map(|site| json!({
+                                "span": [site.span.start,site.span.end],
+                                "enclosing_function": site.enclosing_function.map(|s| [s.start,s.end]),
+                            })).collect::<Vec<_>>(),
                         "lexical_with_statements": hazard.lexical_with_statements.iter()
-                            .map(|span| [span.start, span.end]).collect::<Vec<_>>(),
+                            .map(|site| json!({
+                                "span": [site.span.start,site.span.end],
+                                "enclosing_function": site.enclosing_function.map(|s| [s.start,s.end]),
+                            })).collect::<Vec<_>>(),
                         "root_scope_binding": hazard.root_scope_binding,
                         "source_mutation_isolated": hazard.source_mutation_isolated,
                         "runtime_ordering_proven": false,

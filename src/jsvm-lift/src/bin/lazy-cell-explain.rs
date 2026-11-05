@@ -8,8 +8,8 @@ use jsvm_lift::{
         proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_update_state,
         structurally_proven_slow_lazy_cell_factory_shapes,
     },
+    lexical_mutation::audit_lexical_binding_mutation,
     receiver_identity::{
-        audit_prototype_method_phase_binding_mutation,
         structurally_proven_prototype_method_phase_closures,
         structurally_proven_runtime_origin_flow,
     },
@@ -85,16 +85,27 @@ fn main() -> Result<()> {
             .iter()
             .any(|shape| shape.phase_binding_symbol == closure.phase_binding_symbol)
     }) {
-        let audit = audit_prototype_method_phase_binding_mutation(semantic, closure, &budget)?;
+        let audit = audit_lexical_binding_mutation(
+            semantic,
+            closure.phase_binding_symbol,
+            oxc_span::Span::new(closure.phase_assignment_start, closure.phase_assignment_end),
+            &budget,
+        )?;
         phase_mutation_audits.push(json!({
             "phase_assignment": [closure.phase_assignment_start, closure.phase_assignment_end],
             "phase_function": [closure.phase_function_start, closure.phase_function_end],
             "equal_value": closure.equal_value,
             "unequal_value": closure.unequal_value,
             "explicit_writes": audit.explicit_writes.iter().map(|span| [span.start,span.end]).collect::<Vec<_>>(),
-            "unique_initialization_write": audit.unique_initialization_write,
-            "lexical_direct_eval_calls": audit.lexical_direct_eval_calls.iter().map(|span| [span.start,span.end]).collect::<Vec<_>>(),
-            "lexical_with_statements": audit.lexical_with_statements.iter().map(|span| [span.start,span.end]).collect::<Vec<_>>(),
+            "unique_expected_write": audit.unique_expected_write,
+            "lexical_direct_eval_calls": audit.lexical_direct_eval_calls.iter().map(|site| json!({
+                "span":[site.span.start,site.span.end],
+                "enclosing_function":site.enclosing_function.map(|s|[s.start,s.end]),
+            })).collect::<Vec<_>>(),
+            "lexical_with_statements": audit.lexical_with_statements.iter().map(|site| json!({
+                "span":[site.span.start,site.span.end],
+                "enclosing_function":site.enclosing_function.map(|s|[s.start,s.end]),
+            })).collect::<Vec<_>>(),
             "root_scope_binding": audit.root_scope_binding,
             "source_mutation_isolated": audit.source_mutation_isolated,
             "initialization_before_later_capture_proven": false,
@@ -193,9 +204,41 @@ fn main() -> Result<()> {
     }
     captured_handlers.sort();
     captured_handlers.dedup();
+
+    // Associate dynamic-source sites with captured functions only when the
+    // exact source interval contains the entire hazard. This is provenance,
+    // not an assertion that the handler was invoked or the site was reached.
+    for audit in &mut phase_mutation_audits {
+        for kind in ["lexical_direct_eval_calls", "lexical_with_statements"] {
+            if let Some(sites) = audit
+                .get_mut(kind)
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for site in sites {
+                    budget.consume(1)?;
+                    let (Some(start), Some(end)) =
+                        (site["span"][0].as_u64(), site["span"][1].as_u64())
+                    else {
+                        continue;
+                    };
+                    let containing_keys = captured_handlers
+                        .iter()
+                        .filter(|capture| {
+                            u64::from(capture.handler[0]) <= start
+                                && end <= u64::from(capture.handler[1])
+                        })
+                        .map(|capture| capture.exact_key)
+                        .collect::<Vec<_>>();
+                    site["containing_captured_handler_keys"] = json!(containing_keys);
+                    site["invocation_witnessed"] = json!(false);
+                }
+            }
+        }
+    }
+
     let source_sha256 = sha256_hex(source.as_bytes());
     let report = json!({
-        "schema": "jsvm-lazy-cell-proof/v1",
+        "schema": "jsvm-lazy-cell-proof/v2",
         "input": args.input,
         "source_sha256": source_sha256,
         "source_bytes": source.len(),
@@ -248,7 +291,9 @@ They are **not** necessarily the functions executed by a specific browser invoca
 
 Source identity and exact byte spans are in [analysis.json](analysis.json).
 Readable files are views, not executable devirtualizations.
-See the phase binding mutation audits in analysis.json before asserting an interpreter phase.
+See the phase binding mutation audits in analysis.json: each dynamic-code site
+includes its exact containing captured handler keys when structural provenance exists.
+This is containment only, not evidence that a handler or the dynamic-code site executed.
 A syntactically unique assignment is not sufficient when direct eval can reach the binding.
 
 | Exact key | Handler function | Original source bytes | Factory call bytes |
@@ -277,6 +322,73 @@ A syntactically unique assignment is not sufficient when direct eval can reach t
             "| {} | [view](handlers/{}) | {}..{} | {}..{} |\n",
             capture.exact_key, name, start, end, capture.factory_call[0], capture.factory_call[1]
         ));
+    }
+    index.push_str(
+        "\n## Dynamic-source lexical mutation hazards\n\n\
+         The following sites are syntactically capable of affecting captured bindings.\n\
+         Captured-handler links prove only exact source-span containment,\n\
+         **not handler execution, temporal reachability or mutation**.\n\n\
+         | Phase function bytes | Site kind | Site bytes | Enclosing function bytes | Containing captured functions |\n\
+         |---|---|---|---|---|\n",
+    );
+    let mut hazard_count = 0_usize;
+    for audit in &phase_mutation_audits {
+        let phase_start = audit["phase_function"][0].as_u64();
+        let phase_end = audit["phase_function"][1].as_u64();
+        let phase_label = match (phase_start, phase_end) {
+            (Some(start), Some(end)) => format!("{start}..{end}"),
+            _ => String::from("unknown"),
+        };
+        for (kind, label) in [
+            ("lexical_direct_eval_calls", "direct eval"),
+            ("lexical_with_statements", "with"),
+        ] {
+            let Some(sites) = audit.get(kind).and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for site in sites {
+                budget.consume(1)?;
+                let (Some(start), Some(end)) = (site["span"][0].as_u64(), site["span"][1].as_u64())
+                else {
+                    continue;
+                };
+                hazard_count += 1;
+                let enclosing = match (
+                    site["enclosing_function"][0].as_u64(),
+                    site["enclosing_function"][1].as_u64(),
+                ) {
+                    (Some(start), Some(end)) => format!("{start}..{end}"),
+                    _ => String::from("top-level / unknown"),
+                };
+                let matching_handlers = captured_handlers
+                    .iter()
+                    .filter(|capture| {
+                        u64::from(capture.handler[0]) <= start
+                            && end <= u64::from(capture.handler[1])
+                    })
+                    .map(|capture| {
+                        format!(
+                            "[key {}](handlers/key-{}-source-{}-{}.js)",
+                            capture.exact_key,
+                            capture.exact_key,
+                            capture.handler[0],
+                            capture.handler[1],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let related = if matching_handlers.is_empty() {
+                    String::from("none proven")
+                } else {
+                    matching_handlers.join(", ")
+                };
+                index.push_str(&format!(
+                    "| {phase_label} | {label} | {start}..{end} | {enclosing} | {related} |\n"
+                ));
+            }
+        }
+    }
+    if hazard_count == 0 {
+        index.push_str("| — | No syntactic hazard found | — | — | — |\n");
     }
     fs::write(args.output.join("README.md"), index)?;
     println!(
