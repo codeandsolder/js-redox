@@ -53,7 +53,7 @@ cargo +1.99.1 run --locked -p jsvm-lift --example lazy-resolver-probe -- \
   path/to/embedded-child.js
 ```
 
-Both tools emit a scope-aware phase-binding mutation audit. A single syntactic initialization is not taken as proof of immutability if a nested direct eval call, with statement, or later resolved write can reach the same binding. The audit does not establish when initialization executed.
+Both tools emit a scope-aware phase-binding mutation audit. A single syntactic initialization is not taken as proof of immutability if a nested direct eval call, with statement, or later resolved write can reach the same binding. The audit does not establish when initialization executed. A separate reusable proof API, `proven_original_prototype_phase_return_at_event`, composes source-wide lexical phase-function stability with a source-exact flattened-machine equality at one event. It refuses any mutation hazard and returns the value the original phase function **would return if called at that event**; it does not claim the call executed or that the equality persists to a later dispatch. The optional `receiver-proof-inventory --phase-closures --phase-event-start=N --phase-event-end=M` report exposes this composite proof alongside the independently established equality and mutation audit.
 
 Its JSON reports `conditional_phases`: `compatible_return_structure=true` means the original handler is selected **under that explicit phase premise**. It does **not** prove the phase at a particular interpreter call, registry-slot persistence, or an observed invocation. The optional final integer argument limits focused analysis to the first N independently proven handler captures; omitting it examines all.
 
