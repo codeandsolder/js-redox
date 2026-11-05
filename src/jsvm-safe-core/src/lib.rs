@@ -551,10 +551,44 @@ struct Collector<'s, 'c> {
     var_number_initializers: &'c HashMap<SymbolId, VarNumberInitializer>,
     reference_spans: &'c HashMap<ReferenceId, Span>,
     protected_spans: &'c [(usize, usize)],
+    may_remove_dead_numeric_writes: bool,
     replacements: Vec<Replacement>,
 }
 
 impl Collector<'_, '_> {
+    // A local scalar that has no remaining lexical reads after structural
+    // reconstruction cannot make numeric state assignments observable.
+    // Avoid arguments aliasing and direct eval, both of which can observe
+    // parameter/local writes without an ordinary identifier reference.
+    fn dead_numeric_assignment(&self, expr: &Expression<'_>) -> bool {
+        if !self.may_remove_dead_numeric_writes {
+            return false;
+        }
+        let Expression::AssignmentExpression(assign) = expr else {
+            return false;
+        };
+        if assign.operator.as_str() != "="
+            || !matches!(&assign.right, Expression::NumericLiteral(_))
+        {
+            return false;
+        }
+        let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left else {
+            return false;
+        };
+        let Some(reference) = id.reference_id.get() else {
+            return false;
+        };
+        let Some(symbol) = self.scoping.get_reference(reference).symbol_id() else {
+            return false;
+        };
+        self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
+            && self
+                .scoping
+                .get_resolved_reference_ids(symbol)
+                .iter()
+                .all(|reference_id| !self.scoping.get_reference(*reference_id).is_read())
+    }
+
     fn is_protected(&self, start: usize, end: usize) -> bool {
         self.protected_spans
             .iter()
@@ -923,7 +957,20 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_while_statement(self, it);
     }
 
+    fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
+        for stmt in &it.body {
+            if let Statement::EmptyStatement(empty) = stmt {
+                self.push(empty.span, String::new(), "remove_empty_block_statement");
+            }
+        }
+        walk::walk_block_statement(self, it);
+    }
+
     fn visit_expression_statement(&mut self, it: &ExpressionStatement<'a>) {
+        if self.dead_numeric_assignment(&it.expression) {
+            self.push(it.span, ";".to_owned(), "dead_numeric_state_write");
+            return;
+        }
         if let Expression::SequenceExpression(seq) = &it.expression {
             let text = seq
                 .expressions
@@ -1330,11 +1377,12 @@ fn transform_once(
     let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
     let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
     budget.checkpoint()?;
+    let direct_eval_present = has_direct_eval(&program);
     initial_replacements.extend(remove_unused_proven_helpers(
         scoping,
         &decoder_analysis.removable_helpers,
         &pure_functions,
-        has_direct_eval(&program),
+        direct_eval_present,
     ));
     budget.checkpoint()?;
 
@@ -1357,6 +1405,9 @@ fn transform_once(
         var_number_initializers: &var_number_initializers,
         reference_spans: &reference_spans,
         protected_spans: &protected_spans,
+        // Parameters in sloppy-mode functions alias their arguments object.
+        // Do not erase writes when that object may be accessed.
+        may_remove_dead_numeric_writes: !direct_eval_present && !source.contains("arguments"),
         replacements: initial_replacements,
     };
     collector.visit_program(&program);

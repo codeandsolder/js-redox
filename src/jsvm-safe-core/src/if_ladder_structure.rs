@@ -692,6 +692,40 @@ mod tests {
     }
 
     #[test]
+    fn dead_numeric_state_writes_removed_only_when_unobserved() {
+        let source = "function f(n){var s,sum=0;for(s=3;s!=9;)s==3?(s=n?4:9):s==4?(sum++,s=3):s==9&&(s=9);return sum;}";
+        let result = deobfuscate(source, 12, &WorkBudget::unlimited("dead-state"));
+        assert!(result.is_ok());
+        if let Some(value) = result.ok().flatten() {
+            assert!(value.source.contains("while (n)"), "{}", value.source);
+            assert!(!value.source.contains("s = 4"), "{}", value.source);
+            assert!(!value.source.contains("s = 9"), "{}", value.source);
+            assert_eq!(value.transforms.get("if_ladder_structured"), Some(&1));
+        }
+
+        let live = "function f(n){var s=0;for(s=3;s!=9;)s==3?(s=n?9:3):s==9&&(s=9);return s;}";
+        let result = deobfuscate(live, 12, &WorkBudget::unlimited("live-state"));
+        assert!(result.is_ok());
+        if let Some(value) = result.ok().flatten() {
+            assert!(value.source.contains("s = 3"), "{}", value.source);
+        }
+
+        let aliased = "function f(s){for(s=3;s!=9;)s==3?(s=9):s==9&&(s=9);return arguments[0];}";
+        let result = deobfuscate(aliased, 12, &WorkBudget::unlimited("aliased-state"));
+        assert!(result.is_ok());
+        if let Some(value) = result.ok().flatten() {
+            assert!(value.source.contains("s = 9"), "{}", value.source);
+        }
+
+        let captured = "function f(){var s=0;const read=()=>s;for(s=3;s!=9;)s==3?(s=9):s==9&&(s=9);return read();}";
+        let result = deobfuscate(captured, 12, &WorkBudget::unlimited("captured-state"));
+        assert!(result.is_ok());
+        if let Some(value) = result.ok().flatten() {
+            assert!(value.source.contains("s = 9"), "{}", value.source);
+        }
+    }
+
+    #[test]
     fn refuses_unknown_state_successors() {
         let source = "for (s = 1; s != 9;) s == 1 ? (s = next()) : s == 2 && (s = 9)";
         let allocator = Allocator::default();
