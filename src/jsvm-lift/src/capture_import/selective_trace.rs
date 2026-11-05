@@ -46,6 +46,24 @@ fn verify_function_definition(
     }
 }
 
+fn verify_observed_frame_source(
+    frame: &mut Value,
+    session: &str,
+    identities: &HashMap<(String, String), Option<String>>,
+) -> bool {
+    let script = frame
+        .get("location")
+        .and_then(|location| location.get("scriptId"))
+        .and_then(Value::as_str);
+    let reported = frame.get("sourceSha256").and_then(Value::as_str);
+    let actual = script
+        .and_then(|id| identities.get(&(session.to_owned(), id.to_owned())))
+        .and_then(Option::as_deref);
+    let exact = actual.is_some() && actual == reported;
+    frame["source_identity"] = json!(if exact { "exact" } else { "unresolved" });
+    exact
+}
+
 pub(super) fn import_selective_trace(
     capture: &Path,
     project: &Path,
@@ -102,6 +120,8 @@ pub(super) fn import_selective_trace(
     }
     let mut verified = 0_u64;
     let mut unresolved = 0_u64;
+    let mut verified_step_frames = 0_u64;
+    let mut unresolved_step_frames = 0_u64;
     let mut verified_definitions = 0_u64;
     let mut unresolved_definitions = 0_u64;
     let hits = trace
@@ -121,20 +141,34 @@ pub(super) fn import_selective_trace(
             .context("trace hit missing frames[]")?;
         for frame in frames {
             budget.consume(1)?;
-            let script = frame
-                .get("location")
-                .and_then(|location| location.get("scriptId"))
-                .and_then(Value::as_str);
-            let reported = frame.get("sourceSha256").and_then(Value::as_str);
-            let actual = script
-                .and_then(|id| identities.get(&(session.clone(), id.to_owned())))
-                .and_then(Option::as_deref);
-            let exact = actual.is_some() && actual == reported;
-            frame["source_identity"] = json!(if exact { "exact" } else { "unresolved" });
-            if exact {
+            if verify_observed_frame_source(frame, &session, &identities) {
                 verified += 1;
             } else {
                 unresolved += 1;
+            }
+        }
+        let steps = hit.get_mut("steps").and_then(Value::as_array_mut);
+        if let Some(steps) = steps {
+            if steps.len() > 32 {
+                bail!("observed path has more than 32 bounded debugger step events");
+            }
+            for (index, step) in steps.iter_mut().enumerate() {
+                budget.consume(1)?;
+                if step.get("index").and_then(Value::as_u64) != Some(index as u64) {
+                    bail!("observed path step indices must be sequential");
+                }
+                let frames = step
+                    .get_mut("frames")
+                    .and_then(Value::as_array_mut)
+                    .context("observed path step requires frames[]")?;
+                for frame in frames {
+                    budget.consume(1)?;
+                    if verify_observed_frame_source(frame, &session, &identities) {
+                        verified_step_frames += 1;
+                    } else {
+                        unresolved_step_frames += 1;
+                    }
+                }
             }
         }
         for scope in hit
@@ -186,6 +220,8 @@ pub(super) fn import_selective_trace(
     trace["schema"] = json!(SELECTIVE_TRACE.schema);
     trace["summary"]["verifiedSourceFrames"] = json!(verified);
     trace["summary"]["unresolvedSourceFrames"] = json!(unresolved);
+    trace["summary"]["verifiedStepFrames"] = json!(verified_step_frames);
+    trace["summary"]["unresolvedStepFrames"] = json!(unresolved_step_frames);
     trace["summary"]["verifiedFunctionDefinitions"] = json!(verified_definitions);
     trace["summary"]["unresolvedFunctionDefinitions"] = json!(unresolved_definitions);
     write_artifact(project, SELECTIVE_TRACE, &trace)?;
@@ -222,7 +258,10 @@ mod tests {
                     {"location":{"scriptId":"6"},"sourceSha256":"abc"},
                     {"location":{"scriptId":"6"},"sourceSha256":"other"},
                     {"location":{"scriptId":"8"},"sourceSha256":"abc"}
-                ], "scopes":[{"type":"local","variables":[
+                ], "steps":[{"index":0,"frames":[
+                    {"location":{"scriptId":"6","lineNumber":2,"columnNumber":1},"sourceSha256":"abc"},
+                    {"location":{"scriptId":"8","lineNumber":2,"columnNumber":1},"sourceSha256":"abc"}
+                ]}], "scopes":[{"type":"local","variables":[
                     {"name":"handler","value":{"type":"function","functionDefinition":{
                         "scriptId":"6","lineNumber":0,"columnNumber":21,
                         "evidence":"Runtime.getProperties.internalProperties.[[FunctionLocation]]"}}},
@@ -246,6 +285,16 @@ mod tests {
         let result = load_artifact(&project, SELECTIVE_TRACE, false)?.context("missing trace")?;
         assert_eq!(result["summary"]["verifiedSourceFrames"], 1);
         assert_eq!(result["summary"]["unresolvedSourceFrames"], 2);
+        assert_eq!(result["summary"]["verifiedStepFrames"], 1);
+        assert_eq!(result["summary"]["unresolvedStepFrames"], 1);
+        assert_eq!(
+            result["hits"][0]["steps"][0]["frames"][0]["source_identity"],
+            "exact"
+        );
+        assert_eq!(
+            result["hits"][0]["steps"][0]["frames"][1]["source_identity"],
+            "unresolved"
+        );
         assert_eq!(result["hits"][0]["frames"][0]["source_identity"], "exact");
         assert_eq!(result["summary"]["verifiedFunctionDefinitions"], 2);
         assert_eq!(result["summary"]["unresolvedFunctionDefinitions"], 2);

@@ -7,7 +7,10 @@ import path from "node:path";
 
 const temp = await mkdtemp(path.join(tmpdir(), "js-redox-selective-trace-"));
 const script = [
-  "function namedHandler(value) { return value + 8; }",
+  "function namedHandler(value) {",
+  "  if (value === 34) return value + 8;",
+  "  return -1;",
+  "}",
   "function dispatch(opcode) {",
   "  const registry = { 34: namedHandler };",
   "  const handler = registry[opcode];",
@@ -35,8 +38,9 @@ const output = process.env.TRACE_CAPTURE_OUTPUT || path.join(temp, "capture");
 await writeFile(specPath, JSON.stringify({
   maxHits: 4,
   points: [{
-    url: base + "/entry.js", lineNumber: 4,
-    expressions: ["opcode", "handler", "registry[opcode]", "handler === registry[opcode]"],
+    url: base + "/entry.js", lineNumber: 7,
+    expressions: ["opcode", "handler", "registry[opcode]", "handler === registry[opcode]", "opcode === 34"],
+    followSteps: 8, stepMode: "into", stepExpressions: ["value", "value === 34"],
   }],
 }));
 
@@ -89,6 +93,20 @@ try {
   assert.deepEqual(scopeDefinition, handlerDefinition,
     "the handler local must resolve to the same code definition");
   assert.equal(hit.frames[0].functionLocation?.scriptId, hit.frames[0].location.scriptId);
+  assert.equal(hit.pathWitnessRequestedSteps, 8);
+  assert.equal(hit.pathWitnessMode, "into");
+  assert.ok(hit.steps.length >= 2, "expected at least two concrete step locations");
+  assert.ok(hit.steps.some((step) => step.frames[0]?.functionName === "namedHandler"),
+    "stepInto must witness actual namedHandler invocation");
+  assert.ok(hit.steps.some((step) => step.expressions.some(
+    (value) => value.expression === "value" && value.status === "observed" &&
+      value.value?.value === 34)),
+    "path steps should record callee argument 34");
+  assert.ok(hit.steps.every((step) => step.frames[0].sourceSha256),
+    "step source identities must be resolved from captured CDP scripts");
+  assert.ok(trace.summary.observedStepLocations >= 2,
+    "expected positive execution path witness locations");
+
 
   console.log("PASS: live Chrome captured opcode 34, registry-selected handler, exact definition and call stack");
   console.log("capture: " + output);

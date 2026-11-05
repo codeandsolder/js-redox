@@ -239,6 +239,109 @@ fn append_observed_callable_definitions(
     Ok(())
 }
 
+/// Render a separate sequential execution witness; never filter unreachable
+/// branches or replace a general source tree based on a single observed run.
+fn build_observed_path_view(
+    project: &Path,
+    identities: &RuntimeIdentityIndex,
+    session: &str,
+    hit: &Value,
+    ordinal: usize,
+) -> Result<String> {
+    let steps = hit
+        .get("steps")
+        .and_then(Value::as_array)
+        .context("path view requires bounded steps[]")?;
+    let mut page = format!(
+        "# Observed execution path {ordinal:04}\n\n         This is an **ordered sequence of {} debugger step pauses** in CDP session {session}.          It is not a complete or universally feasible program path, and debugger instrumentation          may perturb timing. Source excerpts refer to original captured code only.\n\n",
+        steps.len()
+    );
+    page.push_str(&format!(
+        "Requested mode: {}. Capture status: {}.\n\n",
+        hit.get("pathWitnessMode")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        hit.get("pathWitnessStatus")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+    ));
+    for (index, step) in steps.iter().enumerate() {
+        let top = step
+            .get("frames")
+            .and_then(Value::as_array)
+            .and_then(|frames| frames.first());
+        let Some(top) = top else {
+            page.push_str(&format!("## Step {index}: no executing frame captured\n\n"));
+            continue;
+        };
+        let function = top
+            .get("functionName")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("<anonymous>");
+        let location = &top["location"];
+        let script = location
+            .get("scriptId")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let line = location.get("lineNumber").and_then(Value::as_u64);
+        let column = location.get("columnNumber").and_then(Value::as_u64);
+        page.push_str(&format!(
+            "## Step {index}: {}\n\nV8 script **{script}**, original line {}, column {} (zero-based).\n\n",
+            function.replace('\n', " "),
+            line.map_or_else(|| "?".to_owned(), |v| v.to_string()),
+            column.map_or_else(|| "?".to_owned(), |v| v.to_string()),
+        ));
+        let sha = top.get("sourceSha256").and_then(verified_sha);
+        let identity = identities
+            .get(&(session.to_owned(), script.to_owned()))
+            .and_then(Option::as_ref);
+        let exact = top.get("source_identity").and_then(Value::as_str) == Some("exact")
+            && sha.is_some()
+            && identity.is_some_and(|source| Some(source.sha256.as_str()) == sha);
+        if exact {
+            let sha = sha.context("checked exact original step source")?;
+            let raw_path = format!("resources/runtime-scripts/{sha}.js");
+            let bytes = fs::read(project.join(&raw_path))
+                .with_context(|| format!("missing original execution step source {sha}"))?;
+            if sha256_hex(&bytes) != sha {
+                bail!("original execution step source hash mismatch: {sha}");
+            }
+            let raw = String::from_utf8(bytes)
+                .with_context(|| format!("execution step code is not UTF-8: {sha}"))?;
+            page.push_str(&format!(
+                "Verified [original source](../../../{raw_path}), SHA-256 **{sha}**.\n\n"
+            ));
+            let readable = format!("src/_readable/runtime-scripts/{sha}.js");
+            if project.join(&readable).is_file() {
+                page.push_str(&format!(
+                    "[General safe-readable view](../../../{readable}) (different source offsets).\n\n"
+                ));
+            }
+            if let Some(line) = line {
+                page.push_str(&source_excerpt(
+                    &raw,
+                    line,
+                    identity.and_then(|source| source.start_line),
+                ));
+                page.push('\n');
+            }
+        } else {
+            page.push_str("Original source identity **unresolved**; no code excerpt claimed.\n\n");
+        }
+        let expressions = step.get("expressions").and_then(Value::as_array);
+        if expressions.is_some_and(|items| !items.is_empty()) {
+            page.push_str("Expressions evaluated at this pause (rejected/unavailable results remain explicitly marked):\n\n");
+            page.push_str(&display_json(&json!(expressions))?);
+            page.push('\n');
+        }
+    }
+    page.push_str(
+        "[Full machine-readable path and paused state](../../../analysis/selective-trace.json)\n",
+    );
+    Ok(page)
+}
+
 /// Render every recorded invocation, including unresolved frames, without
 /// treating source offsets from transformed code as original CDP locations.
 /// Re-runnable on an already reconstructed project; no deobfuscation rescan.
@@ -394,6 +497,21 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             }
         }
         append_observed_callable_definitions(&mut view, project, &identities, &session, hit)?;
+        if hit
+            .get("steps")
+            .and_then(Value::as_array)
+            .is_some_and(|steps| !steps.is_empty())
+        {
+            let path_name = format!("{ordinal:04}-path.md");
+            let path_destination = format!("src/_observed/invocations/{path_name}");
+            let path_view = build_observed_path_view(project, &identities, &session, hit, ordinal)?;
+            fs::write(output.join(&path_name), path_view)?;
+            hit["path_view_path"] = json!(path_destination);
+            view.push_str(&format!(
+                "## Ordered execution witness\n\n[Browse {} observed debugger steps](./{path_name}).                  This is a bounded sequence, not universal path specialization.\n\n",
+                hit.get("steps").and_then(Value::as_array).map_or(0, Vec::len),
+            ));
+        }
         view.push_str("## Observed bindings and expression results\n\n");
         view.push_str("Only values captured at this pause. Expressions were requested with side-effect checks; rejected or unavailable evaluations are not facts.\n\n");
         view.push_str(&display_json(&json!({
@@ -417,11 +535,28 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
         let item = item?;
         let file = item.file_name();
         let Some(file) = file.to_str() else { continue };
-        if let Some(number) = file
-            .strip_suffix(".md")
-            .and_then(|text| text.parse::<usize>().ok())
-        {
+        let page_ordinal = file
+            .strip_suffix("-path.md")
+            .and_then(|value| value.parse::<usize>().ok())
+            .or_else(|| {
+                file.strip_suffix(".md")
+                    .and_then(|value| value.parse::<usize>().ok())
+            });
+        if let Some(number) = page_ordinal {
             if number >= keep && number.to_string().len() <= 4 {
+                fs::remove_file(item.path())?;
+            }
+        }
+        if let Some(number) = file
+            .strip_suffix("-path.md")
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            if number < keep
+                && !hits[number]
+                    .get("steps")
+                    .and_then(Value::as_array)
+                    .is_some_and(|steps| !steps.is_empty())
+            {
                 fs::remove_file(item.path())?;
             }
         }
@@ -479,7 +614,13 @@ mod tests {
                     {"functionName":"dispatch","location":{"scriptId":"6","lineNumber":2,"columnNumber":2},
                      "sourceSha256":digest,"source_identity":"exact"},
                     {"location":{"scriptId":"missing","lineNumber":42},"source_identity":"unresolved"},
-                ],"scopes":[{"type":"local","variables":[
+                ],"steps":[{"index":0,"reason":"other","frames":[
+                    {"functionName":"dispatch","location":{"scriptId":"6","lineNumber":2,"columnNumber":2},
+                     "sourceSha256":digest,"source_identity":"exact"}
+                ],"expressions":[{"expression":"opcode === 34","status":"observed",
+                    "value":{"type":"boolean","value":true}}],"scopes":[]}],
+                "pathWitnessStatus":"bounded_steps_recorded","pathWitnessMode":"into",
+                "scopes":[{"type":"local","variables":[
                     {"name":"opcode","value":{"type":"number","value":34}},
                     {"name":"handler","value":{"type":"function","functionDefinition":{
                         "scriptId":"6","lineNumber":0,"columnNumber":9,
@@ -501,11 +642,21 @@ mod tests {
         assert!(page.contains("Verified observed callable definitions"));
         assert!(page.contains("original line 1, column 10"));
         assert!(page.contains("function dispatch(opcode)"));
+        assert!(page.contains("0000-path.md"));
+        let path = fs::read_to_string(project.join("src/_observed/invocations/0000-path.md"))?;
+        assert!(path.contains("Step 0: dispatch"));
+        assert!(path.contains("return handler(opcode)"));
+        assert!(path.contains("opcode === 34"));
+        assert!(path.contains("true"));
 
         let trace = load_artifact(project, SELECTIVE_TRACE, false)?.context("trace")?;
         assert_eq!(
             trace["hits"][0]["readable_view_path"],
             "src/_observed/invocations/0000.md"
+        );
+        assert_eq!(
+            trace["hits"][0]["path_view_path"],
+            "src/_observed/invocations/0000-path.md"
         );
         Ok(())
     }
