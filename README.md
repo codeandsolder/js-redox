@@ -251,3 +251,26 @@ Current families include:
 - aggressive non-VM js-confuser CFF negative.
 
 See the Notion page **JavaScript VM obfuscation & static devirtualization — current** and its implementation-log child for detailed findings and pinned third-party revisions.
+
+### Link extracted handlers to their original lexical helpers
+
+The generated source tree can also include real lexical helper implementations from
+the full original JavaScript, without Chromium:
+
+~~~sh
+cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- source-tree \
+  path/to/extracted-handlers work/readable-handlers \
+  --context-source path/to/original.pretty.js \
+  --max-iterations 12 --format-output
+~~~
+
+The generated lexical-context/ directory contains the original enclosing
+program and transformed helper source, with links from each handler to the
+helper definitions it actually references. Lookup begins with unresolved
+identifiers in the extracted handler and follows *exact original lexical
+symbols* through dependencies. Shadowed parameters are not confused with
+external helper calls, and ambiguous names are not guessed.
+
+Helper files are navigation views, not independently runnable modules.
+The original enclosing source remains available because captured variables,
+later reassignments, and top-level side effects can change their behavior.

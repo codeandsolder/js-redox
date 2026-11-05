@@ -4,6 +4,7 @@ use jsvm_lift::{
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions},
     safe_deob::{deobfuscate_source, SourceMode},
+    source_tree_context::reconstruct_context,
 };
 use serde_json::json;
 use std::{
@@ -92,6 +93,10 @@ struct SourceTreeArgs {
     /// Pretty-print the analyst source view. Reformatting may alter Function#toString.
     #[arg(long)]
     format_output: bool,
+    /// Original full JavaScript program enclosing extracted functions.
+    /// Materializes lexical helper implementations alongside the readable tree.
+    #[arg(long)]
+    context_source: Option<PathBuf>,
 }
 
 fn collect_js_sources(root: &Path) -> Result<Vec<PathBuf>> {
@@ -248,6 +253,118 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
     summary_text.push('\n');
     fs::write(out.join("reconstruction.json"), summary_text)?;
     md.push_str("\nMachine-readable summary: [reconstruction.json](reconstruction.json).\n");
+    if let Some(context_path) = &args.context_source {
+        let original = fs::read_to_string(context_path)
+            .with_context(|| format!("reading context {}", context_path.display()))?;
+        let source_inputs = collect_js_sources(&root)?
+            .into_iter()
+            .map(|path| {
+                Ok((
+                    path.strip_prefix(&root)?
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    fs::read_to_string(&path)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let context = reconstruct_context(&original, &source_inputs)?;
+        let folder = out.join("lexical-context");
+        anyhow::ensure!(
+            !folder.exists(),
+            "output already has a lexical-context directory"
+        );
+        fs::create_dir_all(folder.join("helpers"))?;
+        fs::write(folder.join("original.js"), &original)?;
+        let mut helper_rows = Vec::new();
+        let mut helper_index = String::from("# Actual lexical helper implementations\n\n");
+        helper_index.push_str("These definitions come from the supplied original program. ");
+        helper_index.push_str(
+            "They are browsing views of closure-scoped code, not independent runnable modules. ",
+        );
+        helper_index.push_str(
+            "The [original lexical program](original.js) preserves the full binding context.\n\n",
+        );
+        let helper_files = context
+            .helpers
+            .iter()
+            .map(|helper| (helper.name.as_str(), helper.file.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        for helper in &context.helpers {
+            let relative = &helper.file;
+            let label = format!("original helper {}", helper.name);
+            let budget = budgets.operation(AnalysisOperation::SafeDeobfuscation, label.clone());
+            let outcome = deobfuscate_source(
+                &helper.source,
+                label,
+                SourceMode::Auto,
+                args.max_iterations,
+                args.format_output,
+                &budget,
+            );
+            let (code, transforms, error) = match outcome {
+                Ok(rewritten) => (rewritten.source, rewritten.report.transforms, None),
+                Err(error) => (
+                    helper.source.clone(),
+                    BTreeMap::new(),
+                    Some(error.to_string()),
+                ),
+            };
+            fs::write(folder.join(relative), code)?;
+            helper_index.push_str(&format!("- [{}]({})", helper.name, relative));
+            if helper.mutable_binding {
+                helper_index.push_str(" — **binding reassigned in original program**");
+            }
+            if !helper.references.is_empty() {
+                helper_index.push_str(&format!(" — uses {}", helper.references.join(", ")));
+            }
+            helper_index.push('\n');
+            helper_rows.push(json!({
+                "name": helper.name,
+                "path": relative,
+                "binding_mutable": helper.mutable_binding,
+                "references": helper.references,
+                "transforms": transforms,
+                "error": error,
+            }));
+        }
+        fs::write(folder.join("README.md"), helper_index)?;
+        md.push_str("\n## Original lexical context and helper code\n\n");
+        md.push_str("[Browse linked helper implementations](lexical-context/README.md). ");
+        md.push_str("These are actual original bindings, not guessed API names.\n\n");
+        for handler in &context.handlers {
+            if handler.linked_helpers.is_empty() {
+                continue;
+            }
+            let links = handler
+                .linked_helpers
+                .iter()
+                .filter_map(|name| {
+                    helper_files
+                        .get(name.as_str())
+                        .map(|file| format!("[{}](lexical-context/{})", name, file))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            md.push_str(&format!(
+                "- [{}]({}) — {}\n",
+                handler.path, handler.path, links
+            ));
+        }
+        let mut context_json = serde_json::to_string_pretty(&json!({
+            "schema": "jsvm-readable-lexical-context/v1",
+            "source": "lexical-context/original.js",
+            "helper_count": helper_rows.len(),
+            "helpers": helper_rows,
+            "handlers": context.handlers.iter().map(|handler| json!({
+                "path": handler.path,
+                "linked_helpers": handler.linked_helpers,
+                "unresolved_references": handler.unresolved_references,
+            })).collect::<Vec<_>>(),
+            "unmatched_names": context.unmatched_names,
+        }))?;
+        context_json.push('\n');
+        fs::write(folder.join("context.json"), context_json)?;
+    }
     fs::write(out.join("README.md"), md)?;
     println!(
         "{}",
@@ -361,6 +478,7 @@ mod tests {
             output: output.clone(),
             max_iterations: 12,
             format_output: false,
+            context_source: None,
         })?;
 
         let index: serde_json::Value =
@@ -383,6 +501,46 @@ mod tests {
     }
 
     #[test]
+    fn source_tree_links_original_lexical_helper_code() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        fs::create_dir_all(&input)?;
+        let original = temp.path().join("original.js");
+        fs::write(
+            &original,
+            "function original(){const helper=function(x){return byte(x)+1;};const byte=function(x){return x[0];};}",
+        )?;
+        fs::write(
+            input.join("handler.js"),
+            "const capturedHandler=function(x){return helper(x);};",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 8,
+            format_output: true,
+            context_source: Some(original),
+        })?;
+        let context_dir = output.join("lexical-context");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(context_dir.join("context.json"))?)?;
+        assert_eq!(metadata["helper_count"], 2);
+        assert!(fs::read_to_string(output.join("README.md"))?.contains("helper-"));
+        assert!(fs::read_to_string(context_dir.join("README.md"))?.contains("byte"));
+        let mut helpers = fs::read_dir(context_dir.join("helpers"))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        helpers.sort();
+        assert_eq!(helpers.len(), 2);
+        assert!(helpers.iter().any(|path| {
+            fs::read_to_string(path)
+                .is_ok_and(|source| source.contains("function") && source.contains("return"))
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn source_tree_cannot_overwrite_or_contain_original() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let input = temp.path().join("raw");
@@ -393,6 +551,7 @@ mod tests {
             output: input.join("out"),
             max_iterations: 1,
             format_output: false,
+            context_source: None,
         });
         assert!(error.is_err());
         assert_eq!(fs::read_to_string(input.join("a.js"))?, "const a=1;");
