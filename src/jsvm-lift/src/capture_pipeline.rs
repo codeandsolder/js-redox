@@ -3,6 +3,7 @@ use crate::{
     bundle_materialize::{materialize_bundle_modules, BundleMaterializeSummary},
     capture_import::{import_capture_project, CaptureImportOptions, CaptureImportSummary},
     capture_project::{read_manifest, MANIFEST_NAME},
+    invocation_views::materialize_invocation_views,
     observed_runtime::{materialize_observed_runtime_sources, ObservedSourceSummary},
     project_api_surface::analyze_project_api_surface,
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions, ProjectDeobSummary},
@@ -39,6 +40,7 @@ pub struct CapturePipelineSummary {
     pub import: CaptureImportSummary,
     pub source: SourceMaterializeSummary,
     pub observed_sources: ObservedSourceSummary,
+    pub observed_invocations: usize,
     pub sourcemaps: ProjectSourcemapSummary,
     pub references: ReferenceScanSummary,
     pub deobfuscation: Option<ProjectDeobSummary>,
@@ -112,6 +114,7 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
     // Reuse proof-gated static reconstruction for CDP-observed script views
     // after it has processed runtime source units as ordinary JS inputs.
     let observed_sources = materialize_observed_runtime_sources(project, &options.budgets)?;
+    let observed_invocations = materialize_invocation_views(project, &options.budgets)?;
 
     let wasm_js_boundary = if options.wasm_analysis && options.safe_deobfuscation {
         Some(correlate_wasm_js_boundary(project, &options.budgets)?)
@@ -141,6 +144,7 @@ pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<Captu
         import,
         source,
         observed_sources,
+        observed_invocations,
         sourcemaps,
         references,
         deobfuscation,

@@ -654,6 +654,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
             json!({
                 "type":"observed_invocation",
                 "point_id":field(hit,"pointId"),
+                "readable_view_path":field(hit,"readable_view_path"),
                 "cdp_session":field(hit,"cdpSession"),
                 "at":field(hit,"at"),
                 "reason":field(hit,"reason"),
