@@ -313,6 +313,15 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn embedded_script_start_offset_is_applied_to_original_source_only() {
+        let source = "const a = 1;\nconst b = a + 2;\n";
+        let excerpt = source_excerpt(source, 11, Some(10));
+        assert!(excerpt.contains(">     12 | const b = a + 2;"));
+        assert!(source_excerpt(source, 11, None).contains("start offset was not recorded"));
+        assert!(source_excerpt(source, 9, Some(10)).contains("precedes"));
+    }
+
+    #[test]
     fn exact_invocation_renders_raw_location_and_values_not_deob_offsets() -> Result<()> {
         let tmp = TempDir::new()?;
         let project = tmp.path();
