@@ -8,7 +8,9 @@ use crate::{
     control_flow::direct_assignment_name, direct_identifier_name, fragment, numeric::exact_u64,
     value_eval::eval,
 };
-use oxc_ast::ast::{Expression, ForStatement, ForStatementInit, Statement};
+use oxc_ast::ast::{
+    BindingPattern, Expression, ForStatement, ForStatementInit, Statement, WhileStatement,
+};
 use oxc_span::GetSpan;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -521,8 +523,67 @@ pub(crate) fn reconstruct_for(it: &ForStatement<'_>, source: &str) -> Option<Str
     }
     let state = direct_assignment_name(&init.left)?;
     let initial = number(&init.right)?;
-    let exit = exit_state(it.test.as_ref()?, state)?;
-    let dispatch = match &it.body {
+    let init_text = format!("{};", fragment(source, init.span()));
+    reconstruct_state_loop(
+        state,
+        initial,
+        it.test.as_ref()?,
+        &it.body,
+        &init_text,
+        source,
+    )
+}
+
+/// Recover a while loop preceded by a numeric state initializer in the same
+/// lexical block. Both syntaxes share the same control-flow reconstruction.
+pub(crate) fn reconstruct_while_adjacent(
+    init: &Statement<'_>,
+    loop_stmt: &WhileStatement<'_>,
+    source: &str,
+) -> Option<String> {
+    let (state, initial) = match init {
+        Statement::ExpressionStatement(stmt) => {
+            let Expression::AssignmentExpression(assign) = &stmt.expression else {
+                return None;
+            };
+            if assign.operator.as_str() != "=" {
+                return None;
+            }
+            (
+                direct_assignment_name(&assign.left)?,
+                number(&assign.right)?,
+            )
+        }
+        Statement::VariableDeclaration(decl) if decl.declarations.len() == 1 => {
+            let declaration = &decl.declarations[0];
+            let BindingPattern::BindingIdentifier(binding) = &declaration.id else {
+                return None;
+            };
+            (binding.name.as_str(), number(declaration.init.as_ref()?)?)
+        }
+        _ => return None,
+    };
+    let initial_text = fragment(source, init.span());
+    reconstruct_state_loop(
+        state,
+        initial,
+        &loop_stmt.test,
+        &loop_stmt.body,
+        initial_text,
+        source,
+    )
+}
+
+fn reconstruct_state_loop(
+    state: &str,
+    initial: u64,
+    test: &Expression<'_>,
+    body: &Statement<'_>,
+    initial_text: &str,
+    source: &str,
+) -> Option<String> {
+    let exit = exit_state(test, state)?;
+    let dispatch = match body {
         Statement::ExpressionStatement(stmt) => &stmt.expression,
         Statement::BlockStatement(block) if block.body.len() == 1 => {
             let Statement::ExpressionStatement(stmt) = &block.body[0] else {
@@ -564,10 +625,7 @@ pub(crate) fn reconstruct_for(it: &ForStatement<'_>, source: &str) -> Option<Str
         fuel: 4096,
     };
     let code = emitter.walk(initial, exit)?;
-    Some(format!(
-        "{{\n{};\n{code}\n}}",
-        fragment(source, init.span())
-    ))
+    Some(format!("{{\n{initial_text}\n{code}\n}}"))
 }
 
 #[cfg(test)]
@@ -722,6 +780,38 @@ mod tests {
         assert!(result.is_ok());
         if let Some(value) = result.ok().flatten() {
             assert!(value.source.contains("s = 9"), "{}", value.source);
+        }
+    }
+
+    #[test]
+    fn preserves_observable_const_assignment_exception() {
+        let original = "function f(){const s=3;s=9;return 1;}";
+        let result = deobfuscate(original, 12, &WorkBudget::unlimited("const-write"));
+        assert!(result.is_ok());
+        if let Some(value) = result.ok().flatten() {
+            assert!(value.source.contains("s=9"), "{}", value.source);
+        }
+    }
+
+    #[test]
+    fn reconstructs_while_with_adjacent_variable_or_assignment_initializer() {
+        for source in [
+            "function f(n,out){let s=41;while(s!=76)s==41?(s=n?91:76):s==91&&(out.push(1),s=76);return out;}",
+            "function f(n,out){let s;s=41;while(s!=76)s==41?(s=n?91:76):s==91&&(out.push(1),s=76);return out;}",
+        ] {
+            let outcome = deobfuscate(source, 12, &WorkBudget::unlimited("while-recovery"));
+            assert!(outcome.is_ok());
+            if let Some(value) = outcome.ok().flatten() {
+                assert!(value.source.contains("if (n)"), "{}", value.source);
+                assert!(!value.source.contains("while(s!=76)"), "{}", value.source);
+                assert_eq!(value.transforms.get("if_ladder_structured"), Some(&1));
+            }
+        }
+        let separated = "function f(n){let s=41;sideEffect();while(s!=76)s==41?(s=n?91:76):s==91&&(s=76);return s;}";
+        let outcome = deobfuscate(separated, 12, &WorkBudget::unlimited("while-separation"));
+        assert!(outcome.is_ok());
+        if let Some(value) = outcome.ok().flatten() {
+            assert!(value.source.contains("while(s!=76)"), "{}", value.source);
         }
     }
 

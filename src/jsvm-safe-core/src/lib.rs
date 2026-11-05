@@ -556,6 +556,22 @@ struct Collector<'s, 'c> {
 }
 
 impl Collector<'_, '_> {
+    fn reconstruct_while_pairs(&mut self, statements: &[Statement<'_>]) {
+        for pair in statements.windows(2) {
+            if let [initial, Statement::WhileStatement(loop_stmt)] = pair {
+                if let Some(code) =
+                    if_ladder_structure::reconstruct_while_adjacent(initial, loop_stmt, self.source)
+                {
+                    self.push(
+                        Span::new(initial.span().start, loop_stmt.span.end),
+                        code,
+                        "if_ladder_structured",
+                    );
+                }
+            }
+        }
+    }
+
     // A local scalar that has no remaining lexical reads after structural
     // reconstruction cannot make numeric state assignments observable.
     // Avoid arguments aliasing and direct eval, both of which can observe
@@ -581,7 +597,9 @@ impl Collector<'_, '_> {
         let Some(symbol) = self.scoping.get_reference(reference).symbol_id() else {
             return false;
         };
-        self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
+        self.scoping.symbol_flags(symbol).is_variable()
+            && !self.scoping.symbol_flags(symbol).is_const_variable()
+            && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
             && self
                 .scoping
                 .get_resolved_reference_ids(symbol)
@@ -957,7 +975,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_while_statement(self, it);
     }
 
+    fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
+        self.reconstruct_while_pairs(&it.statements);
+        walk::walk_function_body(self, it);
+    }
+
     fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
+        self.reconstruct_while_pairs(&it.body);
         for stmt in &it.body {
             if let Statement::EmptyStatement(empty) = stmt {
                 self.push(empty.span, String::new(), "remove_empty_block_statement");
