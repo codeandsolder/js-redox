@@ -213,7 +213,7 @@ fn match_root(
 ) -> Result<Vec<(usize, ModuleSourceIdentity)>> {
     let mut out = Vec::new();
     for &idx in raw_index.get(&source.output_path).into_iter().flatten() {
-        let identity = source_identity(project, &units[idx], &bodies, budget)?;
+        let identity = source_identity(project, &units[idx], bodies, budget)?;
         anyhow::ensure!(
             identity.raw_sha256 == source.sha256 && source.matches_manifest_sha256,
             "raw HTML root digest changed: {}",
