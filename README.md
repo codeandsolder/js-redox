@@ -46,6 +46,15 @@ For source files whose structural scan reports a lazy-registry indirect-call can
   --output work/lazy-cell-explained
 ```
 
+The separate research-grade `lazy-resolver-probe` example can derive *possible* phase values from proven prototype-method phase closures and check each exact handler capture against independently proven state-field, prototype-carrier, and resolver-index semantics. It is intentionally opt-in and keeps its output distinct from the source project:
+
+```sh
+cargo +1.99.1 run --locked -p jsvm-lift --example lazy-resolver-probe -- \
+  path/to/embedded-child.js
+```
+
+Its JSON reports `conditional_phases`: `compatible_return_structure=true` means the original handler is selected **under that explicit phase premise**. It does **not** prove the phase at a particular interpreter call, registry-slot persistence, or an observed invocation. The optional final integer argument limits focused analysis to the first N independently proven handler captures; omitting it examines all.
+
 This deliberately stays outside the fast default browser-project pipeline. Its `analysis.json` records SHA-256-bound source spans, exact constructor/receiver origin, specialized lazy-cell factory calls, original registry-install provenance, and individually proven captured handler functions. `handlers/` contains independently formatted readable views of those original function literals with a local navigation README. A proof that a wrapper **captured** a handler is not a proof that a given browser invocation **returned or executed** that handler: dynamic resolver phases, registry-slot persistence, and observed control flow remain separate obligations. An existing nonempty output directory is refused to avoid stale generated files.
 
 ## Pinned real-corpus evaluation
