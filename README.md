@@ -65,6 +65,30 @@ Its JSON reports `conditional_phases`: `compatible_return_structure=true` means 
 
 This deliberately stays outside the fast default browser-project pipeline. Its `analysis.json` records SHA-256-bound source spans, exact constructor/receiver origin, specialized lazy-cell factory calls, original registry-install provenance, and individually proven captured handler functions. `handlers/` contains independently formatted readable views of those original function literals with a local navigation README. A proof that a wrapper **captured** a handler is not a proof that a given browser invocation **returned or executed** that handler: dynamic resolver phases, registry-slot persistence, and observed control flow remain separate obligations. An existing nonempty output directory is refused to avoid stale generated files.
 
+## Readable JavaScript source-tree reconstruction
+
+A browser capture is **not** required to statically reconstruct ordinary JavaScript files.
+The source-tree mode recursively scans JS, MJS, and CJS files, applies AST-driven
+constant recovery, nested numeric-state control-flow reconstruction (for and
+adjacent-initializer while dispatch), and removal of unread dispatcher-state
+writes, then writes a **navigable directory of real transformed JavaScript**.
+The original source directory is not modified.
+
+```sh
+cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- source-tree   path/to/original-js-tree work/readable-js-tree --max-iterations 12 --format-output
+```
+
+The output preserves relative source paths and contains linked README.md
+navigation plus reconstruction.json with per-file transformation counts.
+The --format-output flag creates an **analyst presentation view**: it may alter
+behavior in code that inspects Function#toString. Omit it when textual fidelity
+matters. Unknown control-flow shapes are left intact and inputs that could not
+be recovered are preserved, explicitly labeled rather than silently omitted.
+
+This mode starts from local JavaScript sources. Acquiring HTML/script URLs
+and resolving indirect dynamic imports remain separate tasks, and a static
+reconstruction does not prove a particular browser execution.
+
 ## Pinned real-corpus evaluation
 
 `corpus-eval` is the single engine-facing evaluator for pinned private/real-world JavaScript corpora. The manifest owns capture hashes and acceptance policy; the evaluator formats, safe-deobfuscates, and structurally scans each raw sample through the Rust library APIs in-process. Node is used only as an independent syntax check for generated analyst/deobfuscated source. Reference samples are hash-verified but never executed.
