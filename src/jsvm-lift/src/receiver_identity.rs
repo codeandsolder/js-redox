@@ -3007,6 +3007,67 @@ pub fn audit_prototype_method_phase_binding_mutation(
     })
 }
 
+/// Identity of the phase function after its structurally proven IIFE
+/// initialization, with no source-level way to overwrite the binding.
+/// This does not prove that any particular later call was made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenStablePrototypePhaseFunction {
+    pub closure: ProvenPrototypeMethodPhaseClosure,
+    pub mutation: PhaseBindingMutationAudit,
+}
+
+/// The result the stable original phase function would return *if called at
+/// the exact event*, where the captured lexical equality has been proved.
+/// Neither a call nor the value of that equality at later events is implied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenOriginalPhaseReturnAtEvent {
+    pub phase: ProvenPrototypeMethodPhaseAtEvent,
+    pub stable_function: ProvenStablePrototypePhaseFunction,
+}
+
+/// A source-wide theorem, independent of any particular VM or runtime trace:
+/// after its guaranteed IIFE initialization this exact lexical binding cannot
+/// be overwritten via resolved writes, direct eval, or with scope injection.
+/// Root/global bindings are excluded because they can be mutated externally.
+pub fn proven_stable_prototype_phase_function(
+    semantic: &Semantic<'_>,
+    closure: &ProvenPrototypeMethodPhaseClosure,
+    budget: &WorkBudget,
+) -> Result<Option<ProvenStablePrototypePhaseFunction>, BudgetExceeded> {
+    let audit = audit_prototype_method_phase_binding_mutation(semantic, closure, budget)?;
+    Ok(audit
+        .source_mutation_isolated
+        .then(|| ProvenStablePrototypePhaseFunction {
+            closure: closure.clone(),
+            mutation: audit,
+        }))
+}
+
+/// Join a stable lexical function with independently proved equality at the
+/// same event. The result is not an observed function invocation witness.
+pub fn proven_original_prototype_phase_return_at_event(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    closure: &ProvenPrototypeMethodPhaseClosure,
+    event: Span,
+    budget: &WorkBudget,
+) -> Result<Option<ProvenOriginalPhaseReturnAtEvent>, BudgetExceeded> {
+    let Some(phase) =
+        proven_prototype_method_phase_at_event(source, program, semantic, closure, event)
+    else {
+        return Ok(None);
+    };
+    let Some(stable_function) = proven_stable_prototype_phase_function(semantic, closure, budget)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ProvenOriginalPhaseReturnAtEvent {
+        phase,
+        stable_function,
+    }))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenPrototypeMethodPhaseAtEvent {
     pub closure: ProvenPrototypeMethodPhaseClosure,
@@ -7557,6 +7618,97 @@ mod tests {
                 "{injected}"
             );
             assert!(!audit.root_scope_binding);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn original_phase_return_requires_stable_lexical_identity() -> TestResult {
+        use super::{
+            proven_original_prototype_phase_return_at_event,
+            proven_stable_prototype_phase_function,
+            structurally_proven_prototype_method_phase_closures,
+        };
+
+        let template = r#"
+            (function() {
+                const C = function() {};
+                let phase;
+                C.prototype.run = function(left, right) {
+                    return left = (right = {}, phase = function() {
+                        return right == left ? 23 : 50;
+                    }, {}), function() {
+                        for (let state = 0; state !== 99;) {
+                            if (state === 0) { right = left; event(); state = 99; }
+                            else if (state === 1) { state = 99; }
+                            else if (state === 2) { state = 99; }
+                            else if (state === 3) { state = 99; }
+                        }
+                    };
+                }();
+                /*injected*/
+            })();
+            (function() {
+                let phase;
+                function unrelated(code) { return eval(code); }
+            })();
+        "#;
+        let cases = [
+            ("", true),
+            ("function hazard(code) { return eval(code); }", false),
+            ("phase = function changed() { return 0; };", false),
+            ("with ({}) { use(); }", false),
+            ("function shadow(phase, code) { return eval(code); }", true),
+        ];
+        for (injected, expected) in cases {
+            let source = template.replace("/*injected*/", injected);
+            let allocator = Allocator::default();
+            let parsed = parse_program(&allocator, &source, SourceType::cjs());
+            assert!(parsed.is_clean(), "case: {injected}");
+            let built = SemanticBuilder::new()
+                .with_build_nodes(true)
+                .with_cfg(true)
+                .build(&parsed.program);
+            assert!(built.diagnostics.is_empty(), "case: {injected}");
+            let closures = test_proof(structurally_proven_prototype_method_phase_closures(
+                &parsed.program,
+                built.semantic.scoping(),
+                &test_budget(),
+            ));
+            assert_eq!(closures.len(), 1, "case: {injected}");
+            let start = source_offset(&source, "event()", "event")?;
+            let event = Span::new(start, start + 7);
+            let equality = super::proven_prototype_method_phase_at_event(
+                &source,
+                &parsed.program,
+                &built.semantic,
+                &closures[0],
+                event,
+            );
+            assert_eq!(
+                equality.as_ref().map(|proof| proof.value),
+                Some(23),
+                "{injected}"
+            );
+            let stable = test_proof(proven_stable_prototype_phase_function(
+                &built.semantic,
+                &closures[0],
+                &test_budget(),
+            ));
+            assert_eq!(stable.is_some(), expected, "{injected}");
+            let joined = test_proof(proven_original_prototype_phase_return_at_event(
+                &source,
+                &parsed.program,
+                &built.semantic,
+                &closures[0],
+                event,
+                &test_budget(),
+            ));
+            assert_eq!(joined.is_some(), expected, "{injected}");
+            if let Some(proof) = joined {
+                assert_eq!(proof.phase.value, 23, "{injected}");
+                assert_eq!(proof.phase.closure, proof.stable_function.closure);
+            }
         }
         Ok(())
     }
