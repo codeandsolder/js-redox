@@ -2914,99 +2914,6 @@ pub struct ProvenPrototypeMethodPhaseClosure {
     pub unequal_value: i64,
 }
 
-/// Scope-aware mutation hazards for a phase function created by an IIFE.
-///
-/// This is deliberately an audit, not a proof of execution ordering:
-/// initialization must still precede a dependent factory call, and
-/// intervening calls must preserve the phase function's value.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PhaseBindingMutationAudit {
-    /// Source-level writes to the same resolved binding, not name matches.
-    pub explicit_writes: Vec<Span>,
-    /// Whether the unique explicit write is the proven phase-function assignment.
-    pub unique_initialization_write: bool,
-    /// Direct eval calls in a lexical scope where this binding is visible.
-    /// Any such call may mutate the binding using dynamically constructed code.
-    pub lexical_direct_eval_calls: Vec<Span>,
-    /// With statements in scopes where the binding is visible.
-    pub lexical_with_statements: Vec<Span>,
-    /// Root-script var bindings can also be observable as global properties.
-    pub root_scope_binding: bool,
-    /// No visible second write, lexical eval, with, or global-object exposure.
-    /// This does not prove that the initialization executed before a later read.
-    pub source_mutation_isolated: bool,
-}
-
-/// Audit mutation hazards which may invalidate a captured phase function after
-/// its structurally proven installation. A pure IIFE assignment plus a single
-/// explicit write is not enough if nested handlers can execute direct eval.
-///
-/// A local callable named eval may contain the native eval, so syntactic direct
-/// eval calls are retained as hazards even when the identifier is bound.
-pub fn audit_prototype_method_phase_binding_mutation(
-    semantic: &Semantic<'_>,
-    closure: &ProvenPrototypeMethodPhaseClosure,
-    budget: &WorkBudget,
-) -> Result<PhaseBindingMutationAudit, BudgetExceeded> {
-    let scoping = semantic.scoping();
-    let symbol = closure.phase_binding_symbol;
-    let name = scoping.symbol_name(symbol);
-    let mut explicit_writes = Vec::new();
-    for reference_id in scoping.get_resolved_reference_ids(symbol) {
-        budget.consume(1)?;
-        let reference = scoping.get_reference(*reference_id);
-        if reference.is_write() {
-            explicit_writes.push(semantic.nodes().get_node(reference.node_id()).kind().span());
-        }
-    }
-    explicit_writes.sort_unstable_by_key(|span| (span.start, span.end));
-    explicit_writes.dedup();
-    let unique_initialization_write = matches!(explicit_writes.as_slice(), [write]
-        if closure.phase_assignment_start <= write.start
-           && write.end <= closure.phase_assignment_end);
-
-    let mut lexical_direct_eval_calls = Vec::new();
-    let mut lexical_with_statements = Vec::new();
-    for node in semantic.nodes().iter() {
-        budget.consume(1)?;
-        let visible = scoping.find_binding(node.scope_id(), name.into()) == Some(symbol);
-        if !visible {
-            continue;
-        }
-        match node.kind() {
-            oxc_ast::AstKind::CallExpression(call) if !call.optional => {
-                if matches!(last_sequence_expression(&call.callee), Expression::Identifier(id)
-                    if id.name == "eval")
-                {
-                    lexical_direct_eval_calls.push(call.span);
-                }
-            }
-            oxc_ast::AstKind::WithStatement(statement) => {
-                lexical_with_statements.push(statement.span);
-            }
-            _ => {}
-        }
-    }
-    lexical_direct_eval_calls.sort_unstable_by_key(|span| (span.start, span.end));
-    lexical_direct_eval_calls.dedup();
-    lexical_with_statements.sort_unstable_by_key(|span| (span.start, span.end));
-    lexical_with_statements.dedup();
-    let root_scope_binding = scoping.symbol_scope_id(symbol) == scoping.root_scope_id();
-    let source_mutation_isolated = unique_initialization_write
-        && lexical_direct_eval_calls.is_empty()
-        && lexical_with_statements.is_empty()
-        && !root_scope_binding;
-
-    Ok(PhaseBindingMutationAudit {
-        explicit_writes,
-        unique_initialization_write,
-        lexical_direct_eval_calls,
-        lexical_with_statements,
-        root_scope_binding,
-        source_mutation_isolated,
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenPrototypeMethodPhaseAtEvent {
     pub closure: ProvenPrototypeMethodPhaseClosure,
@@ -7476,10 +7383,8 @@ mod tests {
 
     #[test]
     fn phase_binding_audit_distinguishes_lexical_eval_and_explicit_writes() -> TestResult {
-        use super::{
-            audit_prototype_method_phase_binding_mutation,
-            structurally_proven_prototype_method_phase_closures,
-        };
+        use super::structurally_proven_prototype_method_phase_closures;
+        use crate::lexical_mutation::audit_lexical_binding_mutation;
 
         // The other IIFE has a same-name binding but cannot mutate ours.
         // A nested eval in our IIFE *can*, even though Oxc sees only the
@@ -7538,19 +7443,20 @@ mod tests {
                 &test_budget(),
             ));
             assert_eq!(closures.len(), 1, "case: {injected}");
-            let audit = test_proof(audit_prototype_method_phase_binding_mutation(
+            let audit = test_proof(audit_lexical_binding_mutation(
                 &semantic.semantic,
-                &closures[0],
+                closures[0].phase_binding_symbol,
+                Span::new(
+                    closures[0].phase_assignment_start,
+                    closures[0].phase_assignment_end,
+                ),
                 &test_budget(),
             ));
             assert_eq!(
                 audit.source_mutation_isolated, expected_isolated,
                 "{injected}"
             );
-            assert_eq!(
-                audit.unique_initialization_write, expected_unique,
-                "{injected}"
-            );
+            assert_eq!(audit.unique_expected_write, expected_unique, "{injected}");
             assert_eq!(
                 audit.lexical_direct_eval_calls.len(),
                 expected_eval,
