@@ -11,6 +11,10 @@ export function validateTraceSpec(spec) {
   if (!Number.isSafeInteger(maxScopeProperties) || maxScopeProperties < 1 || maxScopeProperties > 64) {
     throw new Error("maxScopeProperties must be an integer from 1 to 64");
   }
+  const maxFunctionLocations = spec.maxFunctionLocations ?? 16;
+  if (!Number.isSafeInteger(maxFunctionLocations) || maxFunctionLocations < 0 || maxFunctionLocations > 64) {
+    throw new Error("maxFunctionLocations must be an integer from 0 to 64");
+  }
   const points = spec.points.map((point, index) => {
     const selectors = ["url", "urlRegex", "scriptHash"].filter(
       (name) => typeof point?.[name] === "string" && point[name].length > 0,
@@ -39,7 +43,7 @@ export function validateTraceSpec(spec) {
       expressions,
     };
   });
-  return { schema: "js-redox/selective-trace-config/v1", maxHits, maxScopeProperties, points };
+  return { schema: "js-redox/selective-trace-config/v1", maxHits, maxScopeProperties, maxFunctionLocations, points };
 }
 
 export function breakpointParams(point) {
@@ -63,6 +67,40 @@ export function compactRemoteValue(remote) {
   return value;
 }
 
+// DevTools represents a function's actual definition as an internal
+// [[FunctionLocation]] property. Its script ID is scoped to this CDP session.
+// Never infer a function's identity from its display name or source string.
+export function parseFunctionDefinition(properties) {
+  const internal = properties?.internalProperties;
+  if (!Array.isArray(internal)) return null;
+  const location = internal.find((entry) => entry?.name === "[[FunctionLocation]]")?.value?.value;
+  if (!location || typeof location !== "object" ||
+      typeof location.scriptId !== "string" || location.scriptId.length === 0 ||
+      !Number.isSafeInteger(location.lineNumber) || location.lineNumber < 0 ||
+      !Number.isSafeInteger(location.columnNumber) || location.columnNumber < 0) {
+    return null;
+  }
+  return {
+    scriptId: location.scriptId,
+    lineNumber: location.lineNumber,
+    columnNumber: location.columnNumber,
+    evidence: "Runtime.getProperties.internalProperties.[[FunctionLocation]]",
+  };
+}
+
+export async function inspectFunctionDefinition(session, remote) {
+  if (remote?.type !== "function" || typeof remote.objectId !== "string") return null;
+  try {
+    const properties = await session.send("Runtime.getProperties", {
+      objectId: remote.objectId, ownProperties: true, generatePreview: false,
+    });
+    return parseFunctionDefinition(properties);
+  } catch {
+    // Bound/native/proxy functions and inspector errors may have no source location.
+    return null;
+  }
+}
+
 async function identityFor(session, remote) {
   if (!remote?.objectId) return null;
   try {
@@ -77,9 +115,24 @@ export async function capturePausedWitness(session, event, point, config) {
   const frames = (event.callFrames || []).slice(0, 16).map((frame) => ({
     functionName: frame.functionName || "",
     location: frame.location,
+    functionLocation: frame.functionLocation ?? null,
     url: frame.url || "",
   }));
   const topFrame = event.callFrames?.[0];
+  // One paused-state budget shared across local/closure and explicit expressions.
+  // Reuse identical inspector handles; they are only valid within this pause.
+  const definitionCache = new Map();
+  let remainingDefinitions = config.maxFunctionLocations ?? 16;
+  async function attachFunctionDefinition(remote, record) {
+    if (remote?.type !== "function" || !remote.objectId) return;
+    if (!definitionCache.has(remote.objectId)) {
+      if (remainingDefinitions === 0) return;
+      remainingDefinitions -= 1;
+      definitionCache.set(remote.objectId, await inspectFunctionDefinition(session, remote));
+    }
+    const definition = definitionCache.get(remote.objectId);
+    if (definition) record.functionDefinition = definition;
+  }
   const scopes = [];
   if (topFrame) {
     for (const scope of (topFrame.scopeChain || []).filter(
@@ -101,6 +154,7 @@ export async function capturePausedWitness(session, event, point, config) {
                 : { status: prop.get || prop.set ? "accessor_not_called" : "unavailable" }),
             };
             if (prop.value?.objectId) entry.heapObjectId = await identityFor(session, prop.value);
+            if (entry.value) await attachFunctionDefinition(prop.value, entry.value);
             row.variables.push(entry);
           }
         } catch (error) {
@@ -123,6 +177,7 @@ export async function capturePausedWitness(session, event, point, config) {
       } else {
         const value = compactRemoteValue(result.result);
         if (result.result?.objectId) value.heapObjectId = await identityFor(session, result.result);
+        await attachFunctionDefinition(result.result, value);
         expressions.push({ expression, status: "observed", value });
       }
     } catch (error) {
