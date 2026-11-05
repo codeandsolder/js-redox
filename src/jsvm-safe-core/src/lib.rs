@@ -1044,6 +1044,14 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_logical_expression(self, it);
     }
 
+    fn visit_sequence_expression(&mut self, it: &oxc_ast::ast::SequenceExpression<'a>) {
+        if let Some(replacement) = trivial_loops::prune_inert_sequence_values(it, self.source) {
+            self.push(it.span, replacement, "prune_inert_sequence_values");
+            return;
+        }
+        walk::walk_sequence_expression(self, it);
+    }
+
     fn visit_conditional_expression(&mut self, it: &oxc_ast::ast::ConditionalExpression<'a>) {
         if let Some(test) = known_bool(&it.test) {
             let selected = if test { &it.consequent } else { &it.alternate };

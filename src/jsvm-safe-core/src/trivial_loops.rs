@@ -4,8 +4,8 @@
 
 use crate::fragment;
 use oxc_ast::ast::{
-    Expression, ForStatement, Statement, VariableDeclaration, VariableDeclarationKind,
-    WhileStatement,
+    Expression, ForStatement, SequenceExpression, Statement, VariableDeclaration,
+    VariableDeclarationKind, WhileStatement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_span::GetSpan;
@@ -64,6 +64,71 @@ pub(crate) fn inert_literal_statement(expr: &Expression<'_>) -> bool {
         // String literals can be directive prologues; never remove them.
         _ => false,
     }
+}
+
+/// A comma expression discards its operands' values but preserves their
+/// effects, and GetValue on the final operand. Dropping the final comma
+/// entirely can change direct eval and member-method receiver identity.
+/// Only collapse to the final expression if its AST produces a value, not a
+/// Reference. Otherwise keep an effectful prefix to retain comma semantics.
+fn inherently_value(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => inherently_value(&paren.expression),
+        Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::TemplateLiteral(_)
+        | Expression::ArrayExpression(_)
+        | Expression::ArrowFunctionExpression(_)
+        | Expression::AssignmentExpression(_)
+        | Expression::AwaitExpression(_)
+        | Expression::BinaryExpression(_)
+        | Expression::CallExpression(_)
+        | Expression::ClassExpression(_)
+        | Expression::ConditionalExpression(_)
+        | Expression::FunctionExpression(_)
+        | Expression::ImportExpression(_)
+        | Expression::LogicalExpression(_)
+        | Expression::NewExpression(_)
+        | Expression::ObjectExpression(_)
+        | Expression::SequenceExpression(_)
+        | Expression::TaggedTemplateExpression(_)
+        | Expression::ThisExpression(_)
+        | Expression::UnaryExpression(_)
+        | Expression::UpdateExpression(_)
+        | Expression::YieldExpression(_)
+        | Expression::PrivateInExpression(_)
+        | Expression::ImportMeta(_)
+        | Expression::NewTarget(_) => true,
+        // Identifier, member, super, optional chain and unmodelled syntax
+        // may produce a Reference. Do not turn an indirect eval into direct
+        // eval or change the this-binding of an extracted method.
+        _ => false,
+    }
+}
+
+pub(crate) fn prune_inert_sequence_values(
+    expr: &SequenceExpression<'_>,
+    source: &str,
+) -> Option<String> {
+    let (last, preceding) = expr.expressions.split_last()?;
+    let mut retained = Vec::new();
+    let mut removed = 0usize;
+    for candidate in preceding {
+        if inert_literal_statement(candidate) || matches!(candidate, Expression::StringLiteral(_)) {
+            removed += 1;
+        } else {
+            retained.push(fragment(source, candidate.span()));
+        }
+    }
+    if removed == 0 || (retained.is_empty() && !inherently_value(last)) {
+        return None;
+    }
+    retained.push(fragment(source, last.span()));
+    Some(format!("({})", retained.join(", ")))
 }
 
 fn literal_bool(expr: &Expression<'_>, expected: bool) -> bool {
@@ -132,6 +197,26 @@ mod tests {
             deobfuscate(input, 12, &WorkBudget::unlimited("trivial-loops"))?
                 .map_or_else(|| input.to_owned(), |result| result.source),
         )
+    }
+
+    #[test]
+    fn strips_inert_sequence_prefix_without_dropping_effects() -> Result<(), BudgetExceeded> {
+        let source = "function f(){let n=0;const x=(n++,false,7);return [x,n];}";
+        let result = rewritten(source)?;
+        assert!(!result.contains("false,7"), "{result}");
+        assert!(result.contains("n++"), "{result}");
+        let source = "function f(){const x=(false,68)==68;return x;}";
+        let result = rewritten(source)?;
+        assert!(!result.contains("false,68"), "{result}");
+        // Removing the final comma would change method receiver identity and
+        // convert an indirect eval into a direct eval.
+        let source = "function f(obj){return (0,obj.method)();}";
+        let result = rewritten(source)?;
+        assert!(result.contains("(0,obj.method)"), "{result}");
+        let source = "function f(){return (0,eval)('2+2');}";
+        let result = rewritten(source)?;
+        assert!(result.contains("(0,eval)"), "{result}");
+        Ok(())
     }
 
     #[test]
