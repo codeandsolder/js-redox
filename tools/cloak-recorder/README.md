@@ -133,3 +133,19 @@ actual paused call stacks, local and closure variable descriptors, expression
 results and session-local heap object identities when available. V8 is resumed
 after every attempted capture. These are observations from selected executions,
 not proofs of all possible branches or handlers. Tracing affects timing.
+
+
+### Resolving observed function definitions
+
+When the selected breakpoint exposes a JavaScript function value, the recorder
+reads V8's internal [[FunctionLocation]] descriptor through
+Runtime.getProperties without invoking the function, getters, or proxy traps.
+Only a structurally valid (scriptId, lineNumber, columnNumber) location is
+recorded; native, bound, proxy or unavailable locations remain unresolved.
+The per-pause maxFunctionLocations setting defaults to 16 and accepts 0-64,
+with inspector handles cached only during that pause. The Rust importer
+independently joins each location to the exact captured CDP session/script
+identity before the source graph and the human-readable invocation pages link
+to its original source definition. Such a link proves a function value was
+observed with that code location, not that the function was invoked,
+that its closure contents are known, or that every possible input selects it.
