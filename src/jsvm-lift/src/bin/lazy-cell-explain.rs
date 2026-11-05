@@ -2,7 +2,7 @@ use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use jsvm_lift::{
     forwarding_semantics::structurally_proven_lazy_registry_read_calls,
-    function_surface::analyze_function_source_surface,
+    function_surface::analyze_function_source_surfaces,
     lazy_cell::{
         proven_slow_lazy_cell_captured_handler_install,
         proven_slow_lazy_cell_exact_registry_assignments, proven_slow_lazy_cell_factory_call,
@@ -199,17 +199,22 @@ fn main() -> Result<()> {
     // Source behavior annotations are deliberately independent of the proof
     // that the original function is captured or ever executed. All nested
     // effects are tagged with their lexical function depth.
-    let mut handler_surfaces = Vec::new();
-    for capture in &captured_handlers {
-        budget.consume(1)?;
-        let [start, end] = capture.handler;
-        let surface =
-            analyze_function_source_surface(&source, semantic, Span::new(start, end), &budget)?
-                .with_context(|| {
-                    format!("handler source is not an exact unique function at {start}..{end}")
-                })?;
-        handler_surfaces.push(surface);
-    }
+    let spans = captured_handlers
+        .iter()
+        .map(|capture| Span::new(capture.handler[0], capture.handler[1]))
+        .collect::<Vec<_>>();
+    let handler_surfaces = analyze_function_source_surfaces(&source, semantic, &spans, &budget)?
+        .into_iter()
+        .zip(&captured_handlers)
+        .map(|(surface, capture)| {
+            surface.with_context(|| {
+                format!(
+                    "handler source is not an exact unique function at {}..{}",
+                    capture.handler[0], capture.handler[1]
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let source_sha256 = sha256_hex(source.as_bytes());
     let report = json!({

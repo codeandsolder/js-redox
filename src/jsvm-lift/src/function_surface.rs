@@ -6,10 +6,10 @@ use oxc_ast::{ast::Expression, AstKind};
 use oxc_semantic::Semantic;
 use oxc_span::{GetSpan, Span};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use work_budget::{BudgetExceeded, WorkBudget};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FunctionSurfaceEvent {
     pub kind: &'static str,
     pub span: [u32; 2],
@@ -18,7 +18,7 @@ pub struct FunctionSurfaceEvent {
     pub expression: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FunctionExternalReference {
     pub name: String,
     pub declaration: Option<[u32; 2]>,
@@ -26,7 +26,7 @@ pub struct FunctionExternalReference {
     pub writes: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FunctionSourceSurface {
     pub function: [u32; 2],
     pub nested_functions: Vec<[u32; 2]>,
@@ -92,75 +92,52 @@ fn member_target_kind(target: &oxc_ast::ast::AssignmentTarget<'_>) -> Option<&'s
     }
 }
 
-/// Resolve the exact function in an existing semantic AST and inventory source
-/// behavior. This is a syntax and lexical-identity index, not execution or
-/// side-effect proof. Returns None for an ambiguous or missing function span.
-pub fn analyze_function_source_surface(
-    source: &str,
-    semantic: &Semantic<'_>,
+#[derive(Debug)]
+struct SurfaceAccumulator {
     span: Span,
-    budget: &WorkBudget,
-) -> Result<Option<FunctionSourceSurface>, BudgetExceeded> {
-    let nodes = semantic.nodes();
-    let targets = nodes
-        .iter_enumerated()
-        .filter(|(_, node)| {
-            node.kind().span() == span
-                && matches!(
-                    node.kind(),
-                    AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
-                )
-        })
-        .map(|(id, _)| id)
-        .collect::<Vec<_>>();
-    let [target] = targets.as_slice() else {
-        return Ok(None);
-    };
-    let mut calls = Vec::new();
-    let mut effects = Vec::new();
-    let mut nested_functions = Vec::new();
-    let mut references = BTreeMap::<(String, Option<(u32, u32)>), (usize, usize)>::new();
+    nested_functions: Vec<[u32; 2]>,
+    references: BTreeMap<(String, Option<(u32, u32)>), (usize, usize)>,
+    calls: Vec<FunctionSurfaceEvent>,
+    effects: Vec<FunctionSurfaceEvent>,
+}
 
-    for (id, node) in nodes.iter_enumerated() {
-        budget.consume(1)?;
-        let current = node.kind().span();
-        if current.start < span.start || current.end > span.end || id == *target {
-            continue;
+impl SurfaceAccumulator {
+    fn new(span: Span) -> Self {
+        Self {
+            span,
+            nested_functions: Vec::new(),
+            references: BTreeMap::new(),
+            calls: Vec::new(),
+            effects: Vec::new(),
         }
-        let mut depth = 0_usize;
-        let mut belongs = nodes.parent_id(id) == *target;
-        for ancestor in nodes.ancestor_ids(id) {
-            if ancestor == *target {
-                belongs = true;
-                break;
-            }
-            if matches!(
-                nodes.kind(ancestor),
-                AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
-            ) {
-                depth += 1;
-            }
-        }
-        if !belongs {
-            continue;
-        }
+    }
 
-        let mut event = |kind, event_span: Span, expression: Option<String>, is_call: bool| {
-            let item = FunctionSurfaceEvent {
-                kind,
-                span: range(event_span),
-                lexical_depth: depth,
-                expression,
-            };
-            if is_call {
-                calls.push(item);
-            } else {
-                effects.push(item);
-            }
+    fn add_event(
+        &mut self,
+        kind: &'static str,
+        event_span: Span,
+        expression: Option<String>,
+        lexical_depth: usize,
+        is_call: bool,
+    ) {
+        let item = FunctionSurfaceEvent {
+            kind,
+            span: range(event_span),
+            lexical_depth,
+            expression,
         };
-        match node.kind() {
-            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) => {
-                nested_functions.push(range(current));
+        if is_call {
+            self.calls.push(item);
+        } else {
+            self.effects.push(item);
+        }
+    }
+
+    fn observe(&mut self, source: &str, semantic: &Semantic<'_>, kind: AstKind<'_>, depth: usize) {
+        match kind {
+            AstKind::Function(function) => self.nested_functions.push(range(function.span)),
+            AstKind::ArrowFunctionExpression(function) => {
+                self.nested_functions.push(range(function.span));
             }
             AstKind::IdentifierReference(identifier) => {
                 let resolved = identifier
@@ -170,15 +147,16 @@ pub fn analyze_function_source_surface(
                 let declaration = resolved
                     .and_then(|reference| reference.symbol_id())
                     .map(|symbol| semantic.scoping().symbol_span(symbol));
-                if declaration.is_some_and(|decl| span.start <= decl.start && decl.end <= span.end)
+                if declaration
+                    .is_some_and(|decl| self.span.start <= decl.start && decl.end <= self.span.end)
                 {
-                    continue;
+                    return;
                 }
                 let key = (
                     identifier.name.to_string(),
                     declaration.map(|decl| (decl.start, decl.end)),
                 );
-                let entry = references.entry(key).or_default();
+                let entry = self.references.entry(key).or_default();
                 if resolved.is_none_or(|reference| reference.is_read()) {
                     entry.0 += 1;
                 }
@@ -187,35 +165,59 @@ pub fn analyze_function_source_surface(
                 }
             }
             AstKind::CallExpression(call) => {
-                event(
+                self.add_event(
                     call_kind(&call.callee),
                     call.span,
                     preview(source, call.callee.span()),
+                    depth,
                     true,
                 );
                 if !call.optional && is_ident(&call.callee, "eval") {
-                    event("direct_eval_candidate", call.span, None, false);
+                    self.add_event("direct_eval_candidate", call.span, None, depth, false);
                 }
                 if is_ident(&call.callee, "Function") {
-                    event("function_constructor_candidate", call.span, None, false);
+                    self.add_event(
+                        "function_constructor_candidate",
+                        call.span,
+                        None,
+                        depth,
+                        false,
+                    );
                 }
             }
             AstKind::NewExpression(expr) => {
-                event(
+                self.add_event(
                     "constructor_call",
                     expr.span,
                     preview(source, expr.callee.span()),
+                    depth,
                     true,
                 );
                 if is_ident(&expr.callee, "Function") {
-                    event("function_constructor_candidate", expr.span, None, false);
+                    self.add_event(
+                        "function_constructor_candidate",
+                        expr.span,
+                        None,
+                        depth,
+                        false,
+                    );
                 }
             }
-            AstKind::ImportExpression(expr) => event("dynamic_import", expr.span, None, false),
-            AstKind::WithStatement(expr) => event("dynamic_with", expr.span, None, false),
+            AstKind::ImportExpression(expr) => {
+                self.add_event("dynamic_import", expr.span, None, depth, false);
+            }
+            AstKind::WithStatement(expr) => {
+                self.add_event("dynamic_with", expr.span, None, depth, false);
+            }
             AstKind::AssignmentExpression(expr) => {
                 if let Some(kind) = member_target_kind(&expr.left) {
-                    event(kind, expr.span, preview(source, expr.left.span()), false);
+                    self.add_event(
+                        kind,
+                        expr.span,
+                        preview(source, expr.left.span()),
+                        depth,
+                        false,
+                    );
                 }
             }
             AstKind::UpdateExpression(expr) => {
@@ -225,57 +227,259 @@ pub fn analyze_function_source_surface(
                         | oxc_ast::ast::SimpleAssignmentTarget::StaticMemberExpression(_)
                         | oxc_ast::ast::SimpleAssignmentTarget::PrivateFieldExpression(_)
                 ) {
-                    event(
+                    self.add_event(
                         "member_update",
                         expr.span,
                         preview(source, expr.argument.span()),
+                        depth,
                         false,
                     );
                 }
             }
             AstKind::UnaryExpression(expr) if expr.operator.as_str() == "delete" => {
-                event(
+                self.add_event(
                     "delete",
                     expr.span,
                     preview(source, expr.argument.span()),
+                    depth,
                     false,
                 );
             }
-            AstKind::ThrowStatement(expr) => event("throw", expr.span, None, false),
+            AstKind::ThrowStatement(expr) => {
+                self.add_event("throw", expr.span, None, depth, false);
+            }
             _ => {}
         }
     }
 
-    let external_references = references
+    fn finish(self) -> FunctionSourceSurface {
+        let external_references = self
+            .references
+            .into_iter()
+            .map(
+                |((name, declaration), (reads, writes))| FunctionExternalReference {
+                    name,
+                    declaration: declaration.map(|(start, end)| [start, end]),
+                    reads,
+                    writes,
+                },
+            )
+            .collect();
+        FunctionSourceSurface {
+            function: range(self.span),
+            nested_functions: self.nested_functions,
+            external_references,
+            calls: self.calls,
+            effects: self.effects,
+            executed_behavior_proven: false,
+        }
+    }
+}
+
+/// Inventory many selected functions in one pass over the semantic AST.
+///
+/// This scales with total AST nodes and lexical nesting depth, rather than
+/// rescanning the entire AST separately for each recovered handler. Source
+/// spans are resolved to unique function nodes before collecting evidence;
+/// missing/ambiguous spans produce None, not a speculative match. Results
+/// preserve the requested order, including duplicates.
+pub fn analyze_function_source_surfaces(
+    source: &str,
+    semantic: &Semantic<'_>,
+    spans: &[Span],
+    budget: &WorkBudget,
+) -> Result<Vec<Option<FunctionSourceSurface>>, BudgetExceeded> {
+    if spans.is_empty() {
+        return Ok(Vec::new());
+    }
+    let nodes = semantic.nodes();
+    let requested = spans
+        .iter()
+        .map(|span| (span.start, span.end))
+        .collect::<BTreeSet<_>>();
+    let mut matching_nodes = BTreeMap::<(u32, u32), Vec<_>>::new();
+
+    for (id, node) in nodes.iter_enumerated() {
+        budget.consume(1)?;
+        let span = node.kind().span();
+        if requested.contains(&(span.start, span.end))
+            && matches!(
+                node.kind(),
+                AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+            )
+        {
+            matching_nodes
+                .entry((span.start, span.end))
+                .or_default()
+                .push(id);
+        }
+    }
+
+    let mut target_by_node = HashMap::new();
+    let mut target_by_span = BTreeMap::new();
+    let mut accumulators = Vec::new();
+    for (span, candidate_nodes) in matching_nodes {
+        let [node_id] = candidate_nodes.as_slice() else {
+            continue;
+        };
+        let index = accumulators.len();
+        target_by_node.insert(*node_id, index);
+        target_by_span.insert(span, index);
+        accumulators.push(SurfaceAccumulator::new(Span::new(span.0, span.1)));
+    }
+
+    if !accumulators.is_empty() {
+        for (id, node) in nodes.iter_enumerated() {
+            budget.consume(1)?;
+            let mut depth = 0;
+            for ancestor in nodes.ancestor_ids(id) {
+                budget.consume(1)?;
+                if let Some(&target_index) = target_by_node.get(&ancestor) {
+                    accumulators[target_index].observe(source, semantic, node.kind(), depth);
+                }
+                if matches!(
+                    nodes.kind(ancestor),
+                    AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+                ) {
+                    depth += 1;
+                }
+            }
+        }
+    }
+
+    let completed = accumulators
         .into_iter()
-        .map(
-            |((name, declaration), (reads, writes))| FunctionExternalReference {
-                name,
-                declaration: declaration.map(|(start, end)| [start, end]),
-                reads,
-                writes,
-            },
-        )
-        .collect();
-    Ok(Some(FunctionSourceSurface {
-        function: range(span),
-        nested_functions,
-        external_references,
-        calls,
-        effects,
-        executed_behavior_proven: false,
-    }))
+        .map(SurfaceAccumulator::finish)
+        .collect::<Vec<_>>();
+    Ok(spans
+        .iter()
+        .map(|span| {
+            target_by_span
+                .get(&(span.start, span.end))
+                .map(|&index| completed[index].clone())
+        })
+        .collect())
+}
+
+/// Inspect one exact function, using the same implementation as batch mode.
+pub fn analyze_function_source_surface(
+    source: &str,
+    semantic: &Semantic<'_>,
+    span: Span,
+    budget: &WorkBudget,
+) -> Result<Option<FunctionSourceSurface>, BudgetExceeded> {
+    Ok(
+        analyze_function_source_surfaces(source, semantic, &[span], budget)?
+            .into_iter()
+            .next()
+            .flatten(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::analyze_function_source_surface;
+    use super::{analyze_function_source_surface, analyze_function_source_surfaces};
     use oxc_allocator::Allocator;
     use oxc_ast::AstKind;
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
     use work_budget::WorkBudget;
+
+    #[test]
+    fn batch_preserves_exact_function_order_and_nested_semantics() {
+        let source = r#"
+            const x = 1;
+            function outer(a) {
+                function inner(z) { return eval(z) + a + x; }
+                return inner(a);
+            }
+            function unrelated() { return eval("0"); }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_build_nodes(true)
+            .build(&parsed.program);
+        let spans = semantic
+            .semantic
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                AstKind::Function(function) => Some(function.span),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(spans.len(), 3);
+        let named_span = |name: &str| {
+            spans
+                .iter()
+                .find(|span| {
+                    source
+                        .get(span.start as usize..span.end as usize)
+                        .is_some_and(|text| text.starts_with(name))
+                })
+                .copied()
+                .expect("named exact function")
+        };
+        let inner_span = named_span("function inner");
+        let outer_span = named_span("function outer");
+        let unrelated_span = named_span("function unrelated");
+        let missing = oxc_span::Span::new(1, 2);
+        let requested = [inner_span, outer_span, missing, outer_span, unrelated_span];
+        let budget = WorkBudget::unlimited("function-surface-batch-test");
+        let batch =
+            analyze_function_source_surfaces(source, &semantic.semantic, &requested, &budget)
+                .expect("batch proof");
+        assert_eq!(batch.len(), requested.len());
+        assert!(batch[2].is_none());
+        assert_eq!(
+            batch[1], batch[3],
+            "duplicate span preserves identical evidence"
+        );
+        for (span, item) in requested.into_iter().zip(batch.iter()) {
+            let single = analyze_function_source_surface(source, &semantic.semantic, span, &budget)
+                .expect("single proof");
+            assert_eq!(&single, item, "batch and singleton must agree");
+        }
+        let inner = batch[0].as_ref().expect("inner");
+        assert_eq!(inner.function, [inner_span.start, inner_span.end]);
+        assert_eq!(
+            inner
+                .effects
+                .iter()
+                .filter(|event| event.kind == "direct_eval_candidate" && event.lexical_depth == 0)
+                .count(),
+            1
+        );
+        let outer = batch[1].as_ref().expect("outer");
+        assert_eq!(
+            outer
+                .effects
+                .iter()
+                .filter(|event| event.kind == "direct_eval_candidate" && event.lexical_depth == 1)
+                .count(),
+            1
+        );
+        assert!(outer.external_references.iter().any(|r| r.name == "x"));
+        assert!(!outer.external_references.iter().any(|r| r.name == "a"));
+        let unrelated = batch[4].as_ref().expect("unrelated");
+        assert_eq!(
+            unrelated
+                .effects
+                .iter()
+                .filter(|e| e.kind == "direct_eval_candidate")
+                .count(),
+            1
+        );
+        assert!(unrelated.nested_functions.is_empty());
+        assert!(
+            analyze_function_source_surfaces(source, &semantic.semantic, &[], &budget)
+                .expect("empty batch")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn separates_nested_effects_and_external_binding_identity() {

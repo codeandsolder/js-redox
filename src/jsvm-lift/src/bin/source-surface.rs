@@ -1,8 +1,8 @@
 //! Inspect syntactic function behavior without requiring a VM handler proof.
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use jsvm_lift::{
-    function_surface::analyze_function_source_surface, safe_deob::SourceMode, sha256_hex,
+    function_surface::analyze_function_source_surfaces, safe_deob::SourceMode, sha256_hex,
 };
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
@@ -113,17 +113,15 @@ fn main() -> Result<()> {
             "interpretation":"Original-source byte spans, not execution or invocation evidence"
         })
     } else {
-        let mut functions = Vec::new();
-        for span in spans {
-            let surface = analyze_function_source_surface(&source, semantic, span, &budget)?
-                .with_context(|| {
+        let functions = analyze_function_source_surfaces(&source, semantic, &spans, &budget)?
+            .into_iter()
+            .zip(spans)
+            .map(|(surface, span)| {
+                surface.with_context(|| {
                     format!("no unique source function at {}:{}", span.start, span.end)
-                })?;
-            functions.push(surface);
-        }
-        if functions.is_empty() {
-            bail!("no functions selected");
-        }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         json!({
             "schema":"jsvm-source-surface/v1",
             "source_sha256":source_sha256,
