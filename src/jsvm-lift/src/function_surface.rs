@@ -273,7 +273,7 @@ mod tests {
     use oxc_allocator::Allocator;
     use oxc_ast::AstKind;
     use oxc_semantic::SemanticBuilder;
-    use oxc_span::{GetSpan, SourceType};
+    use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
     use work_budget::WorkBudget;
 
