@@ -403,16 +403,21 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 .map(|(index, literal)| format!("argument {index} = {literal}"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let display_file = relative
+                .strip_prefix("specializations/")
+                .unwrap_or(relative.as_str());
+            let caller_links = specialized
+                .call_sites
+                .iter()
+                .filter_map(|site| {
+                    let (path, offset) = site.rsplit_once(':')?;
+                    Some(format!("[{path}:{offset}](../../{path})"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             specializations_md.push_str(&format!(
-                "- [{}]({}) ({constants}), used at {}\n",
-                specialized.helper,
-                relative,
-                specialized
-                    .call_sites
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "- [{}]({display_file}) ({constants}), used at {caller_links}\n",
+                specialized.helper
             ));
             specialization_rows.push(json!({
                 "helper": specialized.helper,
