@@ -2,6 +2,7 @@
 //! and import-map resolver output. Never equate raw and transformed source bytes
 //! or interpret imported source offsets against the original capture.
 use crate::{
+    capture_project::CaptureManifest,
     document_entrypoints::{CapturedScriptSource, DocumentEntrypoints},
     sha256_hex,
 };
@@ -23,6 +24,8 @@ pub struct ModuleSourceIdentity {
     pub analyzed_sha256: String,
     pub transform: String,
     pub url: Option<String>,
+    pub capture_manifest_resource_ids: Vec<u64>,
+    pub capture_manifest_raw_sha256_verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -77,6 +80,36 @@ struct Unit<'a> {
     raw_path: &'a str,
     analyzed_path: &'a str,
     transform: &'a str,
+    origin: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CapturedManifestBody<'a> {
+    sha256: &'a str,
+    resource_id: Option<u64>,
+    url: Option<&'a str>,
+}
+type ManifestBodies<'a> = BTreeMap<(&'a str, &'a str), Vec<CapturedManifestBody<'a>>>;
+
+fn manifest_bodies(manifest: &CaptureManifest) -> ManifestBodies<'_> {
+    let mut out = ManifestBodies::new();
+    for (origin, rows) in [
+        ("resource", &manifest.resources),
+        ("inline_script", &manifest.inline_scripts),
+    ] {
+        for row in rows {
+            if let (Some(raw), Some(sha)) = (field(row, "output_path"), field(row, "sha256")) {
+                out.entry((raw, origin))
+                    .or_default()
+                    .push(CapturedManifestBody {
+                        sha256: sha,
+                        resource_id: row.get("id").and_then(Value::as_u64),
+                        url: field(row, "url"),
+                    });
+            }
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +126,7 @@ fn field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 fn source_identity(
     project: &Path,
     unit: &Unit<'_>,
+    bodies: &ManifestBodies<'_>,
     budget: &WorkBudget,
 ) -> Result<ModuleSourceIdentity> {
     budget.consume(1)?;
@@ -102,6 +136,36 @@ fn source_identity(
         .with_context(|| format!("reading analyzed source {}", unit.analyzed_path))?;
     let raw_sha = sha256_hex(&raw);
     let analyzed_sha = sha256_hex(&analyzed);
+    let captured = bodies
+        .get(&(unit.raw_path, unit.origin))
+        .filter(|rows| !rows.is_empty())
+        .with_context(|| {
+            format!(
+                "module source has no original capture manifest identity: {} ({})",
+                unit.raw_path, unit.origin
+            )
+        })?;
+    let mut resource_ids = Vec::new();
+    for body in captured {
+        anyhow::ensure!(
+            body.sha256 == raw_sha,
+            "captured source differs from manifest SHA: {} ({})",
+            unit.raw_path,
+            unit.origin
+        );
+        if let (Some(expected), Some(actual)) = (body.url, field(unit.row, "url")) {
+            anyhow::ensure!(
+                expected == actual,
+                "captured URL differs from indexed source URL: {}",
+                unit.raw_path
+            );
+        }
+        if let Some(id) = body.resource_id {
+            resource_ids.push(id);
+        }
+    }
+    resource_ids.sort_unstable();
+    resource_ids.dedup();
     anyhow::ensure!(
         field(unit.row, "content_sha256") == Some(analyzed_sha.as_str()),
         "analysis source digest mismatch: {}",
@@ -114,6 +178,8 @@ fn source_identity(
         analyzed_sha256: analyzed_sha,
         transform: unit.transform.to_string(),
         url: field(unit.row, "url").map(str::to_owned),
+        capture_manifest_resource_ids: resource_ids,
+        capture_manifest_raw_sha256_verified: true,
     })
 }
 
@@ -141,12 +207,13 @@ fn match_root(
     source: &CapturedScriptSource,
     raw_index: &BTreeMap<String, Vec<usize>>,
     units: &[Unit<'_>],
+    bodies: &ManifestBodies<'_>,
     project: &Path,
     budget: &WorkBudget,
 ) -> Result<Vec<(usize, ModuleSourceIdentity)>> {
     let mut out = Vec::new();
     for &idx in raw_index.get(&source.output_path).into_iter().flatten() {
-        let identity = source_identity(project, &units[idx], budget)?;
+        let identity = source_identity(project, &units[idx], &bodies, budget)?;
         anyhow::ensure!(
             identity.raw_sha256 == source.sha256 && source.matches_manifest_sha256,
             "raw HTML root digest changed: {}",
@@ -169,8 +236,10 @@ pub fn link_static_modules(
     documents: &[DocumentEntrypoints],
     source_index: &Value,
     js_references: &Value,
+    manifest: &CaptureManifest,
     budget: &WorkBudget,
 ) -> Result<StaticModuleGraph> {
+    let bodies = manifest_bodies(manifest);
     let source_rows = source_index
         .get("units")
         .and_then(Value::as_array)
@@ -229,6 +298,7 @@ pub fn link_static_modules(
             raw_path,
             analyzed_path,
             transform: link.transform,
+            origin: link.origin,
         });
         raw_index.entry(raw_path.to_string()).or_default().push(idx);
         // A document URL is also the URL of every inline script within it.
@@ -251,7 +321,7 @@ pub fn link_static_modules(
                 continue;
             }
             for source in &script.captured_sources {
-                let resolved = match_root(source, &raw_index, &units, project, budget)?;
+                let resolved = match_root(source, &raw_index, &units, &bodies, project, budget)?;
                 if resolved.is_empty() {
                     unmatched_module_roots.push(UnmatchedModuleRoot {
                         document_resource_id: document.document_resource_id,
@@ -284,7 +354,7 @@ pub fn link_static_modules(
         let from = if let Some(identity) = identities.get(&idx) {
             identity.clone()
         } else {
-            let identity = source_identity(project, &units[idx], budget)?;
+            let identity = source_identity(project, &units[idx], &bodies, budget)?;
             identities.insert(idx, identity.clone());
             identity
         };
@@ -336,7 +406,7 @@ pub fn link_static_modules(
                         let target_identity = if let Some(value) = identities.get(&target) {
                             value.clone()
                         } else {
-                            let value = source_identity(project, &units[target], budget)?;
+                            let value = source_identity(project, &units[target], &bodies, budget)?;
                             identities.insert(target, value.clone());
                             value
                         };
@@ -409,6 +479,7 @@ pub fn link_static_modules(
 mod tests {
     use super::link_static_modules;
     use crate::{
+        capture_project::{CaptureManifest, CaptureSource},
         document_entrypoints::{CapturedScriptSource, DocumentEntrypoints, DocumentScriptRoot},
         sha256_hex,
     };
@@ -513,6 +584,42 @@ mod tests {
             json!({"units":[main_unit,first_unit,second_unit,dep_unit,lazy_unit,inline_unit]});
         let refs =
             json!({"code_units":[main_refs,first_refs,second_refs,dep_refs,lazy_refs,inline_refs]});
+        let mut resources = Vec::new();
+        let mut inline_scripts = Vec::new();
+        for (i, unit) in index["units"].as_array().into_iter().flatten().enumerate() {
+            let raw_path = unit["raw_path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("fixture source raw path"))?;
+            let sha = sha256_hex(&fs::read(project.join(raw_path))?);
+            let url = refs["code_units"][i]["url"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("fixture source URL"))?;
+            if unit["origin"] == "inline_script" {
+                inline_scripts.push(json!({
+                    "output_path":raw_path,"sha256":sha,
+                    "parent_resource_id":3,"ordinal":99
+                }));
+            } else {
+                resources.push(json!({
+                    "output_path":raw_path,"sha256":sha,
+                    "id":i,"url":url,"kind":"javascript"
+                }));
+            }
+        }
+        let manifest = CaptureManifest {
+            schema: "capture-project/v1".into(),
+            source: CaptureSource {
+                kind: "test".into(),
+                input: "synthetic".into(),
+                salvaged: false,
+                extra: Default::default(),
+            },
+            pages: vec![],
+            resources,
+            inline_scripts,
+            counts: Default::default(),
+            extra: Default::default(),
+        };
         let source = CapturedScriptSource {
             resource_id: Some(8),
             output_path: "resources/main.js".into(),
@@ -546,6 +653,7 @@ mod tests {
             &[make_document(3), make_document(4)],
             &index,
             &refs,
+            &manifest,
             &budget,
         )?;
         assert_eq!(result.roots.len(), 2);
@@ -553,6 +661,13 @@ mod tests {
         let root_source = &result.roots[0].source;
         assert_ne!(root_source.raw_sha256, root_source.analyzed_sha256);
         assert_eq!(root_source.transform, "prettified");
+        assert!(root_source.capture_manifest_raw_sha256_verified);
+        assert_eq!(root_source.capture_manifest_resource_ids, vec![0]);
+        assert!(result
+            .dependencies
+            .iter()
+            .flat_map(|edge| &edge.target_candidates)
+            .all(|body| body.capture_manifest_raw_sha256_verified));
         assert_eq!(result.visited_module_contexts, 5); // doc3: root, both pkg versions, dep; doc4: root; dynamic lazy is not traversed.
         assert!(result
             .dependencies
@@ -589,7 +704,20 @@ mod tests {
         assert!(!result.import_map_timing_proven);
         let mut tampered = make_document(3);
         tampered.scripts[0].captured_sources[0].sha256 = "tampered".into();
-        assert!(link_static_modules(project, &[tampered], &index, &refs, &budget).is_err());
+        assert!(
+            link_static_modules(project, &[tampered], &index, &refs, &manifest, &budget).is_err()
+        );
+        let mut changed_manifest = manifest.clone();
+        changed_manifest.resources[1]["sha256"] = json!("incorrect-target-hash");
+        assert!(link_static_modules(
+            project,
+            &[make_document(3)],
+            &index,
+            &refs,
+            &changed_manifest,
+            &budget
+        )
+        .is_err());
         Ok(())
     }
 }

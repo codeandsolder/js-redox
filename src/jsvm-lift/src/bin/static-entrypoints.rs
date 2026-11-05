@@ -2,12 +2,15 @@
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use jsvm_lift::{
-    analysis_artifacts::{load_artifact, JS_REFERENCES, SOURCE_INDEX},
+    analysis_artifacts::{
+        load_artifact, EXECUTION_COVERAGE, JS_REFERENCES, RUNTIME_SCRIPTS, SOURCE_INDEX,
+    },
     capture_project::read_manifest,
     document_entrypoints::captured_document_entrypoints,
     safe_deob::SourceMode,
     sha256_hex,
     static_calls::analyze_static_calls,
+    static_execution_witness::join_initial_source_coverage,
     static_module_graph::link_static_modules,
 };
 use oxc_allocator::Allocator;
@@ -128,7 +131,7 @@ fn main() -> Result<()> {
         (Some(source_index), Some(js_references)) => json!({
             "status":"available",
             "analysis":link_static_modules(
-                &project, &documents, &source_index, &js_references, &budget,
+                &project, &documents, &source_index, &js_references, &manifest, &budget,
             )?,
             "references_schema": JS_REFERENCES.schema,
             "source_index_schema": SOURCE_INDEX.schema,
@@ -136,6 +139,21 @@ fn main() -> Result<()> {
         _ => json!({
             "status":"unavailable",
             "reason":"Existing source-index and JS-reference artifacts are both required for contextual module resolution",
+        }),
+    };
+    let execution_correlations = match (
+        load_artifact(&project, EXECUTION_COVERAGE, true)?,
+        load_artifact(&project, RUNTIME_SCRIPTS, true)?,
+    ) {
+        (Some(_), Some(runtime_sources)) => json!({
+            "status":"available",
+            "analysis":join_initial_source_coverage(&documents, &runtime_sources, &budget)?,
+            "runtime_schema":RUNTIME_SCRIPTS.schema,
+            "coverage_schema":EXECUTION_COVERAGE.schema,
+        }),
+        _ => json!({
+            "status":"unavailable",
+            "reason":"Positive V8 script coverage and the runtime-script identity index are both required",
         }),
     };
     let root_count: usize = documents
@@ -153,7 +171,7 @@ fn main() -> Result<()> {
         .filter(|value| value["analysis"]["status"] == "analyzed")
         .count();
     let output = json!({
-        "schema":"jsvm-document-static-entrypoints/v2",
+        "schema":"jsvm-document-static-entrypoints/v3",
         "capture_project":project,
         "document_count":documents.len(),
         "executable_parser_script_roots":root_count,
@@ -161,6 +179,7 @@ fn main() -> Result<()> {
         "documents":documents,
         "source_graphs":source_graphs,
         "static_module_dependencies":module_graph,
+        "positive_source_coverage_join":execution_correlations,
         "limitations":[
             "HTML script ordinals and scheduler classes are source-level candidates, not observed completion order.",
             "Async, defer, module, nomodule, dynamic script insertions and module imports require independent browser-semantic and input-dependent resolution.",
