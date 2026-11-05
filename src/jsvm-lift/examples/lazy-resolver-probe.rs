@@ -11,6 +11,7 @@ use jsvm_lift::{
         structurally_proven_slow_lazy_cell_factory_shapes, SlowLazyCellResolverIndexFacts,
     },
     receiver_identity::{
+        audit_prototype_method_phase_binding_mutation,
         structurally_proven_prototype_method_phase_closures,
         structurally_proven_runtime_origin_flow,
     },
@@ -54,6 +55,20 @@ fn main() -> Result<()> {
     let shapes = structurally_proven_slow_lazy_cell_factory_shapes(&parsed.program, scoping);
     let phase_closures =
         structurally_proven_prototype_method_phase_closures(&parsed.program, scoping, &budget)?;
+    let mut phase_binding_mutation_audits = Vec::new();
+    for closure in &phase_closures {
+        let audit = audit_prototype_method_phase_binding_mutation(semantic, closure, &budget)?;
+        phase_binding_mutation_audits.push(json!({
+            "phase_assignment":[closure.phase_assignment_start,closure.phase_assignment_end],
+            "unique_initialization_write":audit.unique_initialization_write,
+            "lexical_direct_eval_calls":audit.lexical_direct_eval_calls.iter()
+                .map(|span|[span.start,span.end]).collect::<Vec<_>>(),
+            "lexical_with_statements":audit.lexical_with_statements.iter()
+                .map(|span|[span.start,span.end]).collect::<Vec<_>>(),
+            "root_scope_binding":audit.root_scope_binding,
+            "source_mutation_isolated":audit.source_mutation_isolated,
+        }));
+    }
     let reads = structurally_proven_lazy_registry_read_calls(&parsed.program, scoping, &budget)?;
     let installs =
         proven_origin_registry_handler_installs(&parsed.program, scoping, &flow, &budget)?;
@@ -234,6 +249,7 @@ fn main() -> Result<()> {
         serde_json::to_string_pretty(&json!({
             "captured_count":captured_count,"conditional_compatible_count":successes,
             "distinct_keys":key_reports.len(),"phase_closure_count":phase_closures.len(),
+            "phase_binding_mutation_audits":phase_binding_mutation_audits,
             "distinct_accessor_shapes":unique_reads.len(),
             "reports":reports,
             "interpretation":"Each phase-value condition is a theorem premise, NOT evidence that the captured phase function returned that value at the actual call."

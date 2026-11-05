@@ -7,6 +7,7 @@ use jsvm_lift::{
         structurally_proven_registry_forwarding_calls, structurally_proven_registry_read_calls,
     },
     receiver_identity::{
+        audit_prototype_method_phase_binding_mutation,
         propagate_matched_prototype_method_call_origins,
         propagate_proven_prototype_method_call_origins, proven_exact_own_data_field_at_direct_call,
         proven_origin_direct_call_event_unreachable, proven_own_data_field_at_runtime_method_call,
@@ -324,7 +325,10 @@ fn main() -> Result<()> {
             .map(|(start, end)| Span::new(start, end));
         let closures = structurally_proven_prototype_method_phase_closures(&parsed.program, scoping, &budget)?
             .into_iter()
-            .map(|closure| {
+            .map(|closure| -> Result<Value> {
+                let hazard = audit_prototype_method_phase_binding_mutation(
+                    &semantic.semantic, &closure, &budget,
+                )?;
                 let phase = event.as_ref().and_then(|event| {
                     proven_prototype_method_phase_at_event(
                         &source,
@@ -353,7 +357,7 @@ fn main() -> Result<()> {
                         })
                     })
                     .collect::<Vec<_>>();
-                json!({
+                Ok(json!({
                     "constructor": [closure.constructor_start, closure.constructor_end],
                     "property": closure.property,
                     "method_assignment": [closure.method_assignment_start, closure.method_assignment_end],
@@ -363,6 +367,16 @@ fn main() -> Result<()> {
                     "phase_function": [closure.phase_function_start, closure.phase_function_end],
                     "phase_binding_declaration": [phase_binding.start, phase_binding.end],
                     "phase_binding_writes": phase_binding_writes,
+                    "binding_mutation_audit": {
+                        "unique_initialization_write": hazard.unique_initialization_write,
+                        "lexical_direct_eval_calls": hazard.lexical_direct_eval_calls.iter()
+                            .map(|span| [span.start, span.end]).collect::<Vec<_>>(),
+                        "lexical_with_statements": hazard.lexical_with_statements.iter()
+                            .map(|span| [span.start, span.end]).collect::<Vec<_>>(),
+                        "root_scope_binding": hazard.root_scope_binding,
+                        "source_mutation_isolated": hazard.source_mutation_isolated,
+                        "runtime_ordering_proven": false,
+                    },
                     "left_declaration": [left.start, left.end],
                     "right_declaration": [right.start, right.end],
                     "equal_value": closure.equal_value,
@@ -372,9 +386,9 @@ fn main() -> Result<()> {
                         "state": phase.equality.state,
                         "assignment": [phase.equality.assignment_start, phase.equality.assignment_end],
                     })),
-                })
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         println!("{}", serde_json::to_string_pretty(&closures)?);
         return Ok(());
     }

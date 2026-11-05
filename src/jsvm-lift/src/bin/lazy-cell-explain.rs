@@ -8,7 +8,11 @@ use jsvm_lift::{
         proven_slow_lazy_cell_registry_assignment, proven_slow_lazy_cell_update_state,
         structurally_proven_slow_lazy_cell_factory_shapes,
     },
-    receiver_identity::structurally_proven_runtime_origin_flow,
+    receiver_identity::{
+        audit_prototype_method_phase_binding_mutation,
+        structurally_proven_prototype_method_phase_closures,
+        structurally_proven_runtime_origin_flow,
+    },
     registry_identity::proven_origin_registry_handler_installs,
 };
 use jsvm_lift::{js_format::format_source, safe_deob::SourceMode, sha256_hex};
@@ -71,6 +75,31 @@ fn main() -> Result<()> {
     );
     let flow = structurally_proven_runtime_origin_flow(&parsed.program, semantic, &budget)?;
     let shapes = structurally_proven_slow_lazy_cell_factory_shapes(&parsed.program, scoping);
+    // Report unresolved mutation hazards on the captured phase closure.
+    // A syntactically unique assignment is not an immutable-value theorem.
+    let phase_closures =
+        structurally_proven_prototype_method_phase_closures(&parsed.program, scoping, &budget)?;
+    let mut phase_mutation_audits = Vec::new();
+    for closure in phase_closures.iter().filter(|closure| {
+        shapes
+            .iter()
+            .any(|shape| shape.phase_binding_symbol == closure.phase_binding_symbol)
+    }) {
+        let audit = audit_prototype_method_phase_binding_mutation(semantic, closure, &budget)?;
+        phase_mutation_audits.push(json!({
+            "phase_assignment": [closure.phase_assignment_start, closure.phase_assignment_end],
+            "phase_function": [closure.phase_function_start, closure.phase_function_end],
+            "equal_value": closure.equal_value,
+            "unequal_value": closure.unequal_value,
+            "explicit_writes": audit.explicit_writes.iter().map(|span| [span.start,span.end]).collect::<Vec<_>>(),
+            "unique_initialization_write": audit.unique_initialization_write,
+            "lexical_direct_eval_calls": audit.lexical_direct_eval_calls.iter().map(|span| [span.start,span.end]).collect::<Vec<_>>(),
+            "lexical_with_statements": audit.lexical_with_statements.iter().map(|span| [span.start,span.end]).collect::<Vec<_>>(),
+            "root_scope_binding": audit.root_scope_binding,
+            "source_mutation_isolated": audit.source_mutation_isolated,
+            "initialization_before_later_capture_proven": false,
+        }));
+    }
     let reads = structurally_proven_lazy_registry_read_calls(&parsed.program, scoping, &budget)?;
     let installs =
         proven_origin_registry_handler_installs(&parsed.program, scoping, &flow, &budget)?;
@@ -184,7 +213,9 @@ fn main() -> Result<()> {
         "captured_handler_count":captured_handlers.len(), "captured_handlers":captured_handlers,
         "exact_assignment_count":exact.len(),"exact_assignments":exact,
         "lazy_read_count":reads.len(),"origin_handler_installs_count":installs.len(),
+        "phase_binding_mutation_audits": phase_mutation_audits,
         "limitations": [
+            "Binding mutation hazards include scope-visible eval and with even when no second explicit assignment is found.",
             "No assertion that an indirect call executed or a selected branch was taken.",
             "No proof of registry-slot persistence from installation to read.",
             "No proof that a lazy-cell returned the captured original handler at a particular runtime phase.",
@@ -217,6 +248,8 @@ They are **not** necessarily the functions executed by a specific browser invoca
 
 Source identity and exact byte spans are in [analysis.json](analysis.json).
 Readable files are views, not executable devirtualizations.
+See the phase binding mutation audits in analysis.json before asserting an interpreter phase.
+A syntactically unique assignment is not sufficient when direct eval can reach the binding.
 
 | Exact key | Handler function | Original source bytes | Factory call bytes |
 |---:|---|---|---|
