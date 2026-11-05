@@ -652,10 +652,13 @@ mod tests {
         assert!(restored.contains("log.push(\"again\")"), "{restored}");
         let allocator = Allocator::default();
         assert!(!parse_program(&allocator, &restored, SourceType::cjs()).fatal_error);
-        let fully = deobfuscate(original, 4, &WorkBudget::unlimited("if-ladder-test"))
-            .expect("unlimited budget")
-            .expect("valid rewrite");
-        assert_eq!(fully.transforms.get("if_ladder_structured"), Some(&1));
+        let result = deobfuscate(original, 4, &WorkBudget::unlimited("if-ladder-test"));
+        assert!(result.is_ok(), "unlimited budget should complete");
+        let recovered = result.ok().flatten();
+        assert!(recovered.is_some(), "valid source should rewrite");
+        if let Some(fully) = recovered {
+            assert_eq!(fully.transforms.get("if_ladder_structured"), Some(&1));
+        }
     }
 
     #[test]
@@ -693,10 +696,20 @@ mod tests {
         let source = "for (s = 1; s != 9;) s == 1 ? (s = next()) : s == 2 && (s = 9)";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
-        let Statement::ForStatement(stmt) = &parsed.program.body[0] else {
-            panic!("expected for");
-        };
-        assert!(reconstruct_for(stmt, source).is_none());
+        let statement = parsed.program.body.first().and_then(|item| {
+            if let Statement::ForStatement(stmt) = item {
+                Some(stmt.as_ref())
+            } else {
+                None
+            }
+        });
+        assert!(
+            statement.is_some(),
+            "fixture should parse as a for statement"
+        );
+        if let Some(stmt) = statement {
+            assert!(reconstruct_for(stmt, source).is_none());
+        }
     }
 
     #[test]
@@ -706,9 +719,19 @@ mod tests {
         let source = "for (s = 1; s != 9;) s == 1 ? (s = pick() ? 2 : 3) : s == 2 ? (s = 3) : s == 3 ? (s = 2) : s == 4 && (s = 9)";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
-        let Statement::ForStatement(stmt) = &parsed.program.body[0] else {
-            panic!("expected for");
-        };
-        assert!(reconstruct_for(stmt, source).is_none());
+        let statement = parsed.program.body.first().and_then(|item| {
+            if let Statement::ForStatement(stmt) = item {
+                Some(stmt.as_ref())
+            } else {
+                None
+            }
+        });
+        assert!(
+            statement.is_some(),
+            "fixture should parse as a for statement"
+        );
+        if let Some(stmt) = statement {
+            assert!(reconstruct_for(stmt, source).is_none());
+        }
     }
 }
