@@ -572,6 +572,129 @@ impl Collector<'_, '_> {
         }
     }
 
+    /// Preserve a numeric state initialized before arbitrary intervening
+    /// statements or an enclosing block. The real proof obligation is on
+    /// the same semantic binding, not adjacency of source statements.
+    fn reconstruct_reaching_while(&mut self, statements: &[Statement<'_>]) {
+        self.reconstruct_reaching_while_with(statements, &HashMap::<SymbolId, (u64, Span)>::new());
+    }
+
+    fn reconstruct_reaching_while_with(
+        &mut self,
+        statements: &[Statement<'_>],
+        inherited: &HashMap<SymbolId, (u64, Span)>,
+    ) {
+        if !self.may_remove_dead_numeric_writes {
+            // Direct eval and sloppy arguments aliasing can change a local
+            // numeric state without an ordinary lexically resolved write.
+            return;
+        }
+        let mut reaching = inherited.clone();
+        for (index, stmt) in statements.iter().enumerate() {
+            if let Statement::WhileStatement(loop_stmt) = stmt {
+                if let Some((symbol, name)) =
+                    if_ladder_structure::while_state_binding(loop_stmt, self.scoping)
+                {
+                    let immediately_preceded = index > 0
+                        && if_ladder_structure::state_initializer(
+                            &statements[index - 1],
+                            self.scoping,
+                        )
+                        .is_some_and(|(other, _, _)| other == symbol);
+                    if !immediately_preceded {
+                        if let Some(&(initial, init_span)) = reaching.get(&symbol) {
+                            if self.reaching_state_is_stable(symbol, init_span, loop_stmt.span) {
+                                if let Some(code) =
+                                    if_ladder_structure::reconstruct_while_with_known_state(
+                                        loop_stmt,
+                                        name,
+                                        initial,
+                                        self.source,
+                                    )
+                                {
+                                    self.push(loop_stmt.span, code, "if_ladder_structured");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            match stmt {
+                Statement::BlockStatement(block) => {
+                    self.reconstruct_reaching_while_with(&block.body, &reaching);
+                }
+                Statement::IfStatement(branch) => {
+                    self.reconstruct_nested_reaching(&branch.consequent, &reaching);
+                    if let Some(alternate) = &branch.alternate {
+                        self.reconstruct_nested_reaching(alternate, &reaching);
+                    }
+                }
+                _ => {}
+            }
+            // Kill any state whose value could have changed in this
+            // statement before processing the next sibling statement.
+            reaching.retain(|&symbol, _| !self.symbol_written_in_span(symbol, stmt.span()));
+            if let Some((symbol, _, initial)) =
+                if_ladder_structure::state_initializer(stmt, self.scoping)
+            {
+                if self.scoping.symbol_flags(symbol).is_variable()
+                    && !self.scoping.symbol_flags(symbol).is_const_variable()
+                    && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
+                {
+                    reaching.insert(symbol, (initial, stmt.span()));
+                }
+            }
+        }
+    }
+
+    fn reconstruct_nested_reaching(
+        &mut self,
+        stmt: &Statement<'_>,
+        reaching: &HashMap<SymbolId, (u64, Span)>,
+    ) {
+        if let Statement::BlockStatement(block) = stmt {
+            self.reconstruct_reaching_while_with(&block.body, reaching);
+        } else {
+            self.reconstruct_reaching_while_with(std::slice::from_ref(stmt), reaching);
+        }
+    }
+
+    fn symbol_written_in_span(&self, symbol: SymbolId, span: Span) -> bool {
+        self.scoping
+            .get_resolved_reference_ids(symbol)
+            .iter()
+            .any(|&ref_id| {
+                let reference = self.scoping.get_reference(ref_id);
+                reference.is_write()
+                    && self
+                        .reference_spans
+                        .get(&ref_id)
+                        .is_some_and(|reference_span| {
+                            span.start <= reference_span.start && reference_span.end <= span.end
+                        })
+            })
+    }
+
+    fn reaching_state_is_stable(&self, symbol: SymbolId, init: Span, loop_span: Span) -> bool {
+        self.scoping.symbol_flags(symbol).is_variable()
+            && !self.scoping.symbol_flags(symbol).is_const_variable()
+            && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
+            && self
+                .scoping
+                .get_resolved_reference_ids(symbol)
+                .iter()
+                .all(|&ref_id| {
+                    let reference = self.scoping.get_reference(ref_id);
+                    if !reference.is_write() {
+                        return true;
+                    }
+                    self.reference_spans.get(&ref_id).is_some_and(|span| {
+                        (init.start <= span.start && span.end <= init.end)
+                            || (loop_span.start <= span.start && span.end <= loop_span.end)
+                    })
+                })
+    }
+
     // A local scalar that has no remaining lexical reads after structural
     // reconstruction cannot make numeric state assignments observable.
     // Avoid arguments aliasing and direct eval, both of which can observe
@@ -977,11 +1100,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
 
     fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
         self.reconstruct_while_pairs(&it.statements);
+        self.reconstruct_reaching_while(&it.statements);
         walk::walk_function_body(self, it);
     }
 
     fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
         self.reconstruct_while_pairs(&it.body);
+        self.reconstruct_reaching_while(&it.body);
         for stmt in &it.body {
             if let Statement::EmptyStatement(empty) = stmt {
                 self.push(empty.span, String::new(), "remove_empty_block_statement");

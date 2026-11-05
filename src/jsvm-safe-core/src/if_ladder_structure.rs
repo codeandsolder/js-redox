@@ -11,7 +11,9 @@ use crate::{
 use oxc_ast::ast::{
     BindingPattern, Expression, ForStatement, ForStatementInit, Statement, WhileStatement,
 };
+use oxc_semantic::Scoping;
 use oxc_span::GetSpan;
+use oxc_syntax::symbol::SymbolId;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone)]
@@ -553,7 +555,21 @@ impl Emitter<'_> {
                 // may contain internal conditionals and previously collapsed
                 // nested loops; both return to the header on every path.
                 let mut body = loop_plan.entering.effects.join("\n");
-                body.push_str(&self.walk(loop_plan.body_start, cursor)?);
+                // The entry path can visit a loop-body node before reaching
+                // the loop header (a do/while-shaped SCC). Re-emitting that
+                // node inside the loop is required for subsequent iterations.
+                // Use a fresh visited set for the body region while sharing
+                // the same bounded work fuel, not a global visited set which
+                // incorrectly rejects this reducible control flow.
+                let mut region = Emitter {
+                    graph: self.graph,
+                    loops: self.loops,
+                    exit: self.exit,
+                    visited: BTreeSet::new(),
+                    fuel: self.fuel,
+                };
+                body.push_str(&region.walk(loop_plan.body_start, cursor)?);
+                self.fuel = region.fuel;
                 let cond = if loop_plan.enters_on_true {
                     loop_plan.condition.clone()
                 } else {
@@ -620,6 +636,75 @@ pub(crate) fn reconstruct_for(it: &ForStatement<'_>, source: &str) -> Option<Str
         &init_text,
         source,
     )
+}
+
+/// Resolve a simple numeric initializer to its exact lexical binding.
+pub(crate) fn state_initializer<'a>(
+    stmt: &'a Statement<'a>,
+    scoping: &Scoping,
+) -> Option<(SymbolId, &'a str, u64)> {
+    match stmt {
+        Statement::ExpressionStatement(expression) => {
+            let Expression::AssignmentExpression(assignment) = &expression.expression else {
+                return None;
+            };
+            if assignment.operator.as_str() != "=" {
+                return None;
+            }
+            let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) = &assignment.left
+            else {
+                return None;
+            };
+            let ref_id = id.reference_id.get()?;
+            let symbol = crate::statically_resolved_symbol(scoping, ref_id)?;
+            Some((symbol, id.name.as_str(), number(&assignment.right)?))
+        }
+        Statement::VariableDeclaration(declaration) if declaration.declarations.len() == 1 => {
+            let item = &declaration.declarations[0];
+            let BindingPattern::BindingIdentifier(binding) = &item.id else {
+                return None;
+            };
+            Some((
+                binding.symbol_id.get()?,
+                binding.name.as_str(),
+                number(item.init.as_ref()?)?,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Match the loop's tested state to the same semantic symbol as its initializer.
+pub(crate) fn while_state_binding<'a>(
+    it: &'a WhileStatement<'a>,
+    scoping: &Scoping,
+) -> Option<(SymbolId, &'a str)> {
+    let Expression::BinaryExpression(binary) = unparen(&it.test) else {
+        return None;
+    };
+    if !matches!(binary.operator.as_str(), "!=" | "!==") {
+        return None;
+    }
+    let id = match (unparen(&binary.left), unparen(&binary.right)) {
+        (Expression::Identifier(id), other) if number(other).is_some() => id,
+        (other, Expression::Identifier(id)) if number(other).is_some() => id,
+        _ => return None,
+    };
+    Some((
+        crate::statically_resolved_symbol(scoping, id.reference_id.get()?)?,
+        id.name.as_str(),
+    ))
+}
+
+/// The original initializer stays where it was. The intervening statements
+/// also stay in execution order, and only the while statement is rewritten.
+pub(crate) fn reconstruct_while_with_known_state(
+    it: &WhileStatement<'_>,
+    state: &str,
+    initial: u64,
+    source: &str,
+) -> Option<String> {
+    reconstruct_state_loop(state, initial, &it.test, &it.body, "", source)
 }
 
 /// Recover a while loop preceded by a numeric state initializer in the same
@@ -938,7 +1023,72 @@ mod tests {
         let outcome = deobfuscate(separated, 12, &WorkBudget::unlimited("while-separation"));
         assert!(outcome.is_ok());
         if let Some(value) = outcome.ok().flatten() {
-            assert!(value.source.contains("while(s!=76)"), "{}", value.source);
+            assert!(value.source.contains("if (n)"), "{}", value.source);
+            assert!(!value.source.contains("while(s!=76)"), "{}", value.source);
+        }
+    }
+
+    #[test]
+    fn reconstructs_cross_block_and_nonadjacent_while_with_preserved_side_effects() {
+        let source = r#"
+            function f(n, log) {
+                let state;
+                state = 3;
+                log.push("before");
+                {
+                    log.push("between");
+                    while (state != 9)
+                        state == 3 ? (log.push("start"), state = 4)
+                        : state == 4 ? (state = n-- ? 3 : 9)
+                        : state == 9 && (state = 9);
+                }
+                return log;
+            }
+        "#;
+        let result = deobfuscate(source, 12, &WorkBudget::unlimited("cross-block-state"));
+        assert!(result.is_ok());
+        let recovered = result.ok().flatten().map(|value| value.source);
+        assert!(recovered.is_some());
+        if let Some(output) = recovered {
+            assert!(output.contains("while (n--)"), "{output}");
+            assert!(!output.contains("state == 3"), "{output}");
+            let before = output.find("before");
+            let between = output.find("between");
+            let action = output.find("start");
+            assert!(before < between && between < action, "{output}");
+            let allocator = Allocator::default();
+            assert!(!parse_program(&allocator, &output, SourceType::cjs()).fatal_error);
+        }
+    }
+
+    #[test]
+    fn rejects_nonadjacent_state_with_intervening_or_captured_clobber() {
+        let fixtures = [
+            // A different statement modifies the same semantic symbol.
+            "function f(n){let s=3; s=n; sideEffect();while(s!=9)s==3?(s=9):s==9&&(s=9);}",
+            // A local closure may mutate state while another helper runs.
+            "function f(n){let s=3;const clobber=()=>s=9; clobber();while(s!=9)s==3?(s=9):s==9&&(s=9);}",
+            // Direct eval can write function-local bindings without a reference.
+            "function f(n){let s=3;eval(n); sideEffect();while(s!=9)s==3?(s=9):s==9&&(s=9);}",
+            // An aliased sloppy-mode argument may be changed in the gap.
+            "function f(s){s=3;arguments[0]=9;sideEffect();while(s!=9)s==3?(s=9):s==9&&(s=9);}",
+            // A shadowed state identifier is not the initializer's symbol.
+            "function f(){let s=3; { let s; sideEffect(); while(s!=9)s==3?(s=9):s==9&&(s=9); }}",
+        ];
+        for source in fixtures {
+            let outcome = deobfuscate(source, 12, &WorkBudget::unlimited("state-clobber"));
+            assert!(outcome.is_ok());
+            if let Some(value) = outcome.ok().flatten() {
+                assert!(
+                    !value.source.contains("if_ladder_structured"),
+                    "unexpected textual marker: {}",
+                    value.source
+                );
+                assert!(
+                    !value.transforms.contains_key("if_ladder_structured"),
+                    "state reconstruction crossed a clobber in: {source}"
+                );
+            }
         }
     }
 
