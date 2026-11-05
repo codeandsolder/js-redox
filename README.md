@@ -274,3 +274,21 @@ external helper calls, and ambiguous names are not guessed.
 Helper files are navigation views, not independently runnable modules.
 The original enclosing source remains available because captured variables,
 later reassignments, and top-level side effects can change their behavior.
+
+### Specialize original helper code at constant-argument callsites
+
+When the original enclosing JavaScript is supplied with --context-source,
+the same source-tree pass also generates a lexical-context/specializations
+directory. Each JS file is a rewritten helper body: literal arguments from
+an actual extracted handler call replace references to the corresponding
+unchanged lexical parameter symbols, and the regular static deobfuscator
+then simplifies the result. Both the full original helper and the specialized
+body are kept and linked by original handler callsite.
+
+Specialization handles primitive literal arguments, including multiple
+constant parameters in a call. It rejects parameter writes, direct eval,
+arguments aliasing, dynamically scoped with blocks, and substitutions that
+would produce invalid JavaScript. Mutable or ambiguously named helper
+bindings remain linked to the unspecialized original. A specialized helper
+view applies to its recorded fixed arguments; it is not a universal
+replacement for the general helper.

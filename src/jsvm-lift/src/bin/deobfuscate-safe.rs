@@ -4,7 +4,9 @@ use jsvm_lift::{
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions},
     safe_deob::{deobfuscate_source, SourceMode},
+    sha256_hex,
     source_tree_context::reconstruct_context,
+    source_tree_specialize::specialize_calls,
 };
 use serde_json::json;
 use std::{
@@ -328,6 +330,105 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             }));
         }
         fs::write(folder.join("README.md"), helper_index)?;
+        // A fixed-argument callsite can expose a more useful helper body than
+        // its multipurpose definition. Materialize *both* source views.
+        let helper_counts =
+            context
+                .helpers
+                .iter()
+                .fold(BTreeMap::<&str, usize>::new(), |mut counts, helper| {
+                    *counts.entry(helper.name.as_str()).or_default() += 1;
+                    counts
+                });
+        let helper_sources = context
+            .helpers
+            .iter()
+            .filter(|helper| {
+                !helper.mutable_binding && helper_counts.get(helper.name.as_str()) == Some(&1)
+            })
+            .map(|helper| (helper.name.clone(), helper.source.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let specializations = specialize_calls(&source_inputs, &helper_sources)?;
+        fs::create_dir_all(folder.join("specializations"))?;
+        let mut specializations_md =
+            String::from("# Constant-argument specialized helper code\n\n");
+        specializations_md.push_str(
+            "Each file substitutes the exact constant arguments of a real handler call              into their original lexical parameter references, then runs static JS              deobfuscation. Original helpers remain available; these files are              callsite-specific analysis views inside the original closure context,              not independent runnable modules.\n\n"
+        );
+        let mut specialization_rows = Vec::new();
+        for specialized in specializations {
+            let encoded_args = serde_json::to_string(&specialized.arguments)?;
+            let suffix = &sha256_hex(encoded_args.as_bytes())[..12];
+            let hint = specialized
+                .arguments
+                .iter()
+                .map(|(index, literal)| {
+                    let literal = literal
+                        .chars()
+                        .filter(char::is_ascii_alphanumeric)
+                        .take(15)
+                        .collect::<String>();
+                    format!("arg{index}-{literal}")
+                })
+                .collect::<Vec<_>>()
+                .join("_");
+            let relative = format!(
+                "specializations/{}-{}-{suffix}.js",
+                specialized.helper, hint
+            );
+            let budget = budgets.operation(
+                AnalysisOperation::SafeDeobfuscation,
+                format!("specialized {}", specialized.helper),
+            );
+            let (code, transforms, error) = match deobfuscate_source(
+                &specialized.source,
+                relative.clone(),
+                SourceMode::Auto,
+                args.max_iterations,
+                args.format_output,
+                &budget,
+            ) {
+                Ok(outcome) => (outcome.source, outcome.report.transforms, None),
+                Err(error) => (
+                    specialized.source.clone(),
+                    BTreeMap::new(),
+                    Some(error.to_string()),
+                ),
+            };
+            fs::write(folder.join(&relative), &code)?;
+            let actual_changes = code != specialized.original;
+            let constants = specialized
+                .arguments
+                .iter()
+                .map(|(index, literal)| format!("argument {index} = {literal}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            specializations_md.push_str(&format!(
+                "- [{}]({}) ({constants}), used at {}\n",
+                specialized.helper,
+                relative,
+                specialized
+                    .call_sites
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            specialization_rows.push(json!({
+                "helper": specialized.helper,
+                "arguments": specialized.arguments,
+                "path": relative,
+                "call_sites": specialized.call_sites,
+                "specialized_source_changed": actual_changes,
+                "transforms": transforms,
+                "error": error,
+            }));
+        }
+        fs::write(folder.join("specializations/README.md"), specializations_md)?;
+        md.push_str("\n## Constant-argument specialized helper bodies\n\n");
+        md.push_str(
+            "[Browse helper code specialized at real handler callsites](lexical-context/specializations/README.md).\n\n"
+        );
         md.push_str("\n## Original lexical context and helper code\n\n");
         md.push_str("[Browse linked helper implementations](lexical-context/README.md). ");
         md.push_str("These are actual original bindings, not guessed API names.\n\n");
@@ -355,6 +456,8 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             "source": "lexical-context/original.js",
             "helper_count": helper_rows.len(),
             "helpers": helper_rows,
+            "specialization_count": specialization_rows.len(),
+            "specializations": specialization_rows,
             "handlers": context.handlers.iter().map(|handler| json!({
                 "path": handler.path,
                 "linked_helpers": handler.linked_helpers,
@@ -509,11 +612,11 @@ mod tests {
         let original = temp.path().join("original.js");
         fs::write(
             &original,
-            "function original(){const helper=function(x){return byte(x)+1;};const byte=function(x){return x[0];};}",
+            "function original(){const helper=function(x,y){return byte(x)+y;};const byte=function(x){return x[0];};}",
         )?;
         fs::write(
             input.join("handler.js"),
-            "const capturedHandler=function(x){return helper(x);};",
+            "const capturedHandler=function(x){return helper(x, 16);};",
         )?;
         run_source_tree(SourceTreeArgs {
             input,
@@ -526,6 +629,11 @@ mod tests {
         let metadata: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(context_dir.join("context.json"))?)?;
         assert_eq!(metadata["helper_count"], 2);
+        assert_eq!(metadata["specialization_count"], 1);
+        assert!(
+            fs::read_to_string(context_dir.join("specializations/README.md"))?
+                .contains("argument 1 = 16")
+        );
         assert!(fs::read_to_string(output.join("README.md"))?.contains("helper-"));
         assert!(fs::read_to_string(context_dir.join("README.md"))?.contains("byte"));
         let mut helpers = fs::read_dir(context_dir.join("helpers"))?
