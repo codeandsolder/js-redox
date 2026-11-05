@@ -59,6 +59,24 @@ Current structural families include same-array rotation (`x.push(x.shift())`, in
 
 Coverage is intentionally measured separately from generic suspicion scoring. On the 47-file real corpus plus 3 VM hard negatives, the simple scanner and structural scanner both cluster 49/50 files, but the structural layer names concrete obfuscation families in 17 files (16 real + the Yandex VM-negative that genuinely contains a rotation bootstrap). That named coverage is the useful metric because the families map directly onto safe deobfuscation passes such as table decoding, pure-helper evaluation, and selector specialization.
 
+## Fast analysis of a recorded browser execution
+
+For a browser capture already processed into a project, rerun just the
+observed invocation explanations and provenance graph without repeating
+deobfuscation, module recovery, or VM scans:
+
+~~~sh
+.cargo-target-nodebug/debug/trace-explain path/to/recovered-project
+~~~
+
+The invocation path page contains original-source AST guard matches and
+concrete, debugger-witnessed selected-arm transitions, with the raw trace
+unchanged except for derived witness metadata. A recorded true/false
+value alone does not prove the branch was taken: the next pause must be
+verified inside the selected AST arm. Missing or ambiguous evidence is
+explicitly left unresolved. The general readable tree is never
+specialized away based on a single recording.
+
 ## Current pipeline
 
 The target is a provenance-preserving **browser capture -> readable source project** pipeline, with VM devirtualization as one transformation stage rather than the whole product.

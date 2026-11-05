@@ -822,6 +822,51 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                 }),
             )?;
         }
+        // Original-source AST guard witnesses are separate from both static
+        // branches and the raw debugger steps. Their source provenance flows
+        // through the already-verified observed-step nodes.
+        for (guard_index, guard) in array_field(hit, "observed_guard_witnesses")
+            .iter()
+            .enumerate()
+        {
+            budget.checkpoint()?;
+            let Some(step_index) = guard
+                .get("step_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+            else {
+                continue;
+            };
+            if step_index >= array_field(hit, "steps").len() {
+                continue;
+            }
+            let guard_id = format!("observed-guard:{ordinal}:{guard_index}");
+            graph.add_node(
+                guard_id.clone(),
+                json!({
+                    "type":"observed_guard",
+                    "witness":guard,
+                    "concrete_observation_only":true,
+                    "complete_execution_path":false,
+                }),
+            )?;
+            graph.add_edge(
+                &format!("observed-step:{ordinal}:{step_index}"),
+                &guard_id,
+                "observed_ast_guard_value",
+                json!({"exact_original_ast":true,"concrete_observation_only":true}),
+            )?;
+            if let Some(selected_arm) = nonempty_string_field(guard, "next_pause_in_selected_arm") {
+                if step_index + 1 < array_field(hit, "steps").len() {
+                    graph.add_edge(
+                        &guard_id,
+                        &format!("observed-step:{ordinal}:{}", step_index + 1),
+                        "observed_next_pause_in_selected_arm",
+                        json!({"arm":selected_arm,"concrete_observation_only":true}),
+                    )?;
+                }
+            }
+        }
         for scope in array_field(hit, "scopes") {
             budget.checkpoint()?;
             let scope_type = nonempty_string_field(scope, "type").unwrap_or("unknown");
