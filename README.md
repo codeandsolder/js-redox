@@ -37,6 +37,17 @@ scripts/build-jsvm-lift.sh
 
 It uses the machine-pinned Rust 1.99 toolchain, requires the distributed sccache build path, derives build parallelism from live farm capacity, and publishes durable executables under `.cargo-target-nodebug/`. The helper builds the scanner/tooling plus `sourcemaps`, `wasm-redox`, and the `fresh-eval` proof helper, and asks Cargo for the workspace target directory rather than assuming a member-local `target/` layout.
 
+### Deep lazy-cell handler provenance (on demand)
+
+For source files whose structural scan reports a lazy-registry indirect-call candidate, run the separate Rust proof pass on the **exact original or recovered child bytes**:
+
+```sh
+.cargo-target-nodebug/debug/lazy-cell-explain path/to/embedded-child.js \
+  --output work/lazy-cell-explained
+```
+
+This deliberately stays outside the fast default browser-project pipeline. Its `analysis.json` records SHA-256-bound source spans, exact constructor/receiver origin, specialized lazy-cell factory calls, original registry-install provenance, and individually proven captured handler functions. `handlers/` contains independently formatted readable views of those original function literals with a local navigation README. A proof that a wrapper **captured** a handler is not a proof that a given browser invocation **returned or executed** that handler: dynamic resolver phases, registry-slot persistence, and observed control flow remain separate obligations. An existing nonempty output directory is refused to avoid stale generated files.
+
 ## Pinned real-corpus evaluation
 
 `corpus-eval` is the single engine-facing evaluator for pinned private/real-world JavaScript corpora. The manifest owns capture hashes and acceptance policy; the evaluator formats, safe-deobfuscates, and structurally scans each raw sample through the Rust library APIs in-process. Node is used only as an independent syntax check for generated analyst/deobfuscated source. Reference samples are hash-verified but never executed.
