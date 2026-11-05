@@ -29,6 +29,19 @@ export function validateTraceSpec(spec) {
         (!Number.isSafeInteger(point.columnNumber) || point.columnNumber < 0)) {
       throw new Error("trace point " + index + ": columnNumber must be nonnegative");
     }
+    const followSteps = point.followSteps ?? 0;
+    if (!Number.isSafeInteger(followSteps) || followSteps < 0 || followSteps > 32) {
+      throw new Error("trace point " + index + ": followSteps must be an integer from 0 to 32");
+    }
+    const stepMode = point.stepMode ?? "into";
+    if (!["into", "over"].includes(stepMode)) {
+      throw new Error("trace point " + index + ": stepMode must be into or over");
+    }
+    const stepExpressions = point.stepExpressions ?? [];
+    if (!Array.isArray(stepExpressions) || stepExpressions.length > 8 ||
+        stepExpressions.some((x) => typeof x !== "string" || x.length < 1 || x.length > 256)) {
+      throw new Error("trace point " + index + ": at most 8 bounded stepExpressions");
+    }
     const expressions = point.expressions ?? [];
     if (!Array.isArray(expressions) || expressions.length > 8 ||
         expressions.some((x) => typeof x !== "string" || x.length < 1 || x.length > 256)) {
@@ -41,6 +54,9 @@ export function validateTraceSpec(spec) {
       lineNumber: point.lineNumber,
       ...(point.columnNumber === undefined ? {} : { columnNumber: point.columnNumber }),
       expressions,
+      followSteps,
+      stepMode,
+      stepExpressions,
     };
   });
   return { schema: "js-redox/selective-trace-config/v1", maxHits, maxScopeProperties, maxFunctionLocations, points };

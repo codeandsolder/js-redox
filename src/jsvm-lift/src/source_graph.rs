@@ -709,6 +709,9 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                 "type":"observed_invocation",
                 "point_id":field(hit,"pointId"),
                 "readable_view_path":field(hit,"readable_view_path"),
+                "path_view_path":field(hit,"path_view_path"),
+                "path_witness_status":field(hit,"pathWitnessStatus"),
+                "path_witness_mode":field(hit,"pathWitnessMode"),
                 "cdp_session":field(hit,"cdpSession"),
                 "at":field(hit,"at"),
                 "reason":field(hit,"reason"),
@@ -747,6 +750,73 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                     "cdp_session":session,
                     "script_id":script_id,
                     "source_sha256":sha,
+                    "identity_basis":"exact_session_script_hash",
+                    "concrete_observation_only":true,
+                }),
+            )?;
+        }
+        // Each debugger step is a concrete next-pause event with explicit
+        // order; only exact top-frame source matches receive executable
+        // location edges. An unknown frame remains an unresolved step node.
+        for (step_index, step) in array_field(hit, "steps").iter().enumerate() {
+            budget.checkpoint()?;
+            let step_id = format!("observed-step:{ordinal}:{step_index}");
+            let top = array_field(step, "frames").first();
+            graph.add_node(
+                step_id.clone(),
+                json!({
+                    "type":"observed_step",
+                    "step_index":step_index,
+                    "point_id":field(hit,"pointId"),
+                    "cdp_session":session,
+                    "reason":field(step,"reason"),
+                    "hit_breakpoints":field(step,"hitBreakpoints"),
+                    "top_frame":top,
+                    "frames":field(step,"frames"),
+                    "scopes":field(step,"scopes"),
+                    "expressions":field(step,"expressions"),
+                    "concrete_observation_only":true,
+                    "complete_execution_path":false,
+                }),
+            )?;
+            graph.add_edge(
+                &node_id,
+                &step_id,
+                "observed_next_step",
+                json!({
+                    "step_index":step_index,
+                    "step_mode":field(hit,"pathWitnessMode"),
+                    "concrete_observation_only":true,
+                }),
+            )?;
+            let Some(top) = top else { continue };
+            if nonempty_string_field(top, "source_identity") != Some("exact") {
+                continue;
+            }
+            let Some(script_id) = top
+                .get("location")
+                .and_then(|location| location.get("scriptId"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let Some(sha) = nonempty_string_field(top, "sourceSha256") else {
+                continue;
+            };
+            let expected = format!("runtime:{}", &sha[..sha.len().min(20)]);
+            let key = (session.to_owned(), script_id.to_owned());
+            if runtime_node_by_instance.get(&key) != Some(&expected) {
+                continue;
+            }
+            graph.add_edge(
+                &expected, &step_id, "observed_executed_location",
+                json!({
+                    "cdp_session":session,
+                    "script_id":script_id,
+                    "source_sha256":sha,
+                    "line_number":top.get("location").and_then(|location| location.get("lineNumber")).cloned(),
+                    "column_number":top.get("location").and_then(|location| location.get("columnNumber")).cloned(),
+                    "step_index":step_index,
                     "identity_basis":"exact_session_script_hash",
                     "concrete_observation_only":true,
                 }),

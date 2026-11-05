@@ -10,6 +10,25 @@ const spec = validateTraceSpec({ points: [
 ] });
 assert.equal(spec.maxHits, 16);
 assert.equal(spec.maxFunctionLocations, 16);
+assert.equal(spec.points[0].followSteps, 0);
+assert.equal(spec.points[0].stepMode, "into");
+assert.deepEqual(spec.points[0].stepExpressions, []);
+assert.deepEqual(validateTraceSpec({ points: [{
+  url: "x", lineNumber: 0, followSteps: 12, stepMode: "over",
+  stepExpressions: ["branch === 34"],
+}] }).points[0].stepExpressions, ["branch === 34"]);
+assert.throws(() => validateTraceSpec({ points: [
+  { url: "x", lineNumber: 0, followSteps: 33 },
+] }), /followSteps/);
+assert.throws(() => validateTraceSpec({ points: [
+  { url: "x", lineNumber: 0, followSteps: -1 },
+] }), /followSteps/);
+assert.throws(() => validateTraceSpec({ points: [
+  { url: "x", lineNumber: 0, stepMode: "bogus" },
+] }), /stepMode/);
+assert.throws(() => validateTraceSpec({ points: [
+  { url: "x", lineNumber: 0, stepExpressions: Array(9).fill("x") },
+] }), /stepExpressions/);
 assert.deepEqual(breakpointParams(spec.points[0]),
   { url: "http://127.0.0.1/test.js", lineNumber: 3 });
 assert.throws(() => validateTraceSpec({ points: [

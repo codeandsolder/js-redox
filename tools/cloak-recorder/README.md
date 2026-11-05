@@ -149,3 +149,37 @@ identity before the source graph and the human-readable invocation pages link
 to its original source definition. Such a link proves a function value was
 observed with that code location, not that the function was invoked,
 that its closure contents are known, or that every possible input selects it.
+
+### Follow a bounded sequence of actual debugger steps
+
+A trace point may additionally specify `followSteps` (0-32, default 0),
+`stepMode` (`into` or `over`, default `into`) and `stepExpressions` (up to 8
+side-effect-checked expressions per step). Example:
+
+    {"maxHits":2,"points":[{
+      "url":"https://example.test/dispatcher.js", "lineNumber":42,
+      "expressions":["opcode", "handler === registry[opcode]"],
+      "followSteps":12,"stepMode":"into",
+      "stepExpressions":["value", "value === 34"]
+    }]}
+
+The recorder captures the initial paused state, uses real Chromium debugger
+step commands and stores each subsequent paused call stack/locals/expression
+snapshot under the corresponding `hits[].steps[]`, in execution order. A
+per-CDP-session controller resumes execution after the bounded number of
+steps or after a failed debugger command, with a final resume fallback.
+The capture summary counts `observedStepLocations`. Import verifies the
+exact CDP session/script/captured SHA for **each** frame independently.
+The provenance graph materializes distinct observed-step nodes with order
+edges and exact top-frame source edges. The generated source project also
+contains an ordered, human-readable `src/_observed/invocations/NNNN-path.md`
+linked from its general invocation page.
+
+A condition such as `value === 34` being observed true at a paused point and
+the next debugger step entering its taken branch is concrete evidence for
+that one execution. This is not a full execution trace or an unconditional
+rewrite rule for other inputs. If no next step arrives, the path is marked
+incomplete rather than treating the missing step as unreachable code. A
+stepInto after the relevant script returns may enter unrelated browser code;
+the captured script identity remains explicit instead of attributing that
+code to the original script.

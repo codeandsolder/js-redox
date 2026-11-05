@@ -16,7 +16,8 @@ import { fileURLToPath } from "node:url";
 import { evaluateDuringScroll, isTerminalTargetClosedError } from "./scroll-retry.mjs";
 import { classifyRelevantBodies } from "./network-completeness.mjs";
 import { normalizePreciseCoverage, summarizePreciseCoverage } from "./precise-coverage.mjs";
-import { validateTraceSpec, breakpointParams, captureAndResume } from "./selective-trace.mjs";
+import { validateTraceSpec, breakpointParams } from "./selective-trace.mjs";
+import { createSelectivePathController } from "./selective-path.mjs";
 import {
   WORKER_TARGET_FILTER,
   createNestedCdpRouter,
@@ -611,6 +612,7 @@ async function main() {
   const runtimeScripts = new Map();
   const coverageSessions = new Map();
   const traceBreakpoints = new Map();
+  const traceControllers = new Map();
   const traceHits = [];
   const traceErrors = [];
   let traceHitSlots = 0;
@@ -1068,23 +1070,24 @@ async function main() {
     });
 
     if (traceSpec) {
-      cdpSession.on("Debugger.paused", (event) => {
-        queueJob((async () => {
-          const byId = traceBreakpoints.get(cdpSessionName);
-          const hitId = (event.hitBreakpoints || []).find((id) => byId?.has(id));
-          const point = hitId ? byId.get(hitId) : null;
-          if (!point || traceHitSlots >= traceSpec.maxHits) {
-            await cdpSession.send("Debugger.resume");
-            return;
-          }
+      const controller = createSelectivePathController({
+        session: cdpSession,
+        sessionName: cdpSessionName,
+        config: traceSpec,
+        acquireHit: () => {
+          if (traceHitSlots >= traceSpec.maxHits) return false;
           traceHitSlots += 1;
-          try {
-            const witness = await captureAndResume(cdpSession, event, point, traceSpec);
-            traceHits.push({ ...witness, cdpSession: cdpSessionName, at: Date.now() });
-          } catch (error) {
-            traceErrors.push({ cdpSession: cdpSessionName, pointId: point.id, error: String(error) });
-          }
-        })(), "selective-trace " + cdpSessionName);
+          return true;
+        },
+        onHit: (witness) => traceHits.push(witness),
+        onError: (error) => traceErrors.push(error),
+      });
+      traceControllers.set(cdpSessionName, controller);
+      cdpSession.on("Debugger.paused", (event) => {
+        queueJob(
+          controller.onPaused(event, traceBreakpoints.get(cdpSessionName)),
+          "selective-trace " + cdpSessionName,
+        );
       });
     }
 
@@ -1511,6 +1514,9 @@ async function main() {
     sessions: coverageRows,
     summary: summarizePreciseCoverage(coverageRows),
   };
+  // A requested debugger step that has no subsequent pause event is incomplete,
+  // not a negative statement about JS execution.
+  for (const controller of traceControllers.values()) controller.finish();
   // CDP session and V8 script ID are the identity; URLs alone are not.
   // Resolve captured source hashes without guessing between script instances.
   const capturedScriptById = new Map();
@@ -1519,14 +1525,19 @@ async function main() {
     if (!capturedScriptById.has(key)) capturedScriptById.set(key, item.captured?.sha256 || null);
     else if (capturedScriptById.get(key) !== item.captured?.sha256) capturedScriptById.set(key, null);
   }
+  const withCapturedSourceIdentity = (frames, session) => frames.map((frame) => ({
+    ...frame,
+    sourceSha256: capturedScriptById.get(session + ":" + frame.location?.scriptId) || null,
+  }));
   const selectiveTrace = traceSpec ? {
     schema: "js-redox/selective-breakpoint-trace/v1",
     config: traceSpec,
     hits: traceHits.map((hit) => ({
       ...hit,
-      frames: hit.frames.map((frame) => ({
-        ...frame,
-        sourceSha256: capturedScriptById.get(hit.cdpSession + ":" + frame.location?.scriptId) || null,
+      frames: withCapturedSourceIdentity(hit.frames, hit.cdpSession),
+      steps: hit.steps.map((step) => ({
+        ...step,
+        frames: withCapturedSourceIdentity(step.frames, hit.cdpSession),
       })),
     })),
     errors: traceErrors,
@@ -1534,6 +1545,7 @@ async function main() {
       configuredPoints: traceSpec.points.length,
       capturedHits: traceHits.length,
       attemptedHits: traceHitSlots,
+      observedStepLocations: traceHits.reduce((sum, hit) => sum + hit.steps.length, 0),
       errors: traceErrors.length,
       completeExecutionPath: false,
     },
