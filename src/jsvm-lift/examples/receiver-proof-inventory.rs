@@ -10,8 +10,9 @@ use jsvm_lift::{
         audit_prototype_method_phase_binding_mutation,
         propagate_matched_prototype_method_call_origins,
         propagate_proven_prototype_method_call_origins, proven_exact_own_data_field_at_direct_call,
-        proven_origin_direct_call_event_unreachable, proven_own_data_field_at_runtime_method_call,
-        proven_prototype_method_phase_at_event,
+        proven_origin_direct_call_event_unreachable,
+        proven_original_prototype_phase_return_at_event,
+        proven_own_data_field_at_runtime_method_call, proven_prototype_method_phase_at_event,
         proven_prototype_method_receiver_preservation_summary,
         proven_prototype_string_at_allocation, proven_prototype_string_at_direct_calls,
         proven_receiver_preserving_prototype_method_call,
@@ -329,6 +330,13 @@ fn main() -> Result<()> {
                 let hazard = audit_prototype_method_phase_binding_mutation(
                     &semantic.semantic, &closure, &budget,
                 )?;
+                let original_return = if let Some(event) = event {
+                    proven_original_prototype_phase_return_at_event(
+                        &source, &parsed.program, &semantic.semantic, &closure, event, &budget,
+                    )?
+                } else {
+                    None
+                };
                 let phase = event.as_ref().and_then(|event| {
                     proven_prototype_method_phase_at_event(
                         &source,
@@ -377,6 +385,12 @@ fn main() -> Result<()> {
                         "source_mutation_isolated": hazard.source_mutation_isolated,
                         "runtime_ordering_proven": false,
                     },
+                    "original_phase_function_return_at_event": original_return.as_ref().map(|proof| json!({
+                        "value_if_called_at_event": proof.phase.value,
+                        "event": [proof.phase.equality.event_start, proof.phase.equality.event_end],
+                        "phase_function": [proof.stable_function.closure.phase_function_start,proof.stable_function.closure.phase_function_end],
+                        "actual_invocation_proven": false,
+                    })),
                     "left_declaration": [left.start, left.end],
                     "right_declaration": [right.start, right.end],
                     "equal_value": closure.equal_value,
