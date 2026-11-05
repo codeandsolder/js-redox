@@ -1,5 +1,7 @@
 //! Human-readable browser execution witnesses with exact original-source context.
 //! This is evidence from a particular paused invocation, never a general proof.
+mod observed_guards;
+
 use crate::{
     analysis_artifacts::{load_artifact, write_artifact, RUNTIME_SCRIPTS, SELECTIVE_TRACE},
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
@@ -74,6 +76,7 @@ fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
 struct RuntimeSourceIdentity {
     sha256: String,
     start_line: Option<u64>,
+    start_column: Option<u64>,
     capture_instrumentation: bool,
 }
 
@@ -105,6 +108,7 @@ fn runtime_identity_index(runtime: &Value) -> RuntimeIdentityIndex {
             let next = RuntimeSourceIdentity {
                 sha256: sha.to_owned(),
                 start_line: instance.get("start_line").and_then(Value::as_u64),
+                start_column: instance.get("start_column").and_then(Value::as_u64),
                 capture_instrumentation: source.get("classification").and_then(Value::as_str)
                     == Some("capture_instrumentation"),
             };
@@ -268,6 +272,30 @@ fn build_observed_path_view(
             .and_then(Value::as_str)
             .unwrap_or("unknown"),
     ));
+    let guard_witnesses = hit
+        .get("observed_guard_witnesses")
+        .and_then(Value::as_array);
+    if let Some(witnesses) = guard_witnesses.filter(|items| !items.is_empty()) {
+        page.push_str("## Guard observations matched to original AST\n\n");
+        page.push_str("Only side-effect-checked booleans at an exact captured guard site appear here. A selected-arm label requires the next debugger pause in the same verified stack and original AST arm. Missing steps are not inferred.\n\n");
+        for witness in witnesses {
+            page.push_str(&format!(
+                "- **Step {}** — {} guard observed **{}**; next pause in selected arm: **{}**.\n",
+                witness["step_index"].as_u64().unwrap_or(0),
+                witness["kind"].as_str().unwrap_or("?"),
+                witness["observed_value"].as_bool().unwrap_or(false),
+                witness["next_pause_in_selected_arm"]
+                    .as_str()
+                    .unwrap_or("not witnessed")
+            ));
+            page.push_str(&fence(
+                &serde_json::to_string(&witness["expression"])?,
+                "json",
+            ));
+            page.push('\n');
+        }
+        page.push('\n');
+    }
     for (index, step) in steps.iter().enumerate() {
         let top = step
             .get("frames")
@@ -516,6 +544,16 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
         {
             let path_name = format!("{ordinal:04}-path.md");
             let path_destination = format!("src/_observed/invocations/{path_name}");
+            let guards = observed_guards::observe(
+                project,
+                &identities,
+                &session,
+                hit.get("steps")
+                    .and_then(Value::as_array)
+                    .context("steps")?,
+                &budget,
+            )?;
+            hit["observed_guard_witnesses"] = json!(guards);
             let path_view = build_observed_path_view(project, &identities, &session, hit, ordinal)?;
             fs::write(output.join(&path_name), path_view)?;
             hit["path_view_path"] = json!(path_destination);
