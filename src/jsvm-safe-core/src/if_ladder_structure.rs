@@ -83,8 +83,7 @@ fn state_test(expr: &Expression<'_>, state: &str) -> Option<u64> {
 }
 
 fn parse_target(expr: &Expression<'_>, state: &str, source: &str) -> Option<Route> {
-    let expr = unparen(expr);
-    match expr {
+    match unparen(expr) {
         Expression::ConditionalExpression(branch) => Some(Route {
             effects: vec![],
             next: Next::Choose {
@@ -93,7 +92,18 @@ fn parse_target(expr: &Expression<'_>, state: &str, source: &str) -> Option<Rout
                 no: Box::new(parse_target(&branch.alternate, state, source)?),
             },
         }),
-        _ => Some(Route::jump(state, number(expr)?)),
+        Expression::SequenceExpression(sequence) => {
+            let (last, rest) = sequence.expressions.split_last()?;
+            let mut result = parse_target(last, state, source)?;
+            let mut effects = rest
+                .iter()
+                .map(|effect| format!("({});", fragment(source, effect.span())))
+                .collect::<Vec<_>>();
+            effects.append(&mut result.effects);
+            result.effects = effects;
+            Some(result)
+        }
+        expr => Some(Route::jump(state, number(expr)?)),
     }
 }
 
@@ -151,6 +161,84 @@ fn collect_dispatch(
                 return None;
             }
             Some(())
+        }
+        _ => None,
+    }
+}
+
+/// Statement-form state dispatchers are the same graph as ternary
+/// dispatchers, with effects spread across statement blocks instead of
+/// comma expressions. Keep the original effect order and lexical scope.
+fn parse_statement_route(stmt: &Statement<'_>, state: &str, source: &str) -> Option<Route> {
+    match stmt {
+        Statement::ExpressionStatement(expression) => {
+            parse_route(&expression.expression, state, source)
+        }
+        Statement::BlockStatement(block) => {
+            let (last, prefix) = block.body.split_last()?;
+            // Moving a block-local declaration outside its original block
+            // changes temporal-dead-zone/closure semantics. Retain those
+            // structures until the graph emitter can render lexical regions.
+            if prefix.iter().any(|statement| {
+                matches!(
+                    statement,
+                    Statement::VariableDeclaration(declaration)
+                        if declaration.kind != oxc_ast::ast::VariableDeclarationKind::Var
+                ) || matches!(
+                    statement,
+                    Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_)
+                )
+            }) {
+                return None;
+            }
+            let mut route = parse_statement_route(last, state, source)?;
+            let mut effects = prefix
+                .iter()
+                .map(|statement| fragment(source, statement.span()).to_owned())
+                .collect::<Vec<_>>();
+            effects.append(&mut route.effects);
+            route.effects = effects;
+            Some(route)
+        }
+        Statement::IfStatement(branch) => Some(Route {
+            effects: Vec::new(),
+            next: Next::Choose {
+                condition: fragment(source, branch.test.span()).to_owned(),
+                yes: Box::new(parse_statement_route(&branch.consequent, state, source)?),
+                no: Box::new(parse_statement_route(
+                    branch.alternate.as_ref()?,
+                    state,
+                    source,
+                )?),
+            },
+        }),
+        _ => None,
+    }
+}
+
+fn collect_dispatch_statement(
+    stmt: &Statement<'_>,
+    state: &str,
+    source: &str,
+    cases: &mut BTreeMap<u64, Route>,
+) -> Option<()> {
+    match stmt {
+        Statement::IfStatement(branch) => {
+            let value = state_test(&branch.test, state)?;
+            let route = parse_statement_route(&branch.consequent, state, source)?;
+            if cases.insert(value, route).is_some() {
+                return None;
+            }
+            if let Some(alternate) = &branch.alternate {
+                collect_dispatch_statement(alternate, state, source, cases)?;
+            }
+            Some(())
+        }
+        Statement::ExpressionStatement(expression) => {
+            collect_dispatch(&expression.expression, state, source, cases)
+        }
+        Statement::BlockStatement(block) if block.body.len() == 1 => {
+            collect_dispatch_statement(&block.body[0], state, source, cases)
         }
         _ => None,
     }
@@ -583,18 +671,8 @@ fn reconstruct_state_loop(
     source: &str,
 ) -> Option<String> {
     let exit = exit_state(test, state)?;
-    let dispatch = match body {
-        Statement::ExpressionStatement(stmt) => &stmt.expression,
-        Statement::BlockStatement(block) if block.body.len() == 1 => {
-            let Statement::ExpressionStatement(stmt) = &block.body[0] else {
-                return None;
-            };
-            &stmt.expression
-        }
-        _ => return None,
-    };
     let mut graph = BTreeMap::new();
-    collect_dispatch(dispatch, state, source, &mut graph)?;
+    collect_dispatch_statement(body, state, source, &mut graph)?;
     let nodes = reachable(initial, exit, &graph)?;
     let loops = build_loops(&graph, &nodes, exit)?;
     // Do not generate an infinite/repeated CFG expansion. Every loop must
@@ -747,6 +825,55 @@ mod tests {
         assert!(!output.contains("s==97"), "{output}");
         let allocator = Allocator::default();
         assert!(!parse_program(&allocator, &output, SourceType::cjs()).fatal_error);
+    }
+
+    #[test]
+    fn restructures_statement_if_else_dispatch_with_early_exit_and_sequence() {
+        let source = r#"
+            function f(data, log) {
+                var s, item;
+                for (s=94; s!=54;)
+                    if (s==94) {
+                        for (item in data) if (item==="stop") return log;
+                        s=10;
+                    } else if (s==10) s=56;
+                    else if (s==56) s=data.length?67:54;
+                    else if (s==67) {
+                        log.push("value");
+                        s=(item=0,54);
+                    }
+                return log;
+            }
+        "#;
+        let restored = recover(source);
+        assert!(!restored.contains("s==94"), "{restored}");
+        assert!(restored.contains("for (item in data)"), "{restored}");
+        assert!(restored.contains("return log"), "{restored}");
+        assert!(restored.contains("item=0"), "{restored}");
+        assert!(restored.contains("log.push"), "{restored}");
+        let allocator = Allocator::default();
+        assert!(!parse_program(&allocator, &restored, SourceType::cjs()).fatal_error);
+    }
+
+    #[test]
+    fn rejects_if_else_dispatch_that_writes_unknown_or_lexically_scoped_state() {
+        for source in [
+            "function f(){var s;for(s=3;s!=9;)if(s==3){s=external()}else if(s==9){s=9;}}",
+            "function f(){var s;for(s=3;s!=9;)if(s==3){const v=9;s=9;}else if(s==9){s=9;}}",
+        ] {
+            let allocator = Allocator::default();
+            let parsed = parse_program(&allocator, source, SourceType::cjs());
+            assert!(!parsed.fatal_error);
+            let mut visitor = FindFor {
+                source,
+                ..Default::default()
+            };
+            visitor.visit_program(&parsed.program);
+            assert!(
+                visitor.outputs.is_empty(),
+                "unexpected reconstruction for {source}"
+            );
+        }
     }
 
     #[test]
