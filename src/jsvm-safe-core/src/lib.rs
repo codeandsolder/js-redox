@@ -4,6 +4,7 @@ mod browser_legacy;
 mod control_flow;
 mod decoder;
 mod decoder_encoding;
+mod if_ladder_structure;
 mod numeric;
 mod proxy;
 mod pure_function;
@@ -895,6 +896,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
+        if let Some(text) = if_ladder_structure::reconstruct_for(it, self.source) {
+            self.push(it.span, text, "if_ladder_structured");
+            return;
+        }
         if let Some(text) = self.reference_state_replacement(it) {
             self.push(it.span, text, "reference_state_unflatten");
             return;
