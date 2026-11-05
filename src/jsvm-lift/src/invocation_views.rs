@@ -74,6 +74,7 @@ fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
 struct RuntimeSourceIdentity {
     sha256: String,
     start_line: Option<u64>,
+    capture_instrumentation: bool,
 }
 
 type RuntimeIdentityIndex = HashMap<(String, String), Option<RuntimeSourceIdentity>>;
@@ -104,6 +105,8 @@ fn runtime_identity_index(runtime: &Value) -> RuntimeIdentityIndex {
             let next = RuntimeSourceIdentity {
                 sha256: sha.to_owned(),
                 start_line: instance.get("start_line").and_then(Value::as_u64),
+                capture_instrumentation: source.get("classification").and_then(Value::as_str)
+                    == Some("capture_instrumentation"),
             };
             let key = (session.to_owned(), script.to_owned());
             match found.get(&key) {
@@ -302,29 +305,38 @@ fn build_observed_path_view(
         if exact {
             let sha = sha.context("checked exact original step source")?;
             let raw_path = format!("resources/runtime-scripts/{sha}.js");
-            let bytes = fs::read(project.join(&raw_path))
-                .with_context(|| format!("missing original execution step source {sha}"))?;
-            if sha256_hex(&bytes) != sha {
-                bail!("original execution step source hash mismatch: {sha}");
-            }
-            let raw = String::from_utf8(bytes)
-                .with_context(|| format!("execution step code is not UTF-8: {sha}"))?;
-            page.push_str(&format!(
-                "Verified [original source](../../../{raw_path}), SHA-256 **{sha}**.\n\n"
-            ));
-            let readable = format!("src/_readable/runtime-scripts/{sha}.js");
-            if project.join(&readable).is_file() {
+            if identity.is_some_and(|source| source.capture_instrumentation)
+                && !project.join(&raw_path).is_file()
+            {
                 page.push_str(&format!(
-                    "[General safe-readable view](../../../{readable}) (different source offsets).\n\n"
+                    "Exact captured script SHA-256 **{sha}**; this is **recorder instrumentation**,                      intentionally excluded from the recovered application source tree.                      No original-source excerpt or application link is claimed.\n\n"
                 ));
-            }
-            if let Some(line) = line {
-                page.push_str(&source_excerpt(
-                    &raw,
-                    line,
-                    identity.and_then(|source| source.start_line),
+            } else {
+                let bytes = fs::read(project.join(&raw_path)).with_context(|| {
+                    format!("missing original application execution step source {sha}")
+                })?;
+                if sha256_hex(&bytes) != sha {
+                    bail!("original execution step source hash mismatch: {sha}");
+                }
+                let raw = String::from_utf8(bytes)
+                    .with_context(|| format!("execution step code is not UTF-8: {sha}"))?;
+                page.push_str(&format!(
+                    "Verified [original source](../../../{raw_path}), SHA-256 **{sha}**.\n\n"
                 ));
-                page.push('\n');
+                let readable = format!("src/_readable/runtime-scripts/{sha}.js");
+                if project.join(&readable).is_file() {
+                    page.push_str(&format!(
+                        "[General safe-readable view](../../../{readable}) (different source offsets).\n\n"
+                    ));
+                }
+                if let Some(line) = line {
+                    page.push_str(&source_excerpt(
+                        &raw,
+                        line,
+                        identity.and_then(|source| source.start_line),
+                    ));
+                    page.push('\n');
+                }
             }
         } else {
             page.push_str("Original source identity **unresolved**; no code excerpt claimed.\n\n");
@@ -508,7 +520,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             fs::write(output.join(&path_name), path_view)?;
             hit["path_view_path"] = json!(path_destination);
             view.push_str(&format!(
-                "## Ordered execution witness\n\n[Browse {} observed debugger steps](./{path_name}).                  This is a bounded sequence, not universal path specialization.\n\n",
+                "## Ordered execution witness\n\n[Browse {} observed debugger steps](./{path_name}). This is a bounded sequence, not universal path specialization.\n\n",
                 hit.get("steps").and_then(Value::as_array).map_or(0, Vec::len),
             ));
         }
@@ -599,7 +611,12 @@ mod tests {
                 "summary":{}, "alpine_families":[], "gtm_families":[],
                 "sources":[{
                     "sha256":digest,
+                    "classification":"application",
                     "script_instances":[{"cdp_session":"main","script_id":"6","start_line":0}],
+                },{
+                    "sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "classification":"capture_instrumentation",
+                    "script_instances":[{"cdp_session":"main","script_id":"7","start_line":0}]
                 }]
             }),
         )?;
@@ -618,7 +635,12 @@ mod tests {
                     {"functionName":"dispatch","location":{"scriptId":"6","lineNumber":2,"columnNumber":2},
                      "sourceSha256":digest,"source_identity":"exact"}
                 ],"expressions":[{"expression":"opcode === 34","status":"observed",
-                    "value":{"type":"boolean","value":true}}],"scopes":[]}],
+                    "value":{"type":"boolean","value":true}}],"scopes":[]},
+                {"index":1,"reason":"other","frames":[
+                    {"functionName":"","location":{"scriptId":"7","lineNumber":1,"columnNumber":1},
+                     "sourceSha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                     "source_identity":"exact"}
+                ],"expressions":[],"scopes":[]}],
                 "pathWitnessStatus":"bounded_steps_recorded","pathWitnessMode":"into",
                 "scopes":[{"type":"local","variables":[
                     {"name":"opcode","value":{"type":"number","value":34}},
@@ -647,6 +669,8 @@ mod tests {
         assert!(path.contains("Step 0: dispatch"));
         assert!(path.contains("return handler(opcode)"));
         assert!(path.contains("opcode === 34"));
+        assert!(path.contains("recorder instrumentation"));
+        assert!(path.contains("Step 1"));
         assert!(path.contains("true"));
 
         let trace = load_artifact(project, SELECTIVE_TRACE, false)?.context("trace")?;
