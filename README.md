@@ -192,9 +192,23 @@ Build the Rust tools, then use the one-command driver:
 ```sh
 .cargo-target-nodebug/debug/capture-project capture.har work/capture-project
 .cargo-target-nodebug/debug/capture-project "Saved Page.html" work/saved-project
+# No Chromium needed: fetch the HTML, linked scripts and module dependency graph with HTTP:
+.cargo-target-nodebug/debug/capture-project https://example.org/ work/example-site
+# Tune bounded network acquisition for large sites:
+.cargo-target-nodebug/debug/capture-project https://example.org/ work/example-large --http-max-resources 512 --http-max-resource-mib 32 --http-max-total-mib 256
 # Large captures / intentional oversubscription of content-only subprocess stages:
 .cargo-target-nodebug/debug/capture-project capture.har work/capture-project --jobs 8
 ```
+
+The URL form runs an HTTP-only acquisition using a browser-like request and a cookie jar,
+follows the HTML's explicit `script src` declarations, `modulepreload` links,
+inline/imported literal ES module dependencies, static worker references, and
+import maps (including scoped and prefix mappings via the existing resolver).
+It persists the fetched HAR in `analysis/http-capture.har` and a concise
+coverage/failure report in `analysis/http-static.json` before presenting the
+normal deobfuscated `src/` project. It does **not** run JavaScript; client-generated
+script URLs and computed imports must be covered with the browser recorder when
+they matter. Request count and per-resource/total response size are bounded.
 
 For a normal browser **Save Page / Webpage, Complete** export, the companion `Saved Page_files/` directory is discovered automatically. `--assets-dir` can override it. Saved-page files get stable synthetic URLs for graph resolution; an original page URL from Chromium's `saved from url=(...)` marker is retained separately when available.
 

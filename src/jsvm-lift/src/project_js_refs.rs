@@ -22,7 +22,7 @@ const IMPORT_KINDS: &[&str] = &["import_static", "import_dynamic"];
 const DYNAMIC_GLOB_KIND: &str = "import_dynamic_glob";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-struct ImportMap {
+pub(crate) struct ImportMap {
     #[serde(default)]
     imports: BTreeMap<String, Option<String>>,
     #[serde(default)]
@@ -178,7 +178,11 @@ fn parse_specifier_map(
     out
 }
 
-fn parse_import_map(base_url: &str, payload: &Value, warnings: &mut Vec<String>) -> ImportMap {
+pub(crate) fn parse_import_map(
+    base_url: &str,
+    payload: &Value,
+    warnings: &mut Vec<String>,
+) -> ImportMap {
     let Some(object) = payload.as_object() else {
         warnings.push("import map root is not an object".into());
         return ImportMap::default();
@@ -240,7 +244,7 @@ fn merge_specifier_map(
     merged
 }
 
-fn merge_import_map(existing: &ImportMap, new: &ImportMap) -> ImportMap {
+pub(crate) fn merge_import_map(existing: &ImportMap, new: &ImportMap) -> ImportMap {
     let mut merged = ImportMap {
         imports: merge_specifier_map(&existing.imports, &new.imports),
         scopes: existing.scopes.clone(),
@@ -298,7 +302,7 @@ fn resolution_value(
     })
 }
 
-fn resolve_with_import_map(
+pub(crate) fn resolve_with_import_map(
     base_url: Option<&str>,
     specifier: &str,
     import_map: Option<&ImportMap>,

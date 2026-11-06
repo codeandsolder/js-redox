@@ -8,18 +8,19 @@ use jsvm_lift::{
     },
     analysis_budget::AnalysisBudgets,
     capture_pipeline::{recover_capture_project, CapturePipelineOptions},
-    capture_project::{read_manifest, MANIFEST_NAME},
+    capture_project::{read_manifest, write_manifest, MANIFEST_NAME},
+    http_capture::{capture_url_to_har, HttpCaptureLimits},
 };
 use serde_json::Value;
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
 };
 
 #[derive(Parser, Debug)]
 #[command(about = "Recover a readable provenance-preserving project from a browser capture")]
 struct Args {
-    capture: PathBuf,
+    capture: String,
     output: PathBuf,
     #[arg(long)]
     assets_dir: Option<PathBuf>,
@@ -35,6 +36,15 @@ struct Args {
     skip_vm_scan: bool,
     #[arg(long)]
     skip_wasm_analysis: bool,
+    /// Maximum HTTP resources when the input is a URL.
+    #[arg(long, default_value_t = 128)]
+    http_max_resources: usize,
+    /// Maximum cumulative HTTP response bytes in MiB.
+    #[arg(long, default_value_t = 64)]
+    http_max_total_mib: usize,
+    /// Per-response HTTP byte cap in MiB.
+    #[arg(long, default_value_t = 8)]
+    http_max_resource_mib: usize,
 }
 
 fn required_artifact(project: &Path, spec: ArtifactSpec) -> Result<Value> {
@@ -229,14 +239,39 @@ fn print_summary(
 fn main() -> Result<()> {
     let args = Args::parse();
     let caller_cwd = env::current_dir()?;
-    let capture = args
-        .capture
-        .canonicalize()
-        .with_context(|| format!("capture does not exist: {}", args.capture.display()))?;
     let output = if args.output.is_absolute() {
         args.output.clone()
     } else {
         caller_cwd.join(&args.output)
+    };
+    let remote = url::Url::parse(&args.capture)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"));
+    let temp_capture = if remote.is_some() {
+        Some(tempfile::tempdir().context("staging HTTP-only capture")?)
+    } else {
+        None
+    };
+    let http_summary = if let Some(temp) = &temp_capture {
+        Some(capture_url_to_har(
+            &args.capture,
+            &temp.path().join("capture.har"),
+            HttpCaptureLimits {
+                max_resources: args.http_max_resources,
+                max_resource_bytes: args.http_max_resource_mib.saturating_mul(1024 * 1024),
+                max_total_bytes: args.http_max_total_mib.saturating_mul(1024 * 1024),
+                ..HttpCaptureLimits::default()
+            },
+        )?)
+    } else {
+        None
+    };
+    let capture = if let Some(temp) = &temp_capture {
+        temp.path().join("capture.har")
+    } else {
+        PathBuf::from(&args.capture)
+            .canonicalize()
+            .with_context(|| format!("capture does not exist: {}", args.capture))?
     };
     let assets_dir = args
         .assets_dir
@@ -268,6 +303,55 @@ fn main() -> Result<()> {
         vm_scan: !args.skip_vm_scan,
         budgets: AnalysisBudgets::standard("capture-project"),
     })?;
+
+    if let Some(summary) = http_summary {
+        let analysis = output.join("analysis");
+        fs::create_dir_all(&analysis)?;
+        let archived = analysis.join("http-capture.har");
+        fs::copy(&capture, &archived)
+            .with_context(|| format!("preserving HTTP capture in {}", archived.display()))?;
+        fs::write(
+            analysis.join("http-static.json"),
+            serde_json::to_vec_pretty(&summary)?,
+        )?;
+        let manifest_path = output.join(MANIFEST_NAME);
+        let mut manifest = read_manifest(&manifest_path)?;
+        manifest.source.kind = "http_static".into();
+        manifest.source.input.clone_from(&args.capture);
+        manifest
+            .source
+            .extra
+            .insert("requested_url".into(), summary.requested_url.clone().into());
+        manifest
+            .source
+            .extra
+            .insert("final_url".into(), summary.final_url.clone().into());
+        manifest
+            .source
+            .extra
+            .insert("captured_har".into(), "analysis/http-capture.har".into());
+        manifest
+            .source
+            .extra
+            .insert("http_static".into(), serde_json::to_value(&summary)?);
+        write_manifest(&manifest_path, &manifest)?;
+        let readme = output.join("README.md");
+        let mut section = format!(
+            "\n## HTTP-only acquisition\n\nRequested: {}\n\nFinal: {}\n\nAcquired **{}** responses ({} failed, {} still pending due to limits), **{}** response bytes. Raw capture: [http-capture.har](analysis/http-capture.har); [HTTP fetch summary](analysis/http-static.json).\n\nThis is static entrypoint discovery, not a browser execution trace: scripts created by runtime JavaScript and non-literal dynamic dependencies require a runtime capture.\n",
+            summary.requested_url, summary.final_url, summary.resources,
+            summary.failed_resources, summary.pending_resources, summary.bytes
+        );
+        if !summary.warnings.is_empty() {
+            section.push_str(
+                "\nUnresolved/failing resources are listed in analysis/http-static.json.\n",
+            );
+        }
+        use std::io::Write as _;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(readme)?
+            .write_all(section.as_bytes())?;
+    }
 
     print_summary(
         &output,
