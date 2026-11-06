@@ -180,9 +180,16 @@ The directory contract is intentionally simple:
   It now recovers meaningful lexical component names from embedded constant
   `__name`, `displayName`, or `name` metadata through nested factory wrappers
   (e.g. `var v = define({__name:'Footer'})` becomes `var Footer = define(...)`).
-  Renaming follows Oxc lexical identities through references and explicitly
-  aliased exports, skips collisions, shorthand properties and dynamic scopes,
-  and **only changes this analyst view**, not the proven transform.
+  It additionally recovers descriptive lexical names from explicit object
+  destructuring (`{footerBg: v}` → `{footerBg: footerBg}`, including defaulted
+  and nested bindings) and static property-reference aliases
+  (`var x = Object.create` → `var objectCreate = Object.create`). These work
+  with ordinary source objects and member paths, not a framework or built-in
+  whitelist. Renaming follows Oxc lexical identities and preserves shorthand
+  object keys and public export names through explicit aliases. Existing
+  meaningful identifiers, name collisions, reserved words and dynamic scopes
+  are respected. **Only this analyst view** changes; the proof-checked
+  deobfuscation and captured bytes remain unchanged.
   When a captured ESM dependency exports a descriptive lexical component name
   (such as `export {Footer as t}`), the same project stage also recovers that
   name in importing modules (`import {t as b}` → `import {t as Footer}`),
