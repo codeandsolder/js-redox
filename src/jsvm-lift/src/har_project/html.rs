@@ -10,6 +10,35 @@ use html_escape::decode_html_entities;
 use std::collections::HashMap;
 use url::Url;
 
+pub(crate) fn document_base(html: &str, final_url: &Url) -> Url {
+    let lower = html.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(relative) = lower[from..].find("<base") {
+        let start = from + relative;
+        if !html
+            .as_bytes()
+            .get(start + 5)
+            .is_some_and(|c| c.is_ascii_whitespace() || *c == b'>')
+        {
+            from = start + 5;
+            continue;
+        }
+        let Some(end) = find_tag_end(html.as_bytes(), start + 5) else {
+            break;
+        };
+        let attrs = parse_attrs(&html[start..=end]);
+        if let Some(href) = attrs.get("href") {
+            if let Ok(candidate) = final_url.join(href) {
+                if matches!(candidate.scheme(), "http" | "https") {
+                    return candidate;
+                }
+            }
+        }
+        from = end + 1;
+    }
+    final_url.clone()
+}
+
 #[derive(Debug)]
 pub(crate) struct ScriptTag {
     pub(crate) attrs: HashMap<String, String>,

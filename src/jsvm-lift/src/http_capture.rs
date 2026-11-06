@@ -5,7 +5,7 @@ use crate::{
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     browser_decode::decode_html,
     browser_script_types::is_executable_script,
-    har_project::html::{extract_script_tags, find_tag_end, parse_attrs},
+    har_project::html::{document_base, extract_script_tags, find_tag_end, parse_attrs},
     js_refs::extract_js_references,
     project_js_refs::{merge_import_map, parse_import_map, resolve_with_import_map, ImportMap},
 };
@@ -100,35 +100,6 @@ fn queue_url(
             kind,
         });
     }
-}
-
-fn document_base(html: &str, final_url: &Url) -> Url {
-    let lower = html.to_ascii_lowercase();
-    let mut from = 0;
-    while let Some(relative) = lower[from..].find("<base") {
-        let start = from + relative;
-        if !html
-            .as_bytes()
-            .get(start + 5)
-            .is_some_and(|c| c.is_ascii_whitespace() || *c == b'>')
-        {
-            from = start + 5;
-            continue;
-        }
-        let Some(end) = find_tag_end(html.as_bytes(), start + 5) else {
-            break;
-        };
-        let attrs = parse_attrs(&html[start..=end]);
-        if let Some(href) = attrs.get("href") {
-            if let Ok(candidate) = final_url.join(href) {
-                if let Some(url) = fetchable_url(candidate) {
-                    return url;
-                }
-            }
-        }
-        from = end + 1;
-    }
-    final_url.clone()
 }
 
 fn link_script_urls(html: &str) -> Vec<String> {

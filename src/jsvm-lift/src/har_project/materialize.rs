@@ -1,6 +1,6 @@
 use super::html::{
-    extract_script_tags, inline_script_extension, is_executable_script_type, is_json_script_type,
-    resolve_ref, script_type, source_refs,
+    document_base, extract_script_tags, inline_script_extension, is_executable_script_type,
+    is_json_script_type, resolve_ref, script_type, source_refs,
 };
 use super::parse::{Har, HarEntry, NameValue};
 use super::resource::{
@@ -17,6 +17,7 @@ use std::{
     fs,
     path::Path,
 };
+use url::Url;
 
 use work_budget::WorkBudget;
 
@@ -74,6 +75,8 @@ struct ResourceMeta {
     references: Vec<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     document_encoding: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    document_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     document_decode_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -272,6 +275,7 @@ fn materialize_entry(
     let mut reused_body = false;
     let mut references = Vec::new();
     let mut document_encoding = None;
+    let mut document_base_url = None;
     let mut document_decode_source = None;
     let mut document_decode_had_errors = None;
     let mut document_decode_uncertain = None;
@@ -307,12 +311,15 @@ fn materialize_entry(
                 });
             let decoded = decode_html(&body, transport_content_type, None);
             document_encoding = Some(decoded.encoding.clone());
+            document_base_url = Url::parse(&entry.request.url)
+                .ok()
+                .map(|url| document_base(&decoded.source, &url).to_string());
             document_decode_source = Some(decoded.decode_source.as_str().to_string());
             document_decode_had_errors = Some(decoded.had_errors);
             document_decode_uncertain = Some(decoded.uncertain);
             materialize_inline_scripts(
                 id,
-                &entry.request.url,
+                document_base_url.as_deref().unwrap_or(&entry.request.url),
                 &decoded.source,
                 &written,
                 output_root,
@@ -361,6 +368,7 @@ fn materialize_entry(
         response_headers: headers(&entry.response.headers),
         references,
         document_encoding,
+        document_base_url,
         document_decode_source,
         document_decode_had_errors,
         document_decode_uncertain,

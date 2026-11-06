@@ -397,7 +397,7 @@ fn load_import_maps(
     for (document_id, scripts) in by_document {
         let resource = resources.get(&document_id).copied();
         let base_url = resource
-            .and_then(|value| value.get("url"))
+            .and_then(|value| value.get("document_base_url").or_else(|| value.get("url")))
             .and_then(Value::as_str)
             .unwrap_or_default();
         let mut merged = ImportMap::default();
@@ -607,6 +607,7 @@ pub fn scan_project_references(
         seen_per_digest.insert(item.digest.clone(), occurrence + 1);
         let mut row = json!({
             "resource_id": item.unit.get("resource_id").cloned().unwrap_or(Value::Null),
+            "origin": item.unit.get("origin").cloned().unwrap_or(Value::Null),
             "url": item.unit.get("url").cloned().unwrap_or(Value::Null),
             "raw_path": item.unit.get("raw_path").cloned().unwrap_or(Value::Null),
             "source_path": item.source_path,
@@ -640,13 +641,39 @@ pub fn scan_project_references(
         rows.push(row);
     }
 
+    let document_bases = manifest
+        .resources
+        .iter()
+        .filter_map(|resource| {
+            Some((
+                resource.get("id")?.as_u64()?,
+                resource.get("document_base_url")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for row in &mut rows {
+        let base_url = if row.get("origin").and_then(Value::as_str) == Some("inline_script") {
+            row.get("resource_id")
+                .and_then(Value::as_u64)
+                .and_then(|id| document_bases.get(&id))
+                .cloned()
+        } else {
+            None
+        };
+        if let Some(base_url) = base_url {
+            row.as_object_mut()
+                .context("reference row must be object")?
+                .insert("resolution_base_url".into(), Value::String(base_url));
+        }
+    }
     let captured_urls = units_by_url.keys().cloned().collect::<Vec<_>>();
     let mut dynamic_glob_matches = BTreeMap::<(usize, usize), Vec<String>>::new();
     let mut dynamic_glob_patterns = 0_usize;
     for (row_id, row) in rows.iter_mut().enumerate() {
         stage_budget.checkpoint()?;
         let base_url = row
-            .get("url")
+            .get("resolution_base_url")
+            .or_else(|| row.get("url"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         let refs = row
@@ -717,7 +744,8 @@ pub fn scan_project_references(
             continue;
         }
         let row_url = rows[row_id]
-            .get("url")
+            .get("resolution_base_url")
+            .or_else(|| rows[row_id].get("url"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         let references = rows[row_id]
@@ -816,7 +844,8 @@ pub fn scan_project_references(
                 Value::Array(contexts[row_id].iter().copied().map(Value::from).collect()),
             );
         let base_url = row
-            .get("url")
+            .get("resolution_base_url")
+            .or_else(|| row.get("url"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         let refs = row
