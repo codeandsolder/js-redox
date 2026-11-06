@@ -206,9 +206,15 @@ inline/imported literal ES module dependencies, static worker references, and
 import maps (including scoped and prefix mappings via the existing resolver).
 It persists the fetched HAR in `analysis/http-capture.har` and a concise
 coverage/failure report in `analysis/http-static.json` before presenting the
-normal deobfuscated `src/` project. It does **not** run JavaScript; client-generated
-script URLs and computed imports must be covered with the browser recorder when
-they matter. Request count and per-resource/total response size are bounded.
+normal deobfuscated `src/` project. **Start in `src/ENTRYPOINTS.md`**: it links
+HTML script declarations to the actual formatted/recovered JavaScript files and
+follows statically resolvable imports through the captured module tree. HTML
+`modulepreload` and `preload as=script` hints are included as separately labeled
+roots, so page and framework chunks are discoverable even without a direct
+import from an entrypoint. Preload hints do not establish actual execution.
+It does **not** run JavaScript; client-generated script URLs and computed
+imports may require the browser recorder. Request count and per-resource/total
+response size are bounded.
 
 For a normal browser **Save Page / Webpage, Complete** export, the companion `Saved Page_files/` directory is discovered automatically. `--assets-dir` can override it. Saved-page files get stable synthetic URLs for graph resolution; an original page URL from Chromium's `saved from url=(...)` marker is retained separately when available.
 
