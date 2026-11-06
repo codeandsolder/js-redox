@@ -9,7 +9,7 @@ use crate::{
     js_refs::extract_js_references,
     project_js_refs::{merge_import_map, parse_import_map, resolve_with_import_map, ImportMap},
 };
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use base64::Engine;
 use reqwest::{
     blocking::Client,
@@ -349,7 +349,7 @@ pub fn capture_url_to_har(
             request = request.header(REFERER, referrer.as_str());
         }
         let outcome: Result<(Url, u16, String, Vec<u8>)> = (|| {
-            let mut response = request
+            let response = request
                 .send()
                 .with_context(|| format!("GET {}", pending.url))?;
             let final_url = response.url().clone();
