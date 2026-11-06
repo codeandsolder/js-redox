@@ -4,6 +4,7 @@ mod browser_legacy;
 mod control_flow;
 mod decoder;
 mod decoder_encoding;
+mod effectful_constant;
 mod if_ladder_structure;
 mod numeric;
 mod proxy;
@@ -965,6 +966,10 @@ impl Collector<'_, '_> {
 
 impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_expression(&mut self, it: &Expression<'a>) {
+        if let Some(replacement) = effectful_constant::fold(it, self.source) {
+            self.push(it.span(), replacement, "effectful_constant_fold");
+            return;
+        }
         if let Expression::Identifier(id) = it {
             if self.shorthand_spans.contains(&(id.span.start, id.span.end)) {
                 walk::walk_expression(self, it);
@@ -1063,6 +1068,29 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             );
         }
         walk::walk_conditional_expression(self, it);
+    }
+
+    fn visit_return_statement(&mut self, it: &oxc_ast::ast::ReturnStatement<'a>) {
+        if let Some(Expression::SequenceExpression(sequence)) = it.argument.as_ref() {
+            if let Some((last, preceding)) = sequence.expressions.split_last() {
+                if !preceding.is_empty()
+                    && preceding.iter().all(|expr| {
+                        trivial_loops::inert_literal_statement(expr)
+                            || matches!(expr, Expression::StringLiteral(_))
+                    })
+                {
+                    // Return always performs GetValue; unlike a call
+                    // callee, it cannot observe reference/this identity.
+                    self.push(
+                        sequence.span,
+                        fragment(self.source, last.span()).to_owned(),
+                        "return_inert_sequence_prefix",
+                    );
+                    return;
+                }
+            }
+        }
+        walk::walk_return_statement(self, it);
     }
 
     fn visit_if_statement(&mut self, it: &IfStatement<'a>) {

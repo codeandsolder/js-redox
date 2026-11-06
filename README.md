@@ -77,8 +77,15 @@ statically known primitive values (`null`, `undefined`, strings, numbers,
 booleans), restructures constant `switch` dispatch with strict-case matching
 and source-order fallthrough, and simplifies empty `if` arms without losing
 the condition's side effects. Unselected switch cases with observable hoisted
-or lexical bindings are retained; dynamic tests are not guessed. These passes
-apply to ordinary JS, not a framework or a specific obfuscator signature.
+or lexical bindings are retained; dynamic tests are not guessed. The numeric
+state-graph reducer also handles `for (var state = initial; ...)`, state
+transitions inside `var` declaration initializers, and sequential terminating
+`return` cases, preserving function-scoped hoisted variables across branches.
+An effect-aware primitive evaluator simplifies expressions with a known result
+while preserving original calls, getters and assignments in evaluation order,
+including logically dead RHS expressions; return-value comma expressions drop
+inert prefixes without altering the indirect-call semantics of callee commas.
+These passes apply to ordinary JS, not a framework or specific obfuscator.
 The original source directory is not modified.
 
 ```sh
