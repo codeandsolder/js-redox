@@ -292,7 +292,7 @@ fn main() -> Result<()> {
     let wasm_analysis = !args.skip_wasm_analysis;
 
     recover_capture_project(&CapturePipelineOptions {
-        input: capture,
+        input: capture.clone(),
         output: output.clone(),
         assets_dir,
         overwrite: args.overwrite,

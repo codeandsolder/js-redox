@@ -358,10 +358,10 @@ pub fn capture_url_to_har(
                 .headers()
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
-                .unwrap_or(if pending.kind == Kind::Script {
-                    "application/javascript"
-                } else {
-                    "application/octet-stream"
+                .unwrap_or(match pending.kind {
+                    Kind::Document => "text/html",
+                    Kind::Script => "application/javascript",
+                    Kind::Asset => "application/octet-stream",
                 })
                 .to_owned();
             let left = limits.max_total_bytes.saturating_sub(total_bytes);
