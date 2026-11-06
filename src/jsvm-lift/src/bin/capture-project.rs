@@ -260,7 +260,6 @@ fn main() -> Result<()> {
                 max_resources: args.http_max_resources,
                 max_resource_bytes: args.http_max_resource_mib.saturating_mul(1024 * 1024),
                 max_total_bytes: args.http_max_total_mib.saturating_mul(1024 * 1024),
-                ..HttpCaptureLimits::default()
             },
         )?)
     } else {
