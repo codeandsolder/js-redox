@@ -1,6 +1,6 @@
 use super::html::{
     document_base, extract_script_tags, inline_script_extension, is_executable_script_type,
-    is_json_script_type, resolve_ref, script_type, source_refs,
+    is_json_script_type, resolve_ref, script_preload_links, script_type, source_refs,
 };
 use super::parse::{Har, HarEntry, NameValue};
 use super::resource::{
@@ -317,6 +317,14 @@ fn materialize_entry(
             document_decode_source = Some(decoded.decode_source.as_str().to_string());
             document_decode_had_errors = Some(decoded.had_errors);
             document_decode_uncertain = Some(decoded.uncertain);
+            let base_url = document_base_url.as_deref().unwrap_or(&entry.request.url);
+            for (href, kind) in script_preload_links(&decoded.source) {
+                references.push(Reference {
+                    kind: kind.into(),
+                    resolved_url: resolve_ref(base_url, &href),
+                    raw: href,
+                });
+            }
             materialize_inline_scripts(
                 id,
                 document_base_url.as_deref().unwrap_or(&entry.request.url),

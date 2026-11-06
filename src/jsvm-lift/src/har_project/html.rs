@@ -39,6 +39,51 @@ pub(crate) fn document_base(html: &str, final_url: &Url) -> Url {
     final_url.clone()
 }
 
+pub(crate) fn script_preload_links(html: &str) -> Vec<(String, &'static str)> {
+    let lower = html.to_ascii_lowercase();
+    let mut from = 0;
+    let mut urls = Vec::new();
+    while let Some(relative) = lower[from..].find("<link") {
+        let start = from + relative;
+        if !html
+            .as_bytes()
+            .get(start + 5)
+            .is_some_and(|c| c.is_ascii_whitespace() || *c == b'>')
+        {
+            from = start + 5;
+            continue;
+        }
+        let Some(end) = find_tag_end(html.as_bytes(), start + 5) else {
+            break;
+        };
+        let attrs = parse_attrs(&html[start..=end]);
+        let rel = attrs.get("rel").map(String::as_str).unwrap_or_default();
+        let modulepreload = rel
+            .split_ascii_whitespace()
+            .any(|word| word.eq_ignore_ascii_case("modulepreload"));
+        let script_preload = rel
+            .split_ascii_whitespace()
+            .any(|word| word.eq_ignore_ascii_case("preload"))
+            && attrs
+                .get("as")
+                .is_some_and(|value| value.eq_ignore_ascii_case("script"));
+        if modulepreload || script_preload {
+            if let Some(url) = attrs.get("href") {
+                urls.push((
+                    url.clone(),
+                    if modulepreload {
+                        "modulepreload"
+                    } else {
+                        "script_preload"
+                    },
+                ));
+            }
+        }
+        from = end + 1;
+    }
+    urls
+}
+
 #[derive(Debug)]
 pub(crate) struct ScriptTag {
     pub(crate) attrs: HashMap<String, String>,
@@ -188,4 +233,27 @@ pub(super) fn source_refs(source: &str, base: &str) -> Vec<Reference> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::script_preload_links;
+
+    #[test]
+    fn collects_module_and_classic_script_preloads() {
+        let html = r#"<!doctype html>
+            <link rel="stylesheet" href="not-a-script.css">
+            <link rel="ModulePreload" href="./a.js">
+            <LINK REL="preload stylesheet" AS="SCRIPT" HREF="./b.js">
+            <link rel="preload" as="font" href="not-a-script.woff2">
+            <linker href="not-a-tag.js">
+        "#;
+        assert_eq!(
+            script_preload_links(html),
+            vec![
+                ("./a.js".to_owned(), "modulepreload"),
+                ("./b.js".to_owned(), "script_preload"),
+            ]
+        );
+    }
 }

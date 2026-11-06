@@ -5,7 +5,7 @@ use crate::{
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     browser_decode::decode_html,
     browser_script_types::is_executable_script,
-    har_project::html::{document_base, extract_script_tags, find_tag_end, parse_attrs},
+    har_project::html::{document_base, extract_script_tags, script_preload_links},
     js_refs::extract_js_references,
     project_js_refs::{merge_import_map, parse_import_map, resolve_with_import_map, ImportMap},
 };
@@ -102,44 +102,6 @@ fn queue_url(
     }
 }
 
-fn link_script_urls(html: &str) -> Vec<String> {
-    let lower = html.to_ascii_lowercase();
-    let mut from = 0;
-    let mut urls = Vec::new();
-    while let Some(relative) = lower[from..].find("<link") {
-        let start = from + relative;
-        if !html
-            .as_bytes()
-            .get(start + 5)
-            .is_some_and(|c| c.is_ascii_whitespace() || *c == b'>')
-        {
-            from = start + 5;
-            continue;
-        }
-        let Some(end) = find_tag_end(html.as_bytes(), start + 5) else {
-            break;
-        };
-        let attrs = parse_attrs(&html[start..=end]);
-        let rel = attrs.get("rel").map(String::as_str).unwrap_or_default();
-        let modulepreload = rel
-            .split_ascii_whitespace()
-            .any(|word| word.eq_ignore_ascii_case("modulepreload"));
-        let script_preload = rel
-            .split_ascii_whitespace()
-            .any(|word| word.eq_ignore_ascii_case("preload"))
-            && attrs
-                .get("as")
-                .is_some_and(|value| value.eq_ignore_ascii_case("script"));
-        if modulepreload || script_preload {
-            if let Some(url) = attrs.get("href") {
-                urls.push(url.clone());
-            }
-        }
-        from = end + 1;
-    }
-    urls
-}
-
 fn add_code_references(
     source: &str,
     from: &Url,
@@ -227,7 +189,7 @@ fn add_document_references(
             );
         }
     }
-    for href in link_script_urls(html) {
+    for (href, _) in script_preload_links(html) {
         if let Ok(url) = base.join(&href) {
             queue_url(queue, known, url, final_url, Kind::Script);
         }

@@ -43,6 +43,59 @@ fn path_link(unit: &Value, readable: &BTreeMap<&str, &str>) -> String {
     format!("[`{}`]({escaped})", display(relative))
 }
 
+fn append_reachable<'a>(
+    lines: &mut Vec<String>,
+    roots: Vec<(&'a Value, String)>,
+    by_url: &BTreeMap<&str, Vec<&'a Value>>,
+    references: &BTreeMap<&str, &[Value]>,
+    readable: &BTreeMap<&str, &str>,
+    global_seen: &mut BTreeSet<&'a str>,
+) {
+    let mut queue = VecDeque::from(roots);
+    let mut visited = BTreeSet::<&str>::new();
+    while let Some((unit, why)) = queue.pop_front() {
+        let Some(raw) = string(unit, "raw_path") else {
+            continue;
+        };
+        if !visited.insert(raw) {
+            continue;
+        }
+        global_seen.insert(raw);
+        lines.push(format!("- {} — {why}", path_link(unit, readable)));
+        for reference in references.get(raw).copied().unwrap_or_default() {
+            let specifier = string(reference, "specifier").unwrap_or("unknown");
+            let kind = string(reference, "kind").unwrap_or("reference");
+            let Some(destination) = string(reference, "resolved_url") else {
+                if !specifier.is_empty() {
+                    lines.push(format!(
+                        "  - `{kind}` `{}` — unresolved",
+                        display(specifier)
+                    ));
+                }
+                continue;
+            };
+            let Some(targets) = by_url.get(destination) else {
+                lines.push(format!(
+                    "  - `{kind}` `{}` — not captured (`{}`)",
+                    display(specifier),
+                    display(destination)
+                ));
+                continue;
+            };
+            for target in targets {
+                queue.push_back((
+                    target,
+                    format!(
+                        "`{kind}` `{}` from {}",
+                        display(specifier),
+                        path_link(unit, readable)
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 /// Materializes a complete navigator of HTML-declared scripts and their
 /// statically resolved transitive JavaScript imports. Returns the number of
 /// distinct declared script entries; an empty index is still useful for
@@ -123,57 +176,73 @@ pub(crate) fn write_entrypoint_index(
             lines.push(String::new());
             continue;
         }
-        let mut queue = VecDeque::new();
-        for unit in roots_for_script {
-            queue.push_back((unit, "declared entrypoint".to_owned()));
-        }
-        let mut visited = BTreeSet::<&str>::new();
-        while let Some((unit, why)) = queue.pop_front() {
-            let Some(raw) = string(unit, "raw_path") else {
-                continue;
-            };
-            if !visited.insert(raw) {
-                continue;
-            }
-            global_seen.insert(raw);
-            lines.push(format!("- {} — {why}", path_link(unit, &readable)));
-            for reference in references.get(raw).copied().unwrap_or_default() {
-                let specifier = string(reference, "specifier").unwrap_or("unknown");
-                let kind = string(reference, "kind").unwrap_or("reference");
-                let Some(destination) = string(reference, "resolved_url") else {
-                    if !specifier.is_empty() {
-                        lines.push(format!(
-                            "  - `{kind}` `{}` — unresolved",
-                            display(specifier)
-                        ));
-                    }
-                    continue;
-                };
-                let Some(targets) = by_url.get(destination) else {
-                    lines.push(format!(
-                        "  - `{kind}` `{}` — not captured (`{}`)",
-                        display(specifier),
-                        display(destination)
-                    ));
-                    continue;
-                };
-                for target in targets {
-                    queue.push_back((
-                        target,
-                        format!(
-                            "`{kind}` `{}` from {}",
-                            display(specifier),
-                            path_link(unit, &readable)
-                        ),
-                    ));
-                }
-            }
-        }
+        append_reachable(
+            &mut lines,
+            roots_for_script
+                .into_iter()
+                .map(|unit| (unit, "declared entrypoint".to_owned()))
+                .collect(),
+            &by_url,
+            &references,
+            &readable,
+            &mut global_seen,
+        );
         lines.push(String::new());
     }
     if roots == 0 {
         lines.push("No executable HTML script declarations were found in this capture.".into());
         lines.push(String::new());
+    }
+    let preloads = fields(manifest, "resources")
+        .iter()
+        .flat_map(|document| {
+            fields(document, "references")
+                .iter()
+                .filter(|reference| {
+                    matches!(
+                        string(reference, "kind"),
+                        Some("modulepreload" | "script_preload")
+                    )
+                })
+                .map(move |reference| (document, reference))
+        })
+        .collect::<Vec<_>>();
+    if !preloads.is_empty() {
+        lines.extend([
+            "## HTML script preload hints".into(),
+            String::new(),
+            "These resources were declared in HTML `<link rel=modulepreload>` or `<link rel=preload as=script>` tags. Preloading is not proof of execution; the listed dependencies are statically discoverable source code.".into(),
+            String::new(),
+        ]);
+        for (document, reference) in preloads {
+            let document_url = string(document, "url").unwrap_or("unknown document");
+            let kind = string(reference, "kind").unwrap_or("preload");
+            let url = string(reference, "resolved_url").unwrap_or_default();
+            lines.push(format!(
+                "### {} — `{}` `{}`",
+                display(document_url),
+                kind,
+                display(url)
+            ));
+            lines.push(String::new());
+            if let Some(units) = by_url.get(url) {
+                append_reachable(
+                    &mut lines,
+                    units
+                        .iter()
+                        .copied()
+                        .map(|unit| (unit, format!("HTML `{kind}` hint")))
+                        .collect(),
+                    &by_url,
+                    &references,
+                    &readable,
+                    &mut global_seen,
+                );
+            } else {
+                lines.push("Preloaded script body not present in this capture.".into());
+            }
+            lines.push(String::new());
+        }
     }
     let unlinked = js_units
         .iter()

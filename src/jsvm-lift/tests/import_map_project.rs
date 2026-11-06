@@ -409,6 +409,8 @@ fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<(
     let mapped_url = "https://fixture.invalid/assets/vendor/logic.js";
     let dynamic_url = "https://fixture.invalid/assets/dynamic.js";
     let page = r#"<!doctype html><base href="../assets/">
+      <link rel="modulepreload" href="vendor/logic.js">
+      <link rel="preload stylesheet" as="script" href="dynamic.js">
       <script type="importmap">{"imports":{"pkg/":"./vendor/"}}</script>
       <script type="module">import {answer} from 'pkg/logic.js'; import('./dynamic.js'); console.log(answer);</script>
       <script src="entry.js" type="module"></script>"#;
@@ -445,6 +447,15 @@ fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<(
     let manifest = read_json(&project.join("capture-manifest.json"))?;
     let document = &manifest["resources"][0];
     assert_eq!(document["document_base_url"], base_url);
+    let preload_references = document["references"]
+        .as_array()
+        .context("document references missing")?;
+    assert!(preload_references.iter().any(|reference| {
+        reference["kind"] == "modulepreload" && reference["resolved_url"] == mapped_url
+    }));
+    assert!(preload_references.iter().any(|reference| {
+        reference["kind"] == "script_preload" && reference["resolved_url"] == dynamic_url
+    }));
     let scripts = manifest["inline_scripts"]
         .as_array()
         .context("missing inline scripts")?;
@@ -496,7 +507,12 @@ fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<(
     let graph = read_json(&project.join("analysis/source-graph.json"))?;
     assert_eq!(graph["summary"]["edge_kinds"]["js_import_static"], 2);
     assert_eq!(graph["summary"]["edge_kinds"]["js_import_dynamic"], 1);
+    assert_eq!(graph["summary"]["edge_kinds"]["modulepreload"], 1);
+    assert_eq!(graph["summary"]["edge_kinds"]["script_preload"], 1);
     let entrypoints = fs::read_to_string(project.join("src/ENTRYPOINTS.md"))?;
+    assert!(entrypoints.contains("## HTML script preload hints"));
+    assert!(entrypoints.contains("`modulepreload`"));
+    assert!(entrypoints.contains("`script_preload`"));
     assert!(entrypoints.contains("assets/entry.js"));
     assert!(entrypoints.contains("assets/vendor/logic.js"));
     assert!(entrypoints.contains("assets/dynamic.js"));
