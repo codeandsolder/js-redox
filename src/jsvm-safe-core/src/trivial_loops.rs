@@ -4,7 +4,7 @@
 
 use crate::fragment;
 use oxc_ast::ast::{
-    Expression, ForStatement, SequenceExpression, Statement, VariableDeclaration,
+    Expression, ForStatement, IfStatement, SequenceExpression, Statement, VariableDeclaration,
     VariableDeclarationKind, WhileStatement,
 };
 use oxc_ast_visit::{walk, Visit};
@@ -131,6 +131,47 @@ pub(crate) fn prune_inert_sequence_values(
     Some(format!("({})", retained.join(", ")))
 }
 
+fn empty_statement(stmt: &Statement<'_>) -> bool {
+    match stmt {
+        Statement::EmptyStatement(_) => true,
+        Statement::BlockStatement(block) => block.body.is_empty(),
+        _ => false,
+    }
+}
+
+/// Turn empty `if` branches into ordinary, readable control flow while still
+/// evaluating the test exactly once. The surrounding block is essential when
+/// this statement is the consequent of another `if`: otherwise removing an
+/// `else` creates a different dangling-else parse. A retained branch keeps its
+/// original braces, lexical bindings, and control transfers.
+pub(crate) fn normalize_empty_if(stmt: &IfStatement<'_>, source: &str) -> Option<String> {
+    let then_empty = empty_statement(&stmt.consequent);
+    let else_empty = stmt
+        .alternate
+        .as_ref()
+        .is_some_and(|alt| empty_statement(alt));
+    if !then_empty && !else_empty {
+        return None;
+    }
+    let test = fragment(source, stmt.test.span());
+    if then_empty && (stmt.alternate.is_none() || else_empty) {
+        return Some(format!("({test});"));
+    }
+    if then_empty {
+        let alternative = stmt.alternate.as_ref()?;
+        return Some(format!(
+            "{{ if (!({test})) {} }}",
+            fragment(source, alternative.span())
+        ));
+    }
+    // Only the alternate is empty. A block around the revised `if` retains
+    // which `else` binds to its enclosing conditional.
+    Some(format!(
+        "{{ if ({test}) {} }}",
+        fragment(source, stmt.consequent.span())
+    ))
+}
+
 fn literal_bool(expr: &Expression<'_>, expected: bool) -> bool {
     match expr {
         Expression::BooleanLiteral(value) => value.value == expected,
@@ -238,6 +279,34 @@ mod tests {
 
         let hoisted = rewritten("function f(){while(false){var x=9;}return typeof x;}")?;
         assert!(hoisted.contains("while(false)"), "{hoisted}");
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_empty_if_arms_without_changing_condition_effects() -> Result<(), BudgetExceeded> {
+        let input = "function f(x){if (check(x)) {} else {return x;} }";
+        let output = rewritten(input)?;
+        assert!(output.contains("if (!(check(x)))"), "{output}");
+        assert!(!output.contains("else"), "{output}");
+
+        let input = "function f(x){if(x){call();}else{} return 0;}";
+        let output = rewritten(input)?;
+        assert!(!output.contains("else"), "{output}");
+        assert!(output.contains("call()"), "{output}");
+
+        let input = "function f(x){if(inc(x)){}else{}return x;}";
+        let output = rewritten(input)?;
+        assert!(!output.contains("if("), "{output}");
+        assert!(output.contains("inc(x)"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_nested_empty_if_without_stealing_outer_else() -> Result<(), BudgetExceeded> {
+        let input = "function f(a,b){if(a)if(b){}else{run();}else{fallback();}}";
+        let output = rewritten(input)?;
+        assert!(output.contains("if (!(b))"), "{output}");
+        assert!(output.contains("else{fallback();}"), "{output}");
         Ok(())
     }
 

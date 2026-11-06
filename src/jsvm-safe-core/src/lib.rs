@@ -11,6 +11,7 @@ mod pure_function;
 mod rewrite;
 mod selector;
 mod string_exposure;
+mod switch_constant;
 mod trivial_loops;
 mod value_eval;
 
@@ -1065,6 +1066,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
+        if let Some(replacement) = trivial_loops::normalize_empty_if(it, self.source) {
+            self.push(it.span, replacement, "normalize_empty_if");
+            return;
+        }
         if let Some(test) = known_bool(&it.test) {
             let text = if test {
                 fragment(self.source, it.consequent.span()).to_string()
@@ -1077,6 +1082,14 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push(it.span, text, "dead_branch");
         }
         walk::walk_if_statement(self, it);
+    }
+
+    fn visit_switch_statement(&mut self, it: &oxc_ast::ast::SwitchStatement<'a>) {
+        if let Some(text) = switch_constant::select_constant_switch(it, self.source) {
+            self.push(it.span, text, "constant_switch");
+            return;
+        }
+        walk::walk_switch_statement(self, it);
     }
 
     fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
@@ -1118,6 +1131,11 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
         self.reconstruct_while_pairs(&it.statements);
         self.reconstruct_reaching_while(&it.statements);
+        for stmt in &it.statements {
+            if let Statement::EmptyStatement(empty) = stmt {
+                self.push(empty.span, String::new(), "remove_empty_function_statement");
+            }
+        }
         walk::walk_function_body(self, it);
     }
 

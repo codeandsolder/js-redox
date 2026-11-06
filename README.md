@@ -72,6 +72,13 @@ The source-tree mode recursively scans JS, MJS, and CJS files, applies AST-drive
 constant recovery, nested numeric-state control-flow reconstruction (for and
 adjacent-initializer while dispatch), and removal of unread dispatcher-state
 writes, then writes a **navigable directory of real transformed JavaScript**.
+The regular safe transform also evaluates ECMAScript abstract equality across
+statically known primitive values (`null`, `undefined`, strings, numbers,
+booleans), restructures constant `switch` dispatch with strict-case matching
+and source-order fallthrough, and simplifies empty `if` arms without losing
+the condition's side effects. Unselected switch cases with observable hoisted
+or lexical bindings are retained; dynamic tests are not guessed. These passes
+apply to ordinary JS, not a framework or a specific obfuscator signature.
 The original source directory is not modified.
 
 ```sh
