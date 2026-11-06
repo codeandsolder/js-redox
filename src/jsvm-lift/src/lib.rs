@@ -43,6 +43,7 @@ pub mod observed_runtime;
 pub mod parse_int;
 pub mod project_api_surface;
 pub mod project_deob;
+mod project_entrypoints;
 pub mod project_js_refs;
 pub mod project_readme;
 pub mod project_scan;

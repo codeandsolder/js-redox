@@ -10,6 +10,7 @@ use jsvm_lift::{
     capture_pipeline::{recover_capture_project, CapturePipelineOptions},
     capture_project::{read_manifest, write_manifest, MANIFEST_NAME},
     http_capture::{capture_url_to_har, HttpCaptureLimits},
+    project_readme::refresh_project_readme,
 };
 use serde_json::Value;
 use std::{
@@ -334,22 +335,7 @@ fn main() -> Result<()> {
             .extra
             .insert("http_static".into(), serde_json::to_value(&summary)?);
         write_manifest(&manifest_path, &manifest)?;
-        let readme = output.join("README.md");
-        let mut section = format!(
-            "\n## HTTP-only acquisition\n\nRequested: {}\n\nFinal: {}\n\nAcquired **{}** responses ({} failed, {} still pending due to limits), **{}** response bytes. Raw capture: [http-capture.har](analysis/http-capture.har); [HTTP fetch summary](analysis/http-static.json).\n\nThis is static entrypoint discovery, not a browser execution trace: scripts created by runtime JavaScript and non-literal dynamic dependencies require a runtime capture.\n",
-            summary.requested_url, summary.final_url, summary.resources,
-            summary.failed_resources, summary.pending_resources, summary.bytes
-        );
-        if !summary.warnings.is_empty() {
-            section.push_str(
-                "\nUnresolved/failing resources are listed in analysis/http-static.json.\n",
-            );
-        }
-        use std::io::Write as _;
-        fs::OpenOptions::new()
-            .append(true)
-            .open(readme)?
-            .write_all(section.as_bytes())?;
+        refresh_project_readme(&output, &AnalysisBudgets::standard("http-project-readme"))?;
     }
 
     print_summary(

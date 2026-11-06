@@ -3,6 +3,7 @@ use jsvm_lift::{
     analysis_budget::AnalysisBudgets,
     capture_import::{import_capture_project, CaptureImportOptions},
     project_js_refs::scan_project_references,
+    project_readme::refresh_project_readme,
     source_graph::build_source_graph,
     source_materialize::materialize_capture_source,
 };
@@ -92,6 +93,10 @@ fn run_pipeline(input: &Path, project: &Path) -> Result<()> {
         &AnalysisBudgets::standard("import-map-reference-test"),
     )?;
     build_source_graph(project, &AnalysisBudgets::standard("import-map-graph-test"))?;
+    refresh_project_readme(
+        project,
+        &AnalysisBudgets::standard("import-map-readme-test"),
+    )?;
     Ok(())
 }
 
@@ -390,5 +395,114 @@ fn import_maps_preserve_document_context_and_isolate_workers() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     check_har(workspace.path())?;
     check_saved_page(workspace.path())?;
+    Ok(())
+}
+
+#[test]
+fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("base.har");
+    let project = root.path().join("project");
+    let page_url = "https://fixture.invalid/site/page.html";
+    let base_url = "https://fixture.invalid/assets/";
+    let entry_url = "https://fixture.invalid/assets/entry.js";
+    let mapped_url = "https://fixture.invalid/assets/vendor/logic.js";
+    let dynamic_url = "https://fixture.invalid/assets/dynamic.js";
+    let page = r#"<!doctype html><base href="../assets/">
+      <script type="importmap">{"imports":{"pkg/":"./vendor/"}}</script>
+      <script type="module">import {answer} from 'pkg/logic.js'; import('./dynamic.js'); console.log(answer);</script>
+      <script src="entry.js" type="module"></script>"#;
+    let entries = vec![
+        har_entry(page_url, "text/html; charset=utf-8", page),
+        har_entry(
+            entry_url,
+            "application/javascript",
+            "import {answer} from 'pkg/logic.js'; console.log(answer);",
+        ),
+        har_entry(
+            mapped_url,
+            "application/javascript",
+            "export const answer=42;",
+        ),
+        har_entry(
+            dynamic_url,
+            "application/javascript",
+            "export const dynamic=true;",
+        ),
+    ];
+    fs::write(
+        &input,
+        serde_json::to_vec(&json!({
+            "log": {
+                "version": "1.2",
+                "creator": {"name":"HTML base resolution regression", "version":"1"},
+                "pages": [{"id":"page_1", "title":"HTML base regression", "startedDateTime":"2026-10-04T00:00:00Z"}],
+                "entries": entries,
+            }
+        }))?,
+    )?;
+    run_pipeline(&input, &project)?;
+    let manifest = read_json(&project.join("capture-manifest.json"))?;
+    let document = &manifest["resources"][0];
+    assert_eq!(document["document_base_url"], base_url);
+    let scripts = manifest["inline_scripts"]
+        .as_array()
+        .context("missing inline scripts")?;
+    let external = scripts
+        .iter()
+        .find(|script| script["src"] == "entry.js")
+        .context("external script declaration missing")?;
+    assert_eq!(external["resolved_src"], entry_url);
+
+    let maps = read_json(&project.join("analysis/import-maps.json"))?;
+    assert_eq!(
+        maps["documents"]["0"]["imports"]["pkg/"],
+        "https://fixture.invalid/assets/vendor/"
+    );
+    let refs = read_json(&project.join("analysis/js-references.json"))?;
+    let units = refs["code_units"]
+        .as_array()
+        .context("missing JS reference units")?;
+    let external = code_unit(units, entry_url)?;
+    assert_eq!(
+        reference(external, "pkg/logic.js")?["resolved_url"],
+        mapped_url
+    );
+    assert_eq!(external["document_resource_ids"], json!([0]));
+    let inline = units
+        .iter()
+        .find(|unit| unit["url"] == page_url && unit["origin"] == "inline_script")
+        .context("missing inline module reference unit")?;
+    assert_eq!(
+        reference(inline, "pkg/logic.js")?["resolved_url"],
+        mapped_url
+    );
+    assert_eq!(
+        reference(inline, "./dynamic.js")?["resolved_url"],
+        dynamic_url
+    );
+    assert_eq!(inline["document_resource_ids"], json!([0]));
+
+    let index = read_json(&project.join("analysis/source-index.json"))?;
+    let source_units = index["units"].as_array().context("missing source units")?;
+    let output = source_units
+        .iter()
+        .find(|unit| unit["url"] == entry_url)
+        .context("missing entrypoint source")?;
+    let source_path = output["source_path"]
+        .as_str()
+        .context("missing entrypoint path")?;
+    assert!(project.join(source_path).is_file());
+    let graph = read_json(&project.join("analysis/source-graph.json"))?;
+    assert_eq!(graph["summary"]["edge_kinds"]["js_import_static"], 2);
+    assert_eq!(graph["summary"]["edge_kinds"]["js_import_dynamic"], 1);
+    let entrypoints = fs::read_to_string(project.join("src/ENTRYPOINTS.md"))?;
+    assert!(entrypoints.contains("assets/entry.js"));
+    assert!(entrypoints.contains("assets/vendor/logic.js"));
+    assert!(entrypoints.contains("assets/dynamic.js"));
+    assert!(entrypoints.contains("`import_static` `pkg/logic.js`"));
+    assert!(entrypoints.contains("`import_dynamic` `./dynamic.js`"));
+    assert!(fs::read_to_string(project.join("README.md"))?
+        .contains("[src/ENTRYPOINTS.md](src/ENTRYPOINTS.md)"));
     Ok(())
 }
