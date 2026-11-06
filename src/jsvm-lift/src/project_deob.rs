@@ -5,6 +5,7 @@ use crate::{
     analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     content_dedup::{default_jobs, link_or_copy},
     js_format::format_source,
+    readable_names::recover_readable_names,
     safe_deob::{deobfuscate_source, SafeDeobReport, SourceMode},
     sha256_hex,
     string_recovery::recover_static_strings,
@@ -280,7 +281,17 @@ fn format_output(
         AnalysisOperation::Format,
         output_path.display().to_string(),
     );
-    let formatted_result = format_source(&exact, &budget);
+    // Analyst-only semantic naming: keep the exact, proof-checked source in
+    // `src/_deobfuscated/` and enrich only the navigable presentation copy.
+    let renamed = recover_readable_names(&exact);
+    let presented = renamed
+        .as_ref()
+        .map_or(exact.as_str(), |(source, _)| source.as_str());
+    let formatted_result = format_source(presented, &budget).or_else(|_| {
+        // An analyst-only naming pass must never cost the project its normal
+        // readable formatter output if one unusual source resists renaming.
+        format_source(&exact, &budget)
+    });
     let (source, formatted, error) = match formatted_result {
         Ok(source) => (source, true, None),
         Err(error) => {
@@ -702,6 +713,54 @@ mod tests {
     use crate::analysis_artifacts::{
         load_artifact, write_artifact, DEOBFUSCATION, SOURCE_INDEX, STRING_RECOVERY,
     };
+
+    #[test]
+    fn project_emits_semantic_component_names_only_in_the_readable_view() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        fs::create_dir_all(project.join("resources"))?;
+        let original = "const define = x => x; var v = define({__name: 'Footer', value: 42}); export {v as t};";
+        fs::write(project.join("resources/component.mjs"), original)?;
+        write_artifact(
+            project,
+            SOURCE_INDEX,
+            &json!({
+                "schema": SOURCE_INDEX.schema,
+                "units": [{
+                    "kind": "javascript",
+                    "raw_path": "resources/component.mjs",
+                    "source_path": "src/component.mjs",
+                }],
+                "summary": {},
+            }),
+        )?;
+        let summary = materialize_project_deobfuscation(
+            project,
+            &ProjectDeobOptions {
+                jobs: Some(1),
+                max_iterations: 8,
+                budgets: AnalysisBudgets::standard("readable-names-project-test"),
+            },
+        )?;
+        assert_eq!(summary.javascript_units, 1);
+        assert_eq!(summary.failed_units, 0);
+        let artifact = load_artifact(project, DEOBFUSCATION, false)?.context("missing deob")?;
+        let row = artifact["units"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .context("missing unit row")?;
+        let proof_path = row["output_path"].as_str().context("missing safe output")?;
+        let readable_path = row["readable_output_path"]
+            .as_str()
+            .context("missing analyst output")?;
+        let proof = fs::read_to_string(project.join(proof_path))?;
+        let readable = fs::read_to_string(project.join(readable_path))?;
+        assert!(proof.contains("var v"), "{proof}");
+        assert!(!proof.contains("var Footer"), "{proof}");
+        assert!(readable.contains("var Footer"), "{readable}");
+        assert!(readable.contains("export { Footer as t }"), "{readable}");
+        Ok(())
+    }
 
     #[test]
     fn project_mode_keeps_identical_module_and_commonjs_inputs_semantically_distinct() -> Result<()>

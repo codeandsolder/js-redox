@@ -48,6 +48,7 @@ pub mod project_js_refs;
 pub mod project_readme;
 pub mod project_scan;
 pub mod project_sourcemaps;
+pub mod readable_names;
 pub mod safe_deob;
 pub mod source_graph;
 pub mod source_materialize;

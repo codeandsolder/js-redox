@@ -177,6 +177,13 @@ The directory contract is intentionally simple:
 - `src/` contains parser-validated/readable or recovered source.
 - `src/_deobfuscated/` contains semantics-preserving recovery from the exact captured JS bytes.
 - `src/_readable/` is the formatted human-facing view of those safe-deobfuscated outputs.
+  It now recovers meaningful lexical component names from embedded constant
+  `__name`, `displayName`, or `name` metadata through nested factory wrappers
+  (e.g. `var v = define({__name:'Footer'})` becomes `var Footer = define(...)`).
+  Renaming follows Oxc lexical identities through references and explicitly
+  aliased exports, skips collisions, shorthand properties and dynamic scopes,
+  and **only changes this analyst view**, not the proven transform.
+  For an individual file, use `js-format --semantic-names INPUT OUTPUT`.
 - `src/_modules/` contains explicit Webpack/Next modules from chunk/direct-table shapes plus named factories recovered from global AMD `define("name", [...], factory)` and structurally proven member-loader calls such as `LWR.define(...)`, `Ya.define(...)`, or local `.define + .require/.loadModules` loaders.
 - `src/_dynamic_deobfuscated/` contains proven safe recovery of generated-code children; exact recovered bytes remain the fallback when validation refuses a child.
 - `src/_dynamic/` contains formatted analyst views of generated-code children after the selected safe stage.
