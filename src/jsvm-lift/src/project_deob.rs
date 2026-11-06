@@ -5,6 +5,7 @@ use crate::{
     analysis_budget::{recoverable_unit_error, AnalysisBudgets, AnalysisOperation},
     content_dedup::{default_jobs, link_or_copy},
     js_format::format_source,
+    project_import_names::propagate_imported_names,
     readable_names::recover_readable_names,
     safe_deob::{deobfuscate_source, SafeDeobReport, SourceMode},
     sha256_hex,
@@ -694,6 +695,9 @@ pub fn materialize_project_deobfuscation(
         },
     });
     write_artifact(project, DEOBFUSCATION, &index)?;
+    // The module reference graph was resolved before this stage.
+    // Enrich local importer names only in the analyst-readable view.
+    let _ = propagate_imported_names(project)?;
 
     Ok(ProjectDeobSummary {
         javascript_units: occurrences.len(),

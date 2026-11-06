@@ -183,6 +183,13 @@ The directory contract is intentionally simple:
   Renaming follows Oxc lexical identities through references and explicitly
   aliased exports, skips collisions, shorthand properties and dynamic scopes,
   and **only changes this analyst view**, not the proven transform.
+  When a captured ESM dependency exports a descriptive lexical component name
+  (such as `export {Footer as t}`), the same project stage also recovers that
+  name in importing modules (`import {t as b}` → `import {t as Footer}`),
+  including named reexports and unambiguous star barrels. It preserves ESM
+  public names, import specifiers, object-property keys and export aliases,
+  uses the existing captured module resolver rather than guessing URLs, and
+  does not rewrite the shared formatter cache or exact deobfuscated source.
   For an individual file, use `js-format --semantic-names INPUT OUTPUT`.
 - `src/_modules/` contains explicit Webpack/Next modules from chunk/direct-table shapes plus named factories recovered from global AMD `define("name", [...], factory)` and structurally proven member-loader calls such as `LWR.define(...)`, `Ya.define(...)`, or local `.define + .require/.loadModules` loaders.
 - `src/_dynamic_deobfuscated/` contains proven safe recovery of generated-code children; exact recovered bytes remain the fallback when validation refuses a child.

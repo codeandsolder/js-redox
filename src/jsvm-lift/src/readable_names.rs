@@ -4,8 +4,8 @@
 use jsvm_safe_core::{eval_static_primitive, statically_resolved_symbol, StaticPrimitiveValue};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BindingPattern, CallExpression, Expression, IdentifierReference, ObjectProperty,
-    ObjectPropertyKind, Program, VariableDeclarator,
+    BindingPattern, CallExpression, Expression, IdentifierReference, ImportDeclaration,
+    ImportDeclarationSpecifier, ObjectProperty, ObjectPropertyKind, Program, VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, SemanticBuilder};
@@ -76,11 +76,70 @@ impl<'a> Visit<'a> for NameCandidates {
     }
 }
 
+/// Descriptive ESM names by resolved source specifier and public export name.
+/// The public ESM import/export name is never altered by presentation renaming.
+pub type ImportedNames = BTreeMap<String, BTreeMap<String, String>>;
+
+struct ImportedNameCandidates<'s> {
+    names: &'s ImportedNames,
+    candidates: BTreeMap<SymbolId, String>,
+}
+
+impl<'a> Visit<'a> for ImportedNameCandidates<'_> {
+    fn visit_import_declaration(&mut self, import: &ImportDeclaration<'a>) {
+        let Some(source) = import.source.value.as_str() else {
+            return;
+        };
+        let Some(exports) = self.names.get(source) else {
+            return;
+        };
+        for specifier in import.specifiers.iter().flatten() {
+            match specifier {
+                ImportDeclarationSpecifier::ImportSpecifier(specifier) => {
+                    let exported = match &specifier.imported {
+                        oxc_ast::ast::ModuleExportName::IdentifierName(id) => id.name.as_str(),
+                        oxc_ast::ast::ModuleExportName::StringLiteral(id) => {
+                            let Some(value) = id.value.as_str() else {
+                                continue;
+                            };
+                            value
+                        }
+                        oxc_ast::ast::ModuleExportName::IdentifierReference(id) => id.name.as_str(),
+                    };
+                    if let (Some(name), Some(symbol)) =
+                        (exports.get(exported), specifier.local.symbol_id.get())
+                    {
+                        self.candidates.insert(symbol, name.clone());
+                    }
+                }
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(specifier) => {
+                    if let (Some(name), Some(symbol)) =
+                        (exports.get("default"), specifier.local.symbol_id.get())
+                    {
+                        self.candidates.insert(symbol, name.clone());
+                    }
+                }
+                ImportDeclarationSpecifier::ImportNamespaceSpecifier(_) => {
+                    // A namespace represents all exports, not one named binding.
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SyntaxAlias {
+    Object(String),
+    Export(String),
+    Import(String),
+}
+
 #[derive(Default)]
 struct NameUsages {
     used_names: BTreeSet<String>,
     references: BTreeMap<SymbolId, Vec<Span>>,
-    forbidden: BTreeSet<SymbolId>,
+    special_references: BTreeMap<(u32, u32), SyntaxAlias>,
+    special_bindings: BTreeMap<SymbolId, SyntaxAlias>,
     dynamic_scope: bool,
 }
 
@@ -112,12 +171,27 @@ impl<'a> Visit<'a> for ScopedReferences<'_> {
     fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
         if property.shorthand {
             if let Expression::Identifier(id) = &property.value {
+                if id.name == "eval" {
+                    self.usages.dynamic_scope = true;
+                }
                 if let Some(symbol) = id
                     .reference_id
                     .get()
                     .and_then(|r| statically_resolved_symbol(self.scoping, r))
                 {
-                    self.usages.forbidden.insert(symbol);
+                    self.usages.special_references.insert(
+                        (id.span.start, id.span.end),
+                        SyntaxAlias::Object(id.name.to_string()),
+                    );
+                    self.usages
+                        .references
+                        .entry(symbol)
+                        .or_default()
+                        .push(id.span);
+                    self.usages.used_names.insert(id.name.to_string());
+                    // The key and value share the same source span. Do not
+                    // traverse again: the new text expands `foo` to `foo: Bar`.
+                    return;
                 }
             }
         }
@@ -131,11 +205,32 @@ impl<'a> Visit<'a> for ScopedReferences<'_> {
                     .get()
                     .and_then(|r| statically_resolved_symbol(self.scoping, r))
                 {
-                    self.usages.forbidden.insert(symbol);
+                    self.usages.special_references.insert(
+                        (id.span.start, id.span.end),
+                        SyntaxAlias::Export(id.name.to_string()),
+                    );
+                    self.usages
+                        .references
+                        .entry(symbol)
+                        .or_default()
+                        .push(id.span);
+                    self.usages.used_names.insert(id.name.to_string());
+                    return;
                 }
             }
         }
         walk::walk_export_specifier(self, specifier);
+    }
+    fn visit_import_specifier(&mut self, specifier: &oxc_ast::ast::ImportSpecifier<'a>) {
+        if specifier.imported.span() == specifier.local.span {
+            if let Some(symbol) = specifier.local.symbol_id.get() {
+                self.usages.special_bindings.insert(
+                    symbol,
+                    SyntaxAlias::Import(specifier.local.name.to_string()),
+                );
+            }
+        }
+        walk::walk_import_specifier(self, specifier);
     }
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if matches!(&call.callee, Expression::Identifier(id) if id.name == "eval") {
@@ -149,7 +244,11 @@ impl<'a> Visit<'a> for ScopedReferences<'_> {
     }
 }
 
-fn rename_in_program(source: &str, program: &Program<'_>) -> Option<(String, usize)> {
+fn rename_in_program(
+    source: &str,
+    program: &Program<'_>,
+    imports: Option<&ImportedNames>,
+) -> Option<(String, usize)> {
     let semantic = SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(program);
@@ -159,6 +258,14 @@ fn rename_in_program(source: &str, program: &Program<'_>) -> Option<(String, usi
     let scoping = semantic.semantic.scoping();
     let mut candidates = NameCandidates::default();
     candidates.visit_program(program);
+    if let Some(imports) = imports {
+        let mut imported = ImportedNameCandidates {
+            names: imports,
+            candidates: BTreeMap::new(),
+        };
+        imported.visit_program(program);
+        candidates.by_symbol.extend(imported.candidates);
+    }
     if candidates.by_symbol.is_empty() {
         return None;
     }
@@ -175,7 +282,6 @@ fn rename_in_program(source: &str, program: &Program<'_>) -> Option<(String, usi
     let mut count = 0;
     for (symbol, name) in candidates.by_symbol {
         if usages.used_names.contains(&name)
-            || usages.forbidden.contains(&symbol)
             || !scoping.symbol_redeclarations(symbol).is_empty()
             || scoping.symbol_name(symbol) == name
         {
@@ -183,13 +289,23 @@ fn rename_in_program(source: &str, program: &Program<'_>) -> Option<(String, usi
         }
         usages.used_names.insert(name.clone());
         let span = scoping.symbol_span(symbol);
-        edits.push((span.start as usize, span.end as usize, name.clone()));
+        let binding_text = match usages.special_bindings.get(&symbol) {
+            Some(SyntaxAlias::Import(original)) => format!("{original} as {name}"),
+            _ => name.clone(),
+        };
+        edits.push((span.start as usize, span.end as usize, binding_text));
         for reference in usages.references.get(&symbol).into_iter().flatten() {
-            edits.push((
-                reference.start as usize,
-                reference.end as usize,
-                name.clone(),
-            ));
+            let text = match usages
+                .special_references
+                .get(&(reference.start, reference.end))
+            {
+                Some(SyntaxAlias::Object(key)) => format!("{key}: {name}"),
+                Some(SyntaxAlias::Export(exported)) => {
+                    format!("{name} as {exported}")
+                }
+                _ => name.clone(),
+            };
+            edits.push((reference.start as usize, reference.end as usize, text));
         }
         count += 1;
     }
@@ -212,11 +328,21 @@ fn rename_in_program(source: &str, program: &Program<'_>) -> Option<(String, usi
 /// Readability-only transformation: original executable deobfuscation output
 /// remains untouched. Exact parsed lexical bindings, not textual substitution.
 pub fn recover_readable_names(source: &str) -> Option<(String, usize)> {
+    recover_readable_names_with_imports(source, None)
+}
+
+/// Recover component names imported from captured ESM modules. The caller
+/// supplies exact specifier-to-export mappings resolved by the project graph.
+/// Public ESM export names and import paths remain exactly as captured.
+pub fn recover_readable_names_with_imports(
+    source: &str,
+    imports: Option<&ImportedNames>,
+) -> Option<(String, usize)> {
     for source_type in [SourceType::mjs(), SourceType::cjs()] {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, source_type);
         if parsed.is_clean() {
-            if let Some((renamed, count)) = rename_in_program(source, &parsed.program) {
+            if let Some((renamed, count)) = rename_in_program(source, &parsed.program, imports) {
                 // Reject invalid edits or newly introduced binding collisions.
                 // This is a presentation-only view, but its source still needs
                 // to parse and resolve consistently for real analysts.
@@ -286,10 +412,25 @@ export {v as t};
     }
 
     #[test]
-    fn preserves_shorthand_export_names_and_all_existing_binding_names() {
+    fn preserves_object_and_export_public_shorthand_names() {
+        let object = "var v = make({__name:'Footer'}); const obj = {v};";
+        let transformed = named(object);
+        assert!(transformed.contains("var Footer = make"), "{transformed}");
+        assert!(
+            transformed.contains("const obj = {v: Footer}"),
+            "{transformed}"
+        );
+        let reexport = "var v = make({__name:'Footer'}); export {v};";
+        let transformed = named(reexport);
+        assert!(
+            transformed.contains("export {Footer as v}"),
+            "{transformed}"
+        );
+    }
+
+    #[test]
+    fn preserves_existing_names_and_redeclared_symbols() {
         for source in [
-            "var v = make({__name:'Footer'}); const obj = {v};",
-            "var v = make({__name:'Footer'}); export {v};",
             "var v = make({__name:'Footer'}); const Footer = 1;",
             "var v = make({__name:'Footer'}); function f(Footer){ return v + Footer; }",
             "var v = make({__name:'Footer'}); returnMe(Footer);",
@@ -297,6 +438,62 @@ export {v as t};
         ] {
             assert_eq!(named(source), source, "{source}");
         }
+    }
+
+    #[test]
+    fn recovers_imported_lexical_names_without_changing_esm_public_names() -> anyhow::Result<()> {
+        use super::{recover_readable_names_with_imports, ImportedNames};
+        let imported = ImportedNames::from([
+            (
+                "./Footer.js".into(),
+                [
+                    ("t".into(), "Footer".into()),
+                    ("default".into(), "VPHome".into()),
+                ]
+                .into(),
+            ),
+            ("./other.js".into(), [("x".into(), "Other".into())].into()),
+        ]);
+        let source = r#"
+import Page, {t as b} from './Footer.js';
+import {x} from './other.js';
+function f(b) { return b; }
+const obj = {b, x};
+export {b, x as yy};
+console.log(Page, b, x);
+"#;
+        let (out, count) = recover_readable_names_with_imports(source, Some(&imported))
+            .ok_or_else(|| anyhow::anyhow!("expected imported name recovery"))?;
+        assert_eq!(count, 3, "{out}");
+        assert!(
+            out.contains("import VPHome, {t as Footer} from './Footer.js'"),
+            "{out}"
+        );
+        assert!(
+            out.contains("import {x as Other} from './other.js'"),
+            "{out}"
+        );
+        assert!(out.contains("function f(b) { return b; }"), "{out}");
+        assert!(out.contains("const obj = {b: Footer, x: Other}"), "{out}");
+        assert!(out.contains("export {Footer as b, Other as yy}"), "{out}");
+        assert!(out.contains("console.log(VPHome, Footer, Other)"), "{out}");
+        Ok(())
+    }
+
+    #[test]
+    fn skips_collisions_and_namespace_imports() {
+        use super::{recover_readable_names_with_imports, ImportedNames};
+        let imported = ImportedNames::from([(
+            "./x.js".into(),
+            [("t".into(), "Footer".into()), ("b".into(), "Footer".into())].into(),
+        )]);
+        let source =
+            "import {t as a, b as c} from './x.js'; import * as ns from './x.js'; consume(a,c,ns);";
+        let output = recover_readable_names_with_imports(source, Some(&imported))
+            .map_or_else(|| source.to_owned(), |(source, _)| source);
+        assert!(output.contains("import {t as Footer, b as c}"), "{output}");
+        assert!(output.contains("import * as ns"), "{output}");
+        assert!(output.contains("consume(Footer,c,ns)"), "{output}");
     }
 
     #[test]

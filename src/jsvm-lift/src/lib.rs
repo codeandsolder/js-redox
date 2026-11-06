@@ -44,6 +44,7 @@ pub mod parse_int;
 pub mod project_api_surface;
 pub mod project_deob;
 mod project_entrypoints;
+mod project_import_names;
 pub mod project_js_refs;
 pub mod project_readme;
 pub mod project_scan;
