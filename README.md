@@ -404,7 +404,16 @@ originate at entrypoint parameters, preserving unknown/dynamic arguments.
 This gives an actual caller-oriented view of obfuscated helper plumbing
 without making an executable replacement from incomplete lexical fragments.
 The same forwarding information is available in `context.json` as
-`caller_views`. The analysis resolves stable function and argument aliases
+`caller_views`. When the source-tree command specifies
+`--caller-view-entry`, it also materializes readable, original-callsite
+specialized helper implementations at
+`lexical-context/caller-views/specializations/`, including the variants
+reached beyond four direct calls. These use the **same shared implementation**
+as the standalone `caller-views --specialize` mode; unlike the separately
+preserved captured-handler specializations, they are joined by original
+function spans and carry original lexical callsites in `context.json` under
+`graph_specializations`. This runs only when a caller entrypoint is requested.
+The analysis resolves stable function and argument aliases
 through direct lexical assignments such as `const local = original`, and also
 accepts `let`/`var` aliases when they have no subsequent resolved writes and
 the program does not use direct `eval` or `with`. It does not infer dynamic

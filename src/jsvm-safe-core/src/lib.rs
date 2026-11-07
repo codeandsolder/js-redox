@@ -1193,8 +1193,17 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             }
         }
         for stmt in &it.statements {
-            if let Statement::EmptyStatement(empty) = stmt {
-                self.push(empty.span, String::new(), "remove_empty_function_statement");
+            match stmt {
+                Statement::EmptyStatement(empty) => {
+                    self.push(empty.span, String::new(), "remove_empty_function_statement");
+                }
+                // A standalone empty block has no bindings, declarations,
+                // effects, or control transfers. Do not rewrite blocks used
+                // as branch, loop, labelled, or try/catch bodies.
+                Statement::BlockStatement(block) if block.body.is_empty() => {
+                    self.push(block.span, String::new(), "remove_empty_block_statement");
+                }
+                _ => {}
             }
         }
         walk::walk_function_body(self, it);
@@ -1215,8 +1224,14 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             }
         }
         for stmt in &it.body {
-            if let Statement::EmptyStatement(empty) = stmt {
-                self.push(empty.span, String::new(), "remove_empty_block_statement");
+            match stmt {
+                Statement::EmptyStatement(empty) => {
+                    self.push(empty.span, String::new(), "remove_empty_block_statement");
+                }
+                Statement::BlockStatement(block) if block.body.is_empty() => {
+                    self.push(block.span, String::new(), "remove_empty_block_statement");
+                }
+                _ => {}
             }
         }
         walk::walk_block_statement(self, it);
@@ -2019,6 +2034,35 @@ mod tests {
         expose_static_strings_budgeted(source, max_iterations, &test_budget())
             .ok()
             .flatten()
+    }
+
+    #[test]
+    fn eliminates_only_standalone_empty_blocks_after_deobfuscation() {
+        let input = "function recovered(flag){ {} { {} } {}; if(flag) {} else {}                     for(;flag;) {} label: {} return 7; }";
+        let output = deobfuscate(input, 12).expect("valid JS");
+        assert!(!output.source.contains("{} {"), "{}", output.source);
+        assert!(!output.source.contains("{ {} }"), "{}", output.source);
+        // Branches and labelled bodies are not anonymous direct statements;
+        // their meaning must not be changed by a blanket brace stripper.
+        // The preexisting empty-if simplifier evaluates flag once;
+        // an empty loop/label body is NOT a removable standalone block.
+        assert!(output.source.contains("(flag);"), "{}", output.source);
+        assert!(
+            output.source.contains("for(;flag;) {}"),
+            "{}",
+            output.source
+        );
+        assert!(output.source.contains("label: {}"), "{}", output.source);
+        assert!(
+            output
+                .transforms
+                .get("remove_empty_block_statement")
+                .copied()
+                .unwrap_or_default()
+                >= 2,
+            "{:?}",
+            output.transforms
+        );
     }
 
     #[test]

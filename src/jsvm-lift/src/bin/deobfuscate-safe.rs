@@ -6,7 +6,7 @@ use jsvm_lift::{
     safe_deob::{deobfuscate_source, SourceMode},
     sha256_hex,
     source_tree_aliases::{explain_captured_handler_origins, explain_property_aliases},
-    source_tree_callflow::reconstruct_caller_views,
+    source_tree_callflow::{reconstruct_caller_views, CallerView},
     source_tree_context::reconstruct_context,
     source_tree_specialize::{specialize_calls, specialize_resolved_call_graph},
 };
@@ -588,11 +588,24 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             }
         }
         let mut caller_view_rows = Vec::new();
+        let mut graph_specialization_rows = Vec::new();
         if let Some(entry) = &args.caller_view_entry {
             let views = reconstruct_caller_views(&original, Some(entry))?;
             if !views.is_empty() {
                 let dir = folder.join("caller-views");
                 fs::create_dir_all(&dir)?;
+                // Same exact graph-based specialization writer as the
+                // standalone caller-views CLI; no second extraction logic.
+                for mut row in
+                    write_callsite_specializations(&original, &views, &dir, args.max_iterations)?
+                {
+                    for key in ["path", "original_path"] {
+                        if let Some(path) = row[key].as_str() {
+                            row[key] = json!(format!("caller-views/{path}"));
+                        }
+                    }
+                    graph_specialization_rows.push(row);
+                }
                 let mut index = String::from(
                     "# Caller-oriented direct argument forwarding\n\nThese are static \
                      lexical call paths and parameter-origin explanations, not new \
@@ -702,17 +715,31 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                         "reachable_functions": view.reachable_functions,
                     }));
                 }
+                index.push_str(&format!(
+                    "\n[Browse {} original callsite-specialized helper bodies](specializations/README.md).\n",
+                    graph_specialization_rows.len()
+                ));
                 fs::write(dir.join("README.md"), index)?;
+                helper_index.push_str(&format!(
+                    "\n[{} source-resolved helper variants](caller-views/specializations/README.md).\n",
+                    graph_specialization_rows.len()
+                ));
                 helper_index
                     .push_str("\n[Caller-oriented parameter origins](caller-views/README.md).\n");
                 fs::write(folder.join("README.md"), &helper_index)?;
                 md.push_str("\n## Caller-oriented source and argument forwarding\n\n");
                 md.push_str("[Browse exact lexical call chains](lexical-context/caller-views/README.md).\n\n");
+                md.push_str(&format!(
+                    "[Browse {} callsite-specialized readable helper bodies](lexical-context/caller-views/specializations/README.md).\n\n",
+                    graph_specialization_rows.len()
+                ));
             }
         }
         let mut context_json = serde_json::to_string_pretty(&json!({
             "caller_view_count": caller_view_rows.len(),
             "caller_views": caller_view_rows,
+            "graph_specialization_count": graph_specialization_rows.len(),
+            "graph_specializations": graph_specialization_rows,
             "origin_source_sha256": origin_source_sha256,
             "origin_handler_count": origin_rows.len(),
             "origin_handlers": origin_rows,
@@ -815,6 +842,90 @@ fn run_project(args: ProjectArgs) -> Result<()> {
     Ok(())
 }
 
+/// One shared writer for original-lexical, callsite-specific helper variants.
+fn write_callsite_specializations(
+    original: &str,
+    views: &[CallerView],
+    output: &Path,
+    max_iterations: usize,
+) -> Result<Vec<serde_json::Value>> {
+    let mut specialization_rows = Vec::new();
+    let all_edges = views
+        .iter()
+        .flat_map(|view| view.reachable_edges.iter().cloned())
+        .collect::<Vec<_>>();
+    let candidates = specialize_resolved_call_graph(original, &all_edges)?;
+    let destination = output.join("specializations");
+    fs::create_dir_all(destination.join("original"))?;
+    let budgets = AnalysisBudgets::standard("deobfuscate-safe-graph-specializations");
+    let mut specialization_index =
+        String::from("# Readable lexical helpers specialized at resolved callsites\n\n");
+    specialization_index.push_str(
+        "Each variant uses the original callsite's primitive literals and          lexical parameter symbols, then runs normal safe JavaScript          deobfuscation. The unspecialized helper and original program remain          available. These are source-reading views, not independent modules.\n\n",
+    );
+    for candidate in candidates {
+        let arguments_json = serde_json::to_string(&candidate.constants)?;
+        let digest = sha256_hex(arguments_json.as_bytes());
+        let filename = format!(
+            "function-{}-{}-{}.js",
+            candidate.function_span[0],
+            candidate.function_span[1],
+            &digest[..12],
+        );
+        let relative = format!("specializations/{filename}");
+        let original_relative = format!("specializations/original/{filename}");
+        let budget = budgets.operation(
+            AnalysisOperation::SafeDeobfuscation,
+            format!("lexical callsite {}", candidate.helper),
+        );
+        let outcome = deobfuscate_source(
+            &candidate.specialized,
+            relative.clone(),
+            SourceMode::Auto,
+            max_iterations,
+            true,
+            &budget,
+        );
+        let (code, transforms, error) = match outcome {
+            Ok(recovered) => (recovered.source, recovered.report.transforms, None),
+            Err(error) => (
+                candidate.specialized.clone(),
+                BTreeMap::new(),
+                Some(error.to_string()),
+            ),
+        };
+        fs::write(output.join(&relative), code)?;
+        fs::write(output.join(&original_relative), &candidate.original)?;
+        let constants = candidate
+            .constants
+            .iter()
+            .map(|(index, literal)| format!("arg{index}={literal}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        specialization_index.push_str(&format!(
+                "- [{}]({filename}) — {} (original bytes {}..{}, {} callsites; [original](original/{filename}))\n",
+                candidate.helper,
+                constants,
+                candidate.function_span[0],
+                candidate.function_span[1],
+                candidate.call_sites.len(),
+            ));
+        specialization_rows.push(json!({
+            "helper": candidate.helper,
+            "function_span": candidate.function_span,
+            "arguments": candidate.constants,
+            "call_sites": candidate.call_sites,
+            "path": relative,
+            "original_path": original_relative,
+            "specialized_source_changed": candidate.specialized != candidate.original,
+            "safe_transforms": transforms,
+            "deobfuscation_error": error,
+        }));
+    }
+    fs::write(destination.join("README.md"), specialization_index)?;
+    Ok(specialization_rows)
+}
+
 fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
     let original = fs::read_to_string(&args.input)
         .with_context(|| format!("reading caller source {}", args.input.display()))?;
@@ -843,85 +954,16 @@ fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
             "markdown_path": path,
         }));
     }
-    let mut specialization_rows = Vec::new();
-    if args.specialize {
-        let all_edges = views
-            .iter()
-            .flat_map(|view| view.reachable_edges.iter().cloned())
-            .collect::<Vec<_>>();
-        let candidates = specialize_resolved_call_graph(&original, &all_edges)?;
-        let destination = args.output.join("specializations");
-        fs::create_dir_all(destination.join("original"))?;
-        let budgets = AnalysisBudgets::standard("deobfuscate-safe-caller-specializations");
-        let mut specialization_index =
-            String::from("# Readable lexical helpers specialized at resolved callsites\n\n");
-        specialization_index.push_str(
-            "These are static analyst views of actual original helper bodies.              Each variant substitutes stable primitive literal call arguments              by original lexical parameter identity, then runs ordinary              safe source deobfuscation. The original program and unspecialized              helper variant remain authoritative.\n\n",
-        );
-        for candidate in candidates {
-            let arguments_json = serde_json::to_string(&candidate.constants)?;
-            let digest = sha256_hex(arguments_json.as_bytes());
-            let filename = format!(
-                "function-{}-{}-{}.js",
-                candidate.function_span[0],
-                candidate.function_span[1],
-                &digest[..12],
-            );
-            let relative = format!("specializations/{filename}");
-            let original_relative = format!("specializations/original/{filename}");
-            let budget = budgets.operation(
-                AnalysisOperation::SafeDeobfuscation,
-                format!("lexical callsite {}", candidate.helper),
-            );
-            let outcome = deobfuscate_source(
-                &candidate.specialized,
-                relative.clone(),
-                SourceMode::Auto,
-                args.max_iterations,
-                true,
-                &budget,
-            );
-            let (code, transforms, error) = match outcome {
-                Ok(recovered) => (recovered.source, recovered.report.transforms, None),
-                Err(error) => (
-                    candidate.specialized.clone(),
-                    BTreeMap::new(),
-                    Some(error.to_string()),
-                ),
-            };
-            fs::write(args.output.join(&relative), code)?;
-            fs::write(args.output.join(&original_relative), &candidate.original)?;
-            let constants = candidate
-                .constants
-                .iter()
-                .map(|(index, literal)| format!("arg{index}={literal}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            specialization_index.push_str(&format!(
-                "- [{}]({filename}) — {} (original bytes {}..{}, {} callsites; [original](original/{filename}))\n",
-                candidate.helper,
-                constants,
-                candidate.function_span[0],
-                candidate.function_span[1],
-                candidate.call_sites.len(),
-            ));
-            specialization_rows.push(json!({
-                "helper": candidate.helper,
-                "function_span": candidate.function_span,
-                "arguments": candidate.constants,
-                "call_sites": candidate.call_sites,
-                "path": relative,
-                "original_path": original_relative,
-                "specialized_source_changed": candidate.specialized != candidate.original,
-                "safe_transforms": transforms,
-                "deobfuscation_error": error,
-            }));
-        }
-        fs::write(destination.join("README.md"), specialization_index)?;
+    let specialization_rows = if args.specialize {
+        let rows =
+            write_callsite_specializations(&original, &views, &args.output, args.max_iterations)?;
         index.push_str(
             "\n[Browse callsite-specialized lexical helper bodies](specializations/README.md).\n",
         );
-    }
+        rows
+    } else {
+        Vec::new()
+    };
     let mut data = serde_json::to_string_pretty(&json!({
         "schema": "jsvm-caller-views/v2",
         "entries": manifest,
@@ -1283,6 +1325,57 @@ mod tests {
             "{text}"
         );
         assert!(folder.join("caller-views/README.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_exposes_shared_deep_specialized_helper_sources() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let input = tmp.path().join("handlers");
+        let output = tmp.path().join("readable");
+        fs::create_dir_all(&input)?;
+        fs::write(input.join("one.js"), "const capturedHandler=()=>0;")?;
+        let original = tmp.path().join("original.js");
+        fs::write(
+            &original,
+            "const deep=function(selector, value) {if(selector===7)return value+1;return value-1;};             const mid=(x)=>deep(7,x);const api={};api.enter=(input)=>mid(input);",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original.clone()),
+            origin_source: None,
+            caller_view_entry: Some("enter".into()),
+        })?;
+        let dir = output.join("lexical-context");
+        let index: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("context.json"))?)?;
+        assert_eq!(index["caller_view_count"], 1);
+        assert_eq!(index["graph_specialization_count"], 1);
+        // Older captured-handler specialization metadata is independent:
+        // this one is linked by original source-level callsite spans.
+        let row = &index["graph_specializations"][0];
+        assert_eq!(row["helper"], "deep");
+        assert_eq!(row["arguments"], serde_json::json!([[0, "7"]]));
+        assert!(row["deobfuscation_error"].is_null());
+        let path = row["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no source path"))?;
+        let original_path = row["original_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no original source path"))?;
+        let readable = fs::read_to_string(dir.join(path))?;
+        let original_body = fs::read_to_string(dir.join(original_path))?;
+        assert!(readable.contains("return value + 1") || readable.contains("return value+1"));
+        assert!(!readable.contains("selector===7") && !readable.contains("selector === 7"));
+        assert!(original_body.contains("selector===7"));
+        assert!(fs::read_to_string(dir.join("caller-views/README.md"))?
+            .contains("specializations/README.md"));
+        assert!(fs::read_to_string(output.join("README.md"))?
+            .contains("callsite-specialized readable helper bodies"));
+        assert!(fs::read_to_string(&original)?.contains("selector===7"));
         Ok(())
     }
 
