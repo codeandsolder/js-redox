@@ -5,6 +5,7 @@ use jsvm_lift::{
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions},
     safe_deob::{deobfuscate_source, SourceMode},
     sha256_hex,
+    source_tree_aliases::explain_property_aliases,
     source_tree_context::reconstruct_context,
     source_tree_specialize::specialize_calls,
 };
@@ -277,6 +278,13 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
         );
         fs::create_dir_all(folder.join("helpers"))?;
         fs::write(folder.join("original.js"), &original)?;
+        let mut explained_rows = Vec::new();
+        let mut explained_index = String::from(
+            "# Path-sensitive property-alias explanations\n\nThese are alternate annotated browsing views, \
+             not replacements for the original executable JavaScript. An alias can be \
+             conditionally overwritten: annotations retain the actual dynamic property lookup \
+             and show assignment values and branch conditions instead of guessing.\n\n",
+        );
         let mut helper_rows = Vec::new();
         let mut helper_index = String::from("# Actual lexical helper implementations\n\n");
         helper_index.push_str("These definitions come from the supplied original program. ");
@@ -311,7 +319,31 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                     Some(error.to_string()),
                 ),
             };
-            fs::write(folder.join(relative), code)?;
+            fs::write(folder.join(relative), &code)?;
+            // Annotate references only where the helper's *own* AST resolves
+            // the property key to the same symbol as its prior assignments.
+            // Never join independent functions by spelling (T, JM, etc.).
+            if let Some(explained) = explain_property_aliases(&code)? {
+                let explained_relative = relative.replacen("helpers/", "explained/", 1);
+                if let Some(parent) = folder.join(&explained_relative).parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(folder.join(&explained_relative), &explained.source)?;
+                explained_index.push_str(&format!(
+                    "- [{}]({}) — {} explained accesses across {} bindings\n",
+                    helper.name,
+                    explained_relative.trim_start_matches("explained/"),
+                    explained.annotated_reads,
+                    explained.aliases.len()
+                ));
+                explained_rows.push(json!({
+                    "helper": helper.name,
+                    "source_path": relative,
+                    "annotated_path": explained_relative,
+                    "annotated_accesses": explained.annotated_reads,
+                    "aliases": explained.aliases,
+                }));
+            }
             helper_index.push_str(&format!("- [{}]({})", helper.name, relative));
             if helper.mutable_binding {
                 helper_index.push_str(" — **binding reassigned in original program**");
@@ -328,6 +360,15 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "transforms": transforms,
                 "error": error,
             }));
+        }
+        if !explained_rows.is_empty() {
+            fs::write(folder.join("explained/README.md"), explained_index)?;
+            helper_index
+                .push_str("\n[Browse annotated lexical property aliases](explained/README.md). ");
+            helper_index.push_str("These preserve conditional runtime property keys.\n");
+            md.push_str("\n## Explained conditional property aliases\n\n");
+            md.push_str("[Browse exact lexical-alias analysis views](lexical-context/explained/README.md). ");
+            md.push_str("The original property expressions remain dynamic where needed.\n\n");
         }
         fs::write(folder.join("README.md"), helper_index)?;
         // A fixed-argument callsite can expose a more useful helper body than
@@ -457,7 +498,9 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             ));
         }
         let mut context_json = serde_json::to_string_pretty(&json!({
-            "schema": "jsvm-readable-lexical-context/v1",
+            "schema": "jsvm-readable-lexical-context/v2",
+            "explained_alias_count": explained_rows.len(),
+            "explained_aliases": explained_rows,
             "source": "lexical-context/original.js",
             "helper_count": helper_rows.len(),
             "helpers": helper_rows,
@@ -635,6 +678,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(context_dir.join("context.json"))?)?;
         assert_eq!(metadata["helper_count"], 2);
         assert_eq!(metadata["specialization_count"], 1);
+        assert_eq!(metadata["explained_alias_count"], 0);
         assert!(
             fs::read_to_string(context_dir.join("specializations/README.md"))?
                 .contains("argument 1 = 16")
@@ -650,6 +694,63 @@ mod tests {
             fs::read_to_string(path)
                 .is_ok_and(|source| source.contains("function") && source.contains("return"))
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_exposes_actual_conditional_lexical_aliases() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("captured");
+        let output = temp.path().join("readable");
+        fs::create_dir_all(&input)?;
+        let original = temp.path().join("original.js");
+        fs::write(
+            &original,
+            r#"function original(){const helper=function(H,key){
+               key='push';H.length<2&&(key=H);
+               return function(value){const list=[];list[key](value);return list.length};
+            };}"#,
+        )?;
+        fs::write(
+            input.join("handler.js"),
+            "const capturedHandler=function(input){return helper(input);};",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 8,
+            format_output: true,
+            context_source: Some(original),
+        })?;
+        let ctx = output.join("lexical-context");
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(ctx.join("context.json"))?)?;
+        assert_eq!(meta["schema"], "jsvm-readable-lexical-context/v2");
+        assert_eq!(meta["explained_alias_count"], 1);
+        let alias = &meta["explained_aliases"][0]["aliases"][0];
+        assert_eq!(alias["binding"], "key");
+        assert_eq!(alias["reads"], 1);
+        assert_eq!(alias["writes"][0]["literal"], "push");
+        assert!(alias["writes"][1]["when"]
+            .as_str()
+            .is_some_and(|condition| condition.contains("H.length")));
+        // Filename offsets are tied to the real original AST, not hardcoded
+        // across formatting. Use the stored manifest relative source paths.
+        let original_path = meta["explained_aliases"][0]["source_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing original source path"))?;
+        let annotated_path = meta["explained_aliases"][0]["annotated_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing annotated source path"))?;
+        let plain = fs::read_to_string(ctx.join(original_path))?;
+        let annotated = fs::read_to_string(ctx.join(annotated_path))?;
+        assert!(!plain.contains("property alias:"));
+        assert!(
+            annotated.contains("list[key /* property alias:"),
+            "{annotated}"
+        );
+        assert!(annotated.contains("H.length"));
+        assert!(ctx.join("explained/README.md").exists());
         Ok(())
     }
 

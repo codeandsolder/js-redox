@@ -357,6 +357,19 @@ Helper files are navigation views, not independently runnable modules.
 The original enclosing source remains available because captured variables,
 later reassignments, and top-level side effects can change their behavior.
 
+For mutable computed-property aliases, the `lexical-context/explained/`
+views retain executable property expressions and annotate them with their
+**actual** lexical string assignments and conditional overrides. For example,
+`target[key /* property alias: "push"; H when (H.length < 2) truthy */]`
+shows why blindly replacing `key` with `.push` would be incorrect. The
+analysis resolves writes and uses by the same Oxc symbol ID (including nested
+closures), so an unrelated shadowed `key` is never joined by spelling. The
+`lexical-context/context.json` v2 manifest exposes each original literal,
+dynamic write, condition and annotated read count for tools. These are
+**alternate browsing views**; the ordinary transformed JS and original
+context remain byte-for-byte unchanged, including any source-sensitive
+`Function.prototype.toString` behavior.
+
 ### Specialize original helper code at constant-argument callsites
 
 When the original enclosing JavaScript is supplied with --context-source,
