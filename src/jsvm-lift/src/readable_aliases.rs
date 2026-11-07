@@ -344,6 +344,11 @@ pub fn inline_readable_intrinsic_aliases(source: &str) -> Option<(String, usize)
         if count == 0 {
             continue;
         }
+        // An alias may be referenced in a surviving initializer of its own
+        // declaration group. Incorporate those nested reference edits into
+        // each retained declarator before replacing the whole group.
+        // Overlapping absolute source edits would discard the whole pass.
+        let mut group_edits = Vec::new();
         for (start, bindings) in accepted {
             let group = &found.declarations[&start];
             let remaining: Vec<_> = group
@@ -362,19 +367,34 @@ pub fn inline_readable_intrinsic_aliases(source: &str) -> Option<(String, usize)
                 let last = group.fragments.last()?;
                 let prefix = source.get(group.span.start as usize..first.start as usize)?;
                 let suffix = source.get(last.end as usize..group.span.end as usize)?;
-                let fragments = remaining
-                    .iter()
-                    .map(|s| source.get(s.start as usize..s.end as usize))
-                    .collect::<Option<Vec<_>>>()?
-                    .join(", ");
-                format!("{prefix}{fragments}{suffix}")
+                let mut parts = Vec::with_capacity(remaining.len());
+                for fragment in remaining {
+                    let fragment_start = fragment.start as usize;
+                    let fragment_end = fragment.end as usize;
+                    let mut part = source.get(fragment_start..fragment_end)?.to_owned();
+                    let mut nested_edits: Vec<_> = edits
+                        .iter()
+                        .filter(|(s, e, _)| *s >= fragment_start && *e <= fragment_end)
+                        .collect();
+                    nested_edits.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
+                    let mut right = fragment_end;
+                    for (s, e, new_text) in nested_edits {
+                        if *s > *e || *e > right {
+                            return None;
+                        }
+                        part.replace_range(s - fragment_start..e - fragment_start, new_text);
+                        right = *s;
+                    }
+                    parts.push(part);
+                }
+                format!("{prefix}{}{suffix}", parts.join(", "))
             };
-            edits.push((
-                group.span.start as usize,
-                group.span.end as usize,
-                replacement,
-            ));
+            let group_start = group.span.start as usize;
+            let group_end = group.span.end as usize;
+            edits.retain(|(s, e, _)| !(*s >= group_start && *e <= group_end));
+            group_edits.push((group_start, group_end, replacement));
         }
+        edits.extend(group_edits);
         edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
         let mut result = source.to_string();
         let mut right = source.len();
@@ -413,6 +433,25 @@ mod tests {
         assert!(out.contains("var x=other()"), "{out}");
         assert!(out.contains("(0, Object.create)(null)"), "{out}");
         assert!(out.contains("(0, Object.defineProperty)({},'a'"), "{out}");
+    }
+    #[test]
+    fn inlines_uses_inside_retained_group_declarators() {
+        let source = "function make(p){var R=Object.create, Z=Object.defineProperty, build=(q)=>Z(R(q),'x',{value:1}), keep=7; return build(p)+keep;}";
+        let output = rewrite(source);
+        assert!(!output.contains("R=Object.create"), "{output}");
+        assert!(!output.contains("Z=Object.defineProperty"), "{output}");
+        assert!(output.contains("var build=(q)=>(0, Object.defineProperty)((0, Object.create)(q),'x',{value:1}), keep=7;"), "{output}");
+        assert!(output.contains("return build(p)+keep"), "{output}");
+    }
+    #[test]
+    fn inlines_refs_in_separate_and_multiple_retained_declarators() {
+        let source = "const f=Math.min, g=()=>f(1,2), h=()=>f(3,4); use(g(),h());";
+        let output = rewrite(source);
+        assert!(!output.contains("f=Math.min"), "{output}");
+        assert!(
+            output.contains("const g=()=>(0, Math.min)(1,2), h=()=>(0, Math.min)(3,4);"),
+            "{output}"
+        );
     }
     #[test]
     fn shorthand_and_shadowing() {
