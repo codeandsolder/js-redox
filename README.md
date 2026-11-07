@@ -461,7 +461,12 @@ by source span, and spread arguments never shift inferred parameter indices.
 The output contains `specializations/*.js` with deobfuscated, formatted
 original helper bodies, `specializations/original/` for comparison, and
 per-variant callsite, source-span, constant-argument, and transform metadata
-in `caller-views.json`. These are closure-context *reading views*, not
+in `caller-views.json`. The generated specialization index lists the
+**20 largest source reductions first**, then all variants grouped by resolved
+helper, with direct links to readable and original bodies, call depth,
+rewrite count, callsite count and byte-size change. These are also included
+as the semantic_rewrites, source_depth, saved_bytes, original_bytes and
+readable_bytes fields in the machine-readable metadata. These are closure-context *reading views*, not
 standalone executable replacements. Expensive variant generation is opt-in.
 
 ### Specialize original helper code at constant-argument callsites

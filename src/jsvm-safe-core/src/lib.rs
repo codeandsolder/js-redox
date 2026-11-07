@@ -1203,6 +1203,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 Statement::BlockStatement(block) if block.body.is_empty() => {
                     self.push(block.span, String::new(), "remove_empty_block_statement");
                 }
+                Statement::BlockStatement(block) => {
+                    if let Some(flattened) =
+                        trivial_loops::flatten_standalone_block(block, self.source, self.scoping)
+                    {
+                        self.push(block.span, flattened, "flatten_redundant_block");
+                    }
+                }
                 _ => {}
             }
         }
@@ -1230,6 +1237,13 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                 }
                 Statement::BlockStatement(block) if block.body.is_empty() => {
                     self.push(block.span, String::new(), "remove_empty_block_statement");
+                }
+                Statement::BlockStatement(block) => {
+                    if let Some(flattened) =
+                        trivial_loops::flatten_standalone_block(block, self.source, self.scoping)
+                    {
+                        self.push(block.span, flattened, "flatten_redundant_block");
+                    }
                 }
                 _ => {}
             }
@@ -2066,6 +2080,68 @@ mod tests {
                 >= 2,
             "{:?}",
             output.transforms
+        );
+    }
+
+    #[test]
+    fn flattens_unnecessary_nested_blocks_with_real_effects() {
+        let input = "function recovered(x){ { { x+=1; } x*=2; } return x; }";
+        let result = deobfuscate(input, 12);
+        assert!(result.is_some());
+        let Some(output) = result else {
+            unreachable!();
+        };
+        assert!(!output.source.contains("{ {"), "{}", output.source);
+        assert!(output.source.contains("x+=1"), "{}", output.source);
+        assert!(output.source.contains("x*=2"), "{}", output.source);
+        assert_eq!(output.transforms.get("flatten_redundant_block"), Some(&2));
+    }
+
+    #[test]
+    fn retains_lexical_scopes_directives_and_control_flow_blocks() {
+        let fixtures = [
+            "function f(){let x=3;{let x=4;run(x);}return x;}",
+            "function f(){let x=3;{const y=4;run(y);}return x;}",
+            "function f(){ {class C{};run(C);}return 1;}",
+            "function f(){ {function inner(){return globalThis.value;} inner.tag=1; run(inner);}return 2;}",
+            "function f(){ {\"use strict\";return this;} }",
+            "function f(x){if(x){return 1;}else{return 2;}}",
+            "function f(x){while(x){x--;}}",
+            "function f(){label:{run();break label;}}",
+            "function f(){try{run();}catch(e){throw e;}}",
+        ];
+        for input in fixtures {
+            let result = deobfuscate(input, 12);
+            assert!(result.is_some(), "{input}");
+            let Some(output) = result else {
+                unreachable!();
+            };
+            assert_eq!(
+                output.transforms.get("flatten_redundant_block"),
+                None,
+                "{input} -> {}",
+                output.source
+            );
+        }
+    }
+
+    #[test]
+    fn permits_var_hoisting_and_direct_break_targets_after_block_flattening() {
+        let input = "function f(flag){var count=0;while(true){{var x=++count;if(flag)break;}break;}return [x,count];}";
+        let result = deobfuscate(input, 12);
+        assert!(result.is_some());
+        let Some(output) = result else {
+            unreachable!();
+        };
+        assert!(output.source.contains("var x=++count"), "{}", output.source);
+        assert!(output.source.contains("if(flag)break"), "{}", output.source);
+        assert!(
+            output
+                .transforms
+                .get("flatten_redundant_block")
+                .copied()
+                .unwrap_or_default()
+                >= 1
         );
     }
 

@@ -4,10 +4,11 @@
 
 use crate::fragment;
 use oxc_ast::ast::{
-    Expression, ForStatement, IfStatement, SequenceExpression, Statement, VariableDeclaration,
-    VariableDeclarationKind, WhileStatement,
+    BlockStatement, Expression, ForStatement, IfStatement, SequenceExpression, Statement,
+    VariableDeclaration, VariableDeclarationKind, WhileStatement,
 };
 use oxc_ast_visit::{walk, Visit};
+use oxc_semantic::Scoping;
 use oxc_span::GetSpan;
 
 #[derive(Default)]
@@ -137,6 +138,52 @@ fn empty_statement(stmt: &Statement<'_>) -> bool {
         Statement::BlockStatement(block) => block.body.is_empty(),
         _ => false,
     }
+}
+
+/// Lift a standalone, nonempty lexical block into its parent statement list
+/// only when its own scope has no block-local declarations. Var belongs to the
+/// containing function and does not create a block-local lexical binding.
+///
+/// Preserve nested control-flow syntax (if/loop/switch/label/try) unchanged:
+/// the caller invokes this only on direct children of a function body or
+/// another BlockStatement, never on a branch or labeled statement body.
+/// String expression statements are retained inside braces because lifting
+/// them to the beginning of a function can create a new strict directive.
+/// Comments and formatting inside the braces are preserved byte-for-byte.
+pub(crate) fn flatten_standalone_block(
+    block: &BlockStatement<'_>,
+    source: &str,
+    scoping: &Scoping,
+) -> Option<String> {
+    // The actual semantic scope must not introduce any binding. This catches
+    // contextual Annex-B/function bindings and declarations beyond direct
+    // statement forms before removing the scope, not just syntactic let/const.
+    if !scoping.get_bindings(block.scope_id.get()?).is_empty() {
+        return None;
+    }
+    if block.body.is_empty()
+        || block.body.iter().any(|statement| match statement {
+            Statement::VariableDeclaration(declaration) => {
+                declaration.kind != VariableDeclarationKind::Var
+            }
+            Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_) => true,
+            _ => false,
+        })
+    {
+        return None;
+    }
+    // A string-literal statement can become a directive at a new position
+    // in its parent statement list. Preserve that scope boundary instead.
+    if block.body.iter().any(|statement| match statement {
+        Statement::ExpressionStatement(expression) => {
+            matches!(&expression.expression, Expression::StringLiteral(_))
+        }
+        _ => false,
+    }) {
+        return None;
+    }
+    let inner = source.get(block.span.start as usize + 1..block.span.end as usize - 1)?;
+    Some(format!("\n{inner}\n"))
 }
 
 /// Turn empty `if` branches into ordinary, readable control flow while still

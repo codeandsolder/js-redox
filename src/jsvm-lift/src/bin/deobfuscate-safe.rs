@@ -855,14 +855,24 @@ fn write_callsite_specializations(
         .flat_map(|view| view.reachable_edges.iter().cloned())
         .collect::<Vec<_>>();
     let candidates = specialize_resolved_call_graph(original, &all_edges)?;
+    let depths = views
+        .iter()
+        .flat_map(|view| &view.reachable_functions)
+        .fold(
+            BTreeMap::<[u32; 2], usize>::new(),
+            |mut depths, function| {
+                depths
+                    .entry(function.span)
+                    .and_modify(|depth| *depth = (*depth).min(function.shortest_call_depth))
+                    .or_insert(function.shortest_call_depth);
+                depths
+            },
+        );
+    let mut ranked = Vec::<(isize, usize, usize, String)>::new();
+    let mut grouped = BTreeMap::<(String, [u32; 2]), Vec<String>>::new();
     let destination = output.join("specializations");
     fs::create_dir_all(destination.join("original"))?;
     let budgets = AnalysisBudgets::standard("deobfuscate-safe-graph-specializations");
-    let mut specialization_index =
-        String::from("# Readable lexical helpers specialized at resolved callsites\n\n");
-    specialization_index.push_str(
-        "Each variant uses the original callsite's primitive literals and          lexical parameter symbols, then runs normal safe JavaScript          deobfuscation. The unspecialized helper and original program remain          available. These are source-reading views, not independent modules.\n\n",
-    );
     for candidate in candidates {
         let arguments_json = serde_json::to_string(&candidate.constants)?;
         let digest = sha256_hex(arguments_json.as_bytes());
@@ -894,22 +904,33 @@ fn write_callsite_specializations(
                 Some(error.to_string()),
             ),
         };
-        fs::write(output.join(&relative), code)?;
+        fs::write(output.join(&relative), &code)?;
         fs::write(output.join(&original_relative), &candidate.original)?;
-        let constants = candidate
-            .constants
+        let semantic_rewrites = transforms
             .iter()
-            .map(|(index, literal)| format!("arg{index}={literal}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        specialization_index.push_str(&format!(
-                "- [{}]({filename}) — {} (original bytes {}..{}, {} callsites; [original](original/{filename}))\n",
-                candidate.helper,
-                constants,
-                candidate.function_span[0],
-                candidate.function_span[1],
-                candidate.call_sites.len(),
-            ));
+            .filter(|(kind, _)| kind.as_str() != "presentation_codegen")
+            .map(|(_, count)| count)
+            .sum::<usize>();
+        let saved_bytes = isize::try_from(candidate.original.len())? - isize::try_from(code.len())?;
+        let depth = depths.get(&candidate.function_span).copied().unwrap_or(0);
+        let file_link = format!("[{}]({filename})", candidate.helper);
+        let summary = format!(
+            "{file_link} (original {}..{}) — {constants_hint}; depth {depth}, {semantic_rewrites} rewrites, {saved_bytes:+} bytes, {} callsites ([original](original/{filename}))",
+            candidate.function_span[0],
+            candidate.function_span[1],
+            candidate.call_sites.len(),
+            constants_hint = candidate
+                .constants
+                .iter()
+                .map(|(index, literal)| format!("arg{index}={literal}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        ranked.push((saved_bytes, semantic_rewrites, depth, summary.clone()));
+        grouped
+            .entry((candidate.helper.clone(), candidate.function_span))
+            .or_default()
+            .push(summary);
         specialization_rows.push(json!({
             "helper": candidate.helper,
             "function_span": candidate.function_span,
@@ -919,10 +940,41 @@ fn write_callsite_specializations(
             "original_path": original_relative,
             "specialized_source_changed": candidate.specialized != candidate.original,
             "safe_transforms": transforms,
+            "semantic_rewrites": semantic_rewrites,
+            "source_depth": depth,
+            "original_bytes": candidate.original.len(),
+            "readable_bytes": code.len(),
+            "saved_bytes": saved_bytes,
             "deobfuscation_error": error,
         }));
     }
-    fs::write(destination.join("README.md"), specialization_index)?;
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+    });
+    let mut navigable = String::from("# Readable lexical helpers by impact\n\n");
+    navigable.push_str(
+        "These are source-reading variants of original functions, not executable replacements.          Byte reduction compares the original helper function with its formatted recovered code;          rewrite counts indicate additional semantic simplifications.\n\n",
+    );
+    navigable.push_str("## Largest source reductions\n\n");
+    for (_, _, _, summary) in ranked.iter().take(20) {
+        navigable.push_str(&format!("- {summary}\n"));
+    }
+    navigable.push_str("\n## All variants grouped by resolved helper\n\n");
+    for ((name, span), variants) in grouped {
+        navigable.push_str(&format!(
+            "### {name} — original bytes {}..{} ({} variants)\n\n",
+            span[0],
+            span[1],
+            variants.len()
+        ));
+        for variant in variants {
+            navigable.push_str(&format!("- {variant}\n"));
+        }
+        navigable.push('\n');
+    }
+    fs::write(destination.join("README.md"), navigable)?;
     Ok(specialization_rows)
 }
 
@@ -1080,7 +1132,44 @@ mod tests {
             "{code}"
         );
         assert!(!code.contains("selector === 3"), "{code}");
-        assert!(fs::read_to_string(output.join("specializations/README.md"))?.contains("helper"));
+        let grouped = fs::read_to_string(output.join("specializations/README.md"))?;
+        assert!(grouped.contains("Largest source reductions"));
+        assert!(grouped.contains("All variants grouped by resolved helper"));
+        assert!(grouped.contains("helper — original bytes"));
+        assert!(row["semantic_rewrites"].as_u64().is_some());
+        assert_eq!(row["source_depth"], 1);
+        assert_eq!(
+            row["saved_bytes"].as_i64(),
+            Some(
+                row["original_bytes"].as_i64().unwrap_or_default()
+                    - row["readable_bytes"].as_i64().unwrap_or_default()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_index_keeps_shadowed_same_named_helpers_distinct() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("source.js");
+        let output = tmp.path().join("readable");
+        fs::write(&source, "const helper=(x)=>x*3;          const api={};api.run=()=>{let r=helper(4);          {const helper=(x)=>x*4;r+=helper(5);}return r;};")?;
+        run_caller_views(CallerViewsArgs {
+            input: source,
+            output: output.clone(),
+            entry_member: Some("run".into()),
+            specialize: true,
+            max_iterations: 12,
+        })?;
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("caller-views.json"))?)?;
+        assert_eq!(meta["specialization_count"], 2);
+        let index = fs::read_to_string(output.join("specializations/README.md"))?;
+        assert_eq!(index.matches("### helper — original bytes").count(), 2);
+        assert_ne!(
+            meta["specializations"][0]["function_span"],
+            meta["specializations"][1]["function_span"]
+        );
         Ok(())
     }
 
@@ -1371,6 +1460,11 @@ mod tests {
         assert!(readable.contains("return value + 1") || readable.contains("return value+1"));
         assert!(!readable.contains("selector===7") && !readable.contains("selector === 7"));
         assert!(original_body.contains("selector===7"));
+        let index = fs::read_to_string(dir.join("caller-views/specializations/README.md"))?;
+        assert!(index.contains("Largest source reductions"));
+        assert!(index.contains("deep — original bytes"));
+        assert!(index.contains("depth 2"));
+        assert_eq!(row["source_depth"], 2);
         assert!(fs::read_to_string(dir.join("caller-views/README.md"))?
             .contains("specializations/README.md"));
         assert!(fs::read_to_string(output.join("README.md"))?
