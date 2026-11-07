@@ -94,7 +94,10 @@ statement is left intact at top level, where its completion value can be
 observable through JavaScript `eval`. Assignment-right comma expressions
 are also split for lexically resolved, stable identifier targets, retaining
 operation order; dynamic/computed member targets and RHS anonymous function
-or class name-inference hazards remain intact.
+or class name-inference hazards remain intact. Semantic recovery always
+runs first to a fixed point, with presentation-level expression lowering only
+on subsequent no-op semantic passes; this prevents cosmetic AST rewrites from
+hiding decoder calls or other semantic patterns before they are recovered.
 These passes apply to ordinary JS, not a framework or specific obfuscator.
 The original source directory is not modified.
 

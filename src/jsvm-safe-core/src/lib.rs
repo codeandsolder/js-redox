@@ -556,6 +556,7 @@ struct Collector<'s, 'c> {
     reference_spans: &'c HashMap<ReferenceId, Span>,
     protected_spans: &'c [(usize, usize)],
     may_remove_dead_numeric_writes: bool,
+    allow_effect_statements: bool,
     function_depth: usize,
     replacements: Vec<Replacement>,
 }
@@ -1200,7 +1201,8 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         // Script/eval Completion values can expose the result of a top-level
         // expression statement. Inside a function, a normal completion is
         // discarded; the statement may be safely normalized to if/blocks.
-        if self.function_depth > 0
+        if self.allow_effect_statements
+            && self.function_depth > 0
             && effectful_constant::fold(&it.expression, self.source).is_none()
         {
             // A known-result effectful expression can eliminate enormous
@@ -1566,13 +1568,19 @@ pub fn safe_source_rejection(source: &str, mode: SafeSourceMode) -> Option<SafeS
     }
 }
 
+#[derive(Clone, Copy)]
+struct TransformOptions {
+    standard_numeric_builtins: bool,
+    allow_effect_statements: bool,
+}
+
 fn transform_once(
     source: &str,
     source_type: SourceType,
     counts: &mut Counts,
     arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
-    standard_numeric_builtins: bool,
+    options: TransformOptions,
     budget: &WorkBudget,
 ) -> Result<Option<String>, BudgetExceeded> {
     budget.checkpoint()?;
@@ -1642,7 +1650,7 @@ fn transform_once(
         pure_functions: &pure_functions,
         from_char_code_aliases: &from_char_code_aliases,
         global_object_aliases: &global_object_aliases,
-        standard_numeric_builtins,
+        standard_numeric_builtins: options.standard_numeric_builtins,
         reference_identity_tables: &reference_identity_tables,
         selector_dispatchers: &selector_dispatchers,
         dispatch_orders: &dispatch_orders,
@@ -1653,6 +1661,7 @@ fn transform_once(
         // Parameters in sloppy-mode functions alias their arguments object.
         // Do not erase writes when that object may be accessed.
         may_remove_dead_numeric_writes: !direct_eval_present && !source.contains("arguments"),
+        allow_effect_statements: options.allow_effect_statements,
         function_depth: 0,
         replacements: initial_replacements,
     };
@@ -1809,18 +1818,45 @@ fn deobfuscate_with_mode(
 
     for iteration in 1..=max_iterations {
         budget.consume(1)?;
-        let Some(next) = transform_once(
+        // Semantic recovery (decoder calls, constant folding, control-flow
+        // reconstruction, and pure-function evaluation) always gets the
+        // original AST first. Only once that work reaches a fixed point do
+        // we normalize the remaining discarded expressions for readability.
+        // An eager presentation rewrite can hide source shapes required by
+        // other analyzers (notably the decoder and WASM import recognizers).
+        let Some(mut next) = transform_once(
             &current,
             source_type,
             &mut counts,
             &mut arithmetic_state_proofs,
             iteration,
-            standard_numeric_builtins,
+            TransformOptions {
+                standard_numeric_builtins,
+                allow_effect_statements: false,
+            },
             budget,
         )?
         else {
             return Ok(None);
         };
+        if next == current {
+            let Some(presented) = transform_once(
+                &current,
+                source_type,
+                &mut counts,
+                &mut arithmetic_state_proofs,
+                iteration,
+                TransformOptions {
+                    standard_numeric_builtins,
+                    allow_effect_statements: true,
+                },
+                budget,
+            )?
+            else {
+                return Ok(None);
+            };
+            next = presented;
+        }
         if next == current {
             break;
         }
