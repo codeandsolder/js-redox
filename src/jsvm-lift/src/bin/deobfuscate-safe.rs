@@ -8,7 +8,7 @@ use jsvm_lift::{
     source_tree_aliases::{explain_captured_handler_origins, explain_property_aliases},
     source_tree_callflow::reconstruct_caller_views,
     source_tree_context::reconstruct_context,
-    source_tree_specialize::specialize_calls,
+    source_tree_specialize::{specialize_calls, specialize_resolved_call_graph},
 };
 use serde_json::json;
 use std::{
@@ -65,6 +65,12 @@ struct CallerViewsArgs {
     /// Optional member-assigned entrypoint, such as aoF_.
     #[arg(long)]
     entry_member: Option<String>,
+    /// Generate readable, callsite-specific helper bodies from original
+    /// lexical call edges (opt-in because it can produce many variants).
+    #[arg(long)]
+    specialize: bool,
+    #[arg(long, default_value_t = 12)]
+    max_iterations: usize,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -837,9 +843,91 @@ fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
             "markdown_path": path,
         }));
     }
+    let mut specialization_rows = Vec::new();
+    if args.specialize {
+        let all_edges = views
+            .iter()
+            .flat_map(|view| view.reachable_edges.iter().cloned())
+            .collect::<Vec<_>>();
+        let candidates = specialize_resolved_call_graph(&original, &all_edges)?;
+        let destination = args.output.join("specializations");
+        fs::create_dir_all(destination.join("original"))?;
+        let budgets = AnalysisBudgets::standard("deobfuscate-safe-caller-specializations");
+        let mut specialization_index =
+            String::from("# Readable lexical helpers specialized at resolved callsites\n\n");
+        specialization_index.push_str(
+            "These are static analyst views of actual original helper bodies.              Each variant substitutes stable primitive literal call arguments              by original lexical parameter identity, then runs ordinary              safe source deobfuscation. The original program and unspecialized              helper variant remain authoritative.\n\n",
+        );
+        for candidate in candidates {
+            let arguments_json = serde_json::to_string(&candidate.constants)?;
+            let digest = sha256_hex(arguments_json.as_bytes());
+            let filename = format!(
+                "function-{}-{}-{}.js",
+                candidate.function_span[0],
+                candidate.function_span[1],
+                &digest[..12],
+            );
+            let relative = format!("specializations/{filename}");
+            let original_relative = format!("specializations/original/{filename}");
+            let budget = budgets.operation(
+                AnalysisOperation::SafeDeobfuscation,
+                format!("lexical callsite {}", candidate.helper),
+            );
+            let outcome = deobfuscate_source(
+                &candidate.specialized,
+                relative.clone(),
+                SourceMode::Auto,
+                args.max_iterations,
+                true,
+                &budget,
+            );
+            let (code, transforms, error) = match outcome {
+                Ok(recovered) => (recovered.source, recovered.report.transforms, None),
+                Err(error) => (
+                    candidate.specialized.clone(),
+                    BTreeMap::new(),
+                    Some(error.to_string()),
+                ),
+            };
+            fs::write(args.output.join(&relative), code)?;
+            fs::write(args.output.join(&original_relative), &candidate.original)?;
+            let constants = candidate
+                .constants
+                .iter()
+                .map(|(index, literal)| format!("arg{index}={literal}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            specialization_index.push_str(&format!(
+                "- [{}]({filename}) — {} (original bytes {}..{}, {} callsites; [original](original/{filename}))\n",
+                candidate.helper,
+                constants,
+                candidate.function_span[0],
+                candidate.function_span[1],
+                candidate.call_sites.len(),
+            ));
+            specialization_rows.push(json!({
+                "helper": candidate.helper,
+                "function_span": candidate.function_span,
+                "arguments": candidate.constants,
+                "call_sites": candidate.call_sites,
+                "path": relative,
+                "original_path": original_relative,
+                "specialized_source_changed": candidate.specialized != candidate.original,
+                "safe_transforms": transforms,
+                "deobfuscation_error": error,
+            }));
+        }
+        fs::write(destination.join("README.md"), specialization_index)?;
+        index.push_str(
+            "\n[Browse callsite-specialized lexical helper bodies](specializations/README.md).\n",
+        );
+    }
     let mut data = serde_json::to_string_pretty(&json!({
-        "schema": "jsvm-caller-views/v1",
+        "schema": "jsvm-caller-views/v2",
         "entries": manifest,
+        "specializations": specialization_rows,
+        "specialization_count": specialization_rows.len(),
+        "source_sha256": sha256_hex(original.as_bytes()),
     }))?;
     data.push('\n');
     fs::write(args.output.join("caller-views.json"), data)?;
@@ -876,10 +964,12 @@ mod tests {
             input,
             output: output.clone(),
             entry_member: Some("run".into()),
+            specialize: false,
+            max_iterations: 12,
         })?;
         let manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("caller-views.json"))?)?;
-        assert_eq!(manifest["schema"], "jsvm-caller-views/v1");
+        assert_eq!(manifest["schema"], "jsvm-caller-views/v2");
         assert_eq!(manifest["entries"][0]["entry"], ".run");
         assert_eq!(
             manifest["entries"][0]["paths"][0]["functions"],
@@ -909,6 +999,46 @@ mod tests {
         );
         assert_eq!(deep["parameters"][0]["unknown_or_nonentry_input"], false);
         assert!(fs::read_to_string(output.join("README.md"))?.contains("entry-0.md"));
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_caller_views_materializes_real_specialized_js() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source.js");
+        let output = temp.path().join("callers");
+        fs::write(
+            &input,
+            "const helper=function(selector,x){if(selector===3)return x+1;return x*2;};             const api={};api.run=(x)=>helper(3,x);",
+        )?;
+        run_caller_views(CallerViewsArgs {
+            input,
+            output: output.clone(),
+            entry_member: Some("run".into()),
+            specialize: true,
+            max_iterations: 12,
+        })?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("caller-views.json"))?)?;
+        assert_eq!(manifest["specialization_count"], 1);
+        let row = &manifest["specializations"][0];
+        assert_eq!(row["helper"], "helper");
+        assert_eq!(row["arguments"], serde_json::json!([[0, "3"]]));
+        assert!(row["deobfuscation_error"].is_null(), "{row}");
+        assert_eq!(row["specialized_source_changed"], true);
+        let code = fs::read_to_string(
+            output.join(
+                row["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("no output path"))?,
+            ),
+        )?;
+        assert!(
+            code.contains("return x + 1") || code.contains("return x+1"),
+            "{code}"
+        );
+        assert!(!code.contains("selector === 3"), "{code}");
+        assert!(fs::read_to_string(output.join("specializations/README.md"))?.contains("helper"));
         Ok(())
     }
 

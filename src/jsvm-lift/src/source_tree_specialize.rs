@@ -4,11 +4,12 @@
 //! constant arguments only at references to the same parameter SymbolId,
 //! and is then passed through the existing JS deobfuscator. This is useful
 //! program recovery, not an independently runnable replacement module.
+use crate::source_tree_callflow::ResolvedCallEdge;
 use anyhow::{ensure, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, BindingPattern, CallExpression, Expression, Function, IdentifierReference, Statement,
-    WithStatement,
+    Argument, BindingPattern, CallExpression, Expression, Function, IdentifierReference,
+    NewExpression, Statement, WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, SemanticBuilder};
@@ -105,6 +106,142 @@ pub fn literal_calls(source: &str) -> Result<Vec<LiteralCall>> {
     Ok(visitor.calls)
 }
 
+/// Primitive literal arguments at their *original* AST callsites. A spread
+/// consumes an unknown number of positions, so subsequent argument indices
+/// cannot be assigned to fixed formal parameters.
+struct OriginalCallLiterals<'s> {
+    source: &'s str,
+    sites: BTreeMap<[u32; 2], Vec<(usize, String)>>,
+}
+
+impl OriginalCallLiterals<'_> {
+    fn remember(&mut self, span: Span, arguments: &[Argument<'_>]) {
+        let mut constants = Vec::new();
+        for (index, argument) in arguments.iter().enumerate() {
+            if matches!(argument, Argument::SpreadElement(_)) {
+                break;
+            }
+            if let Some(literal) = literal_argument(argument, self.source) {
+                constants.push((index, literal));
+            }
+        }
+        if !constants.is_empty() {
+            self.sites.insert([span.start, span.end], constants);
+        }
+    }
+}
+
+impl<'a> Visit<'a> for OriginalCallLiterals<'_> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !call.optional {
+            self.remember(call.span, &call.arguments);
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_new_expression(&mut self, expr: &NewExpression<'a>) {
+        self.remember(expr.span, &expr.arguments);
+        walk::walk_new_expression(self, expr);
+    }
+}
+
+/// An analysis-only variant of a real function, specialized at exact
+/// statically resolved lexical callsites in the original JavaScript.
+#[derive(Debug, Clone)]
+pub struct ResolvedSpecialization {
+    pub helper: String,
+    pub function_span: [u32; 2],
+    pub constants: Vec<(usize, String)>,
+    pub call_sites: BTreeSet<[u32; 2]>,
+    pub original: String,
+    pub specialized: String,
+}
+
+/// Materialize selected primitive parameter values for all reachable direct
+/// callees. Calls are joined by resolved original callee function spans,
+/// **never by function name**, so shadowed identifiers remain distinct.
+/// A parameter written inside a helper cannot be replaced; other independent
+/// constant parameters still contribute to the best valid specialization.
+pub fn specialize_resolved_call_graph(
+    original: &str,
+    edges: &[ResolvedCallEdge],
+) -> Result<Vec<ResolvedSpecialization>> {
+    let allocator = Allocator::default();
+    let parsed = parse_program(&allocator, original, SourceType::unambiguous());
+    ensure!(parsed.is_clean(), "invalid original lexical JavaScript");
+    let mut collector = OriginalCallLiterals {
+        source: original,
+        sites: BTreeMap::new(),
+    };
+    collector.visit_program(&parsed.program);
+    let mut requested =
+        BTreeMap::<([u32; 2], Vec<(usize, String)>), (String, BTreeSet<[u32; 2]>)>::new();
+    for edge in edges {
+        let Some(constants) = collector.sites.get(&edge.call.span) else {
+            continue;
+        };
+        let entry = requested
+            .entry((edge.to_span, constants.clone()))
+            .or_insert_with(|| (edge.call.callee.clone(), BTreeSet::new()));
+        entry.1.insert(edge.call.span);
+    }
+
+    let mut specializations = Vec::new();
+    for ((function_span, constants), (helper, call_sites)) in requested {
+        let Some(raw) = original.get(function_span[0] as usize..function_span[1] as usize) else {
+            continue;
+        };
+        // Source function expressions, named declarations, and arrows all
+        // become root function-valued initializer expressions. This preserves
+        // their own parameter symbols, nested scopes, and function bodies.
+        let wrapped = format!("const __redox_lexical_helper = ({raw});\n");
+        // A valid expression in its original lexical context can reference
+        // contextual syntax such as super. Skip only this unwrappable body,
+        // not the entire set of recoverable callsites.
+        let wrapper_allocator = Allocator::default();
+        if !parse_program(&wrapper_allocator, &wrapped, SourceType::unambiguous()).is_clean() {
+            continue;
+        }
+        // Select precisely the literals that can actually replace a read
+        // of their formal parameter. This simultaneously drops reassigned,
+        // rest/default, and unused parameters. It avoids duplicate variants
+        // differing only by literals irrelevant to the recovered body.
+        let mut selected = Vec::new();
+        for constant in &constants {
+            if specialize_function(&wrapped, std::slice::from_ref(constant))?.is_some() {
+                selected.push(constant.clone());
+            }
+        }
+        if selected.is_empty() {
+            continue;
+        }
+        let Some(specialized) = specialize_function(&wrapped, &selected)? else {
+            continue;
+        };
+        specializations.push(ResolvedSpecialization {
+            helper,
+            function_span,
+            constants: selected,
+            call_sites,
+            original: wrapped,
+            specialized,
+        });
+    }
+    // Different callsite literal tuples may reduce to the same viable subset.
+    // Merge these instead of emitting identical helper bodies repeatedly.
+    let mut deduplicated =
+        BTreeMap::<([u32; 2], Vec<(usize, String)>), ResolvedSpecialization>::new();
+    for candidate in specializations {
+        let key = (candidate.function_span, candidate.constants.clone());
+        if let Some(existing) = deduplicated.get_mut(&key) {
+            existing.call_sites.extend(candidate.call_sites);
+        } else {
+            deduplicated.insert(key, candidate);
+        }
+    }
+    Ok(deduplicated.into_values().collect())
+}
+
 struct FunctionCandidate {
     params: BTreeMap<usize, SymbolId>,
 }
@@ -185,7 +322,15 @@ pub fn specialize_function(source: &str, constants: &[(usize, String)]) -> Resul
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::unambiguous());
     ensure!(parsed.is_clean(), "invalid helper source");
-    let semantic = SemanticBuilder::new().build(&parsed.program);
+    // Oxc's parser accepts some context-dependent syntax such as super in a
+    // detached arrow. Semantic early-error validation is required for source
+    // extraction: such a function may be legal only in its original class.
+    let semantic = SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&parsed.program);
+    if !semantic.diagnostics.is_empty() {
+        return Ok(None);
+    }
     let scoping = semantic.semantic.scoping();
     let Some(root) = root_function_params(&parsed.program) else {
         return Ok(None);
@@ -273,8 +418,114 @@ pub fn specialize_calls(
 
 #[cfg(test)]
 mod tests {
-    use super::{literal_calls, specialize_function};
+    use super::{literal_calls, specialize_function, specialize_resolved_call_graph};
+    use crate::source_tree_callflow::reconstruct_caller_views;
     use anyhow::{anyhow, Result};
+
+    #[test]
+    fn recovers_distinct_literal_variants_from_original_lexical_graph() -> Result<()> {
+        let src = r#"const helper=function(selector,value){
+            if(selector===3)return value+1;
+            return value*2;
+        };
+        const api={};
+        api.run=function(x) {return helper(3,x)+helper(4,x);};"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        assert_eq!(variants.len(), 2, "{variants:?}");
+        assert!(variants.iter().all(|v| v.helper == "helper"));
+        assert!(variants.iter().all(|v| v.call_sites.len() == 1));
+        assert!(variants.iter().any(|v| {
+            v.constants == [(0, "3".into())] && v.specialized.contains("if((3)===3)")
+        }));
+        assert!(variants.iter().any(|v| {
+            v.constants == [(0, "4".into())] && v.specialized.contains("if((4)===3)")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn uses_unchanged_subset_when_other_literal_parameter_is_written() -> Result<()> {
+        let src = r#"const helper=function(a,b){a=9;return b+a;};
+          const api={};api.run=()=>helper(3,4);"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        assert_eq!(variants.len(), 1, "{variants:?}");
+        assert_eq!(variants[0].constants, [(1, "4".into())]);
+        assert!(variants[0].specialized.contains("return (4)+a"));
+        assert!(variants[0].specialized.contains("a=9"));
+        Ok(())
+    }
+
+    #[test]
+    fn spread_argument_positions_are_never_misidentified() -> Result<()> {
+        let src = r#"const helper=(a,b)=>a+b;
+          const api={};api.run=(xs)=>helper(...xs,42)+helper(3,...xs);"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        assert_eq!(variants.len(), 1, "{variants:?}");
+        assert_eq!(variants[0].constants, [(0, "3".into())]);
+        Ok(())
+    }
+
+    #[test]
+    fn same_spelling_in_another_scope_is_not_the_target_function() -> Result<()> {
+        let src = r#"const helper=(a)=>a*3;
+          const api={};api.run=()=>{
+              const helper=(a)=>a*4;
+              return helper(7);
+          };"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        assert_eq!(variants.len(), 1, "{variants:?}");
+        assert!(variants[0].original.contains("a*4"));
+        assert!(!variants[0].original.contains("a*3"));
+        Ok(())
+    }
+
+    #[test]
+    fn contextual_super_expression_does_not_abort_other_valid_helpers() -> Result<()> {
+        let src = r#"class Base { method(x){return x;} }
+          class Child extends Base {
+            method(){
+              const contextual=(x)=>super.method(x);
+              const regular=(x)=>x*2;
+              const api={};api.run=()=>contextual(3)+regular(4);
+              return api;
+            }
+          }"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        assert_eq!(variants.len(), 1, "{variants:?}");
+        assert_eq!(variants[0].helper, "regular");
+        assert_eq!(variants[0].constants, [(0, "4".into())]);
+        Ok(())
+    }
+
+    #[test]
+    fn unused_literal_arguments_do_not_produce_redundant_variants() -> Result<()> {
+        let src = r#"const helper=(selector,unused)=>selector*2;
+            const api={};api.run=()=>helper(3,7)+helper(3,8);"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        assert_eq!(variants.len(), 1, "{variants:?}");
+        assert_eq!(variants[0].constants, [(0, "3".into())]);
+        assert_eq!(variants[0].call_sites.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn constructor_call_and_same_literal_tuple_deduplicate() -> Result<()> {
+        let src = r#"function Helper(flag){this.result=flag?1:0;}
+          const api={};api.run=()=>[new Helper(true),new Helper(true)];"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        assert_eq!(variants.len(), 1, "{variants:?}");
+        assert_eq!(variants[0].call_sites.len(), 2);
+        assert_eq!(variants[0].constants, [(0, "true".into())]);
+        assert!(variants[0].specialized.contains("(true)?1:0"));
+        Ok(())
+    }
 
     #[test]
     fn finds_only_unresolved_lexical_calls_with_primitive_literals() -> Result<()> {

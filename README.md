@@ -434,6 +434,27 @@ graph and parameter origins do not.
 The entry member is optional; no provider-specific code or entrypoint name
 is baked in.
 
+To turn resolved constant selectors into **actual simplified helper bodies**,
+use the same standalone command with `--specialize`:
+
+~~~sh
+cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
+  path/to/original.js work/caller-views --entry-member someMethod --specialize
+~~~
+
+The tool recovers source-resolved direct call and constructor targets throughout
+the reachable graph, not only calls in extracted handlers. Each callsite's
+primitive literal arguments are matched to the original function's formal
+parameter symbols, preserving separately indexed variants for different
+selector tuples. It can still use stable constants when other formal
+parameters are reassigned; shadowed same-name functions are distinguished
+by source span, and spread arguments never shift inferred parameter indices.
+The output contains `specializations/*.js` with deobfuscated, formatted
+original helper bodies, `specializations/original/` for comparison, and
+per-variant callsite, source-span, constant-argument, and transform metadata
+in `caller-views.json`. These are closure-context *reading views*, not
+standalone executable replacements. Expensive variant generation is opt-in.
+
 ### Specialize original helper code at constant-argument callsites
 
 When the original enclosing JavaScript is supplied with --context-source,
