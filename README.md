@@ -382,6 +382,16 @@ version of the original is useful for browsing but must not be used as the
 span provenance source. `context.json` records the original declaration
 spans, assignment alternatives, and linked handler paths.
 
+For source-level direct-call and constructor forwarding, add
+`--caller-view-entry <member-property>` (for instance, a site's exposed API
+method name). The output `lexical-context/caller-views/` traces Oxc-resolved
+function-to-function calls and explains which final callee parameters still
+originate at entrypoint parameters, preserving unknown/dynamic arguments.
+This gives an actual caller-oriented view of obfuscated helper plumbing
+without making an executable replacement from incomplete lexical fragments.
+The same forwarding information is available in `context.json` as
+`caller_views`. No provider-specific code or entrypoint name is baked in.
+
 ### Specialize original helper code at constant-argument callsites
 
 When the original enclosing JavaScript is supplied with --context-source,

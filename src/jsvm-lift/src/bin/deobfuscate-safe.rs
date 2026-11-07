@@ -6,6 +6,7 @@ use jsvm_lift::{
     safe_deob::{deobfuscate_source, SourceMode},
     sha256_hex,
     source_tree_aliases::{explain_captured_handler_origins, explain_property_aliases},
+    source_tree_callflow::reconstruct_caller_views,
     source_tree_context::reconstruct_context,
     source_tree_specialize::specialize_calls,
 };
@@ -105,6 +106,11 @@ struct SourceTreeArgs {
     /// not have the same offsets and must not be substituted here.
     #[arg(long, requires = "context_source")]
     origin_source: Option<PathBuf>,
+    /// Optional AST property name of a member-assigned function entrypoint.
+    /// Produces exact lexical direct-call argument-forwarding browsing views.
+    /// Does not modify executable JS or infer dynamic method dispatch.
+    #[arg(long, requires = "context_source")]
+    caller_view_entry: Option<String>,
 }
 
 fn collect_js_sources(root: &Path) -> Result<Vec<PathBuf>> {
@@ -508,10 +514,14 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
         // for browsing helper definitions but is NOT a span provenance source.
         let mut origin_rows = Vec::new();
         let mut origin_source_sha256 = None;
+        let mut raw_caller_views = Vec::new();
         if let Some(origin_path) = &args.origin_source {
             let raw_origin = fs::read_to_string(origin_path)
                 .with_context(|| format!("reading raw capture origin {}", origin_path.display()))?;
             origin_source_sha256 = Some(sha256_hex(raw_origin.as_bytes()));
+            if let Some(entry) = &args.caller_view_entry {
+                raw_caller_views = reconstruct_caller_views(&raw_origin, Some(entry))?;
+            }
             let transformed_handlers = source_inputs
                 .iter()
                 .map(|(path, _)| Ok((path.clone(), fs::read_to_string(out.join(path))?)))
@@ -558,7 +568,121 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 md.push_str("[Browse property aliases in individual recovered handlers](lexical-context/handler-origins/README.md).\n\n");
             }
         }
+        let mut caller_view_rows = Vec::new();
+        if let Some(entry) = &args.caller_view_entry {
+            let views = reconstruct_caller_views(&original, Some(entry))?;
+            if !views.is_empty() {
+                let dir = folder.join("caller-views");
+                fs::create_dir_all(&dir)?;
+                let mut index = String::from(
+                    "# Caller-oriented direct argument forwarding\n\nThese are static \
+                     lexical call paths and parameter-origin explanations, not new \
+                     executable modules. Unknown or rewritten values remain dynamic.\n\n",
+                );
+                for (index_num, view) in views.into_iter().enumerate() {
+                    let relative = format!("caller-views/entry-{index_num}.md");
+                    let mut source = view.source.clone();
+                    let helpers = view
+                        .paths
+                        .iter()
+                        .flat_map(|path| &path.functions)
+                        .filter_map(|name| helper_files.get(name.as_str()).map(|file| (name, file)))
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if !helpers.is_empty() {
+                        source.push_str("## Reconstructed helper implementations\n\n");
+                        for (name, path) in helpers {
+                            source.push_str(&format!("- [`{name}`](../{path})\n"));
+                        }
+                        source.push('\n');
+                    }
+                    // Original pretty/raw offsets differ. Use separately
+                    // parsed exact raw function spans to connect only
+                    // captured handlers whose *verified lexical declaration*
+                    // belongs to an exact leaf function in this path.
+                    let linked = view
+                        .paths
+                        .iter()
+                        .flat_map(|pretty_path| {
+                            let matching = raw_caller_views
+                                .iter()
+                                .flat_map(|raw| &raw.paths)
+                                .filter(|path| path.functions == pretty_path.functions)
+                                .collect::<Vec<_>>();
+                            if let [raw_path] = matching.as_slice() {
+                                if let Some(leaf) = raw_path.function_spans.last() {
+                                    return origin_rows
+                                        .iter()
+                                        .filter_map(|row| {
+                                            let aliases = row.get("aliases")?.as_array()?;
+                                            let attached = aliases.iter().any(|alias| {
+                                                let declaration = alias
+                                                    .get("declaration")
+                                                    .and_then(serde_json::Value::as_array);
+                                                declaration.is_some_and(|d| {
+                                                    d.len() == 2
+                                                        && d[0].as_u64().is_some_and(|start| {
+                                                            start >= u64::from(leaf[0])
+                                                        })
+                                                        && d[1].as_u64().is_some_and(|end| {
+                                                            end <= u64::from(leaf[1])
+                                                        })
+                                                })
+                                            });
+                                            attached
+                                                .then(|| {
+                                                    row.get("annotated_path")?
+                                                        .as_str()
+                                                        .map(str::to_owned)
+                                                })
+                                                .flatten()
+                                        })
+                                        .collect::<Vec<_>>();
+                                }
+                            }
+                            Vec::new()
+                        })
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if !linked.is_empty() {
+                        source.push_str(
+                            "## Captured handlers from the original lexical function\n\n",
+                        );
+                        for path in &linked {
+                            source.push_str(&format!(
+                                "- [Original-bound `{}`](../{})\n",
+                                Path::new(path)
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or(path),
+                                path
+                            ));
+                        }
+                        source.push('\n');
+                    }
+                    fs::write(folder.join(&relative), &source)?;
+                    index.push_str(&format!(
+                        "- [{}](entry-{index_num}.md): {} resolved paths\n",
+                        view.entry,
+                        view.paths.len()
+                    ));
+                    caller_view_rows.push(json!({
+                        "entry": view.entry,
+                        "entry_span": view.entry_span,
+                        "path": relative,
+                        "linked_origin_handlers": linked.into_iter().collect::<Vec<_>>(),
+                        "paths": view.paths,
+                    }));
+                }
+                fs::write(dir.join("README.md"), index)?;
+                helper_index
+                    .push_str("\n[Caller-oriented parameter origins](caller-views/README.md).\n");
+                fs::write(folder.join("README.md"), &helper_index)?;
+                md.push_str("\n## Caller-oriented source and argument forwarding\n\n");
+                md.push_str("[Browse exact lexical call chains](lexical-context/caller-views/README.md).\n\n");
+            }
+        }
         let mut context_json = serde_json::to_string_pretty(&json!({
+            "caller_view_count": caller_view_rows.len(),
+            "caller_views": caller_view_rows,
             "origin_source_sha256": origin_source_sha256,
             "origin_handler_count": origin_rows.len(),
             "origin_handlers": origin_rows,
@@ -695,6 +819,7 @@ mod tests {
             format_output: false,
             context_source: None,
             origin_source: None,
+            caller_view_entry: None,
         })?;
 
         let index: serde_json::Value =
@@ -738,6 +863,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             origin_source: None,
+            caller_view_entry: None,
         })?;
         let context_dir = output.join("lexical-context");
         let metadata: serde_json::Value =
@@ -788,6 +914,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             origin_source: None,
+            caller_view_entry: None,
         })?;
         let ctx = output.join("lexical-context");
         let meta: serde_json::Value =
@@ -858,6 +985,7 @@ mod tests {
             format_output: true,
             context_source: Some(original.clone()),
             origin_source: Some(original),
+            caller_view_entry: None,
         })?;
         let context_dir = output.join("lexical-context");
         let meta: serde_json::Value =
@@ -877,6 +1005,45 @@ mod tests {
     }
 
     #[test]
+    fn source_tree_emits_caller_oriented_argument_provenance() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let input = tmp.path().join("captures");
+        let output = tmp.path().join("readable");
+        fs::create_dir_all(&input)?;
+        fs::write(
+            input.join("entry.js"),
+            "const capturedHandler=function(){return 1;};",
+        )?;
+        let source = tmp.path().join("original.js");
+        fs::write(&source,
+            "function outer(){const deep=function(value){return value;};const Wd=function(a,b){return deep(b);};const api={};api.enter=function(J,Q){return new Wd(Q,J);};}")?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 8,
+            format_output: true,
+            context_source: Some(source),
+            origin_source: None,
+            caller_view_entry: Some("enter".into()),
+        })?;
+        let folder = output.join("lexical-context");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(folder.join("context.json"))?)?;
+        assert_eq!(manifest["caller_view_count"], 1);
+        assert_eq!(
+            manifest["caller_views"][0]["paths"][0]["functions"],
+            serde_json::json!([".enter", "Wd", "deep"])
+        );
+        let text = fs::read_to_string(folder.join("caller-views/entry-0.md"))?;
+        assert!(
+            text.contains("`value` (parameter 0) ← entry `J` (parameter 0)"),
+            "{text}"
+        );
+        assert!(folder.join("caller-views/README.md").exists());
+        Ok(())
+    }
+
+    #[test]
     fn source_tree_cannot_overwrite_or_contain_original() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let input = temp.path().join("raw");
@@ -889,6 +1056,7 @@ mod tests {
             format_output: false,
             context_source: None,
             origin_source: None,
+            caller_view_entry: None,
         });
         assert!(error.is_err());
         assert_eq!(fs::read_to_string(input.join("a.js"))?, "const a=1;");
