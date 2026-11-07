@@ -599,49 +599,57 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                     // parsed exact raw function spans to connect only
                     // captured handlers whose *verified lexical declaration*
                     // belongs to an exact leaf function in this path.
-                    let linked = view
-                        .paths
-                        .iter()
-                        .flat_map(|pretty_path| {
-                            let matching = raw_caller_views
-                                .iter()
-                                .flat_map(|raw| &raw.paths)
-                                .filter(|path| path.functions == pretty_path.functions)
-                                .collect::<Vec<_>>();
-                            if let [raw_path] = matching.as_slice() {
-                                if let Some(leaf) = raw_path.function_spans.last() {
-                                    return origin_rows
-                                        .iter()
-                                        .filter_map(|row| {
-                                            let aliases = row.get("aliases")?.as_array()?;
-                                            let attached = aliases.iter().any(|alias| {
-                                                let declaration = alias
-                                                    .get("declaration")
-                                                    .and_then(serde_json::Value::as_array);
-                                                declaration.is_some_and(|d| {
-                                                    d.len() == 2
-                                                        && d[0].as_u64().is_some_and(|start| {
-                                                            start >= u64::from(leaf[0])
-                                                        })
-                                                        && d[1].as_u64().is_some_and(|end| {
-                                                            end <= u64::from(leaf[1])
-                                                        })
-                                                })
-                                            });
-                                            attached
-                                                .then(|| {
-                                                    row.get("annotated_path")?
-                                                        .as_str()
-                                                        .map(str::to_owned)
-                                                })
-                                                .flatten()
-                                        })
-                                        .collect::<Vec<_>>();
-                                }
-                            }
-                            Vec::new()
-                        })
-                        .collect::<std::collections::BTreeSet<_>>();
+                    let mut linked = std::collections::BTreeSet::new();
+                    let mut focused_paths = std::collections::BTreeSet::new();
+                    for (path_index, pretty_path) in view.paths.iter().enumerate() {
+                        let matching = raw_caller_views
+                            .iter()
+                            .flat_map(|raw| &raw.paths)
+                            .filter(|path| path.functions == pretty_path.functions)
+                            .collect::<Vec<_>>();
+                        let [raw_path] = matching.as_slice() else {
+                            continue;
+                        };
+                        let Some(leaf) = raw_path.function_spans.last() else {
+                            continue;
+                        };
+                        let bound_handlers = origin_rows
+                            .iter()
+                            .filter_map(|row| {
+                                let aliases = row.get("aliases")?.as_array()?;
+                                let attached = aliases.iter().any(|alias| {
+                                    let declaration = alias
+                                        .get("declaration")
+                                        .and_then(serde_json::Value::as_array);
+                                    declaration.is_some_and(|d| {
+                                        d.len() == 2
+                                            && d[0]
+                                                .as_u64()
+                                                .is_some_and(|start| start >= u64::from(leaf[0]))
+                                            && d[1]
+                                                .as_u64()
+                                                .is_some_and(|end| end <= u64::from(leaf[1]))
+                                    })
+                                });
+                                attached
+                                    .then(|| row.get("annotated_path")?.as_str().map(str::to_owned))
+                                    .flatten()
+                            })
+                            .collect::<Vec<_>>();
+                        if !bound_handlers.is_empty() {
+                            focused_paths.insert(path_index);
+                            linked.extend(bound_handlers);
+                        }
+                    }
+                    if !focused_paths.is_empty() && focused_paths.len() < view.paths.len() {
+                        let complete = format!("caller-views/entry-{index_num}-all.md");
+                        fs::write(folder.join(&complete), &view.source)?;
+                        source = view.render_paths(&original, &focused_paths);
+                        source
+                            .push_str(&format!(
+                            "[All {} directly resolved call paths](entry-{index_num}-all.md).\n\n",
+                            view.paths.len()));
+                    }
                     if !linked.is_empty() {
                         source.push_str(
                             "## Captured handlers from the original lexical function\n\n",
@@ -669,6 +677,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                         "entry_span": view.entry_span,
                         "path": relative,
                         "linked_origin_handlers": linked.into_iter().collect::<Vec<_>>(),
+                        "focused_path_count": focused_paths.len(),
                         "paths": view.paths,
                     }));
                 }

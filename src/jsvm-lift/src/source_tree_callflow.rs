@@ -375,6 +375,23 @@ impl PathWalker<'_> {
     }
 }
 
+impl CallerView {
+    /// Render a focused subset of the full source-resolved graph. The JSON
+    /// manifest can still retain all reachable paths for deeper inspection.
+    #[must_use]
+    pub fn render_paths(&self, original: &str, selected: &BTreeSet<usize>) -> String {
+        let mut view = self.clone();
+        view.paths = self
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| selected.contains(index))
+            .map(|(_, path)| path.clone())
+            .collect();
+        format_view(&view, original)
+    }
+}
+
 fn format_view(view: &CallerView, original: &str) -> String {
     let mut output = format!("# Caller-oriented lexical forwarding: `{}`\n\n", view.entry);
     output.push_str("This is a **source-derived reading view**, not a rewritten executable. ");
