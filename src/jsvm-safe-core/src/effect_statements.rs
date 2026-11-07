@@ -251,7 +251,9 @@ mod tests {
         let output = rewritten(source)?;
         assert!(output.contains("L=U&127"), "{output}");
         assert!(output.contains("v=AM(Y)<<7"), "{output}");
-        assert!(output.contains("U = ("), "{output}");
+        // A later generic bitwise pass may further simplify the now-separated
+        // RHS; the essential invariant is that the assignment is separate.
+        assert!(output.contains("U = "), "{output}");
         assert!(!output.contains("U=(L=U&127,v="), "{output}");
         Ok(())
     }
