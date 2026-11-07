@@ -18,7 +18,7 @@ use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 type FunctionKey = (u32, u32);
 
@@ -183,11 +183,22 @@ pub struct CallerPath {
     pub leaf_parameters: Vec<ForwardedParameter>,
 }
 
+/// Each reachable edge is stored once per original callsite. This graph is
+/// complete across statically resolved targets even when the browsable path
+/// index is depth-limited to avoid combinatorial explosion.
+#[derive(Clone, Debug, Serialize)]
+pub struct ResolvedCallEdge {
+    pub from_span: [u32; 2],
+    pub to_span: [u32; 2],
+    pub call: CallLink,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CallerView {
     pub entry: String,
     pub entry_span: [u32; 2],
     pub paths: Vec<CallerPath>,
+    pub reachable_edges: Vec<ResolvedCallEdge>,
     pub source: String,
 }
 
@@ -520,7 +531,26 @@ fn format_view(view: &CallerView, original: &str) -> String {
         }
         output.push('\n');
     }
-    output.push_str("## Original source excerpts\n\n");
+    output.push_str("## Complete reachable lexical call graph\n\n");
+    output.push_str("Each original callsite occurs once, independent of path depth. ");
+    output.push_str(
+        "Function byte spans identify both endpoints; cycles do not truncate the graph.\n\n",
+    );
+    for edge in &view.reachable_edges {
+        output.push_str(&format!(
+            "- {} ({}..{}) to {} ({}..{}) via {} at {}..{}\n",
+            edge.call.caller,
+            edge.from_span[0],
+            edge.from_span[1],
+            edge.call.callee,
+            edge.to_span[0],
+            edge.to_span[1],
+            edge.call.kind,
+            edge.call.span[0],
+            edge.call.span[1],
+        ));
+    }
+    output.push_str("\n## Original source excerpts\n\n");
     output.push_str(
         "These are **verbatim original function expressions**, not runnable copies; \
         the complete original program and separately reconstructed lexical helpers \
@@ -664,8 +694,30 @@ pub fn reconstruct_caller_views(
             &mut Vec::new(),
             &mut BTreeSet::from([*root]),
         );
+        // Explore the *finite graph* separately from the path-focused index.
+        // Each reachable function is expanded once; cycles and arbitrary
+        // call depths are represented without enumerating every simple path.
+        let mut queue = VecDeque::from([*root]);
+        let mut visited = BTreeSet::new();
+        let mut reachable_edges = Vec::new();
+        while let Some(from) = queue.pop_front() {
+            if !visited.insert(from) {
+                continue;
+            }
+            if let Some(edges) = collector.edges.get(&from) {
+                for (to, call) in edges {
+                    reachable_edges.push(ResolvedCallEdge {
+                        from_span: [from.0, from.1],
+                        to_span: [to.0, to.1],
+                        call: call.clone(),
+                    });
+                    queue.push_back(*to);
+                }
+            }
+        }
+        reachable_edges.sort_by_key(|edge| (edge.from_span, edge.to_span, edge.call.span));
         let mut paths = walker.output;
-        if paths.is_empty() {
+        if reachable_edges.is_empty() {
             continue;
         }
         // Stable display ordering and bounded, meaningful entries.
@@ -674,6 +726,7 @@ pub fn reconstruct_caller_views(
             entry: def.label.clone(),
             entry_span: [root.0, root.1],
             paths,
+            reachable_edges,
             source: String::new(),
         };
         view.source = format_view(&view, source);
@@ -685,6 +738,42 @@ pub fn reconstruct_caller_views(
 #[cfg(test)]
 mod tests {
     use super::reconstruct_caller_views;
+
+    #[test]
+    fn complete_graph_reaches_beyond_display_depth_and_preserves_cycles() -> anyhow::Result<()> {
+        let source = r#"const f5=(x)=>x ? f1(x-1) : x;
+          const f4=(x)=>f5(x);
+          const f3=(x)=>f4(x);
+          const f2=(x)=>f3(x);
+          const f1=(x)=>f2(x);
+          const api={}; api.run=(x)=>f1(x);"#;
+        let views = reconstruct_caller_views(source, Some("run"))?;
+        assert_eq!(views.len(), 1);
+        let view = &views[0];
+        assert!(view
+            .paths
+            .iter()
+            .all(|path| !path.functions.contains(&"f5".to_owned())));
+        assert!(view
+            .reachable_edges
+            .iter()
+            .any(|edge| edge.call.callee == "f5"));
+        assert_eq!(view.reachable_edges.len(), 6);
+        assert!(view
+            .source
+            .contains("Complete reachable lexical call graph"));
+        Ok(())
+    }
+
+    #[test]
+    fn one_hop_entry_has_graph_even_without_long_path() -> anyhow::Result<()> {
+        let source = "const helper=(x)=>x;const api={};api.run=(x)=>helper(x);";
+        let views = reconstruct_caller_views(source, Some("run"))?;
+        assert_eq!(views.len(), 1);
+        assert!(views[0].paths.is_empty());
+        assert_eq!(views[0].reachable_edges.len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn forwards_an_entry_parameter_through_new_and_call_by_resolved_symbols() -> anyhow::Result<()>

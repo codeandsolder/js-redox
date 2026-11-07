@@ -692,6 +692,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                         "linked_origin_handlers": linked.into_iter().collect::<Vec<_>>(),
                         "focused_path_count": focused_paths.len(),
                         "paths": view.paths,
+                        "reachable_edges": view.reachable_edges,
                     }));
                 }
                 fs::write(dir.join("README.md"), index)?;
@@ -830,6 +831,7 @@ fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
             "entry": view.entry,
             "entry_span": view.entry_span,
             "paths": view.paths,
+            "reachable_edges": view.reachable_edges,
             "markdown_path": path,
         }));
     }
@@ -884,6 +886,12 @@ mod tests {
         assert_eq!(
             manifest["entries"][0]["paths"][0]["leaf_parameters"][0]["from_entry_index"],
             0
+        );
+        assert_eq!(
+            manifest["entries"][0]["reachable_edges"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
         );
         assert!(fs::read_to_string(output.join("README.md"))?.contains("entry-0.md"));
         Ok(())

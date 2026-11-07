@@ -419,8 +419,13 @@ cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views  
 
 The output includes linked Markdown source excerpts and a machine-readable
 `caller-views.json` with function spans, exact callsite locations, and
-parameter-origin chains. The entry member is optional; no provider-specific
-code or entrypoint name is baked in.
+parameter-origin chains. Every entry also exposes all statically reachable
+`reachable_edges` in a finite call graph: each distinct callsite is recorded
+once, including recursive cycles and edges beyond the short path listing.
+The browsable path examples intentionally stop after four call edges to
+avoid exponential path enumeration; the complete graph does not.
+The entry member is optional; no provider-specific code or entrypoint name
+is baked in.
 
 ### Specialize original helper code at constant-argument callsites
 
