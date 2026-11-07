@@ -297,8 +297,28 @@ pub fn inline_readable_intrinsic_aliases(source: &str) -> Option<(String, usize)
                 continue;
             }
             let group = &found.declarations[&alias.declaration];
-            let group_text = source.get(group.span.start as usize..group.span.end as usize)?;
-            if group_text.contains("/*") || group_text.contains("//") {
+            // Comments inside retained initializers survive reconstruction.
+            // A comment in an eliminated declarator or between declarators
+            // would be dropped; reject just those cases. Raw substring checks
+            // incorrectly treat URL strings and template contents as comments.
+            let Some(alias_fragment) = group
+                .fragments
+                .iter()
+                .find(|span| span.start <= alias.binding.start && alias.binding.end <= span.end)
+            else {
+                continue;
+            };
+            if parsed.program.comments.iter().any(|comment| {
+                let comment = comment.span;
+                comment.start >= group.span.start
+                    && comment.end <= group.span.end
+                    && ((comment.start >= alias_fragment.start
+                        && comment.end <= alias_fragment.end)
+                        || !group
+                            .fragments
+                            .iter()
+                            .any(|span| span.start <= comment.start && comment.end <= span.end))
+            }) {
                 continue;
             }
             let Some(value) = source.get(alias.value.start as usize..alias.value.end as usize)
@@ -452,6 +472,34 @@ mod tests {
             output.contains("const g=()=>(0, Math.min)(1,2), h=()=>(0, Math.min)(3,4);"),
             "{output}"
         );
+    }
+    #[test]
+    fn literal_comment_markers_do_not_block_alias_inlining() {
+        let source = "var f=Math.min, url='https://example.invalid/x/*not-a-comment*/', run=(x)=>f(x,2); use(run(1),url);";
+        let output = rewrite(source);
+        assert!(!output.contains("f=Math.min"), "{output}");
+        assert!(
+            output.contains("https://example.invalid/x/*not-a-comment*/"),
+            "{output}"
+        );
+        assert!(output.contains("(0, Math.min)(x,2)"), "{output}");
+    }
+    #[test]
+    fn preserves_real_comments_in_retained_declarators() {
+        let source = "var f=Math.min, run=(x)=>{/* useful */return f(x,2);}; use(run(1));";
+        let output = rewrite(source);
+        assert!(!output.contains("f=Math.min"), "{output}");
+        assert!(output.contains("/* useful */"), "{output}");
+        assert!(output.contains("(0, Math.min)(x,2)"), "{output}");
+    }
+    #[test]
+    fn refuses_comment_loss_from_removed_or_separator_spans() {
+        for source in [
+            "var f=Math.min/* keep this */, run=(x)=>f(x,2); use(run(1));",
+            "var f=Math.min, /* attached to declaration */ run=(x)=>f(x,2); use(run(1));",
+        ] {
+            assert_eq!(rewrite(source), source, "{source}");
+        }
     }
     #[test]
     fn shorthand_and_shadowing() {
