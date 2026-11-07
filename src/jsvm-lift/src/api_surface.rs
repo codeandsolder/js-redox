@@ -72,6 +72,16 @@ fn symbol_is_safe_xhr_receiver(
         })
 }
 
+// Binding reassignment can replace the XMLHttpRequest instance entirely. We
+// still surface calls on escaped instances as candidates, but never calls on a
+// binding whose value may have been overwritten.
+fn xhr_binding_is_not_reassigned(scoping: &Scoping, symbol: SymbolId) -> bool {
+    scoping
+        .get_resolved_reference_ids(symbol)
+        .iter()
+        .all(|id| !scoping.get_reference(*id).is_write())
+}
+
 fn direct_reference_id(expression: &Expression<'_>) -> Option<ReferenceId> {
     let Expression::Identifier(identifier) = unparenthesized(expression) else {
         return None;
@@ -522,6 +532,7 @@ struct XhrBindingCollector<'c> {
     safe_member_refs: &'c BTreeSet<ReferenceId>,
     standard_xhr_available: bool,
     symbols: BTreeSet<SymbolId>,
+    candidate_symbols: BTreeSet<SymbolId>,
 }
 
 impl<'a> Visit<'a> for XhrBindingCollector<'_> {
@@ -537,9 +548,16 @@ impl<'a> Visit<'a> for XhrBindingCollector<'_> {
                         .is_some_and(allowed_xhr_path)
                 {
                     if let Some(symbol) = identifier.symbol_id.get() {
-                        if symbol_is_safe_xhr_receiver(self.scoping, symbol, self.safe_member_refs)
-                        {
-                            self.symbols.insert(symbol);
+                        if xhr_binding_is_not_reassigned(self.scoping, symbol) {
+                            if symbol_is_safe_xhr_receiver(
+                                self.scoping,
+                                symbol,
+                                self.safe_member_refs,
+                            ) {
+                                self.symbols.insert(symbol);
+                            } else {
+                                self.candidate_symbols.insert(symbol);
+                            }
                         }
                     }
                 }
@@ -555,6 +573,7 @@ struct Collector<'s, 'c> {
     constants: &'c ProvenConstantEnvironment,
     mutated_sinks: &'c BTreeSet<&'static str>,
     xhr_symbols: &'c BTreeSet<SymbolId>,
+    xhr_candidate_symbols: &'c BTreeSet<SymbolId>,
     lines: LineIndex,
     callsites: BTreeSet<ApiCallsite>,
 }
@@ -658,7 +677,8 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             }
 
             if let Some(symbol) = self.xhr_receiver_symbol(&call.callee) {
-                if self.xhr_symbols.contains(&symbol) {
+                let confirmed = self.xhr_symbols.contains(&symbol);
+                if confirmed || self.xhr_candidate_symbols.contains(&symbol) {
                     let (method, method_expression) = exact_argument(
                         self.source,
                         call.arguments.first(),
@@ -679,10 +699,14 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                         self.constants,
                     );
                     self.push(
-                        "xhr_open",
+                        if confirmed { "xhr_open" } else { "xhr_open_candidate" },
                         call.span,
                         source_fragment(self.source, call.callee.span()),
-                        "stable_symbol_initialized_from_standard_XMLHttpRequest",
+                        if confirmed {
+                            "stable_symbol_initialized_from_standard_XMLHttpRequest"
+                        } else {
+                            "unreassigned_binding_initialized_from_standard_XMLHttpRequest_but_receiver_escapes_or_is_mutable"
+                        },
                         (method, method_expression, method_status),
                         (url, url_expression),
                     );
@@ -783,6 +807,7 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<Vec<ApiC
             safe_member_refs: &safe_member_refs.refs,
             standard_xhr_available: !mutations.mutated.contains("xhr"),
             symbols: BTreeSet::new(),
+            candidate_symbols: BTreeSet::new(),
         };
         xhr.visit_program(&program);
         budget.checkpoint()?;
@@ -793,6 +818,7 @@ pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<Vec<ApiC
             constants: &constants,
             mutated_sinks: &mutations.mutated,
             xhr_symbols: &xhr.symbols,
+            xhr_candidate_symbols: &xhr.candidate_symbols,
             lines: LineIndex::new(source),
             callsites: BTreeSet::new(),
         };
@@ -1085,7 +1111,7 @@ fetch("https://classic.example.test/");
     }
 
     #[test]
-    fn xhr_receiver_must_not_escape_or_reach_prototype_mutation() -> Result<()> {
+    fn escaped_xhr_receivers_remain_candidates_without_becoming_verified_calls() -> Result<()> {
         let source = r#"
 const aliased = new XMLHttpRequest();
 const alias = aliased;
@@ -1102,12 +1128,81 @@ direct.open("POST", "https://real.example.test/direct");
 direct.send(payload);
 "#;
         let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 4, "{rows:#?}");
+        for candidate in &rows[..3] {
+            assert_eq!(candidate.kind, "xhr_open_candidate");
+            assert!(candidate.proof.contains("escapes_or_is_mutable"));
+        }
+        assert_eq!(rows[0].url.as_deref(), Some("https://fake.invalid/alias"));
+        assert_eq!(rows[1].url.as_deref(), Some("https://fake.invalid/passed"));
+        assert_eq!(
+            rows[2].url.as_deref(),
+            Some("https://fake.invalid/prototype")
+        );
+        assert_eq!(rows[3].kind, "xhr_open");
+        assert_eq!(rows[3].method.as_deref(), Some("POST"));
+        assert_eq!(
+            rows[3].url.as_deref(),
+            Some("https://real.example.test/direct")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn htmx_style_xhr_requests_keep_both_request_paths() -> Result<()> {
+        let source = r#"
+function loadHistoryFromServer(path) {
+    const request = new XMLHttpRequest();
+    const details = { path, xhr: request };
+    request.open("GET", path, true);
+    request.onload = function() { details.response = this.response; };
+    triggerEvent(details);
+    request.send();
+}
+function issueAjaxRequest(verb, finalPath, eltData) {
+    const xhr = new XMLHttpRequest();
+    eltData.xhr = xhr;
+    xhr.open(verb.toUpperCase(), finalPath, true);
+    xhr.onload = () => eltData.xhr = null;
+    xhr.send(payload);
+}
+"#;
+        let rows = analyze_api_surface(source)?;
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        assert!(rows.iter().all(|row| row.kind == "xhr_open_candidate"));
+        assert_eq!(rows[0].callee, "request.open");
+        assert_eq!(rows[0].method.as_deref(), Some("GET"));
+        assert_eq!(rows[0].url_expression.as_deref(), Some("path"));
+        assert_eq!(rows[1].callee, "xhr.open");
+        assert_eq!(
+            rows[1].method_expression.as_deref(),
+            Some("verb.toUpperCase()")
+        );
+        assert_eq!(rows[1].url_expression.as_deref(), Some("finalPath"));
+        Ok(())
+    }
+
+    #[test]
+    fn xhr_binding_candidates_do_not_include_reassigned_or_shadowed_xhr() -> Result<()> {
+        let source = r#"
+function falsePositive(XMLHttpRequest) {
+    const fake = new XMLHttpRequest();
+    const payload = {fake};
+    fake.open('GET', 'https://fake.invalid/shadow');
+}
+let changed = new XMLHttpRequest();
+changed = unrelated;
+changed.open('POST', 'https://fake.invalid/reassigned');
+const real = new XMLHttpRequest();
+unknown(real);
+real.open('PUT', 'https://candidate.invalid/path');
+"#;
+        let rows = analyze_api_surface(source)?;
         assert_eq!(rows.len(), 1, "{rows:#?}");
-        assert_eq!(rows[0].kind, "xhr_open");
-        assert_eq!(rows[0].method.as_deref(), Some("POST"));
+        assert_eq!(rows[0].kind, "xhr_open_candidate");
         assert_eq!(
             rows[0].url.as_deref(),
-            Some("https://real.example.test/direct")
+            Some("https://candidate.invalid/path")
         );
         Ok(())
     }

@@ -1,15 +1,22 @@
 mod base91;
 mod base91_recovery;
+mod bitwise_algebra;
+mod bitwise_effects;
 mod browser_legacy;
 mod control_flow;
 mod decoder;
 mod decoder_encoding;
+mod effect_statements;
+mod effectful_constant;
+mod if_ladder_structure;
 mod numeric;
 mod proxy;
 mod pure_function;
 mod rewrite;
 mod selector;
 mod string_exposure;
+mod switch_constant;
+mod trivial_loops;
 mod value_eval;
 
 pub use browser_legacy::{
@@ -550,10 +557,187 @@ struct Collector<'s, 'c> {
     var_number_initializers: &'c HashMap<SymbolId, VarNumberInitializer>,
     reference_spans: &'c HashMap<ReferenceId, Span>,
     protected_spans: &'c [(usize, usize)],
+    may_remove_dead_numeric_writes: bool,
+    allow_effect_statements: bool,
+    function_depth: usize,
     replacements: Vec<Replacement>,
 }
 
 impl Collector<'_, '_> {
+    fn reconstruct_while_pairs(&mut self, statements: &[Statement<'_>]) {
+        for pair in statements.windows(2) {
+            if let [initial, Statement::WhileStatement(loop_stmt)] = pair {
+                if let Some(code) =
+                    if_ladder_structure::reconstruct_while_adjacent(initial, loop_stmt, self.source)
+                {
+                    self.push(
+                        Span::new(initial.span().start, loop_stmt.span.end),
+                        code,
+                        "if_ladder_structured",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Preserve a numeric state initialized before arbitrary intervening
+    /// statements or an enclosing block. The real proof obligation is on
+    /// the same semantic binding, not adjacency of source statements.
+    fn reconstruct_reaching_while(&mut self, statements: &[Statement<'_>]) {
+        self.reconstruct_reaching_while_with(statements, &HashMap::<SymbolId, (u64, Span)>::new());
+    }
+
+    fn reconstruct_reaching_while_with(
+        &mut self,
+        statements: &[Statement<'_>],
+        inherited: &HashMap<SymbolId, (u64, Span)>,
+    ) {
+        if !self.may_remove_dead_numeric_writes {
+            // Direct eval and sloppy arguments aliasing can change a local
+            // numeric state without an ordinary lexically resolved write.
+            return;
+        }
+        let mut reaching = inherited.clone();
+        for (index, stmt) in statements.iter().enumerate() {
+            if let Statement::WhileStatement(loop_stmt) = stmt {
+                if let Some((symbol, name)) =
+                    if_ladder_structure::while_state_binding(loop_stmt, self.scoping)
+                {
+                    let immediately_preceded = index > 0
+                        && if_ladder_structure::state_initializer(
+                            &statements[index - 1],
+                            self.scoping,
+                        )
+                        .is_some_and(|(other, _, _)| other == symbol);
+                    if !immediately_preceded {
+                        if let Some(&(initial, init_span)) = reaching.get(&symbol) {
+                            if self.reaching_state_is_stable(symbol, init_span, loop_stmt.span) {
+                                if let Some(code) =
+                                    if_ladder_structure::reconstruct_while_with_known_state(
+                                        loop_stmt,
+                                        name,
+                                        initial,
+                                        self.source,
+                                    )
+                                {
+                                    self.push(loop_stmt.span, code, "if_ladder_structured");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            match stmt {
+                Statement::BlockStatement(block) => {
+                    self.reconstruct_reaching_while_with(&block.body, &reaching);
+                }
+                Statement::IfStatement(branch) => {
+                    self.reconstruct_nested_reaching(&branch.consequent, &reaching);
+                    if let Some(alternate) = &branch.alternate {
+                        self.reconstruct_nested_reaching(alternate, &reaching);
+                    }
+                }
+                _ => {}
+            }
+            // Kill any state whose value could have changed in this
+            // statement before processing the next sibling statement.
+            reaching.retain(|&symbol, _| !self.symbol_written_in_span(symbol, stmt.span()));
+            if let Some((symbol, _, initial)) =
+                if_ladder_structure::state_initializer(stmt, self.scoping)
+            {
+                if self.scoping.symbol_flags(symbol).is_variable()
+                    && !self.scoping.symbol_flags(symbol).is_const_variable()
+                    && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
+                {
+                    reaching.insert(symbol, (initial, stmt.span()));
+                }
+            }
+        }
+    }
+
+    fn reconstruct_nested_reaching(
+        &mut self,
+        stmt: &Statement<'_>,
+        reaching: &HashMap<SymbolId, (u64, Span)>,
+    ) {
+        if let Statement::BlockStatement(block) = stmt {
+            self.reconstruct_reaching_while_with(&block.body, reaching);
+        } else {
+            self.reconstruct_reaching_while_with(std::slice::from_ref(stmt), reaching);
+        }
+    }
+
+    fn symbol_written_in_span(&self, symbol: SymbolId, span: Span) -> bool {
+        self.scoping
+            .get_resolved_reference_ids(symbol)
+            .iter()
+            .any(|&ref_id| {
+                let reference = self.scoping.get_reference(ref_id);
+                reference.is_write()
+                    && self
+                        .reference_spans
+                        .get(&ref_id)
+                        .is_some_and(|reference_span| {
+                            span.start <= reference_span.start && reference_span.end <= span.end
+                        })
+            })
+    }
+
+    fn reaching_state_is_stable(&self, symbol: SymbolId, init: Span, loop_span: Span) -> bool {
+        self.scoping.symbol_flags(symbol).is_variable()
+            && !self.scoping.symbol_flags(symbol).is_const_variable()
+            && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
+            && self
+                .scoping
+                .get_resolved_reference_ids(symbol)
+                .iter()
+                .all(|&ref_id| {
+                    let reference = self.scoping.get_reference(ref_id);
+                    if !reference.is_write() {
+                        return true;
+                    }
+                    self.reference_spans.get(&ref_id).is_some_and(|span| {
+                        (init.start <= span.start && span.end <= init.end)
+                            || (loop_span.start <= span.start && span.end <= loop_span.end)
+                    })
+                })
+    }
+
+    // A local scalar that has no remaining lexical reads after structural
+    // reconstruction cannot make numeric state assignments observable.
+    // Avoid arguments aliasing and direct eval, both of which can observe
+    // parameter/local writes without an ordinary identifier reference.
+    fn dead_numeric_assignment(&self, expr: &Expression<'_>) -> bool {
+        if !self.may_remove_dead_numeric_writes {
+            return false;
+        }
+        let Expression::AssignmentExpression(assign) = expr else {
+            return false;
+        };
+        if assign.operator.as_str() != "="
+            || !matches!(&assign.right, Expression::NumericLiteral(_))
+        {
+            return false;
+        }
+        let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left else {
+            return false;
+        };
+        let Some(reference) = id.reference_id.get() else {
+            return false;
+        };
+        let Some(symbol) = self.scoping.get_reference(reference).symbol_id() else {
+            return false;
+        };
+        self.scoping.symbol_flags(symbol).is_variable()
+            && !self.scoping.symbol_flags(symbol).is_const_variable()
+            && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
+            && self
+                .scoping
+                .get_resolved_reference_ids(symbol)
+                .iter()
+                .all(|reference_id| !self.scoping.get_reference(*reference_id).is_read())
+    }
+
     fn is_protected(&self, start: usize, end: usize) -> bool {
         self.protected_spans
             .iter()
@@ -786,7 +970,23 @@ impl Collector<'_, '_> {
 }
 
 impl<'a> Visit<'a> for Collector<'_, '_> {
+    fn visit_function(&mut self, it: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        self.function_depth += 1;
+        walk::walk_function(self, it, flags);
+        self.function_depth -= 1;
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+        self.function_depth += 1;
+        walk::walk_arrow_function_expression(self, it);
+        self.function_depth -= 1;
+    }
+
     fn visit_expression(&mut self, it: &Expression<'a>) {
+        if let Some(replacement) = effectful_constant::fold(it, self.source) {
+            self.push(it.span(), replacement, "effectful_constant_fold");
+            return;
+        }
         if let Expression::Identifier(id) = it {
             if self.shorthand_spans.contains(&(id.span.start, id.span.end)) {
                 walk::walk_expression(self, it);
@@ -815,6 +1015,12 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_binary_expression(&mut self, it: &oxc_ast::ast::BinaryExpression<'a>) {
+        if self.allow_effect_statements {
+            if let Some(text) = bitwise_effects::normalize(it, self.source) {
+                self.push(it.span, text, "bitwise_effects");
+                return;
+            }
+        }
         if matches!(it.operator.as_str(), "==" | "===" | "!=" | "!==") {
             let left_reference =
                 reference_identity(&it.left, self.scoping, self.reference_identity_tables);
@@ -867,6 +1073,14 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_logical_expression(self, it);
     }
 
+    fn visit_sequence_expression(&mut self, it: &oxc_ast::ast::SequenceExpression<'a>) {
+        if let Some(replacement) = trivial_loops::prune_inert_sequence_values(it, self.source) {
+            self.push(it.span, replacement, "prune_inert_sequence_values");
+            return;
+        }
+        walk::walk_sequence_expression(self, it);
+    }
+
     fn visit_conditional_expression(&mut self, it: &oxc_ast::ast::ConditionalExpression<'a>) {
         if let Some(test) = known_bool(&it.test) {
             let selected = if test { &it.consequent } else { &it.alternate };
@@ -879,7 +1093,34 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_conditional_expression(self, it);
     }
 
+    fn visit_return_statement(&mut self, it: &oxc_ast::ast::ReturnStatement<'a>) {
+        if let Some(Expression::SequenceExpression(sequence)) = it.argument.as_ref() {
+            if let Some((last, preceding)) = sequence.expressions.split_last() {
+                if !preceding.is_empty()
+                    && preceding.iter().all(|expr| {
+                        trivial_loops::inert_literal_statement(expr)
+                            || matches!(expr, Expression::StringLiteral(_))
+                    })
+                {
+                    // Return always performs GetValue; unlike a call
+                    // callee, it cannot observe reference/this identity.
+                    self.push(
+                        sequence.span,
+                        fragment(self.source, last.span()).to_owned(),
+                        "return_inert_sequence_prefix",
+                    );
+                    return;
+                }
+            }
+        }
+        walk::walk_return_statement(self, it);
+    }
+
     fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
+        if let Some(replacement) = trivial_loops::normalize_empty_if(it, self.source) {
+            self.push(it.span, replacement, "normalize_empty_if");
+            return;
+        }
         if let Some(test) = known_bool(&it.test) {
             let text = if test {
                 fragment(self.source, it.consequent.span()).to_string()
@@ -894,7 +1135,23 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_if_statement(self, it);
     }
 
+    fn visit_switch_statement(&mut self, it: &oxc_ast::ast::SwitchStatement<'a>) {
+        if let Some(text) = switch_constant::select_constant_switch(it, self.source) {
+            self.push(it.span, text, "constant_switch");
+            return;
+        }
+        walk::walk_switch_statement(self, it);
+    }
+
     fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
+        if let Some(text) = trivial_loops::single_iteration_for(it, self.source) {
+            self.push(it.span, text, "single_iteration_for");
+            return;
+        }
+        if let Some(text) = if_ladder_structure::reconstruct_for(it, self.source) {
+            self.push(it.span, text, "if_ladder_structured");
+            return;
+        }
         if let Some(text) = self.reference_state_replacement(it) {
             self.push(it.span, text, "reference_state_unflatten");
             return;
@@ -911,6 +1168,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_while_statement(&mut self, it: &oxc_ast::ast::WhileStatement<'a>) {
+        if let Some(text) = trivial_loops::never_entered_while(it) {
+            self.push(it.span, text, "never_entered_loop");
+            return;
+        }
         if let Some(text) = self.ordered_switch_while_replacement(it) {
             self.push(it.span, text, "ordered_switch_unflatten");
             return;
@@ -918,7 +1179,103 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_while_statement(self, it);
     }
 
+    fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
+        self.reconstruct_while_pairs(&it.statements);
+        self.reconstruct_reaching_while(&it.statements);
+        if self.allow_effect_statements
+            && self.function_depth > 0
+            && self.may_remove_dead_numeric_writes
+        {
+            for (span, expression) in
+                bitwise_algebra::scan(&it.statements, self.source, self.scoping)
+            {
+                self.push(span, expression, "bitwise_algebra");
+            }
+        }
+        for stmt in &it.statements {
+            match stmt {
+                Statement::EmptyStatement(empty) => {
+                    self.push(empty.span, String::new(), "remove_empty_function_statement");
+                }
+                // A standalone empty block has no bindings, declarations,
+                // effects, or control transfers. Do not rewrite blocks used
+                // as branch, loop, labelled, or try/catch bodies.
+                Statement::BlockStatement(block) if block.body.is_empty() => {
+                    self.push(block.span, String::new(), "remove_empty_block_statement");
+                }
+                Statement::BlockStatement(block) => {
+                    if let Some(flattened) =
+                        trivial_loops::flatten_standalone_block(block, self.source, self.scoping)
+                    {
+                        self.push(block.span, flattened, "flatten_redundant_block");
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk::walk_function_body(self, it);
+    }
+
+    fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
+        self.reconstruct_while_pairs(&it.body);
+        self.reconstruct_reaching_while(&it.body);
+        if self.allow_effect_statements
+            && self.function_depth > 0
+            && self.may_remove_dead_numeric_writes
+        {
+            // Top-level var declarations may alias global object properties.
+            // Direct eval, mapped arguments, and dynamic with-environments
+            // may change local bindings outside the visible statement list.
+            for (span, expression) in bitwise_algebra::scan(&it.body, self.source, self.scoping) {
+                self.push(span, expression, "bitwise_algebra");
+            }
+        }
+        for stmt in &it.body {
+            match stmt {
+                Statement::EmptyStatement(empty) => {
+                    self.push(empty.span, String::new(), "remove_empty_block_statement");
+                }
+                Statement::BlockStatement(block) if block.body.is_empty() => {
+                    self.push(block.span, String::new(), "remove_empty_block_statement");
+                }
+                Statement::BlockStatement(block) => {
+                    if let Some(flattened) =
+                        trivial_loops::flatten_standalone_block(block, self.source, self.scoping)
+                    {
+                        self.push(block.span, flattened, "flatten_redundant_block");
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk::walk_block_statement(self, it);
+    }
+
     fn visit_expression_statement(&mut self, it: &ExpressionStatement<'a>) {
+        if trivial_loops::inert_literal_statement(&it.expression) {
+            self.push(it.span, String::new(), "remove_inert_literal_statement");
+            return;
+        }
+        // Script/eval Completion values can expose the result of a top-level
+        // expression statement. Inside a function, a normal completion is
+        // discarded; the statement may be safely normalized to if/blocks.
+        if self.allow_effect_statements
+            && self.function_depth > 0
+            && effectful_constant::fold(&it.expression, self.source).is_none()
+        {
+            // A known-result effectful expression can eliminate enormous
+            // dead RHS subtrees. Give it precedence over presentation-only
+            // statement lowering; the next fixed-point iteration may then
+            // lower the surviving effects into readable statements.
+            if let Some(replacement) = effect_statements::lower(it, self.source, self.scoping) {
+                self.push(it.span, replacement, "effect_statement_lowering");
+                return;
+            }
+        }
+        if self.dead_numeric_assignment(&it.expression) {
+            self.push(it.span, ";".to_owned(), "dead_numeric_state_write");
+            return;
+        }
         if let Expression::SequenceExpression(seq) = &it.expression {
             let text = seq
                 .expressions
@@ -1269,13 +1626,19 @@ pub fn safe_source_rejection(source: &str, mode: SafeSourceMode) -> Option<SafeS
     }
 }
 
+#[derive(Clone, Copy)]
+struct TransformOptions {
+    standard_numeric_builtins: bool,
+    allow_effect_statements: bool,
+}
+
 fn transform_once(
     source: &str,
     source_type: SourceType,
     counts: &mut Counts,
     arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
-    standard_numeric_builtins: bool,
+    options: TransformOptions,
     budget: &WorkBudget,
 ) -> Result<Option<String>, BudgetExceeded> {
     budget.checkpoint()?;
@@ -1325,11 +1688,12 @@ fn transform_once(
     let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
     let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
     budget.checkpoint()?;
+    let direct_eval_present = has_direct_eval(&program);
     initial_replacements.extend(remove_unused_proven_helpers(
         scoping,
         &decoder_analysis.removable_helpers,
         &pure_functions,
-        has_direct_eval(&program),
+        direct_eval_present,
     ));
     budget.checkpoint()?;
 
@@ -1344,7 +1708,7 @@ fn transform_once(
         pure_functions: &pure_functions,
         from_char_code_aliases: &from_char_code_aliases,
         global_object_aliases: &global_object_aliases,
-        standard_numeric_builtins,
+        standard_numeric_builtins: options.standard_numeric_builtins,
         reference_identity_tables: &reference_identity_tables,
         selector_dispatchers: &selector_dispatchers,
         dispatch_orders: &dispatch_orders,
@@ -1352,6 +1716,11 @@ fn transform_once(
         var_number_initializers: &var_number_initializers,
         reference_spans: &reference_spans,
         protected_spans: &protected_spans,
+        // Parameters in sloppy-mode functions alias their arguments object.
+        // Do not erase writes when that object may be accessed.
+        may_remove_dead_numeric_writes: !direct_eval_present && !source.contains("arguments"),
+        allow_effect_statements: options.allow_effect_statements,
+        function_depth: 0,
         replacements: initial_replacements,
     };
     collector.visit_program(&program);
@@ -1507,18 +1876,45 @@ fn deobfuscate_with_mode(
 
     for iteration in 1..=max_iterations {
         budget.consume(1)?;
-        let Some(next) = transform_once(
+        // Semantic recovery (decoder calls, constant folding, control-flow
+        // reconstruction, and pure-function evaluation) always gets the
+        // original AST first. Only once that work reaches a fixed point do
+        // we normalize the remaining discarded expressions for readability.
+        // An eager presentation rewrite can hide source shapes required by
+        // other analyzers (notably the decoder and WASM import recognizers).
+        let Some(mut next) = transform_once(
             &current,
             source_type,
             &mut counts,
             &mut arithmetic_state_proofs,
             iteration,
-            standard_numeric_builtins,
+            TransformOptions {
+                standard_numeric_builtins,
+                allow_effect_statements: false,
+            },
             budget,
         )?
         else {
             return Ok(None);
         };
+        if next == current {
+            let Some(presented) = transform_once(
+                &current,
+                source_type,
+                &mut counts,
+                &mut arithmetic_state_proofs,
+                iteration,
+                TransformOptions {
+                    standard_numeric_builtins,
+                    allow_effect_statements: true,
+                },
+                budget,
+            )?
+            else {
+                return Ok(None);
+            };
+            next = presented;
+        }
         if next == current {
             break;
         }
@@ -1652,6 +2048,101 @@ mod tests {
         expose_static_strings_budgeted(source, max_iterations, &test_budget())
             .ok()
             .flatten()
+    }
+
+    #[test]
+    fn eliminates_only_standalone_empty_blocks_after_deobfuscation() {
+        let input = "function recovered(flag){ {} { {} } {}; if(flag) {} else {}                     for(;flag;) {} label: {} return 7; }";
+        let result = deobfuscate(input, 12);
+        assert!(result.is_some(), "fixture should be valid JavaScript");
+        let Some(output) = result else {
+            unreachable!();
+        };
+        assert!(!output.source.contains("{} {"), "{}", output.source);
+        assert!(!output.source.contains("{ {} }"), "{}", output.source);
+        // Branches and labelled bodies are not anonymous direct statements;
+        // their meaning must not be changed by a blanket brace stripper.
+        // The preexisting empty-if simplifier evaluates flag once;
+        // an empty loop/label body is NOT a removable standalone block.
+        assert!(output.source.contains("(flag);"), "{}", output.source);
+        assert!(
+            output.source.contains("for(;flag;) {}"),
+            "{}",
+            output.source
+        );
+        assert!(output.source.contains("label: {}"), "{}", output.source);
+        assert!(
+            output
+                .transforms
+                .get("remove_empty_block_statement")
+                .copied()
+                .unwrap_or_default()
+                >= 2,
+            "{:?}",
+            output.transforms
+        );
+    }
+
+    #[test]
+    fn flattens_unnecessary_nested_blocks_with_real_effects() {
+        let input = "function recovered(x){ { { x+=1; } x*=2; } return x; }";
+        let result = deobfuscate(input, 12);
+        assert!(result.is_some());
+        let Some(output) = result else {
+            unreachable!();
+        };
+        assert!(!output.source.contains("{ {"), "{}", output.source);
+        assert!(output.source.contains("x+=1"), "{}", output.source);
+        assert!(output.source.contains("x*=2"), "{}", output.source);
+        assert_eq!(output.transforms.get("flatten_redundant_block"), Some(&2));
+    }
+
+    #[test]
+    fn retains_lexical_scopes_directives_and_control_flow_blocks() {
+        let fixtures = [
+            "function f(){let x=3;{let x=4;run(x);}return x;}",
+            "function f(){let x=3;{const y=4;run(y);}return x;}",
+            "function f(){ {class C{};run(C);}return 1;}",
+            "function f(){ {function inner(){return globalThis.value;} inner.tag=1; run(inner);}return 2;}",
+            "function f(){ {\"use strict\";return this;} }",
+            "function f(x){if(x){return 1;}else{return 2;}}",
+            "function f(x){while(x){x--;}}",
+            "function f(){label:{run();break label;}}",
+            "function f(){try{run();}catch(e){throw e;}}",
+        ];
+        for input in fixtures {
+            let result = deobfuscate(input, 12);
+            assert!(result.is_some(), "{input}");
+            let Some(output) = result else {
+                unreachable!();
+            };
+            assert_eq!(
+                output.transforms.get("flatten_redundant_block"),
+                None,
+                "{input} -> {}",
+                output.source
+            );
+        }
+    }
+
+    #[test]
+    fn permits_var_hoisting_and_direct_break_targets_after_block_flattening() {
+        let input = "function f(flag){var count=0;while(true){{var x=++count;if(flag)break;}break;}return [x,count];}";
+        let result = deobfuscate(input, 12);
+        assert!(result.is_some());
+        let Some(output) = result else {
+            unreachable!();
+        };
+        assert!(output.source.contains("var x=++count"), "{}", output.source);
+        assert!(output.source.contains("if(flag)break"), "{}", output.source);
+        assert!(
+            output
+                .transforms
+                .get("flatten_redundant_block")
+                .copied()
+                .unwrap_or_default()
+                >= 1
+        );
     }
 
     #[test]

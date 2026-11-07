@@ -222,6 +222,27 @@ pub fn js_to_int32(n: f64) -> i32 {
     n.to_int_32()
 }
 
+/// ECMAScript Abstract Equality for the complete primitive domain modeled by
+/// this evaluator. Object, Symbol and BigInt equality is deliberately handled
+/// outside this domain, never guessed from source text.
+fn abstract_primitive_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null | Value::Undefined, Value::Null | Value::Undefined) => true,
+        (Value::Bool(value), other) => {
+            abstract_primitive_equal(&Value::Number(if *value { 1.0 } else { 0.0 }), other)
+        }
+        (other, Value::Bool(value)) => {
+            abstract_primitive_equal(other, &Value::Number(if *value { 1.0 } else { 0.0 }))
+        }
+        (Value::String(text), Value::Number(number))
+        | (Value::Number(number), Value::String(text)) => {
+            text.as_str().string_to_number() == *number
+        }
+        (Value::Null | Value::Undefined, _) | (_, Value::Null | Value::Undefined) => false,
+        _ => same_value(left, right),
+    }
+}
+
 pub fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
     match op {
         "+" => {
@@ -270,15 +291,8 @@ pub fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
         "===" => Some(Value::Bool(same_value(&left, &right))),
         "!==" => Some(Value::Bool(!same_value(&left, &right))),
         "==" | "!=" => {
-            let equal = same_value(&left, &right)
-                || matches!(
-                    (&left, &right),
-                    (Value::Null, Value::Undefined) | (Value::Undefined, Value::Null)
-                );
-            if !equal {
-                return None;
-            }
-            Some(Value::Bool(op == "=="))
+            let equal = abstract_primitive_equal(&left, &right);
+            Some(Value::Bool(if op == "==" { equal } else { !equal }))
         }
         "<" | "<=" | ">" | ">=" => {
             let result = if let (Value::String(a), Value::String(b)) = (&left, &right) {
