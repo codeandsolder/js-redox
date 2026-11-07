@@ -5,7 +5,7 @@ use jsvm_lift::{
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions},
     safe_deob::{deobfuscate_source, SourceMode},
     sha256_hex,
-    source_tree_aliases::explain_property_aliases,
+    source_tree_aliases::{explain_captured_handler_origins, explain_property_aliases},
     source_tree_context::reconstruct_context,
     source_tree_specialize::specialize_calls,
 };
@@ -100,6 +100,11 @@ struct SourceTreeArgs {
     /// Materializes lexical helper implementations alongside the readable tree.
     #[arg(long)]
     context_source: Option<PathBuf>,
+    /// Raw original source, byte-for-byte matching source hashes and spans
+    /// in captured-handler provenance headers. Pretty-printed source does
+    /// not have the same offsets and must not be substituted here.
+    #[arg(long, requires = "context_source")]
+    origin_source: Option<PathBuf>,
 }
 
 fn collect_js_sources(root: &Path) -> Result<Vec<PathBuf>> {
@@ -370,7 +375,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             md.push_str("[Browse exact lexical-alias analysis views](lexical-context/explained/README.md). ");
             md.push_str("The original property expressions remain dynamic where needed.\n\n");
         }
-        fs::write(folder.join("README.md"), helper_index)?;
+        fs::write(folder.join("README.md"), &helper_index)?;
         // A fixed-argument callsite can expose a more useful helper body than
         // its multipurpose definition. Materialize *both* source views.
         let helper_counts =
@@ -497,7 +502,66 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 handler.path, handler.path, links
             ));
         }
+        // Only a *byte-identical raw* original allows the source spans and
+        // the pre-existing SHA-256 headers to identify external lexical
+        // bindings of captured handlers. The pretty-printed context is fine
+        // for browsing helper definitions but is NOT a span provenance source.
+        let mut origin_rows = Vec::new();
+        let mut origin_source_sha256 = None;
+        if let Some(origin_path) = &args.origin_source {
+            let raw_origin = fs::read_to_string(origin_path)
+                .with_context(|| format!("reading raw capture origin {}", origin_path.display()))?;
+            origin_source_sha256 = Some(sha256_hex(raw_origin.as_bytes()));
+            let transformed_handlers = source_inputs
+                .iter()
+                .map(|(path, _)| Ok((path.clone(), fs::read_to_string(out.join(path))?)))
+                .collect::<Result<Vec<_>>>()?;
+            let views = explain_captured_handler_origins(&raw_origin, &transformed_handlers)?;
+            if !views.is_empty() {
+                let origin_dir = folder.join("handler-origins");
+                fs::create_dir_all(&origin_dir)?;
+                let mut index = String::from(
+                    "# Original-source-bound property aliases in captured handlers\n\nEvery listed property key is tied to the **original raw source SHA-256, \
+                    original function byte span, and an exact original lexical SymbolId**. \
+                    Dynamic and conditional alias writes remain possible. These are browsing views, \
+                    not executable replacements. Ordinary transformed files are unchanged.\n\n",
+                );
+                for view in views {
+                    let relative = Path::new(&view.input_path);
+                    let destination = origin_dir.join(relative);
+                    if let Some(parent) = destination.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&destination, &view.annotated_source)?;
+                    index.push_str(&format!(
+                        "- [{}]({}) — {} explained accesses, original bytes {}..{}\n",
+                        view.input_path,
+                        view.input_path,
+                        view.annotated_reads,
+                        view.original_span[0],
+                        view.original_span[1]
+                    ));
+                    origin_rows.push(json!({
+                        "input_path": view.input_path,
+                        "annotated_path": format!("handler-origins/{}", view.input_path),
+                        "original_span": view.original_span,
+                        "annotated_accesses": view.annotated_reads,
+                        "aliases": view.aliases,
+                    }));
+                }
+                fs::write(origin_dir.join("README.md"), index)?;
+                helper_index.push_str(
+                    "\n[Captured handler property-alias origins](handler-origins/README.md).\n",
+                );
+                fs::write(folder.join("README.md"), &helper_index)?;
+                md.push_str("\n## Source-bound captured handler property aliases\n\n");
+                md.push_str("[Browse property aliases in individual recovered handlers](lexical-context/handler-origins/README.md).\n\n");
+            }
+        }
         let mut context_json = serde_json::to_string_pretty(&json!({
+            "origin_source_sha256": origin_source_sha256,
+            "origin_handler_count": origin_rows.len(),
+            "origin_handlers": origin_rows,
             "schema": "jsvm-readable-lexical-context/v2",
             "explained_alias_count": explained_rows.len(),
             "explained_aliases": explained_rows,
@@ -607,7 +671,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_source_tree, SourceTreeArgs};
+    use super::{run_source_tree, sha256_hex, SourceTreeArgs};
     use anyhow::Result;
     use std::fs;
 
@@ -630,6 +694,7 @@ mod tests {
             max_iterations: 12,
             format_output: false,
             context_source: None,
+            origin_source: None,
         })?;
 
         let index: serde_json::Value =
@@ -672,6 +737,7 @@ mod tests {
             max_iterations: 8,
             format_output: true,
             context_source: Some(original),
+            origin_source: None,
         })?;
         let context_dir = output.join("lexical-context");
         let metadata: serde_json::Value =
@@ -721,6 +787,7 @@ mod tests {
             max_iterations: 8,
             format_output: true,
             context_source: Some(original),
+            origin_source: None,
         })?;
         let ctx = output.join("lexical-context");
         let meta: serde_json::Value =
@@ -755,6 +822,61 @@ mod tests {
     }
 
     #[test]
+    fn source_tree_links_exact_raw_capture_spans_into_annotated_handlers() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let source_dir = tmp.path().join("captures");
+        let output = tmp.path().join("recovered");
+        fs::create_dir_all(&source_dir)?;
+        let raw = r#"function parent() {
+            const helper = function(H, alias) {
+                alias = "push";
+                H.length < 2 && (alias = H);
+                return function(value) { const out = []; out[alias](value); return out; };
+            };
+        }"#;
+        let start = raw
+            .find("function(value)")
+            .ok_or_else(|| anyhow::anyhow!("capture body missing"))?;
+        let end = raw[start..]
+            .find("};")
+            .map(|size| start + size + 1)
+            .ok_or_else(|| anyhow::anyhow!("capture end missing"))?;
+        let hash = sha256_hex(raw.as_bytes());
+        let captured = format!(
+            "// Readable, non-devirtualized provenance view. Original SHA-256: {hash}\n\
+             // Handler key: 7. Original bytes: {start}..{end}. Factory call: 0..1.\n\
+             const capturedHandler = {};\n",
+            &raw[start..end]
+        );
+        fs::write(source_dir.join("handler.js"), captured)?;
+        let original = tmp.path().join("original.js");
+        fs::write(&original, raw)?;
+        run_source_tree(SourceTreeArgs {
+            input: source_dir,
+            output: output.clone(),
+            max_iterations: 8,
+            format_output: true,
+            context_source: Some(original.clone()),
+            origin_source: Some(original),
+        })?;
+        let context_dir = output.join("lexical-context");
+        let meta: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(context_dir.join("context.json"))?)?;
+        assert_eq!(meta["origin_handler_count"], 1);
+        assert_eq!(meta["origin_handlers"][0]["annotated_accesses"], 1);
+        assert_eq!(meta["origin_handlers"][0]["aliases"][0]["binding"], "alias");
+        let plain = fs::read_to_string(output.join("handler.js"))?;
+        assert!(!plain.contains("property alias from original"));
+        let explained = fs::read_to_string(context_dir.join("handler-origins/handler.js"))?;
+        assert!(
+            explained.contains("out[alias /* property alias from original"),
+            "{explained}"
+        );
+        assert!(context_dir.join("handler-origins/README.md").exists());
+        Ok(())
+    }
+
+    #[test]
     fn source_tree_cannot_overwrite_or_contain_original() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let input = temp.path().join("raw");
@@ -766,6 +888,7 @@ mod tests {
             max_iterations: 1,
             format_output: false,
             context_source: None,
+            origin_source: None,
         });
         assert!(error.is_err());
         assert_eq!(fs::read_to_string(input.join("a.js"))?, "const a=1;");

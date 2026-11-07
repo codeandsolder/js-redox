@@ -390,3 +390,285 @@ mod tests {
         Ok(())
     }
 }
+
+/// A captured function can be linked to original lexical symbols only after
+/// its source-span and source-hash provenance are checked against the *raw*
+/// original program. Pretty-printed code has different offsets and must not
+/// silently serve as the provenance source.
+#[derive(Clone, Debug, Serialize)]
+pub struct CapturedAlias {
+    pub binding: String,
+    pub declaration: [u32; 2],
+    pub original_reads: usize,
+    pub writes: Vec<AliasWrite>,
+    pub other_writes_possible: bool,
+}
+
+#[derive(Debug)]
+pub struct CapturedAliasView {
+    pub input_path: String,
+    pub original_span: [u32; 2],
+    pub annotated_source: String,
+    pub annotated_reads: usize,
+    pub aliases: Vec<CapturedAlias>,
+}
+
+#[derive(Default)]
+struct OriginalFunctions(BTreeSet<(u32, u32)>);
+
+impl<'a> Visit<'a> for OriginalFunctions {
+    fn visit_function(
+        &mut self,
+        function: &oxc_ast::ast::Function<'a>,
+        flags: oxc_syntax::scope::ScopeFlags,
+    ) {
+        self.0.insert((function.span.start, function.span.end));
+        walk::walk_function(self, function, flags);
+    }
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        self.0.insert((function.span.start, function.span.end));
+        walk::walk_arrow_function_expression(self, function);
+    }
+}
+
+fn capture_origin(source: &str) -> Option<(String, [u32; 2])> {
+    let line = source.lines().next()?;
+    let hash =
+        line.strip_prefix("// Readable, non-devirtualized provenance view. Original SHA-256: ")?;
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let line = source.lines().nth(1)?.trim();
+    let (_, rest) = line.split_once("Original bytes: ")?;
+    let (start, rest) = rest.split_once("..")?;
+    let (end, _) = rest.split_once('.')?;
+    Some((hash.to_owned(), [start.parse().ok()?, end.parse().ok()?]))
+}
+
+struct CapturedReads<'s> {
+    scoping: &'s Scoping,
+    candidates: &'s BTreeMap<String, CapturedAlias>,
+    edits: Vec<(usize, String)>,
+}
+
+impl<'a> Visit<'a> for CapturedReads<'_> {
+    fn visit_computed_member_expression(&mut self, it: &ComputedMemberExpression<'a>) {
+        let mut expr = &it.expression;
+        while let Expression::ParenthesizedExpression(paren) = expr {
+            expr = &paren.expression;
+        }
+        if let Expression::Identifier(id) = expr {
+            let unresolved = id.reference_id.get().is_some_and(|reference| {
+                self.scoping.get_reference(reference).symbol_id().is_none()
+            });
+            if unresolved {
+                if let Some(alias) = self.candidates.get(id.name.as_str()) {
+                    let property = PropertyAlias {
+                        binding: alias.binding.clone(),
+                        reads: alias.original_reads,
+                        writes: alias.writes.clone(),
+                        other_writes_possible: alias.other_writes_possible,
+                    };
+                    let origin = alias.declaration[0];
+                    let comment = comment_text(&property).replacen(
+                        "property alias:",
+                        &format!("property alias from original declaration byte {origin}:"),
+                        1,
+                    );
+                    self.edits.push((id.span.end as usize, comment));
+                }
+            }
+        }
+        walk::walk_computed_member_expression(self, it);
+    }
+}
+
+/// Produce handler-specific *browsing* views, not executable replacements.
+/// The source hash, original function spans and external symbols are all
+/// checked in the raw source AST. A same-named reference is annotated in a
+/// transformed handler only if it remains unresolved *and* the original
+/// capture had one uniquely resolved lexical symbol for that property name.
+pub fn explain_captured_handler_origins(
+    raw_original: &str,
+    handlers: &[(String, String)],
+) -> Result<Vec<CapturedAliasView>> {
+    use crate::sha256_hex;
+    let expected_hash = sha256_hex(raw_original.as_bytes());
+    let allocator = Allocator::default();
+    let parsed = parse_program(&allocator, raw_original, SourceType::unambiguous());
+    ensure!(parsed.is_clean(), "raw origin is not valid JavaScript");
+    let semantic = SemanticBuilder::new().build(&parsed.program);
+    let scoping = semantic.semantic.scoping();
+    let mut functions = OriginalFunctions::default();
+    functions.visit_program(&parsed.program);
+    let mut reader = Reader {
+        source: raw_original,
+        scoping,
+        guard: Vec::new(),
+        writes: BTreeMap::new(),
+        unmodeled_writes: BTreeSet::new(),
+        property_reads: BTreeMap::new(),
+    };
+    reader.visit_program(&parsed.program);
+    let mut output = Vec::new();
+    for (path, source) in handlers {
+        let Some((hash, span)) = capture_origin(source) else {
+            continue;
+        };
+        ensure!(
+            hash == expected_hash,
+            "handler {path} has a different original source SHA-256"
+        );
+        ensure!(
+            functions.0.contains(&(span[0], span[1])),
+            "handler {path} original byte span is not an AST function"
+        );
+        let mut by_name: BTreeMap<String, (SymbolId, CapturedAlias)> = BTreeMap::new();
+        let mut ambiguous = BTreeSet::new();
+        for (symbol, reads) in &reader.property_reads {
+            let count = reads
+                .iter()
+                .filter(|&&end| span[0] <= end && end <= span[1])
+                .count();
+            if count == 0 {
+                continue;
+            }
+            let declaration = scoping.symbol_span(*symbol);
+            if span[0] <= declaration.start && declaration.end <= span[1] {
+                continue;
+            }
+            let Some(writes) = reader.writes.get(symbol) else {
+                continue;
+            };
+            if !writes.iter().any(|write| write.literal.is_some()) {
+                continue;
+            }
+            let name = scoping.symbol_name(*symbol).to_owned();
+            let tracked = writes.len();
+            let total_writes = scoping
+                .get_resolved_reference_ids(*symbol)
+                .iter()
+                .filter(|reference| scoping.get_reference(**reference).is_write())
+                .count();
+            let alias = CapturedAlias {
+                binding: name.clone(),
+                declaration: [declaration.start, declaration.end],
+                original_reads: count,
+                writes: writes.clone(),
+                other_writes_possible: reader.unmodeled_writes.contains(symbol)
+                    || total_writes > tracked,
+            };
+            if let Some((previous, _)) = by_name.insert(name.clone(), (*symbol, alias)) {
+                if previous != *symbol {
+                    ambiguous.insert(name);
+                }
+            }
+        }
+        for name in &ambiguous {
+            by_name.remove(name);
+        }
+        if by_name.is_empty() {
+            continue;
+        }
+        let candidates = by_name
+            .into_iter()
+            .map(|(name, (_, alias))| (name, alias))
+            .collect::<BTreeMap<_, _>>();
+        let allocator = Allocator::default();
+        let transformed = parse_program(&allocator, source, SourceType::unambiguous());
+        ensure!(
+            transformed.is_clean(),
+            "captured handler {path} is not valid JavaScript"
+        );
+        let semantics = SemanticBuilder::new().build(&transformed.program);
+        let mut reads = CapturedReads {
+            scoping: semantics.semantic.scoping(),
+            candidates: &candidates,
+            edits: Vec::new(),
+        };
+        reads.visit_program(&transformed.program);
+        if reads.edits.is_empty() {
+            continue;
+        }
+        reads
+            .edits
+            .sort_unstable_by_key(|(pos, _)| std::cmp::Reverse(*pos));
+        let mut annotated_source = source.clone();
+        for (pos, comment) in &reads.edits {
+            annotated_source.insert_str(*pos, comment);
+        }
+        output.push(CapturedAliasView {
+            input_path: path.clone(),
+            original_span: span,
+            annotated_source,
+            annotated_reads: reads.edits.len(),
+            aliases: candidates.into_values().collect(),
+        });
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::explain_captured_handler_origins;
+    use crate::sha256_hex;
+
+    fn input() -> (String, Vec<(String, String)>) {
+        let original = r#"function run(){
+            const helper=function(H,alias){
+                alias="push";
+                H.length<2 && (alias=H);
+                return function(value){const out=[];out[alias](value);return out;};
+            };
+        }"#;
+        let start = original.find("function(value)").unwrap_or_default();
+        let end = original[start..]
+            .find("};")
+            .map_or(start, |len| start + len + 1);
+        let hash = sha256_hex(original.as_bytes());
+        let captured = format!(
+            "// Readable, non-devirtualized provenance view. Original SHA-256: {hash}\n\
+             // Handler key: 1. Original bytes: {start}..{end}. Factory call: 0..1.\n\
+             const capturedHandler = {};\n",
+            &original[start..end]
+        );
+        (original.to_owned(), vec![("key-1.js".to_owned(), captured)])
+    }
+
+    #[test]
+    fn joins_captured_function_span_to_exact_original_alias_binding() -> anyhow::Result<()> {
+        let (original, captures) = input();
+        let explained = explain_captured_handler_origins(&original, &captures)?;
+        assert_eq!(explained.len(), 1, "{explained:?}");
+        let view = &explained[0];
+        assert_eq!(view.annotated_reads, 1);
+        assert_eq!(view.aliases[0].binding, "alias");
+        assert_eq!(view.aliases[0].writes[0].literal.as_deref(), Some("push"));
+        assert!(view.aliases[0].writes[1].when.is_some());
+        assert!(view
+            .annotated_source
+            .contains("out[alias /* property alias from original declaration byte"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_wrong_source_hash_and_forged_function_span() -> anyhow::Result<()> {
+        let (original, mut captures) = input();
+        captures[0].1 = captures[0]
+            .1
+            .replacen("Original SHA-256: ", "Original SHA-256: 0", 1);
+        // Malformed SHA or span cannot establish provenance and is skipped.
+        assert!(explain_captured_handler_origins(&original, &captures)?.is_empty());
+        let (_, mut captures) = input();
+        captures[0].1 =
+            captures[0]
+                .1
+                .replacen("Original bytes: ", "Original bytes: 1..2. Fake: ", 1);
+        assert!(explain_captured_handler_origins(&original, &captures).is_err());
+        Ok(())
+    }
+}

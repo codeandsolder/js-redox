@@ -370,6 +370,18 @@ dynamic write, condition and annotated read count for tools. These are
 context remain byte-for-byte unchanged, including any source-sensitive
 `Function.prototype.toString` behavior.
 
+When original function-capture headers include the unformatted source SHA-256
+and exact byte spans, pass `--origin-source path/to/raw-original.js` alongside
+`--context-source` to produce `lexical-context/handler-origins/` annotated
+views **directly in the individual recovered handlers**. The tool verifies
+the raw original hash, exact function span and enclosing lexical symbol,
+then annotates a property only if the readable handler still has an unresolved
+reference to that same proven external binding. This avoids confusing a
+shadowed parameter with the original `push`/`length` alias. A pretty-printed
+version of the original is useful for browsing but must not be used as the
+span provenance source. `context.json` records the original declaration
+spans, assignment alternatives, and linked handler paths.
+
 ### Specialize original helper code at constant-argument callsites
 
 When the original enclosing JavaScript is supplied with --context-source,
