@@ -184,6 +184,23 @@ impl Lowered {
     }
 }
 
+/// Direct `guard && call()` / `guard || call()` already has readable
+/// short-circuit semantics. Retain that idiomatic source shape at statement
+/// root rather than expanding it into an `if`; downstream semantic analyzers
+/// can then recognize the same source-level guard/call relationship. Nested
+/// comma expressions and assignment-heavy dispatch still get restructured.
+fn simple_guarded_call(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => simple_guarded_call(&paren.expression),
+        Expression::LogicalExpression(logical)
+            if matches!(logical.operator.as_str(), "&&" | "||") =>
+        {
+            matches!(&logical.right, Expression::CallExpression(_))
+        }
+        _ => false,
+    }
+}
+
 /// Lower an expression statement only when it actually contains conditional
 /// or sequencing structure. Plain assignments, calls, property accesses and
 /// existing idiomatic JavaScript expressions remain in their original form.
@@ -192,6 +209,9 @@ pub(crate) fn lower(
     source: &str,
     scoping: &Scoping,
 ) -> Option<String> {
+    if simple_guarded_call(&statement.expression) {
+        return None;
+    }
     let mut lowered = Lowered::default();
     lowered.emit(&statement.expression, source, scoping, 0)?;
     if !lowered.structured {
@@ -283,6 +303,18 @@ mod tests {
         let output = rewritten(source)?;
         assert!(!output.contains("deadCall"), "{output}");
         assert!(output.contains("AM(Y)"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn retains_idiomatic_guarded_calls_for_semantic_consumers() -> Result<(), BudgetExceeded> {
+        let source =
+            "function f(offset,view,address){offset === 56708 || view.setUint32(address,1,false);}";
+        let output = rewritten(source)?;
+        assert!(
+            output.contains("offset === 56708 || view.setUint32(address,1,false)"),
+            "{output}"
+        );
         Ok(())
     }
 
