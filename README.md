@@ -229,8 +229,18 @@ The directory contract is intentionally simple:
   whitelist. Renaming follows Oxc lexical identities and preserves shorthand
   object keys and public export names through explicit aliases. Existing
   meaningful identifiers, name collisions, reserved words and dynamic scopes
-  are respected. **Only this analyst view** changes; the proof-checked
-  deobfuscation and captured bytes remain unchanged.
+  are respected. The presentation layer also eliminates redundant aliases of
+  unshadowed standard intrinsic properties, e.g. a stable
+  objectCreate = Object.create binding becomes direct Object.create references.
+  A formerly detached call stays detached as (0, Object.create)(...), so its
+  receiver is not accidentally rebound. It rejects alias writes/redeclarations,
+  exports, dynamic scope, shadowed intrinsics, direct local builtin mutations,
+  and conditionally initialized aliases. This last simplification deliberately
+  assumes standard intrinsic members have not been monkeypatched by other
+  scripts and are ordinary native data properties: it is for source reading,
+  **not a proof of cross-script runtime equivalence**. Arbitrary object
+  getters/properties are not inlined. **Only this analyst view** changes;
+  the proof-checked deobfuscation and captured bytes remain unchanged.
   When a captured ESM dependency exports a descriptive lexical component name
   (such as `export {Footer as t}`), the same project stage also recovers that
   name in importing modules (`import {t as b}` → `import {t as Footer}`),

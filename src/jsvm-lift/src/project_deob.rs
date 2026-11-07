@@ -6,6 +6,7 @@ use crate::{
     content_dedup::{default_jobs, link_or_copy},
     js_format::format_source,
     project_import_names::propagate_imported_names,
+    readable_aliases::inline_readable_intrinsic_aliases,
     readable_names::recover_readable_names,
     safe_deob::{deobfuscate_source, SafeDeobReport, SourceMode},
     sha256_hex,
@@ -285,9 +286,13 @@ fn format_output(
     // Analyst-only semantic naming: keep the exact, proof-checked source in
     // `src/_deobfuscated/` and enrich only the navigable presentation copy.
     let renamed = recover_readable_names(&exact);
-    let presented = renamed
+    let named = renamed
         .as_ref()
         .map_or(exact.as_str(), |(source, _)| source.as_str());
+    let inlined = inline_readable_intrinsic_aliases(named);
+    let presented = inlined
+        .as_ref()
+        .map_or(named, |(source, _)| source.as_str());
     let formatted_result = format_source(presented, &budget).or_else(|_| {
         // An analyst-only naming pass must never cost the project its normal
         // readable formatter output if one unusual source resists renaming.
