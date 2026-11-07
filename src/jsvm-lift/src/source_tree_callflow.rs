@@ -151,6 +151,9 @@ impl<'a> Visit<'a> for Definitions<'_> {
 #[derive(Clone, Debug, Serialize)]
 pub struct ArgumentLink {
     pub expression: String,
+    /// True only when this argument occupies its stated position without an
+    /// earlier spread that might supply zero or multiple parameters.
+    pub positional: bool,
     pub caller_param_index: Option<usize>,
     pub caller_param: Option<String>,
 }
@@ -193,12 +196,32 @@ pub struct ResolvedCallEdge {
     pub call: CallLink,
 }
 
+/// A function parameter may have several entry-origin possibilities when
+/// multiple statically possible callsites converge. An unknown/literal input
+/// is represented separately; it never becomes a guessed entry parameter.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReachableParameter {
+    pub name: String,
+    pub index: usize,
+    pub possible_entry_indices: Vec<usize>,
+    pub unknown_or_nonentry_input: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ReachableFunction {
+    pub name: String,
+    pub span: [u32; 2],
+    pub shortest_call_depth: usize,
+    pub parameters: Vec<ReachableParameter>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CallerView {
     pub entry: String,
     pub entry_span: [u32; 2],
     pub paths: Vec<CallerPath>,
     pub reachable_edges: Vec<ResolvedCallEdge>,
+    pub reachable_functions: Vec<ReachableFunction>,
     pub source: String,
 }
 
@@ -324,12 +347,20 @@ impl Calls<'_> {
         let Some(target) = self.defs.get(&callee_key) else {
             return;
         };
+        let mut prior_spread = false;
         let arguments = args
             .iter()
             .map(|arg| {
+                let spread = matches!(arg, Argument::SpreadElement(_));
+                let positional = !prior_spread && !spread;
+                prior_spread |= spread;
                 let arg_span = arg.span();
                 let mut forward = None;
-                if let Some(Expression::Identifier(value)) = arg.as_expression().map(unparen) {
+                if let Some(Expression::Identifier(value)) = positional
+                    .then(|| arg.as_expression())
+                    .flatten()
+                    .map(unparen)
+                {
                     if let Some(symbol) = value
                         .reference_id
                         .get()
@@ -353,6 +384,7 @@ impl Calls<'_> {
                 }
                 ArgumentLink {
                     expression: fragment(self.source, arg_span).to_owned(),
+                    positional,
                     caller_param: forward.map(|idx| caller.params[idx].0.clone()),
                     caller_param_index: forward,
                 }
@@ -429,11 +461,13 @@ impl PathWalker<'_> {
                 .params
                 .iter()
                 .enumerate()
-                .map(|(index, _)| {
-                    edge.arguments.get(index).and_then(|argument| {
-                        argument
-                            .caller_param_index
-                            .and_then(|i| origin.get(i).copied().flatten())
+                .map(|(index, (_, binding))| {
+                    binding.and_then(|_| {
+                        edge.arguments.get(index).and_then(|argument| {
+                            argument
+                                .caller_param_index
+                                .and_then(|i| origin.get(i).copied().flatten())
+                        })
                     })
                 })
                 .collect::<Vec<_>>();
@@ -473,6 +507,112 @@ impl PathWalker<'_> {
             visited.remove(next);
         }
     }
+}
+
+/// Propagate entry-parameter origins across all statically reachable call
+/// edges until the finite union of possible origins reaches a fixed point.
+/// This is a *may-flow* result: multiple inputs/unknowns remain explicit,
+/// and no path enumeration or arbitrary depth limit is involved.
+fn propagate_reachable_parameter_origins(
+    root: FunctionKey,
+    definitions: &BTreeMap<FunctionKey, Definition>,
+    edges: &BTreeMap<FunctionKey, Vec<(FunctionKey, CallLink)>>,
+) -> Vec<ReachableFunction> {
+    let Some(entry) = definitions.get(&root) else {
+        return Vec::new();
+    };
+    let mut shortest_depth = BTreeMap::from([(root, 0_usize)]);
+    let mut distance_queue = VecDeque::from([root]);
+    while let Some(from) = distance_queue.pop_front() {
+        let depth = shortest_depth[&from];
+        if let Some(calls) = edges.get(&from) {
+            for (to, _) in calls {
+                if let std::collections::btree_map::Entry::Vacant(slot) = shortest_depth.entry(*to)
+                {
+                    slot.insert(depth + 1);
+                    distance_queue.push_back(*to);
+                }
+            }
+        }
+    }
+
+    type Sources = BTreeSet<Option<usize>>;
+    let mut states = BTreeMap::<FunctionKey, Vec<Sources>>::new();
+    states.insert(
+        root,
+        entry
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, (_, binding))| BTreeSet::from([binding.map(|_| index)]))
+            .collect(),
+    );
+    let mut pending = VecDeque::from([root]);
+    while let Some(from) = pending.pop_front() {
+        let Some(from_params) = states.get(&from).cloned() else {
+            continue;
+        };
+        let Some(calls) = edges.get(&from) else {
+            continue;
+        };
+        for (to, call) in calls {
+            let Some(definition) = definitions.get(to) else {
+                continue;
+            };
+            let (target_states, mut changed) = match states.entry(*to) {
+                std::collections::btree_map::Entry::Vacant(slot) => (
+                    slot.insert(vec![Sources::new(); definition.params.len()]),
+                    true,
+                ),
+                std::collections::btree_map::Entry::Occupied(slot) => (slot.into_mut(), false),
+            };
+            for (index, (.., binding)) in definition.params.iter().enumerate() {
+                let supplied = if binding.is_some() {
+                    call.arguments
+                        .get(index)
+                        .filter(|argument| argument.positional)
+                        .and_then(|argument| argument.caller_param_index)
+                        .and_then(|source_index| from_params.get(source_index).cloned())
+                } else {
+                    None
+                };
+                // Defaults/destructuring, omitted arguments, spread arguments,
+                // and computed input expressions have no direct entry origin.
+                let input = supplied.unwrap_or_else(|| Sources::from([None]));
+                let before = target_states[index].len();
+                target_states[index].extend(input);
+                changed |= target_states[index].len() != before;
+            }
+            if changed {
+                pending.push_back(*to);
+            }
+        }
+    }
+
+    let mut functions = states
+        .into_iter()
+        .filter_map(|(key, params)| {
+            let definition = definitions.get(&key)?;
+            let depth = shortest_depth.get(&key).copied()?;
+            Some(ReachableFunction {
+                name: definition.label.clone(),
+                span: [key.0, key.1],
+                shortest_call_depth: depth,
+                parameters: params
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, sources)| ReachableParameter {
+                        name: definition.params[index].0.clone(),
+                        index,
+                        possible_entry_indices: sources.iter().flatten().copied().collect(),
+                        unknown_or_nonentry_input: sources.contains(&None),
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Vec<_>>();
+    functions.sort_by_key(|function| (function.shortest_call_depth, function.span));
+    functions
 }
 
 impl CallerView {
@@ -549,6 +689,35 @@ fn format_view(view: &CallerView, original: &str) -> String {
             edge.call.span[0],
             edge.call.span[1],
         ));
+    }
+    output.push_str("\n## Parameters reachable at arbitrary call depth\n\n");
+    output.push_str("Each function is listed once. Origins are unions across all statically possible caller paths; unknown or non-entry inputs are explicit.\n\n");
+    for function in &view.reachable_functions {
+        output.push_str(&format!(
+            "- **{}** ({}..{}, shortest call depth {})",
+            function.name, function.span[0], function.span[1], function.shortest_call_depth
+        ));
+        if function.parameters.is_empty() {
+            output.push_str(" — no parameters\n");
+            continue;
+        }
+        output.push('\n');
+        for parameter in &function.parameters {
+            let mut names = parameter
+                .possible_entry_indices
+                .iter()
+                .map(|index| format!("entry parameter {index}"))
+                .collect::<Vec<_>>();
+            if parameter.unknown_or_nonentry_input {
+                names.push("unknown/non-entry input".to_owned());
+            }
+            output.push_str(&format!(
+                "  - {} (parameter {}) ← {}\n",
+                parameter.name,
+                parameter.index,
+                names.join(" or ")
+            ));
+        }
     }
     output.push_str("\n## Original source excerpts\n\n");
     output.push_str(
@@ -716,6 +885,8 @@ pub fn reconstruct_caller_views(
             }
         }
         reachable_edges.sort_by_key(|edge| (edge.from_span, edge.to_span, edge.call.span));
+        let reachable_functions =
+            propagate_reachable_parameter_origins(*root, &finder.functions, &collector.edges);
         let mut paths = walker.output;
         if reachable_edges.is_empty() {
             continue;
@@ -727,6 +898,7 @@ pub fn reconstruct_caller_views(
             entry_span: [root.0, root.1],
             paths,
             reachable_edges,
+            reachable_functions,
             source: String::new(),
         };
         view.source = format_view(&view, source);
@@ -762,6 +934,129 @@ mod tests {
         assert!(view
             .source
             .contains("Complete reachable lexical call graph"));
+        Ok(())
+    }
+
+    #[test]
+    fn propagates_parameter_origins_beyond_display_cap_and_through_cycles() -> anyhow::Result<()> {
+        let source = r#"const leaf=(p)=>p;
+          const f4=(p)=>leaf(p);
+          const f3=(p)=>f4(p);
+          const f2=(p)=>f3(p);
+          const f1=(p)=>f2(p);
+          const api={};api.run=(input)=>f1(input);"#;
+        let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
+        assert!(view
+            .paths
+            .iter()
+            .all(|path| !path.functions.contains(&"leaf".into())));
+        let leaf = view
+            .reachable_functions
+            .iter()
+            .find(|item| item.name == "leaf")
+            .ok_or_else(|| anyhow::anyhow!("leaf missing"))?;
+        assert_eq!(leaf.shortest_call_depth, 5);
+        assert_eq!(leaf.parameters[0].possible_entry_indices, [0]);
+        assert!(!leaf.parameters[0].unknown_or_nonentry_input);
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_callers_preserve_ambiguous_and_nonentry_sources() -> anyhow::Result<()> {
+        let source = r#"const leaf=(p)=>p;
+          const fromA=(x)=>leaf(x);
+          const fromB=(y)=>leaf(y);
+          const api={};api.run=(first,second)=>{
+              fromA(first);
+              fromB(second);
+              leaf(5);
+          };"#;
+        let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
+        let leaf = view
+            .reachable_functions
+            .iter()
+            .find(|item| item.name == "leaf")
+            .ok_or_else(|| anyhow::anyhow!("leaf missing"))?;
+        assert_eq!(leaf.parameters[0].possible_entry_indices, [0, 1]);
+        assert!(leaf.parameters[0].unknown_or_nonentry_input);
+        Ok(())
+    }
+
+    #[test]
+    fn recursive_parameter_swaps_converge_to_all_possible_sources() -> anyhow::Result<()> {
+        let source = r#"const one=(a,b)=>two(a,b);
+          const two=(a,b)=>one(b,a);
+          const api={};api.run=(first,second)=>one(first,second);"#;
+        let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
+        let one = view
+            .reachable_functions
+            .iter()
+            .find(|item| item.name == "one")
+            .ok_or_else(|| anyhow::anyhow!("recursive function missing"))?;
+        for param in &one.parameters {
+            assert_eq!(param.possible_entry_indices, [0, 1]);
+            assert!(!param.unknown_or_nonentry_input);
+        }
+        assert_eq!(view.reachable_edges.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn entry_defaults_are_not_identical_to_external_argument_values() -> anyhow::Result<()> {
+        let source = "const helper=(value)=>value;                      const api={};api.run=(input=42)=>helper(input);";
+        let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
+        let entry = view
+            .reachable_functions
+            .iter()
+            .find(|function| function.name == ".run")
+            .ok_or_else(|| anyhow::anyhow!("entry missing"))?;
+        assert!(entry.parameters[0].possible_entry_indices.is_empty());
+        assert!(entry.parameters[0].unknown_or_nonentry_input);
+        let helper = view
+            .reachable_functions
+            .iter()
+            .find(|function| function.name == "helper")
+            .ok_or_else(|| anyhow::anyhow!("helper missing"))?;
+        assert!(helper.parameters[0].possible_entry_indices.is_empty());
+        assert!(helper.parameters[0].unknown_or_nonentry_input);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_parameter_functions_still_propagate_reachability() -> anyhow::Result<()> {
+        let source = "const leaf=(p)=>p;const noArgs=()=>leaf(5);                      const entry={};entry.run=()=>noArgs();";
+        let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
+        let leaf = view
+            .reachable_functions
+            .iter()
+            .find(|function| function.name == "leaf")
+            .ok_or_else(|| anyhow::anyhow!("zero-parameter intermediary blocked leaf"))?;
+        assert_eq!(leaf.shortest_call_depth, 2);
+        assert!(leaf.parameters[0].possible_entry_indices.is_empty());
+        assert!(leaf.parameters[0].unknown_or_nonentry_input);
+        Ok(())
+    }
+
+    #[test]
+    fn spread_and_default_arguments_do_not_claim_direct_forwarding() -> anyhow::Result<()> {
+        let source = r#"const leaf=(a,b)=>[a,b];
+          const withDefault=(a=10)=>leaf(a,a);
+          const middle=(x,y,arr)=>{
+              leaf(...arr,x);
+              leaf(x,...arr);
+              withDefault(y);
+          };
+          const api={};api.run=(one,two,arr)=>middle(one,two,arr);"#;
+        let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
+        let leaf = view
+            .reachable_functions
+            .iter()
+            .find(|item| item.name == "leaf")
+            .ok_or_else(|| anyhow::anyhow!("leaf missing"))?;
+        assert!(leaf.parameters[0].possible_entry_indices.contains(&0));
+        assert!(leaf.parameters[0].unknown_or_nonentry_input);
+        assert!(leaf.parameters[1].unknown_or_nonentry_input);
+        assert!(!leaf.parameters[1].possible_entry_indices.contains(&0));
         Ok(())
     }
 

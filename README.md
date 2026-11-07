@@ -422,8 +422,15 @@ The output includes linked Markdown source excerpts and a machine-readable
 parameter-origin chains. Every entry also exposes all statically reachable
 `reachable_edges` in a finite call graph: each distinct callsite is recorded
 once, including recursive cycles and edges beyond the short path listing.
-The browsable path examples intentionally stop after four call edges to
-avoid exponential path enumeration; the complete graph does not.
+`reachable_functions` additionally propagates entry-parameter origins
+through arbitrary call depth using a finite fixed-point calculation, retaining
+multiple possible source parameters and unknown/non-entry values rather than
+guessing a single caller. The analysis distinguishes positional arguments
+from spreads, and does not falsely treat default/destructured parameters as
+unchanged forwarding. This is a static may-flow analysis, not evidence that
+all syntactic paths execute. The browsable path examples intentionally stop
+after four call edges to avoid exponential path enumeration; the complete
+graph and parameter origins do not.
 The entry member is optional; no provider-specific code or entrypoint name
 is baked in.
 

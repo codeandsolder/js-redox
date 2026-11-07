@@ -693,6 +693,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                         "focused_path_count": focused_paths.len(),
                         "paths": view.paths,
                         "reachable_edges": view.reachable_edges,
+                        "reachable_functions": view.reachable_functions,
                     }));
                 }
                 fs::write(dir.join("README.md"), index)?;
@@ -832,6 +833,7 @@ fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
             "entry_span": view.entry_span,
             "paths": view.paths,
             "reachable_edges": view.reachable_edges,
+            "reachable_functions": view.reachable_functions,
             "markdown_path": path,
         }));
     }
@@ -893,6 +895,19 @@ mod tests {
                 .map(Vec::len),
             Some(2)
         );
+        let functions = manifest["entries"][0]["reachable_functions"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing reachable function origins"))?;
+        let deep = functions
+            .iter()
+            .find(|node| node["name"] == "deep")
+            .ok_or_else(|| anyhow::anyhow!("missing deep lexical function"))?;
+        assert_eq!(deep["shortest_call_depth"], 2);
+        assert_eq!(
+            deep["parameters"][0]["possible_entry_indices"],
+            serde_json::json!([0])
+        );
+        assert_eq!(deep["parameters"][0]["unknown_or_nonentry_input"], false);
         assert!(fs::read_to_string(output.join("README.md"))?.contains("entry-0.md"));
         Ok(())
     }
