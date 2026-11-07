@@ -4,6 +4,7 @@ mod browser_legacy;
 mod control_flow;
 mod decoder;
 mod decoder_encoding;
+mod effect_statements;
 mod effectful_constant;
 mod if_ladder_structure;
 mod numeric;
@@ -555,6 +556,7 @@ struct Collector<'s, 'c> {
     reference_spans: &'c HashMap<ReferenceId, Span>,
     protected_spans: &'c [(usize, usize)],
     may_remove_dead_numeric_writes: bool,
+    function_depth: usize,
     replacements: Vec<Replacement>,
 }
 
@@ -965,6 +967,18 @@ impl Collector<'_, '_> {
 }
 
 impl<'a> Visit<'a> for Collector<'_, '_> {
+    fn visit_function(&mut self, it: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        self.function_depth += 1;
+        walk::walk_function(self, it, flags);
+        self.function_depth -= 1;
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+        self.function_depth += 1;
+        walk::walk_arrow_function_expression(self, it);
+        self.function_depth -= 1;
+    }
+
     fn visit_expression(&mut self, it: &Expression<'a>) {
         if let Some(replacement) = effectful_constant::fold(it, self.source) {
             self.push(it.span(), replacement, "effectful_constant_fold");
@@ -1182,6 +1196,21 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         if trivial_loops::inert_literal_statement(&it.expression) {
             self.push(it.span, String::new(), "remove_inert_literal_statement");
             return;
+        }
+        // Script/eval Completion values can expose the result of a top-level
+        // expression statement. Inside a function, a normal completion is
+        // discarded; the statement may be safely normalized to if/blocks.
+        if self.function_depth > 0
+            && effectful_constant::fold(&it.expression, self.source).is_none()
+        {
+            // A known-result effectful expression can eliminate enormous
+            // dead RHS subtrees. Give it precedence over presentation-only
+            // statement lowering; the next fixed-point iteration may then
+            // lower the surviving effects into readable statements.
+            if let Some(replacement) = effect_statements::lower(it, self.source, self.scoping) {
+                self.push(it.span, replacement, "effect_statement_lowering");
+                return;
+            }
         }
         if self.dead_numeric_assignment(&it.expression) {
             self.push(it.span, ";".to_owned(), "dead_numeric_state_write");
@@ -1624,6 +1653,7 @@ fn transform_once(
         // Parameters in sloppy-mode functions alias their arguments object.
         // Do not erase writes when that object may be accessed.
         may_remove_dead_numeric_writes: !direct_eval_present && !source.contains("arguments"),
+        function_depth: 0,
         replacements: initial_replacements,
     };
     collector.visit_program(&program);

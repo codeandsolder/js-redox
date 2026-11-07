@@ -85,6 +85,16 @@ An effect-aware primitive evaluator simplifies expressions with a known result
 while preserving original calls, getters and assignments in evaluation order,
 including logically dead RHS expressions; return-value comma expressions drop
 inert prefixes without altering the indirect-call semantics of callee commas.
+Within function bodies, discarded expression values can also be lowered to
+normal statements: comma sequences become ordered statements, `&&`/`||`
+become conditional branches, and ternaries become `if/else`. Dynamic tests
+are evaluated once, direct/indirect calls preserve their syntax, and generated
+blocks cannot accidentally introduce string directives. The original
+statement is left intact at top level, where its completion value can be
+observable through JavaScript `eval`. Assignment-right comma expressions
+are also split for lexically resolved, stable identifier targets, retaining
+operation order; dynamic/computed member targets and RHS anonymous function
+or class name-inference hazards remain intact.
 These passes apply to ordinary JS, not a framework or specific obfuscator.
 The original source directory is not modified.
 
