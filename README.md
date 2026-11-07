@@ -98,6 +98,14 @@ or class name-inference hazards remain intact. Semantic recovery always
 runs first to a fixed point, with presentation-level expression lowering only
 on subsequent no-op semantic passes; this prevents cosmetic AST rewrites from
 hiding decoder calls or other semantic patterns before they are recovered.
+A bounded bitwise algebra pass recovers simpler 32-bit formulas from
+symbol-resolved, locally established primitive Int32 assignments. It compares
+linear combinations of bitwise Boolean expressions against shorter formulas
+using an exhaustive per-bit identity check (not random sampling), while
+rejecting possible BigInt/object coercions, direct eval, captured bindings,
+intervening writes, potentially observable negative zero, and arithmetic
+outside the exact JS Number range. This can turn obfuscated byte composition
+into ordinary `low | high` without special-casing any provider or function.
 These passes apply to ordinary JS, not a framework or specific obfuscator.
 The original source directory is not modified.
 

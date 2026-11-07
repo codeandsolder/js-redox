@@ -1,5 +1,6 @@
 mod base91;
 mod base91_recovery;
+mod bitwise_algebra;
 mod browser_legacy;
 mod control_flow;
 mod decoder;
@@ -1174,6 +1175,16 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
         self.reconstruct_while_pairs(&it.statements);
         self.reconstruct_reaching_while(&it.statements);
+        if self.allow_effect_statements
+            && self.function_depth > 0
+            && self.may_remove_dead_numeric_writes
+        {
+            for (span, expression) in
+                bitwise_algebra::scan(&it.statements, self.source, self.scoping)
+            {
+                self.push(span, expression, "bitwise_algebra");
+            }
+        }
         for stmt in &it.statements {
             if let Statement::EmptyStatement(empty) = stmt {
                 self.push(empty.span, String::new(), "remove_empty_function_statement");
@@ -1185,6 +1196,17 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
         self.reconstruct_while_pairs(&it.body);
         self.reconstruct_reaching_while(&it.body);
+        if self.allow_effect_statements
+            && self.function_depth > 0
+            && self.may_remove_dead_numeric_writes
+        {
+            // Top-level var declarations may alias global object properties.
+            // Direct eval, mapped arguments, and dynamic with-environments
+            // may change local bindings outside the visible statement list.
+            for (span, expression) in bitwise_algebra::scan(&it.body, self.source, self.scoping) {
+                self.push(span, expression, "bitwise_algebra");
+            }
+        }
         for stmt in &it.body {
             if let Statement::EmptyStatement(empty) = stmt {
                 self.push(empty.span, String::new(), "remove_empty_block_statement");
