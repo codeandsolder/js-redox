@@ -173,8 +173,22 @@ impl<'a> Visit<'a> for Reader<'_> {
         };
         let guard = self
             .text(it.left.span().start, it.left.span().end)
-            .filter(|text| text.len() <= 120)
-            .map(|text| format!("({text}) {operator}"));
+            .map(|text| {
+                if text.len() <= 120 {
+                    format!("({text}) {operator}")
+                } else {
+                    // Still record the real conditional dependency even when
+                    // the controlling expression is a huge nested sequence.
+                    // Do not imply it was unconditional just because its AST
+                    // spelling exceeds the inline display budget.
+                    let tail = text.chars().rev().take(90).collect::<String>();
+                    let tail = tail.chars().rev().collect::<String>();
+                    format!(
+                        "(…{tail}) {operator} [left at byte {}]",
+                        it.left.span().start
+                    )
+                }
+            });
         let added = guard.is_some();
         if let Some(guard) = guard {
             self.guard.push(guard);
