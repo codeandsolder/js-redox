@@ -2039,7 +2039,11 @@ mod tests {
     #[test]
     fn eliminates_only_standalone_empty_blocks_after_deobfuscation() {
         let input = "function recovered(flag){ {} { {} } {}; if(flag) {} else {}                     for(;flag;) {} label: {} return 7; }";
-        let output = deobfuscate(input, 12).expect("valid JS");
+        let result = deobfuscate(input, 12);
+        assert!(result.is_some(), "fixture should be valid JavaScript");
+        let Some(output) = result else {
+            unreachable!();
+        };
         assert!(!output.source.contains("{} {"), "{}", output.source);
         assert!(!output.source.contains("{ {} }"), "{}", output.source);
         // Branches and labelled bodies are not anonymous direct statements;
