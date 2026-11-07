@@ -1,6 +1,7 @@
 mod base91;
 mod base91_recovery;
 mod bitwise_algebra;
+mod bitwise_effects;
 mod browser_legacy;
 mod control_flow;
 mod decoder;
@@ -1014,6 +1015,12 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_binary_expression(&mut self, it: &oxc_ast::ast::BinaryExpression<'a>) {
+        if self.allow_effect_statements {
+            if let Some(text) = bitwise_effects::normalize(it, self.source) {
+                self.push(it.span, text, "bitwise_effects");
+                return;
+            }
+        }
         if matches!(it.operator.as_str(), "==" | "===" | "!=" | "!==") {
             let left_reference =
                 reference_identity(&it.left, self.scoping, self.reference_identity_tables);

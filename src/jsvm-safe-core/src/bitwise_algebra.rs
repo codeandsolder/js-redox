@@ -309,6 +309,19 @@ fn simplify(
             format!("~{}", names[index]),
             Bits::Not(Box::new(Bits::Variable(symbol))),
         ));
+        // Single-variable masks are frequent in state guards, byte flags,
+        // and protocol fields. The candidates are domain-independent; the
+        // exhaustive equivalence check decides which, if any, is valid.
+        for bit in 0..32 {
+            let mask = i32::from_ne_bytes((1u32 << bit).to_ne_bytes());
+            alternatives.push((
+                format!("{} & {mask}", names[index]),
+                Bits::And(
+                    Box::new(Bits::Variable(symbol)),
+                    Box::new(Bits::Constant(mask)),
+                ),
+            ));
+        }
     }
     for i in 0..variables.len() {
         for j in i + 1..variables.len() {
@@ -455,6 +468,16 @@ pub(super) fn scan(
     let mut numeric = BTreeSet::<SymbolId>::new();
     let mut replacements = Vec::new();
     for stmt in statements {
+        if let Statement::IfStatement(if_stmt) = stmt {
+            // The condition executes before either arm. Prior sequential
+            // Number facts are valid at this point, even though the arms
+            // themselves require a full control-flow merge analysis.
+            if let Some(rewrite) = simplify(&if_stmt.test, source, scoping, &numeric) {
+                replacements.push((if_stmt.test.span(), rewrite));
+            }
+            numeric.clear();
+            continue;
+        }
         let Statement::ExpressionStatement(expr_stmt) = stmt else {
             numeric.clear();
             continue;
@@ -531,6 +554,20 @@ mod tests {
             output.contains("~(a&b)"),
             "no need to make already concise source longer: {output}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn simplifies_a_typed_control_bit_guard_without_discarding_unknown_coercions(
+    ) -> Result<(), BudgetExceeded> {
+        let typed = "function f(x,U){U=x&255;if(129+(U&-129)+(~U^128)){work();}return U;}";
+        let (output, count) = recover(typed)?;
+        assert!(count >= 1, "{output}");
+        assert!(output.contains("U & 128"), "{output}");
+
+        let untyped = "function f(U){if(129+(U&-129)+(~U^128)){work();}}";
+        let (output, _) = recover(untyped)?;
+        assert!(!output.contains("U & 128"), "{output}");
         Ok(())
     }
 

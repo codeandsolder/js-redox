@@ -106,6 +106,12 @@ rejecting possible BigInt/object coercions, direct eval, captured bindings,
 intervening writes, potentially observable negative zero, and arithmetic
 outside the exact JS Number range. This can turn obfuscated byte composition
 into ordinary `low | high` without special-casing any provider or function.
+A complementary effect-preserving algebra pass rewrites bounded affine
+combinations involving complemented bitwise XOR, retaining the original
+number and evaluation order of JavaScript coercions even when operand values
+are objects with stateful `valueOf` methods. Proven-primitive Int32 bindings
+can additionally simplify control-flow bit-mask tests; unproven return values
+remain in the two-coercion form instead of making unsafe assumptions.
 These passes apply to ordinary JS, not a framework or specific obfuscator.
 The original source directory is not modified.
 
