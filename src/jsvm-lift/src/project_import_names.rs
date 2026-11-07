@@ -12,7 +12,7 @@ use oxc_ast::ast::{
     ModuleExportName, Statement,
 };
 use oxc_span::SourceType;
-use oxc_syntax::identifier;
+use oxc_syntax::{identifier, keyword};
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::Value;
 use std::{
@@ -55,9 +55,12 @@ fn exported_key(name: &ModuleExportName<'_>) -> Option<String> {
 }
 
 fn usable_name(name: &str) -> bool {
-    name.len() >= 3
-        && name.as_bytes()[0].is_ascii_uppercase()
+    // Names originate from explicit ESM source identifiers and export keys:
+    // camelCase, snake_case, PascalCase and __pageData are equally informative.
+    // Do not propagate one- or two-letter minifier aliases as semantic names.
+    name.chars().filter(|ch| ch.is_alphabetic()).count() >= 4
         && identifier::is_identifier_name(name)
+        && !keyword::is_reserved_keyword(name)
 }
 
 fn parse_exports(source: &str) -> Option<ModuleExports> {
@@ -189,6 +192,11 @@ fn exported_names(modules: &BTreeMap<String, SourceModule>) -> BTreeMap<String, 
         for (url, module) in modules {
             let mut entries = Exports::new();
             for (public, local) in &module.exports.local {
+                // Preserve the original declaration identity across imports
+                // and barrels. Only fall back to the public API label when
+                // the originating local/forwarded name is minified or unknown.
+                // This avoids turning an actual Footer component into a
+                // generic name such as forwarded.
                 let inferred = if usable_name(local) {
                     Some(local.clone())
                 } else {
@@ -203,7 +211,9 @@ fn exported_names(modules: &BTreeMap<String, SourceModule>) -> BTreeMap<String, 
                                 .cloned()
                         })
                 };
-                if let Some(name) = inferred {
+                if let Some(name) = inferred.or_else(|| {
+                    (public != "default" && usable_name(public)).then(|| public.clone())
+                }) {
                     entries.insert(public.clone(), name);
                 }
             }
@@ -447,6 +457,34 @@ mod tests {
                 "collision.js",
                 "import {u as b} from './Star.js'; const Footer = 1; consume(b);",
             ),
+            (
+                "PublicApi.js",
+                "const z=()=>7; export {z as createApp};",
+            ),
+            (
+                "ApiBarrel.js",
+                "export {createApp as createApplication} from './PublicApi.js';",
+            ),
+            (
+                "ApiConsumer.js",
+                "import {createApplication as q} from './ApiBarrel.js'; console.log(q());",
+            ),
+            (
+                "DirectApiConsumer.js",
+                "import {createApp as q} from './PublicApi.js'; console.log(q());",
+            ),
+            (
+                "ApiCollision.js",
+                "import {createApplication as q} from './ApiBarrel.js'; const createApp=1; console.log(q());",
+            ),
+            (
+                "DescriptiveLocal.js",
+                "const decodeResponse=(data)=>data; export {decodeResponse as r};",
+            ),
+            (
+                "LocalConsumer.js",
+                "import {r as q} from './DescriptiveLocal.js'; use(q);",
+            ),
         ];
         let refs = [
             ("Barrel.js", "./Footer.js", "reexport_named", "Footer.js"),
@@ -465,6 +503,36 @@ mod tests {
                 "Conflicted.js",
             ),
             ("collision.js", "./Star.js", "import_static", "Star.js"),
+            (
+                "ApiBarrel.js",
+                "./PublicApi.js",
+                "reexport_named",
+                "PublicApi.js",
+            ),
+            (
+                "ApiConsumer.js",
+                "./ApiBarrel.js",
+                "import_static",
+                "ApiBarrel.js",
+            ),
+            (
+                "DirectApiConsumer.js",
+                "./PublicApi.js",
+                "import_static",
+                "PublicApi.js",
+            ),
+            (
+                "ApiCollision.js",
+                "./ApiBarrel.js",
+                "import_static",
+                "ApiBarrel.js",
+            ),
+            (
+                "LocalConsumer.js",
+                "./DescriptiveLocal.js",
+                "import_static",
+                "DescriptiveLocal.js",
+            ),
         ];
         let mut source_units = Vec::new();
         let mut deob_units = Vec::new();
@@ -515,7 +583,7 @@ mod tests {
                 "schema":JS_REFERENCES.schema,"code_units":ref_units,"summary":{}
             }),
         )?;
-        assert_eq!(propagate_imported_names(project)?, 5);
+        assert_eq!(propagate_imported_names(project)?, 8);
         let index = fs::read_to_string(project.join("src/_readable/index.js"))?;
         assert!(index.contains("import {u as Footer}"), "{index}");
         assert!(index.contains("const obj={b: Footer}"), "{index}");
@@ -546,6 +614,27 @@ mod tests {
             files[7].1,
             "cross-module naming mutated the deduplicated formatter cache"
         );
+        let consumer = fs::read_to_string(project.join("src/_readable/ApiConsumer.js"))?;
+        assert!(
+            consumer.contains("import {createApplication as createApp}"),
+            "{consumer}"
+        );
+        assert!(consumer.contains("console.log(createApp())"), "{consumer}");
+        let direct = fs::read_to_string(project.join("src/_readable/DirectApiConsumer.js"))?;
+        assert!(
+            direct.contains("import {createApp as createApp}"),
+            "{direct}"
+        );
+        assert!(direct.contains("console.log(createApp())"), "{direct}");
+        let local = fs::read_to_string(project.join("src/_readable/LocalConsumer.js"))?;
+        assert!(local.contains("import {r as decodeResponse}"), "{local}");
+        assert!(local.contains("use(decodeResponse)"), "{local}");
+        let collision = fs::read_to_string(project.join("src/_readable/ApiCollision.js"))?;
+        assert!(
+            collision.contains("import {createApplication as q}"),
+            "{collision}"
+        );
+        assert!(collision.contains("console.log(q())"), "{collision}");
         // Only `_readable` is rewritten; source bytes used for safe analysis are not.
         let exact = fs::read_to_string(project.join("src/_deobfuscated/index.js"))?;
         assert_eq!(exact, files[7].1);

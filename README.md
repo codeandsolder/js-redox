@@ -241,10 +241,14 @@ The directory contract is intentionally simple:
   **not a proof of cross-script runtime equivalence**. Arbitrary object
   getters/properties are not inlined. **Only this analyst view** changes;
   the proof-checked deobfuscation and captured bytes remain unchanged.
-  When a captured ESM dependency exports a descriptive lexical component name
+  When a captured ESM dependency exports a descriptive lexical name
   (such as `export {Footer as t}`), the same project stage also recovers that
-  name in importing modules (`import {t as b}` → `import {t as Footer}`),
-  including named reexports and unambiguous star barrels. It preserves ESM
+  name in importing modules (`import {t as b}` → `import {t as Footer}`).
+  It handles functions and helpers as well as components, and can recover
+  descriptive public export keys when the source binding is minified (e.g.
+  `export {S as createApp}`). An explicit source/forwarded identity takes
+  precedence over a different public alias. This works through named
+  reexports and unambiguous star barrels. It preserves ESM
   public names, import specifiers, object-property keys and export aliases,
   uses the existing captured module resolver rather than guessing URLs, and
   does not rewrite the shared formatter cache or exact deobfuscated source.

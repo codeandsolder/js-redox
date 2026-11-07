@@ -60,8 +60,10 @@ fn meaningful_property_name(name: &str) -> bool {
     // Even short public keys such as `id` and `url` are useful knowledge.
     // JS IdentifierName allows reserved words that cannot be bindings, so
     // exclude those before proposing any source edit.
-    name.chars().count() >= 2
-        && !name.starts_with('_')
+    // Public data may use leading underscores; rejecting every such property
+    // loses names like __pageData in otherwise static destructuring. Reject
+    // punctuation-only and single-letter aliases instead.
+    name.chars().filter(|ch| ch.is_alphanumeric()).count() >= 2
         && name != "eval"
         && name != "arguments"
         && !keyword::is_reserved_keyword(name)
@@ -503,6 +505,21 @@ export {v as oldFooterBg};
             "{out}"
         );
         assert!(out.contains("export {footerBg as oldFooterBg}"), "{out}");
+    }
+
+    #[test]
+    fn recovers_underscored_static_destructuring_names() {
+        let input = "let {__pageData: a, _sessionToken: b, __: c, _x: d, default: e} = load(); consume(a,b,c,d,e);";
+        let out = named(input);
+        assert!(out.contains("__pageData: __pageData"), "{out}");
+        assert!(out.contains("_sessionToken: _sessionToken"), "{out}");
+        assert!(out.contains("__: c"), "{out}");
+        assert!(out.contains("_x: d"), "{out}");
+        assert!(out.contains("default: e"), "{out}");
+        assert!(
+            out.contains("consume(__pageData,_sessionToken,c,d,e)"),
+            "{out}"
+        );
     }
 
     #[test]
