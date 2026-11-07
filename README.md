@@ -404,7 +404,23 @@ originate at entrypoint parameters, preserving unknown/dynamic arguments.
 This gives an actual caller-oriented view of obfuscated helper plumbing
 without making an executable replacement from incomplete lexical fragments.
 The same forwarding information is available in `context.json` as
-`caller_views`. No provider-specific code or entrypoint name is baked in.
+`caller_views`. The analysis resolves stable function and argument aliases
+through direct lexical assignments such as `const local = original`, and also
+accepts `let`/`var` aliases when they have no subsequent resolved writes and
+the program does not use direct `eval` or `with`. It does not infer dynamic
+property dispatch, runtime reassignment, or computed argument values.
+
+To inspect a standalone source file without reconstructing the full handler
+tree, use the focused caller-view command:
+
+~~~sh
+cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views   path/to/already-formatted-original.js work/caller-views --entry-member someMethod
+~~~
+
+The output includes linked Markdown source excerpts and a machine-readable
+`caller-views.json` with function spans, exact callsite locations, and
+parameter-origin chains. The entry member is optional; no provider-specific
+code or entrypoint name is baked in.
 
 ### Specialize original helper code at constant-argument callsites
 

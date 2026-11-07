@@ -33,6 +33,8 @@ enum Command {
     Source(SourceArgs),
     /// Materialize an entire directory of ordinary JavaScript source files as a readable tree.
     SourceTree(SourceTreeArgs),
+    /// Trace lexical call chains and parameter origins in a standalone JS program.
+    CallerViews(CallerViewsArgs),
     /// Materialize safe source recovery/deobfuscation for a normalized capture project.
     Project(ProjectArgs),
 }
@@ -52,6 +54,17 @@ struct SourceArgs {
     /// Function#toString and related self-defending code can observe formatting.
     #[arg(long)]
     format_output: bool,
+}
+
+#[derive(ClapArgs, Debug)]
+struct CallerViewsArgs {
+    /// Original JS source (prefer the already formatted source for readable excerpts).
+    input: PathBuf,
+    /// Directory containing browsable Markdown and compact machine-readable paths.
+    output: PathBuf,
+    /// Optional member-assigned entrypoint, such as aoF_.
+    #[arg(long)]
+    entry_member: Option<String>,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -794,19 +807,87 @@ fn run_project(args: ProjectArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
+    let original = fs::read_to_string(&args.input)
+        .with_context(|| format!("reading caller source {}", args.input.display()))?;
+    let views = reconstruct_caller_views(&original, args.entry_member.as_deref())?;
+    fs::create_dir_all(&args.output)
+        .with_context(|| format!("creating caller output {}", args.output.display()))?;
+    let mut index = String::from("# Source-resolved caller paths\n\n");
+    index.push_str("Each path traces lexical function targets and argument origins. ");
+    index.push_str("Immutable aliases of functions and parameters are followed. ");
+    index.push_str("This is a source reading view, not an executable replacement.\n\n");
+    let mut manifest = Vec::with_capacity(views.len());
+    for (number, view) in views.iter().enumerate() {
+        let path = format!("entry-{number}.md");
+        fs::write(args.output.join(&path), &view.source)?;
+        index.push_str(&format!(
+            "- [{}]({path}) — {} resolved paths\n",
+            view.entry,
+            view.paths.len()
+        ));
+        manifest.push(json!({
+            "entry": view.entry,
+            "entry_span": view.entry_span,
+            "paths": view.paths,
+            "markdown_path": path,
+        }));
+    }
+    let mut data = serde_json::to_string_pretty(&json!({
+        "schema": "jsvm-caller-views/v1",
+        "entries": manifest,
+    }))?;
+    data.push('\n');
+    fs::write(args.output.join("caller-views.json"), data)?;
+    fs::write(args.output.join("README.md"), index)?;
+    println!("caller views: {} entries", views.len());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Args::parse().command {
         Command::Source(args) => run_source(args),
         Command::SourceTree(args) => run_source_tree(args),
+        Command::CallerViews(args) => run_caller_views(args),
         Command::Project(args) => run_project(args),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{run_source_tree, sha256_hex, SourceTreeArgs};
+    use super::{run_caller_views, run_source_tree, sha256_hex, CallerViewsArgs, SourceTreeArgs};
     use anyhow::Result;
     use std::fs;
+
+    #[test]
+    fn standalone_caller_views_trace_immutable_aliases_without_source_tree() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source.js");
+        let output = temp.path().join("callers");
+        fs::write(
+            &input,
+            "const deep=(x)=>x;const alias=deep;const middle=(p)=>alias(p);             const api={};api.run=(arg)=>middle(arg);",
+        )?;
+        run_caller_views(CallerViewsArgs {
+            input,
+            output: output.clone(),
+            entry_member: Some("run".into()),
+        })?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("caller-views.json"))?)?;
+        assert_eq!(manifest["schema"], "jsvm-caller-views/v1");
+        assert_eq!(manifest["entries"][0]["entry"], ".run");
+        assert_eq!(
+            manifest["entries"][0]["paths"][0]["functions"],
+            serde_json::json!([".run", "middle", "deep"])
+        );
+        assert_eq!(
+            manifest["entries"][0]["paths"][0]["leaf_parameters"][0]["from_entry_index"],
+            0
+        );
+        assert!(fs::read_to_string(output.join("README.md"))?.contains("entry-0.md"));
+        Ok(())
+    }
 
     #[test]
     fn source_tree_materializes_nested_js_and_keeps_unknown_source() -> Result<()> {

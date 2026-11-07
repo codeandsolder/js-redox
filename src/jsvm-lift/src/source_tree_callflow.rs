@@ -9,7 +9,8 @@ use anyhow::{ensure, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, AssignmentExpression, AssignmentTarget, BindingPattern, CallExpression, Expression,
-    FormalParameters, Function, NewExpression, VariableDeclarator,
+    FormalParameters, Function, NewExpression, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator, WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, SemanticBuilder};
@@ -190,15 +191,99 @@ pub struct CallerView {
     pub source: String,
 }
 
+/// Direct eval and with can rebind non-const lexical references without
+/// ordinary resolved write flags. Do not infer mutable declaration aliases in
+/// programs using these constructs.
+#[derive(Default)]
+struct DynamicScope {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for DynamicScope {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if matches!(unparen(&call.callee), Expression::Identifier(id) if id.name == "eval") {
+            self.found = true;
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_with_statement(&mut self, _statement: &WithStatement<'a>) {
+        self.found = true;
+    }
+}
+
+/// Immutable, direct lexical aliases (const alias = original) are safe
+/// call graph edges as long as the originating function binding is stable.
+/// Keep this separate from Definitions: aliases are not distinct functions.
+struct AliasCollector<'s> {
+    scoping: &'s Scoping,
+    dynamic_scope: bool,
+    aliases: BTreeMap<SymbolId, SymbolId>,
+}
+
+impl<'a> Visit<'a> for AliasCollector<'_> {
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        if declaration.kind == VariableDeclarationKind::Const
+            || (!self.dynamic_scope
+                && matches!(
+                    declaration.kind,
+                    VariableDeclarationKind::Let | VariableDeclarationKind::Var
+                ))
+        {
+            for declarator in &declaration.declarations {
+                let (BindingPattern::BindingIdentifier(id), Some(init)) =
+                    (&declarator.id, &declarator.init)
+                else {
+                    continue;
+                };
+                let Expression::Identifier(source) = unparen(init) else {
+                    continue;
+                };
+                let target = source
+                    .reference_id
+                    .get()
+                    .and_then(|reference| self.scoping.get_reference(reference).symbol_id());
+                if let (Some(alias), Some(target)) = (id.symbol_id.get(), target) {
+                    if alias != target
+                        && self.scoping.symbol_redeclarations(alias).is_empty()
+                        && !self
+                            .scoping
+                            .get_resolved_reference_ids(alias)
+                            .iter()
+                            .any(|reference| self.scoping.get_reference(*reference).is_write())
+                    {
+                        self.aliases.insert(alias, target);
+                    }
+                }
+            }
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
 struct Calls<'s> {
     source: &'s str,
     scoping: &'s Scoping,
     defs: &'s BTreeMap<FunctionKey, Definition>,
     symbols: &'s BTreeMap<SymbolId, FunctionKey>,
+    aliases: &'s BTreeMap<SymbolId, SymbolId>,
     stack: Vec<FunctionKey>,
     edges: BTreeMap<FunctionKey, Vec<(FunctionKey, CallLink)>>,
 }
 impl Calls<'_> {
+    /// Follow a lexical const-to-identifier chain, bounded by the number of
+    /// aliases. A cyclic or unresolved source never becomes a call edge.
+    fn original_symbol(&self, mut symbol: SymbolId) -> Option<SymbolId> {
+        let mut visited = BTreeSet::new();
+        while let Some(&next) = self.aliases.get(&symbol) {
+            if !visited.insert(symbol) {
+                return None;
+            }
+            symbol = next;
+        }
+        Some(symbol)
+    }
+
     fn emit(
         &mut self,
         callee: &Expression<'_>,
@@ -239,15 +324,19 @@ impl Calls<'_> {
                         .get()
                         .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
                     {
-                        if !self
-                            .scoping
-                            .get_resolved_reference_ids(symbol)
-                            .iter()
-                            .any(|reference| self.scoping.get_reference(*reference).is_write())
-                        {
-                            forward = caller.params.iter().enumerate().find_map(
-                                |(index, (_, target))| (*target == Some(symbol)).then_some(index),
-                            );
+                        if let Some(original) = self.original_symbol(symbol) {
+                            if !self
+                                .scoping
+                                .get_resolved_reference_ids(original)
+                                .iter()
+                                .any(|reference| self.scoping.get_reference(*reference).is_write())
+                            {
+                                forward = caller.params.iter().enumerate().find_map(
+                                    |(index, (_, target))| {
+                                        (*target == Some(original)).then_some(index)
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -517,11 +606,39 @@ pub fn reconstruct_caller_views(
             symbols.remove(&symbol);
         }
     }
+    // First validate the original function definitions, then extend the map
+    // through const aliases. A renamed direct call is still a call to the
+    // original function, not a new function definition.
+    let mut dynamic_scope = DynamicScope::default();
+    dynamic_scope.visit_program(&parsed.program);
+    let mut aliases = AliasCollector {
+        scoping,
+        dynamic_scope: dynamic_scope.found,
+        aliases: BTreeMap::new(),
+    };
+    aliases.visit_program(&parsed.program);
+    let mut expanded = symbols.clone();
+    // Alias-to-alias chains may be declared in any source order.
+    for _ in 0..aliases.aliases.len() {
+        let mut grew = false;
+        for (alias, target) in &aliases.aliases {
+            if let Some(&key) = expanded.get(target) {
+                if expanded.insert(*alias, key).is_none() {
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
     let mut collector = Calls {
         source,
         scoping,
         defs: &finder.functions,
-        symbols: &symbols,
+        symbols: &expanded,
+        aliases: &aliases.aliases,
         stack: Vec::new(),
         edges: BTreeMap::new(),
     };
@@ -605,6 +722,97 @@ mod tests {
             .find(|p| p.functions.last().is_some_and(|x| x == "last"))
             .ok_or_else(|| anyhow::anyhow!("arrow call chain absent"))?;
         assert_eq!(path.leaf_parameters[0].from_entry_index, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn follows_immutable_function_and_parameter_alias_chains() -> anyhow::Result<()> {
+        let source = r#"function app(){
+            const deep=(leaf)=>leaf;
+            var deepAlias=deep;
+            const deepAlias2=deepAlias;
+            const middle=(input)=>{
+                const copied=input;
+                const forwarded=copied;
+                return deepAlias2(forwarded);
+            };
+            let middleAlias=middle;
+            const entry={}; entry.run=(request)=>middleAlias(request);
+        }"#;
+        let views = reconstruct_caller_views(source, Some("run"))?;
+        assert_eq!(views.len(), 1, "{views:?}");
+        let path = views[0]
+            .paths
+            .iter()
+            .find(|path| path.functions.last().is_some_and(|name| name == "deep"))
+            .ok_or_else(|| anyhow::anyhow!("missing aliased deep path"))?;
+        assert_eq!(path.functions, vec![".run", "middle", "deep"]);
+        assert_eq!(path.leaf_parameters[0].from_entry_index, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn mutated_let_alias_or_eval_blocks_false_function_edges() -> anyhow::Result<()> {
+        for mutation in [
+            "const deep=(v)=>v; let alias=deep; alias=()=>0;",
+            "const deep=(v)=>v; let alias=deep; eval('alias = ()=>0');",
+        ] {
+            let source = format!(
+                "function app(){{{mutation} const middle=(arg)=>alias(arg);                 const entry={{}};entry.run=(request)=>middle(request);}}"
+            );
+            let views = reconstruct_caller_views(&source, Some("run"))?;
+            assert!(
+                views.iter().all(|view| view
+                    .paths
+                    .iter()
+                    .all(|path| { !path.functions.iter().any(|name| name == "deep") })),
+                "{views:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shadowed_function_name_is_not_resolved_via_alias() -> anyhow::Result<()> {
+        let source = "const deep=(v)=>v;const middle=(deep, arg)=>{const alias=deep;return alias(arg);};                      const entry={};entry.run=(request)=>middle(()=>0,request);";
+        let views = reconstruct_caller_views(source, Some("run"))?;
+        assert!(views.iter().all(|view| view
+            .paths
+            .iter()
+            .all(|path| { !path.functions.iter().any(|name| name == "deep") })));
+        Ok(())
+    }
+
+    #[test]
+    fn alias_of_mutated_function_does_not_create_certain_call_edge() -> anyhow::Result<()> {
+        let source = r#"function app(){
+            let deep=(value)=>value;
+            const alias=deep;
+            deep=(value)=>value+1;
+            const middle=(arg)=>alias(arg);
+            const entry={};entry.run=(request)=>middle(request);
+        }"#;
+        let views = reconstruct_caller_views(source, Some("run"))?;
+        assert!(views.iter().all(|view| view
+            .paths
+            .iter()
+            .all(|path| { !path.functions.iter().any(|name| name == "deep") })));
+        Ok(())
+    }
+
+    #[test]
+    fn aliased_parameter_with_direct_write_is_not_invariant() -> anyhow::Result<()> {
+        let source = r#"const deep=(p)=>p;
+            const middle=(arg)=>{const copy=arg; arg=0;return deep(copy);};
+            const entry={};entry.run=(request)=>middle(request);"#;
+        let views = reconstruct_caller_views(source, Some("run"))?;
+        assert_eq!(views.len(), 1);
+        let path = views[0]
+            .paths
+            .iter()
+            .find(|p| p.functions.last().is_some_and(|name| name == "deep"))
+            .ok_or_else(|| anyhow::anyhow!("missing path"))?;
+        assert_eq!(path.leaf_parameters[0].from_entry_index, None);
         Ok(())
     }
 
