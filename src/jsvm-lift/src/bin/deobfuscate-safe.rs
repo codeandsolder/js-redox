@@ -915,10 +915,11 @@ fn write_callsite_specializations(
         let depth = depths.get(&candidate.function_span).copied().unwrap_or(0);
         let file_link = format!("[{}]({filename})", candidate.helper);
         let summary = format!(
-            "{file_link} (original {}..{}) — {constants_hint}; depth {depth}, {semantic_rewrites} rewrites, {saved_bytes:+} bytes, {} callsites ([original](original/{filename}))",
+            "{file_link} (original {}..{}) — {constants_hint}; depth {depth}, {semantic_rewrites} rewrites, {saved_bytes:+} bytes, {} callsite{} ([original](original/{filename}))",
             candidate.function_span[0],
             candidate.function_span[1],
             candidate.call_sites.len(),
+            if candidate.call_sites.len() == 1 { "" } else { "s" },
             constants_hint = candidate
                 .constants
                 .iter()
@@ -955,8 +956,12 @@ fn write_callsite_specializations(
     });
     let mut navigable = String::from("# Readable lexical helpers by impact\n\n");
     navigable.push_str(
-        "These are source-reading variants of original functions, not executable replacements.          Byte reduction compares the original helper function with its formatted recovered code;          rewrite counts indicate additional semantic simplifications.\n\n",
+        "These are source-reading variants of original functions, not executable replacements. ",
     );
+    navigable.push_str(
+        "Byte reduction compares the original helper with its formatted recovered code; ",
+    );
+    navigable.push_str("rewrite counts indicate additional semantic simplifications.\n\n");
     navigable.push_str("## Largest source reductions\n\n");
     for (_, _, _, summary) in ranked.iter().take(20) {
         navigable.push_str(&format!("- {summary}\n"));
