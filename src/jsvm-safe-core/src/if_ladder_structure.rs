@@ -1457,6 +1457,7 @@ fn splice_unique_successor(route: &mut Route, target: u64, successor: &Route) ->
 struct ExceptionEntryProof<'a> {
     roots: &'a BTreeSet<u64>,
     reachable: &'a BTreeSet<u64>,
+    excluded: &'a BTreeSet<u64>,
 }
 
 fn single_entry_exception_regions(
@@ -1501,7 +1502,7 @@ fn single_entry_exception_regions(
     let mut absorbed = BTreeSet::new();
     let mut occupied = BTreeSet::new();
     for &predecessor in entry.reachable {
-        if occupied.contains(&predecessor) {
+        if occupied.contains(&predecessor) || entry.excluded.contains(&predecessor) {
             continue;
         }
         let Some(&body) = statements.get(&predecessor) else {
@@ -1518,6 +1519,7 @@ fn single_entry_exception_regions(
             || !entry.reachable.contains(&target)
             || entry.roots.contains(&target)
             || occupied.contains(&target)
+            || entry.excluded.contains(&target)
             || edits.contains_key(&predecessor)
         {
             continue;
@@ -1901,40 +1903,57 @@ pub(crate) fn prune_exception_dispatcher(
         work.extend(next);
     }
 
-    // Prefer a complete single-entry conditional region when both arms
-    // reconverge: emit both original branch bodies and their common join
-    // exactly once, without introducing a new catch boundary. Fall back to
-    // the simpler single-successor merge for straight-line cases. Only one
-    // region is absorbed per pass; subsequent iterations can recover more.
+    // Recover one conditional diamond, then recover independent linear
+    // regions against the UPDATED CFG. Protect the diamond's entry and
+    // absorbed states so a second rewrite cannot discard its source body.
+    // This preserves disjoint straight-line improvements in the same pass.
     let (combined_regions, absorbed_regions) = if known_bool(&loop_stmt.test) == Some(true) {
-        let (diamond, absorbed) = exception_diamond_regions(
+        let empty = BTreeSet::new();
+        let (mut combined, mut absorbed) = exception_diamond_regions(
             dispatcher,
             state,
             ExceptionEntryProof {
                 roots: &roots,
                 reachable: &reachable,
+                excluded: &empty,
             },
             &mut cases,
             &retargeted,
             &effects,
             source,
         )?;
-        if absorbed.is_empty() {
-            single_entry_exception_regions(
-                dispatcher,
-                state,
-                ExceptionEntryProof {
-                    roots: &roots,
-                    reachable: &reachable,
-                },
-                &mut cases,
-                &retargeted,
-                &effects,
-                source,
-            )?
-        } else {
-            (diamond, absorbed)
+        let mut after_diamond = reachable.clone();
+        if !absorbed.is_empty() {
+            after_diamond.clear();
+            let mut work = VecDeque::from_iter(roots.iter().copied());
+            while let Some(current) = work.pop_front() {
+                if current == exit || !after_diamond.insert(current) {
+                    continue;
+                }
+                let route = cases.get(&current)?.as_ref()?;
+                let mut next = Vec::new();
+                route.targets(&mut next);
+                work.extend(next);
+            }
         }
+        let mut excluded = absorbed.clone();
+        excluded.extend(combined.keys().copied());
+        let (linear, linear_absorbed) = single_entry_exception_regions(
+            dispatcher,
+            state,
+            ExceptionEntryProof {
+                roots: &roots,
+                reachable: &after_diamond,
+                excluded: &excluded,
+            },
+            &mut cases,
+            &retargeted,
+            &effects,
+            source,
+        )?;
+        combined.extend(linear);
+        absorbed.extend(linear_absorbed);
+        (combined, absorbed)
     } else {
         (BTreeMap::new(), BTreeSet::new())
     };
