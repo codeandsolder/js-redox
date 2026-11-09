@@ -451,6 +451,12 @@ cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
   path/to/original.js work/caller-views --entry-member someMethod --specialize
 ~~~
 
+Exception-sensitive state dispatchers retain their original try/catch
+and one-state-per-iteration semantics. Exact lexical-state reachability
+includes catch-resume assignments as additional roots, so unreachable
+case comparisons can be removed without erasing recovery paths or moving
+potentially throwing operations across the handler.
+
 Numeric-state control-flow recovery also structures single-entry reducible
 cycles with early exits from the middle of their bodies. The original
 state-transition graph determines a common exit; every emitted path must

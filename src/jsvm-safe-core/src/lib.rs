@@ -706,6 +706,32 @@ impl Collector<'_, '_> {
                     }
                 }
             }
+            // Exception-driven dispatchers often use a constant-true loop,
+            // rather than testing the state in the condition. The original
+            // lexical initializer and write-provenance still prove its entry.
+            if let Statement::WhileStatement(loop_stmt) = stmt {
+                if let Statement::TryStatement(protected) = &loop_stmt.body {
+                    for (&symbol, &(initial, init_span)) in &reaching {
+                        if !self.reaching_state_is_stable(symbol, init_span, loop_stmt.span) {
+                            continue;
+                        }
+                        let state = self.scoping.symbol_name(symbol);
+                        if let Some(code) = if_ladder_structure::prune_exception_dispatcher(
+                            loop_stmt,
+                            state,
+                            initial,
+                            symbol,
+                            self.scoping,
+                            self.source,
+                        ) {
+                            if let Some(dispatcher) = protected.block.body.first() {
+                                self.push(dispatcher.span(), code, "exception_state_pruned");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             match stmt {
                 Statement::BlockStatement(block) => {
                     self.reconstruct_reaching_while_with(&block.body, &reaching);
@@ -2143,6 +2169,95 @@ mod tests {
         expose_static_strings_budgeted(source, max_iterations, &test_budget())
             .ok()
             .flatten()
+    }
+
+    #[test]
+    fn exception_dispatcher_prunes_unreachable_state_but_keeps_catch_resume_root() {
+        let source = r#"
+            function f(flag, log) {
+                let state=1;
+                let recovery=0;
+                while(true) try {
+                    if(state==99) {log.push("dead");return log;}
+                    else if(state==1) state=flag?2:4;
+                    else if(state==2) {
+                        recovery=1;
+                        log.push("try");
+                        throw Error("caught");
+                    } else if(state==3) {
+                        log.push("recovered");
+                        state=4;
+                    } else if(state==4) return log;
+                } catch(error) {
+                    if(recovery==1) {
+                        log.push(error.message);
+                        state=3;
+                    } else throw error;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert_eq!(
+            result.transforms.get("exception_state_pruned"),
+            Some(&1),
+            "{result:?}"
+        );
+        assert!(!result.source.contains("dead"), "{}", result.source);
+        assert!(result.source.contains("state==3"), "{}", result.source);
+        assert!(result.source.contains("catch"), "{}", result.source);
+        assert!(result.source.contains("while"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_refuses_unknown_reachable_transitions() {
+        let source = r#"
+            function f(value) {
+                let state=1;
+                let other=0;
+                while(true) try {
+                    if(state==1) state=value;
+                    else if(state==2) return 2;
+                    else if(state==3) return 3;
+                } catch(error) {
+                    other++;
+                    state=3;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            !result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_refuses_dynamic_catch_state() {
+        let source = r#"
+            function f(value) {
+                let state=1;
+                let other=0;
+                while(true) try {
+                    if(state==1) throw Error("x");
+                    else if(state==2) return 2;
+                    else if(state==3) return 3;
+                } catch(error) {
+                    other++;
+                    state=value;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            !result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
     }
 
     #[test]

@@ -9,8 +9,9 @@ use crate::{
     value_eval::eval,
 };
 use oxc_ast::ast::{
-    ArrayExpressionElement, BindingPattern, Expression, ForStatement, ForStatementInit, Statement,
-    VariableDeclarationKind, WhileStatement,
+    ArrayExpressionElement, AssignmentExpression, AssignmentTarget, BindingPattern, CallExpression,
+    Expression, ForStatement, ForStatementInit, IdentifierReference, Statement, UpdateExpression,
+    VariableDeclarationKind, WhileStatement, WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::Scoping;
@@ -1100,6 +1101,173 @@ pub(crate) fn reconstruct_while_with_known_state(
     source: &str,
 ) -> Option<String> {
     reconstruct_state_loop(state, initial, &it.test, &it.body, "", source)
+}
+
+/// Track every write to the dispatcher's original lexical state symbol,
+/// including nested expressions and catch handlers. A nonnumeric assignment,
+/// update, dynamic evaluation, or nested shadowing invalidates a closed
+/// reachable-state proof; none of those may introduce unknown dispatch cases.
+struct ExceptionStateWrites<'s> {
+    symbol: SymbolId,
+    state_name: &'s str,
+    scoping: &'s Scoping,
+    source: &'s str,
+    targets: BTreeSet<u64>,
+    unsafe_write: bool,
+}
+
+impl<'a> Visit<'a> for ExceptionStateWrites<'_> {
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        if id.name == self.state_name
+            && id
+                .reference_id
+                .get()
+                .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
+                != Some(self.symbol)
+        {
+            self.unsafe_write = true;
+        }
+    }
+
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        if let AssignmentTarget::AssignmentTargetIdentifier(id) = &assignment.left {
+            if id.name == self.state_name {
+                if assignment.operator.as_str() != "=" {
+                    self.unsafe_write = true;
+                } else if let Some(route) =
+                    parse_target(&assignment.right, self.state_name, self.source)
+                {
+                    let mut targets = Vec::new();
+                    route.targets(&mut targets);
+                    self.targets.extend(targets);
+                } else {
+                    self.unsafe_write = true;
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+
+    fn visit_update_expression(&mut self, update: &UpdateExpression<'a>) {
+        if update.argument.get_identifier_name() == Some(self.state_name) {
+            self.unsafe_write = true;
+        }
+        walk::walk_update_expression(self, update);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if matches!(unparen(&call.callee), Expression::Identifier(id) if id.name=="eval") {
+            self.unsafe_write = true;
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_with_statement(&mut self, stmt: &WithStatement<'a>) {
+        self.unsafe_write = true;
+        walk::walk_with_statement(self, stmt);
+    }
+}
+
+/// Preserve exception-handling scope and the original one-state-per-iteration
+/// execution order. Only remove state comparisons proven unreachable from
+/// both the lexical initializer and every statically possible catch recovery.
+///
+/// This deliberately leaves the try/catch in place: combining states into a
+/// single iteration could alter catch-visible intermediate state or a loop
+/// condition's evaluation count.
+pub(crate) fn prune_exception_dispatcher(
+    loop_stmt: &WhileStatement<'_>,
+    state: &str,
+    initial: u64,
+    symbol: SymbolId,
+    scoping: &Scoping,
+    source: &str,
+) -> Option<String> {
+    let Statement::TryStatement(protected) = &loop_stmt.body else {
+        return None;
+    };
+    if protected.finalizer.is_some() || protected.block.body.len() != 1 {
+        return None;
+    }
+    let handler = protected.handler.as_ref()?;
+    let dispatcher = &protected.block.body[0];
+
+    let mut writes = ExceptionStateWrites {
+        symbol,
+        state_name: state,
+        scoping,
+        source,
+        targets: BTreeSet::new(),
+        unsafe_write: false,
+    };
+    writes.visit_statement(dispatcher);
+    if writes.unsafe_write {
+        return None;
+    }
+    // Do not seed the reachability graph with states written *inside* the
+    // normal dispatcher: those are transitions, not independent entries.
+    // Only the catch handler can resume a failed iteration from a new state.
+    writes.targets.clear();
+    writes.visit_block_statement(&handler.body);
+    if writes.unsafe_write {
+        return None;
+    }
+
+    let exit = u64::MAX;
+    if writes.targets.contains(&exit) {
+        return None;
+    }
+    let mut cases = BTreeMap::new();
+    collect_dispatch_statement(dispatcher, state, exit, source, &mut cases)?;
+    if cases.contains_key(&exit) {
+        return None;
+    }
+    // The outer catch can retry at the state it intercepted, *or* resume
+    // from any numeric state it assigns. Treat each catch target as a root;
+    // rejecting unknown reachable transitions prevents false dead cases.
+    let mut roots = writes.targets;
+    roots.insert(initial);
+    let mut reachable = BTreeSet::new();
+    let mut work = VecDeque::from_iter(roots);
+    while let Some(current) = work.pop_front() {
+        if current == exit || !reachable.insert(current) {
+            continue;
+        }
+        let route = cases.get(&current)?.as_ref()?;
+        let mut next = Vec::new();
+        route.targets(&mut next);
+        work.extend(next);
+    }
+
+    let mut alternatives = Vec::new();
+    let mut cursor = dispatcher;
+    loop {
+        let Statement::IfStatement(branch) = cursor else {
+            return None;
+        };
+        let label = state_test(&branch.test, state)?;
+        if reachable.contains(&label) {
+            alternatives.push(format!(
+                "if ({}) {}",
+                fragment(source, branch.test.span()),
+                fragment(source, branch.consequent.span())
+            ));
+        }
+        match branch.alternate.as_ref() {
+            Some(other @ Statement::IfStatement(_)) => cursor = other,
+            None => break,
+            Some(_) => return None,
+        }
+    }
+    if alternatives.len() == cases.len() || alternatives.is_empty() {
+        return None;
+    }
+    let mut text = alternatives.remove(0);
+    for branch in alternatives {
+        text.push_str(" else ");
+        text.push_str(&branch);
+    }
+    Some(text)
 }
 
 /// Recover a while loop preceded by a numeric state initializer in the same
