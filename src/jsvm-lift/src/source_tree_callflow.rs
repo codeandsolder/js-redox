@@ -227,24 +227,51 @@ pub struct CallerView {
     pub source: String,
 }
 
-/// Direct eval and with can rebind non-const lexical references without
-/// ordinary resolved write flags. Do not infer mutable declaration aliases in
-/// programs using these constructs.
+/// Dynamic eval/with affects mutable alias proof across the program, but
+/// call-method receivers can be evaluated independently in lexical functions
+/// with no such syntax. Track exactly the enclosing functions containing
+/// direct eval/with rather than disabling all graph edges for one unrelated
+/// script helper (a common pattern in large bundled JavaScript).
 #[derive(Default)]
 struct DynamicScope {
     found: bool,
+    stack: Vec<FunctionKey>,
+    unsafe_callers: BTreeSet<FunctionKey>,
+}
+
+impl DynamicScope {
+    fn mark_enclosing(&mut self) {
+        self.found = true;
+        self.unsafe_callers.extend(self.stack.iter().copied());
+    }
 }
 
 impl<'a> Visit<'a> for DynamicScope {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        self.stack.push(key(function.span));
+        walk::walk_function(self, function, flags);
+        self.stack.pop();
+    }
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        self.stack.push(key(function.span));
+        walk::walk_arrow_function_expression(self, function);
+        self.stack.pop();
+    }
+
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if matches!(unparen(&call.callee), Expression::Identifier(id) if id.name == "eval") {
-            self.found = true;
+            self.mark_enclosing();
         }
         walk::walk_call_expression(self, call);
     }
 
-    fn visit_with_statement(&mut self, _statement: &WithStatement<'a>) {
-        self.found = true;
+    fn visit_with_statement(&mut self, statement: &WithStatement<'a>) {
+        self.mark_enclosing();
+        walk::walk_with_statement(self, statement);
     }
 }
 
@@ -345,7 +372,7 @@ struct Calls<'s> {
     symbols: &'s BTreeMap<SymbolId, FunctionKey>,
     aliases: &'s BTreeMap<SymbolId, SymbolId>,
     blocked_call_targets: &'s BTreeSet<FunctionKey>,
-    dynamic_scope: bool,
+    unsafe_callers: &'s BTreeSet<FunctionKey>,
     stack: Vec<FunctionKey>,
     edges: BTreeMap<FunctionKey, Vec<(FunctionKey, CallLink)>>,
 }
@@ -398,7 +425,7 @@ impl Calls<'_> {
         // A spread in receiver position may supply zero or several values;
         // no subsequent fixed formal parameter position can be inferred.
         if skip_receiver
-            && (self.dynamic_scope
+            && (self.unsafe_callers.contains(&caller_key)
                 || self.blocked_call_targets.contains(&callee_key)
                 || matches!(args.first(), Some(Argument::SpreadElement(_))))
         {
@@ -924,7 +951,7 @@ pub fn reconstruct_caller_views(
         symbols: &expanded,
         aliases: &aliases.aliases,
         blocked_call_targets: &blocked_call_targets,
-        dynamic_scope: dynamic_scope.found,
+        unsafe_callers: &dynamic_scope.unsafe_callers,
         stack: Vec::new(),
         edges: BTreeMap::new(),
     };
@@ -997,6 +1024,23 @@ pub fn reconstruct_caller_views(
 #[cfg(test)]
 mod tests {
     use super::reconstruct_caller_views;
+
+    #[test]
+    fn unrelated_dynamic_eval_does_not_suppress_other_lexical_call_wrappers() -> anyhow::Result<()>
+    {
+        let source = r#"const unrelated=x=>eval(x);
+            const leaf=x=>x===88?true:false;
+            const wrapper=()=>leaf.call(this,88);
+            const api={};api.run=()=>wrapper();"#;
+        let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
+        assert!(
+            view.reachable_edges
+                .iter()
+                .any(|edge| { edge.call.callee == "leaf" && edge.call.kind == "function.call" }),
+            "{view:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn source_resolved_function_call_preserves_receiver_and_formal_offsets() -> anyhow::Result<()> {
