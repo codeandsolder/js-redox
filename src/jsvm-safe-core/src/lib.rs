@@ -2895,6 +2895,166 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_merges_effectful_predecessor_prefix() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        log.push("prefix");
+                        state = 2;
+                    } else if (state == 2) {
+                        log.push("successor");
+                        return log;
+                    }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            panic!("valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state==2)"), "{}", result.source);
+        assert!(flat.contains("state=2"), "{}", result.source);
+        assert_eq!(
+            flat.matches("log.push(\"prefix\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"successor\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_convergent_conditional_arms_once() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        if (flag) { log.push("left"); state = 2; }
+                        else { log.push("right"); state = 2; }
+                    } else if (state === 2) {
+                        log.push("tail");
+                        return log;
+                    }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            panic!("valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state===2)"), "{}", result.source);
+        assert_eq!(
+            flat.matches("log.push(\"tail\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"left\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"right\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_keeps_nonconvergent_conditional_target() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        if (flag) { log.push("left"); state = 2; }
+                        else { log.push("right"); state = 3; }
+                    } else if (state == 2) return "two";
+                    else if (state == 3) return "three";
+                } catch (error) { throw error; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            panic!("valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("state=2") && flat.contains("state=3"),
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("return\"two\";").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("return\"three\";").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_convergent_throw_preserves_catch_visible_state() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        if (flag) { log.push("left"); state = 2; }
+                        else { log.push("right"); state = 2; }
+                    } else if (state == 2) {
+                        log.push("before-throw");
+                        throw Error("oops");
+                    }
+                } catch (error) { log.push(error.message); return [state, log]; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            panic!("valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state==2)"), "{}", result.source);
+        assert_eq!(
+            flat.matches("log.push(\"before-throw\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(flat.contains("return[state,log]"), "{}", result.source);
+    }
+
+    #[test]
     fn exception_dispatcher_handles_inert_array_literal_loop_test() {
         let source = r#"
             function f(flag) {

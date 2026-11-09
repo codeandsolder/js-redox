@@ -268,3 +268,53 @@ console.log(JSON.stringify([
     oneEntryCaughtException(),
     independentCatchEntry()
 ]));
+
+
+function convergentEffectfulPredecessor(flag) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state === 1) {
+            if (flag) { log.push("left"); state = 2; }
+            else { log.push("right"); state = 2; }
+        } else if (state === 2) {
+            log.push("tail");
+            return [state, log];
+        }
+    } catch (error) { throw error; }
+}
+function convergentThrowCatch(flag) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state == 1) {
+            if (flag) { log.push("L"); state = 2; }
+            else { log.push("R"); state = 2; }
+        } else if (state == 2) {
+            log.push("before-throw");
+            throw Error("expected");
+        }
+    } catch (error) {
+        log.push(error.message);
+        return [state, log];
+    }
+}
+function divergentPredecessor(flag) {
+    let state = 1;
+    while (true) try {
+        if (state == 1) {
+            if (flag) state = 2;
+            else state = 3;
+        } else if (state == 2) return "two";
+        else if (state == 3) return "three";
+    } catch (error) { throw error; }
+}
+console.log(JSON.stringify([
+    "generalized-single-entry",
+    convergentEffectfulPredecessor(true),
+    convergentEffectfulPredecessor(false),
+    convergentThrowCatch(true),
+    convergentThrowCatch(false),
+    divergentPredecessor(true),
+    divergentPredecessor(false)
+]));

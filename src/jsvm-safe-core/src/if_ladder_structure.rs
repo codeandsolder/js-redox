@@ -1411,10 +1411,42 @@ fn print_terminal_edits(
     Some(text)
 }
 
+/// Count all concrete finite successor targets of a modeled route. A
+/// convergent predecessor may contain effects and conditional arms, as long
+/// as every successful path reaches the same numeric state.
+fn single_numeric_destination(route: &Route) -> Option<u64> {
+    let mut targets = Vec::new();
+    route.targets(&mut targets);
+    let target = *targets.first()?;
+    targets
+        .iter()
+        .all(|candidate| *candidate == target)
+        .then_some(target)
+}
+
+/// Splice the successor route into every matching conditional arm while
+/// retaining the original prefix effects and branch conditions. This keeps
+/// the modeled graph faithful to the emitted straight-line source region.
+fn splice_unique_successor(route: &mut Route, target: u64, successor: &Route) -> bool {
+    match &mut route.next {
+        Next::State(state) if *state == target => {
+            route.effects.extend(successor.effects.iter().cloned());
+            route.next = successor.next.clone();
+            true
+        }
+        Next::Choose { yes, no, .. } => {
+            let yes_changed = splice_unique_successor(yes, target, successor);
+            let no_changed = splice_unique_successor(no, target, successor);
+            yes_changed && no_changed
+        }
+        Next::State(_) => false,
+    }
+}
+
 /// Merge a state with its sole entering predecessor, without cloning its body.
 ///
-/// The source predecessor must consist only of a direct numeric state
-/// assignment; the target must have exactly one incoming CFG edge and no
+/// All successful predecessor CFG arms must reach the same state, which
+/// must have exactly one distinct incoming source case and no
 /// independent initializer/catch entry. The original target statement runs
 /// inside the same try block after the assignment, so a thrown exception
 /// observes the same state as in the original next iteration.
@@ -1454,12 +1486,14 @@ fn single_entry_exception_regions(
         }
     }
 
-    let mut incoming = BTreeMap::<u64, Vec<u64>>::new();
+    // Count distinct source cases, not duplicate conditional arms from
+    // the same case. Multiple arms may safely converge to one successor.
+    let mut incoming = BTreeMap::<u64, BTreeSet<u64>>::new();
     for &label in entry.reachable {
         let mut targets = Vec::new();
         cases.get(&label)?.as_ref()?.targets(&mut targets);
         for target in targets {
-            incoming.entry(target).or_default().push(label);
+            incoming.entry(target).or_default().insert(label);
         }
     }
 
@@ -1473,7 +1507,11 @@ fn single_entry_exception_regions(
         let Some(&body) = statements.get(&predecessor) else {
             continue;
         };
-        let Some(target) = inert_exception_transition(body, state) else {
+        let Some(target) = cases
+            .get(&predecessor)?
+            .as_ref()
+            .and_then(single_numeric_destination)
+        else {
             continue;
         };
         if target == predecessor
@@ -1486,25 +1524,30 @@ fn single_entry_exception_regions(
         }
         if incoming
             .get(&target)
-            .is_none_or(|edges| edges.len() != 1 || edges[0] != predecessor)
+            .is_none_or(|sources| sources.len() != 1 || !sources.contains(&predecessor))
         {
             continue;
         }
         let Some(&successor) = statements.get(&target) else {
             continue;
         };
-        // A contextual function/class declaration can change Annex B binding
-        // semantics when moved. Such a statement is not a modeled route.
-        if cases.get(&target)?.is_none() {
+        // Both cases must have modeled routes. The original source bodies
+        // are preserved in their existing lexical blocks without cloning.
+        let Some(successor_route) = cases.get(&target)?.as_ref().cloned() else {
             continue;
-        }
+        };
         let first = fragment(source, body.span());
         let second = match edits.get(&target) {
             Some(replacements) => print_terminal_edits(successor, source, replacements)?,
             None => fragment(source, successor.span()).to_owned(),
         };
-        let next = cases.get(&target)?.as_ref()?.next.clone();
-        cases.get_mut(&predecessor)?.as_mut()?.next = next;
+        if !splice_unique_successor(
+            cases.get_mut(&predecessor)?.as_mut()?,
+            target,
+            &successor_route,
+        ) {
+            return None;
+        }
         combined.insert(predecessor, format!("{{ {first};\n{second} }}"));
         absorbed.insert(target);
         occupied.insert(predecessor);
