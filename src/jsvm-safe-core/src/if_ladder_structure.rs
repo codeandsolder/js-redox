@@ -1422,11 +1422,15 @@ fn print_terminal_edits(
 /// A new wrapper block contains two *sibling* source statements. Neither the
 /// predecessor nor the wrapper creates lexical bindings, and the target's
 /// existing block (if any) retains its own lexical scope.
+struct ExceptionEntryProof<'a> {
+    roots: &'a BTreeSet<u64>,
+    reachable: &'a BTreeSet<u64>,
+}
+
 fn single_entry_exception_regions(
     dispatcher: &Statement<'_>,
     state: &str,
-    roots: &BTreeSet<u64>,
-    reachable: &BTreeSet<u64>,
+    entry: ExceptionEntryProof<'_>,
     cases: &mut BTreeMap<u64, Option<Route>>,
     edits: &BTreeMap<u64, Vec<TerminalStateEdit>>,
     effects: &ExceptionLoopEffectContext<'_>,
@@ -1451,7 +1455,7 @@ fn single_entry_exception_regions(
     }
 
     let mut incoming = BTreeMap::<u64, Vec<u64>>::new();
-    for &label in reachable {
+    for &label in entry.reachable {
         let mut targets = Vec::new();
         cases.get(&label)?.as_ref()?.targets(&mut targets);
         for target in targets {
@@ -1462,7 +1466,7 @@ fn single_entry_exception_regions(
     let mut combined = BTreeMap::new();
     let mut absorbed = BTreeSet::new();
     let mut occupied = BTreeSet::new();
-    for &predecessor in reachable {
+    for &predecessor in entry.reachable {
         if occupied.contains(&predecessor) {
             continue;
         }
@@ -1473,8 +1477,8 @@ fn single_entry_exception_regions(
             continue;
         };
         if target == predecessor
-            || !reachable.contains(&target)
-            || roots.contains(&target)
+            || !entry.reachable.contains(&target)
+            || entry.roots.contains(&target)
             || occupied.contains(&target)
             || edits.contains_key(&predecessor)
         {
@@ -1682,8 +1686,10 @@ pub(crate) fn prune_exception_dispatcher(
         single_entry_exception_regions(
             dispatcher,
             state,
-            &roots,
-            &reachable,
+            ExceptionEntryProof {
+                roots: &roots,
+                reachable: &reachable,
+            },
             &mut cases,
             &retargeted,
             &effects,
