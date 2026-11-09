@@ -451,6 +451,13 @@ cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
   path/to/original.js work/caller-views --entry-member someMethod --specialize
 ~~~
 
+Numeric-state control-flow recovery also structures single-entry reducible
+cycles with early exits from the middle of their bodies. The original
+state-transition graph determines a common exit; every emitted path must
+reach either that exit or the loop header, so irreducible or multi-entry
+cycles remain unchanged. Early exits render as ordinary break/continue
+without losing the effects of intermediate states.
+
 The tool recovers source-resolved direct calls, constructors, and eligible
 Function.prototype.call forwarding through original lexical function bindings
 throughout the reachable graph, not only calls in extracted handlers. For a

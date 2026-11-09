@@ -381,15 +381,24 @@ fn exit_state(expr: &Expression<'_>, state: &str) -> Option<u64> {
 }
 
 #[derive(Debug, Clone)]
+enum LoopBody {
+    Natural {
+        condition: String,
+        enters_on_true: bool,
+        entering: Route,
+        exiting: Route,
+        header_effects: Vec<String>,
+        body_start: u64,
+    },
+    /// Single-entry cycle with common exit and early breaks from its body.
+    MultiExit { body: String },
+}
+
+#[derive(Debug, Clone)]
 struct Loop {
     members: BTreeSet<u64>,
-    condition: String,
-    enters_on_true: bool,
-    entering: Route,
-    exiting: Route,
-    header_effects: Vec<String>,
-    body_start: u64,
     exit: u64,
+    body: LoopBody,
 }
 
 fn reachable(start: u64, exit: u64, graph: &BTreeMap<u64, Route>) -> Option<BTreeSet<u64>> {
@@ -519,13 +528,15 @@ fn build_loops(
                 header,
                 Loop {
                     members,
-                    condition: condition.clone(),
-                    enters_on_true,
-                    entering: entering.as_ref().clone(),
-                    exiting: exiting.as_ref().clone(),
-                    header_effects: route.effects.clone(),
-                    body_start: enter,
                     exit: out,
+                    body: LoopBody::Natural {
+                        condition: condition.clone(),
+                        enters_on_true,
+                        entering: entering.as_ref().clone(),
+                        exiting: exiting.as_ref().clone(),
+                        header_effects: route.effects.clone(),
+                        body_start: enter,
+                    },
                 },
             ));
         }
@@ -537,6 +548,251 @@ fn build_loops(
         loops.insert(header, selected);
     }
     Some(loops)
+}
+
+/// Expand a cycle from one header until every path either returns to it
+/// or reaches the *same* exit. A repeated non-header node on a path is an
+/// unstructured inner cycle and cannot be represented by this loop.
+struct MultiExitEmitter<'a> {
+    graph: &'a BTreeMap<u64, Route>,
+    header: u64,
+    exit: u64,
+    members: BTreeSet<u64>,
+    visited: BTreeSet<u64>,
+    saw_continue: bool,
+    saw_break: bool,
+    fuel: usize,
+}
+
+impl MultiExitEmitter<'_> {
+    fn state(&mut self, state: u64, initial: bool) -> Option<String> {
+        self.fuel = self.fuel.checked_sub(1)?;
+        if !initial && state == self.header {
+            self.saw_continue = true;
+            return Some("continue;".into());
+        }
+        if state == self.exit {
+            self.saw_break = true;
+            return Some("break;".into());
+        }
+        if !self.visited.insert(state) {
+            return None;
+        }
+        self.members.insert(state);
+        let route = self.graph.get(&state)?;
+        let text = self.route(route);
+        self.visited.remove(&state);
+        text
+    }
+
+    fn route(&mut self, route: &Route) -> Option<String> {
+        self.fuel = self.fuel.checked_sub(1)?;
+        let mut text = route.effects.join("\n");
+        match &route.next {
+            Next::State(target) => text.push_str(&self.state(*target, false)?),
+            Next::Choose { condition, yes, no } => {
+                let then_body = self.route(yes)?;
+                let else_body = self.route(no)?;
+                text.push_str(&format!(
+                    "\nif ({condition}) {{\n{then_body}\n}} else {{\n{else_body}\n}}"
+                ));
+            }
+        }
+        Some(text)
+    }
+}
+
+/// Natural single-entry cycles can have early exits from internal branches:
+/// neither header arm necessarily returns to the header on every path.
+/// Render each edge as structured break/continue, then collapse the whole
+/// loop to its common exit for the outer branch-join calculation.
+/// Tarjan SCCs identify actual cyclic regions rather than trying every
+/// pair of graph states as possible loop boundaries. The graph is already
+/// restricted to the statically proven reachable states.
+fn strongly_connected_regions(
+    graph: &BTreeMap<u64, Route>,
+    nodes: &BTreeSet<u64>,
+) -> Vec<BTreeSet<u64>> {
+    struct Search<'a> {
+        graph: &'a BTreeMap<u64, Route>,
+        nodes: &'a BTreeSet<u64>,
+        next: usize,
+        index: BTreeMap<u64, usize>,
+        low: BTreeMap<u64, usize>,
+        stack: Vec<u64>,
+        on_stack: BTreeSet<u64>,
+        regions: Vec<BTreeSet<u64>>,
+    }
+    impl Search<'_> {
+        fn visit(&mut self, node: u64) {
+            let index = self.next;
+            self.next += 1;
+            self.index.insert(node, index);
+            self.low.insert(node, index);
+            self.stack.push(node);
+            self.on_stack.insert(node);
+            let mut successors = Vec::new();
+            if let Some(route) = self.graph.get(&node) {
+                route.targets(&mut successors);
+            }
+            for next in successors
+                .into_iter()
+                .filter(|state| self.nodes.contains(state))
+            {
+                if !self.index.contains_key(&next) {
+                    self.visit(next);
+                    if let Some(&child_low) = self.low.get(&next) {
+                        if let Some(current) = self.low.get_mut(&node) {
+                            *current = (*current).min(child_low);
+                        }
+                    }
+                } else if self.on_stack.contains(&next) {
+                    if let Some(&target_index) = self.index.get(&next) {
+                        if let Some(current) = self.low.get_mut(&node) {
+                            *current = (*current).min(target_index);
+                        }
+                    }
+                }
+            }
+            if self.low.get(&node) == self.index.get(&node) {
+                let mut region = BTreeSet::new();
+                while let Some(member) = self.stack.pop() {
+                    self.on_stack.remove(&member);
+                    region.insert(member);
+                    if member == node {
+                        break;
+                    }
+                }
+                self.regions.push(region);
+            }
+        }
+    }
+    let mut search = Search {
+        graph,
+        nodes,
+        next: 0,
+        index: BTreeMap::new(),
+        low: BTreeMap::new(),
+        stack: Vec::new(),
+        on_stack: BTreeSet::new(),
+        regions: Vec::new(),
+    };
+    for &node in nodes {
+        if !search.index.contains_key(&node) {
+            search.visit(node);
+        }
+    }
+    search.regions
+}
+
+fn extend_multi_exit_loops(
+    graph: &BTreeMap<u64, Route>,
+    nodes: &BTreeSet<u64>,
+    initial: u64,
+    exit: u64,
+    loops: &mut BTreeMap<u64, Loop>,
+) {
+    let regions = strongly_connected_regions(graph, nodes);
+    for region in regions {
+        let is_cycle = region.len() > 1
+            || region.iter().any(|&state| {
+                let mut targets = Vec::new();
+                if let Some(route) = graph.get(&state) {
+                    route.targets(&mut targets);
+                }
+                targets.contains(&state)
+            });
+        if !is_cycle
+            || loops
+                .values()
+                .any(|plan| !plan.members.is_disjoint(&region))
+        {
+            continue;
+        }
+        let mut entries = BTreeSet::new();
+        if region.contains(&initial) {
+            entries.insert(initial);
+        }
+        let mut exits = BTreeSet::new();
+        for &state in nodes {
+            let mut targets = Vec::new();
+            if let Some(route) = graph.get(&state) {
+                route.targets(&mut targets);
+            }
+            for target in targets {
+                if region.contains(&state) && !region.contains(&target) {
+                    exits.insert(target);
+                } else if !region.contains(&state) && region.contains(&target) {
+                    entries.insert(target);
+                }
+            }
+        }
+        let Some(&header) = entries.first() else {
+            continue;
+        };
+        if entries.len() != 1 || exits.is_empty() {
+            continue;
+        }
+        // A shared exit must be reachable from every outgoing edge of the
+        // cycle; then the exact path emitter verifies that no alternative
+        // transition can bypass the exit or hide an unstructured inner cycle.
+        let mut exit_maps = exits
+            .iter()
+            .map(|&state| reachable_collapsed(state, exit, graph, loops));
+        let Some(first) = exit_maps.next() else {
+            continue;
+        };
+        let candidates = exit_maps.fold(
+            first.keys().copied().collect::<BTreeSet<_>>(),
+            |acc, map| {
+                acc.intersection(&map.keys().copied().collect())
+                    .copied()
+                    .collect()
+            },
+        );
+        let mut candidate_plans = Vec::new();
+        for stop in candidates.difference(&region) {
+            let mut emitter = MultiExitEmitter {
+                graph,
+                header,
+                exit: *stop,
+                members: BTreeSet::new(),
+                visited: BTreeSet::new(),
+                saw_continue: false,
+                saw_break: false,
+                fuel: 4096,
+            };
+            let Some(body) = emitter.state(header, true) else {
+                continue;
+            };
+            if !emitter.saw_continue || !emitter.saw_break {
+                continue;
+            }
+            let occupied = loops
+                .values()
+                .flat_map(|plan| plan.members.iter().copied())
+                .collect::<BTreeSet<_>>();
+            if !emitter.members.is_disjoint(&occupied) {
+                continue;
+            }
+            let unique_entry = nodes.difference(&emitter.members).all(|&outside| {
+                collapsed_edges(outside, graph, loops)
+                    .iter()
+                    .all(|target| *target == header || !emitter.members.contains(target))
+            });
+            if unique_entry {
+                candidate_plans.push(Loop {
+                    members: emitter.members,
+                    exit: *stop,
+                    body: LoopBody::MultiExit { body },
+                });
+            }
+        }
+        candidate_plans.sort_by_key(|plan| (plan.members.len(), plan.exit));
+        if let Some(plan) = candidate_plans.into_iter().next() {
+            loops.insert(header, plan);
+        }
+    }
 }
 
 fn reachable_collapsed(
@@ -672,37 +928,45 @@ impl Emitter<'_> {
                 // Render the loop body as its own region. Natural loops
                 // may contain internal conditionals and previously collapsed
                 // nested loops; both return to the header on every path.
-                let mut body = loop_plan.entering.effects.join("\n");
-                // The entry path can visit a loop-body node before reaching
-                // the loop header (a do/while-shaped SCC). Re-emitting that
-                // node inside the loop is required for subsequent iterations.
-                // Use a fresh visited set for the body region while sharing
-                // the same bounded work fuel, not a global visited set which
-                // incorrectly rejects this reducible control flow.
-                let mut region = Emitter {
-                    graph: self.graph,
-                    loops: self.loops,
-                    exit: self.exit,
-                    visited: BTreeSet::new(),
-                    fuel: self.fuel,
-                };
-                body.push_str(&region.walk(loop_plan.body_start, cursor)?);
-                self.fuel = region.fuel;
-                let cond = if loop_plan.enters_on_true {
-                    loop_plan.condition.clone()
-                } else {
-                    format!("!({})", loop_plan.condition)
-                };
-                if loop_plan.header_effects.is_empty() {
-                    out.push_str(&format!("\nwhile ({cond}) {{\n{body}\n}}\n"));
-                    out.push_str(&loop_plan.exiting.effects.join("\n"));
-                } else {
-                    out.push_str("\nfor (;;) {\n");
-                    out.push_str(&loop_plan.header_effects.join("\n"));
-                    out.push_str(&format!(
-                        "\nif (!({cond})) {{\n{}\nbreak;\n}}\n{body}\n}}\n",
-                        loop_plan.exiting.effects.join("\n")
-                    ));
+                match &loop_plan.body {
+                    LoopBody::MultiExit { body } => {
+                        out.push_str(&format!("\nfor (;;) {{\n{body}\n}}\n"));
+                    }
+                    LoopBody::Natural {
+                        condition,
+                        enters_on_true,
+                        entering,
+                        exiting,
+                        header_effects,
+                        body_start,
+                    } => {
+                        let mut body = entering.effects.join("\n");
+                        let mut region = Emitter {
+                            graph: self.graph,
+                            loops: self.loops,
+                            exit: self.exit,
+                            visited: BTreeSet::new(),
+                            fuel: self.fuel,
+                        };
+                        body.push_str(&region.walk(*body_start, cursor)?);
+                        self.fuel = region.fuel;
+                        let cond = if *enters_on_true {
+                            condition.clone()
+                        } else {
+                            format!("!({condition})")
+                        };
+                        if header_effects.is_empty() {
+                            out.push_str(&format!("\nwhile ({cond}) {{\n{body}\n}}\n"));
+                            out.push_str(&exiting.effects.join("\n"));
+                        } else {
+                            out.push_str("\nfor (;;) {\n");
+                            out.push_str(&header_effects.join("\n"));
+                            out.push_str(&format!(
+                                "\nif (!({cond})) {{\n{}\nbreak;\n}}\n{body}\n}}\n",
+                                exiting.effects.join("\n")
+                            ));
+                        }
+                    }
                 }
                 cursor = loop_plan.exit;
             } else {
@@ -924,7 +1188,8 @@ fn reconstruct_state_loop(
         .filter_map(|(number, route)| route.map(|route| (number, route)))
         .collect::<BTreeMap<_, _>>();
     let nodes = reachable(initial, exit, &graph)?;
-    let loops = build_loops(&graph, &nodes, exit)?;
+    let mut loops = build_loops(&graph, &nodes, exit)?;
+    extend_multi_exit_loops(&graph, &nodes, initial, exit, &mut loops);
     // Do not generate an infinite/repeated CFG expansion. Every loop must
     // have a single entry; all reachable code must be fully accounted for.
     for (&header, loop_plan) in &loops {
@@ -1238,6 +1503,94 @@ mod tests {
         if let Some(value) = result.ok().flatten() {
             assert!(value.source.contains("s=9"), "{}", value.source);
         }
+    }
+
+    #[test]
+    fn structures_reducible_cycle_with_mid_body_break_and_effects() {
+        let source = r#"
+            function f(limit, log) {
+                let state=1;
+                while(state!=99) {
+                    if(state==1) state=2;
+                    else if(state==2) state=limit>0?3:5;
+                    else if(state==3) {
+                        log.push(limit);
+                        limit--;
+                        state=limit>0?2:5;
+                    } else if(state==5) {
+                        log.push("end");
+                        state=99;
+                    }
+                }
+                return log;
+            }
+        "#;
+        let result = deobfuscate(source, 12, &WorkBudget::unlimited("mid-body-break"));
+        assert!(result.is_ok(), "{result:?}");
+        let Ok(Some(value)) = result else {
+            unreachable!()
+        };
+        assert_eq!(
+            value.transforms.get("if_ladder_structured"),
+            Some(&1),
+            "{value:?}"
+        );
+        assert!(!value.source.contains("state==2"), "{}", value.source);
+        assert!(value.source.contains("for (;;)"), "{}", value.source);
+        assert!(value.source.contains("log.push"), "{}", value.source);
+    }
+
+    #[test]
+    fn structures_alternate_exit_from_inside_single_entry_cycle() {
+        let source = r#"
+            function f(flag, log) {
+                let state=20;
+                while(state!=90)
+                    if(state==20) state=flag?21:24;
+                    else if(state==21) state=flag?22:23;
+                    else if(state==22) {log.push(22);state=20;}
+                    else if(state==23) {log.push(23);state=24;}
+                    else if(state==24) {log.push(24);state=90;}
+                return log;
+            }
+        "#;
+        let result = deobfuscate(source, 12, &WorkBudget::unlimited("multiple-cycle-exits"));
+        assert!(result.is_ok(), "{result:?}");
+        let Ok(Some(value)) = result else {
+            unreachable!()
+        };
+        assert_eq!(
+            value.transforms.get("if_ladder_structured"),
+            Some(&1),
+            "{value:?}"
+        );
+        assert!(!value.source.contains("state==20"), "{}", value.source);
+        assert!(value.source.contains("for (;;)"), "{}", value.source);
+    }
+
+    #[test]
+    fn rejects_irreducible_cycle_with_multiple_entry_states() {
+        let source = r#"
+            function f(flag) {
+                let state=1;
+                while(state!=9) {
+                    if(state==1) state=flag?2:3;
+                    else if(state==2) state=3;
+                    else if(state==3) state=flag?2:9;
+                }
+                return state;
+            }
+        "#;
+        let result = deobfuscate(source, 12, &WorkBudget::unlimited("multiple-cycle-entries"));
+        assert!(result.is_ok(), "{result:?}");
+        let Ok(Some(value)) = result else {
+            unreachable!()
+        };
+        assert!(
+            !value.transforms.contains_key("if_ladder_structured"),
+            "{value:?}"
+        );
+        assert!(value.source.contains("while"), "{}", value.source);
     }
 
     #[test]

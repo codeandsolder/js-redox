@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 28] = [
+const MAIN_FIXTURES: [&str; 29] = [
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
@@ -32,6 +32,7 @@ const MAIN_FIXTURES: [&str; 28] = [
     "arithmetic-state-registers.js",
     "arithmetic-state-try.js",
     "arithmetic-state-conditional.js",
+    "multi-exit-reducible-state.js",
     "static-alias-installer-calls.js",
     "static-alias-live-forwarding.js",
 ];
@@ -140,6 +141,9 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
             assert!(count(report, "proxy_computed_member") >= 2);
         }
         "proxy-calls.js" => assert!(count(report, "proxy_call") >= 3),
+        "multi-exit-reducible-state.js" => {
+            assert!(count(report, "if_ladder_structured") >= 2);
+        }
         "proven-helper-prune.js" => {
             assert!(!outcome.source.contains("function pruneMe"));
             assert!(outcome.source.contains("function keepMe"));
