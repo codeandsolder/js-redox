@@ -147,12 +147,16 @@ fn collect_dispatch(
     expr: &Expression<'_>,
     state: &str,
     source: &str,
-    cases: &mut BTreeMap<u64, Route>,
+    cases: &mut BTreeMap<u64, Option<Route>>,
 ) -> Option<()> {
     match unparen(expr) {
         Expression::ConditionalExpression(branch) => {
             let value = state_test(&branch.test, state)?;
-            let route = parse_route(&branch.consequent, state, source)?;
+            // Keep an unsupported case in the index, but only require its
+            // transition to be modelled if that numeric state is reachable
+            // from the proved initializer. Unknown unreachable transitions
+            // must not prevent recovery of the actually executed states.
+            let route = parse_route(&branch.consequent, state, source);
             if cases.insert(value, route).is_some() {
                 return None;
             }
@@ -160,7 +164,7 @@ fn collect_dispatch(
         }
         Expression::LogicalExpression(logical) if logical.operator.as_str() == "&&" => {
             let value = state_test(&logical.left, state)?;
-            let route = parse_route(&logical.right, state, source)?;
+            let route = parse_route(&logical.right, state, source);
             if cases.insert(value, route).is_some() {
                 return None;
             }
@@ -306,12 +310,12 @@ fn collect_dispatch_statement(
     state: &str,
     exit: u64,
     source: &str,
-    cases: &mut BTreeMap<u64, Route>,
+    cases: &mut BTreeMap<u64, Option<Route>>,
 ) -> Option<()> {
     match stmt {
         Statement::IfStatement(branch) => {
             let value = state_test(&branch.test, state)?;
-            let route = parse_statement_route(&branch.consequent, state, exit, source)?;
+            let route = parse_statement_route(&branch.consequent, state, exit, source);
             if cases.insert(value, route).is_some() {
                 return None;
             }
@@ -350,7 +354,7 @@ fn collect_dispatch_statement(
                     effects: vec![fragment(source, return_stmt.span()).to_owned()],
                     next: Next::State(exit),
                 };
-                if cases.insert(label, route).is_some() {
+                if cases.insert(label, Some(route)).is_some() {
                     return None;
                 }
             }
@@ -909,8 +913,16 @@ fn reconstruct_state_loop(
     source: &str,
 ) -> Option<String> {
     let exit = exit_state(test, state)?;
-    let mut graph = BTreeMap::new();
-    collect_dispatch_statement(body, state, exit, source, &mut graph)?;
+    let mut candidate_cases = BTreeMap::new();
+    collect_dispatch_statement(body, state, exit, source, &mut candidate_cases)?;
+    // A route is proof-bearing only when its complete effects and successor
+    // are known. Drop unmodelled cases *from the graph*, not from the original
+    // source: reachable() will reject a missing route if execution can enter
+    // that state, while genuinely unreachable branches are irrelevant.
+    let graph = candidate_cases
+        .into_iter()
+        .filter_map(|(number, route)| route.map(|route| (number, route)))
+        .collect::<BTreeMap<_, _>>();
     let nodes = reachable(initial, exit, &graph)?;
     let loops = build_loops(&graph, &nodes, exit)?;
     // Do not generate an infinite/repeated CFG expansion. Every loop must
@@ -1226,6 +1238,85 @@ mod tests {
         if let Some(value) = result.ok().flatten() {
             assert!(value.source.contains("s=9"), "{}", value.source);
         }
+    }
+
+    #[test]
+    fn reconstructs_known_reachable_states_despite_unmodelled_dead_dispatch_cases() {
+        let original = r#"
+          function f(log) {
+            let state=1;
+            while(state!=9)
+              if(state==1){log.push(1);state=2;}
+              else if(state==2){log.push(2);state=9;}
+              else if(state==7){log.push("dead");state=unmodelled();}
+            return log;
+          }
+        "#;
+        let result = deobfuscate(
+            original,
+            12,
+            &WorkBudget::unlimited("dead-unmodelled-state"),
+        );
+        assert!(result.is_ok(), "deobfuscation should succeed");
+        let Ok(Some(value)) = result else {
+            unreachable!();
+        };
+        assert!(
+            value.transforms.contains_key("if_ladder_structured"),
+            "{value:?}"
+        );
+        assert!(!value.source.contains("unmodelled()"), "{}", value.source);
+        assert!(!value.source.contains("dead"), "{}", value.source);
+        assert!(value.source.contains("log.push(1)"), "{}", value.source);
+        assert!(value.source.contains("log.push(2)"), "{}", value.source);
+    }
+
+    #[test]
+    fn does_not_claim_a_reachable_unmodelled_state_is_recoverable() {
+        let original = r#"
+          function f(log) {
+            let state=1;
+            while(state!=9)
+              if(state==1){log.push(1);state=7;}
+              else if(state==2){log.push(2);state=9;}
+              else if(state==7){state=unmodelled();}
+            return log;
+          }
+        "#;
+        let result = deobfuscate(
+            original,
+            12,
+            &WorkBudget::unlimited("live-unmodelled-state"),
+        );
+        assert!(result.is_ok(), "deobfuscation should succeed");
+        let Ok(Some(value)) = result else {
+            unreachable!();
+        };
+        assert!(
+            !value.transforms.contains_key("if_ladder_structured"),
+            "{value:?}"
+        );
+        assert!(value.source.contains("unmodelled()"), "{}", value.source);
+    }
+
+    #[test]
+    fn reconstructs_for_dispatcher_with_dead_unsupported_branch() {
+        let source = r#"function f(x){
+          for(var s=1;s!=9;)s==1?(x.push(1),s=2)
+             :s==2?(x.push(2),s=9)
+             :s==7&&(x.push(7),s=unmodelled());
+          return x;
+        }"#;
+        let result = deobfuscate(source, 12, &WorkBudget::unlimited("for-dead-unknown"));
+        assert!(result.is_ok(), "deobfuscation should succeed");
+        let Ok(Some(value)) = result else {
+            unreachable!();
+        };
+        assert!(
+            value.transforms.contains_key("if_ladder_structured"),
+            "{value:?}"
+        );
+        assert!(!value.source.contains("unmodelled()"), "{}", value.source);
     }
 
     #[test]

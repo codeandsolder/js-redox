@@ -2157,8 +2157,11 @@ mod tests {
             "function healthy(){let dead=0;function inner(){return arguments[0];}dead=5;return 1;}",
         ];
         for source in fixtures {
-            let output = deobfuscate(source, 12)
-                .unwrap_or_else(|| panic!("fixture not recovered: {source}"));
+            let result = deobfuscate(source, 12);
+            assert!(result.is_some(), "fixture not recovered: {source}");
+            let Some(output) = result else {
+                unreachable!();
+            };
             assert!(
                 output
                     .transforms
@@ -2184,8 +2187,11 @@ mod tests {
             "function outer(){let state=0;function inner(){state=5;}inner();return eval('state');}",
         ];
         for source in fixtures {
-            let output = deobfuscate(source, 12)
-                .unwrap_or_else(|| panic!("fixture not recovered: {source}"));
+            let result = deobfuscate(source, 12);
+            assert!(result.is_some(), "fixture not recovered: {source}");
+            let Some(output) = result else {
+                unreachable!();
+            };
             assert!(
                 !output.transforms.contains_key("dead_numeric_state_write"),
                 "{source} -> {} {:#?}",
@@ -2204,7 +2210,11 @@ mod tests {
                 return healthy();
             }
         "#;
-        let result = deobfuscate(source, 12).expect("valid source");
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else {
+            unreachable!();
+        };
         assert_eq!(
             result.transforms.get("dead_numeric_state_write"),
             Some(&1),
