@@ -538,6 +538,84 @@ enum CallRewriteTraversal {
     WalkChildren,
 }
 
+/// Dynamic eval and mapped arguments are function-local hazards for
+/// numeric-state proofs. An unrelated bundled helper must not disable
+/// source reconstruction throughout an entire source file.
+#[derive(Default)]
+struct NumericStateAliasRisks {
+    /// The nearest ordinary function owns the arguments object; arrows share
+    /// it, whereas an ordinary nested function has its own arguments object.
+    stack: Vec<(Span, bool)>,
+    unsafe_functions: HashSet<(u32, u32)>,
+    unsafe_top_level: bool,
+}
+
+impl NumericStateAliasRisks {
+    fn mark_eval_or_with(&mut self) {
+        if self.stack.is_empty() {
+            self.unsafe_top_level = true;
+        }
+        // Direct eval (or with) in a nested function may mutate lexical
+        // bindings of any enclosing function, so include every ancestor.
+        for (span, _) in &self.stack {
+            self.unsafe_functions.insert((span.start, span.end));
+        }
+    }
+
+    fn mark_arguments(&mut self) {
+        // A reference in an arrow resolves the nearest ordinary function's
+        // arguments object; only that function and the enclosed arrows can
+        // observe or modify the mapped parameters through that object.
+        let start = self.stack.iter().rposition(|(_, ordinary)| *ordinary);
+        if let Some(start) = start {
+            for (span, _) in &self.stack[start..] {
+                self.unsafe_functions.insert((span.start, span.end));
+            }
+        } else if self.stack.is_empty() {
+            self.unsafe_top_level = true;
+        } else {
+            for (span, _) in &self.stack {
+                self.unsafe_functions.insert((span.start, span.end));
+            }
+        }
+    }
+}
+
+impl<'a> Visit<'a> for NumericStateAliasRisks {
+    fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        self.stack.push((function.span, true));
+        walk::walk_function(self, function, flags);
+        self.stack.pop();
+    }
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        self.stack.push((function.span, false));
+        walk::walk_arrow_function_expression(self, function);
+        self.stack.pop();
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if matches!(&call.callee, Expression::Identifier(id) if id.name == "eval") {
+            self.mark_eval_or_with();
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_with_statement(&mut self, statement: &WithStatement<'a>) {
+        self.mark_eval_or_with();
+        walk::walk_with_statement(self, statement);
+    }
+
+    fn visit_identifier_reference(&mut self, id: &oxc_ast::ast::IdentifierReference<'a>) {
+        if id.name == "arguments" {
+            self.mark_arguments();
+        }
+    }
+}
+
 struct Collector<'s, 'c> {
     source: &'s str,
     scoping: &'c Scoping,
@@ -558,6 +636,7 @@ struct Collector<'s, 'c> {
     reference_spans: &'c HashMap<ReferenceId, Span>,
     protected_spans: &'c [(usize, usize)],
     may_remove_dead_numeric_writes: bool,
+    unsafe_numeric_functions: &'c HashSet<(u32, u32)>,
     allow_effect_statements: bool,
     function_depth: usize,
     replacements: Vec<Replacement>,
@@ -971,15 +1050,27 @@ impl Collector<'_, '_> {
 
 impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_function(&mut self, it: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        let enclosing_safe = self.may_remove_dead_numeric_writes;
+        self.may_remove_dead_numeric_writes = enclosing_safe
+            && !self
+                .unsafe_numeric_functions
+                .contains(&(it.span.start, it.span.end));
         self.function_depth += 1;
         walk::walk_function(self, it, flags);
         self.function_depth -= 1;
+        self.may_remove_dead_numeric_writes = enclosing_safe;
     }
 
     fn visit_arrow_function_expression(&mut self, it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+        let enclosing_safe = self.may_remove_dead_numeric_writes;
+        self.may_remove_dead_numeric_writes = enclosing_safe
+            && !self
+                .unsafe_numeric_functions
+                .contains(&(it.span.start, it.span.end));
         self.function_depth += 1;
         walk::walk_arrow_function_expression(self, it);
         self.function_depth -= 1;
+        self.may_remove_dead_numeric_writes = enclosing_safe;
     }
 
     fn visit_expression(&mut self, it: &Expression<'a>) {
@@ -1689,6 +1780,8 @@ fn transform_once(
     let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
     budget.checkpoint()?;
     let direct_eval_present = has_direct_eval(&program);
+    let mut numeric_state_risks = NumericStateAliasRisks::default();
+    numeric_state_risks.visit_program(&program);
     initial_replacements.extend(remove_unused_proven_helpers(
         scoping,
         &decoder_analysis.removable_helpers,
@@ -1716,9 +1809,11 @@ fn transform_once(
         var_number_initializers: &var_number_initializers,
         reference_spans: &reference_spans,
         protected_spans: &protected_spans,
-        // Parameters in sloppy-mode functions alias their arguments object.
-        // Do not erase writes when that object may be accessed.
-        may_remove_dead_numeric_writes: !direct_eval_present && !source.contains("arguments"),
+        // Only dynamic scopes or arguments aliases in the *relevant lexical
+        // function* can expose otherwise dead local state writes. Nonlocal
+        // script syntax, including string contents, is not such a hazard.
+        may_remove_dead_numeric_writes: !numeric_state_risks.unsafe_top_level,
+        unsafe_numeric_functions: &numeric_state_risks.unsafe_functions,
         allow_effect_statements: options.allow_effect_statements,
         function_depth: 0,
         replacements: initial_replacements,
@@ -2048,6 +2143,74 @@ mod tests {
         expose_static_strings_budgeted(source, max_iterations, &test_budget())
             .ok()
             .flatten()
+    }
+
+    #[test]
+    fn numeric_state_proofs_ignore_unrelated_eval_and_literal_arguments_text() {
+        let fixtures = [
+            // A direct eval in another function cannot observe this helper's
+            // unreferenced local variable.
+            "function unrelated(x){return eval(x);}function healthy(){let dead=0;dead=5;return 1;}",
+            // An occurrence in string content is not an arguments reference.
+            "function unrelated(){return 'arguments';}function healthy(){let dead=0;dead=5;return 1;}",
+            // A nested ordinary function owns its own arguments object.
+            "function healthy(){let dead=0;function inner(){return arguments[0];}dead=5;return 1;}",
+        ];
+        for source in fixtures {
+            let output = deobfuscate(source, 12)
+                .unwrap_or_else(|| panic!("fixture not recovered: {source}"));
+            assert!(
+                output
+                    .transforms
+                    .get("dead_numeric_state_write")
+                    .is_some_and(|count| *count >= 1),
+                "{source} -> {} {:#?}",
+                output.source,
+                output.transforms
+            );
+            assert!(!output.source.contains("dead=5"), "{}", output.source);
+        }
+    }
+
+    #[test]
+    fn numeric_state_proofs_keep_writes_visible_to_eval_and_mapped_arguments() {
+        let fixtures = [
+            "function f(x){x=5;eval('x');return 1;}",
+            "function f(x){x=5;arguments[0];return 1;}",
+            "function f(x){const change=()=>eval('x');x=5;return change();}",
+            "function f(x){const nested=()=>arguments[0];x=5;return nested();}",
+            // An ancestor direct eval may inspect a local written by a
+            // nested ordinary function, even without a static identifier read.
+            "function outer(){let state=0;function inner(){state=5;}inner();return eval('state');}",
+        ];
+        for source in fixtures {
+            let output = deobfuscate(source, 12)
+                .unwrap_or_else(|| panic!("fixture not recovered: {source}"));
+            assert!(
+                !output.transforms.contains_key("dead_numeric_state_write"),
+                "{source} -> {} {:#?}",
+                output.source,
+                output.transforms
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_state_proofs_keep_independent_sibling_function_regions() {
+        let source = r#"
+            function outer(){
+                function risky(x){arguments[0]=3;x=5;}
+                function healthy(){let dead=0;dead=5;return 1;}
+                return healthy();
+            }
+        "#;
+        let result = deobfuscate(source, 12).expect("valid source");
+        assert_eq!(
+            result.transforms.get("dead_numeric_state_write"),
+            Some(&1),
+            "{result:?}"
+        );
+        assert!(!result.source.contains("dead=5"), "{}", result.source);
     }
 
     #[test]
