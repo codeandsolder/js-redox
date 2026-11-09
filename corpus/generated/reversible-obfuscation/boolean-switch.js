@@ -112,3 +112,57 @@ try {
 } finally {
     Array.prototype.toString = originalToString;
 }
+
+
+function knownEffectful(flag, log) {
+    switch (!(flag === 1)) {
+        case 0 == ![log.push("array-element")]:
+            log.push("known-true");
+            break;
+        case false:
+            log.push("known-false");
+            break;
+    }
+    return log;
+}
+function knownWithDefault(flag, log) {
+    switch (!flag) {
+        default:
+            log.push("default");
+            break;
+        case (log.push("before-array"), 0 == ![log.push("in-array")]):
+            log.push("true");
+            break;
+        case false:
+            log.push("false");
+            break;
+    }
+    return log;
+}
+function knownWithSpread(flag, log, throwOnIteration) {
+    const iterable = { [Symbol.iterator]() {
+        log.push("iterator");
+        if (throwOnIteration) { throw Error("iterator failed"); }
+        return [1, 2][Symbol.iterator]();
+    } };
+    try {
+        switch (!flag) {
+            case 0 == ![...iterable]:
+                log.push("known");
+                break;
+            case false:
+                log.push("other");
+                break;
+        }
+    } catch (e) {
+        log.push(e.message);
+    }
+    return log;
+}
+for (const value of [false, true]) {
+    console.log(JSON.stringify(["knownEffectful", value, knownEffectful(value, [])]));
+    console.log(JSON.stringify(["knownWithDefault", value, knownWithDefault(value, [])]));
+    for (const throwOnIteration of [false, true]) {
+        console.log(JSON.stringify(["knownWithSpread", value, throwOnIteration, knownWithSpread(value, [], throwOnIteration)]));
+    }
+}

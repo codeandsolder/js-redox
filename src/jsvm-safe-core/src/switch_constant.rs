@@ -198,6 +198,112 @@ fn boolean_switch_branch(
     Some(statements.join("\n"))
 }
 
+/// Proof of the *result after evaluation*, not proof that the expression is pure.
+///
+/// This intentionally does not feed into the ordinary constant folder:
+/// array/object literal evaluation can execute spreads, getters, computed keys,
+/// or throw on a TDZ reference, even though the resulting object is truthy.
+fn value_after_evaluation(expr: &Expression<'_>) -> Option<crate::value_eval::Value> {
+    use crate::value_eval::{eval_binary, Value};
+
+    if let Some(value) = eval(expr) {
+        return Some(value);
+    }
+    match expr {
+        Expression::ParenthesizedExpression(paren) => value_after_evaluation(&paren.expression),
+        Expression::UnaryExpression(unary) if unary.operator.as_str() == "!" => {
+            let argument = &unary.argument;
+            match argument {
+                Expression::ArrayExpression(_)
+                | Expression::ObjectExpression(_)
+                | Expression::FunctionExpression(_)
+                | Expression::ArrowFunctionExpression(_)
+                | Expression::ClassExpression(_) => Some(Value::Bool(false)),
+                _ => Some(Value::Bool(!value_after_evaluation(argument)?.truthy())),
+            }
+        }
+        Expression::BinaryExpression(binary) => eval_binary(
+            binary.operator.as_str(),
+            value_after_evaluation(&binary.left)?,
+            value_after_evaluation(&binary.right)?,
+        ),
+        Expression::SequenceExpression(sequence) => {
+            value_after_evaluation(sequence.expressions.last()?)
+        }
+        Expression::ConditionalExpression(conditional) => {
+            let yes = value_after_evaluation(&conditional.consequent)?;
+            let no = value_after_evaluation(&conditional.alternate)?;
+            if same_value(&yes, &no) {
+                Some(yes)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Reconstruct a boolean switch even when a label's value is known only after
+/// running its original expression. Each selected path evaluates precisely
+/// the labels encountered in the original switch, then executes the matching
+/// case body. This avoids repeating a large case body across branches.
+fn structure_boolean_switch_with_effectful_known_labels(
+    node: &SwitchStatement<'_>,
+    source: &str,
+) -> Option<String> {
+    use crate::value_eval::Value;
+
+    let mut labels = Vec::with_capacity(node.cases.len());
+    let mut requires_effect_preservation = false;
+    let mut default = None;
+    for (index, case) in node.cases.iter().enumerate() {
+        let label = if let Some(test) = &case.test {
+            let Value::Bool(value) = value_after_evaluation(test)? else {
+                return None;
+            };
+            requires_effect_preservation |= eval(test).is_none();
+            Some(value)
+        } else {
+            default = Some(index);
+            None
+        };
+        labels.push(label);
+        for statement in &case.consequent {
+            let mut hazard = BooleanSwitchBindingHazard::default();
+            hazard.visit_statement(statement);
+            if hazard.0 {
+                return None;
+            }
+        }
+    }
+    if !requires_effect_preservation {
+        return None;
+    }
+    let mut bodies = Vec::new();
+    for discriminant in [true, false] {
+        let matched = labels.iter().position(|label| *label == Some(discriminant));
+        let selected = matched.or(default);
+        // When there is no match, the switch evaluates every non-default
+        // label, including those after an earlier default position.
+        let tested = matched.map_or(node.cases.len(), |index| index + 1);
+        let evaluated_labels = node.cases.iter().take(tested).filter_map(|case| {
+            case.test.as_ref().map(|test| {
+                // Parenthesized expression statement: even an object or
+                // function expression cannot become a declaration here.
+                format!("({});", fragment(source, test.span()))
+            })
+        });
+        let mut instructions = evaluated_labels.collect::<Vec<_>>();
+        instructions.push(boolean_switch_branch(node, selected, source)?);
+        bodies.push(instructions.join("\n"));
+    }
+    let [when_true, when_false] = <[String; 2]>::try_from(bodies).ok()?;
+    Some(format!(
+        "{{\nif ({}) {{\n{when_true}\n}} else {{\n{when_false}\n}}\n}}",
+        fragment(source, node.discriminant.span())
+    ))
+}
+
 /// When a boolean switch starts with a pure, statically known case, that
 /// case consumes one entire side of the boolean domain. Cases after it can
 /// be arbitrary dynamic expressions, but are evaluated only on the opposite
@@ -274,6 +380,9 @@ fn structure_boolean_switch_with_dynamic_suffix(
 pub(crate) fn structure_boolean_switch(node: &SwitchStatement<'_>, source: &str) -> Option<String> {
     if !is_boolean_valued(&node.discriminant) || node.cases.is_empty() {
         return None;
+    }
+    if let Some(recovered) = structure_boolean_switch_with_effectful_known_labels(node, source) {
+        return Some(recovered);
     }
     if node.cases.iter().any(|case| {
         case.test
@@ -469,6 +578,65 @@ mod tests {
         "#;
         let output = transformed(source)?;
         assert!(output.contains("switch"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn known_effectful_case_label_preserves_evaluation_and_avoids_body_duplication(
+    ) -> Result<(), BudgetExceeded> {
+        let source = r#"
+            function f(flag, events) {
+                switch (!(flag == 1)) {
+                    case 0 == ![events.push("element")]:
+                        events.push("long-body");
+                        events.push("long-body");
+                        break;
+                    case false:
+                        events.push("fallback");
+                        break;
+                }
+                return events;
+            }
+        "#;
+        let output = transformed(source)?;
+        assert!(!output.contains("switch"), "{output}");
+        assert_eq!(
+            output.matches("events.push(\"long-body\")").count(),
+            2,
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("events.push(\"element\")").count(),
+            2,
+            "{output}"
+        );
+        assert!(output.contains("events.push(\"fallback\")"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn effectful_boolean_case_handles_default_position_and_sequence_effects(
+    ) -> Result<(), BudgetExceeded> {
+        let source = r#"
+            function f(flag, events) {
+                switch (!flag) {
+                    default: events.push("default"); break;
+                    case (events.push("first"), 0 == ![events.push("second")]):
+                        events.push("true"); break;
+                    case false: events.push("false"); break;
+                }
+                return events;
+            }
+        "#;
+        let output = transformed(source)?;
+        assert!(!output.contains("switch"), "{output}");
+        assert_eq!(
+            output.matches("events.push(\"true\")").count(),
+            1,
+            "{output}"
+        );
+        assert!(output.contains("events.push(\"first\")"), "{output}");
+        assert!(output.contains("events.push(\"second\")"), "{output}");
         Ok(())
     }
 
