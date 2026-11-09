@@ -1556,6 +1556,185 @@ fn single_entry_exception_regions(
     Some((combined, absorbed))
 }
 
+/// Recover a single-entry, single-join conditional region without cloning
+/// either branch or its shared continuation. This handles both full diamonds
+/// (entry -> left/right -> join) and triangles (entry -> side/join -> join).
+///
+/// The proof is over *source-case* predecessors, not raw conditional edges.
+/// Independent catch/initializer entries, other predecessors, and cycles
+/// through the region are rejected by the incoming-edge checks. All original
+/// source statements remain inside the same try block and keep their numeric
+/// state writes, so throwing effects retain their catch-visible state.
+fn exception_diamond_regions(
+    dispatcher: &Statement<'_>,
+    state: &str,
+    entry: ExceptionEntryProof<'_>,
+    cases: &mut BTreeMap<u64, Option<Route>>,
+    edits: &BTreeMap<u64, Vec<TerminalStateEdit>>,
+    effects: &ExceptionLoopEffectContext<'_>,
+    source: &str,
+) -> Option<(BTreeMap<u64, String>, BTreeSet<u64>)> {
+    let mut statements = BTreeMap::new();
+    let mut tests = BTreeMap::new();
+    let mut cursor = dispatcher;
+    loop {
+        let Statement::IfStatement(branch) = cursor else {
+            return None;
+        };
+        if branch.test.may_have_side_effects(effects) {
+            return None;
+        }
+        let label = state_test(&branch.test, state)?;
+        statements.insert(label, &branch.consequent);
+        tests.insert(label, fragment(source, branch.test.span()));
+        match branch.alternate.as_ref() {
+            Some(other @ Statement::IfStatement(_)) => cursor = other,
+            None => break,
+            Some(_) => return None,
+        }
+    }
+
+    let mut incoming = BTreeMap::<u64, BTreeSet<u64>>::new();
+    for &label in entry.reachable {
+        let Some(Some(route)) = cases.get(&label) else {
+            return None;
+        };
+        let mut targets = Vec::new();
+        route.targets(&mut targets);
+        for target in targets {
+            incoming.entry(target).or_default().insert(label);
+        }
+    }
+
+    let text_of = |label: u64| -> Option<String> {
+        let statement = *statements.get(&label)?;
+        match edits.get(&label) {
+            Some(changes) => print_terminal_edits(statement, source, changes),
+            None => Some(fragment(source, statement.span()).to_owned()),
+        }
+    };
+
+    for &predecessor in entry.reachable {
+        let Some(Some(route)) = cases.get(&predecessor) else {
+            continue;
+        };
+        let Next::Choose { yes, no, .. } = &route.next else {
+            continue;
+        };
+        let (Some(left), Some(right)) = (yes.plain_target(), no.plain_target()) else {
+            continue;
+        };
+        if left == right {
+            continue;
+        }
+
+        let mut left_targets = BTreeSet::from([left]);
+        let mut right_targets = BTreeSet::from([right]);
+        if let Some(target) = cases
+            .get(&left)
+            .and_then(Option::as_ref)
+            .and_then(single_numeric_destination)
+        {
+            left_targets.insert(target);
+        }
+        if let Some(target) = cases
+            .get(&right)
+            .and_then(Option::as_ref)
+            .and_then(single_numeric_destination)
+        {
+            right_targets.insert(target);
+        }
+
+        for &join in left_targets.intersection(&right_targets) {
+            if join == predecessor
+                || !entry.reachable.contains(&join)
+                || entry.roots.contains(&join)
+            {
+                continue;
+            }
+            let mut indirect = Vec::new();
+            let mut expected_join_inputs = BTreeSet::new();
+            let mut valid = true;
+            for branch in [left, right] {
+                if branch == join {
+                    expected_join_inputs.insert(predecessor);
+                    continue;
+                }
+                let valid_branch = branch != predecessor
+                    && entry.reachable.contains(&branch)
+                    && !entry.roots.contains(&branch)
+                    && incoming.get(&branch).is_some_and(|sources| {
+                        sources.len() == 1 && sources.contains(&predecessor)
+                    })
+                    && cases
+                        .get(&branch)
+                        .and_then(Option::as_ref)
+                        .and_then(single_numeric_destination)
+                        == Some(join);
+                if !valid_branch {
+                    valid = false;
+                    break;
+                }
+                indirect.push(branch);
+                expected_join_inputs.insert(branch);
+            }
+            if !valid
+                || incoming.get(&join) != Some(&expected_join_inputs)
+                || cases.get(&join).and_then(Option::as_ref).is_none()
+            {
+                continue;
+            }
+
+            let mut composed = route.clone();
+            let Some(Some(join_route)) = cases.get(&join).cloned() else {
+                continue;
+            };
+            let Next::Choose { yes, no, .. } = &mut composed.next else {
+                continue;
+            };
+            for (side, target) in [(yes, left), (no, right)] {
+                if target != join {
+                    let Some(Some(branch_route)) = cases.get(&target).cloned() else {
+                        valid = false;
+                        break;
+                    };
+                    valid &= splice_unique_successor(side, target, &branch_route);
+                }
+            }
+            if !valid || !splice_unique_successor(&mut composed, join, &join_route) {
+                continue;
+            }
+
+            // Keep exact source statements, including all conditional effects,
+            // lexical blocks, return/throw statements and original assignments.
+            let first = text_of(predecessor)?;
+            let last = text_of(join)?;
+            let branching = if indirect.len() == 2 {
+                let a = indirect[0];
+                let b = indirect[1];
+                format!(
+                    "if ({}) {{ {}; }} else {{ {}; }}",
+                    tests.get(&a)?,
+                    text_of(a)?,
+                    text_of(b)?,
+                )
+            } else {
+                let target = *indirect.first()?;
+                format!("if ({}) {{ {}; }}", tests.get(&target)?, text_of(target)?)
+            };
+            let region = format!("{{ {first};\n{branching}\n{last}; }}");
+            *cases.get_mut(&predecessor)?.as_mut()? = composed;
+            indirect.push(join);
+            return Some((
+                BTreeMap::from([(predecessor, region)]),
+                indirect.into_iter().collect(),
+            ));
+        }
+    }
+
+    Some((BTreeMap::new(), BTreeSet::new()))
+}
+
 /// Return values that cannot throw or execute user code. Reading a resolved
 /// function-scoped binding is safe even before assignment (it yields
 /// undefined), unlike a block-scoped binding with a temporal dead zone.
@@ -1721,12 +1900,13 @@ pub(crate) fn prune_exception_dispatcher(
         work.extend(next);
     }
 
-    // Fuse single-entry state regions without duplicating their bodies.
-    // Preserve the original numeric state write, original try/catch, and
-    // successor's complete source statement. Only the inert loop boundary
-    // and proven pure state comparisons disappear.
+    // Prefer a complete single-entry conditional region when both arms
+    // reconverge: emit both original branch bodies and their common join
+    // exactly once, without introducing a new catch boundary. Fall back to
+    // the simpler single-successor merge for straight-line cases. Only one
+    // region is absorbed per pass; subsequent iterations can recover more.
     let (combined_regions, absorbed_regions) = if known_bool(&loop_stmt.test) == Some(true) {
-        single_entry_exception_regions(
+        let (diamond, absorbed) = exception_diamond_regions(
             dispatcher,
             state,
             ExceptionEntryProof {
@@ -1737,7 +1917,23 @@ pub(crate) fn prune_exception_dispatcher(
             &retargeted,
             &effects,
             source,
-        )?
+        )?;
+        if absorbed.is_empty() {
+            single_entry_exception_regions(
+                dispatcher,
+                state,
+                ExceptionEntryProof {
+                    roots: &roots,
+                    reachable: &reachable,
+                },
+                &mut cases,
+                &retargeted,
+                &effects,
+                source,
+            )?
+        } else {
+            (diamond, absorbed)
+        }
     } else {
         (BTreeMap::new(), BTreeSet::new())
     };

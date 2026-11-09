@@ -2696,7 +2696,7 @@ mod tests {
         );
         assert!(!compact.contains("elseif(state===4)"), "{}", result.source);
         assert!(
-            compact.contains("if(state===4)returnlog;"),
+            compact.contains("state=4") && compact.contains("returnlog;"),
             "{}",
             result.source
         );
@@ -3054,6 +3054,229 @@ mod tests {
             result.source
         );
         assert!(flat.contains("return[state,log]"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_single_entry_diamond_shared_effectful_join() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = flag ? 2 : 3;
+                    else if (state === 2) { log.push("left"); state = 4; }
+                    else if (state === 3) { log.push("right"); state = 4; }
+                    else if (state === 4) { log.push("join"); return log; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state===4)"), "{}", result.source);
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"left\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"right\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(flat.matches("returnlog;").count(), 1, "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_triangle_without_cloning_join() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 4;
+                    else if (state == 2) { log.push("detour"); state = 4; }
+                    else if (state == 4) { log.push("join"); return [state, log]; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state==4)"), "{}", result.source);
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"detour\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(flat.contains("return[state,log]"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_diamond_retains_competing_catch_entry() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("left"); state = 4; }
+                    else if (state == 3) { log.push("right"); state = 4; }
+                    else if (state == 4) { log.push("join"); return log; }
+                    else if (state == 6) { state = 4; }
+                } catch (error) { log.push(error.message); state = 6; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==4)"),
+            "shared catch-reachable join cannot be absorbed: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_diamond_throw_preserves_original_catch_state() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("left"); state = 4; }
+                    else if (state == 3) { log.push("right"); state = 4; }
+                    else if (state == 4) {
+                        log.push("before-throw");
+                        throw Error("expected");
+                    }
+                } catch (error) { log.push(error.message); return [state, log]; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state==4)"), "{}", result.source);
+        assert_eq!(
+            flat.matches("log.push(\"before-throw\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(flat.contains("return[state,log]"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_diamond_preserves_backedge_and_effect_count() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1, rounds = 0;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("left"); state = 4; }
+                    else if (state == 3) { log.push("right"); state = 4; }
+                    else if (state == 4) {
+                        log.push("join");
+                        if (rounds++ < 1) state = 1;
+                        else return log;
+                    }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(
+            flat.contains("state=1"),
+            "backedge must survive: {}",
+            result.source
+        );
+        assert!(flat.contains("returnlog;"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_diamond_preserves_independent_side_catch_root() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1, first = true;
+                while (true) try {
+                    if (state == 1) {
+                        if (first) { first = false; throw Error("retry"); }
+                        state = flag ? 2 : 3;
+                    } else if (state == 2) { log.push("left"); state = 4; }
+                    else if (state == 3) { log.push("right"); state = 4; }
+                    else if (state == 4) { log.push("join"); return log; }
+                } catch (error) { log.push(error.message); state = 2; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==2)"),
+            "catch-root entry must survive: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
     }
 
     #[test]

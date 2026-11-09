@@ -318,3 +318,97 @@ console.log(JSON.stringify([
     divergentPredecessor(true),
     divergentPredecessor(false)
 ]));
+
+
+function diamondJoin(flag) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state === 1) state = flag ? 2 : 3;
+        else if (state === 2) { log.push("left"); state = 4; }
+        else if (state === 3) { log.push("right"); state = 4; }
+        else if (state === 4) { log.push("join"); return [state, log]; }
+    } catch (error) { throw error; }
+}
+function triangleJoin(flag) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state == 1) state = flag ? 2 : 4;
+        else if (state == 2) { log.push("detour"); state = 4; }
+        else if (state == 4) { log.push("join"); return [state, log]; }
+    } catch (error) { throw error; }
+}
+function diamondThrowCatch(flag) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state == 1) state = flag ? 2 : 3;
+        else if (state == 2) { log.push("left"); state = 4; }
+        else if (state == 3) { log.push("right"); state = 4; }
+        else if (state == 4) {
+            log.push("before-throw");
+            throw Error("expected");
+        }
+    } catch (error) {
+        log.push(error.message);
+        return [state, log];
+    }
+}
+function diamondCompetingCatchRoot(flag) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state == 1) state = flag ? 2 : 3;
+        else if (state == 2) { log.push("left"); state = 4; }
+        else if (state == 3) { log.push("right"); state = 4; }
+        else if (state == 4) { log.push("join"); return log; }
+        else if (state == 6) state = 4;
+    } catch (error) {
+        log.push(error.message);
+        state = 6;
+    }
+}
+console.log(JSON.stringify([
+    "diamond-join-regions",
+    diamondJoin(true), diamondJoin(false),
+    triangleJoin(true), triangleJoin(false),
+    diamondThrowCatch(true), diamondThrowCatch(false),
+    diamondCompetingCatchRoot(true), diamondCompetingCatchRoot(false)
+]));
+
+
+function diamondBackedge(flag) {
+    const log = [];
+    let state = 1, rounds = 0;
+    while (true) try {
+        if (state == 1) state = flag ? 2 : 3;
+        else if (state == 2) { log.push("left"); state = 4; }
+        else if (state == 3) { log.push("right"); state = 4; }
+        else if (state == 4) {
+            log.push("join");
+            if (rounds++ < 1) state = 1;
+            else return log;
+        }
+    } catch (error) { throw error; }
+}
+function diamondIndependentSideCatchRoot(flag) {
+    const log = [];
+    let state = 1, first = true;
+    while (true) try {
+        if (state == 1) {
+            if (first) { first = false; throw Error("retry"); }
+            state = flag ? 2 : 3;
+        } else if (state == 2) { log.push("left"); state = 4; }
+        else if (state == 3) { log.push("right"); state = 4; }
+        else if (state == 4) { log.push("join"); return log; }
+    } catch (error) {
+        log.push(error.message);
+        state = 2;
+    }
+}
+console.log(JSON.stringify([
+    "diamond-cycles-and-catch-roots",
+    diamondBackedge(true), diamondBackedge(false),
+    diamondIndependentSideCatchRoot(true), diamondIndependentSideCatchRoot(false)
+]));
