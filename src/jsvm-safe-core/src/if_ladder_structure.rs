@@ -1561,8 +1561,9 @@ fn single_entry_exception_regions(
 /// (entry -> left/right -> join) and triangles (entry -> side/join -> join).
 ///
 /// The proof is over *source-case* predecessors, not raw conditional edges.
-/// Independent catch/initializer entries, other predecessors, and cycles
-/// through the region are rejected by the incoming-edge checks. All original
+/// Independent catch/initializer entries and competing incoming edges are
+/// rejected. A join may loop back to the entry in a later iteration, but no
+/// side or join may be entered from outside the proven region. All original
 /// source statements remain inside the same try block and keep their numeric
 /// state writes, so throwing effects retain their catch-visible state.
 fn exception_diamond_regions(
