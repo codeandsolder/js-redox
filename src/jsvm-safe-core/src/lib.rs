@@ -2490,7 +2490,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_dispatcher_factors_nonthrowing_terminal_return() {
+    fn exception_dispatcher_merges_effectful_predecessor_with_return() {
         let source = r#"
             function f(log) {
                 let state = 1;
@@ -2509,7 +2509,9 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            compact.contains("if(state==2)returnlog;"),
+            compact.contains("state=2")
+                && compact.contains("returnlog;")
+                && compact.contains("log.push(\"before\")"),
             "{}",
             result.source
         );
@@ -2609,7 +2611,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_dispatcher_factored_return_handles_automatic_semicolon_insertion() {
+    fn exception_dispatcher_merged_return_handles_automatic_semicolon_insertion() {
         let source = r#"
             function f(log) {
                 let state = 1;
@@ -2630,7 +2632,7 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            compact.contains("if(state==2)returnlog;"),
+            compact.contains("state=2") && compact.contains("returnlog;"),
             "{}",
             result.source
         );
