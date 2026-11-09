@@ -3280,6 +3280,55 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_composes_diamond_with_disjoint_linear_region() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = flag ? 2 : 3;
+                    else if (state === 2) { log.push("left"); state = 4; }
+                    else if (state === 3) { log.push("right"); state = 4; }
+                    else if (state === 4) { log.push("join"); state = 5; }
+                    else if (state === 5) { log.push("tail"); state = 6; }
+                    else if (state === 6) { log.push("finish"); return log; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("if(state===4)"),
+            "diamond's shared join must be emitted only once: {}",
+            result.source
+        );
+        assert!(
+            !compact.contains("if(state===6)"),
+            "disjoint linear region must also be merged: {}",
+            result.source
+        );
+        for effect in ["left", "right", "join", "tail", "finish"] {
+            assert_eq!(
+                compact.matches(&format!("log.push(\"{effect}\")")).count(),
+                1,
+                "{}",
+                result.source
+            );
+        }
+        assert_eq!(
+            compact.matches("returnlog;").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_handles_inert_array_literal_loop_test() {
         let source = r#"
             function f(flag) {

@@ -412,3 +412,22 @@ console.log(JSON.stringify([
     diamondBackedge(true), diamondBackedge(false),
     diamondIndependentSideCatchRoot(true), diamondIndependentSideCatchRoot(false)
 ]));
+
+
+function diamondWithIndependentLinearMerge(flag) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state === 1) state = flag ? 2 : 3;
+        else if (state === 2) { log.push("left"); state = 4; }
+        else if (state === 3) { log.push("right"); state = 4; }
+        else if (state === 4) { log.push("join"); state = 5; }
+        else if (state === 5) { log.push("tail"); state = 6; }
+        else if (state === 6) { log.push("finish"); return [state, log]; }
+    } catch (error) { throw error; }
+}
+console.log(JSON.stringify([
+    "diamond-plus-independent-linear",
+    diamondWithIndependentLinearMerge(true),
+    diamondWithIndependentLinearMerge(false)
+]));
