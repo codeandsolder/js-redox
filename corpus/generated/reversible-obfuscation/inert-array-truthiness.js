@@ -217,3 +217,54 @@ console.log(JSON.stringify([
     inertLiteralReturn(true),
     inertLiteralReturn(false)
 ]));
+
+
+function oneEntryEffectfulRegion(flag) {
+    const events = [];
+    let state = 1;
+    while (true) try {
+        if (state == 1) state = 2;
+        else if (state == 2) {
+            events.push("effect");
+            state = flag ? 3 : 4;
+        } else if (state == 3) return ["left", events];
+        else if (state == 4) return ["right", events];
+    } catch (error) { throw error; }
+}
+function oneEntryCaughtException() {
+    const events = [];
+    let state = 1;
+    while (true) try {
+        if (state === 1) state = 2;
+        else if (state === 2) {
+            events.push("before-throw");
+            throw Error("expected");
+        }
+    } catch (error) {
+        events.push(error.message);
+        return [state, events];
+    }
+}
+function independentCatchEntry() {
+    const events = [];
+    let state = 1, first = true;
+    while (true) try {
+        if (state == 1) {
+            if (first) { first = false; throw Error("retry"); }
+            state = 2;
+        } else if (state == 2) {
+            events.push("entered-two");
+            state = 3;
+        } else if (state == 3) return events;
+    } catch (error) {
+        events.push(error.message);
+        state = 2;
+    }
+}
+console.log(JSON.stringify([
+    "single-entry-regions",
+    oneEntryEffectfulRegion(true),
+    oneEntryEffectfulRegion(false),
+    oneEntryCaughtException(),
+    independentCatchEntry()
+]));

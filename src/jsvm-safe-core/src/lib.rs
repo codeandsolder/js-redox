@@ -2346,7 +2346,11 @@ mod tests {
         let output = deobfuscate(cycle, 12);
         assert!(output.is_some(), "valid source");
         let Some(output) = output else { unreachable!() };
-        assert!(output.source.contains("state==2"), "{}", output.source);
+        assert!(
+            output.source.contains("state=2") && output.source.contains("state=1"),
+            "{}",
+            output.source
+        );
         let effectful = r#"
             function f(log) {
                 let state=1;
@@ -2547,7 +2551,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_dispatcher_retains_potentially_throwing_return_state() {
+    fn exception_dispatcher_merges_throwing_return_in_original_catch_scope() {
         let source = r#"
             function f(object, log) {
                 let state = 1;
@@ -2566,8 +2570,8 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            compact.contains("state==2"),
-            "getter may throw: {}",
+            compact.contains("state=2") && compact.contains("returnobject.value"),
+            "getter must retain state and expression: {}",
             result.source
         );
         assert!(compact.contains("returnobject.value"), "{}", result.source);
@@ -2753,6 +2757,138 @@ mod tests {
         );
         assert!(
             compact.contains("if(state===3)return\"three\";"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_single_entry_effectful_region() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) { state = 2; }
+                    else if (state == 2) {
+                        log.push("effect");
+                        state = flag ? 3 : 4;
+                    } else if (state == 3) return "left";
+                    else if (state == 4) return "right";
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state==2)"), "{}", result.source);
+        assert!(
+            flat.contains("state=2;") && flat.contains("log.push(\"effect\")"),
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"effect\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_multiple_incoming_region() {
+        let source = r#"
+            function f(flag) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) state = 4;
+                    else if (state == 3) state = 4;
+                    else if (state == 4) return flag;
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // Two independent incoming edges must share, not clone, the terminal.
+        assert_eq!(flat.matches("returnflag;").count(), 1, "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_catch_root_to_single_entry_candidate() {
+        let source = r#"
+            function f(log) {
+                let state = 1, first = true;
+                while (true) try {
+                    if (state == 1) {
+                        if (first) { first = false; throw Error("retry"); }
+                        state = 2;
+                    } else if (state == 2) { log.push("resumed"); state = 3; }
+                    else if (state == 3) return log;
+                } catch (error) { log.push(error.message); state = 2; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==2)"),
+            "catch-entry body remains: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"resumed\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_target_that_can_throw() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = 2;
+                    else if (state === 2) {
+                        log.push("at-two");
+                        throw Error("oops");
+                    }
+                } catch (error) { log.push(error.message); return [state, log]; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("state=2") && flat.contains("throwError("),
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"at-two\")").count(),
+            1,
             "{}",
             result.source
         );

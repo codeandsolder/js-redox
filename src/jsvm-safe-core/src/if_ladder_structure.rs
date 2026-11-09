@@ -1411,6 +1411,104 @@ fn print_terminal_edits(
     Some(text)
 }
 
+/// Merge a state with its sole entering predecessor, without cloning its body.
+///
+/// The source predecessor must consist only of a direct numeric state
+/// assignment; the target must have exactly one incoming CFG edge and no
+/// independent initializer/catch entry. The original target statement runs
+/// inside the same try block after the assignment, so a thrown exception
+/// observes the same state as in the original next iteration.
+///
+/// A new wrapper block contains two *sibling* source statements. Neither the
+/// predecessor nor the wrapper creates lexical bindings, and the target's
+/// existing block (if any) retains its own lexical scope.
+fn single_entry_exception_regions(
+    dispatcher: &Statement<'_>,
+    state: &str,
+    roots: &BTreeSet<u64>,
+    reachable: &BTreeSet<u64>,
+    cases: &mut BTreeMap<u64, Option<Route>>,
+    edits: &BTreeMap<u64, Vec<TerminalStateEdit>>,
+    effects: &ExceptionLoopEffectContext<'_>,
+    source: &str,
+) -> Option<(BTreeMap<u64, String>, BTreeSet<u64>)> {
+    let mut statements = BTreeMap::new();
+    let mut cursor = dispatcher;
+    loop {
+        let Statement::IfStatement(branch) = cursor else {
+            return None;
+        };
+        if branch.test.may_have_side_effects(effects) {
+            return None;
+        }
+        let label = state_test(&branch.test, state)?;
+        statements.insert(label, &branch.consequent);
+        match branch.alternate.as_ref() {
+            Some(other @ Statement::IfStatement(_)) => cursor = other,
+            None => break,
+            Some(_) => return None,
+        }
+    }
+
+    let mut incoming = BTreeMap::<u64, Vec<u64>>::new();
+    for &label in reachable {
+        let mut targets = Vec::new();
+        cases.get(&label)?.as_ref()?.targets(&mut targets);
+        for target in targets {
+            incoming.entry(target).or_default().push(label);
+        }
+    }
+
+    let mut combined = BTreeMap::new();
+    let mut absorbed = BTreeSet::new();
+    let mut occupied = BTreeSet::new();
+    for &predecessor in reachable {
+        if occupied.contains(&predecessor) {
+            continue;
+        }
+        let Some(&body) = statements.get(&predecessor) else {
+            continue;
+        };
+        let Some(target) = inert_exception_transition(body, state) else {
+            continue;
+        };
+        if target == predecessor
+            || !reachable.contains(&target)
+            || roots.contains(&target)
+            || occupied.contains(&target)
+            || edits.contains_key(&predecessor)
+        {
+            continue;
+        }
+        if incoming
+            .get(&target)
+            .is_none_or(|edges| edges.len() != 1 || edges[0] != predecessor)
+        {
+            continue;
+        }
+        let Some(&successor) = statements.get(&target) else {
+            continue;
+        };
+        // A contextual function/class declaration can change Annex B binding
+        // semantics when moved. Such a statement is not a modeled route.
+        if cases.get(&target)?.is_none() {
+            continue;
+        }
+        let first = fragment(source, body.span());
+        let second = match edits.get(&target) {
+            Some(replacements) => print_terminal_edits(successor, source, replacements)?,
+            None => fragment(source, successor.span()).to_owned(),
+        };
+        let next = cases.get(&target)?.as_ref()?.next.clone();
+        cases.get_mut(&predecessor)?.as_mut()?.next = next;
+        combined.insert(predecessor, format!("{{ {first};\n{second} }}"));
+        absorbed.insert(target);
+        occupied.insert(predecessor);
+        occupied.insert(target);
+    }
+    Some((combined, absorbed))
+}
+
 /// Return values that cannot throw or execute user code. Reading a resolved
 /// function-scoped binding is safe even before assignment (it yields
 /// undefined), unlike a block-scoped binding with a temporal dead zone.
@@ -1565,7 +1663,7 @@ pub(crate) fn prune_exception_dispatcher(
     let mut roots = writes.targets;
     roots.insert(initial);
     let mut reachable = BTreeSet::new();
-    let mut work = VecDeque::from_iter(roots);
+    let mut work = VecDeque::from_iter(roots.iter().copied());
     while let Some(current) = work.pop_front() {
         if current == exit || !reachable.insert(current) {
             continue;
@@ -1574,6 +1672,38 @@ pub(crate) fn prune_exception_dispatcher(
         let mut next = Vec::new();
         route.targets(&mut next);
         work.extend(next);
+    }
+
+    // Fuse single-entry state regions without duplicating their bodies.
+    // Preserve the original numeric state write, original try/catch, and
+    // successor's complete source statement. Only the inert loop boundary
+    // and proven pure state comparisons disappear.
+    let (combined_regions, absorbed_regions) = if known_bool(&loop_stmt.test) == Some(true) {
+        single_entry_exception_regions(
+            dispatcher,
+            state,
+            &roots,
+            &reachable,
+            &mut cases,
+            &retargeted,
+            &effects,
+            source,
+        )?
+    } else {
+        (BTreeMap::new(), BTreeSet::new())
+    };
+    if !absorbed_regions.is_empty() {
+        reachable.clear();
+        let mut work = VecDeque::from_iter(roots.iter().copied());
+        while let Some(current) = work.pop_front() {
+            if current == exit || !reachable.insert(current) {
+                continue;
+            }
+            let route = cases.get(&current)?.as_ref()?;
+            let mut next = Vec::new();
+            route.targets(&mut next);
+            work.extend(next);
+        }
     }
 
     // Extract a single common return sink rather than duplicating it in
@@ -1640,12 +1770,18 @@ pub(crate) fn prune_exception_dispatcher(
             .iter()
             .any(|(terminal, _, _)| *terminal == label)
         {
-            // The guarded return is emitted exactly once after the
-            // dispatcher. This source branch has no other effects.
+            // One common terminal return is emitted after the dispatcher.
+        } else if absorbed_regions.contains(&label) {
+            // Its original body now occurs inside the sole entering region,
+            // so no declaration or observable effect is discarded.
         } else if reachable.contains(&label) {
-            let consequent = match retargeted.get(&label) {
-                Some(edits) => print_terminal_edits(&branch.consequent, source, edits)?,
-                None => fragment(source, branch.consequent.span()).to_owned(),
+            let consequent = if let Some(region) = combined_regions.get(&label) {
+                region.clone()
+            } else {
+                match retargeted.get(&label) {
+                    Some(edits) => print_terminal_edits(&branch.consequent, source, edits)?,
+                    None => fragment(source, branch.consequent.span()).to_owned(),
+                }
             };
             alternatives.push(format!(
                 "if ({}) {consequent}",
