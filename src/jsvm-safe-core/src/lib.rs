@@ -2215,6 +2215,46 @@ mod tests {
     }
 
     #[test]
+    fn folds_inert_nonempty_array_truthiness_without_skipping_evaluation() {
+        let source = r#"
+            function f(log) {
+                let n=0;
+                while(!["", null, 1, false, [2], {}, /x/, void 0] == 0) {
+                    log.push(++n);
+                    if(n==2) break;
+                }
+                return log;
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(
+            result.is_some(),
+            "inert array should allow constant folding"
+        );
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(flat.contains("while(true)"), "{}", result.source);
+    }
+
+    #[test]
+    fn non_inert_array_truthiness_keeps_observable_effects_and_tdz_reads() {
+        for source in [
+            "function f(log){let n=0;while(![log.push('tick')]==0){if(++n==2)break;}return log;}",
+            "function f(iter){while(![...iter]==0){break;}}",
+            "function f(){try{while(![later]==0){break;}}catch(e){return e.name;}let later=1;}",
+        ] {
+            let result = deobfuscate(source, 12);
+            let output = result.map_or_else(|| source.to_owned(), |result| result.source);
+            let compact: String = output.chars().filter(|ch| !ch.is_whitespace()).collect();
+            assert!(compact.contains("while(!["), "{source} -> {output}");
+        }
+    }
+
+    #[test]
     fn exception_dispatcher_handles_inert_array_literal_loop_test() {
         let source = r#"
             function f(flag) {

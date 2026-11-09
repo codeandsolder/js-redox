@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 32] = [
+const MAIN_FIXTURES: [&str; 33] = [
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
@@ -36,6 +36,7 @@ const MAIN_FIXTURES: [&str; 32] = [
     "early-abrupt-state-dispatch.js",
     "exception-resume-state.js",
     "boolean-switch.js",
+    "inert-array-truthiness.js",
     "static-alias-installer-calls.js",
     "static-alias-live-forwarding.js",
 ];
@@ -155,6 +156,9 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
         }
         "boolean-switch.js" => {
             assert!(count(report, "boolean_switch_structured") >= 2);
+        }
+        "inert-array-truthiness.js" => {
+            assert!(count(report, "constant_fold") >= 2);
         }
         "proven-helper-prune.js" => {
             assert!(!outcome.source.contains("function pruneMe"));

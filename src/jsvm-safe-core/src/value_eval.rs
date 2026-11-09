@@ -7,8 +7,8 @@
 //! may resolve identifiers only after independently proving their bindings safe.
 
 use oxc_ast::ast::{
-    Expression, IdentifierReference, LogicalExpression, StringLiteral, TemplateElement,
-    UnaryExpression,
+    ArrayExpressionElement, Expression, IdentifierReference, LogicalExpression, StringLiteral,
+    TemplateElement, UnaryExpression,
 };
 use oxc_ecmascript::{StringToNumber, ToInt32, ToUint32};
 use oxc_syntax::number::ToJsString;
@@ -158,6 +158,59 @@ where
     }
 }
 
+/// A literal expression whose complete evaluation cannot access bindings,
+/// invoke user code, or throw. Fresh array/RegExp/object allocations have
+/// no externally visible effect until their values escape.
+fn inert_literal_value(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::StringLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::BooleanLiteral(_) => true,
+        Expression::TemplateLiteral(template) => template.expressions.is_empty(),
+        Expression::ArrayExpression(array) => array.elements.iter().all(inert_array_element),
+        Expression::ObjectExpression(object) => object.properties.is_empty(),
+        Expression::ParenthesizedExpression(paren) => inert_literal_value(&paren.expression),
+        Expression::UnaryExpression(unary)
+            if matches!(unary.operator.as_str(), "!" | "void" | "typeof") =>
+        {
+            inert_literal_value(&unary.argument)
+        }
+        Expression::UnaryExpression(unary)
+            if matches!(unary.operator.as_str(), "+" | "-" | "~") =>
+        {
+            inert_literal_value(&unary.argument) && eval(&unary.argument).is_some()
+        }
+        Expression::BinaryExpression(binary) => {
+            inert_literal_value(&binary.left)
+                && inert_literal_value(&binary.right)
+                && eval(expr).is_some()
+        }
+        Expression::LogicalExpression(logical) => {
+            inert_literal_value(&logical.left) && inert_literal_value(&logical.right)
+        }
+        Expression::ConditionalExpression(conditional) => {
+            inert_literal_value(&conditional.test)
+                && inert_literal_value(&conditional.consequent)
+                && inert_literal_value(&conditional.alternate)
+        }
+        Expression::SequenceExpression(sequence) => {
+            sequence.expressions.iter().all(inert_literal_value)
+        }
+        _ => false,
+    }
+}
+
+fn inert_array_element(element: &ArrayExpressionElement<'_>) -> bool {
+    match element {
+        ArrayExpressionElement::Elision(_) => true,
+        ArrayExpressionElement::SpreadElement(_) => false,
+        _ => element.as_expression().is_some_and(inert_literal_value),
+    }
+}
+
 pub fn known_bool_with_resolver<'a, F>(expr: &Expression<'a>, resolve: &F) -> Option<bool>
 where
     F: Fn(&IdentifierReference<'a>) -> Option<Value>,
@@ -166,7 +219,7 @@ where
         return Some(v.truthy());
     }
     match expr {
-        Expression::ArrayExpression(v) if v.elements.is_empty() => Some(true),
+        Expression::ArrayExpression(v) if v.elements.iter().all(inert_array_element) => Some(true),
         Expression::ObjectExpression(v) if v.properties.is_empty() => Some(true),
         Expression::ParenthesizedExpression(v) => known_bool_with_resolver(&v.expression, resolve),
         _ => None,
