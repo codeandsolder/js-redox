@@ -2392,6 +2392,100 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_retargets_effectful_terminal_assignment() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) { log.push("start"); state = 2; }
+                    else if (state == 2) state = 3;
+                    else if (state == 3) { log.push("finish"); state = 4; }
+                    else if (state == 4) return log;
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("state==2"), "{}", result.source);
+        assert!(
+            flat.contains("log.push(\"start\");state=3"),
+            "{}",
+            result.source
+        );
+        assert!(flat.contains("log.push(\"finish\")"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_retargets_conditional_and_sequence_terminals() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        log.push("enter");
+                        state = flag ? 2 : (log.push("condition-false"), 5);
+                    } else if (state == 2) state = 3;
+                    else if (state == 3) { log.push("true"); state = 6; }
+                    else if (state == 5) { log.push("false"); state = 6; }
+                    else if (state == 6) return log;
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("state==2"), "{}", result.source);
+        assert!(flat.contains("flag?3:"), "{}", result.source);
+        assert!(
+            flat.contains("log.push(\"condition-false\")"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_retains_catch_root_even_if_other_entries_skip_it() {
+        let source = r#"
+            function f(log) {
+                let state = 1, first = true;
+                while (true) try {
+                    if (state == 1) {
+                        log.push("normal");
+                        if (first) { first = false; throw Error("once"); }
+                        state = 2;
+                    } else if (state == 2) state = 3;
+                    else if (state == 3) return log;
+                } catch (error) {
+                    log.push(error.message);
+                    state = 2;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(flat.contains("state==2"), "{}", result.source);
+        assert!(flat.contains("state=3"), "{}", result.source);
+        assert!(flat.contains("log.push(\"normal\")"), "{}", result.source);
+    }
+
+    #[test]
     fn exception_dispatcher_handles_inert_array_literal_loop_test() {
         let source = r#"
             function f(flag) {

@@ -1246,6 +1246,171 @@ fn resolve_inert_exception_chain(start: u64, silent: &BTreeMap<u64, u64>) -> Opt
     Some(current)
 }
 
+/// One AST terminal assignment that can be retargeted from a silent state.
+/// The emitted source and graph edge must change together.
+#[derive(Clone)]
+struct TerminalStateEdit {
+    span: oxc_span::Span,
+    from: u64,
+    to: u64,
+}
+
+fn terminal_rhs_edits(
+    expr: &Expression<'_>,
+    silent: &BTreeMap<u64, u64>,
+    edits: &mut Vec<TerminalStateEdit>,
+) {
+    match unparen(expr) {
+        Expression::ConditionalExpression(branch) => {
+            terminal_rhs_edits(&branch.consequent, silent, edits);
+            terminal_rhs_edits(&branch.alternate, silent, edits);
+        }
+        Expression::SequenceExpression(sequence) => {
+            if let Some(last) = sequence.expressions.last() {
+                terminal_rhs_edits(last, silent, edits);
+            }
+        }
+        value if inert_literal_value(value) => {
+            if let Some(crate::value_eval::Value::Number(number)) = eval(value) {
+                if let Some(from) = exact_u64(number) {
+                    if let Some(to) = resolve_inert_exception_chain(from, silent) {
+                        if from != to {
+                            edits.push(TerminalStateEdit {
+                                span: value.span(),
+                                from,
+                                to,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn terminal_assignment_edits(
+    expr: &Expression<'_>,
+    state: &str,
+    silent: &BTreeMap<u64, u64>,
+    edits: &mut Vec<TerminalStateEdit>,
+) {
+    match unparen(expr) {
+        Expression::AssignmentExpression(assign)
+            if assign.operator.as_str() == "="
+                && direct_assignment_name(&assign.left) == Some(state) =>
+        {
+            terminal_rhs_edits(&assign.right, silent, edits);
+        }
+        Expression::SequenceExpression(sequence) => {
+            if let Some(last) = sequence.expressions.last() {
+                terminal_assignment_edits(last, state, silent, edits);
+            }
+        }
+        Expression::ConditionalExpression(branch) => {
+            terminal_assignment_edits(&branch.consequent, state, silent, edits);
+            terminal_assignment_edits(&branch.alternate, state, silent, edits);
+        }
+        _ => {}
+    }
+}
+
+/// Follow only terminal statement shapes supported by the route parser.
+/// Prefix statements retain all their existing effects and state writes.
+fn terminal_statement_edits(
+    statement: &Statement<'_>,
+    state: &str,
+    silent: &BTreeMap<u64, u64>,
+    edits: &mut Vec<TerminalStateEdit>,
+) {
+    match statement {
+        Statement::ExpressionStatement(expr) => {
+            terminal_assignment_edits(&expr.expression, state, silent, edits);
+        }
+        Statement::BlockStatement(block) => {
+            if let Some(last) = block.body.last() {
+                terminal_statement_edits(last, state, silent, edits);
+            }
+        }
+        Statement::IfStatement(branch) => {
+            terminal_statement_edits(&branch.consequent, state, silent, edits);
+            if let Some(alternate) = &branch.alternate {
+                terminal_statement_edits(alternate, state, silent, edits);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_route_targets(route: &mut Route, redirect: &BTreeMap<u64, u64>) {
+    fn rewrite(next: &mut Next, redirect: &BTreeMap<u64, u64>) {
+        match next {
+            Next::State(target) => {
+                if let Some(destination) = redirect.get(target) {
+                    *target = *destination;
+                }
+            }
+            Next::Choose { yes, no, .. } => {
+                rewrite(&mut yes.next, redirect);
+                rewrite(&mut no.next, redirect);
+            }
+        }
+    }
+    rewrite(&mut route.next, redirect);
+}
+
+/// Each rewritten source terminal must correspond to exactly one modelled
+/// CFG edge. Unmodelled or differently parsed forms stay unchanged.
+fn verified_terminal_edits(
+    statement: &Statement<'_>,
+    state: &str,
+    silent: &BTreeMap<u64, u64>,
+    route: &mut Route,
+) -> Vec<TerminalStateEdit> {
+    let mut edits = Vec::new();
+    terminal_statement_edits(statement, state, silent, &mut edits);
+    let mut edge_targets = Vec::new();
+    route.targets(&mut edge_targets);
+    let mut edge_counts = BTreeMap::new();
+    for target in edge_targets {
+        *edge_counts.entry(target).or_insert(0_usize) += 1;
+    }
+    let mut edit_counts = BTreeMap::new();
+    for edit in &edits {
+        *edit_counts.entry(edit.from).or_insert(0_usize) += 1;
+    }
+    let redirect = edits
+        .iter()
+        .filter(|edit| edit_counts.get(&edit.from) == edge_counts.get(&edit.from))
+        .map(|edit| (edit.from, edit.to))
+        .collect::<BTreeMap<_, _>>();
+    edits.retain(|edit| redirect.contains_key(&edit.from));
+    if !redirect.is_empty() {
+        rewrite_route_targets(route, &redirect);
+    }
+    edits
+}
+
+fn print_terminal_edits(
+    statement: &Statement<'_>,
+    source: &str,
+    edits: &[TerminalStateEdit],
+) -> Option<String> {
+    let span = statement.span();
+    let mut text = fragment(source, span).to_owned();
+    let mut ordered = edits.to_vec();
+    ordered.sort_by_key(|edit| std::cmp::Reverse(edit.span.start));
+    for edit in ordered {
+        let start = usize::try_from(edit.span.start.checked_sub(span.start)?).ok()?;
+        let end = usize::try_from(edit.span.end.checked_sub(span.start)?).ok()?;
+        if start > end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            return None;
+        }
+        text.replace_range(start..end, &edit.to.to_string());
+    }
+    Some(text)
+}
+
 /// Preserve exception-handling scope and the original one-state-per-iteration
 /// execution order. Only remove state comparisons proven unreachable from
 /// both the lexical initializer and every statically possible catch recovery.
@@ -1326,14 +1491,25 @@ pub(crate) fn prune_exception_dispatcher(
                 Some(_) => return None,
             }
         }
-        for (&label, &target) in &silent {
-            let Some(destination) = resolve_inert_exception_chain(target, &silent) else {
-                continue;
+        // Retarget terminal numeric assignments in any supported branch, not
+        // only in already-silent branches. Prefix effects and conditions
+        // remain in their original positions; the CFG and text edits agree.
+        let mut cursor = dispatcher;
+        loop {
+            let Statement::IfStatement(branch) = cursor else {
+                return None;
             };
-            if destination != target {
-                let route = cases.get_mut(&label)?.as_mut()?;
-                *route = Route::jump(state, destination);
-                retargeted.insert(label, destination);
+            let label = state_test(&branch.test, state)?;
+            if let Some(Some(route)) = cases.get_mut(&label) {
+                let edits = verified_terminal_edits(&branch.consequent, state, &silent, route);
+                if !edits.is_empty() {
+                    retargeted.insert(label, edits);
+                }
+            }
+            match branch.alternate.as_ref() {
+                Some(other @ Statement::IfStatement(_)) => cursor = other,
+                None => break,
+                Some(_) => return None,
             }
         }
     }
@@ -1364,10 +1540,10 @@ pub(crate) fn prune_exception_dispatcher(
         };
         let label = state_test(&branch.test, state)?;
         if reachable.contains(&label) {
-            let consequent = retargeted.get(&label).map_or_else(
-                || fragment(source, branch.consequent.span()).to_owned(),
-                |destination| format!("{{ {state} = {destination}; }}"),
-            );
+            let consequent = match retargeted.get(&label) {
+                Some(edits) => print_terminal_edits(&branch.consequent, source, edits)?,
+                None => fragment(source, branch.consequent.span()).to_owned(),
+            };
             alternatives.push(format!(
                 "if ({}) {consequent}",
                 fragment(source, branch.test.span()),

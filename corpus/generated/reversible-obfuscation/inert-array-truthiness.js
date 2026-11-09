@@ -82,3 +82,34 @@ function catchIntoSilentChain() {
     }
 }
 console.log(JSON.stringify([collapsedSilentChain(false),collapsedSilentChain(true),catchIntoSilentChain()]));
+
+
+function effectfulTerminal(flag) {
+    const events=[];
+    let state=1;
+    while(true) try {
+        if(state==1) {
+            events.push("enter");
+            state=flag?2:(events.push("alternative"),5);
+        } else if(state==2) state=3;
+        else if(state==3) { events.push("true"); state=6; }
+        else if(state==5) { events.push("false"); state=6; }
+        else if(state==6) return events;
+    } catch(error) { throw error; }
+}
+function catchRootTerminal() {
+    const events=[];
+    let state=1, first=true;
+    while(true) try {
+        if(state==1) {
+            events.push("normal");
+            if(first) { first=false; throw Error("once"); }
+            state=2;
+        } else if(state==2) state=3;
+        else if(state==3) return events;
+    } catch(error) {
+        events.push(error.message);
+        state=2;
+    }
+}
+console.log(JSON.stringify([effectfulTerminal(true),effectfulTerminal(false),catchRootTerminal()]));
