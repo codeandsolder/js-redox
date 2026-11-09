@@ -2211,6 +2211,30 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_handles_inert_array_literal_loop_test() {
+        let source = r#"
+            function f(flag) {
+                let state=1;
+                while(![""]==0) try {
+                    if(state==99) return "unreachable";
+                    else if(state==1) state=flag?2:3;
+                    else if(state==2) return "two";
+                    else if(state==3) return "three";
+                } catch(error) { state=3; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert_eq!(
+            result.transforms.get("exception_state_pruned"),
+            Some(&1),
+            "{result:?}"
+        );
+        assert!(!result.source.contains("unreachable"), "{}", result.source);
+    }
+
+    #[test]
     fn exception_dispatcher_refuses_unknown_reachable_transitions() {
         let source = r#"
             function f(value) {
@@ -2224,6 +2248,49 @@ mod tests {
                     other++;
                     state=3;
                 }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            !result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_refuses_loop_condition_that_mutates_state() {
+        let source = r#"
+            function f(log) {
+                let state=1;
+                while((state=99,true)) try {
+                    if(state==1) return "initial";
+                    else if(state==99) return "condition";
+                    else if(state==2) return "other";
+                } catch(error) { state=2; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            !result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+        assert!(result.source.contains("state==99"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_refuses_effectful_property_read_in_condition() {
+        let source = r#"
+            function f(guard) {
+                let state=1;
+                while(guard.enabled) try {
+                    if(state==1) state=2;
+                    else if(state==2) return 2;
+                    else if(state==99) return 99;
+                } catch(error) { state=2; }
             }
         "#;
         let result = deobfuscate(source, 12);

@@ -14,6 +14,10 @@ use oxc_ast::ast::{
     VariableDeclarationKind, WhileStatement, WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
+use oxc_ecmascript::{
+    side_effects::{MayHaveSideEffects, MayHaveSideEffectsContext, PropertyReadSideEffects},
+    GlobalContext,
+};
 use oxc_semantic::Scoping;
 use oxc_span::GetSpan;
 use oxc_syntax::symbol::SymbolId;
@@ -1168,6 +1172,36 @@ impl<'a> Visit<'a> for ExceptionStateWrites<'_> {
     }
 }
 
+/// The surrounding loop condition is evaluated *before every dispatch*.
+/// Proving state transitions inside the try is insufficient if that condition
+/// can itself write the state or invoke a getter/function which does so.
+struct ExceptionLoopEffectContext<'s> {
+    scoping: &'s Scoping,
+}
+
+impl<'a> GlobalContext<'a> for ExceptionLoopEffectContext<'_> {
+    fn is_global_reference(&self, id: &IdentifierReference<'a>) -> bool {
+        id.reference_id
+            .get()
+            .is_none_or(|reference| self.scoping.get_reference(reference).symbol_id().is_none())
+    }
+}
+
+impl<'a> MayHaveSideEffectsContext<'a> for ExceptionLoopEffectContext<'_> {
+    fn annotations(&self) -> bool {
+        false
+    }
+    fn manual_pure_functions(&self, _callee: &Expression<'_>) -> bool {
+        false
+    }
+    fn property_read_side_effects(&self) -> PropertyReadSideEffects {
+        PropertyReadSideEffects::All
+    }
+    fn unknown_global_side_effects(&self) -> bool {
+        true
+    }
+}
+
 /// Preserve exception-handling scope and the original one-state-per-iteration
 /// execution order. Only remove state comparisons proven unreachable from
 /// both the lexical initializer and every statically possible catch recovery.
@@ -1183,6 +1217,10 @@ pub(crate) fn prune_exception_dispatcher(
     scoping: &Scoping,
     source: &str,
 ) -> Option<String> {
+    let effects = ExceptionLoopEffectContext { scoping };
+    if loop_stmt.test.may_have_side_effects(&effects) {
+        return None;
+    }
     let Statement::TryStatement(protected) = &loop_stmt.body else {
         return None;
     };
