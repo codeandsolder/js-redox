@@ -42,3 +42,73 @@ function selectedOnce(value, out) {
 for (const value of [2, 3, 5, 7, null]) {
     console.log(JSON.stringify([value, run(value, []), selectedOnce(value, [])]));
 }
+
+
+function dynamicCase(flag, log) {
+    switch (!flag) {
+        case true:
+            log.push("first");
+            break;
+        case (log.push("evaluated"), true == []):
+            log.push("dynamic");
+            break;
+        case false:
+            log.push("fallback");
+            break;
+    }
+    return log;
+}
+function fallthrough(flag, log) {
+    switch (!flag) {
+        case true:
+            log.push("first");
+        case (log.push("skipped-label-on-fallthrough"), true == []):
+            log.push("body-after-fallthrough");
+            break;
+        default:
+            log.push("default");
+    }
+    return log;
+}
+function dynamicNonBoolean(flag, log) {
+    switch (!flag) {
+        case false:
+            log.push("known");
+            break;
+        case (log.push("tested"), 17):
+            log.push("number");
+            break;
+        default:
+            log.push("default");
+    }
+    return log;
+}
+function dynamicLabelsAfterKnown(flag, log) {
+    switch (!flag) {
+        case true:
+            log.push("known");
+            break;
+        case (log.push("first-test"), "wrong"):
+            log.push("wrong");
+            break;
+        case (log.push("second-test"), false):
+            log.push("false");
+            break;
+        default:
+            log.push("default");
+    }
+    return log;
+}
+for (const value of [false, true]) {
+    for (const f of [dynamicCase, fallthrough, dynamicNonBoolean, dynamicLabelsAfterKnown]) {
+        const observed = f(value, []);
+        console.log(JSON.stringify([f.name, value, observed]));
+    }
+}
+const originalToString = Array.prototype.toString;
+try {
+    Array.prototype.toString = function() { return "1"; };
+    console.log(JSON.stringify(["monkeypatched", dynamicCase(true, [])]));
+} finally {
+    Array.prototype.toString = originalToString;
+}

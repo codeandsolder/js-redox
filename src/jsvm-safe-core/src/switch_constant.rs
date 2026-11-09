@@ -198,9 +198,89 @@ fn boolean_switch_branch(
     Some(statements.join("\n"))
 }
 
+/// When a boolean switch starts with a pure, statically known case, that
+/// case consumes one entire side of the boolean domain. Cases after it can
+/// be arbitrary dynamic expressions, but are evaluated only on the opposite
+/// side, in their exact source order until the first strict-equality match.
+///
+/// Unlike declaring a synthetic selector variable, this keeps direct eval,
+/// scope, and single selector evaluation intact. The matched body is emitted
+/// once and fallthrough begins at the exact selected case.
+fn structure_boolean_switch_with_dynamic_suffix(
+    node: &SwitchStatement<'_>,
+    source: &str,
+) -> Option<String> {
+    let first = node.cases.first()?.test.as_ref()?;
+    let crate::value_eval::Value::Bool(first_value) = eval(first)? else {
+        return None;
+    };
+    for case in &node.cases {
+        for statement in &case.consequent {
+            let mut hazard = BooleanSwitchBindingHazard::default();
+            hazard.visit_statement(statement);
+            if hazard.0 {
+                return None;
+            }
+        }
+    }
+    let opposite = !first_value;
+    let first_body = boolean_switch_branch(node, Some(0), source)?;
+    let mut choices = Vec::new();
+    let mut default = None;
+    for (index, case) in node.cases.iter().enumerate().skip(1) {
+        let Some(test) = &case.test else {
+            default = Some(index);
+            continue;
+        };
+        match eval(test) {
+            Some(crate::value_eval::Value::Bool(value)) if value == opposite => {
+                // Every later case label would be skipped after this match.
+                // Earlier dynamic tests must still run first.
+                choices.push((None, boolean_switch_branch(node, Some(index), source)?));
+                default = None;
+                break;
+            }
+            Some(_) => {
+                // A pure, non-boolean primitive cannot be strictly equal to
+                // a boolean selector; evaluating it has no visible effect.
+            }
+            None => choices.push((
+                Some(format!(
+                    "{opposite} === ({})",
+                    fragment(source, test.span())
+                )),
+                boolean_switch_branch(node, Some(index), source)?,
+            )),
+        }
+    }
+    let mut other_body = boolean_switch_branch(node, default, source)?;
+    for (condition, body) in choices.into_iter().rev() {
+        other_body = match condition {
+            Some(condition) => format!("if ({condition}) {{\n{body}\n}} else {{\n{other_body}\n}}"),
+            None => format!("{{\n{body}\n}}"),
+        };
+    }
+    let (true_body, false_body) = if first_value {
+        (first_body, other_body)
+    } else {
+        (other_body, first_body)
+    };
+    Some(format!(
+        "{{\nif ({}) {{\n{true_body}\n}} else {{\n{false_body}\n}}\n}}",
+        fragment(source, node.discriminant.span())
+    ))
+}
+
 pub(crate) fn structure_boolean_switch(node: &SwitchStatement<'_>, source: &str) -> Option<String> {
     if !is_boolean_valued(&node.discriminant) || node.cases.is_empty() {
         return None;
+    }
+    if node.cases.iter().any(|case| {
+        case.test
+            .as_ref()
+            .is_some_and(|expr| !matches!(eval(expr), Some(crate::value_eval::Value::Bool(_))))
+    }) {
+        return structure_boolean_switch_with_dynamic_suffix(node, source);
     }
     let mut labels = Vec::with_capacity(node.cases.len());
     let mut default_index = None;
@@ -340,12 +420,55 @@ mod tests {
             "function f(v){switch(!v){case true:let x=1;break;case false: return 2;}}",
             "function f(v){switch(!v){case true:function nested(){}break;case false: return 2;}}",
             "function f(v){switch(!v){case true:if(v)break;other();break;case false:return 2;}}",
-            "function f(v){switch(!v){case true:return 1;case sideEffect():return 2;}}",
+            "function f(v){switch(!v){case sideEffect():return 1;case true:return 2;}}",
             "function f(v){switch(v){case true:return 1;case false:return 2;}}",
         ] {
             let output = transformed(source)?;
             assert!(output.contains("switch"), "{source} -> {output}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn dynamically_evaluated_case_after_known_boolean_case_preserves_order(
+    ) -> Result<(), BudgetExceeded> {
+        let source = r#"
+            function f(flag, log) {
+                switch (!flag) {
+                    case true:
+                        log.push("first");
+                        break;
+                    case (log.push("test"), true == []):
+                        log.push("dynamic");
+                        break;
+                    case false:
+                        log.push("fallback");
+                        break;
+                }
+                return log;
+            }
+        "#;
+        let output = transformed(source)?;
+        assert!(!output.contains("switch"), "{output}");
+        assert!(output.contains("true == []"), "{output}");
+        assert!(output.contains("log.push(\"test\")"), "{output}");
+        assert!(output.contains("log.push(\"first\")"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_first_case_stays_a_switch_without_a_proven_branch_partition(
+    ) -> Result<(), BudgetExceeded> {
+        let source = r#"
+            function f(flag, log) {
+                switch (!flag) {
+                    case (log.push("test"), true == []): log.push("dynamic"); break;
+                    case false: log.push("fallback"); break;
+                }
+            }
+        "#;
+        let output = transformed(source)?;
+        assert!(output.contains("switch"), "{output}");
         Ok(())
     }
 
