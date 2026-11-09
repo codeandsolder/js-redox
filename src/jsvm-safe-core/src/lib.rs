@@ -1257,6 +1257,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             self.push(it.span, text, "constant_switch");
             return;
         }
+        if let Some(text) = switch_constant::structure_boolean_switch(it, self.source) {
+            self.push(it.span, text, "boolean_switch_structured");
+            return;
+        }
         walk::walk_switch_statement(self, it);
     }
 

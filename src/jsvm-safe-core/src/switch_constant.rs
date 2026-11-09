@@ -5,8 +5,8 @@ use crate::{
     fragment,
     value_eval::{eval, same_value},
 };
-use oxc_ast::ast::{Statement, SwitchStatement};
-use oxc_ast_visit::Visit;
+use oxc_ast::ast::{Expression, Statement, SwitchStatement};
+use oxc_ast_visit::{walk, Visit};
 use oxc_span::GetSpan;
 
 /// A discarded switch arm can still declare bindings for the entire switch or
@@ -109,6 +109,136 @@ pub(crate) fn select_constant_switch(node: &SwitchStatement<'_>, source: &str) -
     Some(format!("{{\n{}\n}}", retained.join("\n")))
 }
 
+/// A JavaScript switch with a provably boolean discriminant and pure boolean
+/// labels is ordinary two-way control flow. Preserve the original case-body
+/// execution (including fallthrough) rather than re-evaluating the selector.
+fn is_boolean_valued(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::BooleanLiteral(_) => true,
+        Expression::ParenthesizedExpression(group) => is_boolean_valued(&group.expression),
+        Expression::UnaryExpression(unary) => unary.operator.as_str() == "!",
+        Expression::BinaryExpression(binary) => matches!(
+            binary.operator.as_str(),
+            "==" | "===" | "!=" | "!==" | "<" | "<=" | ">" | ">=" | "in" | "instanceof"
+        ),
+        Expression::LogicalExpression(logical) => {
+            is_boolean_valued(&logical.left) && is_boolean_valued(&logical.right)
+        }
+        Expression::ConditionalExpression(conditional) => {
+            is_boolean_valued(&conditional.consequent) && is_boolean_valued(&conditional.alternate)
+        }
+        Expression::SequenceExpression(sequence) => {
+            sequence.expressions.last().is_some_and(is_boolean_valued)
+        }
+        _ => false,
+    }
+}
+
+/// Switch cases share a lexical environment. A rewrite to separate if blocks
+/// may only happen when no case (including an unselected one) declares a
+/// binding in that environment or in the enclosing function. Nested function
+/// expressions are separate scopes and are not a hazard.
+#[derive(Default)]
+struct BooleanSwitchBindingHazard(bool);
+
+impl<'a> Visit<'a> for BooleanSwitchBindingHazard {
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        if matches!(
+            statement,
+            Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_)
+        ) {
+            self.0 = true;
+        } else {
+            walk::walk_statement(self, statement);
+        }
+    }
+
+    fn visit_variable_declaration(&mut self, _: &oxc_ast::ast::VariableDeclaration<'a>) {
+        self.0 = true;
+    }
+
+    fn visit_function(&mut self, _: &oxc_ast::ast::Function<'a>, _: oxc_syntax::scope::ScopeFlags) {
+    }
+
+    fn visit_arrow_function_expression(&mut self, _: &oxc_ast::ast::ArrowFunctionExpression<'a>) {}
+    fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {}
+}
+
+fn boolean_switch_branch(
+    node: &SwitchStatement<'_>,
+    start: Option<usize>,
+    source: &str,
+) -> Option<String> {
+    let Some(start) = start else {
+        return Some(String::new());
+    };
+    let mut statements = Vec::new();
+    for case in node.cases.iter().skip(start) {
+        for (position, statement) in case.consequent.iter().enumerate() {
+            if let Statement::BreakStatement(brk) = statement {
+                if brk.label.is_none() {
+                    // A terminal top-level break exits this switch, not the
+                    // surrounding loop; after replacement it must disappear.
+                    if position + 1 != case.consequent.len() {
+                        return None;
+                    }
+                    return Some(statements.join("\n"));
+                }
+            }
+            // A conditional break targeting the removed switch cannot be
+            // represented by an if; retain the original statement instead.
+            let mut hazard = SwitchBreakHazard::default();
+            hazard.visit_statement(statement);
+            if hazard.0 {
+                return None;
+            }
+            statements.push(fragment(source, statement.span()));
+        }
+    }
+    Some(statements.join("\n"))
+}
+
+pub(crate) fn structure_boolean_switch(node: &SwitchStatement<'_>, source: &str) -> Option<String> {
+    if !is_boolean_valued(&node.discriminant) || node.cases.is_empty() {
+        return None;
+    }
+    let mut labels = Vec::with_capacity(node.cases.len());
+    let mut default_index = None;
+    for (index, case) in node.cases.iter().enumerate() {
+        let value = match &case.test {
+            Some(expr) => match eval(expr)? {
+                crate::value_eval::Value::Bool(value) => Some(value),
+                _ => return None,
+            },
+            None => {
+                default_index = Some(index);
+                None
+            }
+        };
+        labels.push(value);
+        for statement in &case.consequent {
+            let mut hazard = BooleanSwitchBindingHazard::default();
+            hazard.visit_statement(statement);
+            if hazard.0 {
+                return None;
+            }
+        }
+    }
+
+    let selected = |value: bool| {
+        labels
+            .iter()
+            .position(|label| *label == Some(value))
+            .or(default_index)
+    };
+    let when_true = boolean_switch_branch(node, selected(true), source)?;
+    let when_false = boolean_switch_branch(node, selected(false), source)?;
+    Some(format!(
+        "{{\nif ({}) {{\n{when_true}\n}} else {{\n{when_false}\n}}\n}}",
+        fragment(source, node.discriminant.span())
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::deobfuscate;
@@ -167,6 +297,55 @@ mod tests {
         assert!(output.contains("true"), "{output}");
         assert!(!output.contains("116==68"), "{output}");
         assert!(!output.contains("'12'==12"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn restructures_boolean_switch_with_reversed_cases_fallthrough_and_callbacks(
+    ) -> Result<(), BudgetExceeded> {
+        let source = r#"
+            function f(value, events) {
+                switch (!(value === 3)) {
+                    case false:
+                        events.push("matched");
+                        break;
+                    case true:
+                        events.push("other");
+                        (function() { events.push("callback"); })();
+                        break;
+                }
+                switch (!(value === 5)) {
+                    case true:
+                        events.push("first");
+                    case false:
+                        events.push("after");
+                        break;
+                }
+                return events;
+            }
+        "#;
+        let output = transformed(source)?;
+        assert!(!output.contains("switch"), "{output}");
+        assert!(output.contains("if ("), "{output}");
+        assert!(output.contains("callback"), "{output}");
+        assert!(output.contains("after"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn retains_switch_when_boolean_rewrite_cannot_preserve_bindings_or_breaks(
+    ) -> Result<(), BudgetExceeded> {
+        for source in [
+            "function f(v){switch(!v){case true:var x=1;break;case false: return typeof x;}}",
+            "function f(v){switch(!v){case true:let x=1;break;case false: return 2;}}",
+            "function f(v){switch(!v){case true:function nested(){}break;case false: return 2;}}",
+            "function f(v){switch(!v){case true:if(v)break;other();break;case false:return 2;}}",
+            "function f(v){switch(!v){case true:return 1;case sideEffect():return 2;}}",
+            "function f(v){switch(v){case true:return 1;case false:return 2;}}",
+        ] {
+            let output = transformed(source)?;
+            assert!(output.contains("switch"), "{source} -> {output}");
+        }
         Ok(())
     }
 
