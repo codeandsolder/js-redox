@@ -1594,7 +1594,7 @@ pub(crate) fn prune_exception_dispatcher(
                         if let Some(completion) = terminal_returns.get(&target) {
                             if route.plain_target() == Some(target)
                                 && completion.1.is_none_or(|symbol| {
-                                    scoping.find_binding(scope, scoping.symbol_name(symbol))
+                                    scoping.find_binding(scope, scoping.symbol_name(symbol).into())
                                         == Some(symbol)
                                 })
                             {
