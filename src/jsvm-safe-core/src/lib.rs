@@ -2486,6 +2486,140 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_inlines_nonthrowing_terminal_return() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) { log.push("before"); state = 2; }
+                    else if (state == 2) return log;
+                } catch (error) { log.push("caught"); throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(compact.contains("state=2;returnlog;"), "{}", result.source);
+        assert!(!compact.contains("state==2"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_catch_entry_to_inlined_return() {
+        let source = r#"
+            function f(log) {
+                let state = 1, first = true;
+                while (true) try {
+                    if (state == 1) {
+                        if (first) { first = false; throw Error("once"); }
+                        state = 2;
+                    } else if (state == 2) return log;
+                } catch (error) { log.push(error.message); state = 2; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("state==2"),
+            "catch target must remain: {}",
+            result.source
+        );
+        assert!(compact.contains("returnlog;"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_retains_potentially_throwing_return_state() {
+        let source = r#"
+            function f(object, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = 2;
+                    else if (state == 2) return object.value;
+                } catch (error) { log.push(state); return log; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("state==2"),
+            "getter may throw: {}",
+            result.source
+        );
+        assert!(compact.contains("returnobject.value"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_inlined_return_preserves_enclosing_finally_state() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                try {
+                    while (true) try {
+                        if (state == 1) state = 2;
+                        else if (state == 2) return "done";
+                    } catch (error) { throw error; }
+                } finally {
+                    log.push(state);
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("state=2;return\"done\";"),
+            "{}",
+            result.source
+        );
+        assert!(compact.contains("log.push(state)"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_inlined_return_handles_automatic_semicolon_insertion() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        log.push("before");
+                        state = 2
+                    } else if (state == 2) return log;
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(compact.contains("state=2;returnlog;"), "{}", result.source);
+    }
+
+    #[test]
     fn exception_dispatcher_handles_inert_array_literal_loop_test() {
         let source = r#"
             function f(flag) {

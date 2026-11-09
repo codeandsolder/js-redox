@@ -113,3 +113,63 @@ function catchRootTerminal() {
     }
 }
 console.log(JSON.stringify([effectfulTerminal(true),effectfulTerminal(false),catchRootTerminal()]));
+
+
+function nonthrowingReturn(log) {
+    let state = 1;
+    while (true) try {
+        if (state == 1) { log.push("before"); state = 2; }
+        else if (state == 2) return log;
+    } catch (error) { log.push("caught"); throw error; }
+}
+function catchRootReturn(log) {
+    let state = 1, first = true;
+    while (true) try {
+        if (state == 1) {
+            if (first) { first = false; throw Error("once"); }
+            state = 2;
+        } else if (state == 2) return log;
+    } catch (error) { log.push(error.message); state = 2; }
+}
+function throwingGetterReturn(log) {
+    let state = 1;
+    const object = { get value() { log.push("getter"); throw Error("bad"); } };
+    while (true) try {
+        if (state == 1) state = 2;
+        else if (state == 2) return object.value;
+    } catch (error) {
+        log.push(error.message);
+        log.push(state);
+        return log;
+    }
+}
+console.log(JSON.stringify([
+    nonthrowingReturn([]),
+    catchRootReturn([]),
+    throwingGetterReturn([])
+]));
+
+
+function finallyObservesState(log) {
+    let state = 1;
+    try {
+        while (true) try {
+            if (state == 1) state = 2;
+            else if (state == 2) return "done";
+        } catch (error) { throw error; }
+    } finally { log.push(state); }
+}
+const observed = [];
+const returned = finallyObservesState(observed);
+console.log(JSON.stringify(["finally", returned, observed]));
+
+
+function automaticSemicolonTerminal() {
+    let state = 1;
+    while (true) try {
+        if (state == 1) {
+            state = 2
+        } else if (state == 2) return "asi";
+    } catch (error) { throw error; }
+}
+console.log(JSON.stringify(["automatic-semicolon", automaticSemicolonTerminal()]));

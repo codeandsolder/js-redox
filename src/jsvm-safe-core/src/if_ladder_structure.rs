@@ -1253,6 +1253,7 @@ struct TerminalStateEdit {
     span: oxc_span::Span,
     from: u64,
     to: u64,
+    replacement: String,
 }
 
 fn terminal_rhs_edits(
@@ -1279,6 +1280,7 @@ fn terminal_rhs_edits(
                                 span: value.span(),
                                 from,
                                 to,
+                                replacement: to.to_string(),
                             });
                         }
                     }
@@ -1406,9 +1408,88 @@ fn print_terminal_edits(
         if start > end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
             return None;
         }
-        text.replace_range(start..end, &edit.to.to_string());
+        text.replace_range(start..end, &edit.replacement);
     }
     Some(text)
+}
+
+/// Return values that cannot throw or execute user code. Reading a resolved
+/// function-scoped binding is safe even before assignment (it yields
+/// undefined), unlike a block-scoped binding with a temporal dead zone.
+fn nonthrowing_return(
+    statement: &Statement<'_>,
+    scoping: &Scoping,
+    source: &str,
+) -> Option<(String, Option<SymbolId>)> {
+    let statement = match statement {
+        Statement::BlockStatement(block) if block.body.len() == 1 => &block.body[0],
+        other => other,
+    };
+    let Statement::ReturnStatement(ret) = statement else {
+        return None;
+    };
+    let binding = match ret.argument.as_ref().map(unparen) {
+        Some(Expression::Identifier(id)) => {
+            let symbol = id
+                .reference_id
+                .get()
+                .and_then(|r| scoping.get_reference(r).symbol_id())?;
+            if !scoping
+                .symbol_flags(symbol)
+                .is_function_scoped_declaration()
+                || scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
+            {
+                return None;
+            }
+            Some(symbol)
+        }
+        Some(
+            Expression::NullLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BigIntLiteral(_),
+        )
+        | None => None,
+        _ => return None,
+    };
+    Some((fragment(source, statement.span()).to_owned(), binding))
+}
+
+/// Only direct terminal assignment statements can be replaced by a return:
+/// a conditional/sequence RHS requires preserving its existing branch shape.
+fn terminal_plain_assignment(
+    statement: &Statement<'_>,
+    state: &str,
+    scoping: &Scoping,
+) -> Option<(oxc_span::Span, u64, oxc_syntax::scope::ScopeId)> {
+    match statement {
+        Statement::BlockStatement(block) => {
+            terminal_plain_assignment(block.body.last()?, state, scoping)
+        }
+        Statement::ExpressionStatement(expr) => {
+            let Expression::AssignmentExpression(assign) = unparen(&expr.expression) else {
+                return None;
+            };
+            if assign.operator.as_str() != "="
+                || direct_assignment_name(&assign.left) != Some(state)
+            {
+                return None;
+            }
+            if !inert_literal_value(&assign.right) {
+                return None;
+            }
+            let crate::value_eval::Value::Number(value) = eval(&assign.right)? else {
+                return None;
+            };
+            let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left else {
+                return None;
+            };
+            let scope = scoping.get_reference(id.reference_id.get()?).scope_id();
+            Some((statement.span(), exact_u64(value)?, scope))
+        }
+        _ => None,
+    }
 }
 
 /// Preserve exception-handling scope and the original one-state-per-iteration
@@ -1476,6 +1557,7 @@ pub(crate) fn prune_exception_dispatcher(
     let mut retargeted = BTreeMap::new();
     if known_bool(&loop_stmt.test) == Some(true) {
         let mut silent = BTreeMap::new();
+        let mut terminal_returns = BTreeMap::new();
         let mut cursor = dispatcher;
         loop {
             let Statement::IfStatement(branch) = cursor else {
@@ -1484,6 +1566,9 @@ pub(crate) fn prune_exception_dispatcher(
             let label = state_test(&branch.test, state)?;
             if let Some(target) = inert_exception_transition(&branch.consequent, state) {
                 silent.insert(label, target);
+            }
+            if let Some(completion) = nonthrowing_return(&branch.consequent, scoping, source) {
+                terminal_returns.insert(label, completion);
             }
             match branch.alternate.as_ref() {
                 Some(other @ Statement::IfStatement(_)) => cursor = other,
@@ -1501,7 +1586,39 @@ pub(crate) fn prune_exception_dispatcher(
             };
             let label = state_test(&branch.test, state)?;
             if let Some(Some(route)) = cases.get_mut(&label) {
-                let edits = verified_terminal_edits(&branch.consequent, state, &silent, route);
+                let mut edits = verified_terminal_edits(&branch.consequent, state, &silent, route);
+                if edits.is_empty() {
+                    if let Some((span, target, scope)) =
+                        terminal_plain_assignment(&branch.consequent, state, scoping)
+                    {
+                        if let Some(completion) = terminal_returns.get(&target) {
+                            if route.plain_target() == Some(target)
+                                && completion.1.is_none_or(|symbol| {
+                                    scoping.find_binding(scope, scoping.symbol_name(symbol))
+                                        == Some(symbol)
+                                })
+                            {
+                                // Keep the state assignment: enclosing
+                                // finally blocks and captured closures may
+                                // observe the final numeric state. Executing
+                                // the proven nonthrowing return immediately
+                                // afterward skips only an inert loop test
+                                // and state comparison.
+                                route.next = Next::State(exit);
+                                edits.push(TerminalStateEdit {
+                                    span,
+                                    from: target,
+                                    to: exit,
+                                    replacement: format!(
+                                        "{{ {}; {} }}",
+                                        fragment(source, span).trim_end().trim_end_matches(';'),
+                                        completion.0
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
                 if !edits.is_empty() {
                     retargeted.insert(label, edits);
                 }
