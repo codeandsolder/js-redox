@@ -1558,9 +1558,14 @@ mod tests {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing computed leaf source path"))?;
         let source = fs::read_to_string(context.join(path))?;
+        assert!(source.contains("__redox_lexical_helper"), "{source}");
         assert!(
-            source.contains("true") && source.contains("+ 1"),
+            !source.contains("selector===11") && !source.contains("selector === 11"),
             "{source}"
+        );
+        assert!(
+            leaf["semantic_rewrites"].as_u64().is_some_and(|n| n > 0),
+            "{leaf}"
         );
         Ok(())
     }
