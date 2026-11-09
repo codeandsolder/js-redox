@@ -2912,9 +2912,9 @@ mod tests {
                 } catch (error) { throw error; }
             }
         "#;
-        let Some(result) = deobfuscate(source, 12) else {
-            panic!("valid source")
-        };
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
         let flat: String = result
             .source
             .chars()
@@ -2952,9 +2952,9 @@ mod tests {
                 } catch (error) { throw error; }
             }
         "#;
-        let Some(result) = deobfuscate(source, 12) else {
-            panic!("valid source")
-        };
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
         let flat: String = result
             .source
             .chars()
@@ -2995,9 +2995,9 @@ mod tests {
                 } catch (error) { throw error; }
             }
         "#;
-        let Some(result) = deobfuscate(source, 12) else {
-            panic!("valid source")
-        };
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
         let flat: String = result
             .source
             .chars()
@@ -3038,9 +3038,9 @@ mod tests {
                 } catch (error) { log.push(error.message); return [state, log]; }
             }
         "#;
-        let Some(result) = deobfuscate(source, 12) else {
-            panic!("valid source")
-        };
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
         let flat: String = result
             .source
             .chars()
