@@ -190,3 +190,30 @@ function lexicalShadowingReturn(log) {
 }
 const shadowLog = [];
 console.log(JSON.stringify(["shadowed-return", lexicalShadowingReturn(shadowLog), shadowLog]));
+
+
+function convergentReturn(flag) {
+    const events = [];
+    let state = 1;
+    while (true) try {
+        if (state === 1) state = flag ? 2 : 3;
+        else if (state === 2) { events.push("left"); state = 4; }
+        else if (state === 3) { events.push("right"); state = 4; }
+        else if (state === 4) return events;
+    } catch (error) { throw error; }
+}
+function inertLiteralReturn(flag) {
+    let state = 1;
+    while (true) try {
+        if (state == 1) state = flag ? 2 : 3;
+        else if (state == 2) return ["left", true];
+        else if (state == 3) return ["right", false];
+    } catch (error) { throw error; }
+}
+console.log(JSON.stringify([
+    "factored-convergent",
+    convergentReturn(true),
+    convergentReturn(false),
+    inertLiteralReturn(true),
+    inertLiteralReturn(false)
+]));

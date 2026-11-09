@@ -1253,7 +1253,6 @@ struct TerminalStateEdit {
     span: oxc_span::Span,
     from: u64,
     to: u64,
-    replacement: String,
 }
 
 fn terminal_rhs_edits(
@@ -1280,7 +1279,6 @@ fn terminal_rhs_edits(
                                 span: value.span(),
                                 from,
                                 to,
-                                replacement: to.to_string(),
                             });
                         }
                     }
@@ -1408,7 +1406,7 @@ fn print_terminal_edits(
         if start > end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
             return None;
         }
-        text.replace_range(start..end, &edit.replacement);
+        text.replace_range(start..end, &edit.to.to_string());
     }
     Some(text)
 }
@@ -1443,53 +1441,15 @@ fn nonthrowing_return(
             }
             Some(symbol)
         }
-        Some(
-            Expression::NullLiteral(_)
-            | Expression::BooleanLiteral(_)
-            | Expression::StringLiteral(_)
-            | Expression::NumericLiteral(_)
-            | Expression::BigIntLiteral(_),
-        )
-        | None => None,
+        Some(expr)
+            if inert_literal_value(expr) || matches!(expr, Expression::ThisExpression(_)) =>
+        {
+            None
+        }
+        None => None,
         _ => return None,
     };
     Some((fragment(source, statement.span()).to_owned(), binding))
-}
-
-/// Only direct terminal assignment statements can be replaced by a return:
-/// a conditional/sequence RHS requires preserving its existing branch shape.
-fn terminal_plain_assignment(
-    statement: &Statement<'_>,
-    state: &str,
-    scoping: &Scoping,
-) -> Option<(oxc_span::Span, u64, oxc_syntax::scope::ScopeId)> {
-    match statement {
-        Statement::BlockStatement(block) => {
-            terminal_plain_assignment(block.body.last()?, state, scoping)
-        }
-        Statement::ExpressionStatement(expr) => {
-            let Expression::AssignmentExpression(assign) = unparen(&expr.expression) else {
-                return None;
-            };
-            if assign.operator.as_str() != "="
-                || direct_assignment_name(&assign.left) != Some(state)
-            {
-                return None;
-            }
-            if !inert_literal_value(&assign.right) {
-                return None;
-            }
-            let crate::value_eval::Value::Number(value) = eval(&assign.right)? else {
-                return None;
-            };
-            let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left else {
-                return None;
-            };
-            let scope = scoping.get_reference(id.reference_id.get()?).scope_id();
-            Some((statement.span(), exact_u64(value)?, scope))
-        }
-        _ => None,
-    }
 }
 
 /// Preserve exception-handling scope and the original one-state-per-iteration
@@ -1555,9 +1515,9 @@ pub(crate) fn prune_exception_dispatcher(
     // invariably true. Keep all catch-root entries, and never collapse a
     // self-loop or cyclic chain of effect-free state assignments.
     let mut retargeted = BTreeMap::new();
+    let mut terminal_returns = BTreeMap::new();
     if known_bool(&loop_stmt.test) == Some(true) {
         let mut silent = BTreeMap::new();
-        let mut terminal_returns = BTreeMap::new();
         let mut cursor = dispatcher;
         loop {
             let Statement::IfStatement(branch) = cursor else {
@@ -1586,39 +1546,7 @@ pub(crate) fn prune_exception_dispatcher(
             };
             let label = state_test(&branch.test, state)?;
             if let Some(Some(route)) = cases.get_mut(&label) {
-                let mut edits = verified_terminal_edits(&branch.consequent, state, &silent, route);
-                if edits.is_empty() {
-                    if let Some((span, target, scope)) =
-                        terminal_plain_assignment(&branch.consequent, state, scoping)
-                    {
-                        if let Some(completion) = terminal_returns.get(&target) {
-                            if route.plain_target() == Some(target)
-                                && completion.1.is_none_or(|symbol| {
-                                    scoping.find_binding(scope, scoping.symbol_name(symbol).into())
-                                        == Some(symbol)
-                                })
-                            {
-                                // Keep the state assignment: enclosing
-                                // finally blocks and captured closures may
-                                // observe the final numeric state. Executing
-                                // the proven nonthrowing return immediately
-                                // afterward skips only an inert loop test
-                                // and state comparison.
-                                route.next = Next::State(exit);
-                                edits.push(TerminalStateEdit {
-                                    span,
-                                    from: target,
-                                    to: exit,
-                                    replacement: format!(
-                                        "{{ {}; {} }}",
-                                        fragment(source, span).trim_end().trim_end_matches(';'),
-                                        completion.0
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                }
+                let edits = verified_terminal_edits(&branch.consequent, state, &silent, route);
                 if !edits.is_empty() {
                     retargeted.insert(label, edits);
                 }
@@ -1648,6 +1576,58 @@ pub(crate) fn prune_exception_dispatcher(
         work.extend(next);
     }
 
+    // Extract a single common return sink rather than duplicating it in
+    // predecessor states. Each incoming state assignment remains observable
+    // in its original source position. Only the proven inert loop predicate
+    // and pure numeric dispatch comparisons are advanced across the return.
+    let mut completion_tail = Vec::new();
+    if known_bool(&loop_stmt.test) == Some(true) {
+        let mut cursor = dispatcher;
+        loop {
+            let Statement::IfStatement(branch) = cursor else {
+                return None;
+            };
+            let label = state_test(&branch.test, state)?;
+            if branch.test.may_have_side_effects(&effects) {
+                return None;
+            }
+            if reachable.contains(&label) {
+                if let Some((completion, binding)) = terminal_returns.get(&label) {
+                    // This tail is emitted in the original try block, beside
+                    // the dispatch statement. A return identifier must bind
+                    // to precisely the same symbol in that enclosing scope.
+                    let Expression::BinaryExpression(test) = unparen(&branch.test) else {
+                        return None;
+                    };
+                    let state_id = [unparen(&test.left), unparen(&test.right)]
+                        .into_iter()
+                        .find_map(|side| match side {
+                            Expression::Identifier(id) if id.name == state => Some(id),
+                            _ => None,
+                        })?;
+                    let scope = scoping
+                        .get_reference(state_id.reference_id.get()?)
+                        .scope_id();
+                    if binding.is_none_or(|symbol| {
+                        scoping.find_binding(scope, scoping.symbol_name(symbol).into())
+                            == Some(symbol)
+                    }) {
+                        completion_tail.push((
+                            label,
+                            fragment(source, branch.test.span()).to_owned(),
+                            completion.clone(),
+                        ));
+                    }
+                }
+            }
+            match branch.alternate.as_ref() {
+                Some(other @ Statement::IfStatement(_)) => cursor = other,
+                None => break,
+                Some(_) => return None,
+            }
+        }
+    }
+
     let mut alternatives = Vec::new();
     let mut hoisted = HoistedVars::default();
     let mut cursor = dispatcher;
@@ -1656,7 +1636,13 @@ pub(crate) fn prune_exception_dispatcher(
             return None;
         };
         let label = state_test(&branch.test, state)?;
-        if reachable.contains(&label) {
+        if completion_tail
+            .iter()
+            .any(|(terminal, _, _)| *terminal == label)
+        {
+            // The guarded return is emitted exactly once after the
+            // dispatcher. This source branch has no other effects.
+        } else if reachable.contains(&label) {
             let consequent = match retargeted.get(&label) {
                 Some(edits) => print_terminal_edits(&branch.consequent, source, edits)?,
                 None => fragment(source, branch.consequent.span()).to_owned(),
@@ -1680,13 +1666,23 @@ pub(crate) fn prune_exception_dispatcher(
     if hoisted.unsupported || hoisted.function_declaration {
         return None;
     }
-    if (alternatives.len() == cases.len() && retargeted.is_empty()) || alternatives.is_empty() {
+    if (alternatives.len() == cases.len() && retargeted.is_empty() && completion_tail.is_empty())
+        || (alternatives.is_empty() && completion_tail.is_empty())
+    {
         return None;
     }
-    let mut text = alternatives.remove(0);
-    for branch in alternatives {
-        text.push_str(" else ");
-        text.push_str(&branch);
+    let mut text = if alternatives.is_empty() {
+        String::new()
+    } else {
+        let mut text = alternatives.remove(0);
+        for branch in alternatives {
+            text.push_str(" else ");
+            text.push_str(&branch);
+        }
+        text
+    };
+    for (_, test, completion) in completion_tail {
+        text.push_str(&format!("\nif ({test}) {completion}"));
     }
     if !hoisted.names.is_empty() {
         text = format!(

@@ -2486,7 +2486,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_dispatcher_inlines_nonthrowing_terminal_return() {
+    fn exception_dispatcher_factors_nonthrowing_terminal_return() {
         let source = r#"
             function f(log) {
                 let state = 1;
@@ -2504,8 +2504,17 @@ mod tests {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        assert!(compact.contains("state=2;returnlog;"), "{}", result.source);
-        assert!(!compact.contains("state==2"), "{}", result.source);
+        assert!(
+            compact.contains("if(state==2)returnlog;"),
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("returnlog;").count(),
+            1,
+            "{}",
+            result.source
+        );
     }
 
     #[test]
@@ -2596,7 +2605,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_dispatcher_inlined_return_handles_automatic_semicolon_insertion() {
+    fn exception_dispatcher_factored_return_handles_automatic_semicolon_insertion() {
         let source = r#"
             function f(log) {
                 let state = 1;
@@ -2616,7 +2625,11 @@ mod tests {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        assert!(compact.contains("state=2;returnlog;"), "{}", result.source);
+        assert!(
+            compact.contains("if(state==2)returnlog;"),
+            "{}",
+            result.source
+        );
     }
 
     #[test]
@@ -2644,6 +2657,103 @@ mod tests {
         assert!(
             compact.contains("state==1"),
             "original return binding must survive: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_factors_convergent_return_region_once() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = flag ? 2 : 3;
+                    else if (state === 2) { log.push("left"); state = 4; }
+                    else if (state === 3) { log.push("right"); state = 4; }
+                    else if (state === 4) return log;
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            compact.matches("returnlog;").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(!compact.contains("elseif(state===4)"), "{}", result.source);
+        assert!(
+            compact.contains("if(state===4)returnlog;"),
+            "{}",
+            result.source
+        );
+        assert!(
+            compact.contains("log.push(\"left\")") && compact.contains("log.push(\"right\")"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_factors_multiple_inert_literal_returns() {
+        let source = r#"
+            function f(flag) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) return ["left", true];
+                    else if (state == 3) return ["right", false];
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(compact.matches("return[").count(), 2, "{}", result.source);
+        assert!(compact.contains("if(state==2)return["), "{}", result.source);
+        assert!(compact.contains("if(state==3)return["), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_strict_return_state_comparison() {
+        let source = r#"
+            function f(flag) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = flag ? 2 : 3;
+                    else if (state === 2) return "two";
+                    else if (state === 3) return "three";
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("if(state===2)return\"two\";"),
+            "{}",
+            result.source
+        );
+        assert!(
+            compact.contains("if(state===3)return\"three\";"),
+            "{}",
             result.source
         );
     }
