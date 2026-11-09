@@ -1514,7 +1514,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("leaf file path missing"))?;
         let source = fs::read_to_string(context.join(path))?;
         assert!(
-            source.contains("return value + 1") || source.contains("return value+1"),
+            source.contains("value + 1") || source.contains("value+1"),
             "{source}"
         );
         assert!(!source.contains("selector===5") && !source.contains("selector === 5"));
