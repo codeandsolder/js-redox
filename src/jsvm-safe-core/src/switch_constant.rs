@@ -233,7 +233,13 @@ fn value_after_evaluation(expr: &Expression<'_>) -> Option<crate::value_eval::Va
         Expression::ConditionalExpression(conditional) => {
             let yes = value_after_evaluation(&conditional.consequent)?;
             let no = value_after_evaluation(&conditional.alternate)?;
-            if same_value(&yes, &no) {
+            // JS strict equality equates +0 and -0, but arithmetic does not.
+            // A proof carried into enclosing expressions must preserve the sign.
+            let equivalent = match (&yes, &no) {
+                (Value::Number(left), Value::Number(right)) => left.to_bits() == right.to_bits(),
+                _ => same_value(&yes, &no),
+            };
+            if equivalent {
                 Some(yes)
             } else {
                 None
@@ -637,6 +643,27 @@ mod tests {
         );
         assert!(output.contains("events.push(\"first\")"), "{output}");
         assert!(output.contains("events.push(\"second\")"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn effectful_result_proof_does_not_merge_positive_and_negative_zero(
+    ) -> Result<(), BudgetExceeded> {
+        let source = r#"
+            function f(flag, events) {
+                switch (!flag) {
+                    case 1 / (flag ? 0 : -0) === 1 / 0:
+                        events.push("first");
+                        break;
+                    case false:
+                        events.push("second");
+                        break;
+                }
+                return events;
+            }
+        "#;
+        let output = transformed(source)?;
+        assert!(output.contains("switch"), "{output}");
         Ok(())
     }
 

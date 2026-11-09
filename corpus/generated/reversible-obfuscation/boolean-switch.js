@@ -166,3 +166,19 @@ for (const value of [false, true]) {
         console.log(JSON.stringify(["knownWithSpread", value, throwOnIteration, knownWithSpread(value, [], throwOnIteration)]));
     }
 }
+
+
+function signedZeroCase(flag, events) {
+    switch (!flag) {
+        case 1 / (flag ? 0 : -0) === 1 / 0:
+            events.push("positive");
+            break;
+        case false:
+            events.push("false");
+            break;
+    }
+    return events;
+}
+for (const flag of [false, true]) {
+    console.log(JSON.stringify(["signed-zero", flag, signedZeroCase(flag, [])]));
+}
