@@ -6,10 +6,11 @@
 //! program recovery, not an independently runnable replacement module.
 use crate::source_tree_callflow::{CallerView, ResolvedCallEdge};
 use anyhow::{ensure, Result};
+use jsvm_safe_core::{eval_static_primitive_with_resolver, StaticPrimitiveValue};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, BindingPattern, CallExpression, Expression, Function, IdentifierReference,
-    NewExpression, Statement, WithStatement,
+    NewExpression, Statement, VariableDeclaration, VariableDeclarationKind, WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, SemanticBuilder};
@@ -106,22 +107,90 @@ pub fn literal_calls(source: &str) -> Result<Vec<LiteralCall>> {
     Ok(visitor.calls)
 }
 
-/// Primitive literal arguments at their *original* AST callsites. A spread
-/// consumes an unknown number of positions, so subsequent argument indices
-/// cannot be assigned to fixed formal parameters.
+/// Infer exact primitive values for stable lexical bindings. This accepts
+/// arbitrary expressions handled by the shared side-effect-free ECMAScript
+/// evaluator, not only literal initializers or aliases with the same spelling.
+/// Fixed-point iteration handles const declarations and aliases that occur
+/// before their source binding in the AST without inventing unknown values.
+struct StablePrimitiveBindings<'s> {
+    scoping: &'s Scoping,
+    values: BTreeMap<SymbolId, StaticPrimitiveValue>,
+    changed: bool,
+}
+
+impl<'a> Visit<'a> for StablePrimitiveBindings<'_> {
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        if matches!(
+            declaration.kind,
+            VariableDeclarationKind::Const | VariableDeclarationKind::Let
+        ) {
+            for declarator in &declaration.declarations {
+                let (BindingPattern::BindingIdentifier(id), Some(init)) =
+                    (&declarator.id, &declarator.init)
+                else {
+                    continue;
+                };
+                let Some(symbol) = id.symbol_id.get() else {
+                    continue;
+                };
+                if self.values.contains_key(&symbol)
+                    || !self.scoping.symbol_redeclarations(symbol).is_empty()
+                    || self
+                        .scoping
+                        .get_resolved_reference_ids(symbol)
+                        .iter()
+                        .any(|reference| self.scoping.get_reference(*reference).is_write())
+                {
+                    continue;
+                }
+                let value = eval_static_primitive_with_resolver(init, &|id| {
+                    id.reference_id
+                        .get()
+                        .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
+                        .and_then(|source| self.values.get(&source).cloned())
+                });
+                if let Some(value) = value.filter(|value| value.render().is_some()) {
+                    self.values.insert(symbol, value);
+                    self.changed = true;
+                }
+            }
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
+/// Primitive arguments at exact source-resolved original callsites. Resolve
+/// literal expressions and immutable lexical constant chains by SymbolId.
+/// Calls with a spread stop collecting at its position: later indexes cannot
+/// be reliably mapped to formal parameters.
 struct OriginalCallLiterals<'s> {
     source: &'s str,
+    scoping: &'s Scoping,
+    values: BTreeMap<SymbolId, StaticPrimitiveValue>,
     sites: BTreeMap<[u32; 2], Vec<(usize, String)>>,
 }
 
 impl OriginalCallLiterals<'_> {
+    fn argument_value(&self, arg: &Argument<'_>) -> Option<String> {
+        if let Some(literal) = literal_argument(arg, self.source) {
+            return Some(literal);
+        }
+        eval_static_primitive_with_resolver(arg.as_expression()?, &|id| {
+            id.reference_id
+                .get()
+                .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
+                .and_then(|symbol| self.values.get(&symbol).cloned())
+        })?
+        .render()
+    }
+
     fn remember(&mut self, span: Span, arguments: &[Argument<'_>]) {
         let mut constants = Vec::new();
         for (index, argument) in arguments.iter().enumerate() {
             if matches!(argument, Argument::SpreadElement(_)) {
                 break;
             }
-            if let Some(literal) = literal_argument(argument, self.source) {
+            if let Some(literal) = self.argument_value(argument) {
                 constants.push((index, literal));
             }
         }
@@ -169,6 +238,7 @@ pub struct ResolvedSpecialization {
 struct UnsafeParameterForwarding {
     stack: Vec<[u32; 2]>,
     functions: BTreeSet<[u32; 2]>,
+    dynamic_scope: bool,
 }
 
 impl UnsafeParameterForwarding {
@@ -196,6 +266,7 @@ impl<'a> Visit<'a> for UnsafeParameterForwarding {
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if matches!(unparen(&call.callee), Expression::Identifier(id) if id.name == "eval") {
             self.mark_enclosing();
+            self.dynamic_scope = true;
         }
         walk::walk_call_expression(self, call);
     }
@@ -208,6 +279,7 @@ impl<'a> Visit<'a> for UnsafeParameterForwarding {
 
     fn visit_with_statement(&mut self, stmt: &WithStatement<'a>) {
         self.mark_enclosing();
+        self.dynamic_scope = true;
         walk::walk_with_statement(self, stmt);
     }
 }
@@ -236,13 +308,35 @@ pub fn specialize_resolved_call_graph(
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, original, SourceType::unambiguous());
     ensure!(parsed.is_clean(), "invalid original lexical JavaScript");
+    let semantic = SemanticBuilder::new().build(&parsed.program);
+    let scoping = semantic.semantic.scoping();
+    let mut unsafe_forwarding = UnsafeParameterForwarding::default();
+    unsafe_forwarding.visit_program(&parsed.program);
+
+    // Dynamic with/eval can shadow or mutate a normally resolved identifier
+    // at runtime, so never substitute a value through a lexical reference in
+    // those programs. Pure self-contained argument expressions still work.
+    let mut bindings = StablePrimitiveBindings {
+        scoping,
+        values: BTreeMap::new(),
+        changed: false,
+    };
+    if !unsafe_forwarding.dynamic_scope {
+        loop {
+            bindings.changed = false;
+            bindings.visit_program(&parsed.program);
+            if !bindings.changed {
+                break;
+            }
+        }
+    }
     let mut collector = OriginalCallLiterals {
         source: original,
+        scoping,
+        values: bindings.values,
         sites: BTreeMap::new(),
     };
     collector.visit_program(&parsed.program);
-    let mut unsafe_forwarding = UnsafeParameterForwarding::default();
-    unsafe_forwarding.visit_program(&parsed.program);
 
     let mut outgoing = BTreeMap::<[u32; 2], Vec<&ResolvedCallEdge>>::new();
     for edge in views.iter().flat_map(|view| &view.reachable_edges) {
@@ -555,6 +649,73 @@ mod tests {
     use super::{literal_calls, specialize_function, specialize_resolved_call_graph};
     use crate::source_tree_callflow::reconstruct_caller_views;
     use anyhow::{anyhow, Result};
+
+    #[test]
+    fn evaluates_pure_argument_expressions_and_immutable_lexical_aliases() -> Result<()> {
+        let src = r#"const base=2+3;
+          const doubled=base*2;
+          const through=(v,flag)=>v?flag:0;
+          const leaf=(x,y,z)=>[x,y,z];
+          const api={};api.run=()=>{
+              const other=doubled+1;
+              return leaf(other, !false, through(0,7))
+                  +leaf(2**3, -0, null);
+          };"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        let left = variants
+            .iter()
+            .find(|v| v.helper == "leaf" && v.constants.iter().any(|x| x == &(0, "11".into())))
+            .ok_or_else(|| anyhow!("constant alias expression not recovered: {variants:?}"))?;
+        assert!(left.constants.contains(&(1, "true".into())), "{left:?}");
+        let right = variants
+            .iter()
+            .find(|v| v.helper == "leaf" && v.constants.iter().any(|x| x == &(0, "8".into())))
+            .ok_or_else(|| anyhow!("pure exponent not recovered: {variants:?}"))?;
+        assert!(
+            right
+                .constants
+                .iter()
+                .any(|x| x.0 == 1 && (x.1 == "-0" || x.1 == "(-0)")),
+            "{right:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lexical_symbols_not_name_strings_and_var_hoisting_not_guessed() -> Result<()> {
+        let src = r#"const x=2;const leaf=(a,b)=>a+b;
+          const api={};api.run=()=>{
+            const x=9;
+            if(false) var conditional=7;
+            return leaf(x,conditional);
+          };"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        let leaf = variants
+            .iter()
+            .find(|v| v.helper == "leaf")
+            .ok_or_else(|| anyhow!("missing leaf"))?;
+        assert_eq!(leaf.constants, [(0, "9".into())], "{leaf:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_scope_and_mutated_bindings_are_not_inferred_as_constants() -> Result<()> {
+        for src in [
+            "const leaf=x=>x;const api={};api.run=()=>{let x=3;x=4;return leaf(x);};",
+            "const leaf=x=>x;const api={};api.run=()=>{const x=3;eval('1');return leaf(x);};",
+            "const leaf=x=>x;const api={};api.run=()=>{const x=3;with({x:5})return leaf(x);};",
+        ] {
+            let views = reconstruct_caller_views(src, Some("run"))?;
+            let variants = specialize_resolved_call_graph(src, &views)?;
+            assert!(
+                variants.iter().all(|v| v.helper != "leaf"),
+                "{src}: {variants:?}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn propagates_literal_selectors_through_six_real_lexical_calls() -> Result<()> {
