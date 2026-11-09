@@ -1522,6 +1522,59 @@ mod tests {
     }
 
     #[test]
+    fn source_tree_traces_function_call_wrapper_and_exposes_true_callee() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let input = tmp.path().join("handlers");
+        let output = tmp.path().join("tree");
+        fs::create_dir_all(&input)?;
+        fs::write(input.join("handler.js"), "const capturedHandler=()=>0;")?;
+        let original = tmp.path().join("original.js");
+        fs::write(
+            &original,
+            "const hV=(opcode,selector,flag)=>opcode===88&&selector===4&&flag?'YES':'NO';\
+             const U6=(selector,flag)=>hV.call(this,88,selector,!!flag);\
+             const api={};api.aoF_=()=>U6(4,1);",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: Some("aoF_".into()),
+        })?;
+        let context = output.join("lexical-context");
+        let info: serde_json::Value =
+            serde_json::from_slice(&fs::read(context.join("context.json"))?)?;
+        let edges = info["caller_views"][0]["reachable_edges"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("no resolved call graph"))?;
+        let edge = edges
+            .iter()
+            .find(|edge| edge["call"]["callee"] == "hV")
+            .ok_or_else(|| anyhow::anyhow!("hV was not linked from U6"))?;
+        assert_eq!(edge["call"]["kind"], "function.call");
+        assert_eq!(edge["call"]["this_argument"], "this");
+        assert_eq!(edge["call"]["arguments"][0]["expression"], "88");
+        let leaf = info["graph_specializations"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["helper"] == "hV"))
+            .ok_or_else(|| anyhow::anyhow!("missing source-specialized hV"))?;
+        assert_eq!(
+            leaf["arguments"],
+            serde_json::json!([[0, "88"], [1, "4"], [2, "true"]])
+        );
+        assert_eq!(leaf["example_call_chain"].as_array().map(Vec::len), Some(2));
+        let path = leaf["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("hV source path missing"))?;
+        let readable = fs::read_to_string(context.join(path))?;
+        assert!(readable.contains("YES"), "{readable}");
+        Ok(())
+    }
+
+    #[test]
     fn source_tree_computes_original_argument_expression_through_two_callers() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let input = tmp.path().join("handlers");

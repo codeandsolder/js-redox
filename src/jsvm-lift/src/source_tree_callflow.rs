@@ -162,8 +162,10 @@ pub struct ArgumentLink {
 pub struct CallLink {
     pub caller: String,
     pub callee: String,
+    /// call / new / function.call. The latter receiver is recorded separately.
     pub kind: &'static str,
     pub span: [u32; 2],
+    pub this_argument: Option<String>,
     pub arguments: Vec<ArgumentLink>,
 }
 
@@ -295,12 +297,55 @@ impl<'a> Visit<'a> for AliasCollector<'_> {
     }
 }
 
+/// A function value's own call property can override Function.prototype.call.
+/// Exclude directly mutated bindings and aliases from exact call-method edges.
+struct CallPropertyWrites<'s> {
+    scoping: &'s Scoping,
+    assigned: BTreeSet<SymbolId>,
+}
+
+impl CallPropertyWrites<'_> {
+    fn mark_member(&mut self, member: &oxc_ast::ast::StaticMemberExpression<'_>) {
+        if !member.optional && member.property.name == "call" {
+            if let Expression::Identifier(id) = unparen(&member.object) {
+                if let Some(symbol) = id
+                    .reference_id
+                    .get()
+                    .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
+                {
+                    self.assigned.insert(symbol);
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Visit<'a> for CallPropertyWrites<'_> {
+    fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
+        if let AssignmentTarget::StaticMemberExpression(member) = &expression.left {
+            self.mark_member(member);
+        }
+        walk::walk_assignment_expression(self, expression);
+    }
+
+    fn visit_unary_expression(&mut self, expression: &oxc_ast::ast::UnaryExpression<'a>) {
+        if expression.operator.as_str() == "delete" {
+            if let Expression::StaticMemberExpression(member) = unparen(&expression.argument) {
+                self.mark_member(member);
+            }
+        }
+        walk::walk_unary_expression(self, expression);
+    }
+}
+
 struct Calls<'s> {
     source: &'s str,
     scoping: &'s Scoping,
     defs: &'s BTreeMap<FunctionKey, Definition>,
     symbols: &'s BTreeMap<SymbolId, FunctionKey>,
     aliases: &'s BTreeMap<SymbolId, SymbolId>,
+    blocked_call_targets: &'s BTreeSet<FunctionKey>,
+    dynamic_scope: bool,
     stack: Vec<FunctionKey>,
     edges: BTreeMap<FunctionKey, Vec<(FunctionKey, CallLink)>>,
 }
@@ -328,8 +373,17 @@ impl Calls<'_> {
         let Some(&caller_key) = self.stack.last() else {
             return;
         };
-        let Expression::Identifier(id) = unparen(callee) else {
-            return;
+        let (id, skip_receiver, kind) = match unparen(callee) {
+            Expression::Identifier(id) => (id, false, kind),
+            Expression::StaticMemberExpression(member)
+                if kind == "call" && !member.optional && member.property.name == "call" =>
+            {
+                let Expression::Identifier(id) = unparen(&member.object) else {
+                    return;
+                };
+                (id, true, "function.call")
+            }
+            _ => return,
         };
         let Some(target_symbol) = id
             .reference_id
@@ -341,6 +395,15 @@ impl Calls<'_> {
         let Some(&callee_key) = self.symbols.get(&target_symbol) else {
             return;
         };
+        // A spread in receiver position may supply zero or several values;
+        // no subsequent fixed formal parameter position can be inferred.
+        if skip_receiver
+            && (self.dynamic_scope
+                || self.blocked_call_targets.contains(&callee_key)
+                || matches!(args.first(), Some(Argument::SpreadElement(_))))
+        {
+            return;
+        }
         let Some(caller) = self.defs.get(&caller_key) else {
             return;
         };
@@ -350,6 +413,7 @@ impl Calls<'_> {
         let mut prior_spread = false;
         let arguments = args
             .iter()
+            .skip(usize::from(skip_receiver))
             .map(|arg| {
                 let spread = matches!(arg, Argument::SpreadElement(_));
                 let positional = !prior_spread && !spread;
@@ -395,6 +459,12 @@ impl Calls<'_> {
             callee: target.label.clone(),
             kind,
             span: [span.start, span.end],
+            this_argument: if skip_receiver {
+                args.first()
+                    .map(|arg| fragment(self.source, arg.span()).to_owned())
+            } else {
+                None
+            },
             arguments,
         };
         self.edges
@@ -635,7 +705,7 @@ impl CallerView {
 fn format_view(view: &CallerView, original: &str) -> String {
     let mut output = format!("# Caller-oriented lexical forwarding: `{}`\n\n", view.entry);
     output.push_str("This is a **source-derived reading view**, not a rewritten executable. ");
-    output.push_str("Edges resolve original Oxc lexical symbols and direct calls/constructors. ");
+    output.push_str("Edges resolve original lexical symbols, direct calls, constructors and eligible Function.call invocations. ");
     output.push_str("Parameter arrows trace unchanged, directly forwarded bindings only. ");
     output.push_str("Potential indirect `eval`, mapped `arguments`, or dynamic mutations require runtime analysis before claiming values are invariant.\n\n");
     for path in &view.paths {
@@ -645,6 +715,11 @@ fn format_view(view: &CallerView, original: &str) -> String {
                 "- `{}` → `{}` (**{}** at source bytes {}..{})\n",
                 edge.caller, edge.callee, edge.kind, edge.span[0], edge.span[1]
             ));
+            if let Some(receiver) = &edge.this_argument {
+                output.push_str(&format!(
+                    "  - this receiver: {receiver} (not a formal parameter)\n"
+                ));
+            }
             for (idx, arg) in edge.arguments.iter().enumerate() {
                 let prefix = arg.caller_param.as_ref().map_or_else(
                     || "dynamic expression".to_owned(),
@@ -832,12 +907,24 @@ pub fn reconstruct_caller_views(
         }
     }
 
+    let mut call_writes = CallPropertyWrites {
+        scoping,
+        assigned: BTreeSet::new(),
+    };
+    call_writes.visit_program(&parsed.program);
+    let blocked_call_targets = call_writes
+        .assigned
+        .iter()
+        .filter_map(|symbol| expanded.get(symbol).copied())
+        .collect::<BTreeSet<_>>();
     let mut collector = Calls {
         source,
         scoping,
         defs: &finder.functions,
         symbols: &expanded,
         aliases: &aliases.aliases,
+        blocked_call_targets: &blocked_call_targets,
+        dynamic_scope: dynamic_scope.found,
         stack: Vec::new(),
         edges: BTreeMap::new(),
     };
@@ -910,6 +997,105 @@ pub fn reconstruct_caller_views(
 #[cfg(test)]
 mod tests {
     use super::reconstruct_caller_views;
+
+    #[test]
+    fn source_resolved_function_call_preserves_receiver_and_formal_offsets() -> anyhow::Result<()> {
+        let source = r#"const leaf=(a,b)=>a*10+b;
+            const alias=leaf;
+            const wrapper=(x)=>alias.call({kind:"receiver"},8,x);
+            const api={};api.run=()=>wrapper(3);"#;
+        let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
+        let edge = view
+            .reachable_edges
+            .iter()
+            .find(|edge| edge.call.callee == "leaf" && edge.call.kind == "function.call")
+            .ok_or_else(|| anyhow::anyhow!("missing lexical Function.call edge"))?;
+        assert_eq!(edge.call.arguments.len(), 2);
+        assert_eq!(edge.call.arguments[0].expression, "8");
+        assert_eq!(edge.call.arguments[1].caller_param_index, Some(0));
+        assert_eq!(
+            edge.call.this_argument.as_deref(),
+            Some("{kind:\"receiver\"}")
+        );
+        assert_eq!(view.reachable_edges.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn function_call_property_mutation_rejects_false_edges() -> anyhow::Result<()> {
+        for mutation in [
+            "leaf.call=function(){return 0;};",
+            "const alias=leaf;alias.call=function(){return 0;};",
+            "delete leaf.call;",
+        ] {
+            let source=format!(
+                "const leaf=x=>x;{mutation}const middle=x=>leaf.call(null,7);const api={{}};api.run=()=>middle(1);"
+            );
+            let view = reconstruct_caller_views(&source, Some("run"))?.remove(0);
+            assert!(
+                view.reachable_edges
+                    .iter()
+                    .all(|edge| edge.call.callee != "leaf"),
+                "{mutation}: {view:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shadowed_or_dynamic_function_call_target_is_not_original_lexical_function(
+    ) -> anyhow::Result<()> {
+        let source = r#"const leaf=x=>x;
+            const wrapper=(leaf,value)=>leaf.call(null,value);
+            const api={};api.run=()=>wrapper(x=>x*2,7);"#;
+        let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
+        assert!(
+            view.reachable_edges
+                .iter()
+                .all(|edge| edge.call.callee != "leaf"),
+            "{view:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spreading_receiver_or_dynamic_eval_disables_exact_function_call_edges() -> anyhow::Result<()>
+    {
+        let cases=[
+            "const leaf=x=>x;const wrapper=a=>leaf.call(...a,9);",
+            "const leaf=x=>x;const wrapper=()=>{eval('leaf.call=function(){}');return leaf.call(null,9);};",
+        ];
+        for body in cases {
+            let src = format!("{body}const api={{}};api.run=()=>wrapper([]);");
+            let view = reconstruct_caller_views(&src, Some("run"))?.remove(0);
+            assert!(
+                view.reachable_edges
+                    .iter()
+                    .all(|edge| edge.call.callee != "leaf"),
+                "{view:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn spread_after_function_call_receiver_does_not_shift_original_parameter_indexes(
+    ) -> anyhow::Result<()> {
+        let source = r#"const leaf=(a,b,c)=>c;
+            const wrapper=(x,y,z)=>leaf.call(null,x,...y,z);
+            const api={};api.run=()=>wrapper(1,[],3);"#;
+        let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
+        let edge = view
+            .reachable_edges
+            .iter()
+            .find(|edge| edge.call.callee == "leaf")
+            .ok_or_else(|| anyhow::anyhow!("missing Function.call edge"))?;
+        assert_eq!(edge.call.arguments.len(), 3);
+        assert!(edge.call.arguments[0].positional);
+        assert!(!edge.call.arguments[1].positional);
+        assert!(!edge.call.arguments[2].positional);
+        Ok(())
+    }
 
     #[test]
     fn complete_graph_reaches_beyond_display_depth_and_preserves_cycles() -> anyhow::Result<()> {

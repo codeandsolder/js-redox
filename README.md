@@ -451,8 +451,13 @@ cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
   path/to/original.js work/caller-views --entry-member someMethod --specialize
 ~~~
 
-The tool recovers source-resolved direct call and constructor targets throughout
-the reachable graph, not only calls in extracted handlers. Each callsite's
+The tool recovers source-resolved direct calls, constructors, and eligible
+Function.prototype.call forwarding through original lexical function bindings
+throughout the reachable graph, not only calls in extracted handlers. For a
+function.call(receiver, args...) edge, the receiver is linked separately from
+the actual callee formal arguments, preserving their correct parameter indices.
+Direct property writes/deletions overriding a function's call method, or dynamic
+eval/with, prevent this exact call-method inference. Each callsite's
 **primitive arguments and side-effect-free constant expressions** are matched
 to the original function's formal parameter symbols. This includes immutable
 lexical constants and their chained aliases, resolved by semantic symbol

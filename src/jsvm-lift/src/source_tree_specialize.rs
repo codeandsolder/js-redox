@@ -385,7 +385,16 @@ impl<'a> Visit<'a> for OriginalCallLiterals<'_> {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
-            self.remember(call.span, &call.arguments);
+            let offset = if matches!(
+                unparen(&call.callee),
+                Expression::StaticMemberExpression(member)
+                    if !member.optional && member.property.name == "call"
+            ) {
+                1
+            } else {
+                0
+            };
+            self.remember(call.span, call.arguments.get(offset..).unwrap_or_default());
         }
         walk::walk_call_expression(self, call);
     }
@@ -899,6 +908,42 @@ mod tests {
     use super::{literal_calls, specialize_function, specialize_resolved_call_graph};
     use crate::source_tree_callflow::reconstruct_caller_views;
     use anyhow::{anyhow, Result};
+
+    #[test]
+    fn function_call_wrapper_propagates_literal_selectors_to_true_leaf() -> Result<()> {
+        let source = r#"const leaf=(opcode,selector,flag)=>opcode===88&&selector===4&&flag?7:0;
+            const wrapper=(selector,flag)=>leaf.call(this,88,selector,!!flag);
+            const outer=(selector,flag)=>wrapper(selector,flag);
+            const api={};api.run=()=>outer(4,1);"#;
+        let views = reconstruct_caller_views(source, Some("run"))?;
+        let variants = specialize_resolved_call_graph(source, &views)?;
+        let leaf = variants
+            .iter()
+            .find(|row| row.helper == "leaf")
+            .ok_or_else(|| anyhow!("Function.call leaf not specialized: {variants:?}"))?;
+        assert_eq!(
+            leaf.constants,
+            [(0, "88".into()), (1, "4".into()), (2, "true".into())]
+        );
+        assert_eq!(leaf.example_call_chain.len(), 3);
+        assert!(leaf.specialized.contains("88") || leaf.specialized.contains("true"));
+        Ok(())
+    }
+
+    #[test]
+    fn function_call_wrapper_skips_this_argument_even_when_literal() -> Result<()> {
+        let source = r#"const leaf=(a,b)=>a+b;
+            const wrapper=x=>leaf.call(100,7,x);
+            const api={};api.run=()=>wrapper(2);"#;
+        let views = reconstruct_caller_views(source, Some("run"))?;
+        let variants = specialize_resolved_call_graph(source, &views)?;
+        let leaf = variants
+            .iter()
+            .find(|row| row.helper == "leaf")
+            .ok_or_else(|| anyhow!("missing leaf"))?;
+        assert_eq!(leaf.constants, [(0, "7".into()), (1, "2".into())]);
+        Ok(())
+    }
 
     #[test]
     fn carries_computed_bitwise_and_conditional_values_through_multiple_helpers() -> Result<()> {
