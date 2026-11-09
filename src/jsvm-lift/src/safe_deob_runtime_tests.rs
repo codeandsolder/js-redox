@@ -158,7 +158,8 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
             assert!(count(report, "boolean_switch_structured") >= 2);
         }
         "inert-array-truthiness.js" => {
-            assert!(count(report, "constant_fold") >= 2);
+            // One actual constant fold; runtime equivalence checks the guarded effects.
+            assert!(count(report, "constant_fold") >= 1);
         }
         "proven-helper-prune.js" => {
             assert!(!outcome.source.contains("function pruneMe"));

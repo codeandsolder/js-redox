@@ -2255,6 +2255,143 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_collapses_only_silent_finite_transition_chains() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 57;
+                let recovery = 0;
+                while (![""] == 0) try {
+                    if (state == 57) state = 73;
+                    else if (state == 73) state = 37;
+                    else if (state == 37) state = 25;
+                    else if (state == 25) {
+                        log.push("work");
+                        state = flag ? 92 : 90;
+                    } else if (state == 92) {
+                        recovery = 1;
+                        throw Error("catch");
+                    } else if (state == 90) return log;
+                } catch (error) {
+                    log.push(error.message);
+                    if (recovery == 1) state = 90;
+                    else throw error;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(!compact.contains("state==73"), "{}", result.source);
+        assert!(!compact.contains("state==37"), "{}", result.source);
+        assert!(compact.contains("state=25"), "{}", result.source);
+        assert!(compact.contains("catch(error)"), "{}", result.source);
+        assert!(
+            result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_catch_entry_into_a_silent_chain() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                let raised = false;
+                while (true) try {
+                    if (state == 1) {
+                        if (!raised) { raised = true; throw Error("once"); }
+                        state = 2;
+                    } else if (state == 2) state = 3;
+                    else if (state == 3) state = 4;
+                    else if (state == 4) return log;
+                } catch (error) {
+                    log.push(error.message);
+                    state = 2;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("state==2"),
+            "catch target must remain: {}",
+            result.source
+        );
+        assert!(!compact.contains("state==3"), "{}", result.source);
+        assert!(compact.contains("state=4"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_keeps_silent_cycles_and_effectful_loop_tests() {
+        let cycle = r#"
+            function f() {
+                let state=1;
+                while(true) try {
+                    if(state==1) state=2;
+                    else if(state==2) state=1;
+                } catch(error) { throw error; }
+            }
+        "#;
+        let output = deobfuscate(cycle, 12);
+        assert!(output.is_some(), "valid source");
+        let Some(output) = output else { unreachable!() };
+        assert!(output.source.contains("state==2"), "{}", output.source);
+        let effectful = r#"
+            function f(log) {
+                let state=1;
+                while(log.push("test")) try {
+                    if(state==1) state=2;
+                    else if(state==2) state=3;
+                    else if(state==3) return log;
+                } catch(error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(effectful, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(compact.contains("state==2"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_does_not_coerce_boolean_state_assignments() {
+        let source = r#"
+            function f() {
+                let state=1;
+                while(true) try {
+                    if(state===1) state=true;
+                    else if(state===true) state=3;
+                    else if(state===3) return 3;
+                } catch(error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(compact.contains("state=true"), "{}", result.source);
+    }
+
+    #[test]
     fn exception_dispatcher_handles_inert_array_literal_loop_test() {
         let source = r#"
             function f(flag) {

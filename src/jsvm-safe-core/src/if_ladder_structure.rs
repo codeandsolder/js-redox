@@ -5,8 +5,10 @@
 //! rendered: irreducible graphs and unmodelled state transitions are left
 //! unchanged rather than emitted with altered execution order.
 use crate::{
-    control_flow::direct_assignment_name, direct_identifier_name, fragment, numeric::exact_u64,
-    value_eval::eval,
+    control_flow::direct_assignment_name,
+    direct_identifier_name, fragment,
+    numeric::exact_u64,
+    value_eval::{eval, inert_literal_value, known_bool},
 };
 use oxc_ast::ast::{
     ArrayExpressionElement, AssignmentExpression, AssignmentTarget, BindingPattern, CallExpression,
@@ -1202,6 +1204,48 @@ impl<'a> MayHaveSideEffectsContext<'a> for ExceptionLoopEffectContext<'_> {
     }
 }
 
+/// A numeric-state dispatch branch that only assigns a proven inert primitive
+/// result to the lexical state binding. A single-statement block has the same
+/// effects, but sequences, calls and destructuring are not silent transitions.
+fn inert_exception_transition(statement: &Statement<'_>, state: &str) -> Option<u64> {
+    let statement = match statement {
+        Statement::BlockStatement(block) if block.body.len() == 1 => &block.body[0],
+        other => other,
+    };
+    let Statement::ExpressionStatement(expr) = statement else {
+        return None;
+    };
+    let Expression::AssignmentExpression(assign) = &expr.expression else {
+        return None;
+    };
+    if assign.operator.as_str() != "=" || direct_assignment_name(&assign.left) != Some(state) {
+        return None;
+    }
+    if !inert_literal_value(&assign.right) {
+        return None;
+    }
+    // Strictly numeric state targets: coercing Boolean or null to numbers
+    // would invent a different value under strict-equality dispatch tests.
+    let crate::value_eval::Value::Number(value) = eval(&assign.right)? else {
+        return None;
+    };
+    exact_u64(value)
+}
+
+/// Follow only finite silent transitions: an all-silent cycle must remain a
+/// loop, not be turned into a direct assignment to one of its nodes.
+fn resolve_inert_exception_chain(start: u64, silent: &BTreeMap<u64, u64>) -> Option<u64> {
+    let mut seen = BTreeSet::new();
+    let mut current = start;
+    while let Some(&next) = silent.get(&current) {
+        if !seen.insert(current) {
+            return None;
+        }
+        current = next;
+    }
+    Some(current)
+}
+
 /// Preserve exception-handling scope and the original one-state-per-iteration
 /// execution order. Only remove state comparisons proven unreachable from
 /// both the lexical initializer and every statically possible catch recovery.
@@ -1260,6 +1304,40 @@ pub(crate) fn prune_exception_dispatcher(
     if cases.contains_key(&exit) {
         return None;
     }
+
+    // Skipping an iteration is only valid if its loop predicate is pure and
+    // invariably true. Keep all catch-root entries, and never collapse a
+    // self-loop or cyclic chain of effect-free state assignments.
+    let mut retargeted = BTreeMap::new();
+    if known_bool(&loop_stmt.test) == Some(true) {
+        let mut silent = BTreeMap::new();
+        let mut cursor = dispatcher;
+        loop {
+            let Statement::IfStatement(branch) = cursor else {
+                return None;
+            };
+            let label = state_test(&branch.test, state)?;
+            if let Some(target) = inert_exception_transition(&branch.consequent, state) {
+                silent.insert(label, target);
+            }
+            match branch.alternate.as_ref() {
+                Some(other @ Statement::IfStatement(_)) => cursor = other,
+                None => break,
+                Some(_) => return None,
+            }
+        }
+        for (&label, &target) in &silent {
+            let Some(destination) = resolve_inert_exception_chain(target, &silent) else {
+                continue;
+            };
+            if destination != target {
+                let route = cases.get_mut(&label)?.as_mut()?;
+                *route = Route::jump(state, destination);
+                retargeted.insert(label, destination);
+            }
+        }
+    }
+
     // The outer catch can retry at the state it intercepted, *or* resume
     // from any numeric state it assigns. Treat each catch target as a root;
     // rejecting unknown reachable transitions prevents false dead cases.
@@ -1286,10 +1364,13 @@ pub(crate) fn prune_exception_dispatcher(
         };
         let label = state_test(&branch.test, state)?;
         if reachable.contains(&label) {
+            let consequent = retargeted.get(&label).map_or_else(
+                || fragment(source, branch.consequent.span()).to_owned(),
+                |destination| format!("{{ {state} = {destination}; }}"),
+            );
             alternatives.push(format!(
-                "if ({}) {}",
+                "if ({}) {consequent}",
                 fragment(source, branch.test.span()),
-                fragment(source, branch.consequent.span())
             ));
         } else {
             hoisted.visit_statement(&branch.consequent);
@@ -1306,7 +1387,7 @@ pub(crate) fn prune_exception_dispatcher(
     if hoisted.unsupported || hoisted.function_declaration {
         return None;
     }
-    if alternatives.len() == cases.len() || alternatives.is_empty() {
+    if (alternatives.len() == cases.len() && retargeted.is_empty()) || alternatives.is_empty() {
         return None;
     }
     let mut text = alternatives.remove(0);
