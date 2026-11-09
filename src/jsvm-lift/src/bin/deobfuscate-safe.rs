@@ -1522,6 +1522,50 @@ mod tests {
     }
 
     #[test]
+    fn source_tree_computes_original_argument_expression_through_two_callers() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let input = tmp.path().join("handlers");
+        let output = tmp.path().join("tree");
+        fs::create_dir_all(&input)?;
+        fs::write(input.join("handler.js"), "const capturedHandler = () => 0;")?;
+        let original = tmp.path().join("original.js");
+        fs::write(
+            &original,
+            "const leaf=(selector,flag)=>selector===11?flag+1:flag-1;             const outer=(a,b)=>leaf((a|0)+(b|0),b>4);             const middle=(x,y)=>outer(x,y);             const api={};api.enter=()=>middle(4,7);",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: Some("enter".into()),
+        })?;
+        let context = output.join("lexical-context");
+        let info: serde_json::Value =
+            serde_json::from_slice(&fs::read(context.join("context.json"))?)?;
+        let leaf = info["graph_specializations"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["helper"] == "leaf"))
+            .ok_or_else(|| anyhow::anyhow!("computed leaf missing in source tree"))?;
+        assert_eq!(
+            leaf["arguments"],
+            serde_json::json!([[0, "11"], [1, "true"]])
+        );
+        assert_eq!(leaf["example_call_chain"].as_array().map(Vec::len), Some(3));
+        let path = leaf["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing computed leaf source path"))?;
+        let source = fs::read_to_string(context.join(path))?;
+        assert!(
+            source.contains("true") && source.contains("+ 1"),
+            "{source}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn source_tree_cannot_overwrite_or_contain_original() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let input = temp.path().join("raw");

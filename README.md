@@ -459,10 +459,17 @@ lexical constants and their chained aliases, resolved by semantic symbol
 identity (not spelling); pure JavaScript arithmetic, logical and conditional
 expressions use the same value evaluator as the deobfuscator. It also **carries
 those values through further helper calls whose arguments are unchanged,
-lexically resolved caller parameters**.
+lexically resolved caller parameters**. It also **evaluates pure expressions
+of known caller parameters at each original callsite**, including arithmetic,
+bitwise, comparison and conditional operators. Original AST symbol references
+are matched to formal parameters before any substitution, so shadowed
+identifiers do not become unrelated constants.
 This works at arbitrary graph depth, including cycles, and preserves each
 reachable constant tuple separately rather than combining unrelated caller
-values into impossible variants. Callers using mapped arguments, direct eval,
+values into impossible variants. Recursive computed selectors use
+constant-invariant widening after a representative recursion, rather than
+enumerating unbounded values from expressions such as f(x + 1). Callers using
+mapped arguments, direct eval,
 or dynamic with-scope do not forward inferred parameter constants; programs
 with dynamic eval/with do not infer lexical-identifier constants. Reassigned
 bindings and effects cannot become inferred values. An

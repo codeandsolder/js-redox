@@ -9,8 +9,9 @@ use anyhow::{ensure, Result};
 use jsvm_safe_core::{eval_static_primitive_with_resolver, StaticPrimitiveValue};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, BindingPattern, CallExpression, Expression, Function, IdentifierReference,
-    NewExpression, Statement, VariableDeclaration, VariableDeclarationKind, WithStatement,
+    Argument, BindingPattern, CallExpression, Expression, FormalParameters, Function,
+    IdentifierReference, NewExpression, Statement, VariableDeclaration, VariableDeclarationKind,
+    WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, SemanticBuilder};
@@ -163,11 +164,143 @@ impl<'a> Visit<'a> for StablePrimitiveBindings<'_> {
 /// literal expressions and immutable lexical constant chains by SymbolId.
 /// Calls with a spread stop collecting at its position: later indexes cannot
 /// be reliably mapped to formal parameters.
+#[derive(Clone, Debug)]
+enum ExpressionInput {
+    Parameter(usize),
+    Literal(String),
+}
+
+#[derive(Clone, Debug)]
+struct ExpressionEdit {
+    start: usize,
+    end: usize,
+    input: ExpressionInput,
+}
+
+/// A copy of one original argument expression, with all allowable identifier
+/// substitutions proven against the original lexical semantic SymbolIds.
+#[derive(Clone, Debug)]
+struct OriginalComputedArgument {
+    source: String,
+    edits: Vec<ExpressionEdit>,
+}
+
+impl OriginalComputedArgument {
+    fn evaluate(&self, parameters: &BTreeMap<usize, String>) -> Option<String> {
+        // No parameter-dependent inputs means the ordinary original-source
+        // literal collector already evaluated this expression once.
+        if !self
+            .edits
+            .iter()
+            .any(|edit| matches!(edit.input, ExpressionInput::Parameter(_)))
+        {
+            return None;
+        }
+        let mut source = self.source.clone();
+        for edit in self.edits.iter().rev() {
+            let value = match &edit.input {
+                ExpressionInput::Parameter(index) => parameters.get(index),
+                ExpressionInput::Literal(value) => Some(value),
+            };
+            // Leave unknown parameters unresolved rather than requiring
+            // every reference to be known: JavaScript short-circuit and
+            // conditional evaluation may never read an unknown branch.
+            if let Some(value) = value {
+                source.replace_range(edit.start..edit.end, &format!("({value})"));
+            }
+        }
+        // Parse the substituted expression as ordinary JavaScript and reuse
+        // the shared side-effect-free evaluator. Unresolved identifiers,
+        // effectful calls, assignments, and unsupported coercions remain
+        // unknown rather than inferred.
+        let wrapped = format!("const __redox_value=({source});");
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, &wrapped, SourceType::unambiguous());
+        if !parsed.is_clean() {
+            return None;
+        }
+        let Statement::VariableDeclaration(decl) = parsed.program.body.first()? else {
+            return None;
+        };
+        let expr = decl.declarations.first()?.init.as_ref()?;
+        jsvm_safe_core::eval_static_primitive(expr)?.render()
+    }
+}
+
+struct ExpressionInputs<'s> {
+    scoping: &'s Scoping,
+    expression_start: u32,
+    parameters: &'s BTreeMap<SymbolId, usize>,
+    values: &'s BTreeMap<SymbolId, StaticPrimitiveValue>,
+    edits: Vec<ExpressionEdit>,
+}
+
+impl<'a> Visit<'a> for ExpressionInputs<'_> {
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        let Some(symbol) = id
+            .reference_id
+            .get()
+            .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
+        else {
+            return;
+        };
+        let input = self
+            .parameters
+            .get(&symbol)
+            .copied()
+            .map(ExpressionInput::Parameter)
+            .or_else(|| {
+                self.values
+                    .get(&symbol)
+                    .and_then(|value| value.render())
+                    .map(ExpressionInput::Literal)
+            });
+        if let Some(input) = input {
+            self.edits.push(ExpressionEdit {
+                start: (id.span.start - self.expression_start) as usize,
+                end: (id.span.end - self.expression_start) as usize,
+                input,
+            });
+        }
+    }
+}
+
+fn stable_formal_parameters(
+    params: &FormalParameters<'_>,
+    scoping: &Scoping,
+) -> BTreeMap<SymbolId, usize> {
+    params
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, parameter)| {
+            if parameter.initializer.is_some() {
+                return None;
+            }
+            let BindingPattern::BindingIdentifier(id) = &parameter.pattern else {
+                return None;
+            };
+            let symbol = id.symbol_id.get()?;
+            if !scoping.symbol_redeclarations(symbol).is_empty()
+                || scoping
+                    .get_resolved_reference_ids(symbol)
+                    .iter()
+                    .any(|reference| scoping.get_reference(*reference).is_write())
+            {
+                return None;
+            }
+            Some((symbol, index))
+        })
+        .collect()
+}
+
 struct OriginalCallLiterals<'s> {
     source: &'s str,
     scoping: &'s Scoping,
     values: BTreeMap<SymbolId, StaticPrimitiveValue>,
     sites: BTreeMap<[u32; 2], Vec<(usize, String)>>,
+    computed: BTreeMap<[u32; 2], Vec<Option<OriginalComputedArgument>>>,
+    functions: Vec<BTreeMap<SymbolId, usize>>,
 }
 
 impl OriginalCallLiterals<'_> {
@@ -186,21 +319,70 @@ impl OriginalCallLiterals<'_> {
 
     fn remember(&mut self, span: Span, arguments: &[Argument<'_>]) {
         let mut constants = Vec::new();
+        let mut expressions = Vec::new();
         for (index, argument) in arguments.iter().enumerate() {
             if matches!(argument, Argument::SpreadElement(_)) {
                 break;
             }
             if let Some(literal) = self.argument_value(argument) {
                 constants.push((index, literal));
+                expressions.push(None);
+                continue;
             }
+            let computed = argument.as_expression().and_then(|expr| {
+                let start = expr.span().start;
+                let source = self.source.get(start as usize..expr.span().end as usize)?;
+                let parameters = self.functions.last()?;
+                let mut refs = ExpressionInputs {
+                    scoping: self.scoping,
+                    expression_start: start,
+                    parameters,
+                    values: &self.values,
+                    edits: Vec::new(),
+                };
+                refs.visit_expression(expr);
+                if !refs
+                    .edits
+                    .iter()
+                    .any(|edit| matches!(edit.input, ExpressionInput::Parameter(_)))
+                {
+                    return None;
+                }
+                refs.edits.sort_by_key(|edit| edit.start);
+                Some(OriginalComputedArgument {
+                    source: source.to_owned(),
+                    edits: refs.edits,
+                })
+            });
+            expressions.push(computed);
         }
         if !constants.is_empty() {
             self.sites.insert([span.start, span.end], constants);
+        }
+        if expressions.iter().any(Option::is_some) {
+            self.computed.insert([span.start, span.end], expressions);
         }
     }
 }
 
 impl<'a> Visit<'a> for OriginalCallLiterals<'_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        self.functions
+            .push(stable_formal_parameters(&function.params, self.scoping));
+        walk::walk_function(self, function, flags);
+        self.functions.pop();
+    }
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        self.functions
+            .push(stable_formal_parameters(&function.params, self.scoping));
+        walk::walk_arrow_function_expression(self, function);
+        self.functions.pop();
+    }
+
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional {
             self.remember(call.span, &call.arguments);
@@ -293,6 +475,12 @@ struct CallContext {
     function: [u32; 2],
     constants: Vec<(usize, String)>,
     chain: Vec<[u32; 2]>,
+    /// Exact caller states on this provenance path, including whether each
+    /// incoming edge evaluated an argument depending on a known parameter.
+    history: Vec<([u32; 2], Vec<(usize, String)>, bool)>,
+    /// Delay widening once per recursive target to expose a representative
+    /// recursive iteration, then retain only truly invariant input values.
+    widened_cycles: BTreeSet<[u32; 2]>,
 }
 
 /// Recover function-level variants by tracing *exact* primitive arguments and
@@ -335,6 +523,8 @@ pub fn specialize_resolved_call_graph(
         scoping,
         values: bindings.values,
         sites: BTreeMap::new(),
+        computed: BTreeMap::new(),
+        functions: Vec::new(),
     };
     collector.visit_program(&parsed.program);
 
@@ -358,6 +548,8 @@ pub fn specialize_resolved_call_graph(
             function: view.entry_span,
             constants: Vec::new(),
             chain: Vec::new(),
+            history: vec![(view.entry_span, Vec::new(), false)],
+            widened_cycles: BTreeSet::new(),
         })
         .collect::<VecDeque<_>>();
     let mut visited = BTreeSet::<RequestKey>::new();
@@ -374,9 +566,13 @@ pub fn specialize_resolved_call_graph(
             .cloned()
             .collect::<BTreeMap<_, _>>();
         for edge in edges {
+            // Computed selectors may generate infinitely many distinct
+            // values along a recursive call chain. Loop invariants are
+            // propagated using exact-value intersection below.
             let direct = collector.sites.get(&edge.call.span);
             let forwarded_is_safe = !unsafe_forwarding.functions.contains(&context.function);
             let mut next = Vec::new();
+            let mut computed_here = false;
             for (index, arg) in edge.call.arguments.iter().enumerate() {
                 if !arg.positional {
                     break;
@@ -389,6 +585,16 @@ pub fn specialize_resolved_call_graph(
                             .then_some(arg.caller_param_index)
                             .flatten()
                             .and_then(|from| incoming.get(&from).cloned())
+                    })
+                    .or_else(|| {
+                        let inferred = forwarded_is_safe
+                            .then(|| collector.computed.get(&edge.call.span))
+                            .flatten()
+                            .and_then(|args| args.get(index))
+                            .and_then(Option::as_ref)
+                            .and_then(|computed| computed.evaluate(&incoming));
+                        computed_here |= inferred.is_some();
+                        inferred
                     });
                 if let Some(literal) = literal {
                     next.push((index, literal));
@@ -402,10 +608,39 @@ pub fn specialize_resolved_call_graph(
                     .or_insert_with(|| (edge.call.callee.clone(), BTreeSet::new(), chain.clone()));
                 entry.1.insert(edge.call.span);
             }
+            let mut propagated = next;
+            let mut widened_cycles = context.widened_cycles.clone();
+            if let Some(previous) = context
+                .history
+                .iter()
+                .rposition(|(function, _, _)| *function == edge.to_span)
+            {
+                // Literal/identity forwarding alone draws from a finite set
+                // of source constants and requires no widening. A recursive
+                // computed edge may create new values on each iteration.
+                let computed_in_cycle = computed_here
+                    || context.history[previous + 1..]
+                        .iter()
+                        .any(|(_, _, computed)| *computed);
+                if computed_in_cycle && !widened_cycles.insert(edge.to_span) {
+                    let before = context.history[previous]
+                        .1
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeMap<_, _>>();
+                    propagated.retain(|(index, value)| {
+                        before.get(index).is_some_and(|prior| prior == value)
+                    });
+                }
+            }
+            let mut history = context.history.clone();
+            history.push((edge.to_span, propagated.clone(), computed_here));
             pending.push_back(CallContext {
                 function: edge.to_span,
-                constants: next,
+                constants: propagated,
                 chain,
+                history,
+                widened_cycles,
             });
         }
     }
@@ -649,6 +884,144 @@ mod tests {
     use super::{literal_calls, specialize_function, specialize_resolved_call_graph};
     use crate::source_tree_callflow::reconstruct_caller_views;
     use anyhow::{anyhow, Result};
+
+    #[test]
+    fn carries_computed_bitwise_and_conditional_values_through_multiple_helpers() -> Result<()> {
+        let src = r#"const leaf=(selector,flag)=>selector ? flag : 0;
+            const outer=(left,right)=>leaf((left|0)+(right|0),right>4);
+            const middle=(p,q)=>outer(p,q);
+            const api={};api.run=()=>middle(4,7);"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        let leaf = variants
+            .iter()
+            .find(|v| v.helper == "leaf")
+            .ok_or_else(|| anyhow!("computed leaf was not specialized: {variants:?}"))?;
+        assert_eq!(leaf.constants, [(0, "11".into()), (1, "true".into())]);
+        assert_eq!(leaf.example_call_chain.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn computed_caller_values_do_not_cross_combine_different_paths() -> Result<()> {
+        let src = r#"const leaf=(selector,which)=>selector+which;
+            const middle=(a,b)=>leaf((a<<2)|b,a-b);
+            const api={};api.run=()=>middle(1,2)+middle(3,1);"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        let mut pairs = variants
+            .iter()
+            .filter(|v| v.helper == "leaf")
+            .map(|v| v.constants.clone())
+            .collect::<Vec<_>>();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            [
+                [(0, "13".into()), (1, "2".into())],
+                [(0, "6".into()), (1, "-1".into())]
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn computed_constructor_arguments_respect_original_symbol_identity() -> Result<()> {
+        let src = r#"function Leaf(selector){this.value=selector;}
+            const middle=(x)=>{
+                const nested=(x)=>x+100;
+                return new Leaf((x|0)+4);
+            };
+            const api={};api.run=()=>middle(5);"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        let leaf = variants
+            .iter()
+            .find(|v| v.helper == "Leaf")
+            .ok_or_else(|| anyhow!("computed constructor missing: {variants:?}"))?;
+        assert_eq!(leaf.constants, [(0, "9".into())]);
+        Ok(())
+    }
+
+    #[test]
+    fn computed_arguments_do_not_use_written_params_or_effectful_unknowns() -> Result<()> {
+        for middle in [
+            "const middle=(x)=>{x=10;return leaf(x+2);};",
+            "const middle=function(x){arguments[0]=10;return leaf(x+2);};",
+            "const middle=(x)=>leaf(sideEffect()+x);",
+            "const middle=(x)=>{eval('x=10');return leaf(x+2);};",
+        ] {
+            let src = format!(
+                "const leaf=(selector)=>selector*2;{middle} const api={{}};api.run=()=>middle(5);"
+            );
+            let views = reconstruct_caller_views(&src, Some("run"))?;
+            let variants = specialize_resolved_call_graph(&src, &views)?;
+            assert!(
+                variants.iter().all(|v| v.helper != "leaf"),
+                "{middle}: {variants:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn computed_argument_with_undefined_parameter_is_not_assumed_known() -> Result<()> {
+        let src = r#"const leaf=(selector)=>selector;
+            const middle=(x,y)=>leaf(x+(y|0));
+            const api={};api.run=(unknown)=>middle(3,unknown);"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        assert!(variants.iter().all(|v| v.helper != "leaf"), "{variants:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn computed_expression_short_circuits_an_unknown_parameter() -> Result<()> {
+        let src = r#"const leaf=(selector)=>selector;
+            const middle=(flag,unknown)=>leaf(flag ? 42 : unknown);
+            const api={};api.run=(unknown)=>middle(true,unknown);"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        assert!(
+            variants
+                .iter()
+                .any(|v| { v.helper == "leaf" && v.constants == [(0, "42".into())] }),
+            "{variants:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recursive_computed_selectors_terminate_without_a_depth_constant() -> Result<()> {
+        let src = r#"const leaf=(selector)=>selector;
+            const recurse=(n)=>{leaf(n);return n < 100 ? recurse(n+1) : n;};
+            const api={};api.run=()=>recurse(1);"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        assert!(
+            variants
+                .iter()
+                .any(|v| { v.helper == "leaf" && v.constants == [(0, "2".into())] }),
+            "{variants:?}"
+        );
+        assert!(variants.len() < 12, "{variants:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn computed_argument_value_preserves_negative_zero() -> Result<()> {
+        let src = r#"const leaf=(value)=>1/value;
+            const middle=(n)=>leaf(n*-1);
+            const api={};api.run=()=>middle(0);"#;
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        let leaf = variants
+            .iter()
+            .find(|v| v.helper == "leaf")
+            .ok_or_else(|| anyhow!("negative zero lost: {variants:?}"))?;
+        assert_eq!(leaf.constants, [(0, "-0".into())]);
+        Ok(())
+    }
 
     #[test]
     fn evaluates_pure_argument_expressions_and_immutable_lexical_aliases() -> Result<()> {
