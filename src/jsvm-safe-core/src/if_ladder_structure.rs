@@ -242,7 +242,11 @@ fn parse_statement_route(
         Statement::ExpressionStatement(expression) => {
             parse_route(&expression.expression, state, source)
         }
-        Statement::ReturnStatement(_) => Some(Route {
+        Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => Some(Route {
+            // Both return and throw leave the dispatcher's function
+            // immediately. Keep the original expression evaluation and
+            // abrupt completion in the effect, and treat the transition as
+            // the synthetic graph exit for reachability and branch joins.
             effects: vec![fragment(source, stmt.span()).to_owned()],
             next: Next::State(exit),
         }),
@@ -305,6 +309,18 @@ fn parse_statement_route(
     }
 }
 
+/// Early-case statements are only interchangeable with a graph exit when
+/// they *unconditionally* complete the current function (return or throw).
+/// Preserve all preceding expressions in a block; their lexical-scope
+/// restrictions are independently validated by parse_statement_route.
+fn has_terminal_completion(stmt: &Statement<'_>) -> bool {
+    match stmt {
+        Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => true,
+        Statement::BlockStatement(block) => block.body.last().is_some_and(has_terminal_completion),
+        _ => false,
+    }
+}
+
 fn collect_dispatch_statement(
     stmt: &Statement<'_>,
     state: &str,
@@ -329,31 +345,19 @@ fn collect_dispatch_statement(
         }
         Statement::BlockStatement(block) => {
             let (last, preceding) = block.body.split_last()?;
-            // Independent early-return state cases can precede the usual
-            // if/else-if ladder. They do not flow into the later dispatch:
-            // their entire matching branch exits the current function.
+            // Independent early-return / early-throw state cases can
+            // precede the final if/else ladder. A matching branch must
+            // complete the function unconditionally, and all branch effects
+            // must be represented exactly once in the structured output.
             for statement in preceding {
                 let Statement::IfStatement(branch) = statement else {
                     return None;
                 };
-                if branch.alternate.is_some() {
+                if branch.alternate.is_some() || !has_terminal_completion(&branch.consequent) {
                     return None;
                 }
                 let label = state_test(&branch.test, state)?;
-                let return_stmt = match &branch.consequent {
-                    Statement::ReturnStatement(return_stmt) => return_stmt,
-                    Statement::BlockStatement(block) if block.body.len() == 1 => {
-                        let Statement::ReturnStatement(return_stmt) = &block.body[0] else {
-                            return None;
-                        };
-                        return_stmt
-                    }
-                    _ => return None,
-                };
-                let route = Route {
-                    effects: vec![fragment(source, return_stmt.span()).to_owned()],
-                    next: Next::State(exit),
-                };
+                let route = parse_statement_route(&branch.consequent, state, exit, source)?;
                 if cases.insert(label, Some(route)).is_some() {
                     return None;
                 }
@@ -1591,6 +1595,71 @@ mod tests {
             "{value:?}"
         );
         assert!(value.source.contains("while"), "{}", value.source);
+    }
+
+    #[test]
+    fn structures_dispatcher_with_early_throw_and_early_return_cases() {
+        let source = r#"
+            function route(flag, log) {
+                for (s=1;s!=9;) if (s==1) s=flag?40:2;
+                else {
+                    if (s==40) { log.push("throw"); throw new Error("boom"); }
+                    if (s==2) { log.push("ok"); s=3; }
+                    else if (s==3) return log;
+                }
+            }
+        "#;
+        let restored = recover(source);
+        assert!(!restored.contains("s==40"), "{restored}");
+        assert!(!restored.contains("s==2"), "{restored}");
+        assert!(restored.contains("throw new Error"), "{restored}");
+        assert!(restored.contains("return log"), "{restored}");
+        assert!(restored.contains("log.push"), "{restored}");
+    }
+
+    #[test]
+    fn structures_dispatcher_with_unreachable_throwing_case() {
+        let source = r#"
+            function route(log) {
+                for (s=1;s!=9;)
+                    if (s==1) s=2;
+                    else {
+                        if (s==40) throw new Error("unreachable");
+                        if (s==2) { log.push("ok"); s=9; }
+                    }
+                return log;
+            }
+        "#;
+        let restored = recover(source);
+        assert!(!restored.contains("unreachable"), "{restored}");
+        assert!(restored.contains("log.push"), "{restored}");
+    }
+
+    #[test]
+    fn refuses_nonterminal_early_case_in_dispatch_block() {
+        let source = r#"
+            function route(log) {
+                for (s=1;s!=9;)
+                    if (s==1) s=2;
+                    else {
+                        if (s==40) log.push("not terminal");
+                        if (s==2) { log.push("ok"); s=9; }
+                    }
+                return log;
+            }
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(!parsed.fatal_error);
+        let mut visitor = FindFor {
+            source,
+            ..Default::default()
+        };
+        visitor.visit_program(&parsed.program);
+        assert!(
+            visitor.outputs.is_empty(),
+            "nonterminal early if must not be moved"
+        );
     }
 
     #[test]
