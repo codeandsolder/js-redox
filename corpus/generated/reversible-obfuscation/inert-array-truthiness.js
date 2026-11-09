@@ -173,3 +173,20 @@ function automaticSemicolonTerminal() {
     } catch (error) { throw error; }
 }
 console.log(JSON.stringify(["automatic-semicolon", automaticSemicolonTerminal()]));
+
+
+function lexicalShadowingReturn(log) {
+    function execute(value) {
+        let state = 0;
+        while (true) try {
+            if (state == 0) {
+                let value = "inner";
+                log.push(value);
+                state = 1;
+            } else if (state == 1) return value;
+        } catch (error) { throw error; }
+    }
+    return execute("outer");
+}
+const shadowLog = [];
+console.log(JSON.stringify(["shadowed-return", lexicalShadowingReturn(shadowLog), shadowLog]));

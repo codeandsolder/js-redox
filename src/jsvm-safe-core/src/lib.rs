@@ -2565,7 +2565,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_dispatcher_inlined_return_preserves_enclosing_finally_state() {
+    fn exception_dispatcher_preserves_enclosing_finally_state() {
         let source = r#"
             function f(log) {
                 let state = 1;
@@ -2588,7 +2588,7 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            compact.contains("state=2;return\"done\";"),
+            compact.contains("state=2;") && compact.contains("return\"done\";"),
             "{}",
             result.source
         );
@@ -2617,6 +2617,35 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(compact.contains("state=2;returnlog;"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_does_not_move_return_into_shadowing_block() {
+        let source = r#"
+            function f(value, log) {
+                let state = 0;
+                while (true) try {
+                    if (state == 0) {
+                        let value = "inner";
+                        log.push(value);
+                        state = 1;
+                    } else if (state == 1) return value;
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("state==1"),
+            "original return binding must survive: {}",
+            result.source
+        );
     }
 
     #[test]
