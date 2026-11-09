@@ -2235,6 +2235,36 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_preserves_destructured_var_hoists_from_dead_states() {
+        let source = r#"
+            const shadowed = "outer";
+            function f() {
+                let state=1;
+                while(true) try {
+                    if(state==99) {
+                        var {shadowed, spare} = {shadowed:"inner", spare:42};
+                        state=2;
+                    } else if(state==1) return [typeof shadowed, typeof spare];
+                } catch(error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert_eq!(
+            result.transforms.get("exception_state_pruned"),
+            Some(&1),
+            "{result:?}"
+        );
+        assert!(!result.source.contains("state==99"), "{}", result.source);
+        assert!(
+            result.source.contains("var shadowed, spare;"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_refuses_unknown_reachable_transitions() {
         let source = r#"
             function f(value) {

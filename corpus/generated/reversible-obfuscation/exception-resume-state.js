@@ -34,3 +34,18 @@ for (const mode of ["throw", "normal"]) {
     const log = [];
     console.log(JSON.stringify([mode, recover(mode, log), log]));
 }
+
+// Dead-case destructuring declarations must still shadow outer bindings.
+const shadowed = "outer";
+function preservedHoists() {
+    let state = 1;
+    while (true) try {
+        if (state == 99) {
+            var {shadowed, spare} = {shadowed: "inner", spare: 42};
+            state = 2;
+        } else if (state == 1) {
+            return [typeof shadowed, typeof spare];
+        }
+    } catch (error) { throw error; }
+}
+console.log(JSON.stringify(["hoisted-bindings", preservedHoists()]));

@@ -1278,6 +1278,7 @@ pub(crate) fn prune_exception_dispatcher(
     }
 
     let mut alternatives = Vec::new();
+    let mut hoisted = HoistedVars::default();
     let mut cursor = dispatcher;
     loop {
         let Statement::IfStatement(branch) = cursor else {
@@ -1290,12 +1291,20 @@ pub(crate) fn prune_exception_dispatcher(
                 fragment(source, branch.test.span()),
                 fragment(source, branch.consequent.span())
             ));
+        } else {
+            hoisted.visit_statement(&branch.consequent);
         }
         match branch.alternate.as_ref() {
             Some(other @ Statement::IfStatement(_)) => cursor = other,
             None => break,
             Some(_) => return None,
         }
+    }
+    // Unreachable var declarations still create function-scoped bindings.
+    // Annex B function declarations have separate binding rules, so keep
+    // such a dispatcher unchanged rather than silently discarding them.
+    if hoisted.unsupported || hoisted.function_declaration {
+        return None;
     }
     if alternatives.len() == cases.len() || alternatives.is_empty() {
         return None;
@@ -1304,6 +1313,12 @@ pub(crate) fn prune_exception_dispatcher(
     for branch in alternatives {
         text.push_str(" else ");
         text.push_str(&branch);
+    }
+    if !hoisted.names.is_empty() {
+        text = format!(
+            "var {};\n{text}",
+            hoisted.names.into_iter().collect::<Vec<_>>().join(", ")
+        );
     }
     Some(text)
 }
@@ -1356,20 +1371,44 @@ pub(crate) fn reconstruct_while_adjacent(
 struct HoistedVars {
     names: BTreeSet<String>,
     unsupported: bool,
+    function_declaration: bool,
+}
+
+/// Destructuring is only syntax for introducing several bindings: retain
+/// all those names even when the initializer itself cannot execute.
+#[derive(Default)]
+struct DeclaredBindingNames {
+    names: BTreeSet<String>,
+}
+
+impl<'a> Visit<'a> for DeclaredBindingNames {
+    fn visit_binding_identifier(&mut self, binding: &oxc_ast::ast::BindingIdentifier<'a>) {
+        self.names.insert(binding.name.to_string());
+    }
+    fn visit_function(&mut self, _: &oxc_ast::ast::Function<'a>, _: oxc_syntax::scope::ScopeFlags) {
+    }
+    fn visit_arrow_function_expression(&mut self, _: &oxc_ast::ast::ArrowFunctionExpression<'a>) {}
+    fn visit_class(&mut self, _: &oxc_ast::ast::Class<'a>) {}
 }
 
 impl<'a> Visit<'a> for HoistedVars {
     fn visit_variable_declaration(&mut self, decl: &oxc_ast::ast::VariableDeclaration<'a>) {
         if decl.kind == VariableDeclarationKind::Var {
+            let mut bindings = DeclaredBindingNames::default();
             for item in &decl.declarations {
-                if let BindingPattern::BindingIdentifier(id) = &item.id {
-                    self.names.insert(id.name.to_string());
-                } else {
-                    self.unsupported = true;
-                }
+                bindings.visit_binding_pattern(&item.id);
             }
+            self.names.extend(bindings.names);
         }
         walk::walk_variable_declaration(self, decl);
+    }
+
+    fn visit_statement(&mut self, stmt: &Statement<'a>) {
+        if matches!(stmt, Statement::FunctionDeclaration(_)) {
+            self.function_declaration = true;
+            return;
+        }
+        walk::walk_statement(self, stmt);
     }
 
     fn visit_function(&mut self, _: &oxc_ast::ast::Function<'a>, _: oxc_syntax::scope::ScopeFlags) {
