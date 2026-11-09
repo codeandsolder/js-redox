@@ -850,11 +850,7 @@ fn write_callsite_specializations(
     max_iterations: usize,
 ) -> Result<Vec<serde_json::Value>> {
     let mut specialization_rows = Vec::new();
-    let all_edges = views
-        .iter()
-        .flat_map(|view| view.reachable_edges.iter().cloned())
-        .collect::<Vec<_>>();
-    let candidates = specialize_resolved_call_graph(original, &all_edges)?;
+    let candidates = specialize_resolved_call_graph(original, views)?;
     let depths = views
         .iter()
         .flat_map(|view| &view.reachable_functions)
@@ -937,6 +933,7 @@ fn write_callsite_specializations(
             "function_span": candidate.function_span,
             "arguments": candidate.constants,
             "call_sites": candidate.call_sites,
+            "example_call_chain": candidate.example_call_chain,
             "path": relative,
             "original_path": original_relative,
             "specialized_source_changed": candidate.specialized != candidate.original,
@@ -1475,6 +1472,52 @@ mod tests {
         assert!(fs::read_to_string(output.join("README.md"))?
             .contains("callsite-specialized readable helper bodies"));
         assert!(fs::read_to_string(&original)?.contains("selector===7"));
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_propagates_a_literal_through_a_helper_without_literal_calls() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let input = tmp.path().join("handlers");
+        let output = tmp.path().join("tree");
+        fs::create_dir_all(&input)?;
+        fs::write(input.join("handler.js"), "const capturedHandler = () => 0;")?;
+        let original = tmp.path().join("original.js");
+        fs::write(
+            &original,
+            "const last=(selector,value)=>selector===5?value+1:value-1;             const middle=(forwarded,input)=>last(forwarded,input);             const api={};api.enter=(input)=>middle(5,input);",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: Some("enter".into()),
+        })?;
+        let context = output.join("lexical-context");
+        let info: serde_json::Value =
+            serde_json::from_slice(&fs::read(context.join("context.json"))?)?;
+        let Some(rows) = info["graph_specializations"].as_array() else {
+            return Err(anyhow::anyhow!("missing graph variants"));
+        };
+        let leaf = rows
+            .iter()
+            .find(|row| row["helper"] == "last")
+            .ok_or_else(|| anyhow::anyhow!("forwarded literal did not reach leaf"))?;
+        assert_eq!(leaf["arguments"], serde_json::json!([[0, "5"]]));
+        assert_eq!(leaf["source_depth"], 2);
+        assert_eq!(leaf["example_call_chain"].as_array().map(Vec::len), Some(2));
+        let path = leaf["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("leaf file path missing"))?;
+        let source = fs::read_to_string(context.join(path))?;
+        assert!(
+            source.contains("return value + 1") || source.contains("return value+1"),
+            "{source}"
+        );
+        assert!(!source.contains("selector===5") && !source.contains("selector === 5"));
         Ok(())
     }
 

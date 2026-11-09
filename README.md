@@ -454,8 +454,14 @@ cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
 The tool recovers source-resolved direct call and constructor targets throughout
 the reachable graph, not only calls in extracted handlers. Each callsite's
 primitive literal arguments are matched to the original function's formal
-parameter symbols, preserving separately indexed variants for different
-selector tuples. It can still use stable constants when other formal
+parameter symbols. It also **carries those values through further helper
+calls whose arguments are unchanged, lexically resolved caller parameters**.
+This works at arbitrary graph depth, including cycles, and preserves each
+reachable constant tuple separately rather than combining unrelated caller
+values into impossible variants. Callers using mapped arguments, direct eval,
+or dynamic with-scope do not forward inferred constants. An
+example_call_chain in the JSON metadata links each variant to one real
+original callsite sequence; the original program stays intact. It can still use stable constants when other formal
 parameters are reassigned; shadowed same-name functions are distinguished
 by source span, and spread arguments never shift inferred parameter indices.
 The output contains `specializations/*.js` with deobfuscated, formatted

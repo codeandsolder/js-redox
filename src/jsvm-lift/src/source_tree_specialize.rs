@@ -4,7 +4,7 @@
 //! constant arguments only at references to the same parameter SymbolId,
 //! and is then passed through the existing JS deobfuscator. This is useful
 //! program recovery, not an independently runnable replacement module.
-use crate::source_tree_callflow::ResolvedCallEdge;
+use crate::source_tree_callflow::{CallerView, ResolvedCallEdge};
 use anyhow::{ensure, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -16,7 +16,7 @@ use oxc_semantic::{Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::{operator::UnaryOperator, scope::ScopeFlags, symbol::SymbolId};
 use rolldown_redox::ecmascript::parse_program;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct LiteralCall {
@@ -153,18 +153,85 @@ pub struct ResolvedSpecialization {
     pub function_span: [u32; 2],
     pub constants: Vec<(usize, String)>,
     pub call_sites: BTreeSet<[u32; 2]>,
+    /// One shortest original-callsite chain from the selected entrypoint
+    /// to this variant. Other routes can lead to the same merged variant.
+    pub example_call_chain: Vec<[u32; 2]>,
     pub original: String,
     pub specialized: String,
 }
 
-/// Materialize selected primitive parameter values for all reachable direct
-/// callees. Calls are joined by resolved original callee function spans,
-/// **never by function name**, so shadowed identifiers remain distinct.
-/// A parameter written inside a helper cannot be replaced; other independent
-/// constant parameters still contribute to the best valid specialization.
+/// Track original functions containing syntax that can indirectly mutate
+/// their formal parameters. In particular, mapped arguments in sloppy-mode
+/// functions and direct eval can bypass ordinary symbol write tracking.
+/// Suppress *forwarded* constants through these callers, while retaining
+/// directly written literal arguments at their own resolved callsites.
+#[derive(Default)]
+struct UnsafeParameterForwarding {
+    stack: Vec<[u32; 2]>,
+    functions: BTreeSet<[u32; 2]>,
+}
+
+impl UnsafeParameterForwarding {
+    fn mark_enclosing(&mut self) {
+        self.functions.extend(self.stack.iter().copied());
+    }
+}
+
+impl<'a> Visit<'a> for UnsafeParameterForwarding {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        self.stack.push([function.span.start, function.span.end]);
+        walk::walk_function(self, function, flags);
+        self.stack.pop();
+    }
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        self.stack.push([function.span.start, function.span.end]);
+        walk::walk_arrow_function_expression(self, function);
+        self.stack.pop();
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if matches!(unparen(&call.callee), Expression::Identifier(id) if id.name == "eval") {
+            self.mark_enclosing();
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        if id.name == "arguments" {
+            self.mark_enclosing();
+        }
+    }
+
+    fn visit_with_statement(&mut self, stmt: &WithStatement<'a>) {
+        self.mark_enclosing();
+        walk::walk_with_statement(self, stmt);
+    }
+}
+
+/// Original graph state. Two paths with different constant tuples remain
+/// distinct; a union of independently inferred parameter values would create
+/// impossible combinations. A cycle is handled by one visit per (function,
+/// entire known tuple), which is finite for the source's finite literal set.
+#[derive(Clone, Debug)]
+struct CallContext {
+    function: [u32; 2],
+    constants: Vec<(usize, String)>,
+    chain: Vec<[u32; 2]>,
+}
+
+/// Recover function-level variants by tracing *exact* primitive arguments and
+/// immutable forwarded formal parameters through arbitrarily deep lexical
+/// call chains. Every root entry starts with unknown parameters. Each emitted
+/// variant is attached to at least one real resolved incoming callsite.
+///
+/// This is a path-specific source-reading view, not an executable replacement.
 pub fn specialize_resolved_call_graph(
     original: &str,
-    edges: &[ResolvedCallEdge],
+    views: &[CallerView],
 ) -> Result<Vec<ResolvedSpecialization>> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, original, SourceType::unambiguous());
@@ -174,20 +241,83 @@ pub fn specialize_resolved_call_graph(
         sites: BTreeMap::new(),
     };
     collector.visit_program(&parsed.program);
-    let mut requested =
-        BTreeMap::<([u32; 2], Vec<(usize, String)>), (String, BTreeSet<[u32; 2]>)>::new();
-    for edge in edges {
-        let Some(constants) = collector.sites.get(&edge.call.span) else {
+    let mut unsafe_forwarding = UnsafeParameterForwarding::default();
+    unsafe_forwarding.visit_program(&parsed.program);
+
+    let mut outgoing = BTreeMap::<[u32; 2], Vec<&ResolvedCallEdge>>::new();
+    for edge in views.iter().flat_map(|view| &view.reachable_edges) {
+        let at = outgoing.entry(edge.from_span).or_default();
+        if !at
+            .iter()
+            .any(|prior| prior.call.span == edge.call.span && prior.to_span == edge.to_span)
+        {
+            at.push(edge);
+        }
+    }
+
+    type RequestKey = ([u32; 2], Vec<(usize, String)>);
+    type RequestValue = (String, BTreeSet<[u32; 2]>, Vec<[u32; 2]>);
+    let mut requested = BTreeMap::<RequestKey, RequestValue>::new();
+    let mut pending = views
+        .iter()
+        .map(|view| CallContext {
+            function: view.entry_span,
+            constants: Vec::new(),
+            chain: Vec::new(),
+        })
+        .collect::<VecDeque<_>>();
+    let mut visited = BTreeSet::<RequestKey>::new();
+    while let Some(context) = pending.pop_front() {
+        if !visited.insert((context.function, context.constants.clone())) {
+            continue;
+        }
+        let Some(edges) = outgoing.get(&context.function) else {
             continue;
         };
-        let entry = requested
-            .entry((edge.to_span, constants.clone()))
-            .or_insert_with(|| (edge.call.callee.clone(), BTreeSet::new()));
-        entry.1.insert(edge.call.span);
+        let incoming = context
+            .constants
+            .iter()
+            .cloned()
+            .collect::<BTreeMap<_, _>>();
+        for edge in edges {
+            let direct = collector.sites.get(&edge.call.span);
+            let forwarded_is_safe = !unsafe_forwarding.functions.contains(&context.function);
+            let mut next = Vec::new();
+            for (index, arg) in edge.call.arguments.iter().enumerate() {
+                if !arg.positional {
+                    break;
+                }
+                let literal = direct
+                    .and_then(|values| values.iter().find(|(at, _)| *at == index))
+                    .map(|(_, literal)| literal.clone())
+                    .or_else(|| {
+                        forwarded_is_safe
+                            .then_some(arg.caller_param_index)
+                            .flatten()
+                            .and_then(|from| incoming.get(&from).cloned())
+                    });
+                if let Some(literal) = literal {
+                    next.push((index, literal));
+                }
+            }
+            let mut chain = context.chain.clone();
+            chain.push(edge.call.span);
+            if !next.is_empty() {
+                let entry = requested
+                    .entry((edge.to_span, next.clone()))
+                    .or_insert_with(|| (edge.call.callee.clone(), BTreeSet::new(), chain.clone()));
+                entry.1.insert(edge.call.span);
+            }
+            pending.push_back(CallContext {
+                function: edge.to_span,
+                constants: next,
+                chain,
+            });
+        }
     }
 
     let mut specializations = Vec::new();
-    for ((function_span, constants), (helper, call_sites)) in requested {
+    for ((function_span, constants), (helper, call_sites, example_call_chain)) in requested {
         let Some(raw) = original.get(function_span[0] as usize..function_span[1] as usize) else {
             continue;
         };
@@ -223,6 +353,7 @@ pub fn specialize_resolved_call_graph(
             function_span,
             constants: selected,
             call_sites,
+            example_call_chain,
             original: wrapped,
             specialized,
         });
@@ -235,6 +366,9 @@ pub fn specialize_resolved_call_graph(
         let key = (candidate.function_span, candidate.constants.clone());
         if let Some(existing) = deduplicated.get_mut(&key) {
             existing.call_sites.extend(candidate.call_sites);
+            if candidate.example_call_chain.len() < existing.example_call_chain.len() {
+                existing.example_call_chain = candidate.example_call_chain;
+            }
         } else {
             deduplicated.insert(key, candidate);
         }
@@ -423,6 +557,89 @@ mod tests {
     use anyhow::{anyhow, Result};
 
     #[test]
+    fn propagates_literal_selectors_through_six_real_lexical_calls() -> Result<()> {
+        let src = "const leaf=(selector,value)=>selector===7?value+1:value-1;          const p5=(s,x)=>leaf(s,x);const p4=(s,x)=>p5(s,x);          const p3=(s,x)=>p4(s,x);const p2=(s,x)=>p3(s,x);          const p1=(s,x)=>p2(s,x);const api={};          api.run=(input)=>p1(7,input);";
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        let leaf = variants
+            .iter()
+            .find(|variant| variant.helper == "leaf")
+            .ok_or_else(|| anyhow!("deep helper was not specialized"))?;
+        assert_eq!(leaf.constants, [(0, "7".into())]);
+        assert_eq!(leaf.example_call_chain.len(), 6);
+        assert!(leaf.specialized.contains("(7)===7"), "{leaf:?}");
+        assert!(views[0].paths.iter().all(|path| path.functions.len() < 6));
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_correlated_tuples_instead_of_cross_multiplying() -> Result<()> {
+        let src = "const leaf=(a,b)=>[a,b];          const middle=(x,y)=>leaf(x,y);          const api={};api.run=()=>middle(1,2)+middle(3,4);";
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        let pairs = variants
+            .iter()
+            .filter(|variant| variant.helper == "leaf")
+            .map(|variant| variant.constants.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            [
+                [(0, "1".into()), (1, "2".into())],
+                [(0, "3".into()), (1, "4".into())],
+            ],
+        );
+        assert!(pairs
+            .iter()
+            .all(|pair| pair[0].1 != "1" || pair[1].1 == "2"));
+        Ok(())
+    }
+
+    #[test]
+    fn does_not_forward_reassigned_or_mapped_arguments_parameters() -> Result<()> {
+        for middle in [
+            "const middle=(x)=>{x=9;return leaf(x);};",
+            "const middle=function(x){arguments[0]=9;return leaf(x);};",
+            "const middle=function(x){eval('x=9');return leaf(x);};",
+        ] {
+            let src = format!("const leaf=(v)=>v*3;{middle}const api={{}};api.run=()=>middle(7);");
+            let views = reconstruct_caller_views(&src, Some("run"))?;
+            let variants = specialize_resolved_call_graph(&src, &views)?;
+            assert!(
+                variants.iter().all(|variant| variant.helper != "leaf"),
+                "{middle}: {variants:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn propagates_only_stable_parameter_through_permuted_constructor_calls() -> Result<()> {
+        let src = "function Leaf(a,b){this.result=a+b;}          const middle=(x,y)=>new Leaf(y,x);          const api={};api.run=(value)=>middle(value,13);";
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        let leaf = variants
+            .iter()
+            .find(|variant| variant.helper == "Leaf")
+            .ok_or_else(|| anyhow!("constructor was not specialized"))?;
+        assert_eq!(leaf.constants, [(0, "13".into())]);
+        assert_eq!(leaf.example_call_chain.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn finite_cycle_propagates_constant_variants_without_unbounded_walk() -> Result<()> {
+        let src = "const leaf=(value)=>value;          const left=(x)=>{leaf(x);return right(x);};          const right=(x)=>left(x);          const api={};api.run=()=>left(7);";
+        let views = reconstruct_caller_views(src, Some("run"))?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
+        assert!(variants
+            .iter()
+            .any(|variant| { variant.helper == "leaf" && variant.constants == [(0, "7".into())] }));
+        assert!(variants.len() < 10, "{variants:?}");
+        Ok(())
+    }
+
+    #[test]
     fn recovers_distinct_literal_variants_from_original_lexical_graph() -> Result<()> {
         let src = r#"const helper=function(selector,value){
             if(selector===3)return value+1;
@@ -431,7 +648,7 @@ mod tests {
         const api={};
         api.run=function(x) {return helper(3,x)+helper(4,x);};"#;
         let views = reconstruct_caller_views(src, Some("run"))?;
-        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 2, "{variants:?}");
         assert!(variants.iter().all(|v| v.helper == "helper"));
         assert!(variants.iter().all(|v| v.call_sites.len() == 1));
@@ -449,7 +666,7 @@ mod tests {
         let src = r#"const helper=function(a,b){a=9;return b+a;};
           const api={};api.run=()=>helper(3,4);"#;
         let views = reconstruct_caller_views(src, Some("run"))?;
-        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 1, "{variants:?}");
         assert_eq!(variants[0].constants, [(1, "4".into())]);
         assert!(variants[0].specialized.contains("return (4)+a"));
@@ -462,7 +679,7 @@ mod tests {
         let src = r#"const helper=(a,b)=>a+b;
           const api={};api.run=(xs)=>helper(...xs,42)+helper(3,...xs);"#;
         let views = reconstruct_caller_views(src, Some("run"))?;
-        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 1, "{variants:?}");
         assert_eq!(variants[0].constants, [(0, "3".into())]);
         Ok(())
@@ -476,7 +693,7 @@ mod tests {
               return helper(7);
           };"#;
         let views = reconstruct_caller_views(src, Some("run"))?;
-        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 1, "{variants:?}");
         assert!(variants[0].original.contains("a*4"));
         assert!(!variants[0].original.contains("a*3"));
@@ -495,7 +712,7 @@ mod tests {
             }
           }"#;
         let views = reconstruct_caller_views(src, Some("run"))?;
-        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 1, "{variants:?}");
         assert_eq!(variants[0].helper, "regular");
         assert_eq!(variants[0].constants, [(0, "4".into())]);
@@ -507,7 +724,7 @@ mod tests {
         let src = r#"const helper=(selector,unused)=>selector*2;
             const api={};api.run=()=>helper(3,7)+helper(3,8);"#;
         let views = reconstruct_caller_views(src, Some("run"))?;
-        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 1, "{variants:?}");
         assert_eq!(variants[0].constants, [(0, "3".into())]);
         assert_eq!(variants[0].call_sites.len(), 2);
@@ -519,7 +736,7 @@ mod tests {
         let src = r#"function Helper(flag){this.result=flag?1:0;}
           const api={};api.run=()=>[new Helper(true),new Helper(true)];"#;
         let views = reconstruct_caller_views(src, Some("run"))?;
-        let variants = specialize_resolved_call_graph(src, &views[0].reachable_edges)?;
+        let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 1, "{variants:?}");
         assert_eq!(variants[0].call_sites.len(), 2);
         assert_eq!(variants[0].constants, [(0, "true".into())]);
