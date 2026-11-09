@@ -471,13 +471,20 @@ impl<'a> Visit<'a> for UnsafeParameterForwarding {
 /// impossible combinations. A cycle is handled by one visit per (function,
 /// entire known tuple), which is finite for the source's finite literal set.
 #[derive(Clone, Debug)]
+struct CallHistoryEntry {
+    function: [u32; 2],
+    constants: Vec<(usize, String)>,
+    computed_on_incoming_edge: bool,
+}
+
+#[derive(Clone, Debug)]
 struct CallContext {
     function: [u32; 2],
     constants: Vec<(usize, String)>,
     chain: Vec<[u32; 2]>,
-    /// Exact caller states on this provenance path, including whether each
-    /// incoming edge evaluated an argument depending on a known parameter.
-    history: Vec<([u32; 2], Vec<(usize, String)>, bool)>,
+    /// Original-callsite provenance plus exact caller constants and whether
+    /// the incoming edge evaluated an argument using a known parameter.
+    history: Vec<CallHistoryEntry>,
     /// Delay widening once per recursive target to expose a representative
     /// recursive iteration, then retain only truly invariant input values.
     widened_cycles: BTreeSet<[u32; 2]>,
@@ -548,7 +555,11 @@ pub fn specialize_resolved_call_graph(
             function: view.entry_span,
             constants: Vec::new(),
             chain: Vec::new(),
-            history: vec![(view.entry_span, Vec::new(), false)],
+            history: vec![CallHistoryEntry {
+                function: view.entry_span,
+                constants: Vec::new(),
+                computed_on_incoming_edge: false,
+            }],
             widened_cycles: BTreeSet::new(),
         })
         .collect::<VecDeque<_>>();
@@ -613,7 +624,7 @@ pub fn specialize_resolved_call_graph(
             if let Some(previous) = context
                 .history
                 .iter()
-                .rposition(|(function, _, _)| *function == edge.to_span)
+                .rposition(|entry| entry.function == edge.to_span)
             {
                 // Literal/identity forwarding alone draws from a finite set
                 // of source constants and requires no widening. A recursive
@@ -621,10 +632,10 @@ pub fn specialize_resolved_call_graph(
                 let computed_in_cycle = computed_here
                     || context.history[previous + 1..]
                         .iter()
-                        .any(|(_, _, computed)| *computed);
+                        .any(|entry| entry.computed_on_incoming_edge);
                 if computed_in_cycle && !widened_cycles.insert(edge.to_span) {
                     let before = context.history[previous]
-                        .1
+                        .constants
                         .iter()
                         .cloned()
                         .collect::<BTreeMap<_, _>>();
@@ -634,7 +645,11 @@ pub fn specialize_resolved_call_graph(
                 }
             }
             let mut history = context.history.clone();
-            history.push((edge.to_span, propagated.clone(), computed_here));
+            history.push(CallHistoryEntry {
+                function: edge.to_span,
+                constants: propagated.clone(),
+                computed_on_incoming_edge: computed_here,
+            });
             pending.push_back(CallContext {
                 function: edge.to_span,
                 constants: propagated,
