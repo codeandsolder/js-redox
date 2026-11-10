@@ -1647,6 +1647,241 @@ fn convergent_exception_region(
     None
 }
 
+/// A closed, acyclic single-entry/single-exit region is a local dominator /
+/// postdominator proof. All paths from the entry terminate at `join`, no
+/// intermediate node has an incoming edge from outside, and all intermediate
+/// SCCs are trivial. The shared join may have any number of internal entries.
+///
+/// Rejecting cycles also prevents re-running a moved source case in a loop:
+/// the outer original dispatcher is retained for regions that need iteration.
+fn closed_exception_dag_region(
+    start: u64,
+    join: u64,
+    cases: &BTreeMap<u64, Option<Route>>,
+    entry: ExceptionEntryProof<'_>,
+    incoming: &BTreeMap<u64, BTreeSet<u64>>,
+) -> Option<Vec<u64>> {
+    if start == join || entry.roots.contains(&join) || entry.excluded.contains(&join) {
+        return None;
+    }
+    cases.get(&join)?.as_ref()?;
+
+    let mut members = BTreeSet::new();
+    let mut pending = Vec::new();
+    cases.get(&start)?.as_ref()?.targets(&mut pending);
+    while let Some(current) = pending.pop() {
+        if current == join {
+            continue;
+        }
+        if current == start
+            || !entry.reachable.contains(&current)
+            || entry.roots.contains(&current)
+            || entry.excluded.contains(&current)
+        {
+            return None;
+        }
+        if members.insert(current) {
+            cases.get(&current)?.as_ref()?.targets(&mut pending);
+        }
+    }
+    if members.is_empty() {
+        return None;
+    }
+
+    let region = members
+        .iter()
+        .copied()
+        .chain(std::iter::once(start))
+        .collect::<BTreeSet<_>>();
+    for &node in members.iter().chain(std::iter::once(&join)) {
+        let predecessors = incoming.get(&node)?;
+        if predecessors.is_empty() || !predecessors.is_subset(&region) {
+            return None;
+        }
+    }
+    // A single successor is handled by the existing straight-line merger.
+    // A true region needs multiple incoming source cases at its common join.
+    if incoming.get(&join)?.len() < 2 {
+        return None;
+    }
+
+    let mut indegrees = BTreeMap::new();
+    let mut ready = BTreeSet::new();
+    for &node in &members {
+        let degree = incoming
+            .get(&node)?
+            .iter()
+            .filter(|predecessor| members.contains(predecessor))
+            .count();
+        indegrees.insert(node, degree);
+        if degree == 0 {
+            ready.insert(node);
+        }
+    }
+    let mut ordered = Vec::with_capacity(members.len());
+    while let Some(&current) = ready.first() {
+        ready.remove(&current);
+        ordered.push(current);
+        let mut targets = Vec::new();
+        cases.get(&current)?.as_ref()?.targets(&mut targets);
+        for successor in targets.into_iter().collect::<BTreeSet<_>>() {
+            if let Some(degree) = indegrees.get_mut(&successor) {
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.insert(successor);
+                }
+            }
+        }
+    }
+    (ordered.len() == members.len()).then_some(ordered)
+}
+
+/// Breadth-first distance is used only to prioritize the nearest proven join;
+/// proof does not rely on shortest-path heuristics.
+fn exception_successor_distances(
+    start: u64,
+    cases: &BTreeMap<u64, Option<Route>>,
+    reachable: &BTreeSet<u64>,
+) -> Option<BTreeMap<u64, usize>> {
+    let mut distance = BTreeMap::from([(start, 0_usize)]);
+    let mut pending = VecDeque::from([start]);
+    while let Some(current) = pending.pop_front() {
+        let length = *distance.get(&current)?;
+        let mut targets = Vec::new();
+        cases.get(&current)?.as_ref()?.targets(&mut targets);
+        for next in targets {
+            if reachable.contains(&next) && !distance.contains_key(&next) {
+                distance.insert(next, length + 1);
+                pending.push_back(next);
+            }
+        }
+    }
+    Some(distance)
+}
+
+/// Structure arbitrary finite branching DAGs inside an exception dispatcher.
+///
+/// The generated source executes each original case once, in topological
+/// order, guarded by its numeric state. This avoids cloning shared effects
+/// even when multiple inner diamonds have their own intermediate joins.
+/// Because every path must postdominate at the common exit, its original
+/// source statement is executed exactly once after the guarded region.
+/// The CFG's summarized route retains the exact external successor set
+/// while storing the whole emitted region as one opaque source effect.
+fn exception_branching_dag_regions(
+    dispatcher: &Statement<'_>,
+    state: &str,
+    entry: ExceptionEntryProof<'_>,
+    cases: &mut BTreeMap<u64, Option<Route>>,
+    edits: &BTreeMap<u64, Vec<TerminalStateEdit>>,
+    effects: &ExceptionLoopEffectContext<'_>,
+    source: &str,
+) -> Option<(BTreeMap<u64, String>, BTreeSet<u64>)> {
+    let mut statements = BTreeMap::new();
+    let mut cursor = dispatcher;
+    loop {
+        let Statement::IfStatement(branch) = cursor else {
+            return None;
+        };
+        if branch.test.may_have_side_effects(effects) {
+            return None;
+        }
+        statements.insert(state_test(&branch.test, state)?, &branch.consequent);
+        match branch.alternate.as_ref() {
+            Some(other @ Statement::IfStatement(_)) => cursor = other,
+            None => break,
+            Some(_) => return None,
+        }
+    }
+
+    let mut incoming = BTreeMap::<u64, BTreeSet<u64>>::new();
+    for &label in entry.reachable {
+        let mut targets = Vec::new();
+        cases.get(&label)?.as_ref()?.targets(&mut targets);
+        for target in targets {
+            incoming.entry(target).or_default().insert(label);
+        }
+    }
+
+    let original_text = |label: u64| -> Option<String> {
+        let stmt = *statements.get(&label)?;
+        match edits.get(&label) {
+            Some(changes) => print_terminal_edits(stmt, source, changes),
+            None => Some(fragment(source, stmt.span()).to_owned()),
+        }
+    };
+
+    for &start in entry.reachable {
+        if entry.excluded.contains(&start) {
+            continue;
+        }
+        let Some(Some(route)) = cases.get(&start) else {
+            continue;
+        };
+        let mut targets = Vec::new();
+        route.targets(&mut targets);
+        let successors = targets.into_iter().collect::<BTreeSet<_>>();
+        if successors.len() < 2 {
+            continue;
+        }
+        let mut candidates = exception_successor_distances(start, cases, entry.reachable)?
+            .into_iter()
+            .filter_map(|(join, distance)| (join != start).then_some((distance, join)))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+
+        for (_, join) in candidates {
+            let Some(ordered) = closed_exception_dag_region(
+                start,
+                join,
+                cases,
+                ExceptionEntryProof {
+                    roots: entry.roots,
+                    reachable: entry.reachable,
+                    excluded: entry.excluded,
+                },
+                &incoming,
+            ) else {
+                continue;
+            };
+            // Keep the original two linear-arm emitter for cases it already
+            // handles compactly. This pass targets genuinely branching DAGs.
+            let has_inner_branch = ordered.iter().any(|label| {
+                cases
+                    .get(label)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|case| {
+                        let mut next = Vec::new();
+                        case.targets(&mut next);
+                        next.into_iter().collect::<BTreeSet<_>>().len() > 1
+                    })
+            });
+            if !has_inner_branch && successors.len() <= 2 {
+                continue;
+            }
+            let mut text = format!("{{ {};", original_text(start)?);
+            for &node in &ordered {
+                text.push_str(&format!(
+                    "\nif ({state} == {node}) {{ {}; }}",
+                    original_text(node)?
+                ));
+            }
+            text.push_str(&format!("\n{}; }}", original_text(join)?));
+            let join_route = cases.get(&join)?.as_ref()?.clone();
+            let absorbed = ordered
+                .into_iter()
+                .chain(std::iter::once(join))
+                .collect::<BTreeSet<_>>();
+            *cases.get_mut(&start)?.as_mut()? = Route {
+                effects: vec![text.clone()],
+                next: join_route.next,
+            };
+            return Some((BTreeMap::from([(start, text)]), absorbed));
+        }
+    }
+    Some((BTreeMap::new(), BTreeSet::new()))
+}
+
 /// Recover a reducible two-arm SESE region from source-case CFG transitions.
 ///
 /// Branch paths may contain any number of modeled states (including effectful
@@ -1961,7 +2196,8 @@ pub(crate) fn prune_exception_dispatcher(
         work.extend(next);
     }
 
-    // Recover one conditional diamond, then recover independent linear
+    // Recover one closed conditional region (compact two-arm or general DAG),
+    // then recover independent linear
     // regions against the UPDATED CFG. Protect the diamond's entry and
     // absorbed states so a second rewrite cannot discard its source body.
     // This preserves disjoint straight-line improvements in the same pass.
@@ -1980,6 +2216,23 @@ pub(crate) fn prune_exception_dispatcher(
             &effects,
             source,
         )?;
+        if absorbed.is_empty() {
+            let (regions, members) = exception_branching_dag_regions(
+                dispatcher,
+                state,
+                ExceptionEntryProof {
+                    roots: &roots,
+                    reachable: &reachable,
+                    excluded: &empty,
+                },
+                &mut cases,
+                &retargeted,
+                &effects,
+                source,
+            )?;
+            combined = regions;
+            absorbed = members;
+        }
         let mut after_diamond = reachable.clone();
         if !absorbed.is_empty() {
             after_diamond.clear();

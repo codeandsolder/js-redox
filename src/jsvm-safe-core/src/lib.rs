@@ -3543,6 +3543,211 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_structures_three_way_branching_join_once() {
+        let source = r#"
+            function f(choice, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = choice === 0 ? 2 : choice === 1 ? 3 : 4;
+                    else if (state === 2) { log.push("a"); state = 7; }
+                    else if (state === 3) { log.push("b"); state = 7; }
+                    else if (state === 4) { log.push("c"); state = 7; }
+                    else if (state === 7) { log.push("join"); return [state, log]; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("if(state===7)"),
+            "join should appear once: {}",
+            result.source
+        );
+        for effect in ["a", "b", "c", "join"] {
+            assert_eq!(
+                compact.matches(&format!("log.push(\"{effect}\")")).count(),
+                1,
+                "{}",
+                result.source,
+            );
+        }
+        assert_eq!(
+            compact.matches("return[state,log]").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_structures_nested_branching_dag_without_cloning() {
+        let source = r#"
+            function f(outer, inner, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = outer ? 2 : 3;
+                    else if (state == 2) state = inner ? 4 : 5;
+                    else if (state == 3) { log.push("right"); state = 6; }
+                    else if (state == 4) { { let scoped = "left"; log.push(scoped); } state = 7; }
+                    else if (state == 5) { log.push("middle"); state = 7; }
+                    else if (state == 6) { log.push("detour"); state = 7; }
+                    else if (state == 7) { log.push("join"); return log; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("if(state==7)"),
+            "multi-branch join should be coalesced: {}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("letscoped=\"left\"").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("returnlog;").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_dag_rejects_independent_catch_entry_inside_region() {
+        let source = r#"
+            function f(choice, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = choice === 0 ? 2 : choice === 1 ? 3 : 4;
+                    else if (state == 2) { log.push("a"); state = 7; }
+                    else if (state == 3) { log.push("b"); state = 7; }
+                    else if (state == 4) { log.push("c"); state = 7; }
+                    else if (state == 7) { log.push("join"); return log; }
+                    else if (state == 9) state = 4;
+                } catch (error) { log.push(error.message); state = 9; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("if(state==7)"),
+            "multi-entry join must remain: {}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_dag_rejects_internal_cycle() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("spin"); state = log.length > 2 ? 7 : 4; }
+                    else if (state == 4) state = 2;
+                    else if (state == 3) { log.push("other"); state = 7; }
+                    else if (state == 7) { log.push("join"); return [state, log]; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("while(true)"),
+            "cyclic region cannot become a DAG: {}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"spin\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_dag_preserves_throwing_intermediate_state() {
+        let source = r#"
+            function f(choice, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = choice === 0 ? 2 : choice === 1 ? 3 : 4;
+                    else if (state == 2) { log.push("a"); state = 7; }
+                    else if (state == 3) { log.push("throw"); throw Error("expected"); state = 7; }
+                    else if (state == 4) { log.push("c"); state = 7; }
+                    else if (state == 7) { log.push("join"); return [state, log]; }
+                } catch (error) { log.push(error.message); return [state, log]; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("if(state==7)"),
+            "shared join not emitted once: {}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"throw\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(compact.contains("throwError("), "{}", result.source);
+    }
+
+    #[test]
     fn exception_dispatcher_handles_inert_array_literal_loop_test() {
         let source = r#"
             function f(flag) {

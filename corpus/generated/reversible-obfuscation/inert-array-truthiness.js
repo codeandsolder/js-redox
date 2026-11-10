@@ -520,3 +520,74 @@ console.log(JSON.stringify([
     boundedMultiHopSideCycle(true),
     boundedMultiHopSideCycle(false)
 ]));
+
+
+function branchingDagThreeWay(choice) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state === 1) state = choice === 0 ? 2 : choice === 1 ? 3 : 4;
+        else if (state === 2) { log.push("a"); state = 7; }
+        else if (state === 3) { log.push("b"); state = 7; }
+        else if (state === 4) { log.push("c"); state = 7; }
+        else if (state === 7) { log.push("join"); return [state, log]; }
+    } catch (error) { throw error; }
+}
+function branchingDagNested(outer, inner) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state == 1) state = outer ? 2 : 3;
+        else if (state == 2) state = inner ? 4 : 5;
+        else if (state == 3) { log.push("right"); state = 6; }
+        else if (state == 4) { { let scoped = "left"; log.push(scoped); } state = 7; }
+        else if (state == 5) { log.push("middle"); state = 7; }
+        else if (state == 6) { log.push("detour"); state = 7; }
+        else if (state == 7) { log.push("join"); return [state, log]; }
+    } catch (error) { throw error; }
+}
+function branchingDagCatchSideEntry(choice) {
+    const log = [];
+    let state = 1, first = true;
+    while (true) try {
+        if (state == 1) {
+            if (first) { first = false; throw Error("restart"); }
+            state = choice === 0 ? 2 : choice === 1 ? 3 : 4;
+        } else if (state == 2) { log.push("a"); state = 7; }
+        else if (state == 3) { log.push("b"); state = 7; }
+        else if (state == 4) { log.push("c"); state = 7; }
+        else if (state == 7) { log.push("join"); return [state, log]; }
+        else if (state == 9) state = 4;
+    } catch (error) { log.push(error.message); state = 9; }
+}
+function branchingDagCycle(flag) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state == 1) state = flag ? 2 : 3;
+        else if (state == 2) { log.push("spin"); state = log.length > 2 ? 7 : 4; }
+        else if (state == 4) state = 2;
+        else if (state == 3) { log.push("other"); state = 7; }
+        else if (state == 7) { log.push("join"); return [state, log]; }
+    } catch (error) { throw error; }
+}
+function branchingDagThrowingCase(choice) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state == 1) state = choice === 0 ? 2 : choice === 1 ? 3 : 4;
+        else if (state == 2) { log.push("a"); state = 7; }
+        else if (state == 3) { log.push("throw"); throw Error("expected"); state = 7; }
+        else if (state == 4) { log.push("c"); state = 7; }
+        else if (state == 7) { log.push("join"); return [state, log]; }
+    } catch (error) { log.push(error.message); return [state, log]; }
+}
+console.log(JSON.stringify([
+    "branching-dag-regions",
+    branchingDagThreeWay(0), branchingDagThreeWay(1), branchingDagThreeWay(2),
+    branchingDagNested(true, true), branchingDagNested(true, false),
+    branchingDagNested(false, true), branchingDagNested(false, false),
+    branchingDagCatchSideEntry(0), branchingDagCatchSideEntry(1), branchingDagCatchSideEntry(2),
+    branchingDagCycle(true), branchingDagCycle(false),
+    branchingDagThrowingCase(0), branchingDagThrowingCase(1), branchingDagThrowingCase(2)
+]));
