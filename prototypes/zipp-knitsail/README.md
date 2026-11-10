@@ -95,3 +95,42 @@ Node and ZIPP agree on `CHECK:2561600/2561600`. The optimizer lowers the origina
 **Reproducible upstream defect candidate:** `tests/tier-o-entry-loop.js` and four structurally similar `while`/`for`/`do-while` loop cases panic under `ZIPP_OPT=1 ZIPP_NO_OPT_TIER_UP=1` with `codegen/opt/build.rs:1785:13: the entry has no predecessor`. Source constructs `bpreds` from actual CFG edges, but the first block's `debug_assert!(preds.is_empty())` rejects a legitimate loop back-edge to entry. Normal baseline run completes; Tier O's debug compiler triggers a reproducible panic. We have **not** tested release builds or verified a fix; no upstream issue/PR was filed. A proper repair must handle entry phi values (e.g. via a synthetic unique entry) rather than deleting the assertion and assuming SSA remains correct. The full Knitsail harness with Tier O enabled also hit this bug while promoting an unrelated helper; `ZIPP_OPT_ONLY=14` isolates handler 208 and completes without the crash.
 
 **Updated recommendation:** Keep ZIPP as a separate optional differential execution/semantic-trace backend; do not transplant the current Tier O into js-redox. If pursuing shared work, first expose a diagnostic bytecode/SSA graph with exact source mapping and add genuinely generalized constant/reachability propagation. The latter would be new functionality, not free reuse.
+
+## ZIPP upstream bug #93: independently tested patch
+
+We filed [ZIPP #93](https://github.com/f2i-com/zipp.org/issues/93) after
+discovering that Tier O panics when bytecode entry has a legitimate loop back-edge.
+The proposed general fix is carried as
+[`patches/zipp-issue-93-entry-preheader.patch`](patches/zipp-issue-93-entry-preheader.patch),
+generated via `git format-patch` from ZIPP commit
+`362be460bba6f6ab3da4c369eb418bb070cbb4b7` based on upstream
+`b7521d2a2a4b562a1764194de56659277232291e`.
+
+It adds a conditional synthetic SSA preheader when bytecode entry has incoming
+edges. Initial values and loop-carried values become distinct phi predecessors;
+the compiler continues to assert that its *actual* entry has no predecessors.
+No `MakeCell` admission or other unrelated JIT changes are made.
+
+Apply against a clean ZIPP checkout at the pinned upstream revision:
+
+```bash
+git am /path/to/zipp-issue-93-entry-preheader.patch
+cargo +1.99.0 test -p zipp-vm --no-default-features --features jit \
+  --test jit_opt_entry_loops --test jit_opt_tier --test jit_opt_tier_up \
+  --test jit_opt_int --test jit_opt_fold --test jit_opt_breadth \
+  --test jit_opt_deopt_stress --test jit_opt_finally --test jit_opt_tier_up_stress
+```
+
+Validation on Acer with normal sccache:
+- Five standalone Node-differential loop shapes: all compiled and executed in
+  experimental Tier O, with exact output parity in **debug and release builds**.
+  Includes nested loops, `do/while`, several back-edges and phi-carried state.
+- New upstream integration test: passed, covering mixed numeric inputs,
+  uninitialized locals, and zero-iteration cases.
+- Eight existing targeted Tier O suites plus the new regression: all passed
+  (four functional, four stress, one new regression).
+
+Upstream fork creation from the available GitHub App credential returned
+HTTP 403 (`Resource not accessible by integration`); no upstream PR is
+claimed. The patch is preserved here on GitHub so it can be forked/cherry-picked
+by an account with permission. It is not a js-redox production dependency.

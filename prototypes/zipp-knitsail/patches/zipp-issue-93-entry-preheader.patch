@@ -1,0 +1,251 @@
+From 362be460bba6f6ab3da4c369eb418bb070cbb4b7 Mon Sep 17 00:00:00 2001
+From: codeandsolder <codeandsolder@gmail.com>
+Date: Tue, 10 Nov 2026 18:33:20 +0100
+Subject: [PATCH] fix(jit): preserve entry-loop phi inputs with synthetic SSA
+ preheader
+
+---
+ crates/zipp-vm/src/codegen/opt/build.rs       | 108 +++++++++++-------
+ .../tests/fixtures/tier_o_entry_loops.js      |  59 ++++++++++
+ crates/zipp-vm/tests/jit_opt_entry_loops.rs   |  17 +++
+ 3 files changed, 145 insertions(+), 39 deletions(-)
+ create mode 100644 crates/zipp-vm/tests/fixtures/tier_o_entry_loops.js
+ create mode 100644 crates/zipp-vm/tests/jit_opt_entry_loops.rs
+
+diff --git a/crates/zipp-vm/src/codegen/opt/build.rs b/crates/zipp-vm/src/codegen/opt/build.rs
+index 9184c3e..691ffe9 100644
+--- a/crates/zipp-vm/src/codegen/opt/build.rs
++++ b/crates/zipp-vm/src/codegen/opt/build.rs
+@@ -1769,54 +1769,84 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
+         class_values: Some((inputs.class_values, inputs.class_epoch)),
+         poly: Some(inputs.poly),
+     };
+-    let mut blocks: Vec<Block> = Vec::with_capacity(order.len());
+-    let mut exit_defs: Vec<Vec<V>> = vec![Vec::new(); order.len()];
++    // A loop may jump back to bytecode ip 0. In that case the bytecode
++    // entry is a loop header, not a unique predecessor-free entry block.
++    // Split out a synthetic SSA preheader so its first invocation and its
++    // back-edges enter through distinct phi inputs.
++    let entry_preheader = !bpreds[0].is_empty();
++    let ir_offset = usize::from(entry_preheader);
++    let mut blocks: Vec<Block> = Vec::with_capacity(order.len() + ir_offset);
++    let mut exit_defs: Vec<Vec<V>> = vec![Vec::new(); order.len() + ir_offset];
+     // Phis to fill once every block is built: (block, phi, register).
+     let mut phis: Vec<(usize, V, u16)> = Vec::new();
+     let undefined_bits = Value::UNDEFINED.bits();
+-    for (k, &bb) in order.iter().enumerate() {
++    let make_entry = |b: &mut Builder| -> (Vec<V>, Vec<V>) {
++        let mut defs: Vec<V> = vec![V::MAX; nregs];
++        let mut insts = Vec::new();
++        let undef = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
++        for (r, d) in defs.iter_mut().enumerate() {
++            *d = if r <= p.param_count as usize {
++                let v = b.push(Op::Param(r as u16), Rep::Tagged, None);
++                insts.push(v);
++                v
++            } else {
++                undef
++            };
++        }
++        // The speculated parameters are unboxed once at the true function
++        // entry, not again when a loop returns to bytecode ip 0.
++        let entry_live = live_before[0].as_ref().expect("the entry has liveness");
++        let unbox: Vec<usize> = (0..nregs).filter(|&r| spec[r]).collect();
++        if !unbox.is_empty() {
++            let s = b.states.len() as u32;
++            b.states.push(FrameState {
++                ip: 0,
++                why: ENTRY_SITE,
++                regs: (0..nregs)
++                    .filter(|&r| entry_live.get(r))
++                    .map(|r| (r as u16, defs[r]))
++                    .collect(),
++            });
++            for r in unbox {
++                let c = b.push(Op::TaggedToF64(defs[r]), Rep::F64, Some(s));
++                insts.push(c);
++                defs[r] = c;
++            }
++        }
++        (defs, insts)
++    };
++    if entry_preheader {
++        let (defs, insts) = make_entry(&mut b);
++        exit_defs[0] = defs;
++        blocks.push(Block {
++            insts,
++            term: Term::Jump(1),
++            preds: Vec::new(),
++        });
++    }
++    for (original_k, &bb) in order.iter().enumerate() {
++        let k = original_k + ir_offset;
+         b.cur_block = k as B;
+         b.memo.clear();
+         b.shape_memo.clear();
+-        let preds: Vec<B> = bpreds[bb].iter().map(|&p| rpo_index[p] as B).collect();
++        let mut preds: Vec<B> = bpreds[bb]
++            .iter()
++            .map(|&p| (rpo_index[p] + ir_offset) as B)
++            .collect();
++        if entry_preheader && original_k == 0 {
++            preds.insert(0, 0);
++        }
+         let mut defs: Vec<V> = vec![V::MAX; nregs];
+         let mut insts_of_block: Vec<V> = Vec::new();
+         if k == 0 {
+             debug_assert!(preds.is_empty(), "the entry has no predecessor");
+-            let undef = b.konst(Op::ConstTagged(undefined_bits), Rep::Tagged);
+-            for (r, d) in defs.iter_mut().enumerate() {
+-                *d = if r <= p.param_count as usize {
+-                    let v = b.push(Op::Param(r as u16), Rep::Tagged, None);
+-                    insts_of_block.push(v);
+-                    v
+-                } else {
+-                    undef
+-                };
+-            }
+-            // The speculated parameters (`spec`), unboxed behind one frame
+-            // state: the call's first op, its parameters as passed.
+-            let entry_live = live_before[starts[bb]].as_ref().expect("the entry has liveness");
+-            let unbox: Vec<usize> = (0..nregs).filter(|&r| spec[r]).collect();
+-            if !unbox.is_empty() {
+-                let s = b.states.len() as u32;
+-                b.states.push(FrameState {
+-                    ip: starts[bb] as u32,
+-                    why: ENTRY_SITE,
+-                    regs: (0..nregs)
+-                        .filter(|&r| entry_live.get(r))
+-                        .map(|r| (r as u16, defs[r]))
+-                        .collect(),
+-                });
+-                for r in unbox {
+-                    let c = b.push(Op::TaggedToF64(defs[r]), Rep::F64, Some(s));
+-                    insts_of_block.push(c);
+-                    defs[r] = c;
+-                }
+-            }
++            (defs, insts_of_block) = make_entry(&mut b);
+         } else if preds.len() == 1 && (preds[0] as usize) < k {
+             defs = exit_defs[preds[0] as usize].clone();
+         } else {
+-            let reps = in_rep[bb].as_ref().expect("a reachable block has entry representations");
++            let reps = in_rep[bb]
++                .as_ref()
++                .expect("a reachable block has entry representations");
+             for r in 0..nregs {
+                 if live_in[bb].get(r) {
+                     let phi = b.push(Op::Phi(Vec::new()), reps[r], None);
+@@ -1839,12 +1869,12 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
+             let inline = inline_at.get(&ip).copied();
+             match translate(&mut b, &top, ip, &code[ip], &mut defs, &mut fs, inline)? {
+                 Flow::Next => {}
+-                Flow::Jump(t) => term = Some(Term::Jump(rpo_index[block_of_ip(t)] as B)),
++                Flow::Jump(t) => term = Some(Term::Jump((rpo_index[block_of_ip(t)] + ir_offset) as B)),
+                 Flow::Branch { cond, t, f } => {
+                     term = Some(Term::Branch {
+                         cond,
+-                        t: rpo_index[block_of_ip(t)] as B,
+-                        f: rpo_index[block_of_ip(f)] as B,
++                        t: (rpo_index[block_of_ip(t)] + ir_offset) as B,
++                        f: (rpo_index[block_of_ip(f)] + ir_offset) as B,
+                     })
+                 }
+                 Flow::Ret(v) => {
+@@ -1856,7 +1886,7 @@ pub(crate) fn build(p: &FuncProto, func_id: u32, inputs: &Inputs) -> Option<Func
+         }
+         let term = term.unwrap_or_else(|| {
+             // Falls through into the next block.
+-            Term::Jump(rpo_index[block_of_ip(end_of(bb))] as B)
++            Term::Jump((rpo_index[block_of_ip(end_of(bb))] + ir_offset) as B)
+         });
+         exit_defs[k] = defs;
+         blocks.push(Block {
+diff --git a/crates/zipp-vm/tests/fixtures/tier_o_entry_loops.js b/crates/zipp-vm/tests/fixtures/tier_o_entry_loops.js
+new file mode 100644
+index 0000000..c522662
+--- /dev/null
++++ b/crates/zipp-vm/tests/fixtures/tier_o_entry_loops.js
+@@ -0,0 +1,59 @@
++"use strict";
++function countdown(n) {
++  while (n > 0) n--;
++  return n;
++}
++function carried(n, acc) {
++  while (n > 0) {
++    acc = (acc * 3 + n) % 16381;
++    n--;
++  }
++  return acc;
++}
++function twoBackedges(n, acc) {
++  while (n > 0) {
++    if ((n & 1) === 0) {
++      acc += 11;
++      n--;
++      continue;
++    }
++    acc += 3;
++    n--;
++  }
++  return acc;
++}
++function nested(n, acc) {
++  while (n > 0) {
++    for (let j = 0; j < 6; j++) acc += (n * j) % 7;
++    n--;
++  }
++  return acc;
++}
++function mixed(n, acc) {
++  while (n > 0) {
++    acc += n;
++    n--;
++  }
++  return acc;
++}
++function unknownLocal(n) {
++  var value;
++  while (n > 0) {
++    value = value === undefined ? 1 : value + 2;
++    n--;
++  }
++  return value === undefined ? -1 : value;
++}
++let counters = [0, 0, 0, 0, 0, 0, 0];
++for (let i = 0; i < 1800; i++) {
++  counters[0] += countdown(i % 13);
++  counters[1] += carried(i % 19, i % 23);
++  counters[2] += twoBackedges(i % 21, i % 10);
++  counters[3] += nested(i % 13, i);
++  counters[4] += mixed(i % 14, 2);
++  counters[5] += unknownLocal(i % 15);
++  counters[6] += mixed(i % 4, 0.25);
++}
++console.log(counters.join(" "));
++console.log(mixed(3, "x"));
++console.log(countdown(-2));
+diff --git a/crates/zipp-vm/tests/jit_opt_entry_loops.rs b/crates/zipp-vm/tests/jit_opt_entry_loops.rs
+new file mode 100644
+index 0000000..d5e35a5
+--- /dev/null
++++ b/crates/zipp-vm/tests/jit_opt_entry_loops.rs
+@@ -0,0 +1,17 @@
++//! Regression: an entry block may have loop back-edges. Tier O must create a
++//! separate SSA preheader so initial parameter/undefined values are merged
++//! with the loop-carried values by phis, instead of asserting no predecessors.
++#![cfg(all(feature = "jit", target_arch = "x86_64"))]
++
++const PROGRAM: &str = include_str!("fixtures/tier_o_entry_loops.js");
++const EXPECTED: &str = "0 11108365 130357 1788395 61924 23400 4950\nx321\n-2";
++
++#[test]
++fn loop_entry_phi_inputs_match_node() {
++    // The environment toggles are cached per test process; use one test.
++    std::env::set_var("ZIPP_OPT", "1");
++    std::env::set_var("ZIPP_NO_OPT_TIER_UP", "1");
++    let out = zipp_vm::run(PROGRAM).expect("compiles");
++    assert_eq!(out.error, None, "{:?}", out.errput);
++    assert_eq!(out.output.join("\n"), EXPECTED);
++}
