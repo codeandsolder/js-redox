@@ -2985,6 +2985,15 @@ pub(crate) fn prune_exception_dispatcher(
     source: &str,
     catch_scope: CatchScopeEvidence<'_>,
 ) -> Option<String> {
+    // Assigning to a const dispatcher binding throws instead of advancing
+    // its numeric value. A normal-state CFG must never model that write as
+    // a successful edge, even if constant propagation later simplifies it.
+    if scoping
+        .symbol_flags(symbol)
+        .contains(oxc_semantic::SymbolFlags::ConstVariable)
+    {
+        return None;
+    }
     let effects = ExceptionLoopEffectContext { scoping };
     if loop_stmt.test.may_have_side_effects(&effects) {
         return None;

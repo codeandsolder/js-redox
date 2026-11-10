@@ -4410,6 +4410,36 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_const_write_does_not_advance_catch_state() {
+        let source = r#"
+            function f() {
+                const state = 1;
+                let caught = 0;
+                while (true) try {
+                    if (state === 1) {
+                        state = 4;
+                    } else if (state === 4) return "wrong-destination";
+                } catch (error) {
+                    if (++caught === 2) return ["const-write-retry", error.name, caught];
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("const-write-retry"),
+            "assignment to an immutable state must still throw into catch: {}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("return \"wrong-destination\""),
+            "a const state never commits a numeric successor: {}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_finite_catch_domain_allows_effectful_merge() {
         let source = r#"
             function f(flag, log) {
