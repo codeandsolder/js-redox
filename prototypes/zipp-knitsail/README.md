@@ -405,3 +405,54 @@ for file in inputs/zipp-generated/*.js; do
   cmp "$file.node.out" "$file.zipp.out"
 done
 ```
+
+## Linked static and runtime-observed source tree (2026-11-10)
+
+scripts/link-runtime-source-tree.mjs composes an independent, navigable tree
+from an existing static source tree and one or more runtime-observed eval
+collections. It does NOT edit the original static source, reconstruction.json,
+or archived challenge. The output gains a runtime-observed/ namespace with a
+link in the root README, full source and execution provenance, one page per
+observed source, backlinks to the original VM callsite, and separate sidecars
+for matching lexical helpers. These are textual callsite matches, NOT independently
+proven lexical identities or universally valid source transformations.
+
+The original VM source is SHA-256-verified before resolving UTF-16 callsite
+offsets. Every observed raw string is checked again for its SHA-256 and UTF-16
+length. Existing output, duplicate source provenance, path overlap, symlinks,
+and mismatched hashes are rejected. The original static tree snapshot fingerprint
+is recorded in runtime-observed/index.json; existing static JavaScript and
+reconstruction.json remain byte-identical. Only copied navigation Markdown is
+extended. Multiple observed captures may be attached to one static source tree.
+
+Reproduce using the private archived Knitsail HTML. Run inside
+prototypes/zipp-knitsail after copying initial.html to ignored inputs/archived.html.
+STATIC should point to the complete current static source-tree directory:
+
+~~~bash
+mkdir -p inputs/eval
+export KNITSAIL_HTML_SHA256=fa1a074588751a928703945a359792756f3be075752f3e8a1ff252a578581c6c
+export KNITSAIL_VM_SOURCE_OUT="$PWD/inputs/original-vm.js"
+export KNITSAIL_DYNAMIC_DIR="$PWD/inputs/eval"
+node scripts/replay-captured-html.cjs inputs/archived.html \
+  > inputs/runtime-report.json 2> inputs/replay.stderr
+node scripts/export-runtime-eval.mjs inputs/runtime-report.json \
+  inputs/eval inputs/observed /path/to/deobfuscate-safe
+node scripts/link-runtime-source-tree.mjs \
+  "$STATIC" inputs/combined inputs/observed inputs/original-vm.js
+node --test tests/runtime-eval-export.test.mjs \
+  tests/runtime-source-tree-link.test.mjs
+~~~
+
+Real archived validation: 51 observed eval executions, 40 unique source
+operands (25 readable standalone fragments, 15 retained parse refusals).
+The 4.4 MB combined view linked 3 textual static-source candidates, including
+lexical-context/helpers/oU-38980.js at line 95. All 785 original JS and
+reconstruction manifest files were verified byte-identical. All 366 local links
+across 49 generated or amended Markdown navigation pages resolved. The static
+snapshot contained 795 files, with pre-navigation fingerprint SHA-256
+552064fe5cdd06d2c16ee366073ef6f6a11de6e420683f9c7e25cccabc0af8fc.
+
+The local sample tree and private archived source stay under ignored inputs;
+this experiment does not merge runtime evidence into universally recovered JS
+or alter the active static reconstruction feature PR.

@@ -21,6 +21,12 @@ const handlerRe = payloadPrefix ? new RegExp('\\.' + payloadPrefix + '_\\s*=') :
 const vmScript = handlerRe ? scripts.find(s => handlerRe.test(s) && /knitsail/.test(s)) : null;
 if (!vmScript) throw new Error('Knitsail VM handler not found for prefix ' + payloadPrefix);
 const vmSha256 = createHash('sha256').update(vmScript).digest('hex');
+// Optional private, exact original VM output for source-offset verification.
+// Written before the in-memory instrumentation transforms the executable copy.
+if (process.env.KNITSAIL_VM_SOURCE_OUT) {
+  fs.writeFileSync(process.env.KNITSAIL_VM_SOURCE_OUT, vmScript);
+}
+
 
 // Optional *site-specific* direct-eval witness. The original source string
 // and its sha stay untouched in the report; only the in-memory execution
