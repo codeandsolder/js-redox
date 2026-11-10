@@ -2072,6 +2072,77 @@ fn nonthrowing_return(
     Some((fragment(source, statement.span()).to_owned(), binding))
 }
 
+/// Determine whether every non-abrupt exit from a catch handler has
+/// assigned a modeled numeric state. A throw/return leaves the function
+/// rather than retrying the loop; an unconditional modeled state write
+/// replaces the interrupted state on every successful fallthrough.
+///
+/// Unrecognized control transfers (including continue/loops/try/switch)
+/// prevent the proof. A preceding effectful expression may throw out of
+/// the catch, but cannot silently skip the later unconditional assignment.
+fn catch_always_replaces_state_or_exits(
+    statement: &Statement<'_>,
+    state: &str,
+    source: &str,
+) -> bool {
+    match statement {
+        Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => true,
+        Statement::ExpressionStatement(expr) => {
+            parse_route(&expr.expression, state, source).is_some()
+        }
+        Statement::IfStatement(branch) => branch.alternate.as_ref().is_some_and(|other| {
+            catch_always_replaces_state_or_exits(&branch.consequent, state, source)
+                && catch_always_replaces_state_or_exits(other, state, source)
+        }),
+        Statement::BlockStatement(block) => {
+            catch_block_always_replaces_state_or_exits(&block.body, state, source)
+        }
+        _ => false,
+    }
+}
+
+fn catch_block_always_replaces_state_or_exits(
+    statements: &[Statement<'_>],
+    state: &str,
+    source: &str,
+) -> bool {
+    for statement in statements {
+        if catch_always_replaces_state_or_exits(statement, state, source) {
+            return true;
+        }
+        if catch_may_resume_before_later_statement(statement) {
+            return false;
+        }
+    }
+    false
+}
+
+/// A continue, labeled transfer, nested try, or complex statement can reach
+/// the next iteration without evaluating a following write. Treat such
+/// control flow as unknown rather than trusting a later assignment.
+fn catch_may_resume_before_later_statement(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::ExpressionStatement(_)
+        | Statement::VariableDeclaration(_)
+        | Statement::ReturnStatement(_)
+        | Statement::ThrowStatement(_)
+        | Statement::EmptyStatement(_)
+        | Statement::DebuggerStatement(_) => false,
+        Statement::IfStatement(branch) => {
+            catch_may_resume_before_later_statement(&branch.consequent)
+                || branch
+                    .alternate
+                    .as_ref()
+                    .is_some_and(|other| catch_may_resume_before_later_statement(other))
+        }
+        Statement::BlockStatement(block) => block
+            .body
+            .iter()
+            .any(catch_may_resume_before_later_statement),
+        _ => true,
+    }
+}
+
 /// Preserve exception-handling scope and the original one-state-per-iteration
 /// execution order. Only remove state comparisons proven unreachable from
 /// both the lexical initializer and every statically possible catch recovery.
@@ -2196,6 +2267,28 @@ pub(crate) fn prune_exception_dispatcher(
         work.extend(next);
     }
 
+    // The catch can also resume without changing the interrupted state.
+    // A throwing case then remains independently enterable on the next
+    // iteration, even if its normal CFG predecessor is otherwise unique.
+    if !catch_block_always_replaces_state_or_exits(&handler.body.body, state, source) {
+        let mut cursor = dispatcher;
+        loop {
+            let Statement::IfStatement(branch) = cursor else {
+                return None;
+            };
+            if branch.consequent.may_have_side_effects(&effects) {
+                let label = state_test(&branch.test, state)?;
+                if reachable.contains(&label) {
+                    roots.insert(label);
+                }
+            }
+            match branch.alternate.as_ref() {
+                Some(other @ Statement::IfStatement(_)) => cursor = other,
+                None => break,
+                Some(_) => return None,
+            }
+        }
+    }
     // Recover one closed conditional region (compact two-arm or general DAG),
     // then recover independent linear
     // regions against the UPDATED CFG. Protect the diamond's entry and

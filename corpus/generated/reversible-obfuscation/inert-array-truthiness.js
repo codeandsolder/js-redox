@@ -591,3 +591,18 @@ console.log(JSON.stringify([
     branchingDagCycle(true), branchingDagCycle(false),
     branchingDagThrowingCase(0), branchingDagThrowingCase(1), branchingDagThrowingCase(2)
 ]));
+
+
+function caughtSameStateRetry() {
+    let state = 1;
+    let attempts = 0, caught = 0;
+    while (true) try {
+        if (state == 1) state = 2;
+        else if (state == 2) {
+            attempts++;
+            if (attempts == 1) throw Error("retry");
+            state = 3;
+        } else if (state == 3) return [state, attempts, caught];
+    } catch (error) { caught++; }
+}
+console.log(JSON.stringify(["implicit-catch-retry", caughtSameStateRetry()]));
