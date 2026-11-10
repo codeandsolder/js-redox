@@ -144,6 +144,79 @@ fn explicit_function_name(call: &CallExpression<'_>) -> Option<String> {
     .then_some(name)
 }
 
+/// Recognize an immediately invoked identity decorator that annotates a
+/// function with a statically recorded displayName, then returns that same
+/// argument: (component => (component.displayName = "Transition", component)).
+fn identity_display_name(call: &CallExpression<'_>) -> Option<String> {
+    if call.optional || call.arguments.len() != 1 {
+        return None;
+    }
+    let Expression::ArrowFunctionExpression(decorator) = unwrap_parens(&call.callee) else {
+        return None;
+    };
+    if decorator.r#async || decorator.params.items.len() != 1 || decorator.params.rest.is_some() {
+        return None;
+    }
+    let param = decorator.params.items.first()?;
+    if param.initializer.is_some() {
+        return None;
+    }
+    let BindingPattern::BindingIdentifier(binding) = &param.pattern else {
+        return None;
+    };
+    let Expression::SequenceExpression(sequence) = unwrap_parens(decorator.body.as_expression()?)
+    else {
+        return None;
+    };
+    let (last, prefix) = sequence.expressions.split_last()?;
+    if !matches!(unwrap_parens(last), Expression::Identifier(id) if id.name == binding.name) {
+        return None;
+    }
+    if !is_function_or_class(call.arguments.first()?.as_expression()?) {
+        return None;
+    }
+    let mut name = None;
+    for expression in prefix {
+        let Expression::AssignmentExpression(assignment) = unwrap_parens(expression) else {
+            return None;
+        };
+        let oxc_ast::ast::AssignmentTarget::StaticMemberExpression(member) = &assignment.left
+        else {
+            return None;
+        };
+        if assignment.operator.as_str() != "="
+            || member.optional
+            || !matches!(unwrap_parens(&member.object), Expression::Identifier(id) if id.name == binding.name)
+        {
+            return None;
+        }
+        if member.property.name == "displayName" {
+            if name.is_some() {
+                return None;
+            }
+            let StaticPrimitiveValue::String(candidate) = eval_static_primitive(&assignment.right)?
+            else {
+                return None;
+            };
+            name = Some(candidate);
+        }
+    }
+    let name = name?;
+    (name.len() >= 3
+        && name.len() <= 80
+        && name.as_bytes()[0].is_ascii_uppercase()
+        && identifier::is_identifier_name(&name))
+    .then_some(name)
+}
+
+fn unwrap_parens<'a, 'e>(expression: &'e Expression<'a>) -> &'e Expression<'a> {
+    if let Expression::ParenthesizedExpression(paren) = expression {
+        unwrap_parens(&paren.expression)
+    } else {
+        expression
+    }
+}
+
 fn name_from_initializer(expression: &Expression<'_>, remaining_calls: usize) -> Option<String> {
     match expression {
         Expression::ObjectExpression(object) => source_metadata_name(object),
@@ -151,12 +224,14 @@ fn name_from_initializer(expression: &Expression<'_>, remaining_calls: usize) ->
             name_from_initializer(&parenthesized.expression, remaining_calls)
         }
         Expression::CallExpression(call) if remaining_calls > 0 && !call.optional => {
-            explicit_function_name(call).or_else(|| {
-                name_from_initializer(
-                    call.arguments.first()?.as_expression()?,
-                    remaining_calls - 1,
-                )
-            })
+            identity_display_name(call)
+                .or_else(|| explicit_function_name(call))
+                .or_else(|| {
+                    name_from_initializer(
+                        call.arguments.first()?.as_expression()?,
+                        remaining_calls - 1,
+                    )
+                })
         }
         _ => None,
     }
@@ -735,6 +810,40 @@ export {r as a, x as b};
             "export {NavigationPanel as a, TooltipOverlay as b}",
         ] {
             assert!(output.contains(expected), "expected {expected} in {output}");
+        }
+    }
+
+    #[test]
+    fn recovers_named_identity_decorator_from_real_vue_bundle_shape() {
+        let source = r#"
+const Zo = {}, Qo = ((e) => (e.displayName = `Transition`, e.props = Zo, e))(
+    (e, {slots: t}) => [e, t]
+);
+export {Qo as q};
+console.log(Qo.displayName, Qo.props);
+"#;
+        let output = named(source);
+        assert!(output.contains("Transition = (("), "{output}");
+        assert!(output.contains("export {Transition as q}"), "{output}");
+        assert!(
+            output.contains("console.log(Transition.displayName, Transition.props)"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn identity_decorator_metadata_requires_proven_same_argument_return() {
+        for source in [
+            r#"var a = (e => (e.displayName = "WrongObject", {}))(function(){});"#,
+            r#"var a = (e => (e.displayName = "NotFunction", e))({});"#,
+            r#"var a = (e => (e.displayName = make(), e))(function(){});"#,
+            r#"var a = (e => (e["displayName"] = "DynamicKey", e))(function(){});"#,
+            r#"var a = (e => (e.displayName = "WrongValue", e.displayName = "RightValue", e))(function(){});"#,
+            r#"var a = (e => (e.displayName = "NoReturn", e.other))(function(){});"#,
+            r#"var a = (e => (e.displayName = "NotAName", e))(...values);"#,
+            r#"var a = async (e => (e.displayName = "NotDirect", e))(function(){});"#,
+        ] {
+            assert_eq!(named(source), source, "{source}");
         }
     }
 
