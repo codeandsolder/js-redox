@@ -290,3 +290,118 @@ long strings. Keep js-redox's conditional property aliases intact.
 archived source. It supplies a new **execution witness**, not a new structural
 recovery or a new static proof. ZIPP integration beyond the experiment remains
 unjustified until it recovers a fact unavailable from the actual source graph.
+
+## Archived Knitsail real dynamic-source recovery (2026-11-10)
+
+The previous archived wrapper replay proved the first API argument and handler
+164's conditional aliases. The same saved September 27 challenge contains a
+**reachable direct `eval(D)` site** that constructs executable JavaScript from
+VM data. This is our first genuine *new readable-source* result, not another
+property-key observation.
+
+**Provenance**: unchanged private archived HTML SHA-256
+`fa1a074588751a928703945a359792756f3be075752f3e8a1ff252a578581c6c`,
+embedded VM script SHA-256
+`e414463345509a89678cd7dc9afa9b9391e4dce58a56f6a1e641990f2884fa5e`;
+the original computed eval call is at **[29409,29416)** in that raw VM
+script. The source is the *same VM variant* as the pinned handler-164 experiment.
+
+**Capture**: in opt-in mode, `scripts/replay-captured-html.cjs` instruments this
+unique original direct-eval call in the in-memory VM source only. It keeps
+syntactically **direct** eval rather than swapping out the global `eval`
+function. It records pre-eval string SHA-256, UTF-16 code-unit length, call
+order, result type or thrown type, source site, and an explicit buffer-truncated
+flag. Exact generated source bytes are written once per SHA-256 into the
+specified ignored private directory. Result metadata is emitted in the
+redacted replay report. No raw HTML, cookies, original VM code or generated
+source bodies are committed to the public repository.
+
+**Focused archived result**:
+- Uninstrumented and instrumented replay both complete with an 851-character
+  `SG_SS` value; results are independent browser-model executions, not claims
+  of byte-for-byte identical randomly generated cookie values.
+- **51** direct eval executions, **40** distinct decoded source strings,
+  **27** returned values and **24** thrown completions; no truncation.
+- Five early eval strings contain freshly generated function expressions
+  (26, 26, 70, 106 and 83 UTF-16 code units), and actually return functions.
+  Their distinctive bodies were absent from the saved static Knitsail source
+  tree. Some other evals return callable lexical references without generating
+  a function: callable result != new function definition.
+- `scripts/export-runtime-eval.mjs` verifies full SHA-256 and code-unit lengths,
+  deduplicates by exact source bytes, and exports a separate manifest-backed,
+  readable source tree. With the existing `deobfuscate-safe source --format-output`
+  formatter, **25 of 40** distinct operands produce formatted analyst fragments;
+  **15** fail standalone parsing (often lexical-dependent or deliberately
+  invalid eval expressions). Rejected fragments remain available byte-for-byte
+  in the provenance-marked raw directory, never silently dropped.
+- The archive's original JavaScript AST and original static source tree cannot
+  simply be assumed to contain these dynamic function bodies. This is
+  **execution-conditioned** evidence, not a universal proof about all program
+  variants, inputs or browsers.
+
+**Reproduce** (private archive file required; Rust 1.99 used for existing
+formatter build, normal configured sccache):
+
+```bash
+cd prototypes/zipp-knitsail
+mkdir -p inputs/dynamic
+export KNITSAIL_HTML_SHA256=fa1a074588751a928703945a359792756f3be075752f3e8a1ff252a578581c6c
+export KNITSAIL_DYNAMIC_DIR="$PWD/inputs/dynamic"
+node scripts/replay-captured-html.cjs /path/to/private/initial.html \
+  > inputs/dynamic-report.json 2> inputs/dynamic-stderr.log
+node scripts/export-runtime-eval.mjs \
+  inputs/dynamic-report.json inputs/dynamic inputs/observed-tree \
+  /path/to/deobfuscate-safe
+node --test tests/runtime-eval-export.test.mjs
+```
+
+`inputs/`, sparse ZIPP checkout and `build/` remain git-ignored.
+The exporter writes exact raw eval fragments under `raw/*.txt`,
+accepted analyst-formatted snippets under `readable/*.js`, and a complete
+`manifest.json` recording the **original** unmodified VM hash, eval source
+offset, frequencies, outcomes and truncation. It refuses overwrite and
+tampered source bytes; focused tests cover duplicates, parse rejection,
+tampering, staging cleanup, and the original replay's bounded-capture mode.
+
+**Architectural decision:** Node executed the archived DOM-facing VM and
+observed the generated JS. This is the source-recovery value; ZIPP has not
+magically created it. ZIPP was separately tested on the first five *actual* generated function
+strings; all five Node/ZIPP differential results matched (see below). Keep this importer prototype out of the static
+js-redox production pipeline until there is a general way to link observed
+dynamic sources to a captured source tree with explicit execution provenance.
+
+### ZIPP dynamic-eval compatibility (focused 5-function differential)
+
+Used a fresh sparse checkout of pinned ZIPP with the experimental computed-
+property observer patch from this PR. From `dynamicCodeEvents`, took the first
+five original eval operands, all of which were 26–106-character newly generated
+function expressions that actually returned callable values. For each source,
+built a one-expression test program that `eval`s the **exact captured source
+bytes**, then prints `RESULT:<type>:<function arity>`. Node and ZIPP's
+`harness/src/bin/witness.rs` produce **byte-identical stdout on all 5**.
+Rust 1.99 through configured sccache; no full challenge/browser execution in
+ZIPP. This validates compatibility of dynamic code handling; it does not
+show that ZIPP discovered these original sources independently.
+
+Recreate fixtures after the capture (all paths are private/ignored):
+
+```bash
+mkdir -p inputs/zipp-generated
+node - <<'JS'
+const fs = require('node:fs');
+const r = JSON.parse(fs.readFileSync('inputs/dynamic-report.json', 'utf8'));
+for (const [i, event] of r.dynamicCodeEvents.slice(0, 5).entries()) {
+  const source = fs.readFileSync('inputs/dynamic/eval-' + event.sha256 + '.js', 'utf8');
+  const driver = 'const f=eval(' + JSON.stringify(source) +
+    '); console.log("RESULT:" + typeof f + ":" + f.length);';
+  fs.writeFileSync('inputs/zipp-generated/source-' + i + '.js', driver);
+}
+JS
+CARGO_TARGET_DIR="$PWD/build" cargo +1.99.0 build \
+  --manifest-path harness/Cargo.toml --bin witness
+for file in inputs/zipp-generated/*.js; do
+  node "$file" > "$file.node.out"
+  build/debug/witness "$file" > "$file.zipp.out" 2> "$file.zipp.stderr"
+  cmp "$file.node.out" "$file.zipp.out"
+done
+```

@@ -22,6 +22,39 @@ const vmScript = handlerRe ? scripts.find(s => handlerRe.test(s) && /knitsail/.t
 if (!vmScript) throw new Error('Knitsail VM handler not found for prefix ' + payloadPrefix);
 const vmSha256 = createHash('sha256').update(vmScript).digest('hex');
 
+// Optional *site-specific* direct-eval witness. The original source string
+// and its sha stay untouched in the report; only the in-memory execution
+// copy is instrumented, preserving the syntactically direct eval call.
+const dynamicDir = process.env.KNITSAIL_DYNAMIC_DIR || null;
+const dynamicCodeEvents = [];
+const pendingEval = [];
+let dynamicTruncated = false;
+let dynamicEvalSite = null;
+let runtimeVmScript = vmScript;
+const dynamicMaxEvents = Number(process.env.KNITSAIL_DYNAMIC_MAX_EVENTS || '10000');
+if (!Number.isSafeInteger(dynamicMaxEvents) || dynamicMaxEvents < 0) {
+  throw Error('KNITSAIL_DYNAMIC_MAX_EVENTS must be a nonnegative integer');
+}
+if (dynamicDir) {
+  const evalExpression = 'eval(D)';
+  const originalCall = 'return ' + evalExpression;
+  if (vmScript.split(originalCall).length !== 2) {
+    throw Error('Expected unique original Knitsail eval site');
+  }
+  const start = vmScript.indexOf(originalCall) + 'return '.length;
+  dynamicEvalSite = { start, end: start + evalExpression.length };
+  const replacement = [
+    'try {',
+    'return __knitsail_capture_eval_result(eval(__knitsail_capture_eval_arg(D)));',
+    '} catch (__knitsail_capture_error) {',
+    '__knitsail_capture_eval_throw(__knitsail_capture_error);',
+    'throw __knitsail_capture_error;',
+    '}'
+  ].join(' ');
+  runtimeVmScript = vmScript.replace(originalCall, replacement);
+  fs.mkdirSync(dynamicDir, {recursive:true});
+}
+
 const eidMatch = wrapper.match(/var eid='([^']*)'/);
 const eid = eidMatch ? eidMatch[1] : 'unknown';
 const baseHref = process.env.KS_HREF || 'https://www.google.com/search?q=rust+async+tokio&hl=en&gl=us';
@@ -136,13 +169,51 @@ const ctx={
 ctx.window=ctx;ctx.self=ctx;ctx.globalThis=ctx;ctx.global=ctx;ctx.top=ctx;ctx.parent=ctx;
 ctx.getComputedStyle=()=>({});
 
+if (dynamicDir) {
+  ctx.__knitsail_capture_eval_arg = value => {
+    if (dynamicCodeEvents.length >= dynamicMaxEvents) {
+      dynamicTruncated = true;
+      pendingEval.push(null);
+      return value;
+    }
+    const isString = typeof value === 'string';
+    const sha256 = isString ? createHash('sha256').update(value).digest('hex') : null;
+    const index = dynamicCodeEvents.length;
+    dynamicCodeEvents.push({
+      index, type:typeof value, length:isString ? value.length : null,
+      sha256, outcome:null
+    });
+    pendingEval.push(index);
+    if (isString) {
+      const filename = require('node:path').join(dynamicDir, 'eval-' + sha256 + '.js');
+      if (!fs.existsSync(filename)) fs.writeFileSync(filename, value);
+    }
+    return value;
+  };
+  ctx.__knitsail_capture_eval_result = value => {
+    const index = pendingEval.pop();
+    if (index !== null && index !== undefined) {
+      dynamicCodeEvents[index].outcome = 'return';
+      dynamicCodeEvents[index].resultType = typeof value;
+    }
+    return value;
+  };
+  ctx.__knitsail_capture_eval_throw = error => {
+    const index = pendingEval.pop();
+    if (index !== null && index !== undefined) {
+      dynamicCodeEvents[index].outcome = 'throw';
+      dynamicCodeEvents[index].thrownType = typeof error;
+    }
+    return error;
+  };
+}
 vm.createContext(ctx);
 const entryCalls = [];
 const outerCalls = [];
 let currentOuterFirst;
 let fatal=null;
 try {
-  vm.runInContext(vmScript,ctx,{filename:'live-knitsail-vm.js',timeout:10000});
+  vm.runInContext(runtimeVmScript,ctx,{filename:'live-knitsail-vm.js',timeout:10000});
   console.error('VM_LOADED',Object.keys(ctx.knitsail||{}));
   const {createHash} = require('node:crypto');
   const sha256 = value => createHash('sha256').update(value).digest('hex');
@@ -199,7 +270,7 @@ setTimeout(()=>{
     source:value?(sgCookie?'cookie':'url'):null,
     valueLength:value?value.length:null,
     startsStar:value?decodeURIComponent(value).startsWith('*'):false,
-    entryCalls, outerCalls,
+    entryCalls, outerCalls, dynamicEvalSite, dynamicCodeEvents, dynamicTruncated,
     // Redact challenge token, query/session IDs and request effects from report.
     cookiePresent:!!cookieValue,requestChanged:!!replacedUrl,beaconCount:beaconUrls.length,accesses
   },null,2));
