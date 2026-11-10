@@ -2108,6 +2108,95 @@ fn catch_condition_for_numeric_value(
     Some(if equality { matches } else { !matches })
 }
 
+/// A catch expression can guarantee a dispatcher overwrite without being a
+/// standalone assignment: e.g. `flag == 2 && (error = caught, state = 8)`.
+/// Follow JavaScript's short-circuit/sequence semantics, not text patterns.
+/// An exception thrown during an earlier expression leaves the catch abruptly,
+/// so only normal-completion paths need to be proven to have written the state.
+fn catch_expression_always_replaces_state(
+    expression: &Expression<'_>,
+    state: &str,
+    source: &str,
+    scoping: &Scoping,
+    selector: Option<(SymbolId, u64)>,
+) -> bool {
+    match unparen(expression) {
+        expr @ Expression::AssignmentExpression(_) => parse_route(expr, state, source).is_some(),
+        Expression::SequenceExpression(sequence) => sequence.expressions.iter().any(|expression| {
+            catch_expression_always_replaces_state(expression, state, source, scoping, selector)
+        }),
+        Expression::LogicalExpression(logical) => {
+            if catch_expression_always_replaces_state(
+                &logical.left,
+                state,
+                source,
+                scoping,
+                selector,
+            ) {
+                return true;
+            }
+            let condition = selector
+                .and_then(|(symbol, value)| {
+                    catch_condition_for_numeric_value(&logical.left, symbol, value, scoping)
+                })
+                .or_else(|| known_bool(&logical.left));
+            if matches!(
+                (logical.operator.as_str(), condition),
+                ("&&", Some(true)) | ("||", Some(false))
+            ) {
+                catch_expression_always_replaces_state(
+                    &logical.right,
+                    state,
+                    source,
+                    scoping,
+                    selector,
+                )
+            } else {
+                false
+            }
+        }
+        Expression::ConditionalExpression(conditional) => {
+            let condition = selector
+                .and_then(|(symbol, value)| {
+                    catch_condition_for_numeric_value(&conditional.test, symbol, value, scoping)
+                })
+                .or_else(|| known_bool(&conditional.test));
+            match condition {
+                Some(true) => catch_expression_always_replaces_state(
+                    &conditional.consequent,
+                    state,
+                    source,
+                    scoping,
+                    selector,
+                ),
+                Some(false) => catch_expression_always_replaces_state(
+                    &conditional.alternate,
+                    state,
+                    source,
+                    scoping,
+                    selector,
+                ),
+                None => {
+                    catch_expression_always_replaces_state(
+                        &conditional.consequent,
+                        state,
+                        source,
+                        scoping,
+                        selector,
+                    ) && catch_expression_always_replaces_state(
+                        &conditional.alternate,
+                        state,
+                        source,
+                        scoping,
+                        selector,
+                    )
+                }
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Return/throw and modeled dispatcher assignments terminate a catch path.
 /// Conditionals are proven per selector value when possible; otherwise both
 /// branches must terminate it.
@@ -2120,9 +2209,13 @@ fn catch_always_replaces_state_or_exits(
 ) -> bool {
     match statement {
         Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => true,
-        Statement::ExpressionStatement(expr) => {
-            parse_route(&expr.expression, state, source).is_some()
-        }
+        Statement::ExpressionStatement(expr) => catch_expression_always_replaces_state(
+            &expr.expression,
+            state,
+            source,
+            scoping,
+            selector,
+        ),
         Statement::IfStatement(branch) => {
             let known = selector.and_then(|(symbol, value)| {
                 catch_condition_for_numeric_value(&branch.test, symbol, value, scoping)

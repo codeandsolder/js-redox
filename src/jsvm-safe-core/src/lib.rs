@@ -3985,6 +3985,76 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_finite_catch_handles_short_circuit_sequence() {
+        let source = r#"
+            function f(flag, log, selector, state, observed) {
+                state = 1;
+                {
+                    selector = 46;
+                    while (true) try {
+                        if (state == 1) { if (flag) selector = 92; state = 2; }
+                        else if (state == 2) { log.push("effect"); state = 3; }
+                        else if (state == 3) return [state, observed, log];
+                    } catch (error) {
+                        if (selector == 46) throw error;
+                        selector == 92 && (observed = error.message, state = 3);
+                    }
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid input");
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("if(state==2)"),
+            "finite exhaustive catch with short-circuit assignment should allow a unique-region merge: {}",
+            result.source,
+        );
+        assert_eq!(
+            compact.matches("log.push(\"effect\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_preserves_nonexecuted_short_circuit_write() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                let selector = 46;
+                while (true) try {
+                    if (state == 1) { if (flag) selector = 92; state = 2; }
+                    else if (state == 2) { log.push("effect"); state = 3; }
+                    else if (state == 3) return [state, log];
+                } catch (error) {
+                    if (selector == 46) throw error;
+                    selector == 92 || (state = 3);
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid input");
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("if(state==2)"),
+            "true || must NOT be treated as executing the state assignment: {}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_handles_inert_array_literal_loop_test() {
         let source = r#"
             function f(flag) {

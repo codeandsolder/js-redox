@@ -696,3 +696,50 @@ function capturedSelectorMutatorCatchRetry() {
     }
 }
 console.log(JSON.stringify(["captured-selector-mutation", capturedSelectorMutatorCatchRetry()]));
+
+
+function exhaustiveShortCircuitCatch(flag, shouldThrow) {
+    let state = 1;
+    let selector = 46;
+    let observed;
+    const log = [];
+    while (true) try {
+        if (state == 1) { if (flag) selector = 92; state = 2; }
+        else if (state == 2) {
+            log.push("effect");
+            if (shouldThrow) throw Error("expected");
+            state = 3;
+        } else if (state == 3) return [state, observed, log];
+    } catch (error) {
+        if (selector == 46) throw error;
+        selector == 92 && (observed = error.message, state = 3);
+    }
+}
+function nonexhaustiveShortCircuitCatch() {
+    let state = 1;
+    let selector = 92;
+    let attempts = 0;
+    while (true) try {
+        if (state == 1) state = 2;
+        else if (state == 2) {
+            if (attempts++ == 0) throw Error("retry");
+            state = 3;
+        } else if (state == 3) return [state, attempts];
+    } catch (error) {
+        if (selector == 46) throw error;
+        selector == 92 || (state = 3);
+    }
+}
+console.log(JSON.stringify([
+    "catch-short-circuit",
+    exhaustiveShortCircuitCatch(false, false),
+    exhaustiveShortCircuitCatch(true, false),
+    exhaustiveShortCircuitCatch(true, true),
+    nonexhaustiveShortCircuitCatch()
+]));
+try {
+    exhaustiveShortCircuitCatch(false, true);
+    console.log("bad-unhandled-throw");
+} catch (error) {
+    console.log(JSON.stringify(["catch-short-circuit-rethrow", error.message]));
+}
