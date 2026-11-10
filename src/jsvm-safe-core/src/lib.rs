@@ -3512,7 +3512,7 @@ mod tests {
                 let state = 1;
                 while (true) try {
                     if (state == 1) state = flag ? 2 : 3;
-                    else if (state == 2) { log.push("loop"); state = 5; }
+                    else if (state == 2) { log.push("loop"); if (log.length > 2) return log; state = 5; }
                     else if (state == 5) { state = 2; }
                     else if (state == 3) { log.push("other"); state = 7; }
                     else if (state == 7) { log.push("join"); return log; }
@@ -3528,7 +3528,9 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
-            flat.contains("state=2") && flat.contains("state=5"),
+            flat.contains("state=2")
+                && flat.contains("if(state==2)")
+                && flat.contains("while(true)"),
             "cycle semantics lost: {}",
             result.source
         );

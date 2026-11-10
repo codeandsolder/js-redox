@@ -499,3 +499,24 @@ console.log(JSON.stringify([
     multiHopIndependentCatchEntry(true),
     multiHopIndependentCatchEntry(false)
 ]));
+
+
+function boundedMultiHopSideCycle(flag) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state == 1) state = flag ? 2 : 3;
+        else if (state == 2) {
+            log.push("loop");
+            if (log.length > 2) return [state, log];
+            state = 5;
+        } else if (state == 5) state = 2;
+        else if (state == 3) { log.push("other"); state = 7; }
+        else if (state == 7) { log.push("join"); return [state, log]; }
+    } catch (error) { throw error; }
+}
+console.log(JSON.stringify([
+    "multi-hop-bounded-cycle",
+    boundedMultiHopSideCycle(true),
+    boundedMultiHopSideCycle(false)
+]));
