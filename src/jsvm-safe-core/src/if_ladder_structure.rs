@@ -1041,39 +1041,51 @@ pub(crate) fn reconstruct_for(it: &ForStatement<'_>, source: &str) -> Option<Str
     )
 }
 
-/// Resolve a simple numeric initializer to its exact lexical binding.
-pub(crate) fn state_initializer<'a>(
+/// Enumerate numeric initializers by exact lexical binding and *individual*
+/// declarator span. An entire multi-declarator statement is not a safe
+/// initializer region: subsequent declarators may write the same symbol.
+pub(crate) fn state_initializers<'a>(
     stmt: &'a Statement<'a>,
     scoping: &Scoping,
-) -> Option<(SymbolId, &'a str, u64)> {
+) -> Vec<(SymbolId, &'a str, u64, Span)> {
     match stmt {
         Statement::ExpressionStatement(expression) => {
             let Expression::AssignmentExpression(assignment) = &expression.expression else {
-                return None;
+                return Vec::new();
             };
             if assignment.operator.as_str() != "=" {
-                return None;
+                return Vec::new();
             }
-            let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) = &assignment.left
-            else {
-                return None;
+            let AssignmentTarget::AssignmentTargetIdentifier(id) = &assignment.left else {
+                return Vec::new();
             };
-            let ref_id = id.reference_id.get()?;
-            let symbol = crate::statically_resolved_symbol(scoping, ref_id)?;
-            Some((symbol, id.name.as_str(), number(&assignment.right)?))
-        }
-        Statement::VariableDeclaration(declaration) if declaration.declarations.len() == 1 => {
-            let item = &declaration.declarations[0];
-            let BindingPattern::BindingIdentifier(binding) = &item.id else {
-                return None;
+            let Some(reference) = id.reference_id.get() else {
+                return Vec::new();
             };
-            Some((
-                binding.symbol_id.get()?,
-                binding.name.as_str(),
-                number(item.init.as_ref()?)?,
-            ))
+            let Some(symbol) = crate::statically_resolved_symbol(scoping, reference) else {
+                return Vec::new();
+            };
+            let Some(value) = number(&assignment.right) else {
+                return Vec::new();
+            };
+            vec![(symbol, id.name.as_str(), value, assignment.span)]
         }
-        _ => None,
+        Statement::VariableDeclaration(declaration) => declaration
+            .declarations
+            .iter()
+            .filter_map(|item| {
+                let BindingPattern::BindingIdentifier(binding) = &item.id else {
+                    return None;
+                };
+                Some((
+                    binding.symbol_id.get()?,
+                    binding.name.as_str(),
+                    number(item.init.as_ref()?)?,
+                    item.span,
+                ))
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1883,6 +1895,168 @@ fn exception_branching_dag_regions(
     Some((BTreeMap::new(), BTreeSet::new()))
 }
 
+/// Absorb one uniquely entered backedge arm of a natural loop without
+/// changing the enclosing `while`/`try` iteration boundary.
+///
+/// The source case at the loop header must choose between an internal path
+/// that returns to its header and an exit from the SCC. Every side case must
+/// have exactly one incoming *source* edge and no independent catch/initial
+/// entry. Moving that entire path into the header retains intermediate state
+/// writes and their catch-visible values, and the header executes only once
+/// in this outer iteration. A true backedge stays as a write to the header
+/// state; only the original next iteration can execute the header again.
+fn exception_scc_backedge_regions(
+    dispatcher: &Statement<'_>,
+    state: &str,
+    entry: ExceptionEntryProof<'_>,
+    cases: &mut BTreeMap<u64, Option<Route>>,
+    edits: &BTreeMap<u64, Vec<TerminalStateEdit>>,
+    effects: &ExceptionLoopEffectContext<'_>,
+    source: &str,
+) -> Option<(BTreeMap<u64, String>, BTreeSet<u64>)> {
+    let mut statements = BTreeMap::new();
+    let mut cursor = dispatcher;
+    loop {
+        let Statement::IfStatement(branch) = cursor else {
+            return None;
+        };
+        if branch.test.may_have_side_effects(effects) {
+            return None;
+        }
+        statements.insert(state_test(&branch.test, state)?, &branch.consequent);
+        match branch.alternate.as_ref() {
+            Some(other @ Statement::IfStatement(_)) => cursor = other,
+            None => break,
+            Some(_) => return None,
+        }
+    }
+
+    let graph = entry
+        .reachable
+        .iter()
+        .map(|&node| Some((node, cases.get(&node)?.as_ref()?.clone())))
+        .collect::<Option<BTreeMap<_, _>>>()?;
+    let mut incoming = BTreeMap::<u64, BTreeSet<u64>>::new();
+    for (&node, route) in &graph {
+        let mut targets = Vec::new();
+        route.targets(&mut targets);
+        for target in targets {
+            incoming.entry(target).or_default().insert(node);
+        }
+    }
+
+    let original_text = |label: u64| -> Option<String> {
+        let statement = *statements.get(&label)?;
+        match edits.get(&label) {
+            Some(changes) => print_terminal_edits(statement, source, changes),
+            None => Some(fragment(source, statement.span()).to_owned()),
+        }
+    };
+
+    for region in strongly_connected_regions(&graph, entry.reachable) {
+        if region.len() < 2 {
+            continue;
+        }
+        let mut entrances = entry
+            .roots
+            .intersection(&region)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for (&outside, route) in &graph {
+            if region.contains(&outside) {
+                continue;
+            }
+            let mut targets = Vec::new();
+            route.targets(&mut targets);
+            entrances.extend(targets.into_iter().filter(|target| region.contains(target)));
+        }
+        if entrances.len() != 1 {
+            // An SCC entered at two labels is irreducible for this source
+            // transformation, even when normal graph edges appear linear.
+            continue;
+        }
+        let header = *entrances.first()?;
+        if entry.excluded.contains(&header) {
+            continue;
+        }
+        let Some(route) = graph.get(&header) else {
+            continue;
+        };
+        let Next::Choose { yes, no, .. } = &route.next else {
+            continue;
+        };
+        let (Some(left), Some(right)) = (yes.plain_target(), no.plain_target()) else {
+            continue;
+        };
+        let (side, left_arm) = match (region.contains(&left), region.contains(&right)) {
+            (true, false) => (left, true),
+            (false, true) => (right, false),
+            _ => continue,
+        };
+        if side == header {
+            continue;
+        }
+
+        let mut path = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut predecessor = header;
+        let mut current = side;
+        while current != header {
+            if !region.contains(&current)
+                || entry.roots.contains(&current)
+                || entry.excluded.contains(&current)
+                || !visited.insert(current)
+                || incoming.get(&current) != Some(&BTreeSet::from([predecessor]))
+            {
+                path.clear();
+                break;
+            }
+            path.push(current);
+            let Some(next) = graph.get(&current).and_then(single_numeric_destination) else {
+                path.clear();
+                break;
+            };
+            predecessor = current;
+            current = next;
+        }
+        if path.is_empty() {
+            continue;
+        }
+
+        let mut composed = route.clone();
+        let Next::Choose { yes, no, .. } = &mut composed.next else {
+            continue;
+        };
+        let arm = if left_arm { yes } else { no };
+        let mut valid = true;
+        for &member in &path {
+            let Some(next_route) = graph.get(&member) else {
+                valid = false;
+                break;
+            };
+            if !splice_unique_successor(arm, member, next_route) {
+                valid = false;
+                break;
+            }
+        }
+        if !valid {
+            continue;
+        }
+        let side_body = path
+            .iter()
+            .map(|&member| Some(format!("{};", original_text(member)?)))
+            .collect::<Option<Vec<_>>>()?
+            .join("\n");
+        let text = format!(
+            "{{ {};\nif ({state} == {side}) {{ {side_body} }} }}",
+            original_text(header)?,
+        );
+        *cases.get_mut(&header)?.as_mut()? = composed;
+        return Some((BTreeMap::from([(header, text)]), path.into_iter().collect()));
+    }
+    Some((BTreeMap::new(), BTreeSet::new()))
+}
+
 /// Recover a reducible two-arm SESE region from source-case CFG transitions.
 ///
 /// Branch paths may contain any number of modeled states (including effectful
@@ -2659,6 +2833,23 @@ pub(crate) fn prune_exception_dispatcher(
         )?;
         if absorbed.is_empty() {
             let (regions, members) = exception_branching_dag_regions(
+                dispatcher,
+                state,
+                ExceptionEntryProof {
+                    roots: &roots,
+                    reachable: &reachable,
+                    excluded: &empty,
+                },
+                &mut cases,
+                &retargeted,
+                &effects,
+                source,
+            )?;
+            combined = regions;
+            absorbed = members;
+        }
+        if absorbed.is_empty() {
+            let (regions, members) = exception_scc_backedge_regions(
                 dispatcher,
                 state,
                 ExceptionEntryProof {

@@ -683,11 +683,12 @@ impl Collector<'_, '_> {
                     if_ladder_structure::while_state_binding(loop_stmt, self.scoping)
                 {
                     let immediately_preceded = index > 0
-                        && if_ladder_structure::state_initializer(
+                        && if_ladder_structure::state_initializers(
                             &statements[index - 1],
                             self.scoping,
                         )
-                        .is_some_and(|(other, _, _)| other == symbol);
+                        .iter()
+                        .any(|(other, _, _, _)| *other == symbol);
                     if !immediately_preceded {
                         if let Some(&(initial, init_span)) = reaching.get(&symbol) {
                             if self.reaching_state_is_stable(symbol, init_span, loop_stmt.span) {
@@ -751,14 +752,14 @@ impl Collector<'_, '_> {
             // Kill any state whose value could have changed in this
             // statement before processing the next sibling statement.
             reaching.retain(|&symbol, _| !self.symbol_written_in_span(symbol, stmt.span()));
-            if let Some((symbol, _, initial)) =
-                if_ladder_structure::state_initializer(stmt, self.scoping)
+            for (symbol, _, initial, init_span) in
+                if_ladder_structure::state_initializers(stmt, self.scoping)
             {
                 if self.scoping.symbol_flags(symbol).is_variable()
                     && !self.scoping.symbol_flags(symbol).is_const_variable()
                     && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
                 {
-                    reaching.insert(symbol, (initial, stmt.span()));
+                    reaching.insert(symbol, (initial, init_span));
                 }
             }
         }
@@ -4050,6 +4051,196 @@ mod tests {
         assert!(
             compact.contains("if(state==2)"),
             "true || must NOT be treated as executing the state assignment: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_absorbs_unique_backedge_arm() {
+        let source = r#"
+            function f(limit, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state == 1) state = count < limit ? 2 : 3;
+                    else if (state == 2) { log.push(count); count++; state = 1; }
+                    else if (state == 3) return [count, log];
+                } catch (error) { throw error; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("if(state==2)else") && !compact.contains("elseif(state==2)"),
+            "unique loop-side case must be absorbed: {}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(count)").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(
+            compact.contains("state=1"),
+            "backedge write must remain: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_absorbs_two_hop_backedge_with_throw() {
+        let source = r#"
+            function f(limit, abort, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state === 1) state = count < limit ? 2 : 3;
+                    else if (state === 2) { log.push("side"); state = 4; }
+                    else if (state === 4) {
+                        log.push("tail");
+                        if (abort) throw Error("expected");
+                        count++;
+                        state = 1;
+                    } else if (state === 3) return [state, count, log];
+                } catch (error) { return [state, error.message, log]; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("elseif(state===2)") && !compact.contains("elseif(state===4)"),
+            "single-entry two-hop backedge should be absorbed: {}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"side\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"tail\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(
+            compact.contains("state=1"),
+            "original backedge lost: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_rejects_catch_root_into_backedge_arm() {
+        let source = r#"
+            function f(limit, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state == 1) state = count < limit ? 2 : 3;
+                    else if (state == 2) { log.push(count); count++; state = 1; }
+                    else if (state == 3) return [count, log];
+                } catch (error) { state = 2; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("if(state==2)"),
+            "independent catch entry into cyclic side cannot be absorbed: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_rejects_irreducible_second_entry() {
+        let source = r#"
+            function f(limit, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state == 1) state = count < limit ? 2 : 3;
+                    else if (state == 2) { log.push(count); count++; state = 1; }
+                    else if (state == 3) return [count, log];
+                    else if (state == 4) state = 2;
+                } catch (error) { state = 4; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("if(state==2)"),
+            "external path from state 4 makes the cycle multi-entry: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_multi_declarator_initializer_tracks_later_write() {
+        let source = r#"
+            function f(log) {
+                let state = 1, other = (state = 2);
+                while (true) try {
+                    if (state == 1) { log.push("wrong"); return log; }
+                    else if (state == 2) { log.push("correct"); return log; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("state == 2") || result.source.contains("state==2"),
+            "later declarator writes state; the earlier initializer is not a reaching value: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_multi_declarator_initializer_in_second_position() {
+        let source = r#"
+            function f(limit, log) {
+                let count = 0, state = 1;
+                while (true) try {
+                    if (state == 1) state = count < limit ? 2 : 3;
+                    else if (state == 2) { log.push(count); count++; state = 1; }
+                    else if (state == 3) return [count, log];
+                } catch (error) { throw error; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("elseif(state==2)"),
+            "numeric initializer in any declarator position must be available: {}",
             result.source
         );
     }

@@ -743,3 +743,64 @@ try {
 } catch (error) {
     console.log(JSON.stringify(["catch-short-circuit-rethrow", error.message]));
 }
+
+
+function uniqueNaturalLoopBackedge(limit) {
+    let state = 1, count = 0, log = [];
+    while (true) try {
+        if (state == 1) state = count < limit ? 2 : 3;
+        else if (state == 2) { log.push(count); count++; state = 1; }
+        else if (state == 3) return [state, count, log];
+    } catch (error) { throw error; }
+}
+function twoHopNaturalLoopBackedge(limit, abort) {
+    let state = 1, count = 0, log = [];
+    while (true) try {
+        if (state === 1) state = count < limit ? 2 : 3;
+        else if (state === 2) { log.push("side"); state = 4; }
+        else if (state === 4) {
+            log.push("tail");
+            if (abort) throw Error("expected");
+            count++;
+            state = 1;
+        } else if (state === 3) return [state, count, log];
+    } catch (error) { return [state, error.message, log]; }
+}
+function multiEntryNaturalLoopReject(limit) {
+    let state = 1, count = 0, log = [];
+    while (true) try {
+        if (state == 1) state = count < limit ? 2 : 3;
+        else if (state == 2) { log.push(count); count++; state = 1; }
+        else if (state == 3) return [state, count, log];
+        else if (state == 4) state = 2;
+    } catch (error) { state = 4; }
+}
+console.log(JSON.stringify([
+    "exception-scc-backedge",
+    uniqueNaturalLoopBackedge(0), uniqueNaturalLoopBackedge(1), uniqueNaturalLoopBackedge(4),
+    twoHopNaturalLoopBackedge(0, false), twoHopNaturalLoopBackedge(2, false),
+    twoHopNaturalLoopBackedge(2, true), multiEntryNaturalLoopReject(3)
+]));
+
+
+function multiDeclaratorInitializerOverwrite() {
+    const log = [];
+    let state = 1, other = (state = 2);
+    while (true) try {
+        if (state == 1) { log.push("wrong"); return log; }
+        else if (state == 2) { log.push("correct"); return log; }
+    } catch (error) { throw error; }
+}
+function multiDeclaratorInitializerSecond(limit) {
+    const log = [];
+    let count = 0, state = 1;
+    while (true) try {
+        if (state == 1) state = count < limit ? 2 : 3;
+        else if (state == 2) { log.push(count); count++; state = 1; }
+        else if (state == 3) return [count, log];
+    } catch (error) { throw error; }
+}
+console.log(JSON.stringify([
+    "declarator-binding-spans", multiDeclaratorInitializerOverwrite(),
+    multiDeclaratorInitializerSecond(0), multiDeclaratorInitializerSecond(3)
+]));
