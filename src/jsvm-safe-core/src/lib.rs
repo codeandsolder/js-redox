@@ -4143,6 +4143,173 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_scc_absorbs_branching_reconvergent_backedge_once() {
+        let source = r#"
+            function f(limit, choose, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state === 1) state = count < limit ? 2 : 3;
+                    else if (state === 2) {
+                        log.push("branch");
+                        state = ((count + choose) % 2) ? 4 : 5;
+                    }
+                    else if (state === 4) { log.push("left"); state = 6; }
+                    else if (state === 5) { log.push("right"); state = 6; }
+                    else if (state === 6) {
+                        log.push("join");
+                        count++;
+                        state = 1;
+                    }
+                    else if (state === 3) return [count, log];
+                } catch (error) { return [state, error.message, log]; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for label in [2, 4, 5, 6] {
+            assert!(
+                !compact.contains(&format!("elseif(state==={label})")),
+                "side case {label} should be absorbed: {}",
+                result.source
+            );
+        }
+        for effect in ["branch", "left", "right", "join"] {
+            assert_eq!(
+                compact.matches(&format!("log.push(\"{effect}\")")).count(),
+                1,
+                "source effect {effect} should appear exactly once: {}",
+                result.source
+            );
+        }
+        assert!(compact.contains("state=1"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_rejects_independent_catch_entry_at_shared_join() {
+        let source = r#"
+            function f(limit, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state === 1) state = count < limit ? 2 : 3;
+                    else if (state === 2) state = count % 2 ? 4 : 5;
+                    else if (state === 4) { log.push("left"); state = 6; }
+                    else if (state === 5) { log.push("right"); state = 6; }
+                    else if (state === 6) { count++; state = 1; }
+                    else if (state === 3) return [count, log];
+                } catch (error) { state = 6; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("elseif(state===6)"),
+            "catch can independently resume at shared join: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_rejects_nested_side_cycle() {
+        let source = r#"
+            function f(limit, spin, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state === 1) state = count < limit ? 2 : 3;
+                    else if (state === 2) state = 4;
+                    else if (state === 4) state = spin() ? 5 : 6;
+                    else if (state === 5) { log.push("again"); state = 4; }
+                    else if (state === 6) { count++; state = 1; }
+                    else if (state === 3) return [count, log];
+                } catch (error) { throw error; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("elseif(state===5)"),
+            "side cycle must remain distinct: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_absorbs_split_backedges_to_header() {
+        // Both branch arms jump directly to the header. There is no
+        // internal side join for the earlier diamond/DAG passes to recover.
+        let source = r#"
+            function f(limit, choose, abort, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state === 1) state = count < limit ? 2 : 3;
+                    else if (state === 2) {
+                        log.push("fork");
+                        state = ((count + choose) % 2) ? 4 : 5;
+                    }
+                    else if (state === 4) {
+                        log.push("left");
+                        if (abort && count === 1) throw Error("interrupted-left");
+                        count++;
+                        state = 1;
+                    }
+                    else if (state === 5) {
+                        log.push("right");
+                        if (abort && count === 1) throw Error("interrupted-right");
+                        count++;
+                        state = 1;
+                    }
+                    else if (state === 3) return [count, log];
+                } catch (error) { return [state, error.message, log]; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for label in [2, 4, 5] {
+            assert!(
+                !compact.contains(&format!("elseif(state==={label})")),
+                "branch-side {label} should be recovered: {}",
+                result.source
+            );
+        }
+        for effect in ["fork", "left", "right"] {
+            assert_eq!(
+                compact.matches(&format!("log.push(\"{effect}\")")).count(),
+                1,
+                "effect {effect} should occur once in the emitted source: {}",
+                result.source
+            );
+        }
+        assert!(
+            compact.contains("state=1"),
+            "backedge lost: {}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_scc_rejects_catch_root_into_backedge_arm() {
         let source = r#"
             function f(limit, log) {

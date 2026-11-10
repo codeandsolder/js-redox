@@ -1898,13 +1898,15 @@ fn exception_branching_dag_regions(
 /// Absorb one uniquely entered backedge arm of a natural loop without
 /// changing the enclosing `while`/`try` iteration boundary.
 ///
-/// The source case at the loop header must choose between an internal path
-/// that returns to its header and an exit from the SCC. Every side case must
-/// have exactly one incoming *source* edge and no independent catch/initial
-/// entry. Moving that entire path into the header retains intermediate state
-/// writes and their catch-visible values, and the header executes only once
-/// in this outer iteration. A true backedge stays as a write to the header
-/// state; only the original next iteration can execute the header again.
+/// The header chooses an internal side and an exit from the SCC. The side
+/// graph must be acyclic after removing the header, and every side route
+/// must remain inside it or return to the header. Shared side joins are
+/// allowed; external or independent catch/initializer entries are not.
+/// Topologically ordered state guards execute each original case at most
+/// once without cloning effects, retaining intermediate numeric writes and
+/// catch-visible values in the original protected try. The true backedge
+/// remains a state write; only the original outer while iteration reenters
+/// the header.
 fn exception_scc_backedge_regions(
     dispatcher: &Statement<'_>,
     state: &str,
@@ -1997,29 +1999,81 @@ fn exception_scc_backedge_regions(
             continue;
         }
 
-        let mut path = Vec::new();
-        let mut visited = BTreeSet::new();
-        let mut predecessor = header;
-        let mut current = side;
-        while current != header {
-            if !region.contains(&current)
-                || entry.roots.contains(&current)
-                || entry.excluded.contains(&current)
-                || !visited.insert(current)
-                || incoming.get(&current) != Some(&BTreeSet::from([predecessor]))
-            {
-                path.clear();
+        // The internal side of a natural loop may branch and reconverge.
+        // Only absorb it when every normal path stays in an acyclic side
+        // graph and eventually returns to the header. This lets us emit
+        // each source case once, instead of cloning effects at joins.
+        let members = region
+            .iter()
+            .copied()
+            .filter(|&member| member != header)
+            .collect::<BTreeSet<_>>();
+        if !members.contains(&side) {
+            continue;
+        }
+        let mut indegrees = BTreeMap::new();
+        let mut valid = true;
+        let mut has_backedge = false;
+        for &member in &members {
+            if entry.roots.contains(&member) || entry.excluded.contains(&member) {
+                valid = false;
                 break;
             }
-            path.push(current);
-            let Some(next) = graph.get(&current).and_then(single_numeric_destination) else {
-                path.clear();
+            let Some(parents) = incoming.get(&member) else {
+                valid = false;
                 break;
             };
-            predecessor = current;
-            current = next;
+            if !parents.is_subset(&region) {
+                valid = false;
+                break;
+            }
+            indegrees.insert(
+                member,
+                parents
+                    .iter()
+                    .filter(|parent| members.contains(parent))
+                    .count(),
+            );
+            let mut targets = Vec::new();
+            graph.get(&member)?.targets(&mut targets);
+            for target in targets {
+                if target == header {
+                    has_backedge = true;
+                } else if !members.contains(&target) {
+                    // No side exits may bypass the header's sole exit arm.
+                    valid = false;
+                    break;
+                }
+            }
+            if !valid {
+                break;
+            }
         }
-        if path.is_empty() {
+        if !valid || !has_backedge {
+            continue;
+        }
+        let mut ready = indegrees
+            .iter()
+            .filter_map(|(&member, &degree)| (degree == 0).then_some(member))
+            .collect::<BTreeSet<_>>();
+        let mut ordered = Vec::with_capacity(members.len());
+        while let Some(&member) = ready.first() {
+            ready.remove(&member);
+            ordered.push(member);
+            let mut targets = Vec::new();
+            graph.get(&member)?.targets(&mut targets);
+            for successor in targets.into_iter().collect::<BTreeSet<_>>() {
+                if let Some(degree) = indegrees.get_mut(&successor) {
+                    *degree -= 1;
+                    if *degree == 0 {
+                        ready.insert(successor);
+                    }
+                }
+            }
+        }
+        if ordered.len() != members.len() {
+            // A cycle not passing through the header would allow a side
+            // case to execute twice and cannot be flattened this way.
             continue;
         }
 
@@ -2028,31 +2082,18 @@ fn exception_scc_backedge_regions(
             continue;
         };
         let arm = if left_arm { yes } else { no };
-        let mut valid = true;
-        for &member in &path {
-            let Some(next_route) = graph.get(&member) else {
-                valid = false;
-                break;
-            };
-            if !splice_unique_successor(arm, member, next_route) {
-                valid = false;
-                break;
-            }
+        arm.next = Next::State(header);
+
+        let mut text = format!("{{ {};", original_text(header)?);
+        for &member in &ordered {
+            text.push_str(&format!(
+                "\nif ({state} == {member}) {{ {}; }}",
+                original_text(member)?
+            ));
         }
-        if !valid {
-            continue;
-        }
-        let side_body = path
-            .iter()
-            .map(|&member| Some(format!("{};", original_text(member)?)))
-            .collect::<Option<Vec<_>>>()?
-            .join("\n");
-        let text = format!(
-            "{{ {};\nif ({state} == {side}) {{ {side_body} }} }}",
-            original_text(header)?,
-        );
+        text.push_str("\n}");
         *cases.get_mut(&header)?.as_mut()? = composed;
-        return Some((BTreeMap::from([(header, text)]), path.into_iter().collect()));
+        return Some((BTreeMap::from([(header, text)]), members));
     }
     Some((BTreeMap::new(), BTreeSet::new()))
 }
