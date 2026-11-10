@@ -4410,6 +4410,224 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_throw_boundary_call_arguments_preserve_order() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        log.push(state = 4, mightThrow(log));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "call-argument-catch-resume";
+                    else if (state === 6) return "unobservable-after-call";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("call-argument-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-call"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_computed_getter_after_key() {
+        let source = r#"
+            function f(obj) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[(state = 4, "dangerous")];
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "getter-catch-resume";
+                    else if (state === 6) return "unobservable-after-getter";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("getter-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-getter"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_method_getter_before_arguments() {
+        let source = r#"
+            function f(obj) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[(state = 4, "fn")](state = 5);
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "getter-before-args-resume";
+                    else if (state === 5) return "invocation-after-args-resume";
+                    else if (state === 6) return "unobservable-after-invocation";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("getter-before-args-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("invocation-after-args-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-invocation"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_constructor_arguments() {
+        let source = r#"
+            function f(Constructor, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        new Constructor(state = 4, log.push("ctor"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "constructor-catch-resume";
+                    else if (state === 6) return "unobservable-after-constructor";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("constructor-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-constructor"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_computed_assignment_lhs_before_rhs() {
+        let source = r#"
+            function f(obj, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[(state = 4, "prop")] = log.push("setter");
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "setter-catch-resume";
+                    else if (state === 6) return "unobservable-after-setter";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("setter-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-setter"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_spread_iteration_after_write() {
+        let source = r#"
+            function f(fn, iterator) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        fn(...(state = 4, iterator));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "spread-catch-resume";
+                    else if (state === 6) return "unobservable-after-spread";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("spread-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-spread"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_optional_call_keeps_skipped_argument() {
+        let source = r#"
+            function f(fn, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        fn?.(state = 4, log.push("maybe"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "optional-call-catch-resume";
+                    else if (state === 6) return "potential-successor";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("optional-call-catch-resume"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_const_write_does_not_advance_catch_state() {
         let source = r#"
             function f() {

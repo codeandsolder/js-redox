@@ -1421,6 +1421,43 @@ fn sequential_exception_roots(
             !writes.unsafe_write && writes.targets.is_empty()
         }
 
+        /// Evaluate the receiver (or constructor) and arguments in ECMAScript
+        /// order. Spreading an argument can throw *after* evaluating its
+        /// expression, when retrieving/iterating the spread value.
+        fn call_arguments(
+            &mut self,
+            arguments: &[oxc_ast::ast::Argument<'_>],
+            mut states: BTreeSet<u64>,
+        ) -> Option<BTreeSet<u64>> {
+            for argument in arguments {
+                if let oxc_ast::ast::Argument::SpreadElement(spread) = argument {
+                    states = self.expression(&spread.argument, states)?;
+                    self.roots.extend(states.iter().copied());
+                } else {
+                    states = self.expression(argument.as_expression()?, states)?;
+                }
+            }
+            Some(states)
+        }
+
+        /// A property Reference is evaluated after the receiver and computed
+        /// key. ToPropertyKey / GetValue / accessors may throw at that point.
+        fn property_reference(
+            &mut self,
+            object: &Expression<'_>,
+            key: Option<&Expression<'_>>,
+            incoming: BTreeSet<u64>,
+        ) -> Option<BTreeSet<u64>> {
+            let after_object = self.expression(object, incoming)?;
+            let after_key = if let Some(key) = key {
+                self.expression(key, after_object)?
+            } else {
+                after_object
+            };
+            self.roots.extend(after_key.iter().copied());
+            Some(after_key)
+        }
+
         /// Evaluate the portions of an expression whose JS evaluation order
         /// is explicit in the AST. A normal result is a set of possible state
         /// values; roots collect the values observed before a possible throw.
@@ -1459,6 +1496,67 @@ fn sequential_exception_roots(
                     let mut merged = left;
                     merged.extend(right);
                     (merged.len() <= 2048).then_some(merged)
+                }
+                // Optional chains can skip argument/key evaluation. Keep
+                // them on the preexisting conservative semantic-write path.
+                Expression::ComputedMemberExpression(member) if !member.optional => {
+                    self.property_reference(&member.object, Some(&member.expression), incoming)
+                }
+                Expression::StaticMemberExpression(member) if !member.optional => {
+                    self.property_reference(&member.object, None, incoming)
+                }
+                Expression::PrivateFieldExpression(member) if !member.optional => {
+                    self.property_reference(&member.object, None, incoming)
+                }
+                Expression::CallExpression(call) if !call.optional => {
+                    // Direct eval can assign to a lexical name dynamically.
+                    // Do not treat it as an ordinary opaque call even if its
+                    // arguments themselves are statically accounted for.
+                    if matches!(
+                        unparen(&call.callee),
+                        Expression::Identifier(id) if id.name == "eval"
+                    ) {
+                        return None;
+                    }
+                    let after_callee = self.expression(&call.callee, incoming)?;
+                    let after_args = self.call_arguments(&call.arguments, after_callee)?;
+                    self.roots.extend(after_args.iter().copied());
+                    Some(after_args)
+                }
+                Expression::NewExpression(new) => {
+                    let after_callee = self.expression(&new.callee, incoming)?;
+                    let after_args = self.call_arguments(&new.arguments, after_callee)?;
+                    self.roots.extend(after_args.iter().copied());
+                    Some(after_args)
+                }
+                // Evaluate computed assignment references before the RHS.
+                // Property conversion and setters can throw even when no
+                // explicit call occurs. Other assignment targets retain
+                // their original conservative write analysis.
+                Expression::AssignmentExpression(assignment)
+                    if assignment.operator.as_str() == "="
+                        && matches!(
+                            assignment.left,
+                            AssignmentTarget::ComputedMemberExpression(_)
+                                | AssignmentTarget::StaticMemberExpression(_)
+                        ) =>
+                {
+                    let after_target = match &assignment.left {
+                        AssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
+                            self.property_reference(
+                                &member.object,
+                                Some(&member.expression),
+                                incoming,
+                            )?
+                        }
+                        AssignmentTarget::StaticMemberExpression(member) if !member.optional => {
+                            self.property_reference(&member.object, None, incoming)?
+                        }
+                        _ => return None,
+                    };
+                    let after_rhs = self.expression(&assignment.right, after_target)?;
+                    self.roots.extend(after_rhs.iter().copied());
+                    Some(after_rhs)
                 }
                 other => {
                     if let Some(target) =
