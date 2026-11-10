@@ -4813,6 +4813,189 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_throw_boundary_object_computed_key() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        ({[(state = 4, "key")]: log.push("value")});
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "object-computed-key-resume";
+                    else if (state === 6) return "object-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("object-computed-key-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("object-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_object_key_coercion_before_value() {
+        let source = r#"
+            function f(key, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        ({[(state = 4, key)]: (state = 5, log.push("value"))});
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "coercion-before-value-resume";
+                    else if (state === 5) return "value-after-coercion-resume";
+                    else if (state === 6) return "object-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("coercion-before-value-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("value-after-coercion-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("object-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_object_value_order() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        ({a: state = 4, b: log.push("may throw"), c: state = 6});
+                        state = 7;
+                    } else if (state === 4) return "object-value-resume";
+                    else if (state === 6) return "object-unobservable-after-value";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("object-value-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("object-unobservable-after-value"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_object_spread_getter() {
+        let source = r#"
+            function f(source) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        ({... (state = 4, source), following: state = 6});
+                        state = 7;
+                    } else if (state === 4) return "object-spread-getter-resume";
+                    else if (state === 6) return "object-unobservable-after-spread";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("object-spread-getter-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("object-unobservable-after-spread"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_object_computed_method_key() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        ({[(state = 4, "method")]() {return 42;}, x: log.push("may throw")});
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "object-method-key-resume";
+                    else if (state === 6) return "object-unobservable-after-method";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("object-method-key-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("object-unobservable-after-method"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_object_unknown_key_write_fallback() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        ({[(state += 3, "key")]: log.push("may throw")});
+                        state = 7;
+                    } else if (state === 4) return "object-unknown-write-resume";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("object-unknown-write-resume"),
+            "unknown compound writes must not delete catch-state roots: {}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_const_write_does_not_advance_catch_state() {
         let source = r#"
             function f() {

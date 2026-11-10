@@ -1532,6 +1532,36 @@ fn sequential_exception_roots(
                     }
                     Some(states)
                 }
+                Expression::ObjectExpression(object) => {
+                    // Object literal entries are evaluated from left to right.
+                    // Computed keys run before their corresponding values,
+                    // and ToPropertyKey can throw before value evaluation.
+                    // Spread performs CopyDataProperties *after* evaluating
+                    // its argument: property enumeration/getters can throw
+                    // before a subsequent object entry executes.
+                    let mut states = incoming;
+                    for entry in &object.properties {
+                        match entry {
+                            oxc_ast::ast::ObjectPropertyKind::SpreadProperty(spread) => {
+                                states = self.expression(&spread.argument, states)?;
+                                self.roots.extend(states.iter().copied());
+                            }
+                            oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property) => {
+                                if property.computed {
+                                    states =
+                                        self.expression(property.key.as_expression()?, states)?;
+                                    self.roots.extend(states.iter().copied());
+                                }
+                                // For accessors and methods this evaluates a
+                                // function expression, not its body. Lexical
+                                // capture is separately rejected by the
+                                // confined_exception_state proof.
+                                states = self.expression(&property.value, states)?;
+                            }
+                        }
+                    }
+                    Some(states)
+                }
                 // Optional chains can skip argument/key evaluation. Keep
                 // them on the preexisting conservative semantic-write path.
                 Expression::ComputedMemberExpression(member) if !member.optional => {
