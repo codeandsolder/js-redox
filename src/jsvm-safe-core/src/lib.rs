@@ -723,6 +723,8 @@ impl Collector<'_, '_> {
                             symbol,
                             self.scoping,
                             self.source,
+                            &reaching,
+                            self.reference_spans,
                         ) {
                             if let Some(dispatcher) = protected.block.body.first() {
                                 self.push(dispatcher.span(), code, "exception_state_pruned");
@@ -3804,6 +3806,178 @@ mod tests {
         assert!(
             result.source.contains("resumed-intermediate"),
             "intermediate exceptional entry must be retained: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_domain_allows_effectful_merge() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                let selector = 46;
+                while (true) try {
+                    if (state == 1) { if (flag) selector = 92; state = 2; }
+                    else if (state == 2) { log.push("effect"); state = 3; }
+                    else if (state == 3) return [state, log];
+                } catch (error) {
+                    if (selector === 46) throw error;
+                    if (selector == 92) { state = 3; }
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("syntactically valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !flat.contains("if(state==2)"),
+            "finite exhaustive catch must permit unique successor merge: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"effect\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_domain_rejects_unhandled_value() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                let selector = 46;
+                while (true) try {
+                    if (state == 1) { selector = flag ? 13 : 92; state = 2; }
+                    else if (state == 2) { log.push("effect"); state = 3; }
+                    else if (state == 3) return [state, log];
+                } catch (error) {
+                    if (selector === 46) throw error;
+                    if (selector == 92) { state = 3; }
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("syntactically valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==2)"),
+            "unhandled 13 permits same-state catch retry: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_domain_rejects_selector_mutation_in_catch() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                let selector = 46;
+                while (true) try {
+                    if (state == 1) { selector = flag ? 92 : 46; state = 2; }
+                    else if (state == 2) { log.push("effect"); state = 3; }
+                    else if (state == 3) return [state, log];
+                } catch (error) {
+                    selector = 13;
+                    if (selector == 46) throw error;
+                    if (selector == 92) { state = 3; }
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("syntactically valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==2)"),
+            "catch can overwrite selector before comparing: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_domain_rejects_unknown_outside_write() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                let selector = 46;
+                function overwrite() { selector = 13; }
+                while (true) try {
+                    if (state == 1) { if (flag) selector = 92; state = 2; }
+                    else if (state == 2) { log.push("effect"); state = 3; }
+                    else if (state == 3) return [state, log];
+                } catch (error) {
+                    if (selector == 46) throw error;
+                    if (selector == 92) { state = 3; }
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("syntactically valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==2)"),
+            "external lexical write breaks finite-domain proof: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_rejects_captured_selector_mutator() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                let selector = 46;
+                let change;
+                let attempts = 0;
+                while (true) try {
+                    if (state == 1) {
+                        change = () => { selector = 46; };
+                        selector = 92;
+                        state = 2;
+                    } else if (state == 2) {
+                        log.push("effect");
+                        if (attempts++ == 0) throw Error("retry");
+                        state = 3;
+                    } else if (state == 3) return [state, selector, attempts, log];
+                } catch (error) {
+                    if (selector == 46) throw error;
+                    change();
+                    if (selector == 92) { state = 3; }
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("syntactically valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==2)"),
+            "captured selector mutation must retain catch retry entry: {}",
             result.source
         );
     }

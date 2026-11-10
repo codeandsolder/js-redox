@@ -21,9 +21,10 @@ use oxc_ecmascript::{
     GlobalContext,
 };
 use oxc_semantic::Scoping;
-use oxc_span::GetSpan;
+use oxc_span::{GetSpan, Span};
+use oxc_syntax::reference::ReferenceId;
 use oxc_syntax::symbol::SymbolId;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 #[derive(Debug, Clone)]
 enum Next {
@@ -2072,31 +2073,91 @@ fn nonthrowing_return(
     Some((fragment(source, statement.span()).to_owned(), binding))
 }
 
-/// Determine whether every non-abrupt exit from a catch handler has
-/// assigned a modeled numeric state. A throw/return leaves the function
-/// rather than retrying the loop; an unconditional modeled state write
-/// replaces the interrupted state on every successful fallthrough.
-///
-/// Unrecognized control transfers (including continue/loops/try/switch)
-/// prevent the proof. A preceding effectful expression may throw out of
-/// the catch, but cannot silently skip the later unconditional assignment.
+/// Resolve a known finite numeric selector condition by lexical identity.
+fn catch_condition_for_numeric_value(
+    test: &Expression<'_>,
+    selector: SymbolId,
+    value: u64,
+    scoping: &Scoping,
+) -> Option<bool> {
+    let Expression::BinaryExpression(binary) = unparen(test) else {
+        return None;
+    };
+    let equality = match binary.operator.as_str() {
+        "==" | "===" => true,
+        "!=" | "!==" => false,
+        _ => return None,
+    };
+    let candidate = |expr: &Expression<'_>| {
+        let Expression::Identifier(id) = unparen(expr) else {
+            return false;
+        };
+        id.reference_id
+            .get()
+            .and_then(|reference| scoping.get_reference(reference).symbol_id())
+            == Some(selector)
+    };
+    let literal = if candidate(&binary.left) && inert_literal_value(&binary.right) {
+        number(&binary.right)?
+    } else if candidate(&binary.right) && inert_literal_value(&binary.left) {
+        number(&binary.left)?
+    } else {
+        return None;
+    };
+    let matches = value == literal;
+    Some(if equality { matches } else { !matches })
+}
+
+/// Return/throw and modeled dispatcher assignments terminate a catch path.
+/// Conditionals are proven per selector value when possible; otherwise both
+/// branches must terminate it.
 fn catch_always_replaces_state_or_exits(
     statement: &Statement<'_>,
     state: &str,
     source: &str,
+    scoping: &Scoping,
+    selector: Option<(SymbolId, u64)>,
 ) -> bool {
     match statement {
         Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => true,
         Statement::ExpressionStatement(expr) => {
             parse_route(&expr.expression, state, source).is_some()
         }
-        Statement::IfStatement(branch) => branch.alternate.as_ref().is_some_and(|other| {
-            catch_always_replaces_state_or_exits(&branch.consequent, state, source)
-                && catch_always_replaces_state_or_exits(other, state, source)
-        }),
-        Statement::BlockStatement(block) => {
-            catch_block_always_replaces_state_or_exits(&block.body, state, source)
+        Statement::IfStatement(branch) => {
+            let known = selector.and_then(|(symbol, value)| {
+                catch_condition_for_numeric_value(&branch.test, symbol, value, scoping)
+            });
+            match known {
+                Some(true) => catch_always_replaces_state_or_exits(
+                    &branch.consequent,
+                    state,
+                    source,
+                    scoping,
+                    selector,
+                ),
+                Some(false) => branch.alternate.as_ref().is_some_and(|other| {
+                    catch_always_replaces_state_or_exits(other, state, source, scoping, selector)
+                }),
+                None => branch.alternate.as_ref().is_some_and(|other| {
+                    catch_always_replaces_state_or_exits(
+                        &branch.consequent,
+                        state,
+                        source,
+                        scoping,
+                        selector,
+                    ) && catch_always_replaces_state_or_exits(
+                        other, state, source, scoping, selector,
+                    )
+                }),
+            }
         }
+        Statement::BlockStatement(block) => catch_block_always_replaces_state_or_exits(
+            &block.body,
+            state,
+            source,
+            scoping,
+            selector,
+        ),
         _ => false,
     }
 }
@@ -2105,9 +2166,11 @@ fn catch_block_always_replaces_state_or_exits(
     statements: &[Statement<'_>],
     state: &str,
     source: &str,
+    scoping: &Scoping,
+    selector: Option<(SymbolId, u64)>,
 ) -> bool {
     for statement in statements {
-        if catch_always_replaces_state_or_exits(statement, state, source) {
+        if catch_always_replaces_state_or_exits(statement, state, source, scoping, selector) {
             return true;
         }
         if catch_may_resume_before_later_statement(statement) {
@@ -2117,9 +2180,7 @@ fn catch_block_always_replaces_state_or_exits(
     false
 }
 
-/// A continue, labeled transfer, nested try, or complex statement can reach
-/// the next iteration without evaluating a following write. Treat such
-/// control flow as unknown rather than trusting a later assignment.
+/// Unrecognized transfers may bypass subsequent catch statements.
 fn catch_may_resume_before_later_statement(statement: &Statement<'_>) -> bool {
     match statement {
         Statement::ExpressionStatement(_)
@@ -2143,6 +2204,147 @@ fn catch_may_resume_before_later_statement(statement: &Statement<'_>) -> bool {
     }
 }
 
+/// Collect only recognized numeric writes to the exact selector symbol.
+/// Every writable lexical reference must be accounted for by the visitor.
+struct CatchSelectorFiniteWrites<'s> {
+    symbol: SymbolId,
+    scoping: &'s Scoping,
+    source: &'s str,
+    values: BTreeSet<u64>,
+    modeled: BTreeSet<ReferenceId>,
+    valid: bool,
+    nested_function_depth: usize,
+}
+
+impl<'a> Visit<'a> for CatchSelectorFiniteWrites<'_> {
+    fn visit_function(
+        &mut self,
+        function: &oxc_ast::ast::Function<'a>,
+        flags: oxc_syntax::scope::ScopeFlags,
+    ) {
+        self.nested_function_depth += 1;
+        walk::walk_function(self, function, flags);
+        self.nested_function_depth -= 1;
+    }
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        self.nested_function_depth += 1;
+        walk::walk_arrow_function_expression(self, function);
+        self.nested_function_depth -= 1;
+    }
+
+    fn visit_assignment_expression(&mut self, expr: &AssignmentExpression<'a>) {
+        if let AssignmentTarget::AssignmentTargetIdentifier(id) = &expr.left {
+            if let Some(reference) = id.reference_id.get() {
+                if self.scoping.get_reference(reference).symbol_id() == Some(self.symbol) {
+                    if self.nested_function_depth != 0 {
+                        self.valid = false;
+                    }
+                    if expr.operator.as_str() == "=" {
+                        if let Some(route) =
+                            parse_target(&expr.right, id.name.as_str(), self.source)
+                        {
+                            let mut targets = Vec::new();
+                            route.targets(&mut targets);
+                            self.values.extend(targets);
+                            self.modeled.insert(reference);
+                        } else {
+                            self.valid = false;
+                        }
+                    } else {
+                        self.valid = false;
+                    }
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, expr);
+    }
+}
+
+/// Prove a finite lexical value domain, established before the loop. No
+/// unrecognized write is allowed in or outside the loop, and the catch must
+/// not modify the selector while its branches are being analyzed.
+fn finite_catch_selector_domain(
+    loop_stmt: &WhileStatement<'_>,
+    catch_span: Span,
+    selector: SymbolId,
+    initial: u64,
+    init_span: Span,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+    source: &str,
+) -> Option<BTreeSet<u64>> {
+    let mut finder = CatchSelectorFiniteWrites {
+        symbol: selector,
+        scoping,
+        source,
+        values: BTreeSet::from([initial]),
+        modeled: BTreeSet::new(),
+        valid: true,
+        nested_function_depth: 0,
+    };
+    finder.visit_while_statement(loop_stmt);
+    if !finder.valid {
+        return None;
+    }
+    for &reference in scoping.get_resolved_reference_ids(selector) {
+        if !scoping.get_reference(reference).is_write() {
+            continue;
+        }
+        let span = *reference_spans.get(&reference)?;
+        if init_span.start <= span.start && span.end <= init_span.end {
+            continue;
+        }
+        if !(loop_stmt.span.start <= span.start
+            && span.end <= loop_stmt.span.end
+            && finder.modeled.contains(&reference))
+            || (catch_span.start <= span.start && span.end <= catch_span.end)
+        {
+            return None;
+        }
+    }
+    Some(finder.values)
+}
+
+/// Every finite candidate value must make the catch throw, return or
+/// overwrite the dispatcher state before any normal catch fallthrough.
+fn catch_finite_domain_always_replaces_state(
+    loop_stmt: &WhileStatement<'_>,
+    handler: &oxc_ast::ast::CatchClause<'_>,
+    state: &str,
+    source: &str,
+    scoping: &Scoping,
+    reaching: &HashMap<SymbolId, (u64, Span)>,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> bool {
+    reaching.iter().any(|(&selector, &(initial, init_span))| {
+        let Some(values) = finite_catch_selector_domain(
+            loop_stmt,
+            handler.body.span,
+            selector,
+            initial,
+            init_span,
+            scoping,
+            reference_spans,
+            source,
+        ) else {
+            return false;
+        };
+        values.into_iter().all(|value| {
+            catch_block_always_replaces_state_or_exits(
+                &handler.body.body,
+                state,
+                source,
+                scoping,
+                Some((selector, value)),
+            )
+        })
+    })
+}
+
 /// Preserve exception-handling scope and the original one-state-per-iteration
 /// execution order. Only remove state comparisons proven unreachable from
 /// both the lexical initializer and every statically possible catch recovery.
@@ -2157,6 +2359,8 @@ pub(crate) fn prune_exception_dispatcher(
     symbol: SymbolId,
     scoping: &Scoping,
     source: &str,
+    reaching: &HashMap<SymbolId, (u64, Span)>,
+    reference_spans: &HashMap<ReferenceId, Span>,
 ) -> Option<String> {
     let effects = ExceptionLoopEffectContext { scoping };
     if loop_stmt.test.may_have_side_effects(&effects) {
@@ -2254,8 +2458,21 @@ pub(crate) fn prune_exception_dispatcher(
     // and retry at any state value held when a source case throws. Those values
     // include *intermediate writes* within the case, not just its modeled
     // normal successor. Track their exceptional edges to a fixed point.
-    let catch_retries_unchanged =
-        !catch_block_always_replaces_state_or_exits(&handler.body.body, state, source);
+    let catch_retries_unchanged = !catch_block_always_replaces_state_or_exits(
+        &handler.body.body,
+        state,
+        source,
+        scoping,
+        None,
+    ) && !catch_finite_domain_always_replaces_state(
+        loop_stmt,
+        handler,
+        state,
+        source,
+        scoping,
+        reaching,
+        reference_spans,
+    );
     let mut source_cases = BTreeMap::new();
     let mut cursor = dispatcher;
     loop {

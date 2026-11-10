@@ -625,3 +625,74 @@ function caughtIntermediateStateRetry() {
     } catch (error) { caught++; }
 }
 console.log(JSON.stringify(["intermediate-catch-retry", caughtIntermediateStateRetry()]));
+
+
+function exhaustiveCatchFiniteDomain(flag, throwEffect) {
+    let state = 1;
+    let selector = 46;
+    const log = [];
+    while (true) try {
+        if (state == 1) { if (flag) selector = 92; state = 2; }
+        else if (state == 2) {
+            log.push("effect");
+            if (throwEffect) throw Error("expected");
+            state = 3;
+        } else if (state == 3) return [state, selector, log];
+    } catch (error) {
+        if (selector === 46) throw error;
+        if (selector == 92) { log.push("caught"); state = 3; }
+    }
+}
+function nonexhaustiveCatchFiniteDomain() {
+    let state = 1;
+    let selector = 46;
+    let attempts = 0;
+    while (true) try {
+        if (state == 1) { selector = 13; state = 2; }
+        else if (state == 2) {
+            if (attempts++ === 0) throw Error("retry");
+            state = 3;
+        } else if (state == 3) return [state, attempts];
+    } catch (error) {
+        if (selector == 46) throw error;
+        if (selector == 92) state = 3;
+    }
+}
+console.log(JSON.stringify([
+    "finite-catch-domain",
+    exhaustiveCatchFiniteDomain(false, false),
+    exhaustiveCatchFiniteDomain(true, false),
+    exhaustiveCatchFiniteDomain(true, true),
+    nonexhaustiveCatchFiniteDomain()
+]));
+try {
+    exhaustiveCatchFiniteDomain(false, true);
+    console.log("unexpected-throw-survival");
+} catch (error) {
+    console.log(JSON.stringify(["finite-catch-rethrow", error.message]));
+}
+
+
+function capturedSelectorMutatorCatchRetry() {
+    let state = 1;
+    let selector = 46;
+    let change;
+    let attempts = 0;
+    const log = [];
+    while (true) try {
+        if (state == 1) {
+            change = () => { selector = 46; };
+            selector = 92;
+            state = 2;
+        } else if (state == 2) {
+            log.push("effect");
+            if (attempts++ == 0) throw Error("retry");
+            state = 3;
+        } else if (state == 3) return [state, selector, attempts, log];
+    } catch (error) {
+        if (selector == 46) throw error;
+        change();
+        if (selector == 92) state = 3;
+    }
+}
+console.log(JSON.stringify(["captured-selector-mutation", capturedSelectorMutatorCatchRetry()]));
