@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingPattern, Declaration, ExportDefaultDeclarationKind, ImportDeclarationSpecifier,
-    ModuleExportName, Statement,
+    ModuleExportName, Statement, VariableDeclaration,
 };
 use oxc_span::SourceType;
 use oxc_syntax::{identifier, keyword};
@@ -170,6 +170,96 @@ fn parse_exports(source: &str) -> Option<ModuleExports> {
         }
     }
     Some(exports)
+}
+
+/// Locate only actual top-level lexical declarations in the final readable
+/// source. Forwarded exports and import aliases have no declaration location
+/// in this module and must not receive invented line numbers.
+fn declaration_lines(source: &str) -> BTreeMap<String, usize> {
+    fn record(source: &str, names: &mut BTreeMap<String, usize>, name: &str, offset: u32) {
+        let Ok(offset) = usize::try_from(offset) else {
+            return;
+        };
+        let Some(prefix) = source.get(..offset) else {
+            return;
+        };
+        names
+            .entry(name.to_owned())
+            .or_insert_with(|| prefix.bytes().filter(|byte| *byte == b'\n').count() + 1);
+    }
+
+    fn variables(
+        source: &str,
+        names: &mut BTreeMap<String, usize>,
+        declaration: &VariableDeclaration<'_>,
+    ) {
+        for declarator in &declaration.declarations {
+            if let BindingPattern::BindingIdentifier(id) = &declarator.id {
+                record(source, names, &id.name, id.span.start);
+            }
+        }
+    }
+
+    fn declaration(
+        source: &str,
+        names: &mut BTreeMap<String, usize>,
+        declaration: &Declaration<'_>,
+    ) {
+        match declaration {
+            Declaration::VariableDeclaration(vars) => variables(source, names, vars),
+            Declaration::FunctionDeclaration(function) => {
+                if let Some(id) = &function.id {
+                    record(source, names, &id.name, id.span.start);
+                }
+            }
+            Declaration::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    record(source, names, &id.name, id.span.start);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let allocator = Allocator::default();
+    let parsed = parse_program(&allocator, source, SourceType::mjs());
+    if !parsed.is_clean() {
+        return BTreeMap::new();
+    }
+    let mut names = BTreeMap::new();
+    for stmt in &parsed.program.body {
+        match stmt {
+            Statement::VariableDeclaration(vars) => variables(source, &mut names, vars),
+            Statement::FunctionDeclaration(function) => {
+                if let Some(id) = &function.id {
+                    record(source, &mut names, &id.name, id.span.start);
+                }
+            }
+            Statement::ClassDeclaration(class) => {
+                if let Some(id) = &class.id {
+                    record(source, &mut names, &id.name, id.span.start);
+                }
+            }
+            Statement::ExportDeclaration(export) => {
+                declaration(source, &mut names, &export.declaration);
+            }
+            Statement::ExportDefaultDeclaration(export) => match &export.declaration {
+                ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
+                    if let Some(id) = &function.id {
+                        record(source, &mut names, &id.name, id.span.start);
+                    }
+                }
+                ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                    if let Some(id) = &class.id {
+                        record(source, &mut names, &id.name, id.span.start);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    names
 }
 
 fn target<'a>(
@@ -384,6 +474,7 @@ Names come from readable source and statically resolved captured ESM exports. Th
         };
         writeln!(output, "## {}\n", symbol_index_link(module)?)?;
         writeln!(output, "Captured URL: {}\n", code_span(url))?;
+        let lines = declaration_lines(&module.source);
         let mut sorted = exports.iter().collect::<Vec<_>>();
         sorted.sort_by(|(key_a, name_a), (key_b, name_b)| {
             name_a.cmp(name_b).then_with(|| key_a.cmp(key_b))
@@ -395,6 +486,16 @@ Names come from readable source and statically resolved captured ESM exports. Th
                 code_span(descriptive),
                 code_span(public)
             )?;
+            if module
+                .exports
+                .local
+                .iter()
+                .any(|(key, local)| key == public && local == descriptive)
+            {
+                if let Some(line) = lines.get(descriptive) {
+                    write!(output, "; declaration line {line}")?;
+                }
+            }
             if let Some(consumers) = incoming.get(&(url.clone(), public.clone())) {
                 let links = consumers
                     .iter()
@@ -571,6 +672,15 @@ mod tests {
     use super::*;
     use crate::analysis_artifacts::{write_artifact, DEOBFUSCATION, JS_REFERENCES, SOURCE_INDEX};
     use serde_json::json;
+
+    #[test]
+    fn declaration_locations_are_ast_grounded_and_ignore_nested_scopes() {
+        let source = "const other=1;\n\nconst Transition = () => 2;\n{ const Inside = 3; }\nexport {Transition as x};";
+        let lines = declaration_lines(source);
+        assert_eq!(lines.get("other"), Some(&1));
+        assert_eq!(lines.get("Transition"), Some(&3));
+        assert!(!lines.contains_key("Inside"));
+    }
 
     #[test]
     fn symbol_index_escapes_captured_names_and_paths() {
@@ -832,7 +942,7 @@ mod tests {
             "{index_doc}"
         );
         assert!(
-            index_doc.contains("`Transition` — exported as `x`"),
+            index_doc.contains("`Transition` — exported as `x`; declaration line 1"),
             "{index_doc}"
         );
         let transition = fs::read_to_string(project.join("src/_readable/Transition.js"))?;
