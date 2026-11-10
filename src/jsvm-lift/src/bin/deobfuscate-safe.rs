@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use jsvm_lift::{
+    analysis_artifacts::{load_artifact, DEOBFUSCATION, JS_REFERENCES, SOURCE_INDEX},
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions},
+    project_import_names::propagate_imported_names,
     safe_deob::{deobfuscate_source, SourceMode},
     sha256_hex,
     source_tree_aliases::{explain_captured_handler_origins, explain_property_aliases},
@@ -37,6 +39,9 @@ enum Command {
     CallerViews(CallerViewsArgs),
     /// Materialize safe source recovery/deobfuscation for a normalized capture project.
     Project(ProjectArgs),
+    /// Reapply captured ESM export/import name linking to existing analyst-only readable files.
+    /// Does not reacquire or deobfuscate sources, and never touches exact captured output.
+    ProjectNames(ProjectNamesArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -80,6 +85,12 @@ struct ProjectArgs {
     jobs: Option<usize>,
     #[arg(long, default_value_t = 16)]
     max_iterations: usize,
+}
+
+#[derive(ClapArgs, Debug)]
+struct ProjectNamesArgs {
+    /// Normalized capture project with existing source/index and deobfuscation artifacts.
+    project: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -815,6 +826,24 @@ fn run_source(args: SourceArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_project_names(args: ProjectNamesArgs) -> Result<()> {
+    let project = args
+        .project
+        .canonicalize()
+        .with_context(|| format!("project does not exist: {}", args.project.display()))?;
+    // Unlike the optional post-pass in the full capture pipeline, a direct
+    // request to relink names must reject missing or invalid graph artifacts.
+    for artifact in [SOURCE_INDEX, DEOBFUSCATION, JS_REFERENCES] {
+        let _ = load_artifact(&project, artifact, false)?;
+    }
+    let renamed = propagate_imported_names(&project)?;
+    println!(
+        "linked {renamed} imported lexical names in readable project {}",
+        project.display()
+    );
+    Ok(())
+}
+
 fn run_project(args: ProjectArgs) -> Result<()> {
     let project = args
         .project
@@ -1038,6 +1067,7 @@ fn main() -> Result<()> {
         Command::SourceTree(args) => run_source_tree(args),
         Command::CallerViews(args) => run_caller_views(args),
         Command::Project(args) => run_project(args),
+        Command::ProjectNames(args) => run_project_names(args),
     }
 }
 

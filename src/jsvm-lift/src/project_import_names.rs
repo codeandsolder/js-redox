@@ -291,7 +291,7 @@ fn safe_readable_path(path: &str) -> bool {
 
 /// Make downstream imports use descriptive component names in the readable
 /// view only. The existing module resolution artifact is authoritative.
-pub(crate) fn propagate_imported_names(project: &Path) -> Result<usize> {
+pub fn propagate_imported_names(project: &Path) -> Result<usize> {
     let Some(refs) = load_artifact(project, JS_REFERENCES, true)? else {
         return Ok(0);
     };
@@ -485,6 +485,14 @@ mod tests {
                 "LocalConsumer.js",
                 "import {r as q} from './DescriptiveLocal.js'; use(q);",
             ),
+            (
+                "Transition.js",
+                "const Transition=((e)=>(e.displayName='Transition',e))(function(){}); export {Transition as x};",
+            ),
+            (
+                "TransitionConsumer.js",
+                "import {x as ve} from './Transition.js'; console.log(ve.displayName);",
+            ),
         ];
         let refs = [
             ("Barrel.js", "./Footer.js", "reexport_named", "Footer.js"),
@@ -532,6 +540,12 @@ mod tests {
                 "./DescriptiveLocal.js",
                 "import_static",
                 "DescriptiveLocal.js",
+            ),
+            (
+                "TransitionConsumer.js",
+                "./Transition.js",
+                "import_static",
+                "Transition.js",
             ),
         ];
         let mut source_units = Vec::new();
@@ -583,7 +597,7 @@ mod tests {
                 "schema":JS_REFERENCES.schema,"code_units":ref_units,"summary":{}
             }),
         )?;
-        assert_eq!(propagate_imported_names(project)?, 8);
+        assert_eq!(propagate_imported_names(project)?, 9);
         let index = fs::read_to_string(project.join("src/_readable/index.js"))?;
         assert!(index.contains("import {u as Footer}"), "{index}");
         assert!(index.contains("const obj={b: Footer}"), "{index}");
@@ -629,6 +643,21 @@ mod tests {
         let local = fs::read_to_string(project.join("src/_readable/LocalConsumer.js"))?;
         assert!(local.contains("import {r as decodeResponse}"), "{local}");
         assert!(local.contains("use(decodeResponse)"), "{local}");
+        let transition = fs::read_to_string(project.join("src/_readable/Transition.js"))?;
+        assert!(
+            transition.contains("export {Transition as x}"),
+            "{transition}"
+        );
+        let transition_consumer =
+            fs::read_to_string(project.join("src/_readable/TransitionConsumer.js"))?;
+        assert!(
+            transition_consumer.contains("import {x as Transition}"),
+            "{transition_consumer}"
+        );
+        assert!(
+            transition_consumer.contains("console.log(Transition.displayName)"),
+            "{transition_consumer}"
+        );
         let collision = fs::read_to_string(project.join("src/_readable/ApiCollision.js"))?;
         assert!(
             collision.contains("import {createApplication as q}"),
