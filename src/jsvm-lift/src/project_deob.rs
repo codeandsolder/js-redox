@@ -728,7 +728,14 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let project = temp.path();
         fs::create_dir_all(project.join("resources"))?;
-        let original = "const define = x => x; var v = define({__name: 'Footer', value: 42}); export {v as t};";
+        let original = r#"
+const define = x => x;
+const __name = (fn, name) => Object.defineProperty(fn, "name", {value: name, configurable: true});
+var v = define({__name: 'Footer', value: 42});
+var r = __name(function() {return 17}, "decodePayload");
+var c = Object.assign(function() {return 4}, {displayName: "NavigationPanel"});
+export {v as t, r as decode, c as panel};
+"#;
         fs::write(project.join("resources/component.mjs"), original)?;
         write_artifact(
             project,
@@ -766,8 +773,19 @@ mod tests {
         let readable = fs::read_to_string(project.join(readable_path))?;
         assert!(proof.contains("var v"), "{proof}");
         assert!(!proof.contains("var Footer"), "{proof}");
+        assert!(proof.contains("var r"), "{proof}");
+        assert!(proof.contains("var c"), "{proof}");
+        assert!(!proof.contains("var decodePayload"), "{proof}");
+        assert!(!proof.contains("var NavigationPanel"), "{proof}");
         assert!(readable.contains("var Footer"), "{readable}");
-        assert!(readable.contains("export { Footer as t }"), "{readable}");
+        assert!(readable.contains("var decodePayload"), "{readable}");
+        assert!(readable.contains("var NavigationPanel"), "{readable}");
+        assert!(
+            readable.contains(
+                "export { Footer as t, decodePayload as decode, NavigationPanel as panel }"
+            ),
+            "{readable}"
+        );
         Ok(())
     }
 

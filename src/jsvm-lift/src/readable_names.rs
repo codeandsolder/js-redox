@@ -40,6 +40,110 @@ fn source_metadata_name(object: &oxc_ast::ast::ObjectExpression<'_>) -> Option<S
     None
 }
 
+/// Only associate function-name metadata with an expression known to
+/// construct a function or a class. A plain object with a `name` property
+/// is data, not evidence of the variable's intended identifier.
+fn is_function_or_class(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::FunctionExpression(_)
+        | Expression::ArrowFunctionExpression(_)
+        | Expression::ClassExpression(_) => true,
+        Expression::ParenthesizedExpression(paren) => is_function_or_class(&paren.expression),
+        _ => false,
+    }
+}
+
+/// Function names explicitly retained by bundlers or assigned through the
+/// standard descriptor API. This is source metadata, not a guess based on a
+/// minified symbol's usage. Only the presentation copy receives the rename.
+fn explicit_function_name(call: &CallExpression<'_>) -> Option<String> {
+    if call.optional || !is_function_or_class(call.arguments.first()?.as_expression()?) {
+        return None;
+    }
+    let value = if matches!(&call.callee, Expression::Identifier(id) if id.name == "__name") {
+        // esbuild's __name(target, "originalName") preserves the source
+        // name of function/class expressions after minification.
+        call.arguments.get(1)?.as_expression()?
+    } else {
+        let Expression::StaticMemberExpression(member) = &call.callee else {
+            return None;
+        };
+        if member.optional
+            || !matches!(&member.object, Expression::Identifier(id) if id.name == "Object")
+        {
+            return None;
+        }
+        if member.property.name == "assign" && call.arguments.len() == 2 {
+            // React and other frameworks frequently attach explicit
+            // displayName metadata when returning a function component.
+            // Reject computed keys/spreads, which could replace that name
+            // without appearing as an explicit static property.
+            let Expression::ObjectExpression(metadata) = call.arguments.get(1)?.as_expression()?
+            else {
+                return None;
+            };
+            let mut name = None;
+            for entry in &metadata.properties {
+                let ObjectPropertyKind::ObjectProperty(property) = entry else {
+                    return None;
+                };
+                if property.computed {
+                    return None;
+                }
+                if property.key.is_specific_static_name("displayName") {
+                    if name.is_some() {
+                        return None;
+                    }
+                    let StaticPrimitiveValue::String(candidate) =
+                        eval_static_primitive(&property.value)?
+                    else {
+                        return None;
+                    };
+                    name = Some(candidate);
+                }
+            }
+            let candidate = name?;
+            return (candidate.len() >= 3
+                && candidate.len() <= 80
+                && candidate.as_bytes()[0].is_ascii_uppercase()
+                && identifier::is_identifier_name(&candidate))
+            .then_some(candidate);
+        }
+        if member.property.name != "defineProperty" {
+            return None;
+        }
+        // Object.defineProperty(target, "name", { value: "originalName" })
+        // also conveys the actual name of the returned target.
+        let name_key = call.arguments.get(1)?.as_expression()?;
+        if !matches!(eval_static_primitive(name_key), Some(StaticPrimitiveValue::String(s)) if s == "name")
+        {
+            return None;
+        }
+        let Expression::ObjectExpression(descriptor) = call.arguments.get(2)?.as_expression()?
+        else {
+            return None;
+        };
+        descriptor.properties.iter().find_map(|entry| {
+            let ObjectPropertyKind::ObjectProperty(property) = entry else {
+                return None;
+            };
+            (!property.computed && property.key.is_specific_static_name("value"))
+                .then_some(&property.value)
+        })?
+    };
+    let StaticPrimitiveValue::String(name) = eval_static_primitive(value)? else {
+        return None;
+    };
+    (name.len() >= 3
+        && name.len() <= 80
+        && name.chars().any(char::is_alphabetic)
+        && name != "eval"
+        && name != "arguments"
+        && !keyword::is_reserved_keyword(&name)
+        && identifier::is_identifier_name(&name))
+    .then_some(name)
+}
+
 fn name_from_initializer(expression: &Expression<'_>, remaining_calls: usize) -> Option<String> {
     match expression {
         Expression::ObjectExpression(object) => source_metadata_name(object),
@@ -47,10 +151,12 @@ fn name_from_initializer(expression: &Expression<'_>, remaining_calls: usize) ->
             name_from_initializer(&parenthesized.expression, remaining_calls)
         }
         Expression::CallExpression(call) if remaining_calls > 0 && !call.optional => {
-            name_from_initializer(
-                call.arguments.first()?.as_expression()?,
-                remaining_calls - 1,
-            )
+            explicit_function_name(call).or_else(|| {
+                name_from_initializer(
+                    call.arguments.first()?.as_expression()?,
+                    remaining_calls - 1,
+                )
+            })
         }
         _ => None,
     }
@@ -590,6 +696,87 @@ console.log(a,b,c,d,e);
         assert!(out.contains("{longProperty: longProperty}"), "{out}");
         assert!(out.contains("const obj={x: longProperty}"), "{out}");
         assert!(out.contains("export {longProperty as x}"), "{out}");
+    }
+
+    #[test]
+    fn restores_explicit_function_names_from_bundler_and_descriptor_metadata() {
+        let source = r#"
+var a = __name(function (input) { return input; }, "decodePayload");
+const b = __name((input) => input + 1, 'parseResponse');
+var c = Object.defineProperty(class {}, "name", {value: "RequestRouter", configurable: true});
+export {a as x, b as y, c as z};
+function scoped(a) {return a;}
+console.log(a, b, c);
+"#;
+        let output = named(source);
+        for expected in [
+            "var decodePayload = __name(function",
+            "const parseResponse = __name(",
+            "var RequestRouter = Object.defineProperty(class",
+            "export {decodePayload as x, parseResponse as y, RequestRouter as z}",
+            "function scoped(a) {return a;}",
+            "console.log(decodePayload, parseResponse, RequestRouter)",
+        ] {
+            assert!(output.contains(expected), "expected {expected} in {output}");
+        }
+    }
+
+    #[test]
+    fn recovers_explicit_function_component_display_names() {
+        let source = r#"
+const r = Object.assign(function() {return "ok";}, {displayName: "NavigationPanel", role: "panel"});
+const x = wrap(Object.assign(() => 7, {displayName: "TooltipOverlay"}));
+export {r as a, x as b};
+"#;
+        let output = named(source);
+        for expected in [
+            "const NavigationPanel = Object.assign(function",
+            "const TooltipOverlay = wrap(Object.assign(",
+            "export {NavigationPanel as a, TooltipOverlay as b}",
+        ] {
+            assert!(output.contains(expected), "expected {expected} in {output}");
+        }
+    }
+
+    #[test]
+    fn follows_explicit_name_metadata_through_nested_factory_calls() {
+        let source = r#"
+const q = decorate(__name(function() {}, "resolveModule"), "static");
+var r = preserve(Object.defineProperty(function () {}, "name", { value: "parseHeader" }));
+export {q, r};
+"#;
+        let output = named(source);
+        for expected in [
+            "const resolveModule = decorate(__name(",
+            "var parseHeader = preserve(Object.defineProperty(",
+            "export {resolveModule as q, parseHeader as r}",
+        ] {
+            assert!(output.contains(expected), "expected {expected} in {output}");
+        }
+    }
+
+    #[test]
+    fn refuses_ambiguous_or_invalid_function_name_metadata() {
+        for source in [
+            r#"var a = __name({}, "NotFunction");"#,
+            r#"var a = Object.defineProperty({}, "name", {value: "NotFunction"});"#,
+            r#"var a = __name(function () {}, getName());"#,
+            r#"var a = __name(function () {}, "not a legal name");"#,
+            r#"var a = __name(function () {}, "if");"#,
+            r#"var a = __name(function () {}, "x");"#,
+            r#"var a = Object.defineProperty(function(){}, "name", { get value() { return "No"; }});"#,
+            r#"var a = Object.defineProperty(function(){}, "other", {value: "NotTheName"});"#,
+            r#"var a = Object.assign({}, {displayName: "NotFunction"});"#,
+            r#"var a = Object.assign(function(){}, {displayName: getName()});"#,
+            r#"var a = Object.assign(function(){}, {displayName: "One", displayName: "Two"});"#,
+            r#"var a = Object.assign(function(){}, {[key]: 1, displayName: "Uncertain"});"#,
+            r#"var a = Object.assign(function(){}, {displayName: "Uncertain"}, more);"#,
+            r#"var a = Object.assign(function(){}, {displayName: "lowercase"});"#,
+            r#"var a = __name(function(){}, "decodePayload"); const decodePayload = 42;"#,
+            r#"var a = __name(function(){}, "decodePayload"); eval("a");"#,
+        ] {
+            assert_eq!(named(source), source, "source: {source}");
+        }
     }
 
     #[test]
