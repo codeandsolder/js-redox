@@ -3814,6 +3814,211 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_throw_boundary_prunes_unobservable_later_write() {
+        let source = r#"
+            function f(log) {
+                let state = 1, caught = 0;
+                while (true) try {
+                    if (state == 1) {
+                        state = 2;
+                        log.push("may-throw");
+                        state = 4;
+                        state = 5;
+                    } else if (state == 2) return ["retry", caught, log];
+                    else if (state == 4) return ["unobservable-post-throw", caught, log];
+                    else if (state == 5) return ["normal", caught, log];
+                } catch (error) { caught++; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            !result.source.contains("unobservable-post-throw"),
+            "state=4 is written only after the last possible throw: {}",
+            result.source
+        );
+        assert!(
+            result.source.contains("retry"),
+            "throw after state=2 must retain the catch-resume case: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_keeps_pre_and_post_write_roots() {
+        let source = r#"
+            function f(log, flag) {
+                let state = 1, caught = 0;
+                while (true) try {
+                    if (state == 1) {
+                        log.push("before");
+                        state = 2;
+                        if (flag) throw Error("after");
+                        state = 4;
+                        state = 5;
+                    } else if (state == 2) return ["retry-after", caught, log];
+                    else if (state == 4) return ["never-at-throw", caught, log];
+                    else if (state == 5) return ["normal", caught, log];
+                } catch (error) { caught++; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("retry-after"),
+            "throw after state=2 must retain that case: {}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("never-at-throw"),
+            "later numeric state is never observable at throw: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_nested_write_falls_back() {
+        let source = r#"
+            function f(log, flag) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        if (flag) state = 4;
+                        log.push("may-throw");
+                        state = 5;
+                    } else if (state == 4) return "nested-write-retry";
+                    else if (state == 5) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("nested-write-retry"),
+            "conditional state write can precede a throw: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_rejects_captured_mutator() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                function changeAndThrow() { state = 4; throw Error("via-closure"); }
+                while (true) try {
+                    if (state == 1) {
+                        state = 2;
+                        changeAndThrow();
+                        state = 4;
+                        state = 5;
+                    } else if (state == 2) return "wrong-retry";
+                    else if (state == 4) return "captured-state-resume";
+                    else if (state == 5) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("captured-state-resume"),
+            "a closure can mutate the state before throwing: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_rejects_destructuring_write() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        state = 2;
+                        [state] = [4];
+                        log.push("may-throw");
+                        state = 4;
+                        state = 5;
+                    } else if (state == 2) return "wrong-retry";
+                    else if (state == 4) return "destructured-state-resume";
+                    else if (state == 5) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("destructured-state-resume"),
+            "destructuring writes cannot use straight-line state-at-throw inference: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_rejects_nested_direct_eval() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                function changeAndThrow() { eval("state = 4; throw Error('eval')"); }
+                while (true) try {
+                    if (state == 1) {
+                        state = 2;
+                        changeAndThrow();
+                        state = 4;
+                        state = 5;
+                    } else if (state == 2) return "wrong-retry";
+                    else if (state == 4) return "eval-state-resume";
+                    else if (state == 5) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("eval-state-resume"),
+            "direct eval in an accessible closure invalidates state confinement: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_preserves_tdz_reads() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        state = 2;
+                        {
+                            // A lexical reference can throw before initialization.
+                            discarded;
+                            let discarded = 1;
+                        }
+                        state = 4;
+                        state = 5;
+                    } else if (state == 2) return "tdz-catch-resume";
+                    else if (state == 4) return "never";
+                    else if (state == 5) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("tdz-catch-resume"),
+            "a TDZ exception observes the previous numeric state: {}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_finite_catch_domain_allows_effectful_merge() {
         let source = r#"
             function f(flag, log) {

@@ -1245,6 +1245,136 @@ fn inert_exception_transition(statement: &Statement<'_>, state: &str) -> Option<
     exact_u64(value)
 }
 
+/// A call/getter outside the dispatcher can change a captured state
+/// binding before throwing. Only use statement-order exceptional analysis for
+/// a lexical local that cannot escape through closures or direct eval.
+/// Function parameters are excluded: in sloppy JS, `arguments` may alias
+/// parameter bindings even without an explicit lexical reference.
+fn confined_exception_state(symbol: SymbolId, scoping: &Scoping) -> bool {
+    let binding_scope = scoping.symbol_scope_id(symbol);
+    if binding_scope == scoping.root_scope_id()
+        || !scoping
+            .symbol_flags(symbol)
+            .contains(oxc_semantic::SymbolFlags::BlockScopedVariable)
+    {
+        return false;
+    }
+    if scoping.scope_descendants_from_root().any(|scope| {
+        (scope == binding_scope || scoping.scope_is_descendant_of(scope, binding_scope))
+            && (scoping.scope_flags(scope).contains_direct_eval()
+                || scoping.scope_flags(scope).is_with())
+    }) {
+        return false;
+    }
+    scoping.get_resolved_references(symbol).all(|reference| {
+        for scope in scoping.scope_ancestors(reference.scope_id()) {
+            if scope == binding_scope {
+                return true;
+            }
+            let flags = scoping.scope_flags(scope);
+            if flags.is_function() || flags.is_arrow() || flags.is_class_static_block() {
+                // Any nested closure, including a read-only one, can leak
+                // access or call code that mutates a captured state.
+                return false;
+            }
+        }
+        false
+    })
+}
+
+/// Recover the exact numeric state at potentially throwing *statement*
+/// boundaries in a straight-line source case. A direct inert state assignment
+/// cannot throw and commits its new value before the following statement.
+/// Other statements are conservatively treated as potential throws, including
+/// TDZ-sensitive reads and effectful returns. We do not assume that Oxc's
+/// general "may have side effects" predicate proves a statement cannot throw.
+///
+/// If a complex statement contains even one state write (including a nested
+/// function body), its evaluation order may be conditional or interleaved
+/// with throws: let the full exceptional-root collector handle that case.
+/// This is a refinement of its overapproximation, not a replacement.
+fn sequential_exception_roots(
+    body: &Statement<'_>,
+    initial: u64,
+    symbol: SymbolId,
+    state: &str,
+    source: &str,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> Option<BTreeSet<u64>> {
+    struct Scan<'s> {
+        current: u64,
+        roots: BTreeSet<u64>,
+        symbol: SymbolId,
+        state: &'s str,
+        source: &'s str,
+        scoping: &'s Scoping,
+        reference_spans: &'s HashMap<ReferenceId, Span>,
+    }
+    impl Scan<'_> {
+        fn statement(&mut self, statement: &Statement<'_>) -> Option<()> {
+            if let Statement::BlockStatement(block) = statement {
+                for member in &block.body {
+                    self.statement(member)?;
+                }
+                return Some(());
+            }
+            if let Some(target) = inert_exception_transition(statement, self.state) {
+                self.current = target;
+                return Some(());
+            }
+            // The old AST visitor only recognizes certain assignment
+            // targets. Use semantic reference write flags as a second guard:
+            // destructuring, loop targets and other unmodeled writes may
+            // change state inside an otherwise opaque statement.
+            let span = statement.span();
+            let has_state_write = self
+                .scoping
+                .get_resolved_reference_ids(self.symbol)
+                .iter()
+                .any(|reference_id| {
+                    if !self.scoping.get_reference(*reference_id).is_write() {
+                        return false;
+                    }
+                    self.reference_spans
+                        .get(reference_id)
+                        .is_none_or(|write| span.start <= write.start && write.end <= span.end)
+                });
+            if has_state_write {
+                return None;
+            }
+            let mut writes = ExceptionStateWrites {
+                symbol: self.symbol,
+                state_name: self.state,
+                scoping: self.scoping,
+                source: self.source,
+                targets: BTreeSet::new(),
+                unsafe_write: false,
+            };
+            writes.visit_statement(statement);
+            if writes.unsafe_write || !writes.targets.is_empty() {
+                return None;
+            }
+            // Includes conditionals, returns, variable declarations and
+            // expressions: a TDZ read or getter may throw despite an otherwise
+            // pure-looking AST. Mark only the numeric state live *here*.
+            self.roots.insert(self.current);
+            Some(())
+        }
+    }
+    let mut scan = Scan {
+        current: initial,
+        roots: BTreeSet::new(),
+        symbol,
+        state,
+        source,
+        scoping,
+        reference_spans,
+    };
+    scan.statement(body)?;
+    Some(scan.roots)
+}
+
 /// Follow only finite silent transitions: an all-silent cycle must remain a
 /// loop, not be turned into a direct assignment to one of its nodes.
 fn resolve_inert_exception_chain(start: u64, silent: &BTreeMap<u64, u64>) -> Option<u64> {
@@ -2791,6 +2921,7 @@ pub(crate) fn prune_exception_dispatcher(
         catch_scope.reaching,
         catch_scope.reference_spans,
     );
+    let confined_state = catch_retries_unchanged && confined_exception_state(symbol, scoping);
     let mut source_cases = BTreeMap::new();
     let mut cursor = dispatcher;
     loop {
@@ -2823,25 +2954,42 @@ pub(crate) fn prune_exception_dispatcher(
             if body.may_have_side_effects(&effects)
                 && inert_exception_transition(body, state).is_none()
             {
-                // A throw before any assignment retries the entering state.
-                roots.insert(current);
-                // A throw after any finite numeric write can retry that
-                // intermediate value, even when the normal route ends
-                // somewhere else. Overapproximating all writes is intentional:
-                // their exact evaluation order may be conditional/effectful.
-                let mut state_writes = ExceptionStateWrites {
-                    symbol,
-                    state_name: state,
-                    scoping,
-                    source,
-                    targets: BTreeSet::new(),
-                    unsafe_write: false,
+                let exact = confined_state
+                    .then(|| {
+                        sequential_exception_roots(
+                            body,
+                            current,
+                            symbol,
+                            state,
+                            source,
+                            scoping,
+                            catch_scope.reference_spans,
+                        )
+                    })
+                    .flatten();
+                let possible = if let Some(at_throw) = exact {
+                    at_throw
+                } else {
+                    // A conditional, expression-nested or otherwise
+                    // unsequenced write can throw before or after any of its
+                    // finite state assignments. Keep all possible values.
+                    let mut state_writes = ExceptionStateWrites {
+                        symbol,
+                        state_name: state,
+                        scoping,
+                        source,
+                        targets: BTreeSet::new(),
+                        unsafe_write: false,
+                    };
+                    state_writes.visit_statement(body);
+                    if state_writes.unsafe_write {
+                        return None;
+                    }
+                    let mut conservative = state_writes.targets;
+                    conservative.insert(current);
+                    conservative
                 };
-                state_writes.visit_statement(body);
-                if state_writes.unsafe_write {
-                    return None;
-                }
-                for target in state_writes.targets {
+                for target in possible {
                     if target == exit {
                         return None;
                     }
