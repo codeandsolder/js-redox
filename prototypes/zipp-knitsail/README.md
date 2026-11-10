@@ -16,7 +16,7 @@ From this directory, create a sparse checkout of ZIPP at the pinned commit:
 ```bash
 git clone --filter=blob:none --sparse https://github.com/f2i-com/zipp.org.git upstream-zipp
 git -C upstream-zipp checkout b7521d2a2a4b562a1764194de56659277232291e
-git -C upstream-zipp sparse-checkout set crates/zipp-vm crates/regress-fork crates/zipp-numparse
+git -C upstream-zipp sparse-checkout set crates/zipp-vm crates/zipp-cli crates/regress-fork crates/zipp-wasm crates/zipp-sandbox crates/zipp-numparse crates/zipp-gpu
 ```
 
 By default, `scripts/make-fixtures.mjs` uses the canonical Acer capture and current js-redox output. Override `KNITSAIL_ORIGINAL` and `KNITSAIL_RECOVERED` to use other paths; the original's SHA is always verified. Needs Node and Rust 1.99, and preserves configured sccache.
