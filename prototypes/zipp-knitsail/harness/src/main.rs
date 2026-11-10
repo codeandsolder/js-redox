@@ -1,13 +1,22 @@
-use std::{collections::{BTreeMap, BTreeSet}, env, fs, process, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fs, process,
+    time::Instant,
+};
 use zipp_vm::embed::compile_script;
 
 fn main() {
-    let path = env::args().nth(1).expect("usage: zipp-knitsail-probe <file.js>");
+    let path = env::args()
+        .nth(1)
+        .expect("usage: zipp-knitsail-probe <file.js>");
     let source = fs::read_to_string(&path).expect("read JS");
     let start = Instant::now();
     let mut state = match compile_script(&source) {
         Ok(state) => state,
-        Err(err) => { eprintln!("COMPILE_ERROR:{err}"); process::exit(2); }
+        Err(err) => {
+            eprintln!("COMPILE_ERROR:{err}");
+            process::exit(2);
+        }
     };
     let compiled_ms = start.elapsed().as_millis();
     state.set_limits(2_000_000, None);
@@ -23,7 +32,9 @@ fn main() {
         Ok(result) => eprintln!("EXECUTION:ok:{result:?}"),
         Err(err) => eprintln!("EXECUTION:error:{err}"),
     }
-    for line in output { println!("{line}"); }
+    for line in output {
+        println!("{line}");
+    }
     match rows {
         None => eprintln!("TRACE:none; steps={steps}; truncated={truncated}; compile_ms={compiled_ms}; execute_ms={executed_ms}"),
         Some(rows) => {
@@ -38,5 +49,7 @@ fn main() {
             eprintln!("TRACE:rows={};unique_pcs={};unique_pc_edges={};steps={steps};truncated={truncated};compile_ms={compiled_ms};execute_ms={executed_ms};opcodes={opcodes:?}", rows.len(), pcs.len(), edges.len());
         }
     }
-    if execution.is_err() { process::exit(3); }
+    if execution.is_err() {
+        process::exit(3);
+    }
 }

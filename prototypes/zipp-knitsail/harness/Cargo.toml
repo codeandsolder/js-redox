@@ -5,6 +5,6 @@ edition = "2021"
 publish = false
 
 [dependencies]
-zipp-vm = { path = "../upstream-zipp/crates/zipp-vm", default-features = false, features = ["instrument"] }
+zipp-vm = { path = "../upstream-zipp/crates/zipp-vm", default-features = false, features = ["instrument", "jit"] }
 
 [workspace]
