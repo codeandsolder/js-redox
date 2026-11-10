@@ -289,6 +289,140 @@ fn safe_readable_path(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+/// Escape a captured path for a Markdown link without interpreting its
+/// characters as markup or allowing a captured URL to become the link target.
+fn link_destination(path: &str) -> String {
+    let mut output = String::new();
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-_.~".contains(&byte) {
+            output.push(char::from(byte));
+        } else {
+            output.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    output
+}
+
+/// Use a delimiter longer than any backtick run in captured names/URLs.
+fn code_span(source: &str) -> String {
+    let safe = source
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t");
+    let longest = safe
+        .split(|ch| ch != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let delimiter = "`".repeat(longest + 1);
+    if longest == 0 {
+        format!("{delimiter}{safe}{delimiter}")
+    } else {
+        format!("{delimiter} {safe} {delimiter}")
+    }
+}
+
+fn symbol_index_link(module: &SourceModule) -> Result<String> {
+    let relative = module
+        .readable_path
+        .strip_prefix("src/")
+        .context("readable module path is not under src/")?;
+    let label = relative.rsplit('/').next().unwrap_or(relative);
+    Ok(format!(
+        "[{}]({})",
+        code_span(label),
+        link_destination(relative)
+    ))
+}
+
+/// Make a browsable source-backed export/import map after linking names.
+/// This is navigation metadata, not a statement about which modules executed.
+fn write_esm_symbol_index(
+    project: &Path,
+    modules: &BTreeMap<String, SourceModule>,
+    known: &BTreeMap<String, Exports>,
+) -> Result<()> {
+    use std::fmt::Write;
+
+    let mut incoming = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    for (consumer_url, module) in modules {
+        for (specifier, public) in module.exports.imported_bindings.values() {
+            let Some(producer_url) = target(modules, module, specifier) else {
+                continue;
+            };
+            if known
+                .get(producer_url)
+                .and_then(|exports| exports.get(public))
+                .is_some()
+            {
+                incoming
+                    .entry((producer_url.to_owned(), public.clone()))
+                    .or_default()
+                    .insert(consumer_url.clone());
+            }
+        }
+    }
+
+    let total_symbols: usize = known.values().map(BTreeMap::len).sum();
+    let total_modules = known.values().filter(|exports| !exports.is_empty()).count();
+    let mut output = format!(
+        r#"# Captured ESM symbols
+
+Names come from readable source and statically resolved captured ESM exports. This is a navigation index, **not** an execution trace or a claim that minified names are known without evidence. Public ESM keys are preserved.
+
+{total_modules} modules with named exports; {total_symbols} exported names. See [JavaScript entrypoints](ENTRYPOINTS.md) for captured module traversal.
+
+"#
+    );
+
+    for (url, exports) in known {
+        if exports.is_empty() {
+            continue;
+        }
+        let Some(module) = modules.get(url) else {
+            continue;
+        };
+        writeln!(output, "## {}\n", symbol_index_link(module)?)?;
+        writeln!(output, "Captured URL: {}\n", code_span(url))?;
+        let mut sorted = exports.iter().collect::<Vec<_>>();
+        sorted.sort_by(|(key_a, name_a), (key_b, name_b)| {
+            name_a.cmp(name_b).then_with(|| key_a.cmp(key_b))
+        });
+        for (public, descriptive) in sorted {
+            write!(
+                output,
+                "- {} — exported as {}",
+                code_span(descriptive),
+                code_span(public)
+            )?;
+            if let Some(consumers) = incoming.get(&(url.clone(), public.clone())) {
+                let links = consumers
+                    .iter()
+                    .filter_map(|consumer| modules.get(consumer))
+                    .map(symbol_index_link)
+                    .collect::<Result<Vec<_>>>()?;
+                if !links.is_empty() {
+                    write!(output, "; imported by {}", links.join(", "))?;
+                }
+            }
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+
+    let path = project.join("src/ESM_SYMBOLS.md");
+    if fs::read_to_string(&path).is_ok_and(|existing| existing == output) {
+        return Ok(());
+    }
+    let parent = path.parent().context("symbol index has no parent folder")?;
+    fs::create_dir_all(parent)?;
+    let temp = tempfile::NamedTempFile::new_in(parent)?;
+    fs::write(temp.path(), output)?;
+    temp.persist(&path)
+        .with_context(|| format!("replacing symbol index {}", path.display()))?;
+    Ok(())
+}
+
 /// Make downstream imports use descriptive component names in the readable
 /// view only. The existing module resolution artifact is authoritative.
 pub fn propagate_imported_names(project: &Path) -> Result<usize> {
@@ -379,38 +513,57 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
             },
         );
     }
-    let known = exported_names(&modules);
     let mut count = 0;
-    for module in modules.values() {
-        let mut names = ImportedNames::new();
-        for (spec, target_url) in &module.refs {
-            let Some(exports) = target_url.as_deref().and_then(|url| known.get(url)) else {
+    // Renaming one module can reveal a descriptive local export name to an
+    // upstream consumer. Reparse the renamed modules and rerun graph linking
+    // until every captured import/export binding reaches a stable fixed point.
+    // A single pass is insufficient even on ordinary bundled ESM graphs.
+    let limit = modules.len().saturating_mul(2).saturating_add(2);
+    for _round in 0..limit {
+        let known = exported_names(&modules);
+        let mut changed = 0;
+        for module in modules.values_mut() {
+            let mut names = ImportedNames::new();
+            for (spec, target_url) in &module.refs {
+                let Some(exports) = target_url.as_deref().and_then(|url| known.get(url)) else {
+                    continue;
+                };
+                if !exports.is_empty() {
+                    names.insert(spec.clone(), exports.clone());
+                }
+            }
+            if names.is_empty() {
                 continue;
-            };
-            if !exports.is_empty() {
-                names.insert(spec.clone(), exports.clone());
+            }
+            if let Some((named, renamed)) =
+                recover_readable_names_with_imports(&module.source, Some(&names))
+            {
+                let exports = parse_exports(&named)
+                    .context("renamed readable module failed export analysis")?;
+                let path = project.join(&module.readable_path);
+                let parent = path
+                    .parent()
+                    .context("readable source has no parent folder")?;
+                let temp = tempfile::NamedTempFile::new_in(parent)?;
+                fs::write(temp.path(), &named)?;
+                // Do not mutate project_deob's shared readable hardlink cache.
+                temp.persist(&path).with_context(|| {
+                    format!("replacing named presentation file {}", path.display())
+                })?;
+                module.source = named;
+                module.exports = exports;
+                changed += renamed;
             }
         }
-        if names.is_empty() {
-            continue;
-        }
-        if let Some((named, renamed)) =
-            recover_readable_names_with_imports(&module.source, Some(&names))
-        {
-            let path = project.join(&module.readable_path);
-            let parent = path
-                .parent()
-                .context("readable source has no parent folder")?;
-            let temp = tempfile::NamedTempFile::new_in(parent)?;
-            fs::write(temp.path(), named)?;
-            // project_deob hard-links identical outputs to a shared cache.
-            // Replace just this source file's inode; do not mutate siblings.
-            temp.persist(&path)
-                .with_context(|| format!("replacing named presentation file {}", path.display()))?;
-            count += renamed;
+        count += changed;
+        if changed == 0 {
+            // The export index must describe the final linked source graph,
+            // not the original pre-rename snapshot.
+            write_esm_symbol_index(project, &modules, &known)?;
+            return Ok(count);
         }
     }
-    Ok(count)
+    anyhow::bail!("readable ESM name linking did not converge after {limit} passes")
 }
 
 #[cfg(test)]
@@ -418,6 +571,16 @@ mod tests {
     use super::*;
     use crate::analysis_artifacts::{write_artifact, DEOBFUSCATION, JS_REFERENCES, SOURCE_INDEX};
     use serde_json::json;
+
+    #[test]
+    fn symbol_index_escapes_captured_names_and_paths() {
+        assert_eq!(code_span("object`name"), "`` object`name ``");
+        assert_eq!(code_span("line\nbreak"), "`line\\nbreak`");
+        assert_eq!(
+            link_destination("_readable/complex (draft).js"),
+            "_readable/complex%20%28draft%29.js"
+        );
+    }
 
     #[test]
     fn propagates_component_names_through_reexports_and_star_barrels() -> Result<()> {
@@ -493,6 +656,14 @@ mod tests {
                 "TransitionConsumer.js",
                 "import {x as ve} from './Transition.js'; console.log(ve.displayName);",
             ),
+            (
+                "Decorated.js",
+                "import {t as h} from './Footer.js'; const b=__name(function(){}, 'DeferredPanel'); export {b as x}; consume(h);",
+            ),
+            (
+                "DeferredConsumer.js",
+                "import {x as v} from './Decorated.js'; use(v);",
+            ),
         ];
         let refs = [
             ("Barrel.js", "./Footer.js", "reexport_named", "Footer.js"),
@@ -547,6 +718,13 @@ mod tests {
                 "import_static",
                 "Transition.js",
             ),
+            ("Decorated.js", "./Footer.js", "import_static", "Footer.js"),
+            (
+                "DeferredConsumer.js",
+                "./Decorated.js",
+                "import_static",
+                "Decorated.js",
+            ),
         ];
         let mut source_units = Vec::new();
         let mut deob_units = Vec::new();
@@ -597,7 +775,7 @@ mod tests {
                 "schema":JS_REFERENCES.schema,"code_units":ref_units,"summary":{}
             }),
         )?;
-        assert_eq!(propagate_imported_names(project)?, 9);
+        assert_eq!(propagate_imported_names(project)?, 12);
         let index = fs::read_to_string(project.join("src/_readable/index.js"))?;
         assert!(index.contains("import {u as Footer}"), "{index}");
         assert!(index.contains("const obj={b: Footer}"), "{index}");
@@ -643,6 +821,20 @@ mod tests {
         let local = fs::read_to_string(project.join("src/_readable/LocalConsumer.js"))?;
         assert!(local.contains("import {r as decodeResponse}"), "{local}");
         assert!(local.contains("use(decodeResponse)"), "{local}");
+        let index_doc = fs::read_to_string(project.join("src/ESM_SYMBOLS.md"))?;
+        assert!(index_doc.contains("Captured ESM symbols"), "{index_doc}");
+        assert!(
+            index_doc.contains("[`Transition.js`](_readable/Transition.js)"),
+            "{index_doc}"
+        );
+        assert!(
+            index_doc.contains("[`TransitionConsumer.js`](_readable/TransitionConsumer.js)"),
+            "{index_doc}"
+        );
+        assert!(
+            index_doc.contains("`Transition` — exported as `x`"),
+            "{index_doc}"
+        );
         let transition = fs::read_to_string(project.join("src/_readable/Transition.js"))?;
         assert!(
             transition.contains("export {Transition as x}"),
@@ -658,6 +850,29 @@ mod tests {
             transition_consumer.contains("console.log(Transition.displayName)"),
             "{transition_consumer}"
         );
+        let deferred = fs::read_to_string(project.join("src/_readable/Decorated.js"))?;
+        assert!(
+            deferred.contains("const DeferredPanel=__name("),
+            "{deferred}"
+        );
+        assert!(
+            deferred.contains("export {DeferredPanel as x}"),
+            "{deferred}"
+        );
+        let deferred_consumer =
+            fs::read_to_string(project.join("src/_readable/DeferredConsumer.js"))?;
+        assert!(
+            deferred_consumer.contains("import {x as DeferredPanel}"),
+            "{deferred_consumer}"
+        );
+        assert!(
+            deferred_consumer.contains("use(DeferredPanel)"),
+            "{deferred_consumer}"
+        );
+        assert!(
+            index_doc.contains("`DeferredPanel` — exported as `x`"),
+            "{index_doc}"
+        );
         let collision = fs::read_to_string(project.join("src/_readable/ApiCollision.js"))?;
         assert!(
             collision.contains("import {createApplication as q}"),
@@ -669,6 +884,11 @@ mod tests {
         assert_eq!(exact, files[7].1);
         // Idempotence of the presentation pass, even for import shorthand.
         assert_eq!(propagate_imported_names(project)?, 0);
+        assert_eq!(
+            fs::read_to_string(project.join("src/ESM_SYMBOLS.md"))?,
+            index_doc,
+            "relinking should preserve a byte-identical symbol index"
+        );
         Ok(())
     }
 }
