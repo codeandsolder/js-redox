@@ -207,3 +207,86 @@ provenance, and must distinguish observed executions from universal rewrites.
 No changes to active js-redox reconstruction worktree. Experimental ZIPP patch
 is versioned only in this draft PR, not proposed as an upstream performance or
 correctness change.
+
+## Real archived caller -> handler 164 -> ZIPP (2026-11-10)
+
+This follow-up uses **the actual captured Google Knitsail challenge wrapper**
+rather than choosing the caller's `H` in a synthetic fixture. No new live
+network requests are made. The original HTML and the captured program string
+are private inputs and are **not committed**.
+
+**Reproducible provenance:**
+
+- Saved 2026-09-27 HTML: 92,667 bytes; SHA-256
+  `fa1a074588751a928703945a359792756f3be075752f3e8a1ff252a578581c6c`,
+  originally under cold-storage's
+  `/srv/scratch/searxrs2/research/google-historical-2026-09-27/fresh-vm-replay2/p15601/initial.html`.
+- VM script embedded in that exact HTML: 63,650 bytes; SHA-256
+  `e414463345509a89678cd7dc9afa9b9391e4dce58a56f6a1e641990f2884fa5e`.
+  Its source contains **exactly** the original 235-byte Knitsail handler 164
+  also embedded in the pinned js-redox source
+  `d016538d95a679e1604c8e6f4c1fa5d78ff3d729eace6c832e54a10b550b4a98`.
+- The original, readable outer wrapper calls `knitsail.a(p, callback, ...)`.
+  The actual VM dispatcher
+  `hV` selects `AV[Q.substring(0, 3) + "_"]` and calls it with
+  `Q.substring(3)`. The exact source caller chain
+  `AV.aoF_(J, ...) -> new Wd(..., J, ...) -> oU(..., H=J, ...)`
+  identifies this string as the conditional property-alias control.
+
+**Real archived execution:**
+
+- The original HTML wrapper executed under the archived Node VM browser
+  simulation; the entry observer wraps exported `a` and dynamically selected
+  `<prefix>_` methods *after* VM installation but before wrapper execution.
+  Baseline and wrapped replays both produce a usable `SG_SS` cookie
+  (851-character value). No cookie or challenge payload is committed.
+- Exactly one `knitsail.a` call: 8 arguments; first argument is a
+  **16,039-character** string, starting with dispatch prefix `aoF`.
+- Exactly one `knitsail.aoF_` call: 9 arguments, first argument is the exact
+  **16,036-character** `knitsail.a` first argument after `.slice(3)`;
+  SHA-256 `150e6812ca473b15ed5a415fc2c99e62db468dbc354d3d41b51992dfe6531eba`.
+- This clarifies an initial misleading measurement: an unparsed `var p='...'`
+  **source literal text** is 16,042 characters because it includes escape
+  sequences; the *runtime* string is 16,039. There is **no** six-character
+  mutation. The function receives the 3-character-trimmed runtime value.
+- For this H, `H.length < 2` is false, preserving `JM="length"` and
+  `T="push"`. Under the original handler 164, ZIPP observed
+  `GetIndex` at IP 35 with key `length`, IP 63 with `push`, and IP 64
+  with numeric index `0` then `1`. Function source span in generated
+  JS: `16602..16837`. 19 events, no truncation.
+- **Node/ZIPP stdout parity passes** for all three modeled handler cases
+  (`normal`, `short`, `archived`). The rest of the handler's closure
+  dependencies remain deterministic stand-ins; the full original browser
+  initializer is not run in ZIPP. Runtime witness != universal source proof.
+
+**Replay on Acer (Rust 1.99, configured sccache):**
+
+```bash
+cd prototypes/zipp-knitsail
+# Apply the observer patch first to a sparse checkout of pinned ZIPP b7521d2.
+git -C upstream-zipp am ../patches/zipp-computed-property-witness.patch
+
+mkdir -p inputs
+export KNITSAIL_HTML_SHA256=fa1a074588751a928703945a359792756f3be075752f3e8a1ff252a578581c6c
+export KNITSAIL_CAPTURE_H_PATH="$PWD/inputs/archived-h.json"
+node scripts/replay-captured-html.cjs /path/to/private/initial.html \
+  > inputs/archived-caller-report.json 2> inputs/archived-caller.log
+
+KNITSAIL_H_INPUT="$PWD/inputs/archived-h.json" node scripts/make-key164-fixtures.mjs
+CARGO_TARGET_DIR="$PWD/build" cargo +1.99.0 build --manifest-path harness/Cargo.toml --bin witness
+node inputs/raw-164-archived.js > inputs/archived-node.out
+build/debug/witness inputs/raw-164-archived.js \
+  > inputs/archived-zipp.out 2> inputs/archived-zipp.log
+cmp inputs/archived-node.out inputs/archived-zipp.out
+```
+
+`replay-captured-html.cjs` reuses the existing historical Node browser mocks,
+with an opt-in captured-`H` output path and output redaction. It is deliberately
+not a general browser emulator; function wrappers can affect reflection, and
+one archived challenge does not establish that all real-world `H` values are
+long strings. Keep js-redox's conditional property aliases intact.
+
+**Verdict:** This closes the missing *observed real caller input* loop for the
+archived source. It supplies a new **execution witness**, not a new structural
+recovery or a new static proof. ZIPP integration beyond the experiment remains
+unjustified until it recovers a fact unavailable from the actual source graph.

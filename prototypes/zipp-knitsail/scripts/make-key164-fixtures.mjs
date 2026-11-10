@@ -14,7 +14,13 @@ const body = original.subarray(27625, 27860).toString('utf8');
 if (!body.startsWith('function(P,K,c,a,k,D,A,h,e){for(e=44;') || !body.endsWith('}')) {
   throw new Error('Handler 164 original byte span changed');
 }
-for (const [variant, H] of [['normal', 'healthy'], ['short', 'x']]) {
+const variants = [['normal', 'healthy'], ['short', 'x']];
+if (process.env.KNITSAIL_H_INPUT) {
+  const captured = JSON.parse(fs.readFileSync(process.env.KNITSAIL_H_INPUT, 'utf8'));
+  if (typeof captured.value !== 'string') throw Error('Archived caller H missing or non-string');
+  variants.push(['archived', captured.value]);
+}
+for (const [variant, H] of variants) {
   // This is the actual oU branch predicate, selectively isolated.
   // The surrounding oU DOM/browser initializer is NOT executed here.
   const code = `
@@ -35,7 +41,7 @@ function x(G,D,K) { writes.push([D,K.slice()]); }
 const capturedHandler = (${body});
 let status = 'ok';
 try { capturedHandler(payload); } catch (err) { status = err.name; }
-console.log('RESULT:' + JSON.stringify({H,status,writes,event}));
+console.log('RESULT:' + JSON.stringify({H_length:H.length,status,writes,event}));
 `;
   const file = path.join(root, 'inputs', 'raw-164-' + variant + '.js');
   fs.writeFileSync(file, code);
