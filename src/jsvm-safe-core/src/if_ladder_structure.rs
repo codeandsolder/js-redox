@@ -1320,38 +1320,34 @@ fn confined_exception_state(symbol: SymbolId, scoping: &Scoping) -> bool {
     })
 }
 
-/// Only a direct inert assignment to the original lexical binding can
-/// advance a proven numeric state. Identifier spelling alone is insufficient:
-/// nested lexical blocks can shadow the dispatcher's binding.
-fn bound_inert_exception_transition(
-    statement: &Statement<'_>,
+/// Only a direct inert numeric assignment to the original lexical binding
+/// is an unconditional, nonthrowing state commit. The target's semantic
+/// identity matters: an inner block can shadow the dispatcher by name.
+fn bound_inert_exception_assignment(
+    expression: &Expression<'_>,
     symbol: SymbolId,
-    state: &str,
     scoping: &Scoping,
 ) -> Option<u64> {
-    let inner = match statement {
-        Statement::BlockStatement(block) if block.body.len() == 1 => &block.body[0],
-        other => other,
-    };
-    let Statement::ExpressionStatement(expression) = inner else {
-        return None;
-    };
-    let Expression::AssignmentExpression(assignment) = &expression.expression else {
+    let Expression::AssignmentExpression(assignment) = unparen(expression) else {
         return None;
     };
     let AssignmentTarget::AssignmentTargetIdentifier(id) = &assignment.left else {
         return None;
     };
-    if id.name != state
+    if assignment.operator.as_str() != "="
         || id
             .reference_id
             .get()
             .and_then(|reference| scoping.get_reference(reference).symbol_id())
             != Some(symbol)
+        || !inert_literal_value(&assignment.right)
     {
         return None;
     }
-    inert_exception_transition(statement, state)
+    let crate::value_eval::Value::Number(value) = eval(&assignment.right)? else {
+        return None;
+    };
+    exact_u64(value)
 }
 
 /// Track all possible normal states at each statement boundary and the
@@ -1408,8 +1404,8 @@ fn sequential_exception_roots(
             !writes.unsafe_write && writes.targets.is_empty()
         }
 
-        fn condition_is_write_free(&self, condition: &Expression<'_>) -> bool {
-            if self.has_state_write(condition.span()) {
+        fn expression_is_write_free(&self, expression: &Expression<'_>) -> bool {
+            if self.has_state_write(expression.span()) {
                 return false;
             }
             let mut writes = ExceptionStateWrites {
@@ -1421,8 +1417,66 @@ fn sequential_exception_roots(
                 modeled_writes: BTreeSet::new(),
                 unsafe_write: false,
             };
-            writes.visit_expression(condition);
+            writes.visit_expression(expression);
             !writes.unsafe_write && writes.targets.is_empty()
+        }
+
+        /// Evaluate the portions of an expression whose JS evaluation order
+        /// is explicit in the AST. A normal result is a set of possible state
+        /// values; roots collect the values observed before a possible throw.
+        /// Unknown expression shapes are accepted only if they cannot write
+        /// the dispatcher state, preserving the original broad fallback.
+        fn expression(
+            &mut self,
+            expression: &Expression<'_>,
+            incoming: BTreeSet<u64>,
+        ) -> Option<BTreeSet<u64>> {
+            if incoming.is_empty() {
+                return Some(incoming);
+            }
+            match unparen(expression) {
+                Expression::SequenceExpression(sequence) => {
+                    let mut states = incoming;
+                    for item in &sequence.expressions {
+                        states = self.expression(item, states)?;
+                    }
+                    Some(states)
+                }
+                Expression::ConditionalExpression(conditional) => {
+                    let after_test = self.expression(&conditional.test, incoming)?;
+                    let yes = self.expression(&conditional.consequent, after_test.clone())?;
+                    let no = self.expression(&conditional.alternate, after_test)?;
+                    let mut merged = yes;
+                    merged.extend(no);
+                    (merged.len() <= 2048).then_some(merged)
+                }
+                Expression::LogicalExpression(logical) => {
+                    // &&, || and ?? may skip the right operand. Keep both
+                    // possible completions unless a separate constant proof
+                    // proves the selection; this is a safe path union.
+                    let left = self.expression(&logical.left, incoming)?;
+                    let right = self.expression(&logical.right, left.clone())?;
+                    let mut merged = left;
+                    merged.extend(right);
+                    (merged.len() <= 2048).then_some(merged)
+                }
+                other => {
+                    if let Some(target) =
+                        bound_inert_exception_assignment(other, self.symbol, self.scoping)
+                    {
+                        return Some(BTreeSet::from([target]));
+                    }
+                    // Calls, getters, template interpolation, destructuring,
+                    // computed LHS references and nonliteral assignment RHS
+                    // may throw before or after hidden writes. Do not infer
+                    // any changes to the state from those expressions.
+                    if !self.expression_is_write_free(other) {
+                        return None;
+                    }
+                    self.roots.extend(incoming.iter().copied());
+                    Some(incoming)
+                }
+            }
         }
 
         fn statement(
@@ -1442,46 +1496,44 @@ fn sequential_exception_roots(
                     Some(states)
                 }
                 Statement::IfStatement(branch) => {
-                    // The test runs before either arm and may throw, even
-                    // when it looks like a pure read (e.g. a TDZ reference).
-                    if !self.condition_is_write_free(&branch.test) {
-                        return None;
-                    }
-                    self.roots.extend(incoming.iter().copied());
-                    let yes = self.statement(&branch.consequent, incoming.clone())?;
+                    // Evaluation of the test can itself assign the numeric
+                    // state and later throw, before choosing either arm.
+                    let after_test = self.expression(&branch.test, incoming)?;
+                    let yes = self.statement(&branch.consequent, after_test.clone())?;
                     let no = match branch.alternate.as_ref() {
-                        Some(other) => self.statement(other, incoming)?,
-                        None => incoming,
+                        Some(other) => self.statement(other, after_test)?,
+                        None => after_test,
                     };
                     let mut merged = yes;
                     merged.extend(no);
                     (merged.len() <= 2048).then_some(merged)
                 }
-                other => {
-                    if let Some(target) = bound_inert_exception_transition(
-                        other,
-                        self.symbol,
-                        self.state,
-                        self.scoping,
-                    ) {
-                        return Some(BTreeSet::from([target]));
+                Statement::ExpressionStatement(expression) => {
+                    self.expression(&expression.expression, incoming)
+                }
+                Statement::ReturnStatement(ret) => {
+                    if let Some(argument) = &ret.argument {
+                        self.expression(argument, incoming)?;
                     }
-                    // Destructuring, update expressions, loop targets,
-                    // conditional assignments and dynamic evaluation order
-                    // cannot be summarized by a single numeric write.
+                    // The expression may throw, but a successful return
+                    // has no normal continuation into following statements.
+                    Some(BTreeSet::new())
+                }
+                Statement::ThrowStatement(throw) => {
+                    let at_throw = self.expression(&throw.argument, incoming)?;
+                    // The completed throw explicitly exposes the final
+                    // state value even if the argument itself was inert.
+                    self.roots.extend(at_throw);
+                    Some(BTreeSet::new())
+                }
+                other => {
+                    // Unknown statements are permitted only when none of
+                    // their expression effects can mutate the state binding.
                     if !self.opaque_statement_is_write_free(other) {
                         return None;
                     }
                     self.roots.extend(incoming.iter().copied());
-                    // Abrupt completions cannot reach the next statement.
-                    if matches!(
-                        other,
-                        Statement::ReturnStatement(_) | Statement::ThrowStatement(_)
-                    ) {
-                        Some(BTreeSet::new())
-                    } else {
-                        Some(incoming)
-                    }
+                    Some(incoming)
                 }
             }
         }

@@ -4236,6 +4236,180 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_throw_boundary_sequence_prunes_later_write() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        (state = 4, log.push("may-throw"), state = 6);
+                        state = 7;
+                    } else if (state === 4) return "sequence-catch-resume";
+                    else if (state === 6) return "never-at-throw";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("sequence-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("never-at-throw"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_ternary_arms_prune_later_write() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        flag ? (state = 4, log.push("left")) : (state = 5, log.push("right"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "ternary-left-resume";
+                    else if (state === 5) return "ternary-right-resume";
+                    else if (state === 6) return "unobservable-after-ternary";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("ternary-left-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("ternary-right-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-ternary"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_short_circuit_prunes_later_write() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        flag && (state = 4, log.push("maybe"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "short-circuit-catch-resume";
+                    else if (state === 6) return "never-after-short-circuit";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("short-circuit-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("never-after-short-circuit"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_test_sequence_preserves_throw_state() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        if ((state = 4, log.push("test"), flag)) state = 6;
+                        else state = 6;
+                        state = 7;
+                    } else if (state === 4) return "test-sequence-catch-resume";
+                    else if (state === 6) return "unobservable-test-successor";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("test-sequence-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-test-successor"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_return_expression_preserves_catch_state() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) return (state = 4, log.push("return"), "normal");
+                    else if (state === 4) return "return-expression-catch-resume";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("return-expression-catch-resume"),
+            "a call in a return argument may throw after the state assignment: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_computed_assignment_falls_back() {
+        let source = r#"
+            function f(obj) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[state = 4] = obj.throwing;
+                        state = 7;
+                    } else if (state === 4) return "computed-lhs-catch-resume";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("computed-lhs-catch-resume"),
+            "complex computed assignment evaluation must retain exceptional state: {}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_finite_catch_domain_allows_effectful_merge() {
         let source = r#"
             function f(flag, log) {
