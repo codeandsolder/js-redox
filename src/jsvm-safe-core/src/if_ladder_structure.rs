@@ -2267,21 +2267,25 @@ impl<'a> Visit<'a> for CatchSelectorFiniteWrites<'_> {
 /// Prove a finite lexical value domain, established before the loop. No
 /// unrecognized write is allowed in or outside the loop, and the catch must
 /// not modify the selector while its branches are being analyzed.
+struct FiniteSelectorSeed {
+    symbol: SymbolId,
+    initial: u64,
+    span: Span,
+}
+
 fn finite_catch_selector_domain(
     loop_stmt: &WhileStatement<'_>,
     catch_span: Span,
-    selector: SymbolId,
-    initial: u64,
-    init_span: Span,
+    seed: FiniteSelectorSeed,
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
     source: &str,
 ) -> Option<BTreeSet<u64>> {
     let mut finder = CatchSelectorFiniteWrites {
-        symbol: selector,
+        symbol: seed.symbol,
         scoping,
         source,
-        values: BTreeSet::from([initial]),
+        values: BTreeSet::from([seed.initial]),
         modeled: BTreeSet::new(),
         valid: true,
         nested_function_depth: 0,
@@ -2290,12 +2294,12 @@ fn finite_catch_selector_domain(
     if !finder.valid {
         return None;
     }
-    for &reference in scoping.get_resolved_reference_ids(selector) {
+    for &reference in scoping.get_resolved_reference_ids(seed.symbol) {
         if !scoping.get_reference(reference).is_write() {
             continue;
         }
         let span = *reference_spans.get(&reference)?;
-        if init_span.start <= span.start && span.end <= init_span.end {
+        if seed.span.start <= span.start && span.end <= seed.span.end {
             continue;
         }
         if !(loop_stmt.span.start <= span.start
@@ -2324,9 +2328,11 @@ fn catch_finite_domain_always_replaces_state(
         let Some(values) = finite_catch_selector_domain(
             loop_stmt,
             handler.body.span,
-            selector,
-            initial,
-            init_span,
+            FiniteSelectorSeed {
+                symbol: selector,
+                initial,
+                span: init_span,
+            },
             scoping,
             reference_spans,
             source,
@@ -2352,6 +2358,11 @@ fn catch_finite_domain_always_replaces_state(
 /// This deliberately leaves the try/catch in place: combining states into a
 /// single iteration could alter catch-visible intermediate state or a loop
 /// condition's evaluation count.
+pub(crate) struct CatchScopeEvidence<'a> {
+    pub reaching: &'a HashMap<SymbolId, (u64, Span)>,
+    pub reference_spans: &'a HashMap<ReferenceId, Span>,
+}
+
 pub(crate) fn prune_exception_dispatcher(
     loop_stmt: &WhileStatement<'_>,
     state: &str,
@@ -2359,8 +2370,7 @@ pub(crate) fn prune_exception_dispatcher(
     symbol: SymbolId,
     scoping: &Scoping,
     source: &str,
-    reaching: &HashMap<SymbolId, (u64, Span)>,
-    reference_spans: &HashMap<ReferenceId, Span>,
+    catch_scope: CatchScopeEvidence<'_>,
 ) -> Option<String> {
     let effects = ExceptionLoopEffectContext { scoping };
     if loop_stmt.test.may_have_side_effects(&effects) {
@@ -2470,8 +2480,8 @@ pub(crate) fn prune_exception_dispatcher(
         state,
         source,
         scoping,
-        reaching,
-        reference_spans,
+        catch_scope.reaching,
+        catch_scope.reference_spans,
     );
     let mut source_cases = BTreeMap::new();
     let mut cursor = dispatcher;

@@ -723,8 +723,10 @@ impl Collector<'_, '_> {
                             symbol,
                             self.scoping,
                             self.source,
-                            &reaching,
-                            self.reference_spans,
+                            if_ladder_structure::CatchScopeEvidence {
+                                reaching: &reaching,
+                                reference_spans: self.reference_spans,
+                            },
                         ) {
                             if let Some(dispatcher) = protected.block.body.first() {
                                 self.push(dispatcher.span(), code, "exception_state_pruned");
