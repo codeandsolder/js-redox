@@ -134,3 +134,76 @@ Upstream fork creation from the available GitHub App credential returned
 HTTP 403 (`Resource not accessible by integration`); no upstream PR is
 claimed. The patch is preserved here on GitHub so it can be forked/cherry-picked
 by an account with permission. It is not a js-redox production dependency.
+
+## Follow-up: source-correlated computed-property witnesses (2026-11-10)
+
+We tried to answer a narrower, actually unresolved Knitsail question: what
+runtime property keys do the two conditional lexical aliases in handler 164
+select? Unlike the original handler-208 experiment, this probes a specific
+unresolved property-name choice rather than counting instruction steps.
+
+**Input provenance:** original Knitsail file SHA-256
+`d016538d95a679e1604c8e6f4c1fa5d78ff3d729eace6c832e54a10b550b4a98`,
+exact 235-byte handler-164 function `[27625,27860)`. The generator
+`scripts/make-key164-fixtures.mjs` verifies that hash and extracts the original
+function bytes; raw payload and generated files stay untracked. Its context
+models the original caller's observed lexical condition
+`T="push"; JM="length"; if (H.length < 2) { T=H; JM=H; }`.
+The rest of the browser initializer is **not executed**: the handler's other
+dependencies are explicit deterministic stand-ins.
+
+**Diagnostic extension:** The reproducible `git am` patch
+[`patches/zipp-computed-property-witness.patch`](patches/zipp-computed-property-witness.patch)
+is based on ZIPP `b7521d2`. It adds an optional embedder API
+`start_property_witnesses(cap)` and `take_property_witnesses()`, separate from
+the ZK proof recorder. Events include function ID/name, function source range in
+the compiled source, bytecode IP, operation (`get`, `set`, `call`), raw key
+bits/display, and whether the raw operand is an object. The buffer has an
+explicit truncation bit and disables JIT during observation. **These are raw
+computed-property operands, not claimed post-ToPropertyKey results or precise
+expression source spans** (function spans and bytecode PCs are all ZIPP exposes).
+The observer does not run ToPropertyKey, so it does not add guest coercion
+effects. Instrumented interception is currently for the ordinary GetIndex,
+SetIndex and CallMethodComputed bytecode paths: other fused/optimized property
+opcodes are not claimed covered.
+
+**Run:**
+
+```bash
+git -C upstream-zipp am ../patches/zipp-computed-property-witness.patch
+mkdir -p inputs
+node scripts/make-key164-fixtures.mjs
+CARGO_TARGET_DIR="$PWD/build" cargo +1.99.0 build --manifest-path harness/Cargo.toml --bin witness
+for case in normal short; do
+  node "inputs/raw-164-$case.js"
+  build/debug/witness "inputs/raw-164-$case.js"
+done
+node tests/property-no-extra-coercion.js
+build/debug/witness tests/property-no-extra-coercion.js
+```
+
+**Measured** (both inputs ZIPP == Node byte-for-byte):
+- `H="healthy"`: handler 164, compiled function range 573..808, IP 35
+  reads raw key `length`; IP 63 reads `push`; successful
+  `x(G,24,[10,20])` write.
+- `H="x"`: handler 164, source range 567..802, IP 35 reads `x`;
+  IP 63 reads `x`; a subsequent index is `NaN`. The call throws
+  `TypeError`, matching Node. No write.
+- Object-key `get` / `set` / `call` test:
+  `tests/property-no-extra-coercion.js` matched Node including all
+  `toString` invocation counts. An object operand is explicitly marked
+  as such; its diagnostic display is **not** substituted for a resolved key.
+- For the normal / short fixtures the observer recorded 19 / 9 total events,
+  respectively, including activity inside test helper functions; no truncation.
+
+**Verdict:** This independently observes actual alias operands on the original
+Knitsail handler under two modeled inputs. It does **not** uncover a new alias
+or establish which input the live browser supplied: js-redox's static lexical
+analysis had already described both conditional outcomes. **Do not integrate
+this into production js-redox based on this evidence alone.** Further work
+would need a genuine novel witness from the live caller with source-specific
+provenance, and must distinguish observed executions from universal rewrites.
+
+No changes to active js-redox reconstruction worktree. Experimental ZIPP patch
+is versioned only in this draft PR, not proposed as an upstream performance or
+correctness change.
