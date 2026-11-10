@@ -1497,6 +1497,41 @@ fn sequential_exception_roots(
                     merged.extend(right);
                     (merged.len() <= 2048).then_some(merged)
                 }
+                Expression::BinaryExpression(binary) => {
+                    // ECMAScript evaluates and obtains the left value before
+                    // the right. The operator itself can then throw (e.g.
+                    // ToPrimitive, mixed BigInt arithmetic, in, instanceof)
+                    // after both operands have committed their state writes.
+                    let after_left = self.expression(&binary.left, incoming)?;
+                    let after_right = self.expression(&binary.right, after_left)?;
+                    self.roots.extend(after_right.iter().copied());
+                    Some(after_right)
+                }
+                Expression::PrivateInExpression(private) => {
+                    let after_right = self.expression(&private.right, incoming)?;
+                    // Private-brand validation is performed after the RHS.
+                    self.roots.extend(after_right.iter().copied());
+                    Some(after_right)
+                }
+                Expression::ArrayExpression(array) => {
+                    // Elements execute left-to-right; an elision has no
+                    // expression to evaluate. Spread iteration can throw
+                    // after evaluating the spread's argument.
+                    let mut states = incoming;
+                    for element in &array.elements {
+                        match element {
+                            ArrayExpressionElement::SpreadElement(spread) => {
+                                states = self.expression(&spread.argument, states)?;
+                                self.roots.extend(states.iter().copied());
+                            }
+                            ArrayExpressionElement::Elision(_) => {}
+                            other => {
+                                states = self.expression(other.as_expression()?, states)?;
+                            }
+                        }
+                    }
+                    Some(states)
+                }
                 // Optional chains can skip argument/key evaluation. Keep
                 // them on the preexisting conservative semantic-write path.
                 Expression::ComputedMemberExpression(member) if !member.optional => {

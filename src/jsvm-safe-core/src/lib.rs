@@ -4628,6 +4628,191 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_throw_boundary_binary_left_before_right() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        (state = 4, 7) + log.push("possible throw");
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "binary-left-catch";
+                    else if (state === 6) return "binary-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("binary-left-catch"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("binary-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_binary_coercion_after_right() {
+        let source = r#"
+            function f(value) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        (state = 4, value) + (state = 5, 1);
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "binary-right-evaluation";
+                    else if (state === 5) return "binary-coercion-catch";
+                    else if (state === 6) return "binary-unobservable-after-operator";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("binary-coercion-catch"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("binary-unobservable-after-operator"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_binary_in_operator_checks_right() {
+        let source = r#"
+            function f(target) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        "key" in (state = 4, target);
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "in-right-catch";
+                    else if (state === 6) return "in-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("in-right-catch"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("in-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_array_element_order() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        [state = 4, log.push("may throw"), state = 6];
+                        state = 7;
+                    } else if (state === 4) return "array-element-catch";
+                    else if (state === 6) return "array-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("array-element-catch"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("array-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_array_spread_iterator_throw() {
+        let source = r#"
+            function f(iterator) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        [...(state = 4, iterator), state = 6];
+                        state = 7;
+                    } else if (state === 4) return "spread-iterator-catch";
+                    else if (state === 6) return "spread-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("spread-iterator-catch"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("spread-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_array_elision_does_not_shift_state() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        [,, state = 4, log.push("may throw")];
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "array-elision-catch";
+                    else if (state === 6) return "array-elision-unobservable";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("array-elision-catch"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("array-elision-unobservable"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_const_write_does_not_advance_catch_state() {
         let source = r#"
             function f() {
