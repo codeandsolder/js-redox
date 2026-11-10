@@ -1,0 +1,10 @@
+[package]
+name = "zipp-knitsail-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+zipp-vm = { path = "../upstream-zipp/crates/zipp-vm", default-features = false, features = ["instrument"] }
+
+[workspace]
