@@ -3774,6 +3774,41 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_preserves_retry_of_intermediate_numeric_write() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                let attempts = 0, caught = 0;
+                while (true) try {
+                    if (state == 1) {
+                        state = 2;
+                        attempts++;
+                        if (attempts == 1) throw Error("retry");
+                        state = 3;
+                    } else if (state == 2) {
+                        return ["resumed-intermediate", state, attempts, caught];
+                    } else if (state == 3) {
+                        return ["normal", state, attempts, caught];
+                    }
+                } catch (error) { caught++; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            result.source.contains("state == 2") || result.source.contains("state==2"),
+            "a throw after state=2 allows implicit catch retry at state 2: {}",
+            result.source
+        );
+        assert!(
+            result.source.contains("resumed-intermediate"),
+            "intermediate exceptional entry must be retained: {}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_handles_inert_array_literal_loop_test() {
         let source = r#"
             function f(flag) {

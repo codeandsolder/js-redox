@@ -2250,9 +2250,26 @@ pub(crate) fn prune_exception_dispatcher(
         }
     }
 
-    // The outer catch can retry at the state it intercepted, *or* resume
-    // from any numeric state it assigns. Treat each catch target as a root;
-    // rejecting unknown reachable transitions prevents false dead cases.
+    // The catch can change the numeric state explicitly, or complete normally
+    // and retry at any state value held when a source case throws. Those values
+    // include *intermediate writes* within the case, not just its modeled
+    // normal successor. Track their exceptional edges to a fixed point.
+    let catch_retries_unchanged =
+        !catch_block_always_replaces_state_or_exits(&handler.body.body, state, source);
+    let mut source_cases = BTreeMap::new();
+    let mut cursor = dispatcher;
+    loop {
+        let Statement::IfStatement(branch) = cursor else {
+            return None;
+        };
+        source_cases.insert(state_test(&branch.test, state)?, &branch.consequent);
+        match branch.alternate.as_ref() {
+            Some(other @ Statement::IfStatement(_)) => cursor = other,
+            None => break,
+            Some(_) => return None,
+        }
+    }
+
     let mut roots = writes.targets;
     roots.insert(initial);
     let mut reachable = BTreeSet::new();
@@ -2265,30 +2282,41 @@ pub(crate) fn prune_exception_dispatcher(
         let mut next = Vec::new();
         route.targets(&mut next);
         work.extend(next);
-    }
 
-    // The catch can also resume without changing the interrupted state.
-    // A throwing case then remains independently enterable on the next
-    // iteration, even if its normal CFG predecessor is otherwise unique.
-    if !catch_block_always_replaces_state_or_exits(&handler.body.body, state, source) {
-        let mut cursor = dispatcher;
-        loop {
-            let Statement::IfStatement(branch) = cursor else {
-                return None;
-            };
-            if branch.consequent.may_have_side_effects(&effects) {
-                let label = state_test(&branch.test, state)?;
-                if reachable.contains(&label) {
-                    roots.insert(label);
+        if catch_retries_unchanged {
+            let body = *source_cases.get(&current)?;
+            if body.may_have_side_effects(&effects)
+                && inert_exception_transition(body, state).is_none()
+            {
+                // A throw before any assignment retries the entering state.
+                roots.insert(current);
+                // A throw after any finite numeric write can retry that
+                // intermediate value, even when the normal route ends
+                // somewhere else. Overapproximating all writes is intentional:
+                // their exact evaluation order may be conditional/effectful.
+                let mut state_writes = ExceptionStateWrites {
+                    symbol,
+                    state_name: state,
+                    scoping,
+                    source,
+                    targets: BTreeSet::new(),
+                    unsafe_write: false,
+                };
+                state_writes.visit_statement(body);
+                if state_writes.unsafe_write {
+                    return None;
                 }
-            }
-            match branch.alternate.as_ref() {
-                Some(other @ Statement::IfStatement(_)) => cursor = other,
-                None => break,
-                Some(_) => return None,
+                for target in state_writes.targets {
+                    if target == exit {
+                        return None;
+                    }
+                    roots.insert(target);
+                    work.push_back(target);
+                }
             }
         }
     }
+
     // Recover one closed conditional region (compact two-arm or general DAG),
     // then recover independent linear
     // regions against the UPDATED CFG. Protect the diamond's entry and

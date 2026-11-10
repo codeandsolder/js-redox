@@ -606,3 +606,22 @@ function caughtSameStateRetry() {
     } catch (error) { caught++; }
 }
 console.log(JSON.stringify(["implicit-catch-retry", caughtSameStateRetry()]));
+
+
+function caughtIntermediateStateRetry() {
+    let state = 1;
+    let attempts = 0, caught = 0;
+    while (true) try {
+        if (state == 1) {
+            state = 2;
+            attempts++;
+            if (attempts == 1) throw Error("retry");
+            state = 3;
+        } else if (state == 2) {
+            return ["resumed-intermediate", state, attempts, caught];
+        } else if (state == 3) {
+            return ["normal", state, attempts, caught];
+        }
+    } catch (error) { caught++; }
+}
+console.log(JSON.stringify(["intermediate-catch-retry", caughtIntermediateStateRetry()]));
