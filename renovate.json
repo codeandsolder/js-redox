@@ -1,17 +1,9 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended",
-    "github>codeandsolder/ci-workflows:renovate-ci-trust-root"
+    "github>codeandsolder/ci-workflows:renovate-fleet"
   ],
-  "dependencyDashboard": true,
-  "minimumReleaseAge": "3 days",
-  "minimumReleaseAgeBehaviour": "timestamp-required",
-  "internalChecksFilter": "strict",
   "separateMultipleMajor": true,
-  "prConcurrentLimit": 0,
-  "prHourlyLimit": 0,
-  "rebaseWhen": "behind-base-branch",
   "packageRules": [
     {
       "description": "Group Oxc crates so one type/version universe moves together",
@@ -44,39 +36,6 @@
       "enabled": false
     },
     {
-      "description": "Automerge ordinary compatible updates after CI",
-      "matchUpdateTypes": [
-        "minor",
-        "patch",
-        "pin",
-        "pinDigest",
-        "digest"
-      ],
-      "matchCurrentVersion": "!/^0/",
-      "automerge": true,
-      "automergeType": "pr"
-    },
-    {
-      "description": "Potentially breaking pre-1.0 updates stay open for review",
-      "matchCurrentVersion": "/^0\\./",
-      "automerge": false
-    },
-    {
-      "description": "Major updates stay open for review",
-      "matchUpdateTypes": [
-        "major"
-      ],
-      "automerge": false
-    },
-    {
-      "description": "Package replacements stay open for review",
-      "matchUpdateTypes": [
-        "replacement"
-      ],
-      "minimumReleaseAge": null,
-      "automerge": false
-    },
-    {
       "description": "Keep the Rust compiler baseline synchronized and review upgrades",
       "matchManagers": [
         "custom.regex"
@@ -85,19 +44,6 @@
         "Rust toolchain"
       ],
       "groupName": "Rust toolchain",
-      "automerge": false
-    },
-    {
-      "description": "Trusted shared CI/strict policy updates bypass ordinary release age but never inherit broad automerge rules",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "matchPackageNames": [
-        "/^codeandsolder\\/(?:ci-workflows|rust-skills2)(?:\\/|$)/"
-      ],
-      "minimumReleaseAge": null,
-      "groupName": "Shared CI trust roots",
-      "groupSlug": "shared-ci-trust-roots",
       "automerge": false
     }
   ],
