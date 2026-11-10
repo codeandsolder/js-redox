@@ -4019,6 +4019,223 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_throw_boundary_conditional_arms_prune_post_throw_writes() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        state = 2;
+                        if (flag) { state = 4; } else { state = 5; }
+                        log.push("may-throw-after-branch");
+                        state = 6;
+                        state = 7;
+                    } else if (state === 2) return "test-throw-retry";
+                    else if (state === 4) return "left-resume";
+                    else if (state === 5) return "right-resume";
+                    else if (state === 6) return "impossible-after-last-throw";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        for value in ["left-resume", "right-resume", "test-throw-retry"] {
+            assert!(
+                result.source.contains(value),
+                "reachable catch-state case {value} was dropped: {}",
+                result.source
+            );
+        }
+        assert!(
+            !result.source.contains("impossible-after-last-throw"),
+            "the later state=6 cannot be caught: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_conditional_without_else_keeps_entry() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        state = 2;
+                        if (flag) { state = 4; }
+                        log.push("may-throw");
+                        state = 6;
+                        state = 7;
+                    } else if (state === 2) return "unchanged-side-resume";
+                    else if (state === 4) return "changed-side-resume";
+                    else if (state === 6) return "unobservable-post-throw";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("unchanged-side-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("changed-side-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-post-throw"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_test_write_uses_conservative_roots() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        state = 2;
+                        if ((state = 4, flag)) log.push("throw?");
+                        else log.push("also throw?");
+                        state = 5;
+                    } else if (state === 2) return "before-test";
+                    else if (state === 4) return "test-mutated-state-resume";
+                    else if (state === 5) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("test-mutated-state-resume"),
+            "a state write within the test precedes the call that may throw: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_return_arm_has_no_normal_successor() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        state = 2;
+                        if (flag) {
+                            state = 4;
+                            return "early-normal-return";
+                        } else {
+                            state = 5;
+                        }
+                        log.push("after-conditional");
+                        state = 6;
+                        state = 7;
+                    } else if (state === 2) return "test-throw-resume";
+                    else if (state === 4) return "return-expression-throw-resume";
+                    else if (state === 5) return "other-arm-resume";
+                    else if (state === 6) return "unobservable-after-last-throw";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("return-expression-throw-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("other-arm-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-last-throw"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_destructuring_assignment_is_exceptional_entry() {
+        let source = r#"
+            function f() {
+                let state = 1, thrown = 0;
+                while (true) try {
+                    if (state === 1) {
+                        [state] = [4];
+                        if (thrown++ === 0) throw Error("interrupt");
+                        state = 2;
+                    } else if (state === 4) return "destructuring-catch-resume";
+                    else if (state === 2) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("destructuring-catch-resume"),
+            "unmodeled destructuring must not discard a catch-resumable state: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_destructuring_in_catch_is_independent_root() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) throw Error("interrupt");
+                    else if (state === 4) return "catch-destructuring-target";
+                } catch (error) { [state] = [4]; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("catch-destructuring-target"),
+            "the catch's destructured state is independently reachable: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_iteration_target_write_is_exceptional_entry() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        for (state of [4]) {}
+                        throw Error("interrupt");
+                    } else if (state === 4) return "loop-target-catch-resume";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("loop-target-catch-resume"),
+            "iteration targets may update state before an exception: {}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_finite_catch_domain_allows_effectful_merge() {
         let source = r#"
             function f(flag, log) {
