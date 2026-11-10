@@ -1513,6 +1513,45 @@ fn sequential_exception_roots(
                     self.roots.extend(after_right.iter().copied());
                     Some(after_right)
                 }
+                Expression::UnaryExpression(unary) => {
+                    // Operand evaluation precedes unary conversion or
+                    // deletion. ToNumber, ToPrimitive and a proxy's
+                    // deleteProperty trap may throw after the operand
+                    // committed its numeric dispatcher-state write.
+                    let after_argument = self.expression(&unary.argument, incoming)?;
+                    self.roots.extend(after_argument.iter().copied());
+                    Some(after_argument)
+                }
+                Expression::TemplateLiteral(template) => {
+                    // Each substitution evaluates and then undergoes ToString
+                    // before the next substitution. Symbol/ToPrimitive
+                    // coercion can throw with the newly committed state.
+                    let mut states = incoming;
+                    for value in &template.expressions {
+                        states = self.expression(value, states)?;
+                        self.roots.extend(states.iter().copied());
+                    }
+                    Some(states)
+                }
+                Expression::TaggedTemplateExpression(tagged) => {
+                    // The tag (including any property getter) evaluates
+                    // before substitutions. Tagged substitutions are passed
+                    // raw, without the ToString conversion of untagged
+                    // templates, and the tag invocation follows all of them.
+                    // Treat direct eval conservatively as with calls.
+                    if matches!(
+                        unparen(&tagged.tag),
+                        Expression::Identifier(id) if id.name == "eval"
+                    ) {
+                        return None;
+                    }
+                    let mut states = self.expression(&tagged.tag, incoming)?;
+                    for value in &tagged.quasi.expressions {
+                        states = self.expression(value, states)?;
+                    }
+                    self.roots.extend(states.iter().copied());
+                    Some(states)
+                }
                 Expression::ArrayExpression(array) => {
                     // Elements execute left-to-right; an elision has no
                     // expression to evaluate. Spread iteration can throw

@@ -4996,6 +4996,265 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_throw_boundary_unary_operand_before_operation() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        +(state = 4, log.push("possible throw"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "unary-operand-resume";
+                    else if (state === 6) return "unary-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("unary-operand-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unary-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_unary_coercion_after_state_write() {
+        let source = r#"
+            function f(value) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        +(state = 4, value);
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "unary-conversion-resume";
+                    else if (state === 6) return "unary-unobservable-after-coercion";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("unary-conversion-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unary-unobservable-after-coercion"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_unary_delete_proxy_trap() {
+        let source = r#"
+            function f(obj) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        delete obj[(state = 4, "key")];
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "delete-proxy-resume";
+                    else if (state === 6) return "delete-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("delete-proxy-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("delete-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_template_coercion_between_substitutions() {
+        let source = r#"
+            function f(value, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        `first ${(state = 4, value)} second ${(state = 5, log.push("later"))}`;
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "template-first-coercion-resume";
+                    else if (state === 5) return "template-second-resume";
+                    else if (state === 6) return "template-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("template-first-coercion-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("template-second-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("template-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_template_symbol_conversion() {
+        let source = r#"
+            function f(value) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        `conversion: ${(state = 4, value)}`;
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "template-symbol-resume";
+                    else if (state === 6) return "template-unobservable-after-symbol";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("template-symbol-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("template-unobservable-after-symbol"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_tagged_template_getter_before_substitutions() {
+        let source = r#"
+            function f(obj) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[(state = 4, "tag")]`sub ${(state = 5, 10)}`;
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "tag-getter-resume";
+                    else if (state === 5) return "tag-call-resume";
+                    else if (state === 6) return "tag-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("tag-getter-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("tag-call-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("tag-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_tagged_template_throwing_substitution() {
+        let source = r#"
+            function f(tag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        tag`first ${(state = 4, log.push("may throw"))} second ${(state = 5, 2)}`;
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "tag-substitution-resume";
+                    else if (state === 5) return "tag-invocation-resume";
+                    else if (state === 6) return "tag-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("tag-substitution-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("tag-invocation-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("tag-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_unary_unknown_write_fallback() {
+        let source = r#"
+            function f(value) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        +(state += 3, value);
+                        state = 7;
+                    } else if (state === 4) return "unary-compound-resume";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("unary-compound-resume"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_const_write_does_not_advance_catch_state() {
         let source = r#"
             function f() {
