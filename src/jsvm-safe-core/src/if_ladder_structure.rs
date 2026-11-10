@@ -1440,22 +1440,65 @@ fn sequential_exception_roots(
             Some(states)
         }
 
-        /// A property Reference is evaluated after the receiver and computed
-        /// key. ToPropertyKey / GetValue / accessors may throw at that point.
-        fn property_reference(
+        /// Evaluate a property reference, optionally skipping its computed
+        /// key and access on a nullish receiver. An optional chain can still
+        /// throw while evaluating the receiver or the executed property.
+        fn member_reference(
             &mut self,
-            object: &Expression<'_>,
-            key: Option<&Expression<'_>>,
+            member: &oxc_ast::ast::MemberExpression<'_>,
             incoming: BTreeSet<u64>,
         ) -> Option<BTreeSet<u64>> {
-            let after_object = self.expression(object, incoming)?;
-            let after_key = if let Some(key) = key {
-                self.expression(key, after_object)?
-            } else {
-                after_object
+            let (object, key, optional) = match member {
+                oxc_ast::ast::MemberExpression::ComputedMemberExpression(value) => {
+                    (&value.object, Some(&value.expression), value.optional)
+                }
+                oxc_ast::ast::MemberExpression::StaticMemberExpression(value) => {
+                    (&value.object, None, value.optional)
+                }
+                oxc_ast::ast::MemberExpression::PrivateFieldExpression(value) => {
+                    (&value.object, None, value.optional)
+                }
             };
-            self.roots.extend(after_key.iter().copied());
-            Some(after_key)
+            let after_object = self.expression(object, incoming)?;
+            let after_access = if let Some(key) = key {
+                self.expression(key, after_object.clone())?
+            } else {
+                after_object.clone()
+            };
+            self.roots.extend(after_access.iter().copied());
+            if optional {
+                let mut merged = after_object;
+                merged.extend(after_access);
+                (merged.len() <= 2048).then_some(merged)
+            } else {
+                Some(after_access)
+            }
+        }
+
+        /// Calls within optional chains can skip argument evaluation even
+        /// when the final call node itself is not marked optional.
+        fn evaluated_call(
+            &mut self,
+            call: &CallExpression<'_>,
+            incoming: BTreeSet<u64>,
+            within_chain: bool,
+        ) -> Option<BTreeSet<u64>> {
+            if matches!(
+                unparen(&call.callee),
+                Expression::Identifier(id) if id.name == "eval"
+            ) {
+                return None;
+            }
+            let after_callee = self.expression(&call.callee, incoming)?;
+            let after_args = self.call_arguments(&call.arguments, after_callee.clone())?;
+            self.roots.extend(after_args.iter().copied());
+            if call.optional || within_chain {
+                let mut merged = after_callee;
+                merged.extend(after_args);
+                (merged.len() <= 2048).then_some(merged)
+            } else {
+                Some(after_args)
+            }
         }
 
         /// Evaluate the portions of an expression whose JS evaluation order
@@ -1601,66 +1644,78 @@ fn sequential_exception_roots(
                     }
                     Some(states)
                 }
-                // Optional chains can skip argument/key evaluation. Keep
-                // them on the preexisting conservative semantic-write path.
-                Expression::ComputedMemberExpression(member) if !member.optional => {
-                    self.property_reference(&member.object, Some(&member.expression), incoming)
+                member @ (Expression::ComputedMemberExpression(_)
+                | Expression::StaticMemberExpression(_)
+                | Expression::PrivateFieldExpression(_)) => {
+                    self.member_reference(member.as_member_expression()?, incoming)
                 }
-                Expression::StaticMemberExpression(member) if !member.optional => {
-                    self.property_reference(&member.object, None, incoming)
-                }
-                Expression::PrivateFieldExpression(member) if !member.optional => {
-                    self.property_reference(&member.object, None, incoming)
-                }
-                Expression::CallExpression(call) if !call.optional => {
-                    // Direct eval can assign to a lexical name dynamically.
-                    // Do not treat it as an ordinary opaque call even if its
-                    // arguments themselves are statically accounted for.
-                    if matches!(
-                        unparen(&call.callee),
-                        Expression::Identifier(id) if id.name == "eval"
-                    ) {
-                        return None;
+                Expression::ChainExpression(chain) => match &chain.expression {
+                    oxc_ast::ast::ChainElement::CallExpression(call) => {
+                        self.evaluated_call(call, incoming, true)
                     }
-                    let after_callee = self.expression(&call.callee, incoming)?;
-                    let after_args = self.call_arguments(&call.arguments, after_callee)?;
-                    self.roots.extend(after_args.iter().copied());
-                    Some(after_args)
-                }
+                    member => self.member_reference(member.as_member_expression()?, incoming),
+                },
+                Expression::CallExpression(call) => self.evaluated_call(call, incoming, false),
                 Expression::NewExpression(new) => {
                     let after_callee = self.expression(&new.callee, incoming)?;
                     let after_args = self.call_arguments(&new.arguments, after_callee)?;
                     self.roots.extend(after_args.iter().copied());
                     Some(after_args)
                 }
-                // Evaluate computed assignment references before the RHS.
-                // Property conversion and setters can throw even when no
-                // explicit call occurs. Other assignment targets retain
-                // their original conservative write analysis.
-                Expression::AssignmentExpression(assignment)
-                    if assignment.operator.as_str() == "="
-                        && matches!(
-                            assignment.left,
-                            AssignmentTarget::ComputedMemberExpression(_)
-                                | AssignmentTarget::StaticMemberExpression(_)
-                        ) =>
-                {
-                    let after_target = match &assignment.left {
-                        AssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
-                            self.property_reference(
-                                &member.object,
-                                Some(&member.expression),
-                                incoming,
-                            )?
+                Expression::AssignmentExpression(assignment) => {
+                    if let Some(target) =
+                        bound_inert_exception_assignment(expression, self.symbol, self.scoping)
+                    {
+                        return Some(BTreeSet::from([target]));
+                    }
+                    // In an assignment, evaluate the LHS reference and
+                    // (for compound operators) read its old value before the
+                    // RHS. Conversions, setters and proxy traps may throw
+                    // after the RHS. Logical assignments can skip the RHS.
+                    let after_target = if let Some(member) = assignment.left.as_member_expression()
+                    {
+                        self.member_reference(member, incoming)?
+                    } else if let AssignmentTarget::AssignmentTargetIdentifier(id) =
+                        &assignment.left
+                    {
+                        if id.name == self.state
+                            || id.reference_id.get().and_then(|reference| {
+                                self.scoping.get_reference(reference).symbol_id()
+                            }) == Some(self.symbol)
+                        {
+                            // A non-inert write to the dispatcher itself can
+                            // commit an unbounded or unmodeled numeric value.
+                            return None;
                         }
-                        AssignmentTarget::StaticMemberExpression(member) if !member.optional => {
-                            self.property_reference(&member.object, None, incoming)?
-                        }
-                        _ => return None,
+                        incoming
+                    } else {
+                        // Destructuring targets can perform arbitrary nested
+                        // writes, property accesses, defaults and iteration.
+                        return None;
                     };
-                    let after_rhs = self.expression(&assignment.right, after_target)?;
+                    let after_rhs = self.expression(&assignment.right, after_target.clone())?;
                     self.roots.extend(after_rhs.iter().copied());
-                    Some(after_rhs)
+                    if assignment.operator.is_logical() {
+                        let mut merged = after_target;
+                        merged.extend(after_rhs);
+                        (merged.len() <= 2048).then_some(merged)
+                    } else {
+                        Some(after_rhs)
+                    }
+                }
+                Expression::UpdateExpression(update) => {
+                    if let Some(member) = update.argument.as_member_expression() {
+                        // Evaluate receiver and computed key, then perform
+                        // GetValue, ToNumeric and PutValue in that order.
+                        // Each may throw; updates of the dispatcher binding
+                        // itself remain on the conservative fallback.
+                        self.member_reference(member, incoming)
+                    } else if self.expression_is_write_free(expression) {
+                        self.roots.extend(incoming.iter().copied());
+                        Some(incoming)
+                    } else {
+                        None
+                    }
                 }
                 other => {
                     if let Some(target) =

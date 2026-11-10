@@ -5255,6 +5255,245 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_ordered_assignment_update_optional_chain_cases() {
+        let cases: &[(&str, &str, &str, Option<&str>, &str)] = &[
+            (
+                "property-compound",
+                r#"function f(obj, log) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj[(state = 4, "x")] += log.push("may throw");
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "compound-key-resume";
+                        else if (state === 6) return "compound-unobservable-later";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "compound-key-resume",
+                None,
+                "compound-unobservable-later",
+            ),
+            (
+                "property-logical",
+                r#"function f(obj, log) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj[(state = 4, "x")] ||= (state = 5, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "logical-getter-resume";
+                        else if (state === 5) return "logical-rhs-resume";
+                        else if (state === 6) return "logical-unobservable-later";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "logical-getter-resume",
+                Some("logical-rhs-resume"),
+                "logical-unobservable-later",
+            ),
+            (
+                "property-nullish",
+                r#"function f(obj, log) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj[(state = 4, "x")] ??= (state = 5, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "nullish-getter-resume";
+                        else if (state === 5) return "nullish-rhs-resume";
+                        else if (state === 6) return "nullish-unobservable-later";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "nullish-getter-resume",
+                Some("nullish-rhs-resume"),
+                "nullish-unobservable-later",
+            ),
+            (
+                "other-identifier-rhs",
+                r#"function f(log) {
+                    let state = 1;
+                    let other;
+                    while (true) try {
+                        if (state === 1) {
+                            other = (state = 4, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "identifier-rhs-resume";
+                        else if (state === 6) return "identifier-unobservable-later";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "identifier-rhs-resume",
+                None,
+                "identifier-unobservable-later",
+            ),
+            (
+                "other-identifier-logical",
+                r#"function f(log, truthy) {
+                    let state = 1;
+                    let other = truthy;
+                    while (true) try {
+                        if (state === 1) {
+                            other &&= (state = 4, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "identifier-logical-rhs-resume";
+                        else if (state === 6) return "identifier-logical-unobservable";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "identifier-logical-rhs-resume",
+                None,
+                "identifier-logical-unobservable",
+            ),
+            (
+                "computed-property-update",
+                r#"function f(obj) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj[(state = 4, "x")]++;
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "update-member-resume";
+                        else if (state === 6) return "update-unobservable-later";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "update-member-resume",
+                None,
+                "update-unobservable-later",
+            ),
+            (
+                "optional-computed-member",
+                r#"function f(obj) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj?.[(state = 4, "x")];
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "optional-computed-resume";
+                        else if (state === 6) return "optional-unobservable-later";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "optional-computed-resume",
+                None,
+                "optional-unobservable-later",
+            ),
+            (
+                "optional-call-argument",
+                r#"function f(fn, log) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            fn?.(state = 4, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "optional-call-resume";
+                        else if (state === 6) return "optional-call-unobservable";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "optional-call-resume",
+                None,
+                "optional-call-unobservable",
+            ),
+            (
+                "nested-optional-call",
+                r#"function f(obj, log) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj?.[(state = 4, "child")].method(state = 5, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "nested-optional-getter-resume";
+                        else if (state === 5) return "nested-optional-call-resume";
+                        else if (state === 6) return "nested-optional-unobservable";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "nested-optional-getter-resume",
+                Some("nested-optional-call-resume"),
+                "nested-optional-unobservable",
+            ),
+            (
+                "optional-computed-call",
+                r#"function f(obj, log) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj?.[(state = 4, "method")]?.(state = 5, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "optional-method-getter-resume";
+                        else if (state === 5) return "optional-method-argument-resume";
+                        else if (state === 6) return "optional-method-unobservable";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "optional-method-getter-resume",
+                Some("optional-method-argument-resume"),
+                "optional-method-unobservable",
+            ),
+        ];
+        for (case, source, first_catch, second_catch, unobservable) in cases {
+            let Some(result) = deobfuscate(source, 12) else {
+                unreachable!("valid source for case {case}")
+            };
+            assert!(
+                result.source.contains(first_catch),
+                "missing first catch root in {case}: {}",
+                result.source
+            );
+            if let Some(second_catch) = second_catch {
+                assert!(
+                    result.source.contains(second_catch),
+                    "missing second catch root in {case}: {}",
+                    result.source
+                );
+            }
+            assert!(
+                !result.source.contains(unobservable),
+                "retained a post-throw unreachable root in {case}: {}",
+                result.source
+            );
+        }
+    }
+
+    #[test]
+    fn exception_dispatcher_update_of_state_binding_still_falls_back() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        state++;
+                        log.push("may throw");
+                        state = 7;
+                    } else if (state === 2) return "update-dispatcher-resume";
+                    else if (state === 7) return "normal";
+                } catch (e) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("update-dispatcher-resume"),
+            "an update to the dispatch binding is not a proved numeric assignment: {}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_const_write_does_not_advance_catch_state() {
         let source = r#"
             function f() {
