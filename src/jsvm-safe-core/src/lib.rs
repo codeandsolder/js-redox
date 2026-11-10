@@ -3329,6 +3329,218 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_merges_arbitrary_depth_shared_join() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = flag ? 2 : 3;
+                    else if (state === 2) { log.push("L1"); state = 5; }
+                    else if (state === 3) { log.push("R1"); state = 6; }
+                    else if (state === 5) { log.push("L2"); state = 7; }
+                    else if (state === 6) { log.push("R2"); state = 7; }
+                    else if (state === 7) { log.push("join"); return [state, log]; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !flat.contains("if(state===7)"),
+            "shared join was not merged: {}",
+            result.source
+        );
+        for effect in ["L1", "L2", "R1", "R2", "join"] {
+            assert_eq!(
+                flat.matches(&format!("log.push(\"{effect}\")")).count(),
+                1,
+                "{}",
+                result.source
+            );
+        }
+        assert!(
+            flat.contains("state=7"),
+            "catch-visible state writes lost: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("return[state,log]").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_deep_triangle_with_conditional_side_effects() {
+        let source = r#"
+            function f(flag, extra, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 7;
+                    else if (state == 2) {
+                        if (extra) { log.push("left"); state = 5; }
+                        else { log.push("right"); state = 5; }
+                    } else if (state == 5) { log.push("detour"); state = 7; }
+                    else if (state == 7) { log.push("join"); return [state, log]; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !flat.contains("if(state==7)"),
+            "shared join was not merged: {}",
+            result.source
+        );
+        for effect in ["left", "right", "detour", "join"] {
+            assert_eq!(
+                flat.matches(&format!("log.push(\"{effect}\")")).count(),
+                1,
+                "{}",
+                result.source
+            );
+        }
+        assert_eq!(
+            flat.matches("return[state,log]").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_deep_region_rejects_external_side_predecessor() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("L1"); state = 5; }
+                    else if (state == 3) { log.push("R1"); state = 6; }
+                    else if (state == 5) { log.push("L2"); state = 7; }
+                    else if (state == 6) { log.push("R2"); state = 7; }
+                    else if (state == 7) { log.push("join"); return log; }
+                    else if (state == 9) state = 5;
+                } catch (error) { log.push(error.message); state = 9; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==7)"),
+            "external side entry was absorbed: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"L2\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_deep_region_preserves_throwing_join_state() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("L1"); state = 5; }
+                    else if (state == 3) { log.push("R1"); state = 6; }
+                    else if (state == 5) { log.push("L2"); state = 7; }
+                    else if (state == 6) { log.push("R2"); state = 7; }
+                    else if (state == 7) { log.push("join"); throw Error("expected"); }
+                } catch (error) { log.push(error.message); return [state, log]; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !flat.contains("if(state==7)"),
+            "throwing join was not merged: {}",
+            result.source
+        );
+        assert!(
+            flat.contains("state=7") && flat.contains("throwError("),
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_deep_region_rejects_internal_cycle() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("loop"); state = 5; }
+                    else if (state == 5) { state = 2; }
+                    else if (state == 3) { log.push("other"); state = 7; }
+                    else if (state == 7) { log.push("join"); return log; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("state=2") && flat.contains("state=5"),
+            "cycle semantics lost: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"loop\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_handles_inert_array_literal_loop_test() {
         let source = r#"
             function f(flag) {

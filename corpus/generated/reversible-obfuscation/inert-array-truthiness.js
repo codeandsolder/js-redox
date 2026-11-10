@@ -431,3 +431,71 @@ console.log(JSON.stringify([
     diamondWithIndependentLinearMerge(true),
     diamondWithIndependentLinearMerge(false)
 ]));
+
+
+function multiHopDiamond(flag) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state === 1) state = flag ? 2 : 3;
+        else if (state === 2) { log.push("L1"); state = 5; }
+        else if (state === 3) { log.push("R1"); state = 6; }
+        else if (state === 5) { log.push("L2"); state = 7; }
+        else if (state === 6) { log.push("R2"); state = 7; }
+        else if (state === 7) { log.push("join"); return [state, log]; }
+    } catch (error) { throw error; }
+}
+function multiHopTriangle(flag, extra) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state == 1) state = flag ? 2 : 7;
+        else if (state == 2) {
+            if (extra) { log.push("A"); state = 5; }
+            else { log.push("B"); state = 5; }
+        } else if (state == 5) { log.push("detour"); state = 7; }
+        else if (state == 7) { log.push("join"); return [state, log]; }
+    } catch (error) { throw error; }
+}
+function multiHopThrowCatch(flag) {
+    const log = [];
+    let state = 1;
+    while (true) try {
+        if (state == 1) state = flag ? 2 : 3;
+        else if (state == 2) { log.push("L1"); state = 5; }
+        else if (state == 3) { log.push("R1"); state = 6; }
+        else if (state == 5) { log.push("L2"); state = 7; }
+        else if (state == 6) { log.push("R2"); state = 7; }
+        else if (state == 7) { log.push("join"); throw Error("expected"); }
+    } catch (error) {
+        log.push(error.message);
+        return [state, log];
+    }
+}
+function multiHopIndependentCatchEntry(flag) {
+    const log = [];
+    let state = 1, first = true;
+    while (true) try {
+        if (state == 1) {
+            if (first) { first = false; throw Error("restart"); }
+            state = flag ? 2 : 3;
+        } else if (state == 2) { log.push("L1"); state = 5; }
+        else if (state == 3) { log.push("R1"); state = 6; }
+        else if (state == 5) { log.push("L2"); state = 7; }
+        else if (state == 6) { log.push("R2"); state = 7; }
+        else if (state == 7) { log.push("join"); return [state, log]; }
+        else if (state == 9) state = 5;
+    } catch (error) {
+        log.push(error.message);
+        state = 9;
+    }
+}
+console.log(JSON.stringify([
+    "multi-hop-join-regions",
+    multiHopDiamond(true), multiHopDiamond(false),
+    multiHopTriangle(true, true), multiHopTriangle(true, false),
+    multiHopTriangle(false, false),
+    multiHopThrowCatch(true), multiHopThrowCatch(false),
+    multiHopIndependentCatchEntry(true),
+    multiHopIndependentCatchEntry(false)
+]));

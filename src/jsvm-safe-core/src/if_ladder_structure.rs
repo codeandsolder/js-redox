@@ -1558,16 +1558,102 @@ fn single_entry_exception_regions(
     Some((combined, absorbed))
 }
 
-/// Recover a single-entry, single-join conditional region without cloning
-/// either branch or its shared continuation. This handles both full diamonds
-/// (entry -> left/right -> join) and triangles (entry -> side/join -> join).
+/// Follow any number of modeled, convergent numeric-state transitions.
 ///
-/// The proof is over *source-case* predecessors, not raw conditional edges.
-/// Independent catch/initializer entries and competing incoming edges are
-/// rejected. A join may loop back to the entry in a later iteration, but no
-/// side or join may be entered from outside the proven region. All original
-/// source statements remain inside the same try block and keep their numeric
-/// state writes, so throwing effects retain their catch-visible state.
+/// The walk stops on unknown, terminal, or cyclic transitions. A candidate
+/// SESE region is accepted only after independently checking every incoming
+/// source edge; this walk itself does not assert that a state is single-entry.
+fn numeric_successor_walk(
+    initial: u64,
+    cases: &BTreeMap<u64, Option<Route>>,
+    reachable: &BTreeSet<u64>,
+) -> Vec<u64> {
+    let mut nodes = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut current = initial;
+    while reachable.contains(&current) && seen.insert(current) {
+        nodes.push(current);
+        let Some(next) = cases
+            .get(&current)
+            .and_then(Option::as_ref)
+            .and_then(single_numeric_destination)
+        else {
+            break;
+        };
+        current = next;
+    }
+    nodes
+}
+
+/// Prove a single-entry/single-exit region consisting of two arbitrary-length
+/// convergent numeric paths. Returns the exclusive side paths and common join.
+///
+/// All intermediate states must have exactly their expected source predecessor,
+/// and the common join must have only the two expected source predecessors.
+/// Initializer/catch roots, competing entries, path cycles, and overlaps are
+/// rejected. The paths may later loop back to their entry after the join.
+fn convergent_exception_region(
+    entry: u64,
+    left: &[u64],
+    right: &[u64],
+    roots: &BTreeSet<u64>,
+    excluded: &BTreeSet<u64>,
+    incoming: &BTreeMap<u64, BTreeSet<u64>>,
+) -> Option<(Vec<u64>, Vec<u64>, u64)> {
+    let mut joins = left
+        .iter()
+        .enumerate()
+        .filter_map(|(a, &join)| {
+            let b = right.iter().position(|&other| other == join)?;
+            Some((a.max(b), a + b, join, a, b))
+        })
+        .collect::<Vec<_>>();
+    joins.sort_unstable();
+
+    for (_, _, join, left_length, right_length) in joins {
+        if join == entry || roots.contains(&join) || excluded.contains(&join) {
+            continue;
+        }
+        let (left_path, right_path) = (&left[..left_length], &right[..right_length]);
+        let mut members = BTreeSet::new();
+        let mut valid = true;
+        for path in [left_path, right_path] {
+            let mut predecessor = entry;
+            for &current in path {
+                if current == entry
+                    || roots.contains(&current)
+                    || excluded.contains(&current)
+                    || !members.insert(current)
+                    || incoming.get(&current) != Some(&BTreeSet::from([predecessor]))
+                {
+                    valid = false;
+                    break;
+                }
+                predecessor = current;
+            }
+            if !valid {
+                break;
+            }
+        }
+        let left_predecessor = left_path.last().copied().unwrap_or(entry);
+        let right_predecessor = right_path.last().copied().unwrap_or(entry);
+        if !valid
+            || incoming.get(&join) != Some(&BTreeSet::from([left_predecessor, right_predecessor]))
+        {
+            continue;
+        }
+        return Some((left_path.to_vec(), right_path.to_vec(), join));
+    }
+    None
+}
+
+/// Recover a reducible two-arm SESE region from source-case CFG transitions.
+///
+/// Branch paths may contain any number of modeled states (including effectful
+/// prefixes and conditionals that ultimately assign the same numeric target).
+/// Their bodies are emitted once in path order, followed by one shared join
+/// body, still inside the original try/catch. Independent catch/initializer
+/// entries and external side/join predecessors always prevent absorption.
 fn exception_diamond_regions(
     dispatcher: &Statement<'_>,
     state: &str,
@@ -1618,6 +1704,9 @@ fn exception_diamond_regions(
     };
 
     for &predecessor in entry.reachable {
+        if entry.excluded.contains(&predecessor) {
+            continue;
+        }
         let Some(Some(route)) = cases.get(&predecessor) else {
             continue;
         };
@@ -1630,111 +1719,80 @@ fn exception_diamond_regions(
         if left == right {
             continue;
         }
+        let left_walk = numeric_successor_walk(left, cases, entry.reachable);
+        let right_walk = numeric_successor_walk(right, cases, entry.reachable);
+        let Some((left_path, right_path, join)) = convergent_exception_region(
+            predecessor,
+            &left_walk,
+            &right_walk,
+            entry.roots,
+            entry.excluded,
+            &incoming,
+        ) else {
+            continue;
+        };
+        let Some(Some(join_route)) = cases.get(&join).cloned() else {
+            continue;
+        };
 
-        let mut left_targets = BTreeSet::from([left]);
-        let mut right_targets = BTreeSet::from([right]);
-        if let Some(target) = cases
-            .get(&left)
-            .and_then(Option::as_ref)
-            .and_then(single_numeric_destination)
-        {
-            left_targets.insert(target);
-        }
-        if let Some(target) = cases
-            .get(&right)
-            .and_then(Option::as_ref)
-            .and_then(single_numeric_destination)
-        {
-            right_targets.insert(target);
-        }
-
-        for &join in left_targets.intersection(&right_targets) {
-            if join == predecessor
-                || !entry.reachable.contains(&join)
-                || entry.roots.contains(&join)
-            {
-                continue;
-            }
-            let mut indirect = Vec::new();
-            let mut expected_join_inputs = BTreeSet::new();
-            let mut valid = true;
-            for branch in [left, right] {
-                if branch == join {
-                    expected_join_inputs.insert(predecessor);
-                    continue;
-                }
-                let valid_branch = branch != predecessor
-                    && entry.reachable.contains(&branch)
-                    && !entry.roots.contains(&branch)
-                    && incoming.get(&branch).is_some_and(|sources| {
-                        sources.len() == 1 && sources.contains(&predecessor)
-                    })
-                    && cases
-                        .get(&branch)
-                        .and_then(Option::as_ref)
-                        .and_then(single_numeric_destination)
-                        == Some(join);
-                if !valid_branch {
+        let mut composed = route.clone();
+        let Next::Choose { yes, no, .. } = &mut composed.next else {
+            continue;
+        };
+        let mut valid = true;
+        for (arm, path) in [(yes, &left_path), (no, &right_path)] {
+            for &current in path {
+                let Some(Some(next_route)) = cases.get(&current).cloned() else {
+                    valid = false;
+                    break;
+                };
+                if !splice_unique_successor(arm, current, &next_route) {
                     valid = false;
                     break;
                 }
-                indirect.push(branch);
-                expected_join_inputs.insert(branch);
             }
-            if !valid
-                || incoming.get(&join) != Some(&expected_join_inputs)
-                || cases.get(&join).and_then(Option::as_ref).is_none()
-            {
-                continue;
-            }
-
-            let mut composed = route.clone();
-            let Some(Some(join_route)) = cases.get(&join).cloned() else {
-                continue;
-            };
-            let Next::Choose { yes, no, .. } = &mut composed.next else {
-                continue;
-            };
-            for (side, target) in [(yes, left), (no, right)] {
-                if target != join {
-                    let Some(Some(branch_route)) = cases.get(&target).cloned() else {
-                        valid = false;
-                        break;
-                    };
-                    valid &= splice_unique_successor(side, target, &branch_route);
-                }
-            }
-            if !valid || !splice_unique_successor(&mut composed, join, &join_route) {
-                continue;
-            }
-
-            // Keep exact source statements, including all conditional effects,
-            // lexical blocks, return/throw statements and original assignments.
-            let first = text_of(predecessor)?;
-            let last = text_of(join)?;
-            let branching = if indirect.len() == 2 {
-                let a = indirect[0];
-                let b = indirect[1];
-                format!(
-                    "if ({}) {{ {}; }} else {{ {}; }}",
-                    tests.get(&a)?,
-                    text_of(a)?,
-                    text_of(b)?,
-                )
-            } else {
-                let target = *indirect.first()?;
-                format!("if ({}) {{ {}; }}", tests.get(&target)?, text_of(target)?)
-            };
-            let region = format!("{{ {first};\n{branching}\n{last}; }}");
-            *cases.get_mut(&predecessor)?.as_mut()? = composed;
-            indirect.push(join);
-            return Some((
-                BTreeMap::from([(predecessor, region)]),
-                indirect.into_iter().collect(),
-            ));
         }
-    }
+        if !valid || !splice_unique_successor(&mut composed, join, &join_route) {
+            continue;
+        }
 
+        let path_text = |path: &[u64]| -> Option<String> {
+            path.iter()
+                .map(|&current| Some(format!("{};", text_of(current)?)))
+                .collect::<Option<Vec<_>>>()
+                .map(|parts| parts.join("\n"))
+        };
+        let side = if left_path.is_empty() {
+            format!(
+                "if ({}) {{ {} }}",
+                tests.get(&right)?,
+                path_text(&right_path)?,
+            )
+        } else if right_path.is_empty() {
+            format!(
+                "if ({}) {{ {} }}",
+                tests.get(&left)?,
+                path_text(&left_path)?
+            )
+        } else {
+            format!(
+                "if ({}) {{ {} }} else {{ {} }}",
+                tests.get(&left)?,
+                path_text(&left_path)?,
+                path_text(&right_path)?,
+            )
+        };
+        let before = text_of(predecessor)?;
+        let after = text_of(join)?;
+        let region = format!("{{ {before};\n{side}\n{after}; }}");
+        *cases.get_mut(&predecessor)?.as_mut()? = composed;
+        let absorbed = left_path
+            .into_iter()
+            .chain(right_path)
+            .chain(std::iter::once(join))
+            .collect();
+        return Some((BTreeMap::from([(predecessor, region)]), absorbed));
+    }
     Some((BTreeMap::new(), BTreeSet::new()))
 }
 
