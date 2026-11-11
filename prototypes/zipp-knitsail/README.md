@@ -456,3 +456,60 @@ snapshot contained 795 files, with pre-navigation fingerprint SHA-256
 The local sample tree and private archived source stay under ignored inputs;
 this experiment does not merge runtime evidence into universally recovered JS
 or alter the active static reconstruction feature PR.
+
+## Upstream ZIPP and corrected two-stage Knitsail provenance (2026-11-11)
+
+ZIPP upstream bug #93 is fixed in v0.0.35. Commit 041f280 carries
+codeandsolder as the author of the synthetic-preheader SSA fix and includes
+the regression fixture. Our old zipp-issue-93-entry-preheader.patch is
+historical, for pinned ZIPP b7521d2 only. Do not apply it on current upstream.
+The maintainer reported faster loops versus the v0.0.34 workaround:
+9% integer, 21% float, 2.4x on a single-iteration call.
+
+IMPORTANT CORRECTION TO PREVIOUS SOURCE OFFSETS: archived VM SHA e4144633
+is actually an outer loader. It concatenates string literals, adds
+randomized newline padding and executes the decoded inner source via
+indirect eval. Prior offset 29409..29416 locates the text eval(D) WITHIN A
+LOADER STRING LITERAL, not a call expression in the outer program. Old
+provenance metadata and navigation are textual/provisional, not verified
+executable-AST linkage.
+
+The new KNITSAIL_INNER_VM_OUT replay option captures the actual original
+inner source at the loader's indirect eval, restores the native eval first,
+and strips only leading randomized newline padding. The canonical decoded
+source has 62,648 UTF-16 code units and SHA-256
+0aa3362aecd624a52d92a1bd32ebcdb109d80525f90e7d3a4d77f1e95775f67d.
+The executable eval(D) expression is at INNER offsets 28442..28449.
+
+A new Rust AST probe in ast-site-probe/ uses the same OXC parser and
+semantic resolver family already used by js-redox. It verifies that the
+inner eval is direct and unresolved globally and that the argument D
+binds to the innermost callback parameter. It matches the containing
+named function and nested lexical parameter structure against the static
+source tree, ignoring only omitted anonymous outer wrappers.
+
+Real Knitsail: exactly 3 AST structural matches, all correctly identifying
+the oU 32-parameter function, nested 5-parameter callback, and inner D
+callback: lexical-context/helpers/oU-38980.js at line 95,
+lexical-context/explained/oU-38980.js at line 95,
+and lexical-context/original.js at line 907.
+No parse failures across 785 input JavaScript files.
+
+This is stronger than whitespace matching but is not proof of
+whole-function behavioral equivalence. The AST probe is implemented and
+tested INDEPENDENTLY; its results are not yet integrated into the
+combined-tree linker or its manifest schema. Do not describe the
+previously generated combined tree as AST-verified; next work must
+model both outer-loader and inner-executable provenance in a new
+manifest and rerun the linking validation.
+
+Reproduction (private archived HTML required):
+
+    export KNITSAIL_INNER_VM_OUT="$PWD/inputs/inner-vm.js"
+    node scripts/replay-captured-html.cjs inputs/archived.html \
+      > inputs/inner-report.json 2> inputs/inner-report.stderr
+    cargo +1.99.0 test --manifest-path ast-site-probe/Cargo.toml
+    /path/to/knitsail-ast-site-probe \
+      inputs/inner-vm.js 28442 28449 "$STATIC"
+
+No secret payloads or original VM code are committed.

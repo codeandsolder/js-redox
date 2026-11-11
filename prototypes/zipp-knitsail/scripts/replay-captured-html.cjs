@@ -214,6 +214,22 @@ if (dynamicDir) {
   };
 }
 vm.createContext(ctx);
+if (process.env.KNITSAIL_INNER_VM_OUT) {
+  if (dynamicDir) throw Error('Capture the original inner VM without dynamic eval instrumentation');
+  const originalEval = vm.runInContext('eval', ctx);
+  ctx.eval = function(source) {
+    // Only the outer loader's *indirect* eval is intercepted. Restore the
+    // original context eval BEFORE executing the decoded source, so its
+    // internal direct eval calls have unchanged lexical semantics.
+    ctx.eval = originalEval;
+    if (typeof source !== 'string' || !source.includes('return eval(D)')) {
+      throw Error('Unexpected first indirect eval in archived Knitsail loader');
+    }
+    const innerVm = source.replace(/^\n+/, '');
+    fs.writeFileSync(process.env.KNITSAIL_INNER_VM_OUT, innerVm);
+    return Reflect.apply(originalEval, undefined, [source]);
+  };
+}
 const entryCalls = [];
 const outerCalls = [];
 let currentOuterFirst;
