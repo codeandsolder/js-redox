@@ -20,8 +20,18 @@ test('preserves exact observed code, deduplicates, reports parse refusals and re
       fs.writeFileSync(path.join(sourceDir, 'eval-' + hash + '.js'), source);
     }
     const report = {
-      htmlSha256:'a'.repeat(64), vmSha256:'b'.repeat(64),
-      dynamicEvalSite:{start:12,end:19}, dynamicTruncated:false,
+      htmlSha256:'a'.repeat(64), outerVmSha256:'b'.repeat(64),
+      sourceProvenance:{
+        outerLoader:{
+          sha256:'b'.repeat(64),decodedBy:'observed-first-indirect-eval',
+          indirectEvalSite:{start:2,end:11,expression:'(0,eval)('},
+        },
+        innerExecutable:{
+          sha256:'c'.repeat(64),strippedLeadingNewlineCodeUnits:25,
+          evalSite:{start:12,end:19,expression:'eval(D)'},
+        },
+      },
+      dynamicTruncated:false,
       dynamicCodeEvents:[
         {index:0,type:'string',length:callable.length,sha256:h1,outcome:'return',resultType:'function'},
         {index:1,type:'string',length:invalid.length,sha256:h2,outcome:'throw',thrownType:'object'},
@@ -45,6 +55,10 @@ test('preserves exact observed code, deduplicates, reports parse refusals and re
     const result = invoke(out);
     assert.equal(result.status,0,result.stderr);
     const manifest = JSON.parse(fs.readFileSync(path.join(out,'manifest.json'),'utf8'));
+    assert.equal(manifest.schemaVersion,2);
+    assert.equal(manifest.sourceProvenance.outerLoader.sha256,'b'.repeat(64));
+    assert.equal(manifest.sourceProvenance.innerExecutable.sha256,'c'.repeat(64));
+    assert.equal(manifest.sourceProvenance.innerExecutable.evalSite.start,12);
     assert.equal(manifest.uniqueSourceCount,2);
     assert.equal(manifest.eventCount,3);
     assert.equal(manifest.entries[0].occurrences,2);
@@ -56,6 +70,13 @@ test('preserves exact observed code, deduplicates, reports parse refusals and re
     assert.equal(fs.existsSync(path.join(out,'readable',h2+'.js')),false);
     assert.notEqual(invoke(out).status,0,'existing destinations must not be overwritten');
 
+    const legacy={...report,sourceProvenance:undefined,vmSha256:'b'.repeat(64),
+      dynamicEvalSite:{start:12,end:19}};
+    fs.writeFileSync(reportFile,JSON.stringify(legacy));
+    const oldFormat=invoke(path.join(root,'legacy'));
+    assert.notEqual(oldFormat.status,0,'v1 data must not be silently accepted');
+    assert.match(oldFormat.stderr,/dual-layer/);
+    fs.writeFileSync(reportFile,JSON.stringify(report));
     fs.writeFileSync(path.join(sourceDir,'eval-'+h1+'.js'),'modified');
     const tamperedOut = path.join(root,'tampered');
     const failed = invoke(tamperedOut);

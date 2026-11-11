@@ -13,15 +13,25 @@ if (!reportFile || !capturedSourceDir || !outputDirectory || !deobfuscator) {
 }
 const hex64 = /^[0-9a-f]{64}$/;
 const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
-if (!hex64.test(report.htmlSha256) || !hex64.test(report.vmSha256)) {
-  throw Error('Provenance hashes are missing or invalid');
-}
-if (!report.dynamicEvalSite || !Number.isSafeInteger(report.dynamicEvalSite.start) ||
-    !Number.isSafeInteger(report.dynamicEvalSite.end) ||
-    report.dynamicEvalSite.start < 0 ||
-    report.dynamicEvalSite.end <= report.dynamicEvalSite.start ||
+const provenance = report.sourceProvenance;
+const loader = provenance?.outerLoader;
+const executable = provenance?.innerExecutable;
+const outerSite = loader?.indirectEvalSite;
+const innerSite = executable?.evalSite;
+const validSite = (site, expression) =>
+  site && Number.isSafeInteger(site.start) && Number.isSafeInteger(site.end) &&
+  site.start >= 0 && site.end - site.start === expression.length &&
+  site.expression === expression;
+if (!hex64.test(report.htmlSha256) || !hex64.test(report.outerVmSha256) ||
+    !hex64.test(loader?.sha256) || !hex64.test(executable?.sha256) ||
+    report.outerVmSha256 !== loader.sha256 ||
+    loader.decodedBy !== 'observed-first-indirect-eval' ||
+    !validSite(outerSite, '(0,eval)(') ||
+    !validSite(innerSite, 'eval(D)') ||
+    !Number.isSafeInteger(executable.strippedLeadingNewlineCodeUnits) ||
+    executable.strippedLeadingNewlineCodeUnits < 0 ||
     !Array.isArray(report.dynamicCodeEvents)) {
-  throw Error('Missing or invalid dynamic callsite provenance');
+  throw Error('Missing or invalid dual-layer loader / executable provenance');
 }
 const output = path.resolve(outputDirectory);
 if (fs.existsSync(output)) throw Error('Output already exists: ' + output);
@@ -100,12 +110,11 @@ try {
     entries.push(entry);
   }
   const metadata = {
-    schemaVersion:1,
+    schemaVersion:2,
     evidenceKind:'execution-observed, not universal static proof',
     environment:'archived HTML replay in modeled Node VM browser',
     htmlSha256: report.htmlSha256,
-    vmSha256: report.vmSha256,
-    evalSite: report.dynamicEvalSite,
+    sourceProvenance: provenance,
     truncated: report.dynamicTruncated === true,
     eventCount: events.length,
     uniqueSourceCount: entries.length,
@@ -120,9 +129,10 @@ try {
     'It is not a proof that these snippets are universal, and standalone parsing',
     'does not imply that an eval string can run outside its original lexical scope.',
     '',
-    'Original VM SHA-256: ' + report.vmSha256,
-    'Original computed eval site (source offsets): ' +
-      report.dynamicEvalSite.start + '..' + report.dynamicEvalSite.end,
+    'Original outer loader SHA-256: ' + loader.sha256,
+    'Original inner executable SHA-256: ' + executable.sha256,
+    'Loader indirect eval offset: ' + outerSite.start + '..' + outerSite.end,
+    'Executable direct eval offset: ' + innerSite.start + '..' + innerSite.end,
     'Eval calls observed: ' + events.length,
     'Unique string operands: ' + entries.length,
     'Event buffer truncated: ' + (report.dynamicTruncated === true),

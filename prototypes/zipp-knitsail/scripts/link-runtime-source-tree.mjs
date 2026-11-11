@@ -3,14 +3,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import {spawnSync} from 'node:child_process';
 
-const [staticDir, destination, ...args] = process.argv.slice(2);
-if (!staticDir || !destination || args.length < 2 || args.length % 2) {
-  throw Error('Usage: link-runtime-source-tree.mjs STATIC_TREE OUT_TREE OBSERVED_TREE ORIGINAL_VM [OBSERVED_TREE ORIGINAL_VM ...]');
+const [staticDir, destination, astProbeBinary, ...args] = process.argv.slice(2);
+if (!staticDir || !destination || !astProbeBinary || args.length < 3 || args.length % 3) {
+  throw Error('Usage: link-runtime-source-tree.mjs STATIC_TREE OUT_TREE AST_PROBE_BIN OBSERVED_TREE OUTER_LOADER_JS INNER_EXECUTABLE_JS [OBSERVED_TREE OUTER_LOADER_JS INNER_EXECUTABLE_JS ...]');
 }
 const source = path.resolve(staticDir), output = path.resolve(destination);
-const pairs = Array.from({length:args.length/2},(_,i)=>({
-  observed:path.resolve(args[i*2]), vm:path.resolve(args[i*2+1]),
+const astProbe = path.resolve(astProbeBinary);
+if (!fs.statSync(astProbe).isFile()) throw Error('AST probe binary not found');
+const pairs = Array.from({length:args.length/3},(_,i)=>({
+  observed:path.resolve(args[i*3]),
+  outer:path.resolve(args[i*3+1]),
+  inner:path.resolve(args[i*3+2]),
 }));
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const sha64 = /^[a-f0-9]{64}$/;
@@ -39,18 +44,47 @@ function listJs(root) {
   walk(root,'');
   return result.sort((a,b)=>a.file.localeCompare(b.file));
 }
-function anchorsFor(files,siteText) {
-  const tokens=siteText.match(/[A-Za-z_$][\w$]*|\d+(?:\.\d+)?|[^\s]/gu);
-  if(!tokens?.length) throw Error('Empty callsite');
-  const escape = s => [...s].map(c=>'\\.^$*+?()[]{}|'.includes(c)?'\\'+c:c).join('');
-  const regex=new RegExp(tokens.map(escape).join('\\s*'),'gu');
-  const matches=[];
-  for(const item of files) for(const match of item.text.matchAll(regex)){
-    matches.push({path:item.file,
-      line:1+(item.text.slice(0,match.index).match(/\n/g)?.length??0),
-      relation:'source-text-match-only'});
+function structuralMatches(pair, site) {
+  const result=spawnSync(astProbe,
+    [pair.inner,String(site.start),String(site.end),source],
+    {encoding:'utf8',timeout:60_000,maxBuffer:16*1024*1024});
+  if (result.error || result.status!==0) {
+    throw Error('OXC AST probe failed: ' +
+      (result.error?.message || result.stderr || result.status).slice(0,1000));
   }
-  return matches;
+  const proof=JSON.parse(result.stdout);
+  if (proof.schema!=='js-redox/ast-site-probe/v1' ||
+      proof.original?.startUtf16!==site.start ||
+      proof.original?.endUtf16!==site.end ||
+      proof.original?.site?.argument_is_bound_to_nearest_parameter!==true ||
+      proof.original?.site?.eval_is_unresolved!==true ||
+      !Array.isArray(proof.matches) || !Array.isArray(proof.parseFailures) ||
+      proof.parseFailures.length!==0) {
+    throw Error('AST probe returned invalid, incomplete or mismatched structural evidence');
+  }
+  const seen=new Set();
+  return proof.matches.map(match=>{
+    if (match.relation!=='ast-lexical-structure-match' ||
+        typeof match.path!=='string' || path.posix.isAbsolute(match.path) ||
+        !match.path.endsWith('.js') || match.path.split('/').includes('..') ||
+        !Number.isSafeInteger(match.site?.line) || match.site.line<1) {
+      throw Error('AST probe returned invalid candidate path or location');
+    }
+    const absolute=path.resolve(source,match.path);
+    if (!absolute.startsWith(source+path.sep) || !fs.statSync(absolute).isFile()) {
+      throw Error('AST candidate escaped source tree');
+    }
+    const key=match.path+':'+match.site.start+':'+match.site.end;
+    if(seen.has(key)) throw Error('AST probe returned duplicate candidate');
+    seen.add(key);
+    return {path:match.path,line:match.site.line,
+      byteSpan:{start:match.site.start,end:match.site.end},
+      relation:'ast-lexical-structure-match',
+      lexicalFrames:match.site.frames.map(frame=>({
+        binding:frame.binding,params:frame.params
+      })),
+    };
+  });
 }
 // The input tree fingerprint is taken *before* navigation documentation is
 // added to the copied tree. It identifies the precise static snapshot used.
@@ -69,9 +103,9 @@ function fingerprint(root) {
   const digest=crypto.createHash('sha256');
   for(const relative of files.sort()){
     digest.update(relative);
-    digest.update('\\0');
+    digest.update(String.fromCharCode(0));
     digest.update(hash(fs.readFileSync(path.join(root,relative))));
-    digest.update('\\n');
+    digest.update(String.fromCharCode(10));
   }
   return {sha256:digest.digest('hex'),files:files.length};
 }
@@ -79,30 +113,46 @@ const stage=output+'.tmp-'+process.pid;
 if(fs.existsSync(output)||fs.existsSync(stage)) throw Error('Refusing to overwrite output');
 if(!fs.existsSync(path.join(source,'README.md'))) throw Error('Missing static tree README');
 if(fs.existsSync(path.join(source,'runtime-observed'))) throw Error('Static tree already has observations');
-for(const input of [source,...pairs.flatMap(p=>[p.observed,p.vm])]){
+for(const input of [source,...pairs.flatMap(p=>[p.observed,p.outer,p.inner])]){
   if(contains(output,input)||contains(input,output)) throw Error('Output overlaps input');
 }
 try{
   copyNoSymlinks(source,stage);
   const staticInputSnapshot=fingerprint(stage);
-  const staticFiles=listJs(stage), backlink=new Map(), captures=[], locations=new Set();
+  const backlink=new Map(), captures=[], locations=new Set();
   for(const pair of pairs){
     const m=JSON.parse(fs.readFileSync(path.join(pair.observed,'manifest.json'),'utf8'));
-    if(m.schemaVersion!==1||!sha64.test(m.vmSha256)||!sha64.test(m.htmlSha256)||
-      !Array.isArray(m.entries)||m.uniqueSourceCount!==m.entries.length||
-      !Number.isSafeInteger(m.eventCount)||m.eventCount<0){
-      throw Error('Invalid observed manifest');
+    const p=m.sourceProvenance;
+    const outer=p?.outerLoader,inner=p?.innerExecutable;
+    if(m.schemaVersion!==2 || !sha64.test(m.htmlSha256) ||
+      !sha64.test(outer?.sha256) || !sha64.test(inner?.sha256) ||
+      outer.decodedBy!=='observed-first-indirect-eval' ||
+      !Array.isArray(m.entries) || m.uniqueSourceCount!==m.entries.length ||
+      !Number.isSafeInteger(m.eventCount) || m.eventCount<0) {
+      throw Error('Required dual-layer v2 source manifest is invalid');
     }
-    const vmBytes=fs.readFileSync(pair.vm);
-    if(hash(vmBytes)!==m.vmSha256) throw Error('VM SHA-256 mismatch');
-    const vm=vmBytes.toString('utf8'),site=m.evalSite??{};
-    if(!Number.isSafeInteger(site.start)||!Number.isSafeInteger(site.end)||
-      site.start<0||site.end<=site.start||site.end>vm.length){
-      throw Error('Invalid original source interval');
+    const outerCode=fs.readFileSync(pair.outer);
+    const innerCode=fs.readFileSync(pair.inner);
+    if(hash(outerCode)!==outer.sha256) throw Error('Outer loader SHA-256 mismatch');
+    if(hash(innerCode)!==inner.sha256) throw Error('Inner executable SHA-256 mismatch');
+    const loader=outerCode.toString('utf8'),vm=innerCode.toString('utf8');
+    const outerSite=outer.indirectEvalSite??{},site=inner.evalSite??{};
+    const validSite=(value,text,code)=>
+      Number.isSafeInteger(value.start) &&
+      Number.isSafeInteger(value.end) && value.start>=0 &&
+      value.end<=code.length && value.end>value.start &&
+      value.expression===text && code.slice(value.start,value.end)===text;
+    if(!validSite(outerSite,'(0,eval)(',loader) ||
+       !validSite(site,'eval(D)',vm) ||
+       !Number.isSafeInteger(inner.strippedLeadingNewlineCodeUnits) ||
+       inner.strippedLeadingNewlineCodeUnits<0) {
+      throw Error('Invalid dual-layer loader/inner executable source coordinates');
     }
-    const siteText=vm.slice(site.start,site.end), matches=anchorsFor(staticFiles,siteText);
-    const relative=path.posix.join('runtime-observed','vm-'+m.vmSha256,
-      'eval-'+site.start+'-'+site.end,'capture-'+m.htmlSha256);
+    const matches=structuralMatches(pair,site);
+    if(matches.length===0) throw Error('No AST-backed source-tree match for the executable eval site');
+    const relative=path.posix.join('runtime-observed','loader-'+outer.sha256,
+      'inner-'+inner.sha256,'eval-'+site.start+'-'+site.end,
+      'capture-'+m.htmlSha256);
     if(locations.has(relative)) throw Error('Duplicate capture provenance');
     locations.add(relative);
     const dir=path.join(stage,relative);
@@ -110,25 +160,35 @@ try{
     const origin=path.posix.join(relative,'origin.md');
     const captureReadme=path.posix.join(relative,'README.md');
     write(path.join(dir,'origin.json'),JSON.stringify({
-      schema:'js-redox/runtime-origin/v1',
-      evidence:'execution-observed, not universally proven static source',
-      vmSha256:m.vmSha256,htmlSha256:m.htmlSha256,site:{...site,expression:siteText},
-      staticSourceTextCandidates:matches,
-      eventCount:m.eventCount,uniqueSourceCount:m.uniqueSourceCount,truncated:m.truncated===true,
+      schema:'js-redox/runtime-origin/v2',
+      evidence:'execution-observed; AST-lexical callsite match, not universal equivalence',
+      htmlSha256:m.htmlSha256,
+      outerLoader:outer,
+      innerExecutable:inner,
+      staticAstStructuralMatches:matches,
+      eventCount:m.eventCount,uniqueSourceCount:m.uniqueSourceCount,
+      truncated:m.truncated===true,
     },null,2));
     const links=[
-      '# Original VM callsite','',
-      'Execution-observed. Static source code is not altered.','',
-      '- VM SHA-256: '+m.vmSha256,
+      '# Executable inner VM direct-eval callsite','',
+      'Execution-observed source; matched AST lexical sites do NOT prove',
+      'whole-function equivalence or universal reachability.','',
       '- HTML capture SHA-256: '+m.htmlSha256,
-      '- Original JavaScript UTF-16 interval: '+site.start+'..'+site.end,'',
-      '~~~javascript',siteText,'~~~','',
-      '## Text-matching static lexical locations','',
+      '- Outer loader SHA-256: '+outer.sha256,
+      '- Outer loader indirect eval source offset: '+outerSite.start+'..'+outerSite.end,
+      '- Inner executable VM SHA-256: '+inner.sha256,
+      '- Inner executable direct eval source offset: '+site.start+'..'+site.end,
+      '- Leading newline units stripped to normalize the decoded VM: '+
+        inner.strippedLeadingNewlineCodeUnits,'',
+      '## Outer loader invocation','',
+      '~~~javascript',outerSite.expression,'~~~','',
+      '## Decoded executable direct eval','',
+      '~~~javascript',site.expression,'~~~','',
+      '## OXC AST + semantic lexical callsite matches','',
     ];
-    if(!matches.length) links.push('No candidates found; not a proof of absence.');
     for(const match of matches){
       links.push('- ['+match.path+']('+link(origin,match.path)+') (line '+
-        match.line+', textual match only; lexical identity not independently proven)');
+        match.line+', verified nested AST/binding structure; not a whole-function equivalence proof)');
       const refs=backlink.get(match.path)??[];
       refs.push({origin,line:match.line});
       backlink.set(match.path,refs);
@@ -188,16 +248,17 @@ try{
       'A callable result can also be a lexical lookup, not a new function definition.','',
       ...callable,'','## Other eval operands, including failures','',...others,'',
     ].join('\n'));
-    captures.push({vmSha256:m.vmSha256,htmlSha256:m.htmlSha256,
-      site:{start:site.start,end:site.end},directory:relative,
-      calls:m.eventCount,sources:m.uniqueSourceCount,
-      truncated:m.truncated===true,staticTextMatches:matches.length});
+    captures.push({outerLoaderSha256:outer.sha256,innerExecutableSha256:inner.sha256,
+      htmlSha256:m.htmlSha256,site:{start:site.start,end:site.end},
+      loaderSite:{start:outerSite.start,end:outerSite.end},
+      directory:relative,calls:m.eventCount,sources:m.uniqueSourceCount,
+      truncated:m.truncated===true,staticAstMatches:matches.length});
   }
   for(const [original,refs] of backlink){
     const sidecar=original+'.runtime-evidence.md';
     write(path.join(stage,sidecar),[
-      '# Runtime source observations related to '+path.posix.basename(original),'',
-      'Textual callsite candidates only; this does not prove lexical identity.',
+      '# Runtime AST source observations related to '+path.posix.basename(original),'',
+      'OXC structural lexical-site match; this does not prove whole-function equivalence.',
       'The JavaScript source file is unchanged.','',
       ...refs.map(r=>'- Line '+r.line+': [observed source and origin]('+
         link(sidecar,r.origin)+')'), '',
@@ -207,14 +268,15 @@ try{
   write(path.join(stage,index),[
     '# Execution-observed source tree','',
     'Separate execution evidence, not universal static source recovery.','',
-    ...captures.map(c=>'- [VM '+c.vmSha256.slice(0,12)+' / site '+
+    ...captures.map(c=>'- [outer '+c.outerLoaderSha256.slice(0,12)+
+      ' / inner '+c.innerExecutableSha256.slice(0,12)+' / executable site '+
       c.site.start+'..'+c.site.end+' / HTML '+c.htmlSha256.slice(0,12)+']('+
       link(index,c.directory+'/README.md')+') — '+c.calls+
       ' evals, '+c.sources+' distinct strings'+(c.truncated?' (truncated)':'')),
     '',
   ].join('\n'));
   write(path.join(stage,'runtime-observed/index.json'),JSON.stringify({
-    schema:'js-redox/linked-runtime-source-tree/v1',
+    schema:'js-redox/linked-runtime-source-tree/v2',
     staticJavaScriptAndReconstructionUnmodified:true,
     staticInputSnapshot,captures,
   },null,2));
@@ -231,7 +293,7 @@ try{
   }
   fs.renameSync(stage,output);
   console.log(JSON.stringify({output,captures:captures.length,
-    staticCandidateFiles:backlink.size,
+    staticAstCandidateFiles:backlink.size,
     observedDistinctSources:captures.reduce((n,c)=>n+c.sources,0)}));
 }catch(e){
   fs.rmSync(stage,{recursive:true,force:true});

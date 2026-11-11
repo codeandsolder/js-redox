@@ -20,7 +20,17 @@ const payloadPrefix = payloadMatch ? payloadMatch[1].slice(0, 3) : null;
 const handlerRe = payloadPrefix ? new RegExp('\\.' + payloadPrefix + '_\\s*=') : null;
 const vmScript = handlerRe ? scripts.find(s => handlerRe.test(s) && /knitsail/.test(s)) : null;
 if (!vmScript) throw new Error('Knitsail VM handler not found for prefix ' + payloadPrefix);
-const vmSha256 = createHash('sha256').update(vmScript).digest('hex');
+const outerVmSha256 = createHash('sha256').update(vmScript).digest('hex');
+// Outer-loader indirect eval, NOT an inner executable callsite.
+const outerEvalText = '(0,eval)(';
+if (vmScript.split(outerEvalText).length !== 2) {
+  throw Error('Expected unique Knitsail loader indirect eval');
+}
+const outerInvocationSite = {
+  start: vmScript.indexOf(outerEvalText),
+  end: vmScript.indexOf(outerEvalText) + outerEvalText.length,
+  expression: outerEvalText,
+};
 // Optional private, exact original VM output for source-offset verification.
 // Written before the in-memory instrumentation transforms the executable copy.
 if (process.env.KNITSAIL_VM_SOURCE_OUT) {
@@ -28,38 +38,19 @@ if (process.env.KNITSAIL_VM_SOURCE_OUT) {
 }
 
 
-// Optional *site-specific* direct-eval witness. The original source string
-// and its sha stay untouched in the report; only the in-memory execution
-// copy is instrumented, preserving the syntactically direct eval call.
+// Observe the outer loader's first indirect eval and instrument only its
+// decoded inner VM. Source coordinates are attached to the correct layer.
 const dynamicDir = process.env.KNITSAIL_DYNAMIC_DIR || null;
 const dynamicCodeEvents = [];
 const pendingEval = [];
 let dynamicTruncated = false;
-let dynamicEvalSite = null;
-let runtimeVmScript = vmScript;
+let sourceProvenance = null;
+const runtimeVmScript = vmScript;
 const dynamicMaxEvents = Number(process.env.KNITSAIL_DYNAMIC_MAX_EVENTS || '10000');
 if (!Number.isSafeInteger(dynamicMaxEvents) || dynamicMaxEvents < 0) {
   throw Error('KNITSAIL_DYNAMIC_MAX_EVENTS must be a nonnegative integer');
 }
-if (dynamicDir) {
-  const evalExpression = 'eval(D)';
-  const originalCall = 'return ' + evalExpression;
-  if (vmScript.split(originalCall).length !== 2) {
-    throw Error('Expected unique original Knitsail eval site');
-  }
-  const start = vmScript.indexOf(originalCall) + 'return '.length;
-  dynamicEvalSite = { start, end: start + evalExpression.length };
-  const replacement = [
-    'try {',
-    'return __knitsail_capture_eval_result(eval(__knitsail_capture_eval_arg(D)));',
-    '} catch (__knitsail_capture_error) {',
-    '__knitsail_capture_eval_throw(__knitsail_capture_error);',
-    'throw __knitsail_capture_error;',
-    '}'
-  ].join(' ');
-  runtimeVmScript = vmScript.replace(originalCall, replacement);
-  fs.mkdirSync(dynamicDir, {recursive:true});
-}
+if (dynamicDir) fs.mkdirSync(dynamicDir, {recursive:true});
 
 const eidMatch = wrapper.match(/var eid='([^']*)'/);
 const eid = eidMatch ? eidMatch[1] : 'unknown';
@@ -214,20 +205,47 @@ if (dynamicDir) {
   };
 }
 vm.createContext(ctx);
-if (process.env.KNITSAIL_INNER_VM_OUT) {
-  if (dynamicDir) throw Error('Capture the original inner VM without dynamic eval instrumentation');
+if (process.env.KNITSAIL_INNER_VM_OUT || dynamicDir) {
   const originalEval = vm.runInContext('eval', ctx);
   ctx.eval = function(source) {
-    // Only the outer loader's *indirect* eval is intercepted. Restore the
-    // original context eval BEFORE executing the decoded source, so its
-    // internal direct eval calls have unchanged lexical semantics.
+    // Only the first outer-loader indirect eval is observed. Native eval is
+    // restored before inner code executes, preserving direct eval semantics.
     ctx.eval = originalEval;
-    if (typeof source !== 'string' || !source.includes('return eval(D)')) {
-      throw Error('Unexpected first indirect eval in archived Knitsail loader');
+    if (typeof source !== 'string') throw Error('Inner VM source is not a string');
+    const prefixLength = (source.match(/^\n*/) || [''])[0].length;
+    const inner = source.slice(prefixLength);
+    const originalCall = 'return eval(D)';
+    if (inner.split(originalCall).length !== 2) {
+      throw Error('Expected unique inner VM direct eval(D) site');
     }
-    const innerVm = source.replace(/^\n+/, '');
-    fs.writeFileSync(process.env.KNITSAIL_INNER_VM_OUT, innerVm);
-    return Reflect.apply(originalEval, undefined, [source]);
+    const start = inner.indexOf(originalCall) + 'return '.length;
+    sourceProvenance = {
+      outerLoader:{
+        sha256:outerVmSha256,
+        indirectEvalSite:outerInvocationSite,
+        decodedBy:'observed-first-indirect-eval',
+      },
+      innerExecutable:{
+        sha256:createHash('sha256').update(inner).digest('hex'),
+        evalSite:{start,end:start+'eval(D)'.length,expression:'eval(D)'},
+        strippedLeadingNewlineCodeUnits:prefixLength,
+      },
+    };
+    if (process.env.KNITSAIL_INNER_VM_OUT) {
+      fs.writeFileSync(process.env.KNITSAIL_INNER_VM_OUT, inner);
+    }
+    if (!dynamicDir) return Reflect.apply(originalEval, undefined, [source]);
+    const replacement = [
+      'try {',
+      'return __knitsail_capture_eval_result(eval(__knitsail_capture_eval_arg(D)));',
+      '} catch (__knitsail_capture_error) {',
+      '__knitsail_capture_eval_throw(__knitsail_capture_error);',
+      'throw __knitsail_capture_error;',
+      '}',
+    ].join(' ');
+    const instrumented = source.slice(0,prefixLength) +
+      inner.replace(originalCall,replacement);
+    return Reflect.apply(originalEval, undefined, [instrumented]);
   };
 }
 const entryCalls = [];
@@ -288,11 +306,11 @@ setTimeout(()=>{
   const sgUrl=replacedUrl ? (new URL(replacedUrl,baseHref).searchParams.get('sg_ss')) : null;
   const value=sgCookie||sgUrl;
   console.log(JSON.stringify({
-    ok:!!value,fatal:fatal?String(fatal):null,htmlSha256,vmSha256,
+    ok:!!value,fatal:fatal?String(fatal):null,htmlSha256,outerVmSha256,
     source:value?(sgCookie?'cookie':'url'):null,
     valueLength:value?value.length:null,
     startsStar:value?decodeURIComponent(value).startsWith('*'):false,
-    entryCalls, outerCalls, dynamicEvalSite, dynamicCodeEvents, dynamicTruncated,
+    entryCalls, outerCalls, sourceProvenance, dynamicCodeEvents, dynamicTruncated,
     // Redact challenge token, query/session IDs and request effects from report.
     cookiePresent:!!cookieValue,requestChanged:!!replacedUrl,beaconCount:beaconUrls.length,accesses
   },null,2));
