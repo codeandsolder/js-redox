@@ -20,14 +20,16 @@ const outerSite = loader?.indirectEvalSite;
 const innerSite = executable?.evalSite;
 const validSite = (site, expression) =>
   site && Number.isSafeInteger(site.start) && Number.isSafeInteger(site.end) &&
-  site.start >= 0 && site.end - site.start === expression.length &&
-  site.expression === expression;
+  site.start >= 0 && site.end - site.start === site.expression?.length &&
+  typeof site.expression === 'string' && site.expression.length > 0 &&
+  (expression === undefined || site.expression === expression);
 if (!hex64.test(report.htmlSha256) || !hex64.test(report.outerVmSha256) ||
     !hex64.test(loader?.sha256) || !hex64.test(executable?.sha256) ||
     report.outerVmSha256 !== loader.sha256 ||
     loader.decodedBy !== 'observed-first-indirect-eval' ||
     !validSite(outerSite, '(0,eval)(') ||
-    !validSite(innerSite, 'eval(D)') ||
+    !validSite(innerSite) ||
+    !/^eval\s*\([\s\S]*\)$/u.test(innerSite.expression) ||
     !Number.isSafeInteger(executable.strippedLeadingNewlineCodeUnits) ||
     executable.strippedLeadingNewlineCodeUnits < 0 ||
     !Array.isArray(report.dynamicCodeEvents)) {
@@ -49,7 +51,9 @@ try {
         (event.outcome !== 'return' && event.outcome !== 'throw')) {
       throw Error('Invalid event at position ' + position);
     }
-    if (event.type !== 'string') continue;
+    if (event.type !== 'string') {
+      throw Error('Non-string events must be counted separately from source events');
+    }
     if (!hex64.test(event.sha256) ||
         !Number.isSafeInteger(event.length) || event.length < 0) {
       throw Error('Invalid source hash or length at event ' + position);
@@ -112,7 +116,8 @@ try {
   const metadata = {
     schemaVersion:2,
     evidenceKind:'execution-observed, not universal static proof',
-    environment:'archived HTML replay in modeled Node VM browser',
+    environment:report.environment ?? 'execution-observed Node VM source',
+    identityKind:report.identityKind ?? 'archived-html',
     htmlSha256: report.htmlSha256,
     sourceProvenance: provenance,
     truncated: report.dynamicTruncated === true,
@@ -125,15 +130,18 @@ try {
   const lines = [
     '# Execution-observed dynamic source tree',
     '',
-    'These are dynamic eval input strings observed during ONE modeled archived challenge replay.',
+    'These are dynamic eval input strings observed during ONE execution capture.',
     'It is not a proof that these snippets are universal, and standalone parsing',
     'does not imply that an eval string can run outside its original lexical scope.',
     '',
+    'Capture identity SHA-256: ' + report.htmlSha256,
+    'Capture environment: ' + (report.environment ?? 'unspecified'),
     'Original outer loader SHA-256: ' + loader.sha256,
     'Original inner executable SHA-256: ' + executable.sha256,
     'Loader indirect eval offset: ' + outerSite.start + '..' + outerSite.end,
     'Executable direct eval offset: ' + innerSite.start + '..' + innerSite.end,
-    'Eval calls observed: ' + events.length,
+    'String eval operands observed: ' + events.length,
+    'Other input types skipped by capture: ' + (report.skippedNonString ?? 0),
     'Unique string operands: ' + entries.length,
     'Event buffer truncated: ' + (report.dynamicTruncated === true),
     '',

@@ -1,6 +1,6 @@
 # Knitsail dynamic-source recovery research
 
-**Current state (2026-11-11).** This experimental js-redox extension recovers
+**Current state (2026-11-12).** This experimental js-redox extension recovers
 JavaScript emitted at actual runtime eval sites and links it alongside static
 reconstruction. The static tree remains authoritative for universal recovery;
 runtime fragments remain **execution-observed**, never silently substituted
@@ -31,6 +31,11 @@ All 785 static JS/manifest files remain byte-identical in the combined tree.
 
 ## Components and documentation
 
+- `scripts/capture-vm-eval.mjs`: **generic configurable** synchronous Node VM
+  producer for arbitrary two-layer loaders and exact direct-eval source sites;
+  no Knitsail/DOM requirements. Emits original source layers, raw operands and
+  a v2 report usable by the same exporter and native importer.
+  [Generic setup, scope and limitations](HOWTO-GENERIC-RUNTIME-EVAL.md).
 - `scripts/replay-captured-html.cjs`: modeled archived browser replay;
   outer/inner source capture and observed eval inputs/outcomes.
 - `scripts/export-runtime-eval.mjs`: v2 manifest, exact deduplicated raw source
