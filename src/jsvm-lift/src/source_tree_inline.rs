@@ -26,25 +26,65 @@ struct ReturnTemplate {
     expression: String,
     /// Byte ranges within the return expression, bound to original formal
     /// parameters by Oxc symbol identity rather than identifier spelling.
-    substitutions: Vec<(usize, usize, usize)>,
+    substitutions: Vec<ReturnSubstitution>,
     formal_count: usize,
     free_names: BTreeSet<String>,
+}
+
+struct ReturnSubstitution {
+    start: usize,
+    end: usize,
+    formal_index: usize,
+    /// In {J}, the object key stays J even if the bound formal is replaced by P.
+    shorthand_key: Option<String>,
 }
 
 struct ReturnReferences<'s> {
     scoping: &'s Scoping,
     parameters: BTreeMap<SymbolId, usize>,
     start: u32,
-    substitutions: Vec<(usize, usize, usize)>,
+    substitutions: Vec<ReturnSubstitution>,
     free_names: BTreeSet<String>,
     invalid: bool,
 }
+impl ReturnReferences<'_> {
+    fn record_reference(&mut self, id: &IdentifierReference<'_>, shorthand: bool) {
+        if id.name == "arguments" || id.name == "eval" {
+            self.invalid = true;
+            return;
+        }
+        let reference = id.reference_id.get();
+        let symbol =
+            reference.and_then(|reference| self.scoping.get_reference(reference).symbol_id());
+        if let Some(index) = symbol.and_then(|symbol| self.parameters.get(&symbol)) {
+            if reference.is_some_and(|reference| self.scoping.get_reference(reference).is_write()) {
+                self.invalid = true;
+            } else {
+                self.substitutions.push(ReturnSubstitution {
+                    start: (id.span.start - self.start) as usize,
+                    end: (id.span.end - self.start) as usize,
+                    formal_index: *index,
+                    shorthand_key: shorthand.then(|| id.name.to_string()),
+                });
+            }
+        } else if symbol.is_some() {
+            // Local helper-only bindings cannot be transplanted into the caller's scope.
+            self.invalid = true;
+        } else {
+            self.free_names.insert(id.name.to_string());
+        }
+    }
+}
 impl<'a> Visit<'a> for ReturnReferences<'_> {
     fn visit_object_property(&mut self, property: &oxc_ast::ast::ObjectProperty<'a>) {
-        // Replacing {J} with {P} would also change the property key from
-        // "J" to "P". Do not silently rewrite object shapes.
         if property.shorthand {
-            self.invalid = true;
+            // Process the value reference exactly once, reconstructing an explicit
+            // property when the original value refers to a formal parameter.
+            if let Expression::Identifier(id) = &property.value {
+                self.record_reference(id, true);
+            } else {
+                self.invalid = true;
+            }
             return;
         }
         walk::walk_object_property(self, property);
@@ -69,30 +109,7 @@ impl<'a> Visit<'a> for ReturnReferences<'_> {
         walk::walk_expression(self, expression);
     }
     fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
-        if id.name == "arguments" || id.name == "eval" {
-            self.invalid = true;
-            return;
-        }
-        let reference = id.reference_id.get();
-        let symbol =
-            reference.and_then(|reference| self.scoping.get_reference(reference).symbol_id());
-        if let Some(index) = symbol.and_then(|symbol| self.parameters.get(&symbol)) {
-            if reference.is_some_and(|reference| self.scoping.get_reference(reference).is_write()) {
-                self.invalid = true;
-            } else {
-                self.substitutions.push((
-                    (id.span.start - self.start) as usize,
-                    (id.span.end - self.start) as usize,
-                    *index,
-                ));
-            }
-        } else if symbol.is_some() {
-            // Local helper-only bindings cannot be transplanted to the
-            // caller's lexical environment by name.
-            self.invalid = true;
-        } else {
-            self.free_names.insert(id.name.to_string());
-        }
+        self.record_reference(id, false);
     }
 }
 
@@ -211,18 +228,29 @@ impl<'a> Visit<'a> for CallExpander<'_> {
                 callee = &paren.expression;
             }
             if let Expression::Identifier(id) = callee {
-                let unresolved = id.reference_id.get().is_some_and(|reference| {
-                    self.scoping.get_reference(reference).symbol_id().is_none()
-                });
-                if unresolved {
-                    if let Some(template) = self.templates.get(id.name.as_str()) {
-                        if let Some(expanded) = self.expand(call, template) {
-                            self.replacements.push((
-                                call.span.start as usize,
-                                call.span.end as usize,
-                                expanded,
-                                id.name.to_string(),
-                            ));
+                if let Some(reference) = id.reference_id.get() {
+                    let binding = self.scoping.get_reference(reference);
+                    if binding.symbol_id().is_none() {
+                        if let Some(template) = self.templates.get(id.name.as_str()) {
+                            // The same free name may be shadowed in one nested
+                            // function but not at another callsite. Do not reject
+                            // an entire handler for an unrelated local declaration.
+                            let scope = binding.scope_id();
+                            let free_names_visible = template.free_names.iter().all(|name| {
+                                self.scoping
+                                    .find_binding(scope, name.as_str().into())
+                                    .is_none()
+                            });
+                            if free_names_visible {
+                                if let Some(expanded) = self.expand(call, template) {
+                                    self.replacements.push((
+                                        call.span.start as usize,
+                                        call.span.end as usize,
+                                        expanded,
+                                        id.name.to_string(),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -268,8 +296,21 @@ impl CallExpander<'_> {
             }
         }
         let mut expanded = template.expression.clone();
-        for (start, end, index) in template.substitutions.iter().rev() {
-            expanded.replace_range(*start..*end, arguments.get(*index)?);
+        for substitution in template.substitutions.iter().rev() {
+            let argument = arguments.get(substitution.formal_index)?;
+            let replacement = substitution.shorthand_key.as_ref().map_or_else(
+                || argument.clone(),
+                |key| {
+                    if key == "__proto__" {
+                        // A bare '__proto__:' would trigger the special
+                        // object-literal prototype setter, unlike shorthand.
+                        format!("[\"__proto__\"]: {argument}")
+                    } else {
+                        format!("{key}: {argument}")
+                    }
+                },
+            );
+            expanded.replace_range(substitution.start..substitution.end, &replacement);
         }
         Some(format!("({expanded})"))
     }
@@ -303,20 +344,12 @@ pub fn expand_helper_returns(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    let local = scoping.symbol_names().collect::<BTreeSet<_>>();
     let templates = context
         .helpers
         .iter()
         .filter_map(|helper| {
             (linked.contains(helper.name.as_str()) && counts.get(helper.name.as_str()) == Some(&1))
-                .then(|| {
-                    let candidate = template(helper)?;
-                    candidate
-                        .free_names
-                        .iter()
-                        .all(|name| !local.contains(name.as_str()))
-                        .then(|| (helper.name.clone(), candidate))
-                })
+                .then(|| template(helper).map(|candidate| (helper.name.clone(), candidate)))
                 .flatten()
         })
         .collect::<BTreeMap<_, _>>();
@@ -424,7 +457,6 @@ mod tests {
             "function root(){const AM=function(J){return this.Y + J.Y;};}",
             "function root(){const AM=function(J){return arguments[0].Y;};}",
             "function root(){const AM=function(J){return ++J;};}",
-            "function root(){const AM=function(J){return {J};};}",
             "function root(){const AM=function(J){return eval('J');};}",
             "function root(){let AM=function(J){return J.Y;};AM=function(J){return J.D;};}",
         ];
@@ -436,6 +468,68 @@ mod tests {
                 "unsound helper expansion: {original}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_object_shorthand_keys_and_nested_expressions() -> Result<()> {
+        let original =
+            "function root(){const pack=function(J){return {J, nested:{J}, computed:{[J]:J}, explicit:J};};}";
+        let source = "const capturedHandler=function(P){return pack(P);};";
+        let context = reconstruct_context(original, &[("handler.js".into(), source.into())])?;
+        let out = expand_helper_returns(source, &context, &context.handlers[0])?
+            .context("expected shorthand-preserving expansion")?;
+        assert_eq!(out.expanded_calls, 1);
+        assert!(
+            out.source
+                .contains("{J: P, nested:{J: P}, computed:{[P]:P}, explicit:P}"),
+            "{}",
+            out.source
+        );
+        assert!(!out.source.contains("pack(P)"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_shorthand_capture_collisions() -> Result<()> {
+        let original = "function root(){const pack=function(J){return {G,J};};}";
+        let source = "const capturedHandler=function(P){const G=1;return pack(P);};";
+        let context = reconstruct_context(original, &[("handler.js".into(), source.into())])?;
+        assert!(expand_helper_returns(source, &context, &context.handlers[0])?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn checks_free_name_collisions_in_each_calls_lexical_scope() -> Result<()> {
+        let original = "function root(){const AM=function(J){return w8(J);};}";
+        let source =
+            "const capturedHandler=function(P){function nested(w8){return AM(P)}return AM(P);};";
+        let context = reconstruct_context(original, &[("handler.js".into(), source.into())])?;
+        let out = expand_helper_returns(source, &context, &context.handlers[0])?
+            .context("expected a source-backed outer call expansion")?;
+        assert_eq!(out.expanded_calls, 1);
+        assert!(
+            out.source.contains("function nested(w8){return AM(P)}"),
+            "{}",
+            out.source
+        );
+        assert!(out.source.contains("return (w8(P));"), "{}", out.source);
+        Ok(())
+    }
+
+    #[test]
+    fn proto_shorthand_stays_an_own_property_not_a_prototype_setter() -> Result<()> {
+        let original = "function root(){const pack=function(__proto__){return {__proto__};};}";
+        let source = "const capturedHandler=function(P){return pack(P);};";
+        let context = reconstruct_context(original, &[("handler.js".into(), source.into())])?;
+        let out = expand_helper_returns(source, &context, &context.handlers[0])?
+            .context("expected __proto__ shorthand expansion")?;
+        assert_eq!(out.expanded_calls, 1);
+        assert!(
+            out.source.contains("{[\"__proto__\"]: P}"),
+            "{}",
+            out.source
+        );
         Ok(())
     }
 

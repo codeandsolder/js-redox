@@ -393,7 +393,13 @@ further: it places the **original return expression directly into the
 recovered code**, substituting formal parameters by Oxc binding identity.
 The expansion requires a stable original helper, side-effect-free and
 non-reassigned arguments, and no conflicting lexical captures, dynamic scope
-or call-frame-dependent syntax. Calls without those proofs stay untouched.
+or call-frame-dependent syntax. For shorthand object properties, the original
+key is retained (for example, `{J}` becomes `{J: P}`, never `{P}`). The
+special `__proto__` shorthand uses a computed key instead of invoking the
+object-literal prototype setter. Free-name
+collisions are checked in each callsite's actual Oxc lexical scope, so an
+unrelated nested binding does not suppress otherwise valid expansion. Calls
+without those proofs stay untouched.
 This is an analyst projection only; the executable/proof-checked source
 tree is always kept separate.
 
