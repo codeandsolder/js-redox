@@ -183,3 +183,62 @@ Native verification:
 JSREDOX_DEOBFUSCATE_BIN=/path/to/deobfuscate-safe \
   node --test tests/direct-native-import.test.mjs
 ```
+
+## Multiple original direct eval sites in one execution
+
+The current direct producer accepts a **nonempty `sites` array** instead of
+single-site root-level `evalExpression` configuration. Each element may use
+unique expression snippets or exact UTF-16 `evalSite` / `firstArgumentSite`
+intervals. When the same expression occurs at multiple locations, provide
+explicit intervals to disambiguate them.
+
+```json
+{
+  "sourceFile": "program.js",
+  "entryFile": "entry.js",
+  "sites": [
+    {
+      "evalSite": {"start": 110, "end": 117, "expression": "eval(D)"},
+      "firstArgumentSite": {"start": 115, "end": 116, "expression": "D"}
+    },
+    {
+      "evalSite": {"start": 280, "end": 287, "expression": "eval(D)"},
+      "firstArgumentSite": {"start": 285, "end": 286, "expression": "D"}
+    }
+  ]
+}
+```
+
+**The offsets above are illustrative; use real original-source UTF-16
+positions.** Overlapping sites and ambiguous snippets are rejected.
+
+Capture instruments all selected sites in the *same execution* and writes a
+run-level `report.json` with globally ordered events, including their
+`siteIndex`, and a `bundle.json` listing selected and observed sites.
+Unexecuted configured sites remain visible with an event count of zero but
+are **not** exported as evidence. Identical operand bytes across sites share
+one source file in the capture, but each site has its own witness, with the
+original global event indices preserved in its v3 manifest.
+
+```bash
+node scripts/capture-direct-eval.mjs inputs/multi/config.json inputs/multi-capture
+node scripts/export-runtime-eval-bundle.mjs \
+  inputs/multi-capture inputs/multi-export /path/to/deobfuscate-safe
+deobfuscate-safe source-tree STATIC_TREE COMBINED_TREE \
+  --observed-direct-bundle inputs/multi-export inputs/multi-capture/executable.js
+```
+
+The bundle exporter publishes individual `site-0000/manifest.json` etc plus
+`bundle.json` and `execution.json` containing the global interleaving. The
+native importer verifies the bundle identity, site ordering, source SHA,
+per-site witness provenance and event counts, then imports all site witnesses
+in one atomic output transaction. If one site fails validation, **none of
+them are published**. Runtime overlay navigation links each string to its
+own original eval callsite; equal source strings from two sites are not
+mistakenly merged into one caller.
+
+```bash
+node --test tests/multi-direct-eval.test.mjs
+JSREDOX_DEOBFUSCATE_BIN=/path/to/deobfuscate-safe \
+  node --test tests/multi-direct-native-import.test.mjs
+```

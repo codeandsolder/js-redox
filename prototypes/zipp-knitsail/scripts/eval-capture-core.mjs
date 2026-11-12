@@ -38,7 +38,7 @@ export function verifySite(code, site, expected) {
   }
 }
 
-export function instrumentEval(code, config, names) {
+export function instrumentEval(code, config, names, siteIndex=0) {
   const site = config.evalSite ?? uniqueSite(code, config.evalExpression, 'executable');
   verifySite(code, site);
   // Text checks restrict obvious mismatches; full AST proof belongs to the
@@ -65,12 +65,44 @@ export function instrumentEval(code, config, names) {
   for (const name of [names.arg, names.result]) {
     if (code.includes(name)) throw Error('Observer hook name conflicts with original executable');
   }
-  const newCall = names.result + '(' +
-    originalCall.slice(0, relativeStart) + names.arg + '(' +
+  const newCall = names.result + '(' + siteIndex + ',' +
+    originalCall.slice(0, relativeStart) + names.arg + '(' + siteIndex + ',' +
     first.expression + ')' + originalCall.slice(relativeEnd) + ')';
   return {
     code:code.slice(0, site.start) + newCall + code.slice(site.end),
     site, hasAdditionalArgs,
+  };
+}
+
+export function instrumentEvalSites(code, configs, names) {
+  if (!Array.isArray(configs) || configs.length === 0) {
+    throw Error('sites must be a nonempty array of eval-site configurations');
+  }
+  const replacements = configs.map((siteConfig, siteIndex) => {
+    const modified = instrumentEval(code, siteConfig, names, siteIndex);
+    return {
+      siteIndex, site:modified.site,
+      hasAdditionalArgs:modified.hasAdditionalArgs,
+      replacement:modified.code.slice(
+        modified.site.start,
+        modified.code.length - (code.length - modified.site.end)),
+    };
+  });
+  const sorted = [...replacements].sort((a,b) => a.site.start-b.site.start);
+  for (let i=1;i<sorted.length;i++) {
+    if (sorted[i].site.start < sorted[i-1].site.end) {
+      throw Error('Eval sites must have distinct, nonoverlapping source intervals');
+    }
+  }
+  let instrumented=code;
+  for (const site of sorted.reverse()) {
+    instrumented=instrumented.slice(0,site.site.start)+site.replacement+
+      instrumented.slice(site.site.end);
+  }
+  return {
+    code:instrumented,
+    sites:replacements.map(({siteIndex,site,hasAdditionalArgs})=>
+      ({siteIndex,...site,hasAdditionalArgs})),
   };
 }
 
@@ -89,16 +121,19 @@ export function createObserver(context, originalSource, destination, maxEvents=1
   let truncated = false;
   let skippedNonString = 0;
   let overlap = false;
-  context[hooks.arg] = value => {
+  context[hooks.arg] = (siteIndex,value) => {
+    if (!Number.isSafeInteger(siteIndex) || siteIndex < 0) {
+      throw Error('Invalid instrumented site index');
+    }
     if (typeof value !== 'string') {
       skippedNonString++;
-      pending.push(null);
+      pending.push({siteIndex,index:null});
       return value;
     }
-    if (pending.some(index => index !== null)) overlap = true;
+    if (pending.some(p => p.index !== null)) overlap = true;
     if (events.length >= maxEvents) {
       truncated = true;
-      pending.push(null);
+      pending.push({siteIndex,index:null});
       return value;
     }
     const bytes = Buffer.from(value, 'utf8');
@@ -116,15 +151,18 @@ export function createObserver(context, originalSource, destination, maxEvents=1
     const index = events.length;
     // Throws cannot be typed from a simple result wrapper without moving
     // the original eval into a different lexical scope.
-    events.push({index, type:'string', sha256:hash, length:value.length,
+    events.push({index, siteIndex, type:'string', sha256:hash, length:value.length,
       outcome:'throw',thrownType:'unknown'});
-    pending.push(index);
+    pending.push({siteIndex,index});
     return value;
   };
-  context[hooks.result] = value => {
-    const index = pending.pop();
-    if (index !== null && index !== undefined) {
-      const event=events[index];
+  context[hooks.result] = (siteIndex,value) => {
+    const completed = pending.pop();
+    if (!completed || completed.siteIndex !== siteIndex) {
+      throw Error('Eval invocation/result attribution mismatch');
+    }
+    if (completed.index !== null) {
+      const event=events[completed.index];
       event.outcome='return';
       event.resultType=typeof value;
       delete event.thrownType;
@@ -133,9 +171,11 @@ export function createObserver(context, originalSource, destination, maxEvents=1
   };
   return {
     hooks, events,
-    finish(hasAdditionalArgs=false) {
+    finish(additionalArgsBySite=[]) {
       if (overlap) throw Error('Nested or reentrant eval attribution is ambiguous');
-      if (hasAdditionalArgs && pending.some(index=>index !== null)) {
+      const extra = typeof additionalArgsBySite === 'boolean' ?
+        [additionalArgsBySite] : additionalArgsBySite;
+      if (pending.some(({siteIndex,index}) => index !== null && extra[siteIndex])) {
         throw Error('A later eval argument may have thrown before eval was invoked');
       }
       if (!events.length) throw Error('No string eval operands were observed');

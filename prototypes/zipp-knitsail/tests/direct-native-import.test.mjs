@@ -7,7 +7,7 @@ import {spawnSync} from 'node:child_process';
 
 const project=path.resolve(import.meta.dirname,'..');
 const runner=path.join(project,'scripts/capture-direct-eval.mjs');
-const exporter=path.join(project,'scripts/export-runtime-eval.mjs');
+const exporter=path.join(project,'scripts/export-runtime-eval-bundle.mjs');
 const binary=process.env.JSREDOX_DEOBFUSCATE_BIN;
 if (!binary) throw Error('Set JSREDOX_DEOBFUSCATE_BIN to the native import binary');
 const run=(command,args)=>{
@@ -32,15 +32,14 @@ test('actual single-stage source -> v3 manifest -> native AST verified overlay',
     }
     fs.writeFileSync(path.join(tmp,'config.json'),JSON.stringify({
       sourceFile:'source.js',entryFile:'entry.js',
-      evalExpression:'eval(D)',firstArgumentExpression:'D',
+      sites:[{evalExpression:'eval(D)',firstArgumentExpression:'D'}],
     }));
     const capture=path.join(tmp,'capture');
     const report=run(process.execPath,[runner,path.join(tmp,'config.json'),capture]);
     assert.equal(report.events,2);
     const exported=path.join(tmp,'exported');
-    const exportedResult=run(process.execPath,[exporter,
-      path.join(capture,'report.json'),path.join(capture,'sources'),exported,binary]);
-    assert.equal(exportedResult.unique,2);
+    const exportedResult=run(process.execPath,[exporter,capture,exported,binary]);
+    assert.equal(exportedResult.observedSites,1);
     const staticTree=path.join(tmp,'static');
     fs.mkdirSync(staticTree);
     fs.writeFileSync(path.join(staticTree,'original.js'),original);
@@ -48,7 +47,7 @@ test('actual single-stage source -> v3 manifest -> native AST verified overlay',
     run(binary,['source-tree',staticTree,staticOnly,'--max-iterations','2']);
     const combined=path.join(tmp,'combined');
     run(binary,['source-tree',staticTree,combined,'--max-iterations','2',
-      '--observed-direct',exported,path.join(capture,'executable.js')]);
+      '--observed-direct-bundle',exported,path.join(capture,'executable.js')]);
     const index=JSON.parse(fs.readFileSync(path.join(combined,'runtime-observed/index.json')));
     assert.equal(index.schema,'js-redox/linked-runtime-source-tree/v3');
     assert.equal(index.captures.length,1);
@@ -67,7 +66,7 @@ test('actual single-stage source -> v3 manifest -> native AST verified overlay',
     assert.deepEqual(fs.readFileSync(path.join(combined,'reconstruction.json')),
       fs.readFileSync(path.join(staticOnly,'reconstruction.json')));
     assert.deepEqual(fs.readFileSync(path.join(combined,directory,'manifest.json')),
-      fs.readFileSync(path.join(exported,'manifest.json')));
+      fs.readFileSync(path.join(exported,'site-0000','manifest.json')));
 
     // Original input is independently verified: mismatched source bytes must
     // not leave an output directory, and cannot reuse a previous success.

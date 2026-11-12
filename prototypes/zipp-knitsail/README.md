@@ -31,10 +31,14 @@ All 785 static JS/manifest files remain byte-identical in the combined tree.
 
 ## Components and documentation
 
-- `scripts/capture-direct-eval.mjs`: original one-stage JavaScript direct-eval
-  source capture with **v3 provenance**, no invented loader. Optional entry
+- `scripts/capture-direct-eval.mjs`: original JavaScript direct-eval capture
+  across **multiple selected callsites in a single execution**, emitting
+  run-wide events and one v3 witness per observed site. No invented loader.
+  Optional entry
   script. Verifies exact original executable bytes and UTF-16 callsite.
   [Direct-source usage](HOWTO-GENERIC-RUNTIME-EVAL.md#direct-original-javascript-no-loader).
+- `scripts/export-runtime-eval-bundle.mjs`: export each observed direct site
+  independently while preserving global event ordering and one bundle index.
 - `scripts/eval-capture-core.mjs`: shared source-location, argument-observer
   and content-addressed capture logic for direct and decoded executables.
 - `scripts/capture-vm-eval.mjs`: **generic configurable** synchronous Node VM

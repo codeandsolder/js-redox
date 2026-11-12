@@ -64,11 +64,27 @@ try {
         !Number.isSafeInteger(event.length) || event.length < 0) {
       throw Error('Invalid source hash or length at event ' + position);
     }
+    const hasGlobal = Number.isSafeInteger(event.globalEventIndex) &&
+      event.globalEventIndex >= 0;
+    if (event.globalEventIndex !== undefined && !hasGlobal) {
+      throw Error('Invalid global event index at local event ' + position);
+    }
     const known = groups.get(event.sha256) ?? {
       sha256: event.sha256, utf16Length: event.length,
       firstEvent: position, occurrences: 0, returned: 0, threw: 0,
       returnedTypes: {}, thrownTypes: {},
+      ...(hasGlobal ? {globalEventIndices:[]} : {}),
     };
+    if (hasGlobal !== ('globalEventIndices' in known)) {
+      throw Error('Inconsistent global event index presence for ' + event.sha256);
+    }
+    if (hasGlobal) {
+      const previous = known.globalEventIndices.at(-1);
+      if (previous !== undefined && event.globalEventIndex <= previous) {
+        throw Error('Global event indices must increase within each source');
+      }
+      known.globalEventIndices.push(event.globalEventIndex);
+    }
     if (known.utf16Length !== event.length) {
       throw Error('Conflicting decoded string lengths for ' + event.sha256);
     }
@@ -83,6 +99,16 @@ try {
       known.thrownTypes[kind] = (known.thrownTypes[kind] ?? 0) + 1;
     }
     groups.set(event.sha256, known);
+  }
+  // Global indices identify the interleaving of identical source strings
+  // across independently exported callsites of the same execution session.
+  const globallyIndexed = events.filter(e=>e.globalEventIndex !== undefined);
+  if (globallyIndexed.length && globallyIndexed.length !== events.length) {
+    throw Error('Partially indexed multi-site capture is not valid');
+  }
+  if (globallyIndexed.length &&
+      new Set(globallyIndexed.map(e=>e.globalEventIndex)).size !== globallyIndexed.length) {
+    throw Error('Duplicate global event index in one site export');
   }
   const entries = [];
   for (const entry of groups.values()) {
