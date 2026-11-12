@@ -485,6 +485,19 @@ cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
   path/to/original.js work/caller-views --entry-member someMethod --specialize
 ~~~
 
+When the source has many unrelated helper families, repeat `--only-helper NAME`
+to retain only source-resolved entrypoint paths and specialized implementations
+for the chosen helpers, without materializing hundreds of other variants.
+This filter changes only the analyst output selection; the same lexical symbol,
+callsite and exact-argument proofs still determine every variant. An example
+using more than one helper:
+
+~~~sh
+cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
+  path/to/original.js work/focused-helpers --specialize \
+  --only-helper da --only-helper eU
+~~~
+
 Exception-sensitive state dispatchers retain their original try/catch
 and one-state-per-iteration semantics. Exact lexical-state reachability
 includes catch-resume assignments as additional roots, so unreachable
@@ -548,8 +561,39 @@ the same source-tree pass also generates a lexical-context/specializations
 directory. Each JS file is a rewritten helper body: literal arguments from
 an actual extracted handler call replace references to the corresponding
 unchanged lexical parameter symbols, and the regular static deobfuscator
-then simplifies the result. Both the full original helper and the specialized
-body are kept and linked by original handler callsite.
+then simplifies the result. Derived original-helper and specialized-helper views
+also structurally reduce single-trip `for`/`while`/`do-while` loops when an
+unconditional terminal break proves that a second iteration is impossible.
+The original initializer and condition are evaluated exactly once, loop
+updates remain unreachable, and potential earlier breaks or continues
+prevent the rewrite. A second run of the existing proof-oriented static
+deobfuscator then folds dead conditions and redundant blocks exposed by
+that structural change (for example, a specialized `if (false)` branch).
+The source-backed helper views also recover direct values from terminal
+return temporaries. An assignment immediately feeding a return can become
+a direct return even when the function previously read or wrote that
+variable: those earlier effects remain in place. Oxc verifies that the
+binding belongs to the function being rewritten and that no nested
+closure can observe its terminal write. The same symbol-resolved
+dataflow applies to labeled branch joins, conditional assignments with a
+fallback return, and complete `if/else` joins. Branch blocks may contain
+earlier side effects, calls, declarations, and conditional exits: their
+original source and lexical scope are retained, and only the final plain
+assignment is replaced by a direct return. An outer guard may enclose a
+labeled join: the result is returned directly only when that guard executes,
+leaving the original fallback return intact. The temporary must belong to
+the function being rewritten; writes to captured or enclosing lexical
+bindings remain observable even if only written and returned once.
+Dynamic scope, `eval`, `arguments` access, or extra reads/writes also
+prevent these rewrites.
+These improvements are fed through the existing static deobfuscator again;
+they are not runtime-execution or value-guessing shortcuts.
+Any unsuccessful follow-up analysis is recorded rather than aborting
+other helpers. The lexical program remains byte-exact in
+`lexical-context/original.js`; reflow counts, follow-up transforms, and
+errors are recorded per helper and specialization in
+`lexical-context/context.json`. Both original helper and specialized body
+are kept and linked by original handler callsite.
 
 Specialization handles primitive literal arguments, including multiple
 constant parameters in a call. It rejects parameter writes, direct eval,

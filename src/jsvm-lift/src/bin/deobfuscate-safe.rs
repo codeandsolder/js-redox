@@ -18,6 +18,8 @@ use jsvm_lift::{
         SpecializedHelperCall,
     },
     source_tree_inline::expand_helper_returns,
+    source_tree_reflow::reflow_single_trip_loops,
+    source_tree_return_flow::recover_terminal_returns,
     source_tree_specialize::{specialize_calls, specialize_resolved_call_graph},
 };
 use serde_json::json;
@@ -91,6 +93,10 @@ struct CallerViewsArgs {
     /// lexical call edges (opt-in because it can produce many variants).
     #[arg(long)]
     specialize: bool,
+    /// Restrict call graph entries and generated specializations to helpers
+    /// with these resolved lexical names. Repeat for several helpers.
+    #[arg(long, requires = "specialize")]
+    only_helper: Vec<String>,
     #[arg(long, default_value_t = 12)]
     max_iterations: usize,
 }
@@ -210,6 +216,89 @@ fn collect_js_sources(root: &Path) -> Result<Vec<PathBuf>> {
     }
     sources.sort();
     Ok(sources)
+}
+
+struct PolishedHelperView {
+    source: String,
+    single_trip_loops_reflowed: usize,
+    subsequent_transforms: BTreeMap<String, usize>,
+    post_reflow_error: Option<String>,
+    adjacent_returns: usize,
+    labeled_return_joins: usize,
+    guarded_return_joins: usize,
+    post_return_error: Option<String>,
+}
+
+/// Re-run the existing static pass after loop structure has become explicit.
+/// This allows its proven dead-branch and block reductions to see through
+/// former single-trip loops without introducing another JS evaluator.
+fn polish_lexical_helper_view(
+    source: String,
+    label: &str,
+    max_iterations: usize,
+    format_output: bool,
+    budgets: &AnalysisBudgets,
+) -> Result<PolishedHelperView> {
+    let reflowed = reflow_single_trip_loops(&source)?;
+    let (source, mut subsequent_transforms, post_reflow_error) = if reflowed.rewritten_loops == 0 {
+        (source, BTreeMap::new(), None)
+    } else {
+        let budget = budgets.operation(
+            AnalysisOperation::SafeDeobfuscation,
+            format!("post-reflow {label}"),
+        );
+        match deobfuscate_source(
+            &reflowed.source,
+            format!("post-reflow {label}"),
+            SourceMode::Auto,
+            max_iterations,
+            format_output,
+            &budget,
+        ) {
+            Ok(outcome) => (outcome.source, outcome.report.transforms, None),
+            Err(error) => (reflowed.source, BTreeMap::new(), Some(error.to_string())),
+        }
+    };
+
+    let returns = recover_terminal_returns(&source)?;
+    let adjacent_returns = returns.adjacent_returns;
+    let labeled_return_joins = returns.labeled_joins;
+    let guarded_return_joins = returns.guarded_joins;
+    let (source, post_return_error) =
+        if adjacent_returns + labeled_return_joins + guarded_return_joins == 0 {
+            (returns.source, None)
+        } else {
+            let budget = budgets.operation(
+                AnalysisOperation::SafeDeobfuscation,
+                format!("post-return-flow {label}"),
+            );
+            match deobfuscate_source(
+                &returns.source,
+                format!("post-return-flow {label}"),
+                SourceMode::Auto,
+                max_iterations,
+                format_output,
+                &budget,
+            ) {
+                Ok(outcome) => {
+                    for (kind, count) in outcome.report.transforms {
+                        *subsequent_transforms.entry(kind).or_default() += count;
+                    }
+                    (outcome.source, None)
+                }
+                Err(error) => (returns.source, Some(error.to_string())),
+            }
+        };
+    Ok(PolishedHelperView {
+        source,
+        single_trip_loops_reflowed: reflowed.rewritten_loops,
+        subsequent_transforms,
+        post_reflow_error,
+        adjacent_returns,
+        labeled_return_joins,
+        guarded_return_joins,
+        post_return_error,
+    })
 }
 
 /// Publish a fully validated output tree without replacing a destination
@@ -465,13 +554,13 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
             let budget = budgets.operation(AnalysisOperation::SafeDeobfuscation, label.clone());
             let outcome = deobfuscate_source(
                 &helper.source,
-                label,
+                label.clone(),
                 SourceMode::Auto,
                 args.max_iterations,
                 args.format_output,
                 &budget,
             );
-            let (code, transforms, error) = match outcome {
+            let (code, mut transforms, error) = match outcome {
                 Ok(rewritten) => (rewritten.source, rewritten.report.transforms, None),
                 Err(error) => (
                     helper.source.clone(),
@@ -479,6 +568,45 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                     Some(error.to_string()),
                 ),
             };
+            // The original program remains byte-exact in lexical-context/original.js.
+            // Improve only the independently readable helper projection.
+            let polished = polish_lexical_helper_view(
+                code,
+                &label,
+                args.max_iterations,
+                args.format_output,
+                &budgets,
+            )?;
+            let code = polished.source;
+            let rewritten_loops = polished.single_trip_loops_reflowed;
+            let post_reflow_error = polished.post_reflow_error;
+            let adjacent_returns = polished.adjacent_returns;
+            let labeled_return_joins = polished.labeled_return_joins;
+            let guarded_return_joins = polished.guarded_return_joins;
+            let post_return_error = polished.post_return_error;
+            for (kind, count) in polished.subsequent_transforms {
+                *transforms.entry(kind).or_default() += count;
+            }
+            if adjacent_returns > 0 {
+                *transforms
+                    .entry("source_adjacent_return_flow".to_owned())
+                    .or_default() += adjacent_returns;
+            }
+            if guarded_return_joins > 0 {
+                *transforms
+                    .entry("source_guarded_return_flow".to_owned())
+                    .or_default() += guarded_return_joins;
+            }
+            if labeled_return_joins > 0 {
+                *transforms
+                    .entry("source_labeled_return_flow".to_owned())
+                    .or_default() += labeled_return_joins;
+            }
+            if rewritten_loops > 0 {
+                *transforms
+                    .entry("source_single_trip_reflow".to_owned())
+                    .or_default() += rewritten_loops;
+            }
             fs::write(folder.join(relative), &code)?;
             // Annotate references only where the helper's *own* AST resolves
             // the property key to the same symbol as its prior assignments.
@@ -517,6 +645,12 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 "path": relative,
                 "binding_mutable": helper.mutable_binding,
                 "references": helper.references,
+                "single_trip_loops_reflowed": rewritten_loops,
+                "post_reflow_error": post_reflow_error,
+                "adjacent_return_values": adjacent_returns,
+                "labeled_return_joins": labeled_return_joins,
+                "guarded_return_joins": guarded_return_joins,
+                "post_return_error": post_return_error,
                 "transforms": transforms,
                 "error": error,
             }));
@@ -686,7 +820,11 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
         let mut specializations_md =
             String::from("# Constant-argument specialized helper code\n\n");
         specializations_md.push_str(
-            "Each file substitutes the exact constant arguments of a real handler call              into their original lexical parameter references, then runs static JS              deobfuscation. Original helpers remain available; these files are              callsite-specific analysis views inside the original closure context,              not independent runnable modules.\n\n"
+            "Each file substitutes exact constant call arguments into the original lexical \
+             parameter references and applies static deobfuscation. Loops proven to run at \
+             most once are reduced to conditional blocks without dropping the initializer \
+             or condition evaluation. Original helpers remain available; these source-backed \
+             derivatives are analysis views, not independently runnable modules.\n\n",
         );
         let mut specialization_rows = Vec::new();
         for (specialized, link) in specializations.into_iter().zip(&specialized_links) {
@@ -695,7 +833,7 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 AnalysisOperation::SafeDeobfuscation,
                 format!("specialized {}", specialized.helper),
             );
-            let (code, transforms, error) = match deobfuscate_source(
+            let (code, mut transforms, error) = match deobfuscate_source(
                 &specialized.source,
                 relative.clone(),
                 SourceMode::Auto,
@@ -710,6 +848,43 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                     Some(error.to_string()),
                 ),
             };
+            let polished = polish_lexical_helper_view(
+                code,
+                &format!("specialized {}", specialized.helper),
+                args.max_iterations,
+                args.format_output,
+                &budgets,
+            )?;
+            let code = polished.source;
+            let rewritten_loops = polished.single_trip_loops_reflowed;
+            let post_reflow_error = polished.post_reflow_error;
+            let adjacent_returns = polished.adjacent_returns;
+            let labeled_return_joins = polished.labeled_return_joins;
+            let guarded_return_joins = polished.guarded_return_joins;
+            let post_return_error = polished.post_return_error;
+            for (kind, count) in polished.subsequent_transforms {
+                *transforms.entry(kind).or_default() += count;
+            }
+            if adjacent_returns > 0 {
+                *transforms
+                    .entry("source_adjacent_return_flow".to_owned())
+                    .or_default() += adjacent_returns;
+            }
+            if guarded_return_joins > 0 {
+                *transforms
+                    .entry("source_guarded_return_flow".to_owned())
+                    .or_default() += guarded_return_joins;
+            }
+            if labeled_return_joins > 0 {
+                *transforms
+                    .entry("source_labeled_return_flow".to_owned())
+                    .or_default() += labeled_return_joins;
+            }
+            if rewritten_loops > 0 {
+                *transforms
+                    .entry("source_single_trip_reflow".to_owned())
+                    .or_default() += rewritten_loops;
+            }
             fs::write(folder.join(&relative), &code)?;
             let actual_changes = code != specialized.original;
             let constants = specialized
@@ -740,6 +915,12 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 "path": relative,
                 "call_sites": specialized.call_sites,
                 "specialized_source_changed": actual_changes,
+                "single_trip_loops_reflowed": rewritten_loops,
+                "post_reflow_error": post_reflow_error,
+                "adjacent_return_values": adjacent_returns,
+                "labeled_return_joins": labeled_return_joins,
+                "guarded_return_joins": guarded_return_joins,
+                "post_return_error": post_return_error,
                 "transforms": transforms,
                 "error": error,
             }));
@@ -840,9 +1021,13 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 fs::create_dir_all(&dir)?;
                 // Same exact graph-based specialization writer as the
                 // standalone caller-views CLI; no second extraction logic.
-                for mut row in
-                    write_callsite_specializations(&original, &views, &dir, args.max_iterations)?
-                {
+                for mut row in write_callsite_specializations(
+                    &original,
+                    &views,
+                    &dir,
+                    args.max_iterations,
+                    &[],
+                )? {
                     for key in ["path", "original_path"] {
                         if let Some(path) = row[key].as_str() {
                             row[key] = json!(format!("caller-views/{path}"));
@@ -1140,6 +1325,7 @@ fn write_callsite_specializations(
     views: &[CallerView],
     output: &Path,
     max_iterations: usize,
+    only_helpers: &[String],
 ) -> Result<Vec<serde_json::Value>> {
     let mut specialization_rows = Vec::new();
     let candidates = specialize_resolved_call_graph(original, views)?;
@@ -1162,6 +1348,9 @@ fn write_callsite_specializations(
     fs::create_dir_all(destination.join("original"))?;
     let budgets = AnalysisBudgets::standard("deobfuscate-safe-graph-specializations");
     for candidate in candidates {
+        if !only_helpers.is_empty() && !only_helpers.contains(&candidate.helper) {
+            continue;
+        }
         let arguments_json = serde_json::to_string(&candidate.constants)?;
         let digest = sha256_hex(arguments_json.as_bytes());
         let filename = format!(
@@ -1275,7 +1464,14 @@ fn write_callsite_specializations(
 fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
     let original = fs::read_to_string(&args.input)
         .with_context(|| format!("reading caller source {}", args.input.display()))?;
-    let views = reconstruct_caller_views(&original, args.entry_member.as_deref())?;
+    let mut views = reconstruct_caller_views(&original, args.entry_member.as_deref())?;
+    if !args.only_helper.is_empty() {
+        views.retain(|view| {
+            view.reachable_functions
+                .iter()
+                .any(|function| args.only_helper.contains(&function.name))
+        });
+    }
     fs::create_dir_all(&args.output)
         .with_context(|| format!("creating caller output {}", args.output.display()))?;
     let mut index = String::from("# Source-resolved caller paths\n\n");
@@ -1301,8 +1497,13 @@ fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
         }));
     }
     let specialization_rows = if args.specialize {
-        let rows =
-            write_callsite_specializations(&original, &views, &args.output, args.max_iterations)?;
+        let rows = write_callsite_specializations(
+            &original,
+            &views,
+            &args.output,
+            args.max_iterations,
+            &args.only_helper,
+        )?;
         index.push_str(
             "\n[Browse callsite-specialized lexical helper bodies](specializations/README.md).\n",
         );
@@ -1512,6 +1713,7 @@ mod tests {
             output: output.clone(),
             entry_member: Some("run".into()),
             specialize: false,
+            only_helper: vec![],
             max_iterations: 12,
         })?;
         let manifest: serde_json::Value =
@@ -1563,6 +1765,7 @@ mod tests {
             output: output.clone(),
             entry_member: Some("run".into()),
             specialize: true,
+            only_helper: vec![],
             max_iterations: 12,
         })?;
         let manifest: serde_json::Value =
@@ -1602,6 +1805,50 @@ mod tests {
     }
 
     #[test]
+    fn standalone_caller_views_focuses_exact_resolved_helper_family() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source.js");
+        let output = temp.path().join("focused");
+        fs::write(
+            &input,
+            "const chosen=(mode,value)=>mode===4?value+1:value-1;\
+             const unrelated=(n)=>n*7;\
+             const api={};api.first=()=>chosen(4,3);\
+             api.second=()=>unrelated(9);api.third=()=>chosen(5,3);",
+        )?;
+        run_caller_views(CallerViewsArgs {
+            input,
+            output: output.clone(),
+            entry_member: None,
+            specialize: true,
+            only_helper: vec!["chosen".into()],
+            max_iterations: 12,
+        })?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("caller-views.json"))?)?;
+        let entries = manifest["entries"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("focused entries missing"))?;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|row| row["entry"] != ".second"));
+        assert_eq!(manifest["specialization_count"], 2);
+        let variants = manifest["specializations"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("focused variants missing"))?;
+        for row in variants {
+            assert_eq!(row["helper"], "chosen");
+            assert!(row["deobfuscation_error"].is_null(), "{row}");
+            let relative = row["path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("focused variant path missing"))?;
+            let recovered = fs::read_to_string(output.join(relative))?;
+            assert!(!recovered.contains("unrelated"), "{recovered}");
+        }
+        assert!(!output.join("entry-2.md").exists());
+        Ok(())
+    }
+
+    #[test]
     fn standalone_index_keeps_shadowed_same_named_helpers_distinct() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let source = tmp.path().join("source.js");
@@ -1612,6 +1859,7 @@ mod tests {
             output: output.clone(),
             entry_member: Some("run".into()),
             specialize: true,
+            only_helper: vec![],
             max_iterations: 12,
         })?;
         let meta: serde_json::Value =
@@ -1668,6 +1916,157 @@ mod tests {
         assert!(!transformed.contains("s==4"), "{transformed}");
         assert!(fs::read_to_string(output.join("README.md"))?.contains("scripts/a.js"));
         assert_eq!(fs::read_to_string(nested.join("a.js"))?, for_dispatcher);
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_reflows_and_polishes_original_and_specialized_helpers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        fs::write(
+            &original,
+            "function root(){const modeHandler=function(x, selector, result){for(0;(selector&90)==selector;true){touch(x);break;}result=x;return result;};}",
+        )?;
+        let handler = "const capturedHandler=function(x){return modeHandler(x,9);};";
+        fs::write(input.join("handler.js"), handler)?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+            observed_eval: Vec::new(),
+            observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
+        })?;
+        let context_dir = output.join("lexical-context");
+        let context: serde_json::Value =
+            serde_json::from_slice(&fs::read(context_dir.join("context.json"))?)?;
+        let original_helper = &context["helpers"][0];
+        assert_eq!(original_helper["name"], "modeHandler");
+        assert_eq!(original_helper["single_trip_loops_reflowed"], 1);
+        assert!(original_helper["post_reflow_error"].is_null());
+        assert_eq!(original_helper["adjacent_return_values"], 1);
+        assert!(original_helper["post_return_error"].is_null());
+        let specialization = &context["specializations"][0];
+        assert_eq!(specialization["helper"], "modeHandler");
+        assert_eq!(specialization["single_trip_loops_reflowed"], 1);
+        assert!(specialization["post_reflow_error"].is_null());
+        assert_eq!(specialization["adjacent_return_values"], 1);
+        assert!(specialization["post_return_error"].is_null());
+        let path = specialization["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no specialized source path"))?;
+        let readable = fs::read_to_string(context_dir.join(path))?;
+        assert!(!readable.contains("for ("), "{readable}");
+        assert!(!readable.contains("if (false)"), "{readable}");
+        assert!(!readable.contains("touch("), "{readable}");
+        assert!(readable.contains("return x;"), "{readable}");
+        assert_eq!(fs::read_to_string(output.join("lexical-context/original.js"))?,
+                   "function root(){const modeHandler=function(x, selector, result){for(0;(selector&90)==selector;true){touch(x);break;}result=x;return result;};}");
+        assert!(fs::read_to_string(output.join("handler.js"))?.contains("modeHandler(x, 9)"));
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_recovers_guarded_return_joins_from_original_helper() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let original_source = "function root(){const guarded=function(J,Q,Y,H){H=seed(J);if((Q&3)==1){a:{if(J.Y){H=w8(J,J.D);break a;}H=Y;}}return H;};}";
+        fs::write(&original, original_source)?;
+        fs::write(
+            input.join("handler.js"),
+            "const capturedHandler=function(J,Y,H){return guarded(J,1,Y,H);};",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+            observed_eval: Vec::new(),
+            observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
+        })?;
+        let lexical = output.join("lexical-context");
+        let context: serde_json::Value =
+            serde_json::from_slice(&fs::read(lexical.join("context.json"))?)?;
+        let row = &context["helpers"][0];
+        assert_eq!(row["name"], "guarded");
+        assert_eq!(row["guarded_return_joins"], 1, "{row}");
+        assert!(row["post_return_error"].is_null(), "{row}");
+        let path = row["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("helper view path missing"))?;
+        let recovered = fs::read_to_string(lexical.join(path))?;
+        assert!(recovered.contains("seed(J)"), "{recovered}");
+        assert!(recovered.contains("return w8(J, J.D)"), "{recovered}");
+        assert!(recovered.contains("return Y"), "{recovered}");
+        assert!(recovered.contains("return H"), "{recovered}");
+        assert!(!recovered.contains("break a"), "{recovered}");
+        assert_eq!(
+            fs::read_to_string(lexical.join("original.js"))?,
+            original_source
+        );
+        assert!(fs::read_to_string(output.join("handler.js"))?.contains("guarded(J, 1, Y, H)"));
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_keeps_prefix_callback_before_returning_closure_array() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let original_source = "function root(){const hV=function(J,Q,Y,u){if(J){Q(function(n){n(Y);});u=[function(){return Y;},function(){}];}return u;};}";
+        fs::write(&original, original_source)?;
+        fs::write(
+            input.join("handler.js"),
+            "const capturedHandler=function(J,Q,Y,u){return hV(J,Q,Y,u);};",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+            observed_eval: Vec::new(),
+            observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
+        })?;
+        let lexical = output.join("lexical-context");
+        let context: serde_json::Value =
+            serde_json::from_slice(&fs::read(lexical.join("context.json"))?)?;
+        let row = &context["helpers"][0];
+        assert_eq!(row["name"], "hV");
+        assert_eq!(row["guarded_return_joins"], 1, "{row}");
+        assert!(row["post_return_error"].is_null(), "{row}");
+        let path = row["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("helper view path missing"))?;
+        let recovered = fs::read_to_string(lexical.join(path))?;
+        assert!(recovered.contains("Q(function(n)"), "{recovered}");
+        assert!(recovered.contains("return ["), "{recovered}");
+        assert!(!recovered.contains("u = ["), "{recovered}");
+        assert!(recovered.contains("return u;"), "{recovered}");
+        assert_eq!(
+            fs::read_to_string(lexical.join("original.js"))?,
+            original_source
+        );
+        assert!(fs::read_to_string(output.join("handler.js"))?.contains("hV(J, Q, Y, u)"));
         Ok(())
     }
 

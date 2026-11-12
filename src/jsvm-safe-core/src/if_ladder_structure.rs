@@ -905,6 +905,22 @@ impl Emitter<'_> {
         Some(())
     }
 
+    /// A graph node shared by two mutually exclusive arms is not a cycle.
+    /// Each arm gets the *current path's* visited state, not a sibling arm's
+    /// history. Fuel remains shared to bound duplicated source expansion.
+    fn branch_lines(&mut self, route: &Route, stop: u64) -> Option<String> {
+        let mut branch = Self {
+            graph: self.graph,
+            loops: self.loops,
+            exit: self.exit,
+            visited: self.visited.clone(),
+            fuel: self.fuel,
+        };
+        let code = branch.lines(route, stop)?;
+        self.fuel = branch.fuel;
+        Some(code)
+    }
+
     fn lines(&mut self, route: &Route, stop: u64) -> Option<String> {
         self.spend()?;
         let mut text = route.effects.join("\n");
@@ -916,8 +932,8 @@ impl Emitter<'_> {
                 let left = yes.plain_target()?;
                 let right = no.plain_target()?;
                 let join = branch_join(left, right, self.exit, self.graph, self.loops)?;
-                let yes_text = self.lines(yes, join)?;
-                let no_text = self.lines(no, join)?;
+                let yes_text = self.branch_lines(yes, join)?;
+                let no_text = self.branch_lines(no, join)?;
                 text.push_str(&format!(
                     "\nif ({condition}) {{\n{yes_text}\n}} else {{\n{no_text}\n}}"
                 ));
@@ -993,8 +1009,8 @@ impl Emitter<'_> {
                         let left = yes.plain_target()?;
                         let right = no.plain_target()?;
                         let join = branch_join(left, right, self.exit, self.graph, self.loops)?;
-                        let yes_text = self.lines(yes, join)?;
-                        let no_text = self.lines(no, join)?;
+                        let yes_text = self.branch_lines(yes, join)?;
+                        let no_text = self.branch_lines(no, join)?;
                         out.push_str(&format!(
                             "\nif ({condition}) {{\n{yes_text}\n}} else {{\n{no_text}\n}}"
                         ));
@@ -3869,6 +3885,62 @@ mod tests {
         visitor.visit_program(&result.program);
         assert_eq!(visitor.outputs.len(), 1, "expected one structured CFG");
         visitor.outputs.remove(0)
+    }
+
+    #[test]
+    fn emits_acyclic_shared_successors_on_mutually_exclusive_paths() {
+        // The second branch can visit state 3, but may also go directly to
+        // state 4. State 3 is therefore NOT a mandatory join of the first
+        // branch: the branch-local reconstruction must be able to emit its
+        // effects in either arm without mistaking that shared DAG node for
+        // a backedge or silently skipping it.
+        let source = r#"
+            function f(first, second, log) {
+                for (var state = 1; state != 9;)
+                    if (state == 1) state = first() ? 2 : 3;
+                    else if (state == 2) state = second() ? 3 : 4;
+                    else if (state == 3) { log.push("shared"); state = 4; }
+                    else if (state == 4) return log;
+                return log;
+            }
+        "#;
+        let restored = recover(source);
+        assert!(restored.contains("first()"), "{restored}");
+        assert!(restored.contains("second()"), "{restored}");
+        assert!(restored.contains("log.push(\"shared\")"), "{restored}");
+        assert!(!restored.contains("state == 1"), "{restored}");
+        assert!(!restored.contains("state == 2"), "{restored}");
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, &restored, SourceType::cjs());
+        assert!(parsed.is_clean(), "rewritten source must parse cleanly");
+    }
+
+    #[test]
+    fn reaches_shared_graph_nodes_through_while_initializer_proof() {
+        let source = r#"
+            function f(first, second, log) {
+                let state;
+                state = 1;
+                while (state != 9)
+                    if (state == 1) state = first() ? 2 : 3;
+                    else if (state == 2) state = second() ? 3 : 4;
+                    else if (state == 3) { log.push("shared"); state = 4; }
+                    else if (state == 4) return log;
+                return log;
+            }
+        "#;
+        let result = deobfuscate(source, 12, &WorkBudget::unlimited("shared-dag-while"));
+        let recovered = result.ok().flatten();
+        assert!(
+            recovered
+                .as_ref()
+                .is_some_and(|value| value.transforms.contains_key("if_ladder_structured")),
+            "{recovered:?}"
+        );
+        if let Some(value) = recovered {
+            assert!(!value.source.contains("state == 1"), "{}", value.source);
+            assert!(value.source.contains("log.push"), "{}", value.source);
+        }
     }
 
     #[test]
