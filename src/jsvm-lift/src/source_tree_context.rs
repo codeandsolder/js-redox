@@ -248,6 +248,16 @@ pub struct AnnotatedHandlerCalls {
     pub helpers: Vec<String>,
 }
 
+/// A recovered, source-backed primitive-argument specialization. The path is
+/// relative to the lexical-context directory; it is a browsing view, not a
+/// drop-in replacement for the original helper.
+#[derive(Clone, Debug)]
+pub struct SpecializedHelperCall {
+    pub helper: String,
+    pub constants: Vec<(usize, String)>,
+    pub file: String,
+}
+
 /// Preserve the exact expression of a tiny, single-return original helper.
 /// Longer or effectful function bodies are linked instead of summarized.
 fn single_return_from_original(helper: &ContextHelper) -> Option<String> {
@@ -284,9 +294,15 @@ fn single_return_from_original(helper: &ContextHelper) -> Option<String> {
         .then(|| text.to_owned())
 }
 
+type LiteralArguments = Vec<(usize, String)>;
+type KnownSpecializations = BTreeMap<(String, LiteralArguments), String>;
+type LiteralCallSites = BTreeMap<u32, (String, LiteralArguments)>;
+
 struct HandlerCallAnnotator<'s> {
     scoping: &'s Scoping,
     helpers: &'s BTreeMap<String, &'s ContextHelper>,
+    specialized: &'s KnownSpecializations,
+    call_constants: &'s LiteralCallSites,
     helper_prefix: String,
     seen: BTreeSet<String>,
     edits: Vec<(usize, String)>,
@@ -304,21 +320,55 @@ impl<'a> Visit<'a> for HandlerCallAnnotator<'_> {
                     self.scoping.get_reference(reference).symbol_id().is_none()
                 });
                 let name = identifier.name.as_str();
-                if external && !self.seen.contains(name) {
+                if external {
                     if let Some(helper) = self.helpers.get(name) {
-                        let link = format!("{}{}", self.helper_prefix, helper.file);
-                        let detail = if helper.mutable_binding {
-                            format!("initial definition {link}; original binding reassigned")
-                        } else if let Some(expression) = single_return_from_original(helper) {
-                            format!("return {expression}; original definition {link}")
-                        } else {
-                            format!("original definition {link}")
-                        };
-                        self.edits.push((
-                            identifier.span.end as usize,
-                            format!(" /* lexical helper {name}: {detail} */"),
-                        ));
-                        self.seen.insert(name.to_owned());
+                        let mut details = Vec::new();
+                        if self.seen.insert(name.to_owned()) {
+                            let link = format!("{}{}", self.helper_prefix, helper.file);
+                            let detail = if helper.mutable_binding {
+                                format!("initial definition {link}; original binding reassigned")
+                            } else if let Some(expression) = single_return_from_original(helper) {
+                                format!("return {expression}; original definition {link}")
+                            } else {
+                                format!("original definition {link}")
+                            };
+                            details.push(detail);
+                        }
+                        if !helper.mutable_binding {
+                            if let Some((callee, constants)) =
+                                self.call_constants.get(&call.span.start)
+                            {
+                                if callee == name {
+                                    if let Some(path) =
+                                        self.specialized.get(&(name.to_owned(), constants.clone()))
+                                    {
+                                        details.push(format!(
+                                            "specialized at {} => {}{}",
+                                            constants
+                                                .iter()
+                                                .map(|(index, value)| format!("arg{index}={value}"))
+                                                .collect::<Vec<_>>()
+                                                .join(", "),
+                                            self.helper_prefix,
+                                            path
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        if !details.is_empty() {
+                            self.edits.push((
+                                identifier.span.end as usize,
+                                format!(
+                                    " /* lexical helper {name}: {} */",
+                                    details
+                                        .join("; ")
+                                        .replace("*/", "*\\/")
+                                        .replace('\n', "\\n")
+                                        .replace('\r', "\\r")
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -336,6 +386,28 @@ pub fn annotate_handler_helper_calls(
     context: &ContextSourceTree,
     handler: &HandlerContext,
 ) -> Result<Option<AnnotatedHandlerCalls>> {
+    annotate_handler_helper_calls_with_specializations(source, context, handler, &[])
+}
+
+pub fn annotate_handler_helper_calls_with_specializations(
+    source: &str,
+    context: &ContextSourceTree,
+    handler: &HandlerContext,
+    specialized_calls: &[SpecializedHelperCall],
+) -> Result<Option<AnnotatedHandlerCalls>> {
+    let call_constants = crate::source_tree_specialize::literal_calls(source)?
+        .into_iter()
+        .map(|call| (call.span.start, (call.helper, call.constants)))
+        .collect::<BTreeMap<_, _>>();
+    let specialized = specialized_calls
+        .iter()
+        .map(|item| {
+            (
+                (item.helper.clone(), item.constants.clone()),
+                item.file.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::unambiguous());
     ensure!(
@@ -364,6 +436,8 @@ pub fn annotate_handler_helper_calls(
     let mut annotator = HandlerCallAnnotator {
         scoping: semantic.semantic.scoping(),
         helpers: &helpers,
+        specialized: &specialized,
+        call_constants: &call_constants,
         // The emitted file is under annotated-handlers/<handler path>,
         // while definitions live under sibling helpers/. Account for
         // handlers originally located in arbitrarily nested folders.
@@ -460,6 +534,74 @@ mod tests {
         );
         let allocator = Allocator::default();
         assert!(parse_program(&allocator, &output.source, SourceType::unambiguous()).is_clean());
+        Ok(())
+    }
+
+    #[test]
+    fn inline_call_context_links_each_proven_mode_specific_body() -> Result<()> {
+        let original = "function parent(){const O=function(input, mode){return mode === 24 ? input + 1 : input;};}";
+        let source = r#"const capturedHandler=function(input,mode){
+            O(input,24);
+            O(input,16);
+            O(input,24);
+            O(input,"*/");
+            O(input,mode);
+            function inner(O){ return O(input,24); }
+        };"#;
+        let context =
+            reconstruct_context(original, &[("nested/handler.js".into(), source.into())])?;
+        let specializations = [
+            super::SpecializedHelperCall {
+                helper: "O".into(),
+                constants: vec![(1, "24".into())],
+                file: "specializations/O-24.js".into(),
+            },
+            super::SpecializedHelperCall {
+                helper: "O".into(),
+                constants: vec![(1, "16".into())],
+                file: "specializations/O-16.js".into(),
+            },
+            super::SpecializedHelperCall {
+                helper: "O".into(),
+                constants: vec![(1, "\"*/\"".into())],
+                file: "specializations/O-comment.js".into(),
+            },
+        ];
+        let result = super::annotate_handler_helper_calls_with_specializations(
+            source,
+            &context,
+            &context.handlers[0],
+            &specializations,
+        )?
+        .context("expected source-backed annotations")?;
+        assert_eq!(result.call_count, 4);
+        assert_eq!(result.helpers, ["O"]);
+        assert_eq!(
+            result
+                .source
+                .matches("specialized at arg1=24 => ../../specializations/O-24.js")
+                .count(),
+            2,
+            "{}",
+            result.source
+        );
+        assert!(result
+            .source
+            .contains("specialized at arg1=16 => ../../specializations/O-16.js"));
+        assert!(
+            result.source.contains("specializations/O-comment.js")
+                && result.source.contains("*\\/"),
+            "{}",
+            result.source
+        );
+        assert!(result.source.contains("O(input,mode)"), "{}", result.source);
+        assert!(
+            result.source.contains("return O(input,24)"),
+            "{}",
+            result.source
+        );
+        let allocator = Allocator::default();
+        assert!(parse_program(&allocator, &result.source, SourceType::unambiguous()).is_clean());
         Ok(())
     }
 

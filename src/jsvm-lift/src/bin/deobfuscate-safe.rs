@@ -9,7 +9,10 @@ use jsvm_lift::{
     sha256_hex,
     source_tree_aliases::{explain_captured_handler_origins, explain_property_aliases},
     source_tree_callflow::{reconstruct_caller_views, CallerView},
-    source_tree_context::{annotate_handler_helper_calls, reconstruct_context},
+    source_tree_context::{
+        annotate_handler_helper_calls_with_specializations, reconstruct_context,
+        SpecializedHelperCall,
+    },
     source_tree_specialize::{specialize_calls, specialize_resolved_call_graph},
 };
 use serde_json::json;
@@ -411,6 +414,53 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             md.push_str("[Browse exact lexical-alias analysis views](lexical-context/explained/README.md). ");
             md.push_str("The original property expressions remain dynamic where needed.\n\n");
         }
+        // A fixed-argument callsite can expose a more useful helper body than
+        // its multipurpose definition. Materialize *both* source views.
+        let helper_counts =
+            context
+                .helpers
+                .iter()
+                .fold(BTreeMap::<&str, usize>::new(), |mut counts, helper| {
+                    *counts.entry(helper.name.as_str()).or_default() += 1;
+                    counts
+                });
+        let helper_sources = context
+            .helpers
+            .iter()
+            .filter(|helper| {
+                !helper.mutable_binding && helper_counts.get(helper.name.as_str()) == Some(&1)
+            })
+            .map(|helper| (helper.name.clone(), helper.source.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let specializations = specialize_calls(&source_inputs, &helper_sources)?;
+        let specialized_links = specializations
+            .iter()
+            .map(|specialized| {
+                let encoded_args = serde_json::to_string(&specialized.arguments)?;
+                let suffix = &sha256_hex(encoded_args.as_bytes())[..12];
+                let hint = specialized
+                    .arguments
+                    .iter()
+                    .map(|(index, literal)| {
+                        let literal = literal
+                            .chars()
+                            .filter(char::is_ascii_alphanumeric)
+                            .take(15)
+                            .collect::<String>();
+                        format!("arg{index}-{literal}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("_");
+                Ok(SpecializedHelperCall {
+                    helper: specialized.helper.clone(),
+                    constants: specialized.arguments.clone(),
+                    file: format!(
+                        "specializations/{}-{}-{suffix}.js",
+                        specialized.helper, hint
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         // Show the original lexical behavior at *actual callsites* in a
         // separate, non-executable browsing copy of each recovered handler.
         // This never touches the semantic recovery file written above.
@@ -421,12 +471,20 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
              Comments at direct calls identify uniquely resolved original \
              helpers; small single-return bodies are quoted verbatim, while \
              larger helpers link to their actual original definitions. \
-             Reassigned helpers describe their *initial* definition only. \
-             Other closure references remain unresolved, not guessed.\n\n",
+             A proven literal-selector call links to its existing specialized \
+             helper body at every matching callsite. Reassigned helpers \
+             describe their *initial* definition only. Other closure \
+             references remain unresolved, not guessed.\n\n",
         );
         for handler in &context.handlers {
             let code = fs::read_to_string(out.join(&handler.path))?;
-            let Some(annotated) = annotate_handler_helper_calls(&code, &context, handler)? else {
+            let Some(annotated) = annotate_handler_helper_calls_with_specializations(
+                &code,
+                &context,
+                handler,
+                &specialized_links,
+            )?
+            else {
                 continue;
             };
             let relative = format!("annotated-handlers/{}", handler.path);
@@ -460,25 +518,6 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             );
         }
         fs::write(folder.join("README.md"), &helper_index)?;
-        // A fixed-argument callsite can expose a more useful helper body than
-        // its multipurpose definition. Materialize *both* source views.
-        let helper_counts =
-            context
-                .helpers
-                .iter()
-                .fold(BTreeMap::<&str, usize>::new(), |mut counts, helper| {
-                    *counts.entry(helper.name.as_str()).or_default() += 1;
-                    counts
-                });
-        let helper_sources = context
-            .helpers
-            .iter()
-            .filter(|helper| {
-                !helper.mutable_binding && helper_counts.get(helper.name.as_str()) == Some(&1)
-            })
-            .map(|helper| (helper.name.clone(), helper.source.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let specializations = specialize_calls(&source_inputs, &helper_sources)?;
         fs::create_dir_all(folder.join("specializations"))?;
         let mut specializations_md =
             String::from("# Constant-argument specialized helper code\n\n");
@@ -486,26 +525,8 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             "Each file substitutes the exact constant arguments of a real handler call              into their original lexical parameter references, then runs static JS              deobfuscation. Original helpers remain available; these files are              callsite-specific analysis views inside the original closure context,              not independent runnable modules.\n\n"
         );
         let mut specialization_rows = Vec::new();
-        for specialized in specializations {
-            let encoded_args = serde_json::to_string(&specialized.arguments)?;
-            let suffix = &sha256_hex(encoded_args.as_bytes())[..12];
-            let hint = specialized
-                .arguments
-                .iter()
-                .map(|(index, literal)| {
-                    let literal = literal
-                        .chars()
-                        .filter(char::is_ascii_alphanumeric)
-                        .take(15)
-                        .collect::<String>();
-                    format!("arg{index}-{literal}")
-                })
-                .collect::<Vec<_>>()
-                .join("_");
-            let relative = format!(
-                "specializations/{}-{}-{suffix}.js",
-                specialized.helper, hint
-            );
+        for (specialized, link) in specializations.into_iter().zip(&specialized_links) {
+            let relative = link.file.clone();
             let budget = budgets.operation(
                 AnalysisOperation::SafeDeobfuscation,
                 format!("specialized {}", specialized.helper),
@@ -1329,6 +1350,10 @@ mod tests {
         let inline = fs::read_to_string(context_dir.join("annotated-handlers/handler.js"))?;
         assert!(
             inline.contains("helper /* lexical helper helper: return byte(x)+y; original definition ../helpers/helper-"),
+            "{inline}"
+        );
+        assert!(
+            inline.contains("specialized at arg1=16 => ../specializations/helper-arg1-16-"),
             "{inline}"
         );
         assert!(fs::read_to_string(output.join("handler.js"))?.contains("helper(x, 16)"));

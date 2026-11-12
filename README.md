@@ -377,7 +377,10 @@ A separate `lexical-context/annotated-handlers/` tree puts confirmed helper
 context **at the first direct call** in each recovered handler. For a short
 original, stable, single-return function it quotes that exact return expression
 next to the call; for longer helpers it links directly to the original
-definition. Helpers whose bindings are subsequently reassigned explicitly
+definition. When a recovered direct call has statically proven literal
+arguments, its annotation additionally links to the already generated,
+argument-specialized helper body. This applies at **every matching callsite**,
+not only the first use of a helper. Helpers whose bindings are subsequently reassigned explicitly
 identify the linked code as the *initial definition*, not necessarily the
 function called at runtime. Semantic symbol resolution prevents annotations
 on local/shadowed parameters or unrecognized call targets. These inline
