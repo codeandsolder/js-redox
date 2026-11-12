@@ -891,7 +891,7 @@ mod tests {
         let reconstruction = fs::read(out.join("reconstruction.json"))?;
         let witness_manifest = fs::read(input.observed_tree.join("manifest.json"))?;
 
-        attach_observed_eval_sources(&out, &[input.clone()])?;
+        attach_observed_eval_sources(&out, std::slice::from_ref(&input))?;
         assert_eq!(original, fs::read(out.join("original.js"))?);
         assert_eq!(reconstruction, fs::read(out.join("reconstruction.json"))?);
 
@@ -935,7 +935,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let (out, input) = sample(tmp.path())?;
         fs::write(&input.inner_source, "tampered VM source")?;
-        let result = attach_observed_eval_sources(&out, &[input.clone()]);
+        let result = attach_observed_eval_sources(&out, std::slice::from_ref(&input));
         assert!(
             result.is_err(),
             "mismatched executable source must be rejected"
