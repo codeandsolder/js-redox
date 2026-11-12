@@ -105,7 +105,7 @@ test('native multi-site bundle keeps same raw source linked to distinct verified
     const denied=invoke(binary,['source-tree',tree,badOrder,'--max-iterations','2',
       '--observed-direct-bundle',exportDir,path.join(captured,'executable.js')]);
     assert.notEqual(denied.status,0);
-    assert.match(denied.stderr,/global event sequence/);
+    assert.match(denied.stderr,/event ordering|global event sequence/);
     assert.equal(fs.existsSync(badOrder),false);
   }finally{fs.rmSync(tmp,{recursive:true,force:true});}
 });

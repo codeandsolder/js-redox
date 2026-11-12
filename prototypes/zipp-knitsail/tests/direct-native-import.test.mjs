@@ -74,7 +74,7 @@ test('actual single-stage source -> v3 manifest -> native AST verified overlay',
     fs.writeFileSync(badSource,original+'// tampered');
     const badDest=path.join(tmp,'bad-output');
     const failed=spawnSync(binary,['source-tree',staticTree,badDest,
-      '--max-iterations','2','--observed-direct',exported,badSource],
+      '--max-iterations','2','--observed-direct-bundle',exported,badSource],
       {encoding:'utf8',timeout:60000});
     assert.notEqual(failed.status,0);
     assert.match(failed.stderr,/SHA-256 mismatch/);
