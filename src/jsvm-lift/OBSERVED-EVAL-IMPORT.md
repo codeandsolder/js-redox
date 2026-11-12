@@ -36,7 +36,11 @@ in the manifest; private payloads remain outside Git.
 
 The importer checks the loader's indirect-eval source site and the inner
 executable direct-eval AST with the OXC semantic resolver, including the
-argument's nearest lexical formal-parameter binding. Each observed source
+argument's nearest lexical formal-parameter binding. Lexical frames cover
+both ordinary function expressions/declarations and arrow functions,
+including nested arrow callbacks. Function and arrow frames have distinct
+kinds: matching argument names and parameter lists alone cannot conflate
+the two source forms. Each observed source
 must match its exact SHA-256, UTF-16 code-unit length, event counts and
 content-addressed path. Old single-layer v1 manifests are deliberately
 rejected.
