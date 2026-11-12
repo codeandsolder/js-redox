@@ -183,6 +183,55 @@ fn collect_js_sources(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(sources)
 }
 
+struct PolishedHelperView {
+    source: String,
+    single_trip_loops_reflowed: usize,
+    post_reflow_transforms: BTreeMap<String, usize>,
+    post_reflow_error: Option<String>,
+}
+
+/// Re-run the existing static pass after loop structure has become explicit.
+/// This allows its proven dead-branch and block reductions to see through
+/// former single-trip loops without introducing another JS evaluator.
+fn polish_lexical_helper_view(
+    source: String,
+    label: &str,
+    max_iterations: usize,
+    format_output: bool,
+    budgets: &AnalysisBudgets,
+) -> Result<PolishedHelperView> {
+    let reflowed = reflow_single_trip_loops(&source)?;
+    if reflowed.rewritten_loops == 0 {
+        return Ok(PolishedHelperView {
+            source,
+            single_trip_loops_reflowed: 0,
+            post_reflow_transforms: BTreeMap::new(),
+            post_reflow_error: None,
+        });
+    }
+    let budget = budgets.operation(
+        AnalysisOperation::SafeDeobfuscation,
+        format!("post-reflow {label}"),
+    );
+    let (source, post_reflow_transforms, post_reflow_error) = match deobfuscate_source(
+        &reflowed.source,
+        format!("post-reflow {label}"),
+        SourceMode::Auto,
+        max_iterations,
+        format_output,
+        &budget,
+    ) {
+        Ok(outcome) => (outcome.source, outcome.report.transforms, None),
+        Err(error) => (reflowed.source, BTreeMap::new(), Some(error.to_string())),
+    };
+    Ok(PolishedHelperView {
+        source,
+        single_trip_loops_reflowed: reflowed.rewritten_loops,
+        post_reflow_transforms,
+        post_reflow_error,
+    })
+}
+
 fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
     let root = args
         .input
@@ -351,7 +400,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             let budget = budgets.operation(AnalysisOperation::SafeDeobfuscation, label.clone());
             let outcome = deobfuscate_source(
                 &helper.source,
-                label,
+                label.clone(),
                 SourceMode::Auto,
                 args.max_iterations,
                 args.format_output,
@@ -367,14 +416,19 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             };
             // The original program remains byte-exact in lexical-context/original.js.
             // Improve only the independently readable helper projection.
-            let reflowed = reflow_single_trip_loops(&code)?;
-            let rewritten_loops = reflowed.rewritten_loops;
-            let code = if rewritten_loops > 0 && args.format_output {
-                jsvm_lift::js_format::format_source(&reflowed.source, &budget)
-                    .unwrap_or(reflowed.source)
-            } else {
-                reflowed.source
-            };
+            let polished = polish_lexical_helper_view(
+                code,
+                &label,
+                args.max_iterations,
+                args.format_output,
+                &budgets,
+            )?;
+            let code = polished.source;
+            let rewritten_loops = polished.single_trip_loops_reflowed;
+            let post_reflow_error = polished.post_reflow_error;
+            for (kind, count) in polished.post_reflow_transforms {
+                *transforms.entry(kind).or_default() += count;
+            }
             if rewritten_loops > 0 {
                 *transforms
                     .entry("source_single_trip_reflow".to_owned())
@@ -419,6 +473,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "binding_mutable": helper.mutable_binding,
                 "references": helper.references,
                 "single_trip_loops_reflowed": rewritten_loops,
+                "post_reflow_error": post_reflow_error,
                 "transforms": transforms,
                 "error": error,
             }));
@@ -616,14 +671,19 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                     Some(error.to_string()),
                 ),
             };
-            let reflowed = reflow_single_trip_loops(&code)?;
-            let rewritten_loops = reflowed.rewritten_loops;
-            let code = if rewritten_loops > 0 && args.format_output {
-                jsvm_lift::js_format::format_source(&reflowed.source, &budget)
-                    .unwrap_or(reflowed.source)
-            } else {
-                reflowed.source
-            };
+            let polished = polish_lexical_helper_view(
+                code,
+                &format!("specialized {}", specialized.helper),
+                args.max_iterations,
+                args.format_output,
+                &budgets,
+            )?;
+            let code = polished.source;
+            let rewritten_loops = polished.single_trip_loops_reflowed;
+            let post_reflow_error = polished.post_reflow_error;
+            for (kind, count) in polished.post_reflow_transforms {
+                *transforms.entry(kind).or_default() += count;
+            }
             if rewritten_loops > 0 {
                 *transforms
                     .entry("source_single_trip_reflow".to_owned())
@@ -660,6 +720,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "call_sites": specialized.call_sites,
                 "specialized_source_changed": actual_changes,
                 "single_trip_loops_reflowed": rewritten_loops,
+                "post_reflow_error": post_reflow_error,
                 "transforms": transforms,
                 "error": error,
             }));
@@ -1401,6 +1462,53 @@ mod tests {
         assert!(!transformed.contains("s==4"), "{transformed}");
         assert!(fs::read_to_string(output.join("README.md"))?.contains("scripts/a.js"));
         assert_eq!(fs::read_to_string(nested.join("a.js"))?, for_dispatcher);
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_reflows_and_polishes_original_and_specialized_helpers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        fs::write(
+            &original,
+            "function root(){const modeHandler=function(x, selector){for(0;(selector&90)==selector;true){touch(x);break;}return x;};}",
+        )?;
+        let handler = "const capturedHandler=function(x){return modeHandler(x,9);};";
+        fs::write(input.join("handler.js"), handler)?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let context_dir = output.join("lexical-context");
+        let context: serde_json::Value =
+            serde_json::from_slice(&fs::read(context_dir.join("context.json"))?)?;
+        let original_helper = &context["helpers"][0];
+        assert_eq!(original_helper["name"], "modeHandler");
+        assert_eq!(original_helper["single_trip_loops_reflowed"], 1);
+        assert!(original_helper["post_reflow_error"].is_null());
+        let specialization = &context["specializations"][0];
+        assert_eq!(specialization["helper"], "modeHandler");
+        assert_eq!(specialization["single_trip_loops_reflowed"], 1);
+        assert!(specialization["post_reflow_error"].is_null());
+        let path = specialization["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no specialized source path"))?;
+        let readable = fs::read_to_string(context_dir.join(path))?;
+        assert!(!readable.contains("for ("), "{readable}");
+        assert!(!readable.contains("if (false)"), "{readable}");
+        assert!(!readable.contains("touch("), "{readable}");
+        assert!(readable.contains("return x;"), "{readable}");
+        assert_eq!(fs::read_to_string(output.join("lexical-context/original.js"))?,
+                   "function root(){const modeHandler=function(x, selector){for(0;(selector&90)==selector;true){touch(x);break;}return x;};}");
+        assert!(fs::read_to_string(output.join("handler.js"))?.contains("modeHandler(x, 9)"));
         Ok(())
     }
 

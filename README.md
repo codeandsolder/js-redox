@@ -551,10 +551,15 @@ also structurally reduce single-trip `for`/`while`/`do-while` loops when an
 unconditional terminal break proves that a second iteration is impossible.
 The original initializer and condition are evaluated exactly once, loop
 updates remain unreachable, and potential earlier breaks or continues
-prevent the rewrite. The lexical program remains byte-exact in
-`lexical-context/original.js`; reflow counts are recorded per helper and
-specialization in `lexical-context/context.json`. The original helper and
-specialized body are kept and linked by original handler callsite.
+prevent the rewrite. A second run of the existing proof-oriented static
+deobfuscator then folds dead conditions and redundant blocks exposed by
+that structural change (for example, a specialized `if (false)` branch).
+Any unsuccessful follow-up analysis is recorded rather than aborting
+other helpers. The lexical program remains byte-exact in
+`lexical-context/original.js`; reflow counts, follow-up transforms, and
+errors are recorded per helper and specialization in
+`lexical-context/context.json`. Both original helper and specialized body
+are kept and linked by original handler callsite.
 
 Specialization handles primitive literal arguments, including multiple
 constant parameters in a call. It rejects parameter writes, direct eval,
