@@ -4,6 +4,13 @@ The native Rust source-tree command supports optional execution-observed
 JavaScript sources. The ordinary static path does not change; no Node or ZIPP
 process is required to import a previously exported witness.
 
+For optional observed-eval inputs, source-tree constructs its complete output
+in a temporary sibling directory and publishes it only after every witness
+and AST link has been validated. Rejected or incomplete captures leave no
+partial output or staging files. The requested destination must not exist,
+so an existing analyst result is never silently overwritten. Static-only
+source-tree retains its previous output behavior.
+
 ## CLI
 
 Repeat one group of three paths for each independent capture:

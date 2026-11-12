@@ -190,7 +190,66 @@ fn collect_js_sources(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(sources)
 }
 
-fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
+fn run_source_tree(mut args: SourceTreeArgs) -> Result<()> {
+    if args.observed_eval.is_empty() {
+        println!("{}", build_source_tree(args)?);
+        return Ok(());
+    }
+    // Observed evidence can fail only after the static output is constructed.
+    // Build the entire tree beside its destination and publish it atomically:
+    // invalid provenance must not leave a partial tree that blocks a retry.
+    let input = args
+        .input
+        .canonicalize()
+        .with_context(|| format!("source tree does not exist: {}", args.input.display()))?;
+    anyhow::ensure!(input.is_dir(), "source tree must be a directory");
+    let output_name = args
+        .output
+        .file_name()
+        .context("observed source-tree destination needs a directory name")?
+        .to_owned();
+    let parent = args
+        .output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let parent = parent.canonicalize()?;
+    let destination = parent.join(output_name);
+    anyhow::ensure!(
+        !destination.starts_with(&input) && !input.starts_with(&destination),
+        "source and output trees must be disjoint"
+    );
+    // Even a dangling symlink must not be treated as an unused output path.
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => anyhow::bail!(
+            "observed source-tree destination already exists: {}",
+            destination.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("checking observed source-tree destination"),
+    }
+    let stage = tempfile::Builder::new()
+        .prefix(".jsvm-observed-stage-")
+        .tempdir_in(&parent)?;
+    args.output = stage.path().join("tree");
+    let mut result = build_source_tree(args)?;
+    anyhow::ensure!(
+        fs::symlink_metadata(&destination).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "observed source-tree destination appeared during staging"
+    );
+    fs::rename(stage.path().join("tree"), &destination).with_context(|| {
+        format!(
+            "publishing observed source tree to {}",
+            destination.display()
+        )
+    })?;
+    result["output"] = json!(destination.display().to_string());
+    println!("{result}");
+    Ok(())
+}
+
+fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
     let root = args
         .input
         .canonicalize()
@@ -917,18 +976,14 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
         })
         .collect::<Vec<_>>();
     attach_observed_eval_sources(&out, &observed)?;
-    println!(
-        "{}",
-        json!({
-            "source_count": summary["source_count"],
-            "semantically_changed_count": semantically_changed,
+    Ok(json!({
+        "source_count": summary["source_count"],
+        "semantically_changed_count": semantically_changed,
         "presentation_only_count": presentation_only,
-            "unrecovered_count": failed,
-            "transforms": summary["transforms"],
-            "output": out.display().to_string(),
-        })
-    );
-    Ok(())
+        "unrecovered_count": failed,
+        "transforms": summary["transforms"],
+        "output": out.display().to_string(),
+    }))
 }
 
 fn run_source(args: SourceArgs) -> Result<()> {
@@ -1221,8 +1276,9 @@ mod tests {
         run_caller_views, run_source_tree, sha256_hex, Args, CallerViewsArgs, Command,
         SourceTreeArgs,
     };
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use clap::Parser;
+    use serde_json::json;
     use std::{fs, path::PathBuf};
 
     #[test]
@@ -1875,6 +1931,121 @@ mod tests {
             leaf["semantic_rewrites"].as_u64().is_some_and(|n| n > 0),
             "{leaf}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn observed_source_tree_publishes_only_fully_validated_results() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let input = tmp.path().join("static");
+        fs::create_dir_all(&input)?;
+        fs::write(
+            input.join("oU.js"),
+            "const oU=function(D){return eval(D);};",
+        )?;
+        let outer = tmp.path().join("outer.js");
+        let inner = tmp.path().join("inner.js");
+        let outer_source = "const run=(0,eval)(payload);";
+        let inner_source = "const oU=function(D){return eval(D);};";
+        fs::write(&outer, outer_source)?;
+        fs::write(&inner, inner_source)?;
+
+        let observed = tmp.path().join("observed");
+        fs::create_dir_all(observed.join("raw"))?;
+        let raw_source = "0,(function(x){return x+1})";
+        let raw_hash = sha256_hex(raw_source.as_bytes());
+        fs::write(observed.join(format!("raw/{raw_hash}.txt")), raw_source)?;
+        let outer_start = outer_source
+            .find("(0,eval)(")
+            .context("missing indirect eval")?;
+        let inner_start = inner_source
+            .find("eval(D)")
+            .context("missing direct eval")?;
+        let manifest = json!({
+            "schemaVersion": 2,
+            "htmlSha256": "a".repeat(64),
+            "evidenceKind": "execution-observed",
+            "sourceProvenance": {
+                "outerLoader": {
+                    "sha256": sha256_hex(outer_source.as_bytes()),
+                    "decodedBy": "observed-first-indirect-eval",
+                    "indirectEvalSite": {
+                        "start": outer_start,
+                        "end": outer_start + 9,
+                        "expression": "(0,eval)("
+                    }
+                },
+                "innerExecutable": {
+                    "sha256": sha256_hex(inner_source.as_bytes()),
+                    "evalSite": {
+                        "start": inner_start,
+                        "end": inner_start + 7,
+                        "expression": "eval(D)"
+                    },
+                    "strippedLeadingNewlineCodeUnits": 0
+                }
+            },
+            "truncated": false,
+            "eventCount": 1,
+            "uniqueSourceCount": 1,
+            "entries": [{
+                "sha256": raw_hash,
+                "utf16Length": raw_source.encode_utf16().count(),
+                "firstEvent": 0,
+                "occurrences": 1,
+                "returned": 1,
+                "threw": 0,
+                "returnedTypes": {"function": 1},
+                "thrownTypes": {},
+                "rawFile": format!("raw/{raw_hash}.txt"),
+                "readableFile": null,
+                "readableStatus": "raw-only"
+            }]
+        });
+        let manifest_path = observed.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+        let args = |destination: PathBuf| SourceTreeArgs {
+            input: input.clone(),
+            output: destination,
+            max_iterations: 2,
+            format_output: false,
+            context_source: None,
+            origin_source: None,
+            caller_view_entry: None,
+            observed_eval: vec![observed.clone(), outer.clone(), inner.clone()],
+        };
+
+        // Invalid evidence fails *after* the static transformation, but no
+        // partially reconstructed tree may appear at the published path.
+        let invalid = tmp.path().join("invalid");
+        let mut corrupted = manifest.clone();
+        corrupted["sourceProvenance"]["innerExecutable"]["sha256"] = json!("b".repeat(64));
+        fs::write(&manifest_path, serde_json::to_vec(&corrupted)?)?;
+        assert!(run_source_tree(args(invalid.clone())).is_err());
+        assert!(!invalid.exists());
+        assert!(
+            fs::read_dir(tmp.path())?.all(|e| e.is_ok_and(|e| !e
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".jsvm-observed-stage-"))),
+            "failed observed import left a staging directory"
+        );
+
+        fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+        let valid = tmp.path().join("valid");
+        run_source_tree(args(valid.clone()))?;
+        let index: serde_json::Value =
+            serde_json::from_slice(&fs::read(valid.join("runtime-observed/index.json"))?)?;
+        assert_eq!(index["schema"], "js-redox/linked-runtime-source-tree/v2");
+        assert_eq!(index["captures"][0]["sources"], 1);
+        assert_eq!(index["captures"][0]["staticAstMatches"], 1);
+        assert!(valid.join("oU.js").exists());
+        assert!(!invalid.exists());
+
+        // A subsequent invocation must never overwrite an existing tree.
+        let old_readme = fs::read(valid.join("README.md"))?;
+        assert!(run_source_tree(args(valid.clone())).is_err());
+        assert_eq!(old_readme, fs::read(valid.join("README.md"))?);
         Ok(())
     }
 
