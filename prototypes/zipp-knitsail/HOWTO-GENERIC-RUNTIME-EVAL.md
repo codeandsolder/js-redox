@@ -130,3 +130,56 @@ JSREDOX_DEOBFUSCATE_BIN=/path/to/deobfuscate-safe \
 
 [Knitsail-specific archived replay](HOWTO-RUNTIME-PROVENANCE.md) remains a
 separate fixture and proof of the historical 51-event, 40-source sample.
+
+## Direct original JavaScript (no loader)
+
+For an ordinary synchronous JavaScript program with a direct eval site,
+there is **no outer source layer**. Do not invent one. Use the separate
+single-stage producer and direct provenance schema v3:
+
+```json
+{
+  "sourceFile": "program.js",
+  "entryFile": "entry.js",
+  "evalExpression": "eval(D + suffix)",
+  "firstArgumentExpression": "D + suffix"
+}
+```
+
+```bash
+node scripts/capture-direct-eval.mjs inputs/direct/config.json inputs/direct-capture
+node scripts/export-runtime-eval.mjs \
+  inputs/direct-capture/report.json \
+  inputs/direct-capture/sources \
+  inputs/direct-export \
+  /path/to/deobfuscate-safe
+
+deobfuscate-safe source-tree /path/to/static-source /path/to/combined \
+  --observed-direct inputs/direct-export inputs/direct-capture/executable.js
+```
+
+`entryFile` is optional: a source program can invoke the selected eval during
+its own evaluation. The original executable is written unchanged to
+`executable.js`; only the ephemeral execution copy is instrumented. Source
+config offsets use UTF-16, not UTF-8 bytes. String capture, local lexical
+scope preservation, source hashing, exact-identity checking and event
+refusals use the same observation core as the two-stage producer.
+
+Direct provenance uses `schemaVersion:3`, `captureSha256`, and
+`sourceProvenance:{kind:"direct-executable", executable:{sha256,evalSite}}`.
+It contains **no outer loader hash or invented indirect-eval source site**.
+The native importer validates this independently using OXC and the supplied
+original executable. Existing original two-stage captures are genuine v2
+evidence and use the separate `--observed-eval` triplet.
+
+This first-party Node VM runner executes synchronous script syntax;
+real browser DOM/network or ESM execution requires a different execution
+environment. The native importer's static parser still supports ESM source
+views independently of this runner.
+
+Native verification:
+
+```bash
+JSREDOX_DEOBFUSCATE_BIN=/path/to/deobfuscate-safe \
+  node --test tests/direct-native-import.test.mjs
+```

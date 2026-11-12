@@ -31,6 +31,12 @@ All 785 static JS/manifest files remain byte-identical in the combined tree.
 
 ## Components and documentation
 
+- `scripts/capture-direct-eval.mjs`: original one-stage JavaScript direct-eval
+  source capture with **v3 provenance**, no invented loader. Optional entry
+  script. Verifies exact original executable bytes and UTF-16 callsite.
+  [Direct-source usage](HOWTO-GENERIC-RUNTIME-EVAL.md#direct-original-javascript-no-loader).
+- `scripts/eval-capture-core.mjs`: shared source-location, argument-observer
+  and content-addressed capture logic for direct and decoded executables.
 - `scripts/capture-vm-eval.mjs`: **generic configurable** synchronous Node VM
   producer for arbitrary two-layer loaders and exact direct-eval source sites;
   no Knitsail/DOM requirements. Emits original source layers, raw operands and
@@ -38,8 +44,8 @@ All 785 static JS/manifest files remain byte-identical in the combined tree.
   [Generic setup, scope and limitations](HOWTO-GENERIC-RUNTIME-EVAL.md).
 - `scripts/replay-captured-html.cjs`: modeled archived browser replay;
   outer/inner source capture and observed eval inputs/outcomes.
-- `scripts/export-runtime-eval.mjs`: v2 manifest, exact deduplicated raw source
-  and independent readable formatting.
+- `scripts/export-runtime-eval.mjs`: v2 loader and v3 direct manifests,
+  exact deduplicated raw source and independent readable formatting.
 - `ast-site-probe/`: Rust 1.99 / OXC AST and semantic resolver.
 - `scripts/link-runtime-source-tree.mjs`: verifiable multi-capture overlay
   with bidirectional AST-linked navigation.

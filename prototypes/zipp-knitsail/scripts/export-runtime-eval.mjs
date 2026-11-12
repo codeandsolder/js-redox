@@ -13,27 +13,33 @@ if (!reportFile || !capturedSourceDir || !outputDirectory || !deobfuscator) {
 }
 const hex64 = /^[0-9a-f]{64}$/;
 const report = JSON.parse(fs.readFileSync(reportFile, 'utf8'));
-const provenance = report.sourceProvenance;
-const loader = provenance?.outerLoader;
-const executable = provenance?.innerExecutable;
-const outerSite = loader?.indirectEvalSite;
-const innerSite = executable?.evalSite;
-const validSite = (site, expression) =>
+const provenance=report.sourceProvenance;
+const isDirect=report.schemaVersion===3 && provenance?.kind==='direct-executable';
+const loader=provenance?.outerLoader;
+const executable=isDirect?provenance?.executable:provenance?.innerExecutable;
+const outerSite=loader?.indirectEvalSite;
+const innerSite=executable?.evalSite;
+const validSite=(site,expression)=>
   site && Number.isSafeInteger(site.start) && Number.isSafeInteger(site.end) &&
-  site.start >= 0 && site.end - site.start === site.expression?.length &&
-  typeof site.expression === 'string' && site.expression.length > 0 &&
-  (expression === undefined || site.expression === expression);
-if (!hex64.test(report.htmlSha256) || !hex64.test(report.outerVmSha256) ||
-    !hex64.test(loader?.sha256) || !hex64.test(executable?.sha256) ||
-    report.outerVmSha256 !== loader.sha256 ||
-    loader.decodedBy !== 'observed-first-indirect-eval' ||
-    !validSite(outerSite, '(0,eval)(') ||
-    !validSite(innerSite) ||
-    !/^eval\s*\([\s\S]*\)$/u.test(innerSite.expression) ||
-    !Number.isSafeInteger(executable.strippedLeadingNewlineCodeUnits) ||
-    executable.strippedLeadingNewlineCodeUnits < 0 ||
-    !Array.isArray(report.dynamicCodeEvents)) {
-  throw Error('Missing or invalid dual-layer loader / executable provenance');
+  site.start>=0 && site.end-site.start===site.expression?.length &&
+  typeof site.expression==='string' && site.expression.length>0 &&
+  (expression===undefined || site.expression===expression);
+const directValid=isDirect &&
+  hex64.test(report.captureSha256) &&
+  hex64.test(executable?.sha256) &&
+  validSite(innerSite) &&
+  /^eval\s*\([\s\S]*\)$/u.test(innerSite.expression);
+const layeredValid=report.schemaVersion===undefined &&
+  hex64.test(report.htmlSha256) && hex64.test(report.outerVmSha256) &&
+  hex64.test(loader?.sha256) && hex64.test(executable?.sha256) &&
+  report.outerVmSha256===loader.sha256 &&
+  loader.decodedBy==='observed-first-indirect-eval' &&
+  validSite(outerSite,'(0,eval)(') && validSite(innerSite) &&
+  /^eval\s*\([\s\S]*\)$/u.test(innerSite.expression) &&
+  Number.isSafeInteger(executable.strippedLeadingNewlineCodeUnits) &&
+  executable.strippedLeadingNewlineCodeUnits>=0;
+if ((!directValid && !layeredValid) || !Array.isArray(report.dynamicCodeEvents)) {
+  throw Error('Missing or invalid direct executable / dual-layer source provenance');
 }
 const output = path.resolve(outputDirectory);
 if (fs.existsSync(output)) throw Error('Output already exists: ' + output);
@@ -114,11 +120,11 @@ try {
     entries.push(entry);
   }
   const metadata = {
-    schemaVersion:2,
+    schemaVersion:isDirect?3:2,
     evidenceKind:'execution-observed, not universal static proof',
     environment:report.environment ?? 'execution-observed Node VM source',
     identityKind:report.identityKind ?? 'archived-html',
-    htmlSha256: report.htmlSha256,
+    ...(isDirect ? {captureSha256:report.captureSha256} : {htmlSha256:report.htmlSha256}),
     sourceProvenance: provenance,
     truncated: report.dynamicTruncated === true,
     eventCount: events.length,
@@ -134,11 +140,15 @@ try {
     'It is not a proof that these snippets are universal, and standalone parsing',
     'does not imply that an eval string can run outside its original lexical scope.',
     '',
-    'Capture identity SHA-256: ' + report.htmlSha256,
+    'Capture identity SHA-256: ' + (isDirect ? report.captureSha256 : report.htmlSha256),
     'Capture environment: ' + (report.environment ?? 'unspecified'),
-    'Original outer loader SHA-256: ' + loader.sha256,
-    'Original inner executable SHA-256: ' + executable.sha256,
-    'Loader indirect eval offset: ' + outerSite.start + '..' + outerSite.end,
+    ...(isDirect ? [
+      'Original direct executable SHA-256: ' + executable.sha256,
+    ] : [
+      'Original outer loader SHA-256: ' + loader.sha256,
+      'Original inner executable SHA-256: ' + executable.sha256,
+      'Loader indirect eval offset: ' + outerSite.start + '..' + outerSite.end,
+    ]),
     'Executable direct eval offset: ' + innerSite.start + '..' + innerSite.end,
     'String eval operands observed: ' + events.length,
     'Other input types skipped by capture: ' + (report.skippedNonString ?? 0),
