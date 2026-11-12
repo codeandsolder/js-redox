@@ -36,7 +36,7 @@ in the manifest; private payloads remain outside Git.
 
 The importer checks the loader's indirect-eval source site and the inner
 executable direct-eval AST with the OXC semantic resolver, including the
-argument's nearest lexical formal-parameter binding. Lexical frames cover
+argument AST and semantic identifier binding roles. Lexical frames cover
 both ordinary function expressions/declarations and arrow functions,
 including nested arrow callbacks. Function and arrow frames have distinct
 kinds: matching argument names and parameter lists alone cannot conflate
@@ -82,3 +82,27 @@ covers multiple independent 3-path option groups.
 This does not authorize promoting observed code into unconditional static
 deobfuscation: every generated fragment is tied to a specific captured
 execution and the matched original AST site, not a proof of all reachable paths.
+
+## General direct-eval source-site matching (2026-11-12)
+
+The v2 inner executable evalSite.expression is checked against the full, exact
+UTF-16-addressed source callsite and its OXC executable direct-eval node.
+It is not limited to the historical Knitsail expression eval(D).
+
+For arbitrary expression arguments, OXC Codegen produces a normalized AST
+representation. Argument arity and spread are retained separately, so a
+sequence expression is not conflated with multiple call arguments.
+Every referenced identifier carries an OXC semantic binding role: formal
+parameter with frame depth and position, import, local declaration kind,
+or unresolved/global. Shadowed, optional, or indirect eval are not promoted
+to direct-eval evidence. These remain structural provenance matches, not
+proofs of equivalent variable values or whole-function behavior.
+
+ES-module files (.mjs and .mts) use module parsing; .js supports script or
+ESM parsing, and corresponding .cjs/.jsx/TypeScript extensions use their
+source-type parsers. UTF-16 source offsets are checked after non-BMP Unicode,
+and offsets inside surrogate pairs are refused.
+
+Focused regressions cover compound arguments, lexical shadowing,
+multi-argument versus sequence expression, spread, module imports,
+source-site UTF-16 indexing, and a full v2 import with an ESM callsite.

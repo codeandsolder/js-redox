@@ -3,14 +3,18 @@ use crate::sha256_hex;
 use anyhow::{bail, Context, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    ArrowFunctionExpression, BindingPattern, CallExpression, Expression, Function,
-    VariableDeclarator,
+    Argument, ArrowFunctionExpression, BindingPattern, CallExpression, Expression, Function,
+    IdentifierReference, VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
+use oxc_codegen::Codegen;
 use oxc_parser::Parser;
 use oxc_semantic::{Scoping, SemanticBuilder};
 use oxc_span::SourceType;
-use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
+use oxc_syntax::{
+    scope::ScopeFlags,
+    symbol::{SymbolFlags, SymbolId},
+};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
@@ -32,14 +36,94 @@ struct Frame {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Site {
     start: u32,
     end: u32,
     line: usize,
+    /// Codegen-normalized argument expressions, including any spread operands.
     argument: String,
+    /// Preserve arity and spread shape: a sequence argument is not two arguments.
+    argument_shapes: Vec<ArgumentShape>,
+    /// Semantic binding roles for every referenced identifier in argument AST order.
+    argument_references: Vec<ArgumentReference>,
     eval_is_unresolved: bool,
-    argument_is_bound_to_nearest_parameter: bool,
+    argument_uses_nearest_formal_parameter: bool,
     frames: Vec<Frame>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ArgumentShape {
+    spread: bool,
+    expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ArgumentReference {
+    name: String,
+    /// Distinguish unresolved global, lexical-local, and frame-formal uses.
+    role: String,
+}
+
+struct ArgumentReferences<'s> {
+    scoping: &'s Scoping,
+    frames: &'s [Frame],
+    references: Vec<ArgumentReference>,
+}
+
+impl<'a> Visit<'a> for ArgumentReferences<'_> {
+    fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {
+        let symbol = identifier
+            .reference_id
+            .get()
+            .and_then(|reference| self.scoping.get_reference(reference).symbol_id());
+        let role = match symbol {
+            None => "unresolved".to_owned(),
+            Some(symbol) => self
+                .frames
+                .iter()
+                .rev()
+                .enumerate()
+                .find_map(|(depth, frame)| {
+                    frame
+                        .symbols
+                        .iter()
+                        .position(|param| *param == Some(symbol))
+                        .map(|position| format!("formal:{depth}:{position}"))
+                })
+                .unwrap_or_else(|| {
+                    let flags = self.scoping.symbol_flags(symbol);
+                    let kind = if flags.intersects(SymbolFlags::Import | SymbolFlags::TypeImport) {
+                        "import"
+                    } else if flags.contains(SymbolFlags::CatchVariable) {
+                        "catch"
+                    } else if flags.contains(SymbolFlags::ConstVariable) {
+                        "const"
+                    } else if flags.contains(SymbolFlags::BlockScopedVariable) {
+                        "let"
+                    } else if flags.contains(SymbolFlags::FunctionScopedVariable) {
+                        "var"
+                    } else if flags.contains(SymbolFlags::Function) {
+                        "function"
+                    } else if flags.contains(SymbolFlags::Class) {
+                        "class"
+                    } else {
+                        "lexical"
+                    };
+                    kind.to_owned()
+                }),
+        };
+        self.references.push(ArgumentReference {
+            name: identifier.name.to_string(),
+            role,
+        });
+    }
+}
+
+fn canonical_argument(expression: &Expression<'_>) -> String {
+    let mut printer = Codegen::new();
+    printer.print_expression(expression);
+    printer.into_source_text()
 }
 
 struct Scan<'s> {
@@ -155,59 +239,80 @@ impl<'a> Visit<'a> for Scan<'_> {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if !call.optional
-            && call.arguments.len() == 1
+            && !call.arguments.is_empty()
             && matches!(&call.callee, Expression::Identifier(id) if id.name == "eval")
         {
-            let arg = call.arguments[0].as_expression();
-            if let Some(Expression::Identifier(id)) = arg {
-                let reference_symbol = id
+            let eval_unresolved = if let Expression::Identifier(callee) = &call.callee {
+                callee
                     .reference_id
                     .get()
-                    .and_then(|reference| self.scoping.get_reference(reference).symbol_id());
-                let eval_unresolved = if let Expression::Identifier(callee) = &call.callee {
-                    callee
-                        .reference_id
-                        .get()
-                        .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
-                        .is_none()
-                } else {
-                    false
-                };
-                let bound = reference_symbol.is_some_and(|symbol| {
-                    self.frames.last().is_some_and(|frame| {
-                        frame
-                            .symbols
-                            .iter()
-                            .zip(&frame.params)
-                            .any(|(declared, name)| {
-                                declared == &Some(symbol) && name == id.name.as_str()
-                            })
-                    })
-                });
-                self.calls.push(Site {
-                    start: call.span.start,
-                    end: call.span.end,
-                    line: 1 + self
-                        .source
-                        .get(..call.span.start as usize)
-                        .unwrap_or_default()
-                        .bytes()
-                        .filter(|byte| *byte == b'\n')
-                        .count(),
-                    argument: id.name.to_string(),
-                    eval_is_unresolved: eval_unresolved,
-                    argument_is_bound_to_nearest_parameter: bound,
-                    frames: self.frames.clone(),
-                });
+                    .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
+                    .is_none()
+            } else {
+                false
+            };
+            let mut parts = Vec::new();
+            let mut shapes = Vec::new();
+            let mut refs = ArgumentReferences {
+                scoping: self.scoping,
+                frames: &self.frames,
+                references: Vec::new(),
+            };
+            for arg in &call.arguments {
+                match arg {
+                    Argument::SpreadElement(spread) => {
+                        let expression = canonical_argument(&spread.argument);
+                        parts.push(format!("...{expression}"));
+                        shapes.push(ArgumentShape {
+                            spread: true,
+                            expression,
+                        });
+                        refs.visit_expression(&spread.argument);
+                    }
+                    _ => {
+                        if let Some(expression) = arg.as_expression() {
+                            let text = canonical_argument(expression);
+                            parts.push(text.clone());
+                            shapes.push(ArgumentShape {
+                                spread: false,
+                                expression: text,
+                            });
+                            refs.visit_expression(expression);
+                        }
+                    }
+                }
             }
+            // The original runtime only guarantees the observed eval operand;
+            // the additional argument list is still part of the static site.
+            let bound = refs
+                .references
+                .iter()
+                .any(|reference| reference.role.starts_with("formal:0:"));
+            self.calls.push(Site {
+                start: call.span.start,
+                end: call.span.end,
+                line: 1 + self
+                    .source
+                    .get(..call.span.start as usize)
+                    .unwrap_or_default()
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count(),
+                argument: parts.join(","),
+                argument_shapes: shapes,
+                argument_references: refs.references,
+                eval_is_unresolved: eval_unresolved,
+                argument_uses_nearest_formal_parameter: bound,
+                frames: self.frames.clone(),
+            });
         }
         walk::walk_call_expression(self, call);
     }
 }
 
-fn parse_sites(source: &str) -> Result<Vec<Site>> {
+fn parse_sites_with_type(source: &str, source_type: SourceType) -> Result<Vec<Site>> {
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, SourceType::cjs()).parse();
+    let parsed = Parser::new(&allocator, source, source_type).parse();
     if !parsed.diagnostics.is_empty() || parsed.fatal_error {
         bail!(
             "JavaScript parse failed with {} errors",
@@ -224,6 +329,33 @@ fn parse_sites(source: &str) -> Result<Vec<Site>> {
     let mut scan = Scan::new(source, sem.semantic.scoping());
     scan.visit_program(&parsed.program);
     Ok(scan.calls)
+}
+
+fn parse_sites(source: &str) -> Result<Vec<Site>> {
+    // Generated loader source is commonly a script/CJS, while real static
+    // source files may contain ESM syntax. Preserve the first fully valid parse.
+    parse_sites_with_type(source, SourceType::cjs()).or_else(|script_error| {
+        parse_sites_with_type(source, SourceType::mjs())
+            .with_context(|| format!("JavaScript script/CJS parse also failed: {script_error}"))
+    })
+}
+
+fn parse_sites_file(source: &str, path: &Path) -> Result<Vec<Site>> {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("mjs" | "mts") => parse_sites_with_type(
+            source,
+            SourceType::from_path(path).context("invalid module source type")?,
+        ),
+        Some("cjs" | "cts") => parse_sites_with_type(
+            source,
+            SourceType::from_path(path).context("invalid CommonJS source type")?,
+        ),
+        Some("jsx" | "tsx" | "ts") => parse_sites_with_type(
+            source,
+            SourceType::from_path(path).context("invalid source type")?,
+        ),
+        _ => parse_sites(source),
+    }
 }
 
 fn utf16_to_bytes(text: &str, offset: usize) -> Result<u32> {
@@ -253,7 +385,18 @@ fn js_files(root: &Path) -> Result<Vec<PathBuf>> {
             }
             if kind.is_dir() {
                 visit(&entry.path(), files)?;
-            } else if kind.is_file() && entry.path().extension().is_some_and(|e| e == "js") {
+            } else if kind.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| {
+                        matches!(
+                            ext,
+                            "js" | "cjs" | "mjs" | "jsx" | "ts" | "cts" | "mts" | "tsx"
+                        )
+                    })
+            {
                 files.push(entry.path());
             }
         }
@@ -276,11 +419,11 @@ fn stable_named_scope(frames: &[Frame]) -> &[Frame] {
 }
 
 fn same_lexical_structure(a: &Site, b: &Site) -> bool {
-    a.argument == b.argument
+    a.argument_shapes == b.argument_shapes
+        && a.argument_references == b.argument_references
         && a.eval_is_unresolved
         && b.eval_is_unresolved
-        && a.argument_is_bound_to_nearest_parameter
-        && b.argument_is_bound_to_nearest_parameter
+        && a.argument_uses_nearest_formal_parameter == b.argument_uses_nearest_formal_parameter
         && stable_named_scope(&a.frames).len() == stable_named_scope(&b.frames).len()
         && stable_named_scope(&a.frames)
             .iter()
@@ -377,6 +520,7 @@ struct AstMatch {
 struct PreparedCapture {
     manifest: Manifest,
     original_manifest: Vec<u8>,
+    original_site: Site,
     relative: String,
     entries: Vec<SourceEntry>,
     matches: Vec<AstMatch>,
@@ -485,7 +629,7 @@ fn scan_matches(output: &Path, original: &Site) -> Result<(Vec<AstMatch>, Vec<St
             .replace('\\', "/");
         let result = fs::read_to_string(&source)
             .with_context(|| format!("reading {}", source.display()))
-            .and_then(|code| parse_sites(&code));
+            .and_then(|code| parse_sites_file(&code, &source));
         match result {
             Ok(sites) => {
                 for site in sites {
@@ -544,16 +688,20 @@ fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedC
     let outer_code = String::from_utf8(outer_bytes)?;
     let inner_code = String::from_utf8(inner_bytes)?;
     exact_site(&outer_code, &outer.indirect_eval_site, "(0,eval)(")?;
-    exact_site(&inner_code, &inner.eval_site, "eval(D)")?;
+    anyhow::ensure!(
+        !inner.eval_site.expression.is_empty(),
+        "empty executable eval site expression"
+    );
+    exact_site(&inner_code, &inner.eval_site, &inner.eval_site.expression)?;
     let start = utf16_to_bytes(&inner_code, inner.eval_site.start)?;
     let end = utf16_to_bytes(&inner_code, inner.eval_site.end)?;
-    let original = parse_sites(&inner_code)?
+    let original = parse_sites_file(&inner_code, &input.inner_source)?
         .into_iter()
         .find(|site| site.start == start && site.end == end)
         .context("inner source position is not an executable direct-eval AST node")?;
     anyhow::ensure!(
-        original.eval_is_unresolved && original.argument_is_bound_to_nearest_parameter,
-        "inner eval is not an unresolved direct eval of its own formal parameter"
+        original.eval_is_unresolved,
+        "inner eval does not invoke the unresolved direct eval binding"
     );
     let (matches, parse_failures) = scan_matches(output, &original)?;
 
@@ -621,6 +769,7 @@ fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedC
     Ok(PreparedCapture {
         manifest,
         original_manifest,
+        original_site: original,
         relative,
         entries,
         matches,
@@ -667,6 +816,7 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
             "outerLoader":outer,
             "innerExecutable":inner,
             "staticAstStructuralMatches":capture.matches,
+            "originalEvalSite":capture.original_site,
             "staticParseFailures":capture.parse_failures,
             "eventCount":m.event_count,
             "uniqueSourceCount":m.unique_source_count,
@@ -1037,7 +1187,7 @@ mod tests {
         assert_eq!(formatted_sites.len(), 1);
         let a = &original_sites[0];
         let b = &formatted_sites[0];
-        assert!(a.eval_is_unresolved && a.argument_is_bound_to_nearest_parameter);
+        assert!(a.eval_is_unresolved && a.argument_uses_nearest_formal_parameter);
         assert_eq!(a.frames.len(), 1);
         assert_eq!(a.frames[0].kind, "arrow");
         assert_eq!(a.frames[0].binding.as_deref(), Some("oU"));
@@ -1052,14 +1202,14 @@ mod tests {
         let sites = parse_sites(original)?;
         let formatted_sites = parse_sites(formatted)?;
         assert_eq!(sites.len(), 1);
-        assert!(sites[0].argument_is_bound_to_nearest_parameter);
+        assert!(sites[0].argument_uses_nearest_formal_parameter);
         assert_eq!(sites[0].frames.len(), 2);
         assert!(sites[0].frames.iter().all(|frame| frame.kind == "arrow"));
         assert!(same_lexical_structure(&sites[0], &formatted_sites[0]));
 
         let captured_outer = parse_sites("const oU = (D) => { return () => eval(D); };")?;
         assert_eq!(captured_outer.len(), 1);
-        assert!(!captured_outer[0].argument_is_bound_to_nearest_parameter);
+        assert!(!captured_outer[0].argument_uses_nearest_formal_parameter);
         assert!(!same_lexical_structure(&sites[0], &captured_outer[0]));
         Ok(())
     }
@@ -1068,8 +1218,8 @@ mod tests {
     fn arrow_and_function_expressions_are_not_the_same_lexical_structure() -> Result<()> {
         let arrow = parse_sites("const oU = (D) => eval(D);")?;
         let function = parse_sites("const oU = function(D) { return eval(D); };")?;
-        assert!(arrow[0].argument_is_bound_to_nearest_parameter);
-        assert!(function[0].argument_is_bound_to_nearest_parameter);
+        assert!(arrow[0].argument_uses_nearest_formal_parameter);
+        assert!(function[0].argument_uses_nearest_formal_parameter);
         assert!(!same_lexical_structure(&arrow[0], &function[0]));
 
         let shadowed = parse_sites("const oU = D => { const eval = x => x; return eval(D); };")?;
@@ -1122,6 +1272,148 @@ mod tests {
         assert_eq!(
             origin["staticAstStructuralMatches"][0]["path"],
             "original.js"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn arbitrary_eval_arguments_are_compared_by_expression_and_lexical_roles() -> Result<()> {
+        let original = parse_sites("const oU = (D) => eval(D + String(D) + suffix);")?;
+        let formatted = parse_sites("const oU = D => { return eval( D+String( D )+suffix ); };")?;
+        assert_eq!(original.len(), 1);
+        assert_eq!(formatted.len(), 1);
+        assert!(original[0].eval_is_unresolved);
+        assert!(original[0].argument_uses_nearest_formal_parameter);
+        assert!(same_lexical_structure(&original[0], &formatted[0]));
+        assert_eq!(original[0].argument_references.len(), 4);
+        assert_eq!(original[0].argument_references[0].role, "formal:0:0");
+        assert_eq!(original[0].argument_references[1].role, "unresolved");
+        assert_eq!(original[0].argument_references[2].role, "formal:0:0");
+        assert_eq!(original[0].argument_references[3].role, "unresolved");
+
+        let shadowed =
+            parse_sites("const suffix = 'x'; const oU = D => eval(D + String(D) + suffix);")?;
+        assert!(!same_lexical_structure(&original[0], &shadowed[0]));
+
+        let changed = parse_sites("const oU = D => eval(D + String(D) + another);")?;
+        assert!(!same_lexical_structure(&original[0], &changed[0]));
+
+        let simple = parse_sites("const oU = D => eval(D);")?;
+        assert!(!same_lexical_structure(&simple[0], &original[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn eval_argument_cardinality_and_spread_shape_affect_site_identity() -> Result<()> {
+        let one = parse_sites("const oU = D => eval(D);")?;
+        let two = parse_sites("const oU = D => eval(D, 1);")?;
+        let other = parse_sites("const oU = D => eval(D, 2);")?;
+        let spread = parse_sites("const oU = D => eval(...D);")?;
+        assert_eq!(one.len(), 1);
+        assert_eq!(two.len(), 1);
+        assert_eq!(spread.len(), 1);
+        assert!(!same_lexical_structure(&one[0], &two[0]));
+        assert!(!same_lexical_structure(&two[0], &other[0]));
+        assert!(!same_lexical_structure(&one[0], &spread[0]));
+        let sequence = parse_sites("const oU = D => eval((D, extra));")?;
+        let multiple = parse_sites("const oU = D => eval(D, extra);")?;
+        assert_eq!(sequence[0].argument_shapes.len(), 1);
+        assert_eq!(multiple[0].argument_shapes.len(), 2);
+        assert!(!same_lexical_structure(&sequence[0], &multiple[0]));
+
+        let optional = parse_sites("const oU = D => eval?.(D);")?;
+        assert!(optional.is_empty(), "optional eval is not direct eval");
+        Ok(())
+    }
+
+    #[test]
+    fn script_and_module_sources_are_parsed_with_their_own_source_types() -> Result<()> {
+        let module =
+            "import { prefix } from './strings.mjs'; export const oU = (D) => eval(prefix + D);";
+        let module_sites = parse_sites_file(module, Path::new("original.mjs"))?;
+        assert_eq!(module_sites.len(), 1);
+        assert_eq!(module_sites[0].argument_references.len(), 2);
+        assert_eq!(module_sites[0].argument_references[0].role, "import");
+        assert_eq!(module_sites[0].argument_references[1].role, "formal:0:0");
+
+        let js = "import { prefix } from './strings.js'; export const oU = (D) => eval(prefix+D);";
+        let js_sites = parse_sites_file(js, Path::new("original.js"))?;
+        assert!(same_lexical_structure(&module_sites[0], &js_sites[0]));
+        let locally_defined = "const prefix = 'x'; export const oU = (D) => eval(prefix+D);";
+        let local_sites = parse_sites_file(locally_defined, Path::new("local.mjs"))?;
+        assert_eq!(local_sites[0].argument_references[0].role, "const");
+        assert!(!same_lexical_structure(&module_sites[0], &local_sites[0]));
+
+        let cjs = "const oU = (D) => eval(D);";
+        assert_eq!(parse_sites_file(cjs, Path::new("original.cjs"))?.len(), 1);
+        assert_eq!(parse_sites_file(cjs, Path::new("original.js"))?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn utf16_source_offsets_reject_surrogate_midpoints() -> Result<()> {
+        let source = "const marker = '🦀'; const oU = D => eval(D);";
+        let position = source.find('🦀').context("missing non-BMP fixture")?;
+        let start = source[..position].encode_utf16().count();
+        assert_eq!(utf16_to_bytes(source, start)? as usize, position);
+        assert!(utf16_to_bytes(source, start + 1).is_err());
+        assert_eq!(
+            utf16_to_bytes(source, start + 2)? as usize,
+            position + '🦀'.len_utf8()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_v2_import_works_with_complex_module_eval_source() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (output, input) = sample(temp.path())?;
+        let module = "const emoji = '🦀'; export const oU = D => eval(D + String(D));\n";
+        let static_module = "export const oU = (D) => eval( D+String( D ) );\n";
+        fs::write(&input.inner_source, module)?;
+        fs::remove_file(output.join("original.js"))?;
+        fs::write(output.join("original.mjs"), static_module)?;
+
+        let manifest_file = input.observed_tree.join("manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_file)?)?;
+        manifest["sourceProvenance"]["innerExecutable"]["sha256"] =
+            json!(sha256_hex(module.as_bytes()));
+        let expression = "eval(D + String(D))";
+        let byte_start = module
+            .find(expression)
+            .context("missing complex eval callsite")?;
+        let start = module[..byte_start].encode_utf16().count();
+        assert!(
+            byte_start > start,
+            "non-BMP prefix must change UTF-16 versus UTF-8 offsets"
+        );
+        manifest["sourceProvenance"]["innerExecutable"]["evalSite"]["start"] = json!(start);
+        manifest["sourceProvenance"]["innerExecutable"]["evalSite"]["end"] =
+            json!(start + expression.encode_utf16().count());
+        manifest["sourceProvenance"]["innerExecutable"]["evalSite"]["expression"] =
+            json!(expression);
+        fs::write(&manifest_file, serde_json::to_vec(&manifest)?)?;
+
+        attach_observed_eval_sources(&output, &[input])?;
+        let index: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("runtime-observed/index.json"))?)?;
+        assert_eq!(index["captures"][0]["staticAstMatches"], 1);
+        let relative = index["captures"][0]["directory"]
+            .as_str()
+            .context("missing combined source-tree capture")?;
+        let origin: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join(relative).join("origin.json"))?)?;
+        assert_eq!(
+            origin["staticAstStructuralMatches"][0]["path"],
+            "original.mjs"
+        );
+        assert!(origin["originalEvalSite"]["argument"]
+            .as_str()
+            .context("missing argument canonical form")?
+            .contains("String"));
+        assert_eq!(
+            origin["originalEvalSite"]["argumentReferences"][0]["role"],
+            "formal:0:0"
         );
         Ok(())
     }
