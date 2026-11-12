@@ -903,19 +903,19 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
         fs::write(folder.join("context.json"), context_json)?;
     }
     fs::write(out.join("README.md"), md)?;
-    let mut groups = args.observed_eval.chunks_exact(3);
+    let (groups, remainder) = args.observed_eval.as_chunks::<3>();
+    anyhow::ensure!(
+        remainder.is_empty(),
+        "each observed-eval requires three paths"
+    );
     let observed = groups
-        .by_ref()
+        .iter()
         .map(|paths| ObservedEvalInput {
             observed_tree: paths[0].clone(),
             outer_source: paths[1].clone(),
             inner_source: paths[2].clone(),
         })
         .collect::<Vec<_>>();
-    anyhow::ensure!(
-        groups.remainder().is_empty(),
-        "each observed-eval requires three paths"
-    );
     attach_observed_eval_sources(&out, &observed)?;
     println!(
         "{}",
