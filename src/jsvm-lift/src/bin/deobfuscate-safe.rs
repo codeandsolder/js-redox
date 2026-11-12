@@ -3,7 +3,9 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use jsvm_lift::{
     analysis_artifacts::{load_artifact, DEOBFUSCATION, JS_REFERENCES, SOURCE_INDEX},
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
-    observed_eval_import::{attach_observed_eval_sources, ObservedEvalInput},
+    observed_eval_import::{
+        attach_observed_eval_sources, expand_observed_direct_bundle, ObservedEvalInput,
+    },
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions},
     project_import_names::propagate_imported_names,
     safe_deob::{deobfuscate_source, SourceMode},
@@ -158,6 +160,11 @@ struct SourceTreeArgs {
     #[arg(long = "observed-direct", num_args = 2, action = clap::ArgAction::Append,
           value_names = ["EXPORTED_TREE", "EXECUTABLE_JS"])]
     observed_direct: Vec<PathBuf>,
+    /// Import a whole execution with multiple independently attributed direct
+    /// eval sites; the bundle manifest enumerates their individual witnesses.
+    #[arg(long = "observed-direct-bundle", num_args = 2, action = clap::ArgAction::Append,
+          value_names = ["EXPORTED_BUNDLE", "EXECUTABLE_JS"])]
+    observed_direct_bundle: Vec<PathBuf>,
 }
 
 fn collect_js_sources(root: &Path) -> Result<Vec<PathBuf>> {
@@ -224,7 +231,10 @@ fn publish_complete_tree(source: &Path, destination: &Path) -> Result<()> {
 }
 
 fn run_source_tree(mut args: SourceTreeArgs) -> Result<()> {
-    if args.observed_eval.is_empty() && args.observed_direct.is_empty() {
+    if args.observed_eval.is_empty()
+        && args.observed_direct.is_empty()
+        && args.observed_direct_bundle.is_empty()
+    {
         println!("{}", build_source_tree(args)?);
         return Ok(());
     }
@@ -1011,6 +1021,14 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
         observed_tree: paths[0].clone(),
         source_files: vec![paths[1].clone()],
     }));
+    let (bundles, bundle_remainder) = args.observed_direct_bundle.as_chunks::<2>();
+    anyhow::ensure!(
+        bundle_remainder.is_empty(),
+        "each observed-direct-bundle requires an exported bundle and original source"
+    );
+    for paths in bundles {
+        observed.extend(expand_observed_direct_bundle(&paths[0], &paths[1])?);
+    }
     attach_observed_eval_sources(&out, &observed)?;
     Ok(json!({
         "source_count": summary["source_count"],
@@ -1318,6 +1336,42 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     #[test]
+    fn source_tree_cli_accepts_multiple_observed_direct_bundles() -> Result<()> {
+        let args = Args::try_parse_from([
+            "deobfuscate-safe",
+            "source-tree",
+            "source",
+            "output",
+            "--observed-direct-bundle",
+            "first-bundle",
+            "source.js",
+            "--observed-direct-bundle",
+            "second-bundle",
+            "other.js",
+        ])?;
+        let Command::SourceTree(tree) = args.command else {
+            anyhow::bail!("source-tree command not selected");
+        };
+        assert_eq!(
+            tree.observed_direct_bundle,
+            ["first-bundle", "source.js", "second-bundle", "other.js"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        );
+        assert!(Args::try_parse_from([
+            "deobfuscate-safe",
+            "source-tree",
+            "source",
+            "output",
+            "--observed-direct-bundle",
+            "just-a-bundle",
+        ])
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
     fn source_tree_cli_accepts_direct_and_two_stage_evidence() -> Result<()> {
         let args = Args::try_parse_from([
             "deobfuscate-safe",
@@ -1567,6 +1621,7 @@ mod tests {
             caller_view_entry: None,
             observed_eval: Vec::new(),
             observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
         })?;
 
         let index: serde_json::Value =
@@ -1613,6 +1668,7 @@ mod tests {
             caller_view_entry: None,
             observed_eval: Vec::new(),
             observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
         })?;
         let context_dir = output.join("lexical-context");
         let metadata: serde_json::Value =
@@ -1685,6 +1741,7 @@ mod tests {
             caller_view_entry: None,
             observed_eval: Vec::new(),
             observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
         })?;
         let ctx = output.join("lexical-context");
         let meta: serde_json::Value =
@@ -1758,6 +1815,7 @@ mod tests {
             caller_view_entry: None,
             observed_eval: Vec::new(),
             observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
         })?;
         let context_dir = output.join("lexical-context");
         let meta: serde_json::Value =
@@ -1799,6 +1857,7 @@ mod tests {
             caller_view_entry: Some("enter".into()),
             observed_eval: Vec::new(),
             observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
         })?;
         let folder = output.join("lexical-context");
         let manifest: serde_json::Value =
@@ -1839,6 +1898,7 @@ mod tests {
             caller_view_entry: Some("enter".into()),
             observed_eval: Vec::new(),
             observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
         })?;
         let dir = output.join("lexical-context");
         let index: serde_json::Value =
@@ -1897,6 +1957,7 @@ mod tests {
             caller_view_entry: Some("enter".into()),
             observed_eval: Vec::new(),
             observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
         })?;
         let context = output.join("lexical-context");
         let info: serde_json::Value =
@@ -1947,6 +2008,7 @@ mod tests {
             caller_view_entry: Some("aoF_".into()),
             observed_eval: Vec::new(),
             observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
         })?;
         let context = output.join("lexical-context");
         let info: serde_json::Value =
@@ -2000,6 +2062,7 @@ mod tests {
             caller_view_entry: Some("enter".into()),
             observed_eval: Vec::new(),
             observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
         })?;
         let context = output.join("lexical-context");
         let info: serde_json::Value =
@@ -2131,6 +2194,7 @@ mod tests {
             caller_view_entry: None,
             observed_eval: vec![observed.clone(), outer.clone(), inner.clone()],
             observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
         };
 
         // Invalid evidence fails *after* the static transformation, but no
@@ -2183,6 +2247,7 @@ mod tests {
             caller_view_entry: None,
             observed_eval: Vec::new(),
             observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
         });
         assert!(error.is_err());
         assert_eq!(fs::read_to_string(input.join("a.js"))?, "const a=1;");

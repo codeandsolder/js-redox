@@ -494,7 +494,7 @@ struct InnerExecutable {
     stripped_leading_newline_code_units: usize,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 struct SourceSite {
     start: usize,
     end: usize,
@@ -512,6 +512,10 @@ struct ObservedEntry {
     threw: usize,
     returned_types: BTreeMap<String, usize>,
     thrown_types: BTreeMap<String, usize>,
+    /// Optional original event order within a multi-site execution, retained
+    /// even when each site is exported as a separate source witness.
+    #[serde(default)]
+    global_event_indices: Option<Vec<usize>>,
     raw_file: String,
     readable_file: Option<String>,
     readable_status: String,
@@ -531,6 +535,164 @@ struct AstMatch {
     byte_span: [u32; 2],
     relation: &'static str,
     lexical_frames: Vec<Frame>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DirectBundle {
+    schema_version: u32,
+    kind: String,
+    executable_sha256: String,
+    capture_sha256: String,
+    sites: Vec<BundleSite>,
+    captures: Vec<BundleCapture>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BundleSite {
+    site_index: usize,
+    eval_site: SourceSite,
+    event_count: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BundleCapture {
+    site_index: usize,
+    directory: String,
+    eval_site: SourceSite,
+    event_count: usize,
+}
+
+/// Expand one already exported multi-site run into independently validated
+/// per-site captures. No fabricated loader or cross-site source attribution.
+pub fn expand_observed_direct_bundle(
+    bundle_root: &Path,
+    executable: &Path,
+) -> Result<Vec<ObservedEvalInput>> {
+    let descriptor: DirectBundle =
+        serde_json::from_slice(&read_observed_file(bundle_root, "bundle.json")?)?;
+    anyhow::ensure!(
+        descriptor.schema_version == 1 && descriptor.kind == "direct-eval-export-bundle",
+        "unrecognized direct-eval export bundle"
+    );
+    anyhow::ensure!(
+        is_sha256(&descriptor.executable_sha256) && is_sha256(&descriptor.capture_sha256),
+        "invalid bundle original-source or capture SHA-256"
+    );
+    anyhow::ensure!(
+        sha256_hex(&read_regular(executable)?) == descriptor.executable_sha256,
+        "bundle executable SHA-256 mismatch"
+    );
+    anyhow::ensure!(
+        !descriptor.sites.is_empty(),
+        "direct-eval bundle has no source sites"
+    );
+    for (index, site) in descriptor.sites.iter().enumerate() {
+        anyhow::ensure!(
+            site.site_index == index,
+            "nonsequential bundle source-site index"
+        );
+        anyhow::ensure!(
+            site.eval_site.start < site.eval_site.end
+                && site.eval_site.end - site.eval_site.start
+                    == site.eval_site.expression.encode_utf16().count(),
+            "invalid bundle source-site UTF-16 interval"
+        );
+    }
+    let mut result = Vec::new();
+    let mut previous = None;
+    let mut global_event_indices = BTreeSet::new();
+    let mut expected_event_count = 0usize;
+    for capture in &descriptor.captures {
+        anyhow::ensure!(
+            previous.is_none_or(|prior| capture.site_index > prior),
+            "duplicate or unordered observed source site"
+        );
+        previous = Some(capture.site_index);
+        let site = descriptor
+            .sites
+            .get(capture.site_index)
+            .context("observed site index outside configured source sites")?;
+        anyhow::ensure!(
+            capture.directory == format!("site-{:04}", capture.site_index)
+                && capture.event_count > 0
+                && site.event_count == capture.event_count
+                && site.eval_site == capture.eval_site,
+            "observed bundle site metadata mismatch"
+        );
+        let relative = format!("{}/manifest.json", capture.directory);
+        let witness: Manifest =
+            serde_json::from_slice(&read_observed_file(bundle_root, &relative)?)?;
+        anyhow::ensure!(
+            witness.schema_version == 3
+                && witness.capture_sha256.as_deref() == Some(descriptor.capture_sha256.as_str())
+                && witness.event_count == capture.event_count
+                && witness.source_provenance.kind.as_deref() == Some("direct-executable")
+                && witness
+                    .source_provenance
+                    .executable
+                    .as_ref()
+                    .is_some_and(|exe| exe.sha256 == descriptor.executable_sha256
+                        && exe.eval_site == capture.eval_site),
+            "direct-eval site witness disagrees with bundle"
+        );
+        expected_event_count = expected_event_count
+            .checked_add(capture.event_count)
+            .context("direct-eval event count overflow")?;
+        let mut witnessed = 0usize;
+        for entry in &witness.entries {
+            let indices = entry
+                .global_event_indices
+                .as_deref()
+                .context("multi-site witness missing global event indices")?;
+            anyhow::ensure!(
+                indices.len() == entry.occurrences
+                    && indices.windows(2).all(|pair| pair[0] < pair[1]),
+                "invalid multi-site source event ordering"
+            );
+            witnessed = witnessed
+                .checked_add(entry.occurrences)
+                .context("multi-site witness event count overflow")?;
+            for index in indices {
+                anyhow::ensure!(
+                    global_event_indices.insert(*index),
+                    "duplicate global event index across direct source sites"
+                );
+            }
+        }
+        anyhow::ensure!(
+            witnessed == capture.event_count,
+            "multi-site witness event counts do not account for the site"
+        );
+        result.push(ObservedEvalInput {
+            observed_tree: bundle_root.join(&capture.directory),
+            source_files: vec![executable.to_path_buf()],
+        });
+    }
+    anyhow::ensure!(
+        descriptor
+            .sites
+            .iter()
+            .filter(|site| site.event_count > 0)
+            .count()
+            == result.len(),
+        "bundle omits a source site with observed events"
+    );
+    anyhow::ensure!(
+        !result.is_empty(),
+        "direct-eval bundle contains no observed source events"
+    );
+    anyhow::ensure!(
+        global_event_indices.len() == expected_event_count
+            && global_event_indices
+                .iter()
+                .copied()
+                .eq(0..expected_event_count),
+        "multi-site witness global events are not a complete contiguous execution"
+    );
+    Ok(result)
 }
 
 struct PreparedCapture {
@@ -802,6 +964,13 @@ fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedC
             entry.first_event < manifest.event_count,
             "invalid observed event index"
         );
+        if let Some(indices) = &entry.global_event_indices {
+            anyhow::ensure!(
+                indices.len() == entry.occurrences
+                    && indices.windows(2).all(|pair| pair[0] < pair[1]),
+                "invalid per-source global event sequence"
+            );
+        }
         counted = counted.saturating_add(entry.occurrences);
         let raw = read_observed_file(&input.observed_tree, &entry.raw_file)?;
         anyhow::ensure!(
@@ -979,6 +1148,12 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
                 serde_json::to_string(&e.returned_types)?,
                 serde_json::to_string(&e.thrown_types)?
             );
+            if let Some(indices) = &e.global_event_indices {
+                details.push_str(&format!(
+                    "- Global execution event indices: {}\n",
+                    serde_json::to_string(indices)?
+                ));
+            }
             if let Some(bytes) = &entry.readable {
                 let fmt = format!("{}/readable/{}.js", capture.relative, e.sha256);
                 write_file(staging.path(), &fmt, bytes)?;
@@ -1181,6 +1356,79 @@ mod tests {
                 source_files: vec![outer_source, inner_source],
             },
         ))
+    }
+
+    #[test]
+    fn direct_bundle_expansion_checks_site_identity_and_complete_coverage() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (_out, input) = sample(tmp.path())?;
+        let original = input.source_files[1].clone();
+        let root = tmp.path().join("bundle");
+        fs::create_dir_all(root.join("site-0000"))?;
+        let old: serde_json::Value =
+            serde_json::from_slice(&fs::read(input.observed_tree.join("manifest.json"))?)?;
+        let exe = old["sourceProvenance"]["innerExecutable"].clone();
+        let capture_id = "c".repeat(64);
+        let witness = json!({
+            "schemaVersion":3,
+            "captureSha256":capture_id,
+            "sourceProvenance":{
+                "kind":"direct-executable",
+                "executable":{"sha256":exe["sha256"],"evalSite":exe["evalSite"]}
+            },
+            "truncated":false,"eventCount":2,"uniqueSourceCount":1,
+            "entries":[{
+                "sha256":"f".repeat(64),"utf16Length":2,"firstEvent":0,
+                "occurrences":2,"returned":2,"threw":0,
+                "returnedTypes":{"number":2},"thrownTypes":{},
+                "rawFile":"raw/".to_owned() + &"f".repeat(64) + ".txt",
+                "readableFile":null,"readableStatus":"standalone-parse-rejected",
+                "globalEventIndices":[0,1]
+            }]
+        });
+        fs::write(
+            root.join("site-0000/manifest.json"),
+            serde_json::to_vec(&witness)?,
+        )?;
+        let descriptor = json!({
+            "schemaVersion":1,
+            "kind":"direct-eval-export-bundle",
+            "captureSha256":capture_id,
+            "executableSha256":exe["sha256"],
+            "sites":[
+                {"siteIndex":0,"evalSite":exe["evalSite"],"eventCount":2},
+                {"siteIndex":1,"evalSite":{"start":0,"end":7,"expression":"eval(D)"},
+                 "eventCount":0}
+            ],
+            "captures":[
+                {"siteIndex":0,"directory":"site-0000",
+                 "evalSite":exe["evalSite"],"eventCount":2}
+            ],
+        });
+        let bundle = root.join("bundle.json");
+        fs::write(&bundle, serde_json::to_vec(&descriptor)?)?;
+        let expanded = expand_observed_direct_bundle(&root, &original)?;
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].observed_tree, root.join("site-0000"));
+        assert_eq!(expanded[0].source_files, vec![original.clone()]);
+
+        let mut altered = descriptor.clone();
+        altered["captures"][0]["siteIndex"] = json!(1);
+        fs::write(&bundle, serde_json::to_vec(&altered)?)?;
+        assert!(expand_observed_direct_bundle(&root, &original).is_err());
+        altered = descriptor.clone();
+        altered["sites"][1]["eventCount"] = json!(1);
+        fs::write(&bundle, serde_json::to_vec(&altered)?)?;
+        assert!(expand_observed_direct_bundle(&root, &original).is_err());
+        altered = descriptor.clone();
+        altered["captures"][0]["directory"] = json!("../escape");
+        fs::write(&bundle, serde_json::to_vec(&altered)?)?;
+        assert!(expand_observed_direct_bundle(&root, &original).is_err());
+        altered = descriptor.clone();
+        altered["captures"][0]["eventCount"] = json!(999);
+        fs::write(&bundle, serde_json::to_vec(&altered)?)?;
+        assert!(expand_observed_direct_bundle(&root, &original).is_err());
+        Ok(())
     }
 
     #[test]

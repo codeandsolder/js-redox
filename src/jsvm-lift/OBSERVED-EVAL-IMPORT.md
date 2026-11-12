@@ -137,3 +137,30 @@ The separate generic Node producer is
 is synchronous, observes one selected direct-eval site, and is not an
 automatic browser emulator. It shares argument instrumentation and
 content-addressed event collection with the original two-stage runner.
+
+## Multiple direct eval sites (one captured execution)
+
+A single original executable may contain several distinct direct eval
+calls, and two different lexical sites may evaluate identical source bytes.
+To preserve both attribution and the run-wide event sequence:
+
+```bash
+deobfuscate-safe source-tree STATIC_TREE COMBINED_TREE \
+  --observed-direct-bundle EXPORTED_BUNDLE ORIGINAL_EXECUTABLE_JS
+```
+
+The exported bundle has a strict site index list, original executable and
+capture SHA-256, and one per-site **v3 direct manifest** for each site with
+observed string events. No-witness sites are recorded only as unobserved in
+the bundle. Global event indices are stored with the entry metadata for
+each source, so cross-site ordering remains inspectable. Raw source
+deduplication is content-addressed but runtime evidence and AST lexical
+provenance are **per site**, never inferred from equal string hashes.
+
+The native importer checks the bundle root and site paths, original source
+SHA, source intervals, complete per-site event counts, manifest schema and
+site correspondence; it then validates every witness independently with
+OXC. It publishes the whole combined tree only when every site passes,
+preserving original static JS/reconstruction and all per-site manifests
+byte-for-byte. Existing genuine two-stage captures use their actual source
+chain and continue to use `--observed-eval`.
