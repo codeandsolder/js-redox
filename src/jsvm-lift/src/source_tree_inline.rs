@@ -371,7 +371,7 @@ pub fn expand_helper_returns(
 mod tests {
     use super::expand_helper_returns;
     use crate::source_tree_context::reconstruct_context;
-    use anyhow::Result;
+    use anyhow::{Context as _, Result};
 
     #[test]
     fn expands_original_return_expression_using_exact_formal_bindings() -> Result<()> {
@@ -380,7 +380,8 @@ mod tests {
         let source = "const capturedHandler=function(P){return AM(P)+AM(P);};";
         let context =
             reconstruct_context(original, &[("nested/handler.js".into(), source.into())])?;
-        let out = expand_helper_returns(source, &context, &context.handlers[0])?.unwrap();
+        let out = expand_helper_returns(source, &context, &context.handlers[0])?
+            .context("expected a source-backed expanded helper return")?;
         assert_eq!(out.expanded_calls, 2);
         assert_eq!(out.helpers, ["AM"]);
         assert_eq!(
@@ -443,7 +444,8 @@ mod tests {
         let original = "function root(){const twice=function(J){return J+J;};}";
         let source = "const capturedHandler=function(){return twice(7)+twice(1+2);};";
         let context = reconstruct_context(original, &[("handler.js".into(), source.into())])?;
-        let out = expand_helper_returns(source, &context, &context.handlers[0])?.unwrap();
+        let out = expand_helper_returns(source, &context, &context.handlers[0])?
+            .context("expected a source-backed expanded helper return")?;
         assert_eq!(out.expanded_calls, 2);
         assert!(out.source.contains("((7)+(7))"), "{}", out.source);
         assert!(out.source.contains("((1+2)+(1+2))"), "{}", out.source);
