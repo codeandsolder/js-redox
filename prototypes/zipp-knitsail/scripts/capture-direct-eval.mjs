@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
+import {spawnSync} from 'node:child_process';
 import {
   sha256, readSource, instrumentEvalSites, createObserver, contextGlobals,
 } from './eval-capture-core.mjs';
@@ -18,6 +19,38 @@ const source=readSource(root, config.sourceFile);
 const entry=config.entryFile ? readSource(root, config.entryFile) : null;
 const identity=config.identityFile ?
   fs.readFileSync(path.resolve(root,config.identityFile)) : source.bytes;
+function resolveSites() {
+  if (Array.isArray(config.sites)) return config.sites;
+  if (config.sites !== 'all') {
+    throw Error('sites must be a nonempty array or "all" for AST-driven discovery');
+  }
+  const parserBinary=config.parserBinary ?? process.env.JSREDOX_DEOBFUSCATE_BIN;
+  if (typeof parserBinary !== 'string' || !parserBinary) {
+    throw Error('AST site discovery requires parserBinary or JSREDOX_DEOBFUSCATE_BIN');
+  }
+  const binary=path.isAbsolute(parserBinary)?parserBinary:path.resolve(root,parserBinary);
+  const result=spawnSync(binary,[
+    'eval-sites',path.resolve(root,config.sourceFile),
+  ],{encoding:'utf8',timeout:45000,maxBuffer:16*1024*1024});
+  if (result.error || result.status!==0) {
+    throw Error('Native AST eval-site discovery failed: '+
+      (result.error?.message ?? result.stderr ?? result.status).slice(0,1000));
+  }
+  const inventory=JSON.parse(result.stdout);
+  if(inventory.schemaVersion!==1 || inventory.sourceSha256!==sha256(source.bytes) ||
+      !Array.isArray(inventory.sites) || !Array.isArray(inventory.unsupported)) {
+    throw Error('Native AST site inventory does not match exact original source');
+  }
+  if (inventory.unsupported.length>0) {
+    throw Error('Native AST inventory includes direct eval sites that cannot be captured: '+
+      JSON.stringify(inventory.unsupported).slice(0,1000));
+  }
+  if(!inventory.sites.length) {
+    throw Error('Native AST inventory contains no executable direct eval sites');
+  }
+  return inventory.sites;
+}
+const sites=resolveSites();
 const timeoutMs=config.timeoutMs ?? 10000;
 if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
   throw Error('timeoutMs must be a positive integer');
@@ -30,7 +63,7 @@ try {
   const context=vm.createContext(contextGlobals(config.globals));
   const observer=createObserver(context,source.bytes,path.join(stage,'sources'),
     config.maxEvents ?? 10000);
-  const instrumented=instrumentEvalSites(source.text,config.sites,observer.hooks);
+  const instrumented=instrumentEvalSites(source.text,sites,observer.hooks);
   new vm.Script(instrumented.code,{filename:'instrumented-direct.js'});
   // Don't alter the original JS file, and don't run an injected wrapper:
   // eval() stays a direct call in the same lexical function and scope.

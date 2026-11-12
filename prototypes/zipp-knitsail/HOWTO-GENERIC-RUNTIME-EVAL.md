@@ -242,3 +242,42 @@ node --test tests/multi-direct-eval.test.mjs
 JSREDOX_DEOBFUSCATE_BIN=/path/to/deobfuscate-safe \
   node --test tests/multi-direct-native-import.test.mjs
 ```
+
+## AST-driven discovery of all direct-eval sites
+
+The producer can now ask the native Rust/OXC parser for **all executable
+unresolved direct eval callsites**, rather than requiring manually counted
+UTF-16 intervals. The exact original source SHA-256 is checked before any
+instrumentation:
+
+```json
+{
+  "sourceFile": "program.js",
+  "entryFile": "entry.js",
+  "sites": "all",
+  "parserBinary": "/path/to/deobfuscate-safe"
+}
+```
+
+```bash
+deobfuscate-safe eval-sites program.js
+node scripts/capture-direct-eval.mjs CONFIG.json CAPTURE_DIR
+```
+
+`JSREDOX_DEOBFUSCATE_BIN` may supply the parser path instead of
+`parserBinary`. The inventory returns each direct `eval(...)` AST node and
+its exact first argument span, both in original UTF-16 code units. Local
+variables/functions shadowing `eval` do not count as direct eval. An
+original direct `eval` that has no first argument or uses a spread-first
+argument is **explicitly reported as unsupported**, not silently skipped;
+`sites:"all"` refuses the capture if any such site is found. Non-parseable
+scripts are refused rather than regex-matched. The capture can instrument
+genuinely **nested direct eval calls** (e.g. `eval(eval(D))`) with ordered
+span insertions, retaining the original inner-before-outer execution event
+order without reassigning source offsets.
+
+Manual `sites:[...]` remains useful for a controlled experiment on a
+chosen subset. `sites:"all"` accounts for the whole directly evaluated
+source surface that the instrumenter supports, subject to the synchronous
+Node VM and first-argument capture limitations stated above.
+The AST inventory itself never executes JavaScript.

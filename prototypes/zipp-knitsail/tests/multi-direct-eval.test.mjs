@@ -118,7 +118,7 @@ test('ambiguous or overlapping site configurations refuse publication',()=>{
     const dest=path.join(tmp,'bad');
     const result=run(process.execPath,[capture,file,dest]);
     assert.notEqual(result.status,0);
-    assert.match(result.stderr,/nonoverlapping/);
+    assert.match(result.stderr,/Duplicate eval callsites/);
     assert.equal(fs.existsSync(dest),false);
     config.sites=[{evalExpression:'eval(D)',firstArgumentExpression:'D'}];
     fs.writeFileSync(file,JSON.stringify(config));
@@ -126,5 +126,39 @@ test('ambiguous or overlapping site configurations refuse publication',()=>{
     assert.notEqual(ambiguous.status,0);
     assert.match(ambiguous.stderr,/exactly once/);
     assert.equal(fs.existsSync(dest),false);
+  }finally{fs.rmSync(tmp,{recursive:true,force:true});}
+});
+
+test('nested eval callsites retain original AST offsets and lexical evaluation order',()=>{
+  const tmp=fs.mkdtempSync(path.join(os.tmpdir(),'jsredox-nested-eval-'));
+  try {
+    const source="var nested=function(D){return eval(eval(D));};";
+    const expression='eval(eval(D))';
+    const inner='eval(D)';
+    const first=source.indexOf(expression);
+    const second=source.indexOf(inner,first+5);
+    const sites=[
+      {evalSite:{start:first,end:first+expression.length,expression},
+        firstArgumentSite:{start:second,end:second+inner.length,expression:inner}},
+      {evalSite:{start:second,end:second+inner.length,expression:inner},
+        firstArgumentSite:{start:second+5,end:second+6,expression:'D'}},
+    ];
+    fs.writeFileSync(path.join(tmp,'source.js'),source);
+    fs.writeFileSync(path.join(tmp,'entry.js'),
+      'if(nested("\\u002240+2\\u0022")!==42) throw Error("nested eval changed");');
+    const config=path.join(tmp,'config.json');
+    fs.writeFileSync(config,JSON.stringify({
+      sourceFile:'source.js',entryFile:'entry.js',sites,
+    }));
+    const out=path.join(tmp,'out');
+    const result=run(process.execPath,[capture,config,out]);
+    assert.equal(result.status,0,result.stderr);
+    const report=JSON.parse(fs.readFileSync(path.join(out,'report.json')));
+    assert.equal(report.dynamicCodeEvents.length,2);
+    assert.deepEqual(report.dynamicCodeEvents.map(e=>e.siteIndex),[1,0]);
+    assert.deepEqual(report.dynamicCodeEvents.map(e=>e.outcome),['return','return']);
+    const bundle=JSON.parse(fs.readFileSync(path.join(out,'bundle.json')));
+    assert.deepEqual(bundle.captures.map(c=>c.siteIndex),[0,1]);
+    assert.deepEqual(bundle.sites.map(c=>c.evalSite),sites.map(c=>c.evalSite));
   }finally{fs.rmSync(tmp,{recursive:true,force:true});}
 });

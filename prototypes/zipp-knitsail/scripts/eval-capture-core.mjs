@@ -70,7 +70,7 @@ export function instrumentEval(code, config, names, siteIndex=0) {
     first.expression + ')' + originalCall.slice(relativeEnd) + ')';
   return {
     code:code.slice(0, site.start) + newCall + code.slice(site.end),
-    site, hasAdditionalArgs,
+    site, firstArgumentSite:first, hasAdditionalArgs,
   };
 }
 
@@ -78,30 +78,59 @@ export function instrumentEvalSites(code, configs, names) {
   if (!Array.isArray(configs) || configs.length === 0) {
     throw Error('sites must be a nonempty array of eval-site configurations');
   }
-  const replacements = configs.map((siteConfig, siteIndex) => {
-    const modified = instrumentEval(code, siteConfig, names, siteIndex);
-    return {
-      siteIndex, site:modified.site,
-      hasAdditionalArgs:modified.hasAdditionalArgs,
-      replacement:modified.code.slice(
-        modified.site.start,
-        modified.code.length - (code.length - modified.site.end)),
-    };
-  });
-  const sorted = [...replacements].sort((a,b) => a.site.start-b.site.start);
-  for (let i=1;i<sorted.length;i++) {
-    if (sorted[i].site.start < sorted[i-1].site.end) {
-      throw Error('Eval sites must have distinct, nonoverlapping source intervals');
+  const sites = configs.map((cfg,siteIndex) => ({
+    siteIndex, ...instrumentEval(code,cfg,names,siteIndex),
+  }));
+  // Every configured site is identified by its original UTF-16 interval.
+  const ids = new Set(sites.map(({site})=>site.start+':'+site.end));
+  if (ids.size !== sites.length) {
+    throw Error('Duplicate eval callsites with identical original source intervals');
+  }
+  const wrappers = sites.flatMap(({siteIndex,site,firstArgumentSite})=>[
+    {start:site.start,end:site.end,kind:'result',
+      open:names.result+'('+siteIndex+',',close:')'},
+    {start:firstArgumentSite.start,end:firstArgumentSite.end,kind:'arg',
+      open:names.arg+'('+siteIndex+',',close:')'},
+  ]);
+  // Valid AST spans are nested or disjoint, never partially overlapping.
+  for (const [i,a] of wrappers.entries()) {
+    for (const b of wrappers.slice(i+1)) {
+      const crosses=(a.start<b.start && b.start<a.end && a.end<b.end) ||
+        (b.start<a.start && a.start<b.end && b.end<a.end);
+      if (crosses) throw Error('Eval and argument source intervals must be nested or disjoint');
     }
   }
-  let instrumented=code;
-  for (const site of sorted.reverse()) {
-    instrumented=instrumented.slice(0,site.site.start)+site.replacement+
-      instrumented.slice(site.site.end);
+  const positions=new Map();
+  for (const wrapper of wrappers) {
+    if (!positions.has(wrapper.start)) positions.set(wrapper.start,[]);
+    if (!positions.has(wrapper.end)) positions.set(wrapper.end,[]);
+    positions.get(wrapper.start).push({...wrapper,opening:true});
+    positions.get(wrapper.end).push({...wrapper,opening:false});
   }
+  let cursor=0;
+  let instrumented='';
+  for(const [offset,items] of [...positions.entries()].sort((a,b)=>a[0]-b[0])) {
+    instrumented+=code.slice(cursor,offset);
+    // Close innermost-to-outermost, then open outermost-to-innermost.
+    // Equal spans occur when an outer call's argument is an inner call:
+    // the outer argument wrapper must surround the inner result wrapper.
+    items.sort((a,b)=>{
+      if(a.opening!==b.opening) return a.opening?1:-1;
+      const sizeA=a.end-a.start,sizeB=b.end-b.start;
+      if(sizeA!==sizeB) return a.opening?sizeB-sizeA:sizeA-sizeB;
+      if(a.kind!==b.kind) {
+        return a.opening ? (a.kind==='arg'?-1:1) :
+          (a.kind==='result'?-1:1);
+      }
+      return a.siteIndex-b.siteIndex;
+    });
+    instrumented+=items.map(item=>item.opening?item.open:item.close).join('');
+    cursor=offset;
+  }
+  instrumented+=code.slice(cursor);
   return {
     code:instrumented,
-    sites:replacements.map(({siteIndex,site,hasAdditionalArgs})=>
+    sites:sites.map(({siteIndex,site,hasAdditionalArgs})=>
       ({siteIndex,...site,hasAdditionalArgs})),
   };
 }
