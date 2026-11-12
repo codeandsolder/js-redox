@@ -14,6 +14,7 @@ use jsvm_lift::{
         SpecializedHelperCall,
     },
     source_tree_inline::expand_helper_returns,
+    source_tree_reflow::reflow_single_trip_loops,
     source_tree_specialize::{specialize_calls, specialize_resolved_call_graph},
 };
 use serde_json::json;
@@ -356,7 +357,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 args.format_output,
                 &budget,
             );
-            let (code, transforms, error) = match outcome {
+            let (code, mut transforms, error) = match outcome {
                 Ok(rewritten) => (rewritten.source, rewritten.report.transforms, None),
                 Err(error) => (
                     helper.source.clone(),
@@ -364,6 +365,21 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                     Some(error.to_string()),
                 ),
             };
+            // The original program remains byte-exact in lexical-context/original.js.
+            // Improve only the independently readable helper projection.
+            let reflowed = reflow_single_trip_loops(&code)?;
+            let rewritten_loops = reflowed.rewritten_loops;
+            let code = if rewritten_loops > 0 && args.format_output {
+                jsvm_lift::js_format::format_source(&reflowed.source, &budget)
+                    .unwrap_or(reflowed.source)
+            } else {
+                reflowed.source
+            };
+            if rewritten_loops > 0 {
+                *transforms
+                    .entry("source_single_trip_reflow".to_owned())
+                    .or_default() += rewritten_loops;
+            }
             fs::write(folder.join(relative), &code)?;
             // Annotate references only where the helper's *own* AST resolves
             // the property key to the same symbol as its prior assignments.
@@ -402,6 +418,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "path": relative,
                 "binding_mutable": helper.mutable_binding,
                 "references": helper.references,
+                "single_trip_loops_reflowed": rewritten_loops,
                 "transforms": transforms,
                 "error": error,
             }));
@@ -571,7 +588,11 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
         let mut specializations_md =
             String::from("# Constant-argument specialized helper code\n\n");
         specializations_md.push_str(
-            "Each file substitutes the exact constant arguments of a real handler call              into their original lexical parameter references, then runs static JS              deobfuscation. Original helpers remain available; these files are              callsite-specific analysis views inside the original closure context,              not independent runnable modules.\n\n"
+            "Each file substitutes exact constant call arguments into the original lexical \
+             parameter references and applies static deobfuscation. Loops proven to run at \
+             most once are reduced to conditional blocks without dropping the initializer \
+             or condition evaluation. Original helpers remain available; these source-backed \
+             derivatives are analysis views, not independently runnable modules.\n\n",
         );
         let mut specialization_rows = Vec::new();
         for (specialized, link) in specializations.into_iter().zip(&specialized_links) {
@@ -580,7 +601,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 AnalysisOperation::SafeDeobfuscation,
                 format!("specialized {}", specialized.helper),
             );
-            let (code, transforms, error) = match deobfuscate_source(
+            let (code, mut transforms, error) = match deobfuscate_source(
                 &specialized.source,
                 relative.clone(),
                 SourceMode::Auto,
@@ -595,6 +616,19 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                     Some(error.to_string()),
                 ),
             };
+            let reflowed = reflow_single_trip_loops(&code)?;
+            let rewritten_loops = reflowed.rewritten_loops;
+            let code = if rewritten_loops > 0 && args.format_output {
+                jsvm_lift::js_format::format_source(&reflowed.source, &budget)
+                    .unwrap_or(reflowed.source)
+            } else {
+                reflowed.source
+            };
+            if rewritten_loops > 0 {
+                *transforms
+                    .entry("source_single_trip_reflow".to_owned())
+                    .or_default() += rewritten_loops;
+            }
             fs::write(folder.join(&relative), &code)?;
             let actual_changes = code != specialized.original;
             let constants = specialized
@@ -625,6 +659,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "path": relative,
                 "call_sites": specialized.call_sites,
                 "specialized_source_changed": actual_changes,
+                "single_trip_loops_reflowed": rewritten_loops,
                 "transforms": transforms,
                 "error": error,
             }));

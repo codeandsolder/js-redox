@@ -546,8 +546,15 @@ the same source-tree pass also generates a lexical-context/specializations
 directory. Each JS file is a rewritten helper body: literal arguments from
 an actual extracted handler call replace references to the corresponding
 unchanged lexical parameter symbols, and the regular static deobfuscator
-then simplifies the result. Both the full original helper and the specialized
-body are kept and linked by original handler callsite.
+then simplifies the result. Derived original-helper and specialized-helper views
+also structurally reduce single-trip `for`/`while`/`do-while` loops when an
+unconditional terminal break proves that a second iteration is impossible.
+The original initializer and condition are evaluated exactly once, loop
+updates remain unreachable, and potential earlier breaks or continues
+prevent the rewrite. The lexical program remains byte-exact in
+`lexical-context/original.js`; reflow counts are recorded per helper and
+specialization in `lexical-context/context.json`. The original helper and
+specialized body are kept and linked by original handler callsite.
 
 Specialization handles primitive literal arguments, including multiple
 constant parameters in a call. It rejects parameter writes, direct eval,
