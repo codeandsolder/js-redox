@@ -329,6 +329,7 @@ struct AstMatch {
 
 struct PreparedCapture {
     manifest: Manifest,
+    original_manifest: Vec<u8>,
     relative: String,
     entries: Vec<SourceEntry>,
     matches: Vec<AstMatch>,
@@ -352,6 +353,41 @@ fn read_regular(path: &Path) -> Result<Vec<u8>> {
         path.display()
     );
     fs::read(path).with_context(|| format!("reading {}", path.display()))
+}
+
+/// Read one untrusted capture artifact without traversing symlinked
+/// intermediate directories. The relative paths are content-derived names.
+fn read_observed_file(root: &Path, relative: &str) -> Result<Vec<u8>> {
+    use std::path::Component;
+    let root_type = fs::symlink_metadata(root)
+        .with_context(|| format!("checking observed source root {}", root.display()))?
+        .file_type();
+    anyhow::ensure!(
+        root_type.is_dir() && !root_type.is_symlink(),
+        "observed source root must be a real directory: {}",
+        root.display()
+    );
+    let components = Path::new(relative).components().collect::<Vec<_>>();
+    anyhow::ensure!(
+        !components.is_empty() && components.iter().all(|c| matches!(c, Component::Normal(_))),
+        "invalid observed artifact relative path"
+    );
+    let mut current = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component);
+        if index + 1 == components.len() {
+            return read_regular(&current);
+        }
+        let kind = fs::symlink_metadata(&current)
+            .with_context(|| format!("checking observed directory {}", current.display()))?
+            .file_type();
+        anyhow::ensure!(
+            kind.is_dir() && !kind.is_symlink(),
+            "symlink or non-directory inside observed source tree: {}",
+            current.display()
+        );
+    }
+    anyhow::bail!("empty observed artifact path")
 }
 
 fn exact_site<'a>(code: &'a str, site: &SourceSite, expected: &str) -> Result<&'a str> {
@@ -424,8 +460,8 @@ fn scan_matches(output: &Path, original: &Site) -> Result<(Vec<AstMatch>, Vec<St
 }
 
 fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedCapture> {
-    let mut manifest: Manifest =
-        serde_json::from_slice(&read_regular(&input.observed_tree.join("manifest.json"))?)?;
+    let original_manifest = read_observed_file(&input.observed_tree, "manifest.json")?;
+    let mut manifest: Manifest = serde_json::from_slice(&original_manifest)?;
     anyhow::ensure!(
         manifest.schema_version == 2,
         "only dual-layer observed-eval manifest v2 is accepted"
@@ -503,7 +539,7 @@ fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedC
             "invalid observed event index"
         );
         counted = counted.saturating_add(entry.occurrences);
-        let raw = read_regular(&input.observed_tree.join(&entry.raw_file))?;
+        let raw = read_observed_file(&input.observed_tree, &entry.raw_file)?;
         anyhow::ensure!(
             sha256_hex(&raw) == entry.sha256,
             "generated source SHA-256 mismatch"
@@ -515,7 +551,7 @@ fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedC
         let readable = entry
             .readable_file
             .as_ref()
-            .map(|f| read_regular(&input.observed_tree.join(f)))
+            .map(|f| read_observed_file(&input.observed_tree, f))
             .transpose()?;
         entries.push(SourceEntry {
             meta: entry,
@@ -524,7 +560,7 @@ fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedC
         });
     }
     anyhow::ensure!(
-        counted <= manifest.event_count,
+        counted == manifest.event_count,
         "observed event count mismatch"
     );
     let relative = format!(
@@ -537,6 +573,7 @@ fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedC
     );
     Ok(PreparedCapture {
         manifest,
+        original_manifest,
         relative,
         entries,
         matches,
@@ -638,7 +675,6 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
              Execution evidence, not static proofs. Callable values may be lexical lookups.\n\n\
              [Executable origin](origin.md) | [Machine-readable origin](origin.json)\n\n",
         );
-        let mut source_entries = Vec::new();
         for entry in &capture.entries {
             let e = &entry.meta;
             let raw_name = format!("{}/raw/{}.txt", capture.relative, e.sha256);
@@ -683,26 +719,15 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
                 e.utf16_length,
                 e.occurrences
             ));
-            source_entries.push(json!({
-                "sha256":e.sha256, "utf16Length":e.utf16_length,
-                "firstEvent":e.first_event,"occurrences":e.occurrences,
-                "returned":e.returned,"threw":e.threw,
-                "returnedTypes":e.returned_types,"thrownTypes":e.thrown_types,
-                "rawFile":e.raw_file,"readableFile":e.readable_file,
-                "readableStatus":e.readable_status
-            }));
         }
         write_file(staging.path(), &readme, listing.as_bytes())?;
-        let original_manifest = json!({
-            "schemaVersion":2,"htmlSha256":m.html_sha256,
-            "sourceProvenance":{"outerLoader":outer,"innerExecutable":inner},
-            "eventCount":m.event_count,"uniqueSourceCount":m.unique_source_count,
-            "truncated":m.truncated,"entries":source_entries
-        });
+        // Preserve the complete externally captured manifest byte-for-byte:
+        // parsed typed fields validate it, while upstream may carry additional
+        // provenance fields such as environment and evidenceKind.
         write_file(
             staging.path(),
             &format!("{}/manifest.json", capture.relative),
-            serde_json::to_string_pretty(&original_manifest)?.as_bytes(),
+            &capture.original_manifest,
         )?;
         index.push_str(&format!(
             "- [Outer {} / inner {} / eval {}..{} / capture {}]({}) - {} calls, {} strings\n",
@@ -812,6 +837,8 @@ mod tests {
         )?;
         let manifest = json!({
             "schemaVersion":2,
+            "evidenceKind":"execution-observed",
+            "environment":{"model":"archived browser replay","runner":"node"},
             "htmlSha256":"a".repeat(64),
             "sourceProvenance":{
                 "outerLoader":{
@@ -862,6 +889,7 @@ mod tests {
         let (out, input) = sample(tmp.path())?;
         let original = fs::read(out.join("original.js"))?;
         let reconstruction = fs::read(out.join("reconstruction.json"))?;
+        let witness_manifest = fs::read(input.observed_tree.join("manifest.json"))?;
 
         attach_observed_eval_sources(&out, &[input.clone()])?;
         assert_eq!(original, fs::read(out.join("original.js"))?);
@@ -875,6 +903,13 @@ mod tests {
         );
         assert_eq!(root_index["captures"][0]["staticAstMatches"], 1);
         assert_eq!(root_index["captures"][0]["sources"], 1);
+        let rel = root_index["captures"][0]["directory"]
+            .as_str()
+            .context("missing captured source directory")?;
+        assert_eq!(
+            witness_manifest,
+            fs::read(out.join(rel).join("manifest.json"))?
+        );
         let relative = root_index["captures"][0]["directory"]
             .as_str()
             .context("missing generated capture directory")?;
@@ -915,6 +950,33 @@ mod tests {
         let result = attach_observed_eval_sources(&out, &[another]);
         assert!(result.is_err(), "legacy v1 manifest must be rejected");
         assert!(!out.join("runtime-observed").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn count_mismatch_is_rejected_without_emitting_evidence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (output, input) = sample(temp.path())?;
+        let manifest_path = input.observed_tree.join("manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        manifest["eventCount"] = json!(3);
+        fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+        assert!(attach_observed_eval_sources(&output, &[input]).is_err());
+        assert!(!output.join("runtime-observed").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_source_directory_symlinks_are_not_followed() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir()?;
+        let (output, input) = sample(temp.path())?;
+        let real = temp.path().join("original-raw");
+        fs::rename(input.observed_tree.join("raw"), &real)?;
+        symlink(&real, input.observed_tree.join("raw"))?;
+        assert!(attach_observed_eval_sources(&output, &[input]).is_err());
+        assert!(!output.join("runtime-observed").exists());
         Ok(())
     }
 
