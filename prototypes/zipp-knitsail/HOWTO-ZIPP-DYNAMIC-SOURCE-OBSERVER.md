@@ -8,7 +8,7 @@ not an importer or replacement for the original OXC/source-tree proofs.
 
 - ZIPP upstream repository: https://github.com/f2i-com/zipp.org
 - Patch base: `bcca68127fe86f0b8a59fd9e6c694f7518406647` (2026-11-12 ZIPP main, v0.0.35 line).
-- Local source commit that generated the patch: `d73d166`.
+- Local source commit that generated the patch: `9acf212`.
 - Patch: [zipp-native-dynamic-source-observer.patch](patches/zipp-native-dynamic-source-observer.patch).
 - It modifies **only** `zipp-vm` embedding/instrumentation and adds a focused
   Rust integration test; no copied full ZIPP source tree or private payload.
@@ -75,3 +75,9 @@ for source recovery.
 
 The unrelated ZIPP Tier O preheader bug #93 was already fixed upstream
 in v0.0.35; **do not apply the old issue-93 patch** to this checkout.
+
+## Verified validation (2026-11-12)
+
+- Rust 1.99, configured sccache: **7/7 focused native Rust tests PASS**.
+- `cargo +1.99.0 clippy -p zipp-vm --no-default-features --features instrument --test dynamic_source_capture` completed, with three pre-existing build-script warnings in ZIPP `build/minify.rs` and `build/sha256.rs`. The strict `-D warnings` run fails on those same baseline warnings, not on the observer.
+- A clean pinned upstream ZIPP checkout accepted the patch with `git apply --check`. No full Knitsail corpus run was made.

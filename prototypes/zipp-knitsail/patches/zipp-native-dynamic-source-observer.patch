@@ -1,15 +1,15 @@
-From d73d16601b291c21be4f8ac79f877510f3743f80 Mon Sep 17 00:00:00 2001
+From 9acf2128e8fbd579941b706130ad2bc776de0377 Mon Sep 17 00:00:00 2001
 From: codeandsolder <codeandsolder@gmail.com>
 Date: Thu, 12 Nov 2026 23:19:43 +0100
 Subject: [PATCH] feat(embed): opt-in bounded runtime source compiler
  observations
 
 ---
- crates/zipp-vm/src/embed.rs                   |  33 ++++-
- crates/zipp-vm/src/vm/engine/run.rs           |  16 +++
- crates/zipp-vm/src/vm/instrument.rs           |  96 +++++++++++++
- .../zipp-vm/tests/dynamic_source_capture.rs   | 129 ++++++++++++++++++
- 4 files changed, 273 insertions(+), 1 deletion(-)
+ crates/zipp-vm/src/embed.rs                   |  33 +++-
+ crates/zipp-vm/src/vm/engine/run.rs           |  16 ++
+ crates/zipp-vm/src/vm/instrument.rs           |  96 ++++++++++++
+ .../zipp-vm/tests/dynamic_source_capture.rs   | 143 ++++++++++++++++++
+ 4 files changed, 287 insertions(+), 1 deletion(-)
  create mode 100644 crates/zipp-vm/tests/dynamic_source_capture.rs
 
 diff --git a/crates/zipp-vm/src/embed.rs b/crates/zipp-vm/src/embed.rs
@@ -227,10 +227,10 @@ index 416911a..03d9a47 100644
          match rec_mut!(self) {
 diff --git a/crates/zipp-vm/tests/dynamic_source_capture.rs b/crates/zipp-vm/tests/dynamic_source_capture.rs
 new file mode 100644
-index 0000000..371fafc
+index 0000000..2dd1a62
 --- /dev/null
 +++ b/crates/zipp-vm/tests/dynamic_source_capture.rs
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,143 @@
 +#![cfg(feature = "instrument")]
 +
 +use zipp_vm::embed::{compile_script, DynamicSourceKind};
@@ -257,11 +257,16 @@ index 0000000..371fafc
 +    assert_eq!(capture.events.len(), 3);
 +    assert_eq!(capture.events[0].kind, DynamicSourceKind::DirectEval);
 +    assert_eq!(capture.events[0].source_bytes, b"x + 7");
-+    assert_eq!(capture.events[1].kind, DynamicSourceKind::IndirectEvalOrHost);
++    assert_eq!(
++        capture.events[1].kind,
++        DynamicSourceKind::IndirectEvalOrHost
++    );
 +    assert_eq!(capture.events[1].source_bytes, b"8 + 9");
-+    assert_eq!(capture.events[2].kind, DynamicSourceKind::FunctionConstructor);
-+    assert!(String::from_utf8_lossy(&capture.events[2].source_bytes)
-+        .contains("return v + 4;"));
++    assert_eq!(
++        capture.events[2].kind,
++        DynamicSourceKind::FunctionConstructor
++    );
++    assert!(String::from_utf8_lossy(&capture.events[2].source_bytes).contains("return v + 4;"));
 +    assert!(state.take_dynamic_source_capture().is_none());
 +}
 +
@@ -276,7 +281,9 @@ index 0000000..371fafc
 +    .expect("compile original script");
 +    state.set_limits(1_000_000, None);
 +    state.start_dynamic_source_capture(2, 1024);
-+    state.run_init().expect("complete guest script even when observer fills");
++    state
++        .run_init()
++        .expect("complete guest script even when observer fills");
 +    let capture = state.take_dynamic_source_capture().expect("capture");
 +    assert_eq!(capture.events.len(), 2);
 +    assert!(capture.truncated);
@@ -312,10 +319,9 @@ index 0000000..371fafc
 +
 +#[test]
 +fn nested_eval_preserves_compiler_entry_order() {
-+    let mut state = compile_script(
-+        "var D = '\"4 + 3\"'; if (eval(eval(D)) !== 7) throw Error('wrong');",
-+    )
-+    .expect("compile");
++    let mut state =
++        compile_script("var D = '\"4 + 3\"'; if (eval(eval(D)) !== 7) throw Error('wrong');")
++            .expect("compile");
 +    state.set_limits(1_000_000, None);
 +    state.start_dynamic_source_capture(10, 1024);
 +    state.run_init().expect("execute");
@@ -345,8 +351,14 @@ index 0000000..371fafc
 +    let capture = state.take_dynamic_source_capture().expect("capture");
 +    assert!(!capture.truncated);
 +    assert_eq!(capture.events.len(), 2);
-+    assert_eq!(capture.events[0].kind, DynamicSourceKind::FunctionConstructor);
-+    assert_eq!(capture.events[0].source_bytes, capture.events[1].source_bytes);
++    assert_eq!(
++        capture.events[0].kind,
++        DynamicSourceKind::FunctionConstructor
++    );
++    assert_eq!(
++        capture.events[0].source_bytes,
++        capture.events[1].source_bytes
++    );
 +}
 +
 +#[test]
@@ -355,7 +367,9 @@ index 0000000..371fafc
 +        compile_script("if (eval('21 + 21') !== 42) throw Error('wrong');").expect("compile");
 +    state.set_limits(1_000_000, None);
 +    state.start_dynamic_source_capture(10, 3);
-+    state.run_init().expect("execute regardless of observer cap");
++    state
++        .run_init()
++        .expect("execute regardless of observer cap");
 +    let capture = state.take_dynamic_source_capture().expect("capture");
 +    assert!(capture.events.is_empty());
 +    assert!(capture.truncated);
