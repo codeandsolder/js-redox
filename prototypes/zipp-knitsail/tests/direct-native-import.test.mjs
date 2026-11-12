@@ -21,10 +21,10 @@ test('actual single-stage source -> v3 manifest -> native AST verified overlay',
   try{
     const original=[
       "const emoji = '🦀';",
-      "function oU(D) { const suffix=' + 1'; return eval(D + suffix); }",
+      "var oU=function(D){return eval(D);};",
     ].join('\n');
     const entry=[
-      "if (oU('40') !== 41) throw Error('wrong direct eval result');",
+      "if (oU('40 + 1') !== 41) throw Error('wrong direct eval result');",
       "try {oU('unknown')} catch(e) {if (!(e instanceof ReferenceError)) throw e;}",
     ].join('\n');
     for (const [name,content] of [['source.js',original],['entry.js',entry]]) {
@@ -32,7 +32,7 @@ test('actual single-stage source -> v3 manifest -> native AST verified overlay',
     }
     fs.writeFileSync(path.join(tmp,'config.json'),JSON.stringify({
       sourceFile:'source.js',entryFile:'entry.js',
-      evalExpression:'eval(D + suffix)',firstArgumentExpression:'D + suffix',
+      evalExpression:'eval(D)',firstArgumentExpression:'D',
     }));
     const capture=path.join(tmp,'capture');
     const report=run(process.execPath,[runner,path.join(tmp,'config.json'),capture]);

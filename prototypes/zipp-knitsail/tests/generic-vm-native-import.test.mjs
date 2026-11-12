@@ -52,7 +52,7 @@ test('unrelated decoded VM -> generic capture -> v2 exporter -> native source-tr
     assertPass(binary,['source-tree',originalTree,combined,'--max-iterations','4',
       '--observed-eval',exported,path.join(captured,'outer.js'),path.join(captured,'inner.js')]);
     const index=JSON.parse(fs.readFileSync(path.join(combined,'runtime-observed/index.json')));
-    assert.equal(index.schema,'js-redox/linked-runtime-source-tree/v2');
+    assert.equal(index.schema,'js-redox/linked-runtime-source-tree/v3');
     assert.equal(index.captures.length,1);
     assert.equal(index.captures[0].calls,2);
     assert.equal(index.captures[0].sources,2);
