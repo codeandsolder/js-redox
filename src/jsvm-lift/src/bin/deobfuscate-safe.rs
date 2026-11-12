@@ -1994,6 +1994,9 @@ mod tests {
             context_source: Some(original),
             origin_source: None,
             caller_view_entry: None,
+            observed_eval: Vec::new(),
+            observed_direct: Vec::new(),
+            observed_direct_bundle: Vec::new(),
         })?;
         let lexical = output.join("lexical-context");
         let context: serde_json::Value =
