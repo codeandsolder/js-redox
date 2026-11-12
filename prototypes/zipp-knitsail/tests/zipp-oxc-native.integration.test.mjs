@@ -73,3 +73,30 @@ test('a separate host entry is not assigned an original AST callsite', {
       e.correlation.status==='unavailable'));
   }finally{fs.rmSync(dir,{recursive:true,force:true});}
 });
+
+test('parentheses preserve direct-eval references; comma and optional calls do not',
+  {skip:!canRun},()=>{
+    const dir=fs.mkdtempSync(path.join(os.tmpdir(),'jsredox-zipp-parens-'));
+    try{
+      const source=[
+        "const crab='🦀';",
+        'let cap=10;',
+        "const values=[eval('cap+1'),(eval)('cap+2'),((eval))('cap+3'),",
+        " eval/*comment*/('cap+4'),eval",
+        " ('cap+5'),(0,eval)('2+2'),eval?.('3+2')];",
+        'if(JSON.stringify(values)!==JSON.stringify([11,12,13,14,15,4,5]))',
+        " throw Error('wrong runtime semantics');",
+      ].join('\n');
+      const src=path.join(dir,'original.js');
+      fs.writeFileSync(src,source);
+      const ast=exec(oxc,['eval-sites',src]);
+      const runtime=exec(zipp,[src]);
+      assert.equal(runtime.execution.initial.ok,true,
+        runtime.execution.initial.error);
+      assert.equal(ast.sites.length,5);
+      assert.equal(ast.unsupported.length,0);
+      const linked=correlateZippEvalSites(fs.readFileSync(src),ast,runtime);
+      assert.deepEqual(linked.summary,
+        {total:7,matched:5,ambiguous:0,unmatched:0,unavailable:2});
+    }finally{fs.rmSync(dir,{recursive:true,force:true});}
+  });

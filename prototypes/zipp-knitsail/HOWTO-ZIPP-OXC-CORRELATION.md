@@ -62,12 +62,15 @@ source; a truncated observation is explicitly incomplete.
    direct, or infer an original callsite from the last native stack frame.
 
 The result is an event-by-event **source correlation**, not a successful
-execution/return witness. An OXC call span whose opening parenthesis differs
-from ZIPP's callsite coordinate may remain unmatched: this is the correct
-outcome until we have a verified callee-position contract. No fabricated
-span shifting. A runtime-generated function needs its *own* compiled-source
-identity before it can be safely joined; a VM-local function ID alone is not
-stable between executions.
+execution/return witness. The live syntax sweep discovered that OXC had
+omitted direct eval behind one or more plain parentheses: `(eval)(D)` and
+`((eval))(D)`. PR #184 now unwraps only these AST parentheses, preserving
+the same unresolved lexical identifier and keeping comma/optional calls
+indirect. The exact call-expression start is still validated against ZIPP's
+callsite position; there is **no fabricated span shifting**. Any other
+unknown coordinate remains unmatched. A runtime-generated function needs
+its *own* compiled-source identity before it can be safely joined; a VM-local
+function ID alone is not stable between executions.
 
 ## Remaining integration boundary
 
