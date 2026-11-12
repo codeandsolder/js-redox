@@ -1,0 +1,184 @@
+# Optional source-tree runtime eval evidence
+
+The native Rust source-tree command supports optional execution-observed
+JavaScript sources. The ordinary static path does not change; no Node or ZIPP
+process is required to import a previously exported witness.
+
+For optional observed-eval inputs, source-tree constructs its complete output
+in a temporary sibling directory and publishes it only after every witness
+and AST link has been validated. Rejected or incomplete captures leave no
+partial output or staging files. The requested destination must not exist,
+so an existing analyst result is never silently overwritten. On Linux,
+Android and Apple platforms, the final publication uses the operating
+system's exclusive no-replace rename, so a concurrently created empty
+output directory is also protected. Static-only source-tree retains its
+previous output behavior.
+
+## CLI
+
+Repeat one group of three paths for each independent capture:
+
+~~~bash
+deobfuscate-safe source-tree handlers/ readable/ \
+  --context-source original.pretty.js \
+  --observed-eval exported-runtime/ original-outer.js normalized-inner.js
+
+deobfuscate-safe source-tree handlers/ readable/ \
+  --context-source original.pretty.js \
+  --observed-eval first-export/ outer-1.js inner-1.js \
+  --observed-eval second-export/ outer-2.js inner-2.js
+~~~
+
+EXPORTED_RUNTIME is the v2 export from the js-redox Knitsail experiment,
+containing a manifest.json and content-addressed raw/ and readable/ files.
+The outer and inner JavaScript files must match the complete SHA-256 digests
+in the manifest; private payloads remain outside Git.
+
+The importer checks the loader's indirect-eval source site and the inner
+executable direct-eval AST with the OXC semantic resolver, including the
+argument AST and semantic identifier binding roles. Lexical frames cover
+both ordinary function expressions/declarations and arrow functions,
+including nested arrow callbacks. Function and arrow frames have distinct
+kinds: matching argument names and parameter lists alone cannot conflate
+the two source forms. Each observed source
+must match its exact SHA-256, UTF-16 code-unit length, event counts and
+content-addressed path. Old single-layer v1 manifests are deliberately
+rejected.
+
+The output gains a runtime-observed/ tree with entry metadata, exact raw
+source, optional formatted JavaScript, and AST-linked navigation sidecars.
+Matching lexical structure does NOT establish whole-function equivalence,
+and observed execution does NOT prove universal reachability.
+
+If a static source cannot be parsed, or no lexical site matches, those
+conditions are recorded. The observed code remains accessible; this is
+not silently reported as a verified universal static transformation.
+The original static JS files and reconstruction.json remain byte-identical.
+
+Source capture and the full experimental reproduction are documented in
+https://github.com/codeandsolder/js-redox/pull/179
+
+## Verified archived Knitsail integration (2026-11-12)
+
+With Node v26.13.1 and the matching system simdjson library restored on Acer,
+the saved 2026-09-27 HTML challenge produced the original v2 witness again:
+51 direct eval executions, 40 unique source strings, 25 standalone formatted,
+15 exact raw-only, and an 851-character challenge result.
+
+The native source-tree command was run twice against a **focused subset of
+three actual static Knitsail source views**: once without the optional input,
+once with the v2 witness. The observed output included all 40 strings and
+three AST lexical-site matches. The three generated static JavaScript files
+and the static reconstruction.json were byte-identical between runs. All 154
+relative links in the 46 runtime evidence/sidecar Markdown pages resolved.
+The complete original manifest, including evidenceKind and environment,
+was preserved **byte-for-byte**.
+
+The importer also rejects symlinked intermediate source directories and
+requires all listed event occurrences to account for the manifest's event
+count. Focused Rust unit tests cover both cases, and a CLI parser regression
+covers multiple independent 3-path option groups.
+
+This does not authorize promoting observed code into unconditional static
+deobfuscation: every generated fragment is tied to a specific captured
+execution and the matched original AST site, not a proof of all reachable paths.
+
+## General direct-eval source-site matching (2026-11-12)
+
+The v2 inner executable evalSite.expression is checked against the full, exact
+UTF-16-addressed source callsite and its OXC executable direct-eval node.
+It is not limited to the historical Knitsail expression eval(D).
+
+For arbitrary expression arguments, OXC Codegen produces a normalized AST
+representation. Argument arity and spread are retained separately, so a
+sequence expression is not conflated with multiple call arguments.
+Every referenced identifier carries an OXC semantic binding role: formal
+parameter with frame depth and position, import, local declaration kind,
+or unresolved/global. Shadowed, optional, or indirect eval are not promoted
+to direct-eval evidence. These remain structural provenance matches, not
+proofs of equivalent variable values or whole-function behavior.
+
+ES-module files (.mjs and .mts) use module parsing; .js supports script or
+ESM parsing, and corresponding .cjs/.jsx/TypeScript extensions use their
+source-type parsers. UTF-16 source offsets are checked after non-BMP Unicode,
+and offsets inside surrogate pairs are refused.
+
+Focused regressions cover compound arguments, lexical shadowing,
+multi-argument versus sequence expression, spread, module imports,
+source-site UTF-16 indexing, and a full v2 import with an ESM callsite.
+
+## Original single-stage direct eval (schema v3)
+
+A direct eval executed in an original JavaScript file does not have an
+indirect-eval loader. Import it with an independently verified one-file
+source chain, rather than manufacturing a loader or assigning false source
+offsets:
+
+```bash
+deobfuscate-safe source-tree handlers/ readable-direct/ \
+  --observed-direct exported-direct/ original-executable.js
+```
+
+The exact original file SHA-256 must match the manifest's
+`sourceProvenance.executable.sha256`; its exact UTF-16 `evalSite` interval
+must be an executable unresolved direct-eval AST call. Source metadata
+declares `schemaVersion:3`, `captureSha256`, and
+`sourceProvenance.kind:direct-executable`; **no outerLoader is present**.
+Original two-stage provenance remains a distinct, truthful source kind,
+using `--observed-eval EXPORTED OUTER INNER`.
+
+`runtime-observed/index.json` uses schema v3 for consistent machine-readable
+origin navigation across both types. The original witness manifest is
+copied byte-for-byte; the static source and reconstruction metadata are
+never rewritten.
+
+The separate generic Node producer is
+`prototypes/zipp-knitsail/scripts/capture-direct-eval.mjs` in PR #179. It
+is synchronous, observes one selected direct-eval site, and is not an
+automatic browser emulator. It shares argument instrumentation and
+content-addressed event collection with the original two-stage runner.
+
+## Multiple direct eval sites (one captured execution)
+
+A single original executable may contain several distinct direct eval
+calls, and two different lexical sites may evaluate identical source bytes.
+To preserve both attribution and the run-wide event sequence:
+
+```bash
+deobfuscate-safe source-tree STATIC_TREE COMBINED_TREE \
+  --observed-direct-bundle EXPORTED_BUNDLE ORIGINAL_EXECUTABLE_JS
+```
+
+The exported bundle has a strict site index list, original executable and
+capture SHA-256, and one per-site **v3 direct manifest** for each site with
+observed string events. No-witness sites are recorded only as unobserved in
+the bundle. Global event indices are stored with the entry metadata for
+each source, so cross-site ordering remains inspectable. Raw source
+deduplication is content-addressed but runtime evidence and AST lexical
+provenance are **per site**, never inferred from equal string hashes.
+
+The native importer checks the bundle root and site paths, original source
+SHA, source intervals, complete per-site event counts, manifest schema and
+site correspondence; it then validates every witness independently with
+OXC. It publishes the whole combined tree only when every site passes,
+preserving original static JS/reconstruction and all per-site manifests
+byte-for-byte. Existing genuine two-stage captures use their actual source
+chain and continue to use `--observed-eval`.
+
+## AST inventory for direct eval source sites
+
+`deobfuscate-safe eval-sites ORIGINAL_JS` produces one JSON object containing
+`schemaVersion:1`, exact `sourceSha256`, `sites` and `unsupported`. Every
+reported interval is in **original UTF-16 code units**, independently
+derived from OXC AST byte spans. The native semantic resolver distinguishes
+real unresolved direct eval calls from locally shadowed `eval`, and optional
+or indirect eval is not mislabeled as a direct call. Each supported entry
+includes the original callsite and first argument source interval.
+
+Direct eval with zero arguments or a spread-first argument is listed in
+`unsupported`; a producer using `sites:"all"` refuses the run rather than
+quietly dropping such sites. This is a discovery/validation command, not
+dynamic execution. The separate Node capture producer consumes this
+inventory, checks the original source hash and instruments the reported
+locations in one synchronous execution. Nested source spans are supported
+in the capture observer via balanced ordered wrappers.

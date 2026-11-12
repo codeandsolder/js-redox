@@ -1156,6 +1156,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rolldown_redox",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

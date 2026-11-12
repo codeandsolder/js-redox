@@ -116,3 +116,6 @@ pub mod structural_signals;
 pub mod sus_scan;
 pub mod switch_ir;
 pub mod table_ir;
+
+// Optional execution-conditioned source-tree evidence.
+pub mod observed_eval_import;
