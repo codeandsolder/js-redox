@@ -561,7 +561,10 @@ variable: those earlier effects remain in place. Oxc verifies that the
 binding belongs to the function being rewritten and that no nested
 closure can observe its terminal write. The same symbol-resolved
 dataflow applies to labeled branch joins, conditional assignments with a
-fallback return, and complete `if/else` joins. An outer guard may enclose a
+fallback return, and complete `if/else` joins. Branch blocks may contain
+earlier side effects, calls, declarations, and conditional exits: their
+original source and lexical scope are retained, and only the final plain
+assignment is replaced by a direct return. An outer guard may enclose a
 labeled join: the result is returned directly only when that guard executes,
 leaving the original fallback return intact. The temporary must belong to
 the function being rewritten; writes to captured or enclosing lexical

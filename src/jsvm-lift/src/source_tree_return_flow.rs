@@ -193,21 +193,30 @@ impl ReturnFlow<'_> {
         ))
     }
 
-    /// Only a single plain assignment, optionally wrapped in a block, is
-    /// eligible as one return edge. A nested declaration or effectful suffix
-    /// cannot accidentally be skipped.
-    fn branch_value<'a>(
-        &self,
-        statement: &'a Statement<'a>,
-        symbol: SymbolId,
-    ) -> Option<&'a Expression<'a>> {
-        let single = match statement {
-            Statement::BlockStatement(block) if block.body.len() == 1 => &block.body[0],
-            Statement::BlockStatement(_) => return None,
+    /// Preserve an entire branch, including lexical scope and every prefix
+    /// statement. Replace only its last plain assignment with a return.
+    /// A normal fallthrough path must reach the assignment; early abrupt
+    /// completions retain their behavior because the prefix is unchanged.
+    fn branch_direct_return(&self, statement: &Statement<'_>, symbol: SymbolId) -> Option<String> {
+        let tail = match statement {
+            Statement::BlockStatement(block) => block.body.last()?,
             other => other,
         };
-        let (target, rhs) = assignment(single)?;
-        (binding(self.scoping, target) == Some(symbol)).then_some(rhs)
+        let (target, rhs) = assignment(tail)?;
+        if binding(self.scoping, target) != Some(symbol) {
+            return None;
+        }
+        let value = snippet(self.source, rhs.span())?;
+        let source = snippet(self.source, statement.span())?;
+        let start = (tail.span().start - statement.span().start) as usize;
+        let end = (tail.span().end - statement.span().start) as usize;
+        let mut rewritten = source.to_owned();
+        rewritten.replace_range(start..end, &format!("return ({value});"));
+        if matches!(statement, Statement::BlockStatement(_)) {
+            Some(rewritten)
+        } else {
+            Some(format!("{{ {rewritten} }}"))
+        }
     }
 
     fn recover_body(&mut self, body: &FunctionBody<'_>) {
@@ -283,31 +292,21 @@ impl ReturnFlow<'_> {
         // path's value (especially relevant for formal parameters).
         if let Some(alternate) = branch.alternate.as_ref() {
             let (Some(yes), Some(no)) = (
-                self.branch_value(&branch.consequent, symbol),
-                self.branch_value(alternate, symbol),
-            ) else {
-                return;
-            };
-            let (Some(yes), Some(no)) = (
-                snippet(self.source, yes.span()),
-                snippet(self.source, no.span()),
+                self.branch_direct_return(&branch.consequent, symbol),
+                self.branch_direct_return(alternate, symbol),
             ) else {
                 return;
             };
             self.edits.push(Candidate {
                 span: Span::new(before.span().start, return_statement.span().end),
-                replacement: format!(
-                    "if ({condition}) {{ return ({yes}); }} else {{ return ({no}); }}"
-                ),
+                replacement: format!("if ({condition}) {yes} else {no}"),
                 kind: Kind::GuardedJoin,
             });
             return;
         }
 
         let new_consequent = self
-            .branch_value(&branch.consequent, symbol)
-            .and_then(|value| snippet(self.source, value.span()))
-            .map(|value| format!("return ({value});"))
+            .branch_direct_return(&branch.consequent, symbol)
             .or_else(|| {
                 let labeled = match &branch.consequent {
                     Statement::LabeledStatement(_) => Some(&branch.consequent),
@@ -319,7 +318,7 @@ impl ReturnFlow<'_> {
         if let Some(consequent) = new_consequent {
             self.edits.push(Candidate {
                 span: before.span(),
-                replacement: format!("if ({condition}) {{ {consequent} }}"),
+                replacement: format!("if ({condition}) {consequent}"),
                 kind: Kind::GuardedJoin,
             });
         }
@@ -601,6 +600,88 @@ mod tests {
         ] {
             let out = recover_terminal_returns(src)?;
             assert_eq!(out.guarded_joins, 1, "{src}: {}", out.source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_return_keeps_effectful_prefix_and_local_block_scope() -> Result<()> {
+        let src = "function f(q,x){if(x){log('prefix');let local=touch();if(local<0)return -1;q=combine(local,q);}return q;}";
+        let out = recover_terminal_returns(src)?;
+        assert_eq!(out.guarded_joins, 1, "{}", out.source);
+        assert!(
+            out.source
+                .contains("log('prefix');let local=touch();if(local<0)return -1;"),
+            "{}",
+            out.source
+        );
+        assert!(
+            out.source.contains("return (combine(local,q));"),
+            "{}",
+            out.source
+        );
+        assert!(out.source.ends_with("return q;}"), "{}", out.source);
+        Ok(())
+    }
+
+    #[test]
+    fn complete_if_else_joins_keep_both_effectful_prefixes() -> Result<()> {
+        let src = "function f(q,x){if(x){log(1);const v=a();q=left(v,q);}else{log(2);const v=b();q=right(v,q);}return q;}";
+        let out = recover_terminal_returns(src)?;
+        assert_eq!(out.guarded_joins, 1, "{}", out.source);
+        assert!(out
+            .source
+            .contains("log(1);const v=a();return (left(v,q));"));
+        assert!(out
+            .source
+            .contains("log(2);const v=b();return (right(v,q));"));
+        assert!(!out.source.contains("return q;"), "{}", out.source);
+        Ok(())
+    }
+
+    #[test]
+    fn knitsail_hv_callback_prefix_is_preserved() -> Result<()> {
+        let src = "const hV=function(J,Q,Y,u){if(!(J-5&14)){Q(function(n){n(Y);});u=[function(){return Y;},function(){}];}return u;};";
+        let out = recover_terminal_returns(src)?;
+        assert_eq!(out.guarded_joins, 1, "{}", out.source);
+        assert!(
+            out.source
+                .contains("Q(function(n){n(Y);});return ([function(){return Y;},function(){}]);"),
+            "{}",
+            out.source
+        );
+        assert!(out.source.contains("return u;"), "{}", out.source);
+        assert!(!out.source.contains("u=[function()"), "{}", out.source);
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_early_exits_or_loop_controls_keep_their_original_order() -> Result<()> {
+        for src in [
+            "function f(q,x){if(x){if(q)return 7;trace();q=one();}return q;}",
+            "function f(q,x){if(x){label:{if(q)break label;trace();}q=one();}return q;}",
+            "function f(q,x){if(x){for(let n=0;n<3;n++){trace(n);if(n===1)break;}q=one();}return q;}",
+        ] {
+            let out = recover_terminal_returns(src)?;
+            assert_eq!(out.guarded_joins, 1, "{src}: {}", out.source);
+            assert!(out.source.contains("return (one());"), "{}", out.source);
+            assert!(!out.source.contains("q=one();"), "{}", out.source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nonterminal_assignment_still_must_remain() -> Result<()> {
+        for src in [
+            "function f(q,x){if(x){q=one();trace();}return q;}",
+            "function f(q,x){if(x){trace();q=one();trace();}return q;}",
+            "function f(q,x){if(x){q=one();trace();}else{q=two();}return q;}",
+            "function f(q,x){if(x){q=one();}else{q=two();trace();}return q;}",
+            "function f(q,x){const saved=()=>q;if(x){trace();q=one();}return q;}",
+        ] {
+            let out = recover_terminal_returns(src)?;
+            assert_eq!(out.source, src, "{src}: {}", out.source);
+            assert_eq!(out.guarded_joins, 0);
         }
         Ok(())
     }

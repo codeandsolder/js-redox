@@ -1644,6 +1644,51 @@ mod tests {
     }
 
     #[test]
+    fn source_tree_keeps_prefix_callback_before_returning_closure_array() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let original_source = "function root(){const hV=function(J,Q,Y,u){if(J){Q(function(n){n(Y);});u=[function(){return Y;},function(){}];}return u;};}";
+        fs::write(&original, original_source)?;
+        fs::write(
+            input.join("handler.js"),
+            "const capturedHandler=function(J,Q,Y,u){return hV(J,Q,Y,u);};",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let lexical = output.join("lexical-context");
+        let context: serde_json::Value =
+            serde_json::from_slice(&fs::read(lexical.join("context.json"))?)?;
+        let row = &context["helpers"][0];
+        assert_eq!(row["name"], "hV");
+        assert_eq!(row["guarded_return_joins"], 1, "{row}");
+        assert!(row["post_return_error"].is_null(), "{row}");
+        let path = row["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("helper view path missing"))?;
+        let recovered = fs::read_to_string(lexical.join(path))?;
+        assert!(recovered.contains("Q(function(n)"), "{recovered}");
+        assert!(recovered.contains("return ["), "{recovered}");
+        assert!(!recovered.contains("u = ["), "{recovered}");
+        assert!(recovered.contains("return u;"), "{recovered}");
+        assert_eq!(
+            fs::read_to_string(lexical.join("original.js"))?,
+            original_source
+        );
+        assert!(fs::read_to_string(output.join("handler.js"))?.contains("hV(J, Q, Y, u)"));
+        Ok(())
+    }
+
+    #[test]
     fn source_tree_links_original_lexical_helper_code() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let input = temp.path().join("source");
