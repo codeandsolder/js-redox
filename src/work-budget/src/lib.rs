@@ -135,7 +135,7 @@ impl BudgetExceeded {
         !self.inherited
     }
 
-    fn with_inherited(mut self, inherited: bool) -> Self {
+    const fn with_inherited(mut self, inherited: bool) -> Self {
         self.inherited = inherited;
         self
     }
@@ -236,12 +236,14 @@ fn terminate_child_tree(child: &mut Child) {
 fn join_output_reader(
     handle: thread::JoinHandle<io::Result<Vec<u8>>>,
 ) -> Result<Vec<u8>, CommandRunError> {
-    match handle.join() {
-        Ok(result) => result.map_err(CommandRunError::Output),
-        Err(_) => Err(CommandRunError::Output(io::Error::other(
-            "child output reader thread panicked",
-        ))),
-    }
+    handle.join().map_or_else(
+        |_| {
+            Err(CommandRunError::Output(io::Error::other(
+                "child output reader thread panicked",
+            )))
+        },
+        |result| result.map_err(CommandRunError::Output),
+    )
 }
 
 /// Run a child process under the same cooperative budget used by in-process
@@ -253,6 +255,12 @@ fn join_output_reader(
 /// group, so descendants are killed with it and cannot keep inherited pipes
 /// open after the parent exits. The budget is checked at most 10 ms apart
 /// while the child is running.
+///
+/// # Errors
+///
+/// Returns `CommandRunError::Budget` if the work budget is exhausted or
+/// cancelled, `CommandRunError::Spawn` if process creation fails, and
+/// `CommandRunError::Output` if output pipes or reader threads fail.
 pub fn run_command(command: &mut Command, budget: &WorkBudget) -> Result<Output, CommandRunError> {
     budget.checkpoint().map_err(CommandRunError::Budget)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -359,7 +367,6 @@ impl BudgetState {
             ACTIVE => return None,
             DEADLINE_EXCEEDED => BudgetExceededKind::Deadline,
             WORK_EXCEEDED => BudgetExceededKind::Work,
-            CANCELLED => BudgetExceededKind::Cancelled,
             _ => BudgetExceededKind::Cancelled,
         };
         Some(self.exceeded(kind, now))
@@ -448,6 +455,11 @@ impl WorkBudget {
     }
 
     /// Check cancellation/deadline constraints without charging deterministic work.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BudgetExceeded` if this scope or any ancestor is cancelled
+    /// or exceeds its deadline/work limit.
     pub fn checkpoint(&self) -> Result<(), BudgetExceeded> {
         let now = Instant::now();
         for (index, state) in self.states.iter().enumerate() {
@@ -462,11 +474,16 @@ impl WorkBudget {
     ///
     /// The charge is transactional across parent/child scopes: if any scope is
     /// already exhausted, no ancestor or sibling-visible allowance is consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BudgetExceeded` when any scope has insufficient work allowance
+    /// or is cancelled/deadline-exceeded; no work is charged on failure.
     pub fn consume(&self, units: u64) -> Result<(), BudgetExceeded> {
         let _guard = self
             .charge_lock
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         for (index, state) in self.states.iter().enumerate() {
             if let Err(error) = state.ensure_work_available(units, now) {
@@ -484,7 +501,7 @@ impl WorkBudget {
         let _guard = self
             .charge_lock
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(state) = self.states.last() {
             let _ = state.status.compare_exchange(
                 ACTIVE,
@@ -577,6 +594,12 @@ impl BudgetPoller {
         true
     }
 
+    /// Finish the polling interval and check the underlying budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns on an earlier budget failure or when the final checkpoint
+    /// detects a cancelled or exhausted budget.
     pub fn finish(&mut self) -> Result<(), BudgetExceeded> {
         if let Some(error) = self.error.clone() {
             return Err(error);

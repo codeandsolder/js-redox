@@ -1372,7 +1372,10 @@ type PreservationKey = (
     bool,
 );
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Direct-call preservation proof threads explicit flow, call, prototype, and memoization state"
+)]
 fn direct_call_preserves_field(
     source: &str,
     program: &Program<'_>,
@@ -1607,7 +1610,10 @@ pub fn proven_origin_direct_call_prefix_preserves_exact_property_before_direct_c
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Interval preservation proof requires ordered bounds and independent provenance state"
+)]
 fn root_context_segment_preserves_field(
     source: &str,
     program: &Program<'_>,
@@ -1672,7 +1678,10 @@ fn root_context_segment_preserves_field(
         })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Call-prefix proof tracks separate target, order, field, and recursion state"
+)]
 fn direct_call_prefix_preserves_field(
     source: &str,
     program: &Program<'_>,
@@ -2066,7 +2075,10 @@ fn collect_unique_direct_call_path(
     Some(path.clone())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Event proof uses distinct call graph, runtime targets, and proof obligations"
+)]
 fn context_field_prefix_before_event(
     source: &str,
     program: &Program<'_>,
@@ -2224,7 +2236,10 @@ fn context_field_prefix_before_event(
         ))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Runtime field proof requires its separate initialization and call-target facts"
+)]
 fn prove_own_data_field_at_runtime_method_call_with_facts(
     source: &str,
     program: &Program<'_>,
@@ -2491,7 +2506,10 @@ fn context_entry_has_no_prior_property_write(
     .is_some_and(|reachability| reachability.valid_contexts.contains(target))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Exact-property prefix proof threads separate recursion caches and flow facts"
+)]
 fn context_prefix_preserves_exact_property(
     source: &str,
     program: &Program<'_>,
@@ -2562,7 +2580,10 @@ fn origin_property_edge_key(call: &ProvenOriginDirectCall) -> OriginPropertyEdge
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Origin identity requires all allocation and constructor span boundaries"
+)]
 fn exact_origin_property_reachability(
     source: &str,
     program: &Program<'_>,
@@ -5247,7 +5268,10 @@ fn direct_call_event_unreachable_if_specialized(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Recursive receiver summary requires separate method and context visitation caches"
+)]
 fn summarize_receiver_context(
     source: &str,
     program: &Program<'_>,
