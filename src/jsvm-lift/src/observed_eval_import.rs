@@ -439,15 +439,18 @@ fn same_lexical_structure(a: &Site, b: &Site) -> bool {
 #[derive(Clone, Debug)]
 pub struct ObservedEvalInput {
     pub observed_tree: PathBuf,
-    pub outer_source: PathBuf,
-    pub inner_source: PathBuf,
+    /// One original file for direct execution, two for a decoded loader.
+    pub source_files: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Manifest {
     schema_version: u32,
-    html_sha256: String,
+    #[serde(default)]
+    html_sha256: Option<String>,
+    #[serde(default)]
+    capture_sha256: Option<String>,
     source_provenance: SourceProvenance,
     truncated: bool,
     event_count: usize,
@@ -455,14 +458,27 @@ struct Manifest {
     entries: Vec<ObservedEntry>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SourceProvenance {
-    outer_loader: OuterLoader,
-    inner_executable: InnerExecutable,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    outer_loader: Option<OuterLoader>,
+    #[serde(default)]
+    inner_executable: Option<InnerExecutable>,
+    #[serde(default)]
+    executable: Option<DirectExecutable>,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectExecutable {
+    sha256: String,
+    eval_site: SourceSite,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OuterLoader {
     sha256: String,
@@ -478,7 +494,7 @@ struct InnerExecutable {
     stripped_leading_newline_code_units: usize,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct SourceSite {
     start: usize,
     end: usize,
@@ -521,6 +537,11 @@ struct PreparedCapture {
     manifest: Manifest,
     original_manifest: Vec<u8>,
     original_site: Site,
+    capture_id: String,
+    executable_sha256: String,
+    executable_site: SourceSite,
+    outer_loader: Option<OuterLoader>,
+    stripped_leading_newline: Option<usize>,
     relative: String,
     entries: Vec<SourceEntry>,
     matches: Vec<AstMatch>,
@@ -654,54 +675,102 @@ fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedC
     let original_manifest = read_observed_file(&input.observed_tree, "manifest.json")?;
     let mut manifest: Manifest = serde_json::from_slice(&original_manifest)?;
     anyhow::ensure!(
-        manifest.schema_version == 2,
-        "only dual-layer observed-eval manifest v2 is accepted"
+        matches!(manifest.schema_version, 2 | 3),
+        "unsupported observed-eval provenance schema"
     );
-    anyhow::ensure!(
-        is_sha256(&manifest.html_sha256),
-        "invalid capture HTML SHA-256"
-    );
+    let p = &manifest.source_provenance;
+    let direct = manifest.schema_version == 3;
+    let capture_id = if direct {
+        anyhow::ensure!(
+            p.kind.as_deref() == Some("direct-executable")
+                && p.executable.is_some()
+                && p.outer_loader.is_none()
+                && p.inner_executable.is_none()
+                && manifest.html_sha256.is_none(),
+            "invalid direct executable provenance"
+        );
+        manifest.capture_sha256.as_ref()
+    } else {
+        anyhow::ensure!(
+            p.kind.is_none()
+                && p.outer_loader.is_some()
+                && p.inner_executable.is_some()
+                && p.executable.is_none()
+                && manifest.capture_sha256.is_none(),
+            "invalid two-stage executable provenance"
+        );
+        manifest.html_sha256.as_ref()
+    }
+    .context("missing capture identity SHA-256")?
+    .clone();
+    anyhow::ensure!(is_sha256(&capture_id), "invalid capture identity SHA-256");
     anyhow::ensure!(
         manifest.entries.len() == manifest.unique_source_count,
         "unique observed-source count mismatch"
     );
-    let outer = &manifest.source_provenance.outer_loader;
-    let inner = &manifest.source_provenance.inner_executable;
+    let expected_files = if direct { 1 } else { 2 };
     anyhow::ensure!(
-        is_sha256(&outer.sha256) && is_sha256(&inner.sha256),
-        "invalid outer/inner code SHA-256"
+        input.source_files.len() == expected_files,
+        "observed source file count does not match provenance kind"
     );
+    let (outer, executable_sha256, executable_site, stripped) = if direct {
+        let exe = p
+            .executable
+            .as_ref()
+            .context("missing original direct executable")?;
+        (None, exe.sha256.clone(), exe.eval_site.clone(), None)
+    } else {
+        let outer = p.outer_loader.as_ref().context("missing outer loader")?;
+        let inner = p
+            .inner_executable
+            .as_ref()
+            .context("missing inner executable")?;
+        anyhow::ensure!(
+            outer.decoded_by == "observed-first-indirect-eval",
+            "unrecognized loader decode provenance"
+        );
+        (
+            Some(outer),
+            inner.sha256.clone(),
+            inner.eval_site.clone(),
+            Some(inner.stripped_leading_newline_code_units),
+        )
+    };
+    anyhow::ensure!(is_sha256(&executable_sha256), "invalid executable SHA-256");
+    if let Some(outer) = outer {
+        anyhow::ensure!(is_sha256(&outer.sha256), "invalid outer-loader SHA-256");
+        let outer_bytes = read_regular(&input.source_files[0])?;
+        anyhow::ensure!(
+            sha256_hex(&outer_bytes) == outer.sha256,
+            "outer-loader SHA-256 mismatch"
+        );
+        let code = String::from_utf8(outer_bytes)?;
+        exact_site(&code, &outer.indirect_eval_site, "(0,eval)(")?;
+    }
+    let executable_path = input
+        .source_files
+        .last()
+        .context("missing executable path")?;
+    let bytes = read_regular(executable_path)?;
     anyhow::ensure!(
-        outer.decoded_by == "observed-first-indirect-eval",
-        "unrecognized loader decode provenance"
+        sha256_hex(&bytes) == executable_sha256,
+        "original executable SHA-256 mismatch"
     );
-    let outer_bytes = read_regular(&input.outer_source)?;
-    let inner_bytes = read_regular(&input.inner_source)?;
+    let code = String::from_utf8(bytes)?;
     anyhow::ensure!(
-        sha256_hex(&outer_bytes) == outer.sha256,
-        "outer loader SHA-256 mismatch"
+        !executable_site.expression.is_empty(),
+        "empty eval site expression"
     );
-    anyhow::ensure!(
-        sha256_hex(&inner_bytes) == inner.sha256,
-        "inner executable SHA-256 mismatch"
-    );
-    let outer_code = String::from_utf8(outer_bytes)?;
-    let inner_code = String::from_utf8(inner_bytes)?;
-    exact_site(&outer_code, &outer.indirect_eval_site, "(0,eval)(")?;
-    anyhow::ensure!(
-        !inner.eval_site.expression.is_empty(),
-        "empty executable eval site expression"
-    );
-    exact_site(&inner_code, &inner.eval_site, &inner.eval_site.expression)?;
-    let start = utf16_to_bytes(&inner_code, inner.eval_site.start)?;
-    let end = utf16_to_bytes(&inner_code, inner.eval_site.end)?;
-    let original = parse_sites_file(&inner_code, &input.inner_source)?
+    exact_site(&code, &executable_site, &executable_site.expression)?;
+    let start = utf16_to_bytes(&code, executable_site.start)?;
+    let end = utf16_to_bytes(&code, executable_site.end)?;
+    let original = parse_sites_file(&code, executable_path)?
         .into_iter()
         .find(|site| site.start == start && site.end == end)
-        .context("inner source position is not an executable direct-eval AST node")?;
+        .context("source site is not an executable direct-eval AST node")?;
     anyhow::ensure!(
         original.eval_is_unresolved,
-        "inner eval does not invoke the unresolved direct eval binding"
+        "eval does not invoke the unresolved direct eval binding"
     );
     let (matches, parse_failures) = scan_matches(output, &original)?;
 
@@ -758,18 +827,28 @@ fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedC
         counted == manifest.event_count,
         "observed event count mismatch"
     );
+    let prefix = if let Some(loader) = outer {
+        format!(
+            "runtime-observed/loader-{}/executable-{}",
+            loader.sha256, executable_sha256
+        )
+    } else {
+        format!("runtime-observed/direct-{}", executable_sha256)
+    };
     let relative = format!(
-        "runtime-observed/loader-{}/inner-{}/eval-{}-{}/capture-{}",
-        outer.sha256,
-        inner.sha256,
-        inner.eval_site.start,
-        inner.eval_site.end,
-        manifest.html_sha256
+        "{prefix}/eval-{}-{}/capture-{}",
+        executable_site.start, executable_site.end, capture_id
     );
+    let outer_loader = outer.cloned();
     Ok(PreparedCapture {
         manifest,
         original_manifest,
         original_site: original,
+        capture_id,
+        executable_sha256,
+        executable_site,
+        outer_loader,
+        stripped_leading_newline: stripped,
         relative,
         entries,
         matches,
@@ -805,16 +884,19 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
     let mut records = Vec::new();
     for capture in &captures {
         let m = &capture.manifest;
-        let outer = &m.source_provenance.outer_loader;
-        let inner = &m.source_provenance.inner_executable;
+        let outer = capture.outer_loader.as_ref();
+        let executable_sha = &capture.executable_sha256;
+        let site = &capture.executable_site;
         let origin = format!("{}/origin.md", capture.relative);
         let readme = format!("{}/README.md", capture.relative);
         let meta = json!({
-            "schema":"js-redox/runtime-origin/v2",
+            "schema":"js-redox/runtime-origin/v3",
             "evidence":"execution-observed, AST lexical site match, not full equivalence",
-            "htmlSha256":m.html_sha256,
+            "captureSha256":capture.capture_id,
+            "sourceProvenance":m.source_provenance,
             "outerLoader":outer,
-            "innerExecutable":inner,
+            "innerExecutable":m.source_provenance.inner_executable,
+            "directExecutable":m.source_provenance.executable,
             "staticAstStructuralMatches":capture.matches,
             "originalEvalSite":capture.original_site,
             "staticParseFailures":capture.parse_failures,
@@ -830,21 +912,23 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
         let mut origin_text = format!(
             "# Verified executable eval site\n\n\
              Execution-observed only; matches do not imply whole-function equivalence.\n\n\
-             - HTML SHA-256: {}\n- Outer loader SHA-256: {}\n\
-             - Loader indirect eval source interval: {}..{}\n\
-             - Inner executable SHA-256: {}\n\
-             - Executable direct eval interval: {}..{}\n\
-             - Normalized leading newline code units: {}\n\n\
-             ## AST lexical matches\n\n",
-            m.html_sha256,
-            outer.sha256,
-            outer.indirect_eval_site.start,
-            outer.indirect_eval_site.end,
-            inner.sha256,
-            inner.eval_site.start,
-            inner.eval_site.end,
-            inner.stripped_leading_newline_code_units
+             - Capture SHA-256: {}\n\
+             - Original executable SHA-256: {}\n\
+             - Executable direct eval interval: {}..{}\n",
+            capture.capture_id, executable_sha, site.start, site.end,
         );
+        if let Some(loader) = outer {
+            origin_text.push_str(&format!(
+                "- Outer loader SHA-256: {}\n\
+                 - Loader indirect eval source interval: {}..{}\n\
+                 - Stripped leading newline units: {}\n",
+                loader.sha256,
+                loader.indirect_eval_site.start,
+                loader.indirect_eval_site.end,
+                capture.stripped_leading_newline.unwrap_or(0)
+            ));
+        }
+        origin_text.push_str("\n## AST lexical matches\n\n");
         for found in &capture.matches {
             origin_text.push_str(&format!(
                 "- [{}]({}) (line {}, AST lexical structure)\n",
@@ -926,27 +1010,47 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
             &format!("{}/manifest.json", capture.relative),
             &capture.original_manifest,
         )?;
+        let label = if let Some(loader) = outer {
+            format!(
+                "Outer {} / executable {}",
+                &loader.sha256[..12],
+                &executable_sha[..12]
+            )
+        } else {
+            format!("Direct executable {}", &executable_sha[..12])
+        };
         index.push_str(&format!(
-            "- [Outer {} / inner {} / eval {}..{} / capture {}]({}) - {} calls, {} strings\n",
-            &outer.sha256[..12],
-            &inner.sha256[..12],
-            inner.eval_site.start,
-            inner.eval_site.end,
-            &m.html_sha256[..12],
+            "- [{label} / eval {}..{} / capture {}]({}) - {} calls, {} strings\n",
+            site.start,
+            site.end,
+            &capture.capture_id[..12],
             relative_link("runtime-observed/README.md", &readme),
             m.event_count,
             m.unique_source_count
         ));
-        records.push(json!({
-            "outerLoaderSha256":outer.sha256,"innerExecutableSha256":inner.sha256,
-            "htmlSha256":m.html_sha256,"directory":capture.relative,
-            "loaderSite":[outer.indirect_eval_site.start,outer.indirect_eval_site.end],
-            "executableSite":[inner.eval_site.start,inner.eval_site.end],
-            "calls":m.event_count,"sources":m.unique_source_count,
+        let mut record = json!({
+            "captureSha256":capture.capture_id,
+            "executableSha256":executable_sha,
+            "directory":capture.relative,
+            "executableSite":[site.start,site.end],
+            "calls":m.event_count,
+            "sources":m.unique_source_count,
             "staticAstMatches":capture.matches.len(),
             "staticParseFailures":capture.parse_failures.len(),
-            "truncated":m.truncated
-        }));
+            "truncated":m.truncated,
+            "provenanceKind":if outer.is_some() {"two-stage"} else {"direct"},
+        });
+        if let Some(loader) = outer {
+            record["outerLoaderSha256"] = json!(loader.sha256);
+            record["loaderSite"] = json!([
+                loader.indirect_eval_site.start,
+                loader.indirect_eval_site.end
+            ]);
+            record["innerExecutableSha256"] = json!(executable_sha);
+        } else {
+            record["directExecutableSha256"] = json!(executable_sha);
+        }
+        records.push(record);
     }
     write_file(
         staging.path(),
@@ -957,7 +1061,7 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
         staging.path(),
         "runtime-observed/index.json",
         serde_json::to_string_pretty(&json!({
-            "schema":"js-redox/linked-runtime-source-tree/v2",
+            "schema":"js-redox/linked-runtime-source-tree/v3",
             "staticJavaScriptAndReconstructionUnmodified":true,
             "captures":records
         }))?
@@ -1074,10 +1178,89 @@ mod tests {
             output,
             ObservedEvalInput {
                 observed_tree,
-                outer_source,
-                inner_source,
+                source_files: vec![outer_source, inner_source],
             },
         ))
+    }
+
+    #[test]
+    fn direct_executable_v3_links_single_original_source() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (out, mut input) = sample(tmp.path())?;
+        let old_original = fs::read(out.join("original.js"))?;
+        let old_reconstruction = fs::read(out.join("reconstruction.json"))?;
+        input.source_files.remove(0);
+        let manifest_path = input.observed_tree.join("manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        let exe = manifest["sourceProvenance"]["innerExecutable"].clone();
+        manifest["schemaVersion"] = json!(3);
+        manifest["captureSha256"] = manifest["htmlSha256"].take();
+        manifest
+            .as_object_mut()
+            .context("not an object")?
+            .remove("htmlSha256");
+        manifest["sourceProvenance"] = json!({
+            "kind":"direct-executable",
+            "executable":{"sha256":exe["sha256"],"evalSite":exe["evalSite"]}
+        });
+        fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+        let original_manifest = fs::read(&manifest_path)?;
+
+        attach_observed_eval_sources(&out, std::slice::from_ref(&input))?;
+        assert_eq!(old_original, fs::read(out.join("original.js"))?);
+        assert_eq!(
+            old_reconstruction,
+            fs::read(out.join("reconstruction.json"))?
+        );
+        let index: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join("runtime-observed/index.json"))?)?;
+        assert_eq!(index["schema"], "js-redox/linked-runtime-source-tree/v3");
+        assert_eq!(index["captures"][0]["provenanceKind"], "direct");
+        assert_eq!(index["captures"][0]["calls"], 2);
+        assert_eq!(index["captures"][0]["staticAstMatches"], 1);
+        let directory = index["captures"][0]["directory"]
+            .as_str()
+            .context("missing direct capture path")?;
+        assert!(directory.starts_with("runtime-observed/direct-"));
+        assert_eq!(
+            original_manifest,
+            fs::read(out.join(directory).join("manifest.json"))?
+        );
+        let origin: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join(directory).join("origin.json"))?)?;
+        assert_eq!(origin["sourceProvenance"]["kind"], "direct-executable");
+        assert!(origin["outerLoader"].is_null());
+        assert!(origin["staticAstStructuralMatches"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_manifest_rejects_fake_loader_and_wrong_source_count() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (out, mut input) = sample(tmp.path())?;
+        let file = input.observed_tree.join("manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&file)?)?;
+        let exe = manifest["sourceProvenance"]["innerExecutable"].clone();
+        manifest["schemaVersion"] = json!(3);
+        manifest["captureSha256"] = manifest["htmlSha256"].take();
+        manifest
+            .as_object_mut()
+            .context("not an object")?
+            .remove("htmlSha256");
+        manifest["sourceProvenance"] = json!({
+            "kind":"direct-executable",
+            "executable":{"sha256":exe["sha256"],"evalSite":exe["evalSite"]}
+        });
+        fs::write(&file, serde_json::to_vec(&manifest)?)?;
+        assert!(attach_observed_eval_sources(&out, std::slice::from_ref(&input)).is_err());
+        input.source_files.remove(0);
+        manifest["sourceProvenance"]["outerLoader"] = json!({"sha256":"f".repeat(64)});
+        fs::write(&file, serde_json::to_vec(&manifest)?)?;
+        assert!(attach_observed_eval_sources(&out, std::slice::from_ref(&input)).is_err());
+        assert!(!out.join("runtime-observed").exists());
+        Ok(())
     }
 
     #[test]
@@ -1096,7 +1279,7 @@ mod tests {
             serde_json::from_slice(&fs::read(out.join("runtime-observed/index.json"))?)?;
         assert_eq!(
             root_index["schema"],
-            "js-redox/linked-runtime-source-tree/v2"
+            "js-redox/linked-runtime-source-tree/v3"
         );
         assert_eq!(root_index["captures"][0]["staticAstMatches"], 1);
         assert_eq!(root_index["captures"][0]["sources"], 1);
@@ -1131,7 +1314,7 @@ mod tests {
     fn invalid_provenance_is_rejected_without_publishing_overlay() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let (out, input) = sample(tmp.path())?;
-        fs::write(&input.inner_source, "tampered VM source")?;
+        fs::write(&input.source_files[1], "tampered VM source")?;
         let result = attach_observed_eval_sources(&out, std::slice::from_ref(&input));
         assert!(
             result.is_err(),
@@ -1240,7 +1423,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let (output, input) = sample(tmp.path())?;
         let inner = "const oU = (D) => eval(D);\n";
-        fs::write(&input.inner_source, inner)?;
+        fs::write(&input.source_files[1], inner)?;
         fs::write(
             output.join("original.js"),
             "const oU = D => { return eval(D); };\n",
@@ -1370,7 +1553,7 @@ mod tests {
         let (output, input) = sample(temp.path())?;
         let module = "const emoji = '🦀'; export const oU = D => eval(D + String(D));\n";
         let static_module = "export const oU = (D) => eval( D+String( D ) );\n";
-        fs::write(&input.inner_source, module)?;
+        fs::write(&input.source_files[1], module)?;
         fs::remove_file(output.join("original.js"))?;
         fs::write(output.join("original.mjs"), static_module)?;
 

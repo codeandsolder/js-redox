@@ -106,3 +106,34 @@ and offsets inside surrogate pairs are refused.
 Focused regressions cover compound arguments, lexical shadowing,
 multi-argument versus sequence expression, spread, module imports,
 source-site UTF-16 indexing, and a full v2 import with an ESM callsite.
+
+## Original single-stage direct eval (schema v3)
+
+A direct eval executed in an original JavaScript file does not have an
+indirect-eval loader. Import it with an independently verified one-file
+source chain, rather than manufacturing a loader or assigning false source
+offsets:
+
+```bash
+deobfuscate-safe source-tree handlers/ readable-direct/ \
+  --observed-direct exported-direct/ original-executable.js
+```
+
+The exact original file SHA-256 must match the manifest's
+`sourceProvenance.executable.sha256`; its exact UTF-16 `evalSite` interval
+must be an executable unresolved direct-eval AST call. Source metadata
+declares `schemaVersion:3`, `captureSha256`, and
+`sourceProvenance.kind:direct-executable`; **no outerLoader is present**.
+Original two-stage provenance remains a distinct, truthful source kind,
+using `--observed-eval EXPORTED OUTER INNER`.
+
+`runtime-observed/index.json` uses schema v3 for consistent machine-readable
+origin navigation across both types. The original witness manifest is
+copied byte-for-byte; the static source and reconstruction metadata are
+never rewritten.
+
+The separate generic Node producer is
+`prototypes/zipp-knitsail/scripts/capture-direct-eval.mjs` in PR #179. It
+is synchronous, observes one selected direct-eval site, and is not an
+automatic browser emulator. It shares argument instrumentation and
+content-addressed event collection with the original two-stage runner.
