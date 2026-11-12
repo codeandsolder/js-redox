@@ -4,7 +4,8 @@ use jsvm_lift::{
     analysis_artifacts::{load_artifact, DEOBFUSCATION, JS_REFERENCES, SOURCE_INDEX},
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     observed_eval_import::{
-        attach_observed_eval_sources, expand_observed_direct_bundle, ObservedEvalInput,
+        attach_observed_eval_sources, discover_direct_eval_sites, expand_observed_direct_bundle,
+        ObservedEvalInput,
     },
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions},
     project_import_names::propagate_imported_names,
@@ -40,6 +41,9 @@ struct Args {
 enum Command {
     /// Deobfuscate one source file and optionally emit a proof report.
     Source(SourceArgs),
+    /// Enumerate all semantically direct eval callsites and their exact UTF-16
+    /// argument spans from original source without executing it.
+    EvalSites(EvalSitesArgs),
     /// Materialize an entire directory of ordinary JavaScript source files as a readable tree.
     SourceTree(SourceTreeArgs),
     /// Trace lexical call chains and parameter origins in a standalone JS program.
@@ -49,6 +53,12 @@ enum Command {
     /// Reapply captured ESM export/import name linking to existing analyst-only readable files.
     /// Does not reacquire or deobfuscate sources, and never touches exact captured output.
     ProjectNames(ProjectNamesArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct EvalSitesArgs {
+    /// The original, unmodified JS/ESM file whose source hash is emitted.
+    input: PathBuf,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -1317,6 +1327,13 @@ fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
 fn main() -> Result<()> {
     match Args::parse().command {
         Command::Source(args) => run_source(args),
+        Command::EvalSites(args) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&discover_direct_eval_sites(&args.input)?)?
+            );
+            Ok(())
+        }
         Command::SourceTree(args) => run_source_tree(args),
         Command::CallerViews(args) => run_caller_views(args),
         Command::Project(args) => run_project(args),
@@ -1334,6 +1351,17 @@ mod tests {
     use clap::Parser;
     use serde_json::json;
     use std::{fs, path::PathBuf};
+
+    #[test]
+    fn eval_sites_cli_accepts_original_source_path() -> Result<()> {
+        let args = Args::try_parse_from(["deobfuscate-safe", "eval-sites", "original.js"])?;
+        let Command::EvalSites(command) = args.command else {
+            anyhow::bail!("eval-sites command not selected");
+        };
+        assert_eq!(command.input, PathBuf::from("original.js"));
+        assert!(Args::try_parse_from(["deobfuscate-safe", "eval-sites"]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn source_tree_cli_accepts_multiple_observed_direct_bundles() -> Result<()> {

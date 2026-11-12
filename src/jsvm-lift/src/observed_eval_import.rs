@@ -10,7 +10,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_codegen::Codegen;
 use oxc_parser::Parser;
 use oxc_semantic::{Scoping, SemanticBuilder};
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::{
     scope::ScopeFlags,
     symbol::{SymbolFlags, SymbolId},
@@ -50,6 +50,9 @@ struct Site {
     eval_is_unresolved: bool,
     argument_uses_nearest_formal_parameter: bool,
     frames: Vec<Frame>,
+    /// Exact first-argument source AST byte span, independent of codegen.
+    #[serde(skip)]
+    first_argument_span: Option<[u32; 2]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -238,9 +241,7 @@ impl<'a> Visit<'a> for Scan<'_> {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if !call.optional
-            && !call.arguments.is_empty()
-            && matches!(&call.callee, Expression::Identifier(id) if id.name == "eval")
+        if !call.optional && matches!(&call.callee, Expression::Identifier(id) if id.name == "eval")
         {
             let eval_unresolved = if let Expression::Identifier(callee) = &call.callee {
                 callee
@@ -304,6 +305,11 @@ impl<'a> Visit<'a> for Scan<'_> {
                 eval_is_unresolved: eval_unresolved,
                 argument_uses_nearest_formal_parameter: bound,
                 frames: self.frames.clone(),
+                first_argument_span: call
+                    .arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                    .map(|expr| [expr.span().start, expr.span().end]),
             });
         }
         walk::walk_call_expression(self, call);
@@ -356,6 +362,56 @@ fn parse_sites_file(source: &str, path: &Path) -> Result<Vec<Site>> {
         ),
         _ => parse_sites(source),
     }
+}
+
+fn bytes_to_utf16(text: &str, offset: u32) -> Result<usize> {
+    let prefix = text
+        .get(..offset as usize)
+        .context("AST byte offset is not a valid UTF-8 codepoint boundary")?;
+    Ok(prefix.encode_utf16().count())
+}
+
+/// Inventory *all* executable unresolved direct-eval calls in the original
+/// source, including those with no capturable first argument. The producer
+/// refuses incomplete "all sites" captures instead of silently skipping
+/// unsupported cases.
+pub fn discover_direct_eval_sites(original_path: &Path) -> Result<serde_json::Value> {
+    let bytes = fs::read(original_path)?;
+    let code = String::from_utf8(bytes.clone())?;
+    let mut selected = Vec::new();
+    let mut unsupported = Vec::new();
+    for found in parse_sites_file(&code, original_path)?
+        .into_iter()
+        .filter(|site| site.eval_is_unresolved)
+    {
+        let eval_start = bytes_to_utf16(&code, found.start)?;
+        let eval_end = bytes_to_utf16(&code, found.end)?;
+        let eval_site = json!({
+            "start":eval_start,"end":eval_end,
+            "expression":code.get(found.start as usize..found.end as usize)
+                .context("invalid AST call source slice")?,
+        });
+        if let Some([first_start, first_end]) = found.first_argument_span {
+            let first_arg = json!({
+                "start":bytes_to_utf16(&code,first_start)?,
+                "end":bytes_to_utf16(&code,first_end)?,
+                "expression":code.get(first_start as usize..first_end as usize)
+                    .context("invalid AST argument source slice")?,
+            });
+            selected.push(json!({"evalSite":eval_site,"firstArgumentSite":first_arg}));
+        } else {
+            unsupported.push(json!({
+                "evalSite":eval_site,
+                "reason":"missing or spread first eval argument cannot be captured without changing semantics",
+            }));
+        }
+    }
+    Ok(json!({
+        "schemaVersion":1,
+        "sourceSha256":sha256_hex(&bytes),
+        "sites":selected,
+        "unsupported":unsupported,
+    }))
 }
 
 fn utf16_to_bytes(text: &str, offset: usize) -> Result<u32> {
@@ -1356,6 +1412,42 @@ mod tests {
                 source_files: vec![outer_source, inner_source],
             },
         ))
+    }
+
+    #[test]
+    fn discover_all_direct_eval_sources_with_unicode_shadowing_and_spread() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("original.js");
+        let code="const crab='🦀';var first=D=>eval(D);var nested=D=>eval(eval(D));var shadow=(eval,D)=>eval(D);var spread=D=>eval(...D);eval();";
+        fs::write(&path, code)?;
+        let inventory = discover_direct_eval_sites(&path)?;
+        assert_eq!(inventory["sourceSha256"], sha256_hex(code.as_bytes()));
+        let sites = inventory["sites"].as_array().context("missing sites")?;
+        let unsupported = inventory["unsupported"]
+            .as_array()
+            .context("missing unsupported")?;
+        assert_eq!(sites.len(), 3);
+        assert_eq!(unsupported.len(), 2);
+        let mut expressions = sites
+            .iter()
+            .map(|x| x["evalSite"]["expression"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        expressions.sort_unstable();
+        assert_eq!(expressions, vec!["eval(D)", "eval(D)", "eval(eval(D))"]);
+        for record in sites.iter().chain(unsupported) {
+            let span = &record["evalSite"];
+            let start = span["start"].as_u64().context("start")? as usize;
+            let end = span["end"].as_u64().context("end")? as usize;
+            let start_byte = utf16_to_bytes(code, start)? as usize;
+            let end_byte = utf16_to_bytes(code, end)? as usize;
+            assert_eq!(
+                &code[start_byte..end_byte],
+                span["expression"].as_str().context("source expression")?,
+            );
+        }
+        let inventory_text = serde_json::to_string(&inventory)?;
+        assert!(inventory_text.contains("spread first eval argument"));
+        Ok(())
     }
 
     #[test]

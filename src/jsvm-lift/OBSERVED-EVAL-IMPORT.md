@@ -164,3 +164,21 @@ OXC. It publishes the whole combined tree only when every site passes,
 preserving original static JS/reconstruction and all per-site manifests
 byte-for-byte. Existing genuine two-stage captures use their actual source
 chain and continue to use `--observed-eval`.
+
+## AST inventory for direct eval source sites
+
+`deobfuscate-safe eval-sites ORIGINAL_JS` produces one JSON object containing
+`schemaVersion:1`, exact `sourceSha256`, `sites` and `unsupported`. Every
+reported interval is in **original UTF-16 code units**, independently
+derived from OXC AST byte spans. The native semantic resolver distinguishes
+real unresolved direct eval calls from locally shadowed `eval`, and optional
+or indirect eval is not mislabeled as a direct call. Each supported entry
+includes the original callsite and first argument source interval.
+
+Direct eval with zero arguments or a spread-first argument is listed in
+`unsupported`; a producer using `sites:"all"` refuses the run rather than
+quietly dropping such sites. This is a discovery/validation command, not
+dynamic execution. The separate Node capture producer consumes this
+inventory, checks the original source hash and instruments the reported
+locations in one synchronous execution. Nested source spans are supported
+in the capture observer via balanced ordered wrappers.
