@@ -1782,6 +1782,7 @@ mod tests {
             context_source: None,
             origin_source: None,
             caller_view_entry: None,
+            observed_eval: Vec::new(),
         });
         assert!(error.is_err());
         assert_eq!(fs::read_to_string(input.join("a.js"))?, "const a=1;");
