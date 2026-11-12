@@ -67,6 +67,8 @@ This deliberately stays outside the fast default browser-project pipeline. Its `
 
 ## Readable JavaScript source-tree reconstruction
 
+Optional execution-observed eval inputs can be attached directly to the static source-tree command, using native Rust/OXC evidence checking (no Node or ZIPP required at import). [Usage and provenance contract](src/jsvm-lift/OBSERVED-EVAL-IMPORT.md).
+
 A browser capture is **not** required to statically reconstruct ordinary JavaScript files.
 The source-tree mode recursively scans JS, MJS, and CJS files, applies AST-driven
 constant recovery, nested numeric-state control-flow reconstruction (for and
