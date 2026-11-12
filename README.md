@@ -562,9 +562,11 @@ unchanged lexical parameter symbols, and the regular static deobfuscator
 then simplifies the result. Derived original-helper and specialized-helper views
 also structurally reduce single-trip `for`/`while`/`do-while` loops when an
 unconditional terminal break proves that a second iteration is impossible.
-The original initializer and condition are evaluated exactly once, loop
-updates remain unreachable, and potential earlier breaks or continues
-prevent the rewrite. A second run of the existing proof-oriented static
+This includes a final break guarded by a provably truthy test: the full test
+expression is still evaluated, including any earlier comma-expression side
+effects (such as `if ((record(), {})) break`). The original initializer and
+loop condition are evaluated exactly once, loop updates remain unreachable,
+and potential earlier breaks or continues prevent the rewrite. A second run of the existing proof-oriented static
 deobfuscator then folds dead conditions and redundant blocks exposed by
 that structural change (for example, a specialized `if (false)` branch).
 The source-backed helper views also recover direct values from terminal
