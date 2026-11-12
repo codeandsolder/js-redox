@@ -2,7 +2,10 @@
 use crate::sha256_hex;
 use anyhow::{bail, Context, Result};
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{BindingPattern, CallExpression, Expression, Function, VariableDeclarator};
+use oxc_ast::ast::{
+    ArrowFunctionExpression, BindingPattern, CallExpression, Expression, Function,
+    VariableDeclarator,
+};
 use oxc_ast_visit::{walk, Visit};
 use oxc_parser::Parser;
 use oxc_semantic::{Scoping, SemanticBuilder};
@@ -20,6 +23,7 @@ use std::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct Frame {
     binding: Option<String>,
+    kind: &'static str,
     params: Vec<String>,
     start: u32,
     end: u32,
@@ -60,13 +64,16 @@ impl<'s> Scan<'s> {
 
 impl<'a> Visit<'a> for Scan<'_> {
     fn visit_variable_declarator(&mut self, decl: &VariableDeclarator<'a>) {
-        if let (
-            BindingPattern::BindingIdentifier(binding),
-            Some(Expression::FunctionExpression(func)),
-        ) = (&decl.id, &decl.init)
-        {
-            self.bindings
-                .insert((func.span.start, func.span.end), binding.name.to_string());
+        if let BindingPattern::BindingIdentifier(binding) = &decl.id {
+            let span = match decl.init.as_ref() {
+                Some(Expression::FunctionExpression(function)) => Some(function.span),
+                Some(Expression::ArrowFunctionExpression(arrow)) => Some(arrow.span),
+                _ => None,
+            };
+            if let Some(span) = span {
+                self.bindings
+                    .insert((span.start, span.end), binding.name.to_string());
+            }
         }
         walk::walk_variable_declarator(self, decl);
     }
@@ -101,12 +108,48 @@ impl<'a> Visit<'a> for Scan<'_> {
             });
         self.frames.push(Frame {
             binding,
+            kind: "function",
             params,
             start: function.span.start,
             end: function.span.end,
             symbols,
         });
         walk::walk_function(self, function, flags);
+        self.frames.pop();
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        let params = arrow
+            .params
+            .items
+            .iter()
+            .map(|param| match &param.pattern {
+                BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                _ => "<pattern>".to_owned(),
+            })
+            .collect();
+        let symbols = arrow
+            .params
+            .items
+            .iter()
+            .map(|param| match &param.pattern {
+                BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
+                _ => None,
+            })
+            .collect();
+        let binding = self
+            .bindings
+            .get(&(arrow.span.start, arrow.span.end))
+            .cloned();
+        self.frames.push(Frame {
+            binding,
+            kind: "arrow",
+            params,
+            start: arrow.span.start,
+            end: arrow.span.end,
+            symbols,
+        });
+        walk::walk_arrow_function_expression(self, arrow);
         self.frames.pop();
     }
 
@@ -242,7 +285,11 @@ fn same_lexical_structure(a: &Site, b: &Site) -> bool {
         && stable_named_scope(&a.frames)
             .iter()
             .zip(stable_named_scope(&b.frames))
-            .all(|(left, right)| left.binding == right.binding && left.params == right.params)
+            .all(|(left, right)| {
+                left.binding == right.binding
+                    && left.kind == right.kind
+                    && left.params == right.params
+            })
 }
 
 /// One independently captured execution and both exact original source layers.
@@ -977,6 +1024,105 @@ mod tests {
         symlink(&real, input.observed_tree.join("raw"))?;
         assert!(attach_observed_eval_sources(&output, &[input]).is_err());
         assert!(!output.join("runtime-observed").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn arrow_parameter_is_a_first_class_lexical_eval_binding() -> Result<()> {
+        let original = "const oU = (D) => eval(D);";
+        let formatted = "const oU = D => { return eval ( D ); };";
+        let original_sites = parse_sites(original)?;
+        let formatted_sites = parse_sites(formatted)?;
+        assert_eq!(original_sites.len(), 1);
+        assert_eq!(formatted_sites.len(), 1);
+        let a = &original_sites[0];
+        let b = &formatted_sites[0];
+        assert!(a.eval_is_unresolved && a.argument_is_bound_to_nearest_parameter);
+        assert_eq!(a.frames.len(), 1);
+        assert_eq!(a.frames[0].kind, "arrow");
+        assert_eq!(a.frames[0].binding.as_deref(), Some("oU"));
+        assert!(same_lexical_structure(a, b));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_arrows_preserve_nearest_parameter_and_function_kind() -> Result<()> {
+        let original = "const oU = (A) => (D) => eval(D);";
+        let formatted = "const oU = A => { return D => eval(D); };";
+        let sites = parse_sites(original)?;
+        let formatted_sites = parse_sites(formatted)?;
+        assert_eq!(sites.len(), 1);
+        assert!(sites[0].argument_is_bound_to_nearest_parameter);
+        assert_eq!(sites[0].frames.len(), 2);
+        assert!(sites[0].frames.iter().all(|frame| frame.kind == "arrow"));
+        assert!(same_lexical_structure(&sites[0], &formatted_sites[0]));
+
+        let captured_outer = parse_sites("const oU = (D) => { return () => eval(D); };")?;
+        assert_eq!(captured_outer.len(), 1);
+        assert!(!captured_outer[0].argument_is_bound_to_nearest_parameter);
+        assert!(!same_lexical_structure(&sites[0], &captured_outer[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn arrow_and_function_expressions_are_not_the_same_lexical_structure() -> Result<()> {
+        let arrow = parse_sites("const oU = (D) => eval(D);")?;
+        let function = parse_sites("const oU = function(D) { return eval(D); };")?;
+        assert!(arrow[0].argument_is_bound_to_nearest_parameter);
+        assert!(function[0].argument_is_bound_to_nearest_parameter);
+        assert!(!same_lexical_structure(&arrow[0], &function[0]));
+
+        let shadowed = parse_sites("const oU = D => { const eval = x => x; return eval(D); };")?;
+        assert_eq!(shadowed.len(), 1);
+        assert!(!shadowed[0].eval_is_unresolved);
+        assert!(!same_lexical_structure(&arrow[0], &shadowed[0]));
+
+        let indirect = parse_sites("const oU = D => (0,eval)(D);")?;
+        assert!(
+            indirect.is_empty(),
+            "indirect eval is not a direct eval callsite"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_observed_import_supports_an_arrow_lexical_site() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let (output, input) = sample(tmp.path())?;
+        let inner = "const oU = (D) => eval(D);\n";
+        fs::write(&input.inner_source, inner)?;
+        fs::write(
+            output.join("original.js"),
+            "const oU = D => { return eval(D); };\n",
+        )?;
+        let manifest_file = input.observed_tree.join("manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_file)?)?;
+        manifest["sourceProvenance"]["innerExecutable"]["sha256"] =
+            json!(sha256_hex(inner.as_bytes()));
+        let start = inner
+            .find("eval(D)")
+            .context("missing eval in arrow source")?;
+        manifest["sourceProvenance"]["innerExecutable"]["evalSite"]["start"] = json!(start);
+        manifest["sourceProvenance"]["innerExecutable"]["evalSite"]["end"] = json!(start + 7);
+        fs::write(&manifest_file, serde_json::to_vec(&manifest)?)?;
+
+        attach_observed_eval_sources(&output, &[input])?;
+        let index: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("runtime-observed/index.json"))?)?;
+        assert_eq!(index["captures"][0]["staticAstMatches"], 1);
+        let relative = index["captures"][0]["directory"]
+            .as_str()
+            .context("missing observed capture directory")?;
+        let origin: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join(relative).join("origin.json"))?)?;
+        assert_eq!(
+            origin["staticAstStructuralMatches"][0]["lexicalFrames"][0]["kind"],
+            "arrow"
+        );
+        assert_eq!(
+            origin["staticAstStructuralMatches"][0]["path"],
+            "original.js"
+        );
         Ok(())
     }
 
