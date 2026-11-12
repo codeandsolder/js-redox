@@ -72,9 +72,13 @@ impl<'a> Visit<'a> for Calls<'_> {
                     self.scoping.get_reference(reference).symbol_id().is_none()
                 });
                 if unresolved {
+                    // Once a spread is encountered, subsequent source
+                    // argument indexes no longer identify formal parameters:
+                    // the spread can contribute any number of values.
                     let constants = call
                         .arguments
                         .iter()
+                        .take_while(|argument| !matches!(argument, Argument::SpreadElement(_)))
                         .enumerate()
                         .filter_map(|(index, argument)| {
                             literal_argument(argument, self.source).map(|literal| (index, literal))
@@ -1351,6 +1355,36 @@ mod tests {
         assert_eq!(calls[2].constants, vec![(1, "true".into())]);
         assert_eq!(calls[3].constants, vec![(1, "'abc'".into())]);
         assert_eq!(calls[4].constants, vec![(1, "-12".into())]);
+        Ok(())
+    }
+
+    #[test]
+    fn spread_arguments_do_not_invent_later_parameter_positions() -> Result<()> {
+        let source = "function handler(dynamic, values) {
+            O(8, ...values, 16);
+            O(...values, 16);
+            O(dynamic, 16);
+            O(7, 16);
+        }";
+        let calls = literal_calls(source)?;
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls[0].constants, [(0, "8".into())]);
+        assert_eq!(calls[1].constants, [(1, "16".into())]);
+        assert_eq!(calls[2].constants, [(0, "7".into()), (1, "16".into())]);
+
+        let helpers = std::collections::BTreeMap::from([(
+            "O".to_owned(),
+            "const O=function(x, selector){return selector + x;}".to_owned(),
+        )]);
+        let specializations =
+            super::specialize_calls(&[("handler.js".into(), source.into())], &helpers)?;
+        assert_eq!(specializations.len(), 3, "{specializations:?}");
+        assert!(specializations
+            .iter()
+            .any(|specialization| { specialization.arguments == [(0, "8".into())] }));
+        assert!(!specializations.iter().any(|specialization| {
+            specialization.arguments == [(1, "16".into()), (2, "16".into())]
+        }));
         Ok(())
     }
 
