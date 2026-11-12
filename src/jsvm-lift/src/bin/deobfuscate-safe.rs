@@ -1714,6 +1714,52 @@ mod tests {
     }
 
     #[test]
+    fn source_tree_splits_comma_if_test_in_original_helper_view() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let original_source = "function root(){const initialize=function(Q,active){if((record('start'),Q.value,active)){record('yes');}else{record('no');}return Q;};}";
+        fs::write(&original, original_source)?;
+        let handler_source = "const capturedHandler=function(Q){return initialize(Q,true);};";
+        fs::write(input.join("handler.js"), handler_source)?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let lexical = output.join("lexical-context");
+        let context: serde_json::Value =
+            serde_json::from_slice(&fs::read(lexical.join("context.json"))?)?;
+        let row = &context["helpers"][0];
+        assert_eq!(row["name"], "initialize");
+        let path = row["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("helper view path missing"))?;
+        let readable = fs::read_to_string(lexical.join(path))?;
+        assert!(readable.contains("if (active)"), "{readable}");
+        assert!(!readable.contains("if ((record("), "{readable}");
+        assert!(readable.contains("record(\"start\")"), "{readable}");
+        assert!(readable.contains("Q.value"), "{readable}");
+        assert!(readable.contains("record(\"yes\")"), "{readable}");
+        assert!(readable.contains("record(\"no\")"), "{readable}");
+        assert_eq!(
+            fs::read_to_string(lexical.join("original.js"))?,
+            original_source
+        );
+        assert!(
+            fs::read_to_string(output.join("handler.js"))?.contains("initialize(Q, true)"),
+            "original executable call must still be present"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn source_tree_recovers_guarded_return_joins_from_original_helper() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let input = temp.path().join("source");

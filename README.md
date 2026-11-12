@@ -96,8 +96,13 @@ become conditional branches, and ternaries become `if/else`. Dynamic tests
 are evaluated once, direct/indirect calls preserve their syntax, and generated
 blocks cannot accidentally introduce string directives. The original
 statement is left intact at top level, where its completion value can be
-observable through JavaScript `eval`. Assignment-right comma expressions
-are also split for lexically resolved, stable identifier targets, retaining
+observable through JavaScript `eval`. An `if ((setup(), ..., condition))`
+whose `if` already occupies a statement slot in a function/block is likewise
+split into ordered setup statements followed by the original final test and
+branch bodies, without creating a new lexical scope. Bare nested/unbraced
+`if`, loop and labelled bodies retain their original single-statement shape.
+Assignment-right comma expressions are also split for lexically resolved,
+stable identifier targets, retaining
 operation order; dynamic/computed member targets and RHS anonymous function
 or class name-inference hazards remain intact. Semantic recovery always
 runs first to a fixed point, with presentation-level expression lowering only

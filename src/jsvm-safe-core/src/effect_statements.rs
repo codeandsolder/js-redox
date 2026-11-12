@@ -7,7 +7,9 @@
 //! retained expressions remain wrapped so object/function literals are valid
 //! statement syntax. Dynamic branches are evaluated exactly once.
 use crate::{fragment, statically_resolved_symbol, value_eval::eval};
-use oxc_ast::ast::{AssignmentTarget, Expression, ExpressionStatement, SequenceExpression};
+use oxc_ast::ast::{
+    AssignmentTarget, Expression, ExpressionStatement, IfStatement, SequenceExpression,
+};
 use oxc_semantic::Scoping;
 use oxc_span::GetSpan;
 
@@ -184,6 +186,56 @@ impl Lowered {
     }
 }
 
+/// Split the side-effecting comma prefix of an if test from its final
+/// condition. The caller must prove this is a sibling statement in an
+/// existing function/block statement list: emitting several statements
+/// in-place under an unbraced if/loop/label would change control flow, and
+/// inserting a new block could change direct-eval/Annex-B binding behavior.
+///
+/// Every prefix still performs GetValue and can throw. Keep the exact source
+/// of each operand and of the original branches, without changing reference
+/// identity, short-circuit behavior, or lexical scope.
+pub(crate) fn lower_if_test(statement: &IfStatement<'_>, source: &str) -> Option<String> {
+    let sequence = sequence_rhs(&statement.test)?;
+    let (condition, prefixes) = sequence.expressions.split_last()?;
+    if prefixes.is_empty() {
+        return None;
+    }
+    let test_start = statement.test.span().start as usize;
+    let test_end = statement.test.span().end as usize;
+    let mut previous_end = test_start;
+    for operand in &sequence.expressions {
+        // Comments between comma operands belong to the original source
+        // narration. Until we can relocate them exactly, leave such tests
+        // unchanged rather than losing the comments in an analyst view.
+        let gap = source.get(previous_end..operand.span().start as usize)?;
+        if gap.contains("/*") || gap.contains("//") {
+            return None;
+        }
+        previous_end = operand.span().end as usize;
+    }
+    let tail = source.get(previous_end..test_end)?;
+    if tail.contains("/*") || tail.contains("//") {
+        return None;
+    }
+
+    let mut text = String::new();
+    for expression in prefixes {
+        let original = fragment(source, expression.span());
+        // An inert known primitive cannot have observable effects. Keep
+        // comments within such an operand rather than deleting annotations.
+        if eval(expression).is_none() || original.contains("/*") || original.contains("//") {
+            text.push_str(&format!("({original});\n"));
+        }
+    }
+    // Preserve every original byte outside the test itself, including
+    // comments between the test and the consequent/alternate statements.
+    text.push_str(source.get(statement.span.start as usize..test_start)?);
+    text.push_str(fragment(source, condition.span()));
+    text.push_str(source.get(test_end..statement.span.end as usize)?);
+    Some(text)
+}
+
 /// Direct `guard && call()` / `guard || call()` already has readable
 /// short-circuit semantics. Retain that idiomatic source shape at statement
 /// root rather than expanding it into an `if`; downstream semantic analyzers
@@ -315,6 +367,84 @@ mod tests {
         let output = rewritten(source)?;
         assert!(
             output.contains("offset === 56708 || view.setUint32(address,1,false)"),
+            "{output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_if_test_comma_effects_without_changing_branch_scope() -> Result<(), BudgetExceeded> {
+        let input = r#"function initialize(log, condition) {
+            if ((log("one"), log("two"), condition)) {
+                log("yes");
+            } else {
+                log("no");
+            }
+        }"#;
+        let output = rewritten(input)?;
+        assert!(output.contains("if (condition)"), "{output}");
+        assert!(!output.contains("if ((log("), "{output}");
+        for word in ["one", "two", "yes", "no"] {
+            assert!(output.contains(word), "{output}");
+        }
+        assert!(
+            matches!(
+                (
+                    output.find("log(\"one\")"),
+                    output.find("log(\"two\")"),
+                    output.find("if (condition)")
+                ),
+                (Some(one), Some(two), Some(test)) if one < two && two < test
+            ),
+            "{output}"
+        );
+        assert!(output.contains("} else {"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn if_test_split_preserves_direct_eval_and_property_reads() -> Result<(), BudgetExceeded> {
+        let input =
+            "function f(o,flag){if((eval('var marker=5'),o.value,flag)){return marker;}return 0;}";
+        let output = rewritten(input)?;
+        assert!(output.contains("eval('var marker=5')"), "{output}");
+        assert!(output.contains("(o.value);"), "{output}");
+        assert!(output.contains("if (flag)"), "{output}");
+        assert!(output.contains("return marker"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_unbraced_nested_if_and_script_level_test_splitting() -> Result<(), BudgetExceeded> {
+        let inputs = [
+            "if((effect(),ready))run();",
+            "function f(ready){if(ready)if((effect(),ready))run();}",
+            "function f(ready){while(ready)if((effect(),ready))run();}",
+            "function f(ready){label:if((effect(),ready))run();}",
+        ];
+        for input in inputs {
+            let output = rewritten(input)?;
+            assert!(
+                output.contains("if((effect(),ready))"),
+                "must not split unsupported statement placement: {output}"
+            );
+            assert!(
+                !output.contains("if (ready)"),
+                "should not split comma test in unsupported placement: {output}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn if_test_split_retains_comments_and_refuses_ambiguous_operand_comments(
+    ) -> Result<(), BudgetExceeded> {
+        let input = "function f(flag){if((ping(),flag))/*branch note*/act();if((ping()/*operand note*/,flag))other();}";
+        let output = rewritten(input)?;
+        assert!(output.contains("/*branch note*/"), "{output}");
+        assert!(output.contains("if (flag)/*branch note*/act()"), "{output}");
+        assert!(
+            output.contains("if((ping()/*operand note*/,flag))"),
             "{output}"
         );
         Ok(())

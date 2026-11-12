@@ -646,6 +646,19 @@ struct Collector<'s, 'c> {
 }
 
 impl Collector<'_, '_> {
+    fn lower_if_test_statements(&mut self, statements: &[Statement<'_>]) {
+        if !self.allow_effect_statements || self.function_depth == 0 {
+            return;
+        }
+        for statement in statements {
+            if let Statement::IfStatement(branch) = statement {
+                if let Some(code) = effect_statements::lower_if_test(branch, self.source) {
+                    self.push(branch.span, code, "if_test_sequence_lowering");
+                }
+            }
+        }
+    }
+
     fn reconstruct_while_pairs(&mut self, statements: &[Statement<'_>]) {
         for pair in statements.windows(2) {
             if let [initial, Statement::WhileStatement(loop_stmt)] = pair {
@@ -1334,6 +1347,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
+        self.lower_if_test_statements(&it.statements);
         self.reconstruct_while_pairs(&it.statements);
         self.reconstruct_reaching_while(&it.statements);
         if self.allow_effect_statements
@@ -1371,6 +1385,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
+        self.lower_if_test_statements(&it.body);
         self.reconstruct_while_pairs(&it.body);
         self.reconstruct_reaching_while(&it.body);
         if self.allow_effect_statements
