@@ -190,6 +190,34 @@ fn collect_js_sources(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(sources)
 }
 
+/// Publish a fully validated output tree without replacing a destination
+/// created after the initial existence check. Linux/Android and Apple supply
+/// a kernel-level exclusive rename for this operation.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn publish_complete_tree(source: &Path, destination: &Path) -> Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE)
+        .map_err(std::io::Error::from)
+        .with_context(|| {
+            format!(
+                "publishing observed source tree to {}",
+                destination.display()
+            )
+        })
+}
+
+// On other platforms, use the native rename behavior. The destination
+// existence check still protects ordinary single-process invocation.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn publish_complete_tree(source: &Path, destination: &Path) -> Result<()> {
+    fs::rename(source, destination).with_context(|| {
+        format!(
+            "publishing observed source tree to {}",
+            destination.display()
+        )
+    })
+}
+
 fn run_source_tree(mut args: SourceTreeArgs) -> Result<()> {
     if args.observed_eval.is_empty() {
         println!("{}", build_source_tree(args)?);
@@ -238,12 +266,7 @@ fn run_source_tree(mut args: SourceTreeArgs) -> Result<()> {
         fs::symlink_metadata(&destination).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
         "observed source-tree destination appeared during staging"
     );
-    fs::rename(stage.path().join("tree"), &destination).with_context(|| {
-        format!(
-            "publishing observed source tree to {}",
-            destination.display()
-        )
-    })?;
+    publish_complete_tree(&stage.path().join("tree"), &destination)?;
     result["output"] = json!(destination.display().to_string());
     println!("{result}");
     Ok(())
@@ -1931,6 +1954,28 @@ mod tests {
             leaf["semantic_rewrites"].as_u64().is_some_and(|n| n > 0),
             "{leaf}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exclusive_publish_refuses_even_an_empty_existing_directory() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("finished");
+        let destination = tmp.path().join("existing");
+        fs::create_dir(&source)?;
+        fs::write(source.join("entry"), "complete")?;
+        fs::create_dir(&destination)?;
+        assert!(
+            super::publish_complete_tree(&source, &destination).is_err(),
+            "an empty destination must not be replaced"
+        );
+        assert_eq!(fs::read_to_string(source.join("entry"))?, "complete");
+        assert!(destination.is_dir());
+
+        fs::remove_dir(&destination)?;
+        super::publish_complete_tree(&source, &destination)?;
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(destination.join("entry"))?, "complete");
         Ok(())
     }
 
