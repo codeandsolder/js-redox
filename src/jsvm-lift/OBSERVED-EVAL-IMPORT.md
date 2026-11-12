@@ -43,3 +43,28 @@ The original static JS files and reconstruction.json remain byte-identical.
 
 Source capture and the full experimental reproduction are documented in
 https://github.com/codeandsolder/js-redox/pull/179
+
+## Verified archived Knitsail integration (2026-11-12)
+
+With Node v26.13.1 and the matching system simdjson library restored on Acer,
+the saved 2026-09-27 HTML challenge produced the original v2 witness again:
+51 direct eval executions, 40 unique source strings, 25 standalone formatted,
+15 exact raw-only, and an 851-character challenge result.
+
+The native source-tree command was run twice against a **focused subset of
+three actual static Knitsail source views**: once without the optional input,
+once with the v2 witness. The observed output included all 40 strings and
+three AST lexical-site matches. The three generated static JavaScript files
+and the static reconstruction.json were byte-identical between runs. All 154
+relative links in the 46 runtime evidence/sidecar Markdown pages resolved.
+The complete original manifest, including evidenceKind and environment,
+was preserved **byte-for-byte**.
+
+The importer also rejects symlinked intermediate source directories and
+requires all listed event occurrences to account for the manifest's event
+count. Focused Rust unit tests cover both cases, and a CLI parser regression
+covers multiple independent 3-path option groups.
+
+This does not authorize promoting observed code into unconditional static
+deobfuscation: every generated fragment is tied to a specific captured
+execution and the matched original AST site, not a proof of all reachable paths.
