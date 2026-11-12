@@ -13,6 +13,7 @@ use jsvm_lift::{
         annotate_handler_helper_calls_with_specializations, reconstruct_context,
         SpecializedHelperCall,
     },
+    source_tree_inline::expand_helper_returns,
     source_tree_specialize::{specialize_calls, specialize_resolved_call_graph},
 };
 use serde_json::json;
@@ -517,6 +518,54 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                  The ordinary reconstructed handler files are unchanged.\n\n",
             );
         }
+        // The ordinary recovered handler remains authoritative. This extra
+        // view substitutes verified short original return expressions at
+        // callsites, keeping larger/unsafe helper calls intact.
+        let mut expanded_rows = Vec::new();
+        let mut expanded_index = String::from(
+            "# Source-backed expanded helper returns\n\n\
+             These files substitute original short return expressions only \
+             when the extracted handler's argument bindings, original helper \
+             parameters, and lexical captures are statically compatible. \
+             Nonmatching calls stay unchanged. This is an analyst-only \
+             projection; the ordinary source tree remains the executable \
+             recovery.\n\n",
+        );
+        for handler in &context.handlers {
+            let code = fs::read_to_string(out.join(&handler.path))?;
+            let Some(expanded) = expand_helper_returns(&code, &context, handler)? else {
+                continue;
+            };
+            let relative = format!("expanded-handlers/{}", handler.path);
+            if let Some(parent) = folder.join(&relative).parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(folder.join(&relative), expanded.source)?;
+            expanded_index.push_str(&format!(
+                "- [{}]({}) — {} original helper calls expanded: {}\n",
+                handler.path,
+                handler.path,
+                expanded.expanded_calls,
+                expanded.helpers.join(", ")
+            ));
+            expanded_rows.push(json!({
+                "path": handler.path,
+                "expanded_path": relative,
+                "expanded_calls": expanded.expanded_calls,
+                "helpers": expanded.helpers,
+            }));
+        }
+        if !expanded_rows.is_empty() {
+            fs::write(folder.join("expanded-handlers/README.md"), expanded_index)?;
+            helper_index.push_str(
+                "\n[Browse source-backed expanded helper return expressions](expanded-handlers/README.md).\n",
+            );
+            md.push_str(
+                "\n## Short original helper returns expanded into analyst code\n\n\
+                 [Read verified expression expansions](lexical-context/expanded-handlers/README.md). \
+                 The ordinary reconstructed handler files remain unchanged.\n\n",
+            );
+        }
         fs::write(folder.join("README.md"), &helper_index)?;
         fs::create_dir_all(folder.join("specializations"))?;
         let mut specializations_md =
@@ -826,6 +875,8 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             "schema": "jsvm-readable-lexical-context/v2",
             "annotated_handler_count": annotated_call_rows.len(),
             "annotated_handler_calls": annotated_call_rows,
+            "expanded_handler_count": expanded_rows.len(),
+            "expanded_handlers": expanded_rows,
             "explained_alias_count": explained_rows.len(),
             "explained_aliases": explained_rows,
             "source": "lexical-context/original.js",
@@ -1347,6 +1398,12 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(context_dir.join("context.json"))?)?;
         assert_eq!(metadata["helper_count"], 2);
         assert_eq!(metadata["annotated_handler_count"], 1);
+        assert_eq!(metadata["expanded_handler_count"], 1);
+        let expanded = fs::read_to_string(context_dir.join("expanded-handlers/handler.js"))?;
+        assert!(expanded.contains("(byte(x)+(16))"), "{expanded}");
+        assert!(!expanded.contains("helper(x, 16)"), "{expanded}");
+        assert!(fs::read_to_string(output.join("README.md"))?
+            .contains("lexical-context/expanded-handlers/README.md"));
         let inline = fs::read_to_string(context_dir.join("annotated-handlers/handler.js"))?;
         assert!(
             inline.contains("helper /* lexical helper helper: return byte(x)+y; original definition ../helpers/helper-"),

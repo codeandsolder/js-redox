@@ -57,6 +57,7 @@ pub mod source_materialize;
 pub mod source_tree_aliases;
 pub mod source_tree_callflow;
 pub mod source_tree_context;
+pub mod source_tree_inline;
 pub mod source_tree_specialize;
 pub mod tool_environment;
 pub mod vm_materialize;

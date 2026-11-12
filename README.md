@@ -388,6 +388,15 @@ comments are presentation-only and do not modify the proof-checked handler.
 The `lexical-context/context.json` manifest records annotated files and call
 counts.
 
+For small, source-backed helpers, `lexical-context/expanded-handlers/` goes
+further: it places the **original return expression directly into the
+recovered code**, substituting formal parameters by Oxc binding identity.
+The expansion requires a stable original helper, side-effect-free and
+non-reassigned arguments, and no conflicting lexical captures, dynamic scope
+or call-frame-dependent syntax. Calls without those proofs stay untouched.
+This is an analyst projection only; the executable/proof-checked source
+tree is always kept separate.
+
 For mutable computed-property aliases, the `lexical-context/explained/`
 views retain executable property expressions and annotate them with their
 **actual** lexical string assignments and conditional overrides. For example,
