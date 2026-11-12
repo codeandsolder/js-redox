@@ -1,0 +1,365 @@
+From d73d16601b291c21be4f8ac79f877510f3743f80 Mon Sep 17 00:00:00 2001
+From: codeandsolder <codeandsolder@gmail.com>
+Date: Thu, 12 Nov 2026 23:19:43 +0100
+Subject: [PATCH] feat(embed): opt-in bounded runtime source compiler
+ observations
+
+---
+ crates/zipp-vm/src/embed.rs                   |  33 ++++-
+ crates/zipp-vm/src/vm/engine/run.rs           |  16 +++
+ crates/zipp-vm/src/vm/instrument.rs           |  96 +++++++++++++
+ .../zipp-vm/tests/dynamic_source_capture.rs   | 129 ++++++++++++++++++
+ 4 files changed, 273 insertions(+), 1 deletion(-)
+ create mode 100644 crates/zipp-vm/tests/dynamic_source_capture.rs
+
+diff --git a/crates/zipp-vm/src/embed.rs b/crates/zipp-vm/src/embed.rs
+index 7fbb273..1567b9f 100644
+--- a/crates/zipp-vm/src/embed.rs
++++ b/crates/zipp-vm/src/embed.rs
+@@ -47,7 +47,9 @@ pub use crate::vm::host_api::SandboxCaps;
+ /// expose the `ScriptState::start_trace` control API; the artifact-internal
+ /// `meter-only` profile deliberately does not.
+ #[cfg(feature = "instrument")]
+-pub use crate::vm::instrument::{op, TraceStep};
++pub use crate::vm::instrument::{
++    op, DynamicSourceCapture, DynamicSourceEvent, DynamicSourceKind, TraceStep,
++};
+ pub use crate::vm::ConsoleStream;
+ 
+ /// Decimal text to `f64`, exactly as `text.parse::<f64>().ok()` reads it (the
+@@ -1296,6 +1298,35 @@ impl ScriptState {
+         });
+     }
+ 
++    /// Record the original bytes supplied to all runtime script-compiler
++    /// attempts, including direct/indirect eval and Function constructors.
++    ///
++    /// Requires `set_limits` (an attached recorder). Unlike `start_trace`,
++    /// this does not disable the native JIT or record instruction steps.
++    /// Caps only the OBSERVATION buffer: execution continues if it fills,
++    /// but `truncated` will be true and the events are not a complete record.
++    /// A Function constructor cache hit is still an attempt event.
++    #[cfg(feature = "instrument")]
++    pub fn start_dynamic_source_capture(&mut self, max_events: usize, max_bytes: usize) {
++        self.with_vm(|vm| {
++            if let Some(rec) = &mut vm.instr_rec {
++                rec.start_dynamic_source_capture(max_events, max_bytes);
++            }
++        });
++    }
++
++    /// Finish observing dynamic-source attempts; returns `None` if capture
++    /// was not enabled. Does not reset the instruction budget.
++    #[cfg(feature = "instrument")]
++    pub fn take_dynamic_source_capture(&mut self) -> Option<DynamicSourceCapture> {
++        self.with_vm(|vm| {
++            vm.instr_rec
++                .as_mut()
++                .and_then(|rec| rec.take_dynamic_source_capture())
++        })
++        .flatten()
++    }
++
+     /// Start recording an execution trace, stopping at `max_steps` rows.
+     ///
+     /// Requires [`Self::set_limits`] first (that is what attaches the recorder);
+diff --git a/crates/zipp-vm/src/vm/engine/run.rs b/crates/zipp-vm/src/vm/engine/run.rs
+index 99c3ca1..517d642 100644
+--- a/crates/zipp-vm/src/vm/engine/run.rs
++++ b/crates/zipp-vm/src/vm/engine/run.rs
+@@ -2366,6 +2366,22 @@ impl<'p> Vm<'p> {
+             self.instrument_dynamic_code_attempt(code.len())
+                 .map_err(|message| Thrown(message.into()))?;
+         }
++        // Capture the SOURCE AT THE COMPILER BOUNDARY, without patching the
++        // guest program or changing direct eval's lexical scope. This is an
++        // attempt event: parse failures and Function constructor cache hits
++        // count, and no assertion about the eventual evaluation is implied.
++        #[cfg(feature = "instrument")]
++        {
++            use crate::vm::instrument::DynamicSourceKind;
++            let kind = if fn_ctor {
++                DynamicSourceKind::FunctionConstructor
++            } else if direct {
++                DynamicSourceKind::DirectEval
++            } else {
++                DynamicSourceKind::IndirectEvalOrHost
++            };
++            self.instrument_dynamic_source_attempt(kind, exact_src.unwrap_or(code.as_bytes()));
++        }
+         // `new Function(...)` compiles a fresh wrapper program around a
+         // function expression and runs it for the function object, so the
+         // same parameters and body compiled, installed and retained the same
+diff --git a/crates/zipp-vm/src/vm/instrument.rs b/crates/zipp-vm/src/vm/instrument.rs
+index 416911a..03d9a47 100644
+--- a/crates/zipp-vm/src/vm/instrument.rs
++++ b/crates/zipp-vm/src/vm/instrument.rs
+@@ -404,6 +404,73 @@ fn heap_walk_stride_for(slots: usize) -> u32 {
+     }
+ }
+ 
++/// Which entry into the common runtime script compiler was observed.
++///
++/// IndirectEvalOrHost includes embedder eval and ShadowRealm; ZIPP does not
++/// identify these more narrowly at the shared compiler boundary.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum DynamicSourceKind {
++    DirectEval,
++    IndirectEvalOrHost,
++    FunctionConstructor,
++}
++
++/// One attempt to compile or reuse a runtime source. The exact bytes may be
++/// WTF-8 (including lone surrogate encodings), so do not assume UTF-8.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct DynamicSourceEvent {
++    pub kind: DynamicSourceKind,
++    pub source_bytes: Vec<u8>,
++}
++
++/// An opt-in diagnostic capture, separate from the algebraic instruction
++/// trace. Events are ordered by compiler entry, not by JS call completion.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct DynamicSourceCapture {
++    pub events: Vec<DynamicSourceEvent>,
++    /// At least one event was omitted due to the configured byte/event cap.
++    /// A truncated capture is not complete execution evidence.
++    pub truncated: bool,
++}
++
++struct DynamicSourceObserver {
++    captured: DynamicSourceCapture,
++    max_events: usize,
++    max_bytes: usize,
++    used_bytes: usize,
++}
++
++impl DynamicSourceObserver {
++    fn new(max_events: usize, max_bytes: usize) -> Self {
++        Self {
++            captured: DynamicSourceCapture {
++                events: Vec::new(),
++                truncated: false,
++            },
++            max_events,
++            max_bytes,
++            used_bytes: 0,
++        }
++    }
++
++    fn record(&mut self, kind: DynamicSourceKind, bytes: &[u8]) {
++        if self.captured.truncated {
++            return;
++        }
++        if self.captured.events.len() >= self.max_events
++            || bytes.len() > self.max_bytes.saturating_sub(self.used_bytes)
++        {
++            self.captured.truncated = true;
++            return;
++        }
++        self.used_bytes += bytes.len();
++        self.captured.events.push(DynamicSourceEvent {
++            kind,
++            source_bytes: bytes.to_vec(),
++        });
++    }
++}
++
+ /// Per-VM instrumentation state. Allocated only when a host asks for it.
+ pub(crate) struct Recorder {
+     /// Instructions the script may still execute, NOT counting any chunk
+@@ -496,6 +563,7 @@ pub(crate) struct Recorder {
+     dynamic_limits: DynamicCodeLimits,
+     dynamic_calls: usize,
+     dynamic_source_bytes: usize,
++    dynamic_source_observer: Option<DynamicSourceObserver>,
+     #[cfg(not(feature = "meter-only"))]
+     steps: Vec<TraceStep>,
+     /// Whether to record rows at all — metering works without tracing.
+@@ -621,6 +689,7 @@ impl Recorder {
+             dynamic_limits: DynamicCodeLimits::UNLIMITED,
+             dynamic_calls: 0,
+             dynamic_source_bytes: 0,
++            dynamic_source_observer: None,
+             #[cfg(not(feature = "meter-only"))]
+             steps: Vec::new(),
+             #[cfg(not(feature = "meter-only"))]
+@@ -862,6 +931,22 @@ impl Recorder {
+         self.dynamic_source_bytes = 0;
+     }
+ 
++    pub(crate) fn start_dynamic_source_capture(&mut self, max_events: usize, max_bytes: usize) {
++        self.dynamic_source_observer = Some(DynamicSourceObserver::new(max_events, max_bytes));
++    }
++
++    pub(crate) fn record_dynamic_source(&mut self, kind: DynamicSourceKind, source: &[u8]) {
++        if let Some(observer) = &mut self.dynamic_source_observer {
++            observer.record(kind, source);
++        }
++    }
++
++    pub(crate) fn take_dynamic_source_capture(&mut self) -> Option<DynamicSourceCapture> {
++        self.dynamic_source_observer
++            .take()
++            .map(|observer| observer.captured)
++    }
++
+     /// Charge a dynamic compilation attempt before parsing or compiler
+     /// allocation. Failed parses count too: otherwise a guest can repeatedly
+     /// spend parser work without consuming the lifetime allowance.
+@@ -1525,6 +1610,17 @@ impl super::Vm<'_> {
+         }
+     }
+ 
++    /// Observe exactly the bytes given to a runtime compilation attempt.
++    pub(crate) fn instrument_dynamic_source_attempt(
++        &mut self,
++        kind: DynamicSourceKind,
++        source: &[u8],
++    ) {
++        if let Some(rec) = rec_mut!(self) {
++            rec.record_dynamic_source(kind, source);
++        }
++    }
++
+     /// Charge one dynamic-code attempt before parsing begins.
+     pub(crate) fn instrument_dynamic_code_attempt(&mut self, source_bytes: usize) -> Tick {
+         match rec_mut!(self) {
+diff --git a/crates/zipp-vm/tests/dynamic_source_capture.rs b/crates/zipp-vm/tests/dynamic_source_capture.rs
+new file mode 100644
+index 0000000..371fafc
+--- /dev/null
++++ b/crates/zipp-vm/tests/dynamic_source_capture.rs
+@@ -0,0 +1,129 @@
++#![cfg(feature = "instrument")]
++
++use zipp_vm::embed::{compile_script, DynamicSourceKind};
++
++#[test]
++fn captures_original_eval_sources_without_guest_rewriting() {
++    let mut state = compile_script(
++        r#"
++        let x = 5;
++        let a = eval("x + 7");
++        let b = (0, eval)("8 + 9");
++        let f = new Function("v", "return v + 4;");
++        if (a !== 12 || b !== 17 || f(6) !== 10) throw Error("bad JS result");
++        "#,
++    )
++    .expect("compile original script");
++    state.set_limits(1_000_000, None);
++    state.start_dynamic_source_capture(10, 4096);
++    state.run_init().expect("run original script");
++    let capture = state
++        .take_dynamic_source_capture()
++        .expect("enabled observer");
++    assert!(!capture.truncated);
++    assert_eq!(capture.events.len(), 3);
++    assert_eq!(capture.events[0].kind, DynamicSourceKind::DirectEval);
++    assert_eq!(capture.events[0].source_bytes, b"x + 7");
++    assert_eq!(capture.events[1].kind, DynamicSourceKind::IndirectEvalOrHost);
++    assert_eq!(capture.events[1].source_bytes, b"8 + 9");
++    assert_eq!(capture.events[2].kind, DynamicSourceKind::FunctionConstructor);
++    assert!(String::from_utf8_lossy(&capture.events[2].source_bytes)
++        .contains("return v + 4;"));
++    assert!(state.take_dynamic_source_capture().is_none());
++}
++
++#[test]
++fn capture_is_bounded_and_reports_incompleteness() {
++    let mut state = compile_script(
++        r#"
++        for (let i = 0; i < 6; i++) eval("globalThis.n = " + i);
++        if (globalThis.n !== 5) throw Error("bad result");
++        "#,
++    )
++    .expect("compile original script");
++    state.set_limits(1_000_000, None);
++    state.start_dynamic_source_capture(2, 1024);
++    state.run_init().expect("complete guest script even when observer fills");
++    let capture = state.take_dynamic_source_capture().expect("capture");
++    assert_eq!(capture.events.len(), 2);
++    assert!(capture.truncated);
++}
++
++#[test]
++fn compile_attempt_not_successful_evaluation() {
++    let mut state = compile_script(
++        r#"
++        try { eval("var ???"); } catch (_) {}
++        eval(42);
++        try { eval("throw Error('whoops')"); } catch (_) {}
++        "#,
++    )
++    .expect("compile original script");
++    state.set_limits(1_000_000, None);
++    state.start_dynamic_source_capture(10, 4096);
++    state.run_init().expect("complete original script");
++    let capture = state.take_dynamic_source_capture().expect("capture");
++    assert!(!capture.truncated);
++    assert_eq!(capture.events.len(), 2, "non-string eval must not compile");
++    assert_eq!(capture.events[0].source_bytes, b"var ???");
++    assert_eq!(capture.events[1].source_bytes, b"throw Error('whoops')");
++}
++
++#[test]
++fn without_recorder_or_opt_in_no_sources_are_collected() {
++    let mut state = compile_script("eval('1+2');").expect("compile");
++    state.start_dynamic_source_capture(10, 100);
++    state.run_init().expect("run");
++    assert!(state.take_dynamic_source_capture().is_none());
++}
++
++#[test]
++fn nested_eval_preserves_compiler_entry_order() {
++    let mut state = compile_script(
++        "var D = '\"4 + 3\"'; if (eval(eval(D)) !== 7) throw Error('wrong');",
++    )
++    .expect("compile");
++    state.set_limits(1_000_000, None);
++    state.start_dynamic_source_capture(10, 1024);
++    state.run_init().expect("execute");
++    let capture = state.take_dynamic_source_capture().expect("capture");
++    assert!(!capture.truncated);
++    assert_eq!(capture.events.len(), 2);
++    assert_eq!(capture.events[0].kind, DynamicSourceKind::DirectEval);
++    assert_eq!(capture.events[0].source_bytes, b"\"4 + 3\"");
++    assert_eq!(capture.events[1].kind, DynamicSourceKind::DirectEval);
++    assert_eq!(capture.events[1].source_bytes, b"4 + 3");
++}
++
++#[test]
++fn cached_function_construction_is_still_observed_as_an_attempt() {
++    let mut state = compile_script(
++        r#"
++        for (let i = 0; i < 2; i++) {
++            const f = new Function("x", "return x * 2;");
++            if (f(i) !== i * 2) throw Error("wrong");
++        }
++        "#,
++    )
++    .expect("compile");
++    state.set_limits(1_000_000, None);
++    state.start_dynamic_source_capture(10, 8192);
++    state.run_init().expect("execute");
++    let capture = state.take_dynamic_source_capture().expect("capture");
++    assert!(!capture.truncated);
++    assert_eq!(capture.events.len(), 2);
++    assert_eq!(capture.events[0].kind, DynamicSourceKind::FunctionConstructor);
++    assert_eq!(capture.events[0].source_bytes, capture.events[1].source_bytes);
++}
++
++#[test]
++fn source_byte_cap_never_interrupts_guest_execution() {
++    let mut state =
++        compile_script("if (eval('21 + 21') !== 42) throw Error('wrong');").expect("compile");
++    state.set_limits(1_000_000, None);
++    state.start_dynamic_source_capture(10, 3);
++    state.run_init().expect("execute regardless of observer cap");
++    let capture = state.take_dynamic_source_capture().expect("capture");
++    assert!(capture.events.is_empty());
++    assert!(capture.truncated);
++}
+-- 
+2.56.0
+

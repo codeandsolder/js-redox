@@ -67,3 +67,13 @@ commit `041f280`. The old `patches/zipp-issue-93-entry-preheader.patch` is
 **historical for pre-fix ZIPP b7521d2 only**; don't apply it to current ZIPP.
 Node recovered the runtime source, while experimental ZIPP independently
 executed five captured generated function expressions with Node parity.
+
+## Native ZIPP dynamic-source capture pilot
+
+A separate engine-level observer now records bounded compiler-entry source
+bytes without rewriting guest JavaScript, including direct/indirect eval,
+Function constructors, nested eval and cache-hit attempts. Its diagnostic
+event stream has no source-correlated AST identity yet, so the Node v2/v3
+producer and native OXC importer remain the operative provenance pipeline.
+
+[Implementation, pinned ZIPP patch and proof boundaries](HOWTO-ZIPP-DYNAMIC-SOURCE-OBSERVER.md).
