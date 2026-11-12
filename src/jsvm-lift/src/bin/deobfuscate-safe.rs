@@ -1217,9 +1217,62 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_caller_views, run_source_tree, sha256_hex, CallerViewsArgs, SourceTreeArgs};
+    use super::{
+        run_caller_views, run_source_tree, sha256_hex, Args, CallerViewsArgs, Command,
+        SourceTreeArgs,
+    };
     use anyhow::Result;
-    use std::fs;
+    use clap::Parser;
+    use std::{fs, path::PathBuf};
+
+    #[test]
+    fn source_tree_cli_accepts_repeated_three_path_observed_eval_groups() -> Result<()> {
+        let parsed = Args::try_parse_from([
+            "deobfuscate-safe",
+            "source-tree",
+            "handlers",
+            "readable",
+            "--observed-eval",
+            "first",
+            "outer-1.js",
+            "inner-1.js",
+            "--observed-eval",
+            "second",
+            "outer-2.js",
+            "inner-2.js",
+        ])?;
+        let Command::SourceTree(source_tree) = parsed.command else {
+            anyhow::bail!("source-tree subcommand not selected");
+        };
+        assert_eq!(
+            source_tree.observed_eval,
+            [
+                "first",
+                "outer-1.js",
+                "inner-1.js",
+                "second",
+                "outer-2.js",
+                "inner-2.js",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>()
+        );
+        assert!(
+            Args::try_parse_from([
+                "deobfuscate-safe",
+                "source-tree",
+                "handlers",
+                "readable",
+                "--observed-eval",
+                "first",
+                "outer-1.js"
+            ])
+            .is_err(),
+            "missing third source-layer path must be refused"
+        );
+        Ok(())
+    }
 
     #[test]
     fn standalone_caller_views_trace_immutable_aliases_without_source_tree() -> Result<()> {
