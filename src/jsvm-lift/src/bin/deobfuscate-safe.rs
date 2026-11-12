@@ -1638,8 +1638,7 @@ mod tests {
             fs::read_to_string(lexical.join("original.js"))?,
             original_source
         );
-        assert!(fs::read_to_string(output.join("handler.js"))?
-            .contains("guarded(J, 1, Y, H)"));
+        assert!(fs::read_to_string(output.join("handler.js"))?.contains("guarded(J, 1, Y, H)"));
         Ok(())
     }
 
