@@ -409,7 +409,7 @@ mod tests {
         let output = rewritten(input)?;
         assert!(output.contains("eval('var marker=5')"), "{output}");
         assert!(output.contains("(o.value);"), "{output}");
-        assert!(output.contains("if (flag)"), "{output}");
+        assert!(output.contains("if(flag)"), "{output}");
         assert!(output.contains("return marker"), "{output}");
         Ok(())
     }
@@ -442,7 +442,7 @@ mod tests {
         let input = "function f(flag){if((ping(),flag))/*branch note*/act();if((ping()/*operand note*/,flag))other();}";
         let output = rewritten(input)?;
         assert!(output.contains("/*branch note*/"), "{output}");
-        assert!(output.contains("if (flag)/*branch note*/act()"), "{output}");
+        assert!(output.contains("if(flag)/*branch note*/act()"), "{output}");
         assert!(
             output.contains("if((ping()/*operand note*/,flag))"),
             "{output}"

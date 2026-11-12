@@ -413,6 +413,16 @@ without those proofs stay untouched.
 This is an analyst projection only; the executable/proof-checked source
 tree is always kept separate.
 
+For helpers with at least eight structurally nested calls, the optional
+`lexical-context/call-spines/` Markdown views identify the deepest AST call
+chain, its original helper line/byte offsets, and which enclosing argument
+contains each nested call. This makes enormous registration expressions
+navigable without inventing an equivalent sequence of statements. The list
+describes **syntax nesting**, not execution order: short-circuit guards,
+argument evaluation, computed keys, callback boundaries and JavaScript
+receiver identity remain governed by the linked helper source. No source
+files or captured bytes are changed by these outlines.
+
 For mutable computed-property aliases, the `lexical-context/explained/`
 views retain executable property expressions and annotate them with their
 **actual** lexical string assignments and conditional overrides. For example,

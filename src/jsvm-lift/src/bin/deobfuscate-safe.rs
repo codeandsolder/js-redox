@@ -8,6 +8,7 @@ use jsvm_lift::{
     safe_deob::{deobfuscate_source, SourceMode},
     sha256_hex,
     source_tree_aliases::{explain_captured_handler_origins, explain_property_aliases},
+    source_tree_call_spines::deepest_call_spine,
     source_tree_callflow::{reconstruct_caller_views, CallerView},
     source_tree_context::{
         annotate_handler_helper_calls_with_specializations, reconstruct_context,
@@ -420,6 +421,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
              and show assignment values and branch conditions instead of guessing.\n\n",
         );
         let mut helper_rows = Vec::new();
+        let mut call_spine_rows = Vec::new();
         let mut helper_index = String::from("# Actual lexical helper implementations\n\n");
         helper_index.push_str("These definitions come from the supplied original program. ");
         helper_index.push_str(
@@ -493,6 +495,15 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                     .or_default() += rewritten_loops;
             }
             fs::write(folder.join(relative), &code)?;
+            if let Some(outline) = deepest_call_spine(&code, relative) {
+                let stem = relative
+                    .trim_start_matches("helpers/")
+                    .trim_end_matches(".js");
+                let outline_path = format!("call-spines/{stem}.md");
+                fs::create_dir_all(folder.join("call-spines"))?;
+                fs::write(folder.join(&outline_path), outline)?;
+                call_spine_rows.push((helper.name.clone(), outline_path));
+            }
             // Annotate references only where the helper's *own* AST resolves
             // the property key to the same symbol as its prior assignments.
             // Never join independent functions by spelling (T, JM, etc.).
@@ -539,6 +550,29 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "transforms": transforms,
                 "error": error,
             }));
+        }
+        if !call_spine_rows.is_empty() {
+            let mut index = String::from(
+                "# Deep nested call structure\n\n\
+                 These are structural AST navigation aids, not executable \
+                 rewrites or runtime traces. Click through to the readable \
+                 original helper for conditional evaluation and receiver semantics.\n\n",
+            );
+            for (name, path) in &call_spine_rows {
+                index.push_str(&format!(
+                    "- [{name}]({})\n",
+                    path.trim_start_matches("call-spines/")
+                ));
+            }
+            fs::write(folder.join("call-spines/README.md"), index)?;
+            helper_index.push_str(
+                "\n[Browse deeply nested helper call structures](call-spines/README.md).\n",
+            );
+            md.push_str(
+                "\n## Deep original-helper call nesting\n\n\
+                 [Browse structural call outlines](lexical-context/call-spines/README.md). \
+                 These are AST maps, not runtime execution orders.\n\n",
+            );
         }
         if !explained_rows.is_empty() {
             fs::write(folder.join("explained/README.md"), explained_index)?;
@@ -1755,6 +1789,54 @@ mod tests {
         assert!(
             fs::read_to_string(output.join("handler.js"))?.contains("initialize(Q, true)"),
             "original executable call must still be present"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_links_deep_original_helper_call_nesting() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let original_source =
+            "function root(){const stack=function(x){return a(b(c(d(e(f(g(h(x))))))));};}";
+        fs::write(&original, original_source)?;
+        let handler = "const capturedHandler=function(x){return stack(x);};";
+        fs::write(input.join("handler.js"), handler)?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let folder = output.join("lexical-context");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(folder.join("context.json"))?)?;
+        let helper = metadata["helpers"][0]["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing helper path"))?;
+        let stem = std::path::Path::new(helper)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow::anyhow!("missing helper stem"))?;
+        let spine = fs::read_to_string(folder.join(format!("call-spines/{stem}.md")))?;
+        assert!(spine.contains("| 8 | `h`"), "{spine}");
+        assert!(spine.contains("argument 1"), "{spine}");
+        assert!(fs::read_to_string(folder.join("call-spines/README.md"))?.contains(stem));
+        assert!(fs::read_to_string(output.join("README.md"))?
+            .contains("lexical-context/call-spines/README.md"));
+        assert_eq!(
+            fs::read_to_string(folder.join("original.js"))?,
+            original_source
+        );
+        assert!(
+            fs::read_to_string(output.join("handler.js"))?.contains("stack(x)"),
+            "the original helper call must remain in the executable tree"
         );
         Ok(())
     }

@@ -55,6 +55,7 @@ pub mod safe_deob;
 pub mod source_graph;
 pub mod source_materialize;
 pub mod source_tree_aliases;
+pub mod source_tree_call_spines;
 pub mod source_tree_callflow;
 pub mod source_tree_context;
 pub mod source_tree_inline;
