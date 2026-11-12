@@ -258,9 +258,9 @@ fn join_output_reader(
 ///
 /// # Errors
 ///
-/// Returns CommandRunError::Budget if the work budget is exhausted or
-/// cancelled, CommandRunError::Spawn if process creation fails, and
-/// CommandRunError::Output if output pipes or reader threads fail.
+/// Returns `CommandRunError::Budget` if the work budget is exhausted or
+/// cancelled, `CommandRunError::Spawn` if process creation fails, and
+/// `CommandRunError::Output` if output pipes or reader threads fail.
 pub fn run_command(command: &mut Command, budget: &WorkBudget) -> Result<Output, CommandRunError> {
     budget.checkpoint().map_err(CommandRunError::Budget)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -458,7 +458,7 @@ impl WorkBudget {
     ///
     /// # Errors
     ///
-    /// Returns BudgetExceeded if this scope or any ancestor is cancelled
+    /// Returns `BudgetExceeded` if this scope or any ancestor is cancelled
     /// or exceeds its deadline/work limit.
     pub fn checkpoint(&self) -> Result<(), BudgetExceeded> {
         let now = Instant::now();
@@ -477,7 +477,7 @@ impl WorkBudget {
     ///
     /// # Errors
     ///
-    /// Returns BudgetExceeded when any scope has insufficient work allowance
+    /// Returns `BudgetExceeded` when any scope has insufficient work allowance
     /// or is cancelled/deadline-exceeded; no work is charged on failure.
     pub fn consume(&self, units: u64) -> Result<(), BudgetExceeded> {
         let _guard = self
@@ -594,6 +594,12 @@ impl BudgetPoller {
         true
     }
 
+    /// Finish the polling interval and check the underlying budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns on an earlier budget failure or when the final checkpoint
+    /// detects a cancelled or exhausted budget.
     pub fn finish(&mut self) -> Result<(), BudgetExceeded> {
         if let Some(error) = self.error.clone() {
             return Err(error);
