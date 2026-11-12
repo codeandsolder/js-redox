@@ -1,7 +1,9 @@
 //! Symbol-resolved terminal return dataflow in original lexical helper views.
 //!
-//! A return temporary whose only references are the assignments feeding its
-//! terminal return can be eliminated, even across a simple labeled join.
+//! A function-owned return temporary can be eliminated at a terminal store
+//! when no escaped closure, dynamic scope, or argument alias can observe it.
+//! Earlier local reads and writes remain intact; branch joins are handled
+//! without assuming the temporary was otherwise unused.
 //! This is an analyst-only source view, never a rewrite of captured executable
 //! reconstruction. Never infer values from spelling alone.
 use anyhow::Result;
@@ -42,6 +44,35 @@ impl<'a> Visit<'a> for DynamicScope {
 
     fn visit_with_statement(&mut self, _: &WithStatement<'a>) {
         self.present = true;
+    }
+}
+
+/// References from nested functions can observe a terminal store after
+/// the enclosing function returns, so a captured binding is never inlined.
+struct CapturedBinding<'s> {
+    scoping: &'s Scoping,
+    symbol: SymbolId,
+    nested_functions: usize,
+    captured: bool,
+}
+
+impl<'a> Visit<'a> for CapturedBinding<'_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        self.nested_functions += 1;
+        walk::walk_function(self, function, flags);
+        self.nested_functions -= 1;
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        self.nested_functions += 1;
+        walk::walk_arrow_function_expression(self, arrow);
+        self.nested_functions -= 1;
+    }
+
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        if self.nested_functions > 0 && binding(self.scoping, id) == Some(self.symbol) {
+            self.captured = true;
+        }
     }
 }
 
@@ -105,15 +136,7 @@ struct ReturnFlow<'s> {
 impl ReturnFlow<'_> {
     /// Recover both edges of a labeled branch join, preserving the original
     /// condition, intervening effects and lexical block scope.
-    fn labeled_join(
-        &self,
-        statement: &Statement<'_>,
-        symbol: SymbolId,
-        reference_count: usize,
-    ) -> Option<String> {
-        if reference_count != 3 {
-            return None;
-        }
+    fn labeled_join(&self, statement: &Statement<'_>, symbol: SymbolId) -> Option<String> {
         let Statement::LabeledStatement(label) = statement else {
             return None;
         };
@@ -206,7 +229,19 @@ impl ReturnFlow<'_> {
         if self.function_scope != Some(self.scoping.symbol_scope_id(symbol)) {
             return;
         }
-        let reference_count = self.scoping.get_resolved_reference_ids(symbol).len();
+        // Earlier reads and writes have already executed before the terminal
+        // store, so only future observers matter. An escaped closure could
+        // still read that variable after this function returns.
+        let mut capture = CapturedBinding {
+            scoping: self.scoping,
+            symbol,
+            nested_functions: 0,
+            captured: false,
+        };
+        capture.visit_function_body(body);
+        if capture.captured {
+            return;
+        }
         let Some(before) = statements.get(statements.len().saturating_sub(2)) else {
             return;
         };
@@ -215,7 +250,7 @@ impl ReturnFlow<'_> {
         };
 
         if let Some((target, rhs)) = assignment(before) {
-            if binding(self.scoping, target) == Some(symbol) && reference_count == 2 {
+            if binding(self.scoping, target) == Some(symbol) {
                 if let Some(expr) = snippet(self.source, rhs.span()) {
                     self.edits.push(Candidate {
                         span: Span::new(before.span().start, return_statement.span().end),
@@ -227,7 +262,7 @@ impl ReturnFlow<'_> {
             return;
         }
 
-        if let Some(replacement) = self.labeled_join(before, symbol, reference_count) {
+        if let Some(replacement) = self.labeled_join(before, symbol) {
             self.edits.push(Candidate {
                 span: Span::new(before.span().start, return_statement.span().end),
                 replacement,
@@ -247,9 +282,6 @@ impl ReturnFlow<'_> {
         // join. Otherwise keep the original terminal return as the false
         // path's value (especially relevant for formal parameters).
         if let Some(alternate) = branch.alternate.as_ref() {
-            if reference_count != 3 {
-                return;
-            }
             let (Some(yes), Some(no)) = (
                 self.branch_value(&branch.consequent, symbol),
                 self.branch_value(alternate, symbol),
@@ -272,18 +304,18 @@ impl ReturnFlow<'_> {
             return;
         }
 
-        let new_consequent = if reference_count == 2 {
-            self.branch_value(&branch.consequent, symbol)
-                .and_then(|value| snippet(self.source, value.span()))
-                .map(|value| format!("return ({value});"))
-        } else {
-            let labeled = match &branch.consequent {
-                Statement::LabeledStatement(_) => Some(&branch.consequent),
-                Statement::BlockStatement(block) if block.body.len() == 1 => block.body.first(),
-                _ => None,
-            };
-            labeled.and_then(|stmt| self.labeled_join(stmt, symbol, reference_count))
-        };
+        let new_consequent = self
+            .branch_value(&branch.consequent, symbol)
+            .and_then(|value| snippet(self.source, value.span()))
+            .map(|value| format!("return ({value});"))
+            .or_else(|| {
+                let labeled = match &branch.consequent {
+                    Statement::LabeledStatement(_) => Some(&branch.consequent),
+                    Statement::BlockStatement(block) if block.body.len() == 1 => block.body.first(),
+                    _ => None,
+                };
+                labeled.and_then(|stmt| self.labeled_join(stmt, symbol))
+            });
         if let Some(consequent) = new_consequent {
             self.edits.push(Candidate {
                 span: before.span(),
@@ -423,13 +455,54 @@ mod tests {
             "function f(q){const a=arguments;q=2;return q;}",
             "function f(q){eval('q=9');q=2;return q;}",
             "function f(q){with({}){}q=2;return q;}",
-            "function f(q){q++;q=2;return q;}",
             "function f(q){q=2;return arguments[0];}",
         ];
         for src in unsafe_cases {
             let out = recover_terminal_returns(src)?;
             assert_eq!(out.source, src, "{src} -> {}", out.source);
             assert_eq!(out.adjacent_returns, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_store_is_dead_after_earlier_reads_and_writes() -> Result<()> {
+        for (source, expected_kind) in [
+            ("function f(q){q++;q=2;return q;}", "adjacent"),
+            ("function f(q){log(q);q=3;return q;}", "adjacent"),
+            ("function f(q,x){q=3;if(x)q=touch(q);return q;}", "guarded"),
+            (
+                "function f(q,x){q=3;if(x){q=left(q);}else{q=right(q);}return q;}",
+                "guarded",
+            ),
+            (
+                "function f(q,x){q++;a:{if(x){q=left(q);break a;}q=right(q);}return q;}",
+                "labeled",
+            ),
+        ] {
+            let out = recover_terminal_returns(source)?;
+            let count = match expected_kind {
+                "adjacent" => out.adjacent_returns,
+                "guarded" => out.guarded_joins,
+                "labeled" => out.labeled_joins,
+                _ => unreachable!(),
+            };
+            assert_eq!(count, 1, "{source}: {}", out.source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn closure_capture_keeps_terminal_assignments_observable() -> Result<()> {
+        for source in [
+            "function f(q){const g=function(){return q;};q=3;return q;}",
+            "function f(q){const g=()=>()=>q;q=3;return q;}",
+            "function f(q){const obj={get x(){return q;}};q=3;return q;}",
+            "function f(q,x){const obj={m(){return q;}};if(x){q=left();}return q;}",
+            "function f(q,x){const g=(x=q)=>x;if(x){q=left();}return q;}",
+        ] {
+            let out = recover_terminal_returns(source)?;
+            assert_eq!(out.source, source, "{source}: {}", out.source);
         }
         Ok(())
     }

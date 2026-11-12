@@ -1604,7 +1604,7 @@ mod tests {
         let output = temp.path().join("readable");
         let original = temp.path().join("original.js");
         fs::create_dir_all(&input)?;
-        let original_source = "function root(){const guarded=function(J,Q,Y,H){if((Q&3)==1){a:{if(J.Y){H=w8(J,J.D);break a;}H=Y;}}return H;};}";
+        let original_source = "function root(){const guarded=function(J,Q,Y,H){H=seed(J);if((Q&3)==1){a:{if(J.Y){H=w8(J,J.D);break a;}H=Y;}}return H;};}";
         fs::write(&original, original_source)?;
         fs::write(
             input.join("handler.js"),
@@ -1630,6 +1630,7 @@ mod tests {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("helper view path missing"))?;
         let recovered = fs::read_to_string(lexical.join(path))?;
+        assert!(recovered.contains("seed(J)"), "{recovered}");
         assert!(recovered.contains("return w8(J, J.D)"), "{recovered}");
         assert!(recovered.contains("return Y"), "{recovered}");
         assert!(recovered.contains("return H"), "{recovered}");

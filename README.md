@@ -555,8 +555,11 @@ prevent the rewrite. A second run of the existing proof-oriented static
 deobfuscator then folds dead conditions and redundant blocks exposed by
 that structural change (for example, a specialized `if (false)` branch).
 The source-backed helper views also recover direct values from terminal
-return temporaries. When Oxc proves a temporary has no other references,
-`temp = value; return temp` becomes `return value`. The same symbol-resolved
+return temporaries. An assignment immediately feeding a return can become
+a direct return even when the function previously read or wrote that
+variable: those earlier effects remain in place. Oxc verifies that the
+binding belongs to the function being rewritten and that no nested
+closure can observe its terminal write. The same symbol-resolved
 dataflow applies to labeled branch joins, conditional assignments with a
 fallback return, and complete `if/else` joins. An outer guard may enclose a
 labeled join: the result is returned directly only when that guard executes,
