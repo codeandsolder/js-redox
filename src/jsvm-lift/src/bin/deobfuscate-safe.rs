@@ -1974,6 +1974,50 @@ mod tests {
     }
 
     #[test]
+    fn source_tree_reflows_truthy_guarded_break_without_dropping_test_effects() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let original_source = "function root(){const guardedLoop=function(Q){while('X')if((trace(Q),{}))break;return Q;};}";
+        fs::write(&original, original_source)?;
+        fs::write(
+            input.join("handler.js"),
+            "const capturedHandler=function(Q){return guardedLoop(Q);};",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let lexical = output.join("lexical-context");
+        let context: serde_json::Value =
+            serde_json::from_slice(&fs::read(lexical.join("context.json"))?)?;
+        let row = &context["helpers"][0];
+        assert_eq!(row["name"], "guardedLoop");
+        assert_eq!(row["single_trip_loops_reflowed"], 1, "{row}");
+        assert!(row["post_reflow_error"].is_null(), "{row}");
+        let path = row["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("helper view path missing"))?;
+        let recovered = fs::read_to_string(lexical.join(path))?;
+        assert!(!recovered.contains("while"), "{recovered}");
+        assert!(recovered.contains("trace(Q)"), "{recovered}");
+        assert!(recovered.contains("return Q"), "{recovered}");
+        assert_eq!(
+            fs::read_to_string(lexical.join("original.js"))?,
+            original_source
+        );
+        assert!(fs::read_to_string(output.join("handler.js"))?.contains("guardedLoop(Q)"));
+        Ok(())
+    }
+
+    #[test]
     fn source_tree_recovers_guarded_return_joins_from_original_helper() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let input = temp.path().join("source");

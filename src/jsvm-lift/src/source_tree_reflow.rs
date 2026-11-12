@@ -1,14 +1,16 @@
 //! Reduce syntactic single-trip loops in analyst-only specialized helpers.
 //!
-//! A loop whose block ends in an unconditional, unlabelled break can execute
-//! its body at most once, unless an earlier branch continues that same loop.
-//! Preserve the initialization and condition, but eliminate the unreachable
-//! update and the loop control frame. The original helper remains available.
+//! A loop whose body terminates with an unlabelled break (either directly
+//! or under a provably truthy guard) can execute at most once, unless an
+//! earlier branch continues that same loop. Preserve the initialization,
+//! condition, and evaluation effects of guarded breaks while eliminating
+//! unreachable updates and the loop control frame. Original source is retained.
 use anyhow::Result;
+use jsvm_safe_core::known_static_bool_with_resolver;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    ArrowFunctionExpression, BreakStatement, DoWhileStatement, ForInStatement, ForOfStatement,
-    ForStatement, Function, Statement, SwitchStatement, WhileStatement,
+    ArrowFunctionExpression, BreakStatement, DoWhileStatement, Expression, ForInStatement,
+    ForOfStatement, ForStatement, Function, Statement, SwitchStatement, WhileStatement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::SemanticBuilder;
@@ -97,24 +99,63 @@ impl<'a> Visit<'a> for Escapes {
     fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
 }
 
-fn single_trip_body<'a>(body: &'a Statement<'a>, source: &'a str) -> Option<&'a str> {
-    let Statement::BlockStatement(block) = body else {
+/// A sequence's earlier expressions can be effectful, but its final value
+/// determines whether the break is taken. Never evaluate or discard them
+/// speculatively: the rewrite emits the full original test as a statement.
+fn truthy_after_effects(test: &Expression<'_>) -> bool {
+    match test {
+        Expression::ParenthesizedExpression(paren) => truthy_after_effects(&paren.expression),
+        Expression::SequenceExpression(sequence) => sequence
+            .expressions
+            .last()
+            .is_some_and(truthy_after_effects),
+        other => known_static_bool_with_resolver(other, &|_| None) == Some(true),
+    }
+}
+
+fn unlabelled_break(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::BreakStatement(brk) => brk.label.is_none(),
+        Statement::BlockStatement(block) if block.body.len() == 1 => {
+            block.body.first().is_some_and(unlabelled_break)
+        }
+        _ => false,
+    }
+}
+
+/// The final guard may itself evaluate side effects before a provably truthy
+/// value. Preserve the complete test expression in the rewritten first trip.
+fn terminal_guard_test<'a>(statement: &'a Statement<'a>) -> Option<&'a Expression<'a>> {
+    let Statement::IfStatement(guard) = statement else {
         return None;
     };
-    let Some(Statement::BreakStatement(brk)) = block.body.last() else {
-        return None;
+    (unlabelled_break(&guard.consequent) && truthy_after_effects(&guard.test))
+        .then_some(&guard.test)
+}
+
+fn single_trip_body(body: &Statement<'_>, source: &str) -> Option<String> {
+    let (prefix, terminal) = if let Statement::BlockStatement(block) = body {
+        let last = block.body.last()?;
+        let mut escapes = Escapes::default();
+        for stmt in &block.body[..block.body.len() - 1] {
+            escapes.visit_statement(stmt);
+        }
+        if escapes.invalid {
+            return None;
+        }
+        (
+            source.get(block.span.start as usize + 1..last.span().start as usize)?,
+            last,
+        )
+    } else {
+        ("", body)
     };
-    if brk.label.is_some() {
-        return None;
+    if unlabelled_break(terminal) {
+        return Some(prefix.to_owned());
     }
-    let mut escapes = Escapes::default();
-    for stmt in &block.body[..block.body.len() - 1] {
-        escapes.visit_statement(stmt);
-    }
-    if escapes.invalid {
-        return None;
-    }
-    source.get(block.span.start as usize + 1..brk.span.start as usize)
+    let test = terminal_guard_test(terminal)?;
+    let test_source = source.get(test.span().start as usize..test.span().end as usize)?;
+    Some(format!("{prefix} ({test_source});"))
 }
 
 struct LoopCandidate<'s> {
@@ -278,6 +319,71 @@ mod tests {
         assert_eq!(out.rewritten_loops, 2);
         assert!(out.source.contains("if (check(x))"), "{}", out.source);
         assert!(!out.source.contains("shouldNotRun()"), "{}", out.source);
+        Ok(())
+    }
+
+    #[test]
+    fn reflows_effectful_but_truthy_guarded_breaks() -> Result<()> {
+        let source = r#"function f(){
+            while ({}) if ((trace.push("while"), {})) break;
+            while ("X") if ((trace.push("again"), true)) {break;}
+            for (init(); enabled(); update()) {
+                trace.push("prefix");
+                if ((trace.push("guard"), [])) break;
+            }
+            do if ((trace.push("do"), {})) break; while (never());
+        }"#;
+        let out = reflow_single_trip_loops(source)?;
+        assert_eq!(out.rewritten_loops, 4, "{}", out.source);
+        assert!(!out.source.contains("while ("), "{}", out.source);
+        assert!(!out.source.contains("update()"), "{}", out.source);
+        assert!(!out.source.contains("never()"), "{}", out.source);
+        for preserved in [
+            "trace.push(\"while\")",
+            "trace.push(\"again\")",
+            "trace.push(\"prefix\")",
+            "trace.push(\"guard\")",
+            "trace.push(\"do\")",
+            "init()",
+            "enabled()",
+        ] {
+            assert!(
+                out.source.contains(preserved),
+                "{preserved}: {}",
+                out.source
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn does_not_assume_effectful_or_false_guards_are_truthy() -> Result<()> {
+        for source in [
+            "function f(x){while('X')if(x)break;}",
+            "function f(){while('X')if((effect(),false))break;}",
+            "function f(){while('X')if((effect(),unknown))break;}",
+            "function f(){while('X')if((effect(),{get prop(){return 3;}}))break;}",
+            "function f(){while('X'){if(x)break;}}",
+            "function f(){while('X'){if((effect(),{}))continue;}}",
+            "function f(){while('X'){if((effect(),{}))break outer;}}",
+        ] {
+            let out = reflow_single_trip_loops(source)?;
+            assert_eq!(out.rewritten_loops, 0, "{source}: {}", out.source);
+            assert_eq!(out.source, source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn one_trip_guarded_break_rejects_outer_loop_escapes() -> Result<()> {
+        for source in [
+            "function f(x){outer:while(x){if(x)continue outer;if((tick(),{}))break;}}",
+            "function f(x){while(x){if(x)continue;if((tick(),{}))break;}}",
+            "function f(x){while(x){if(x)break;if((tick(),{}))break;}}",
+        ] {
+            let out = reflow_single_trip_loops(source)?;
+            assert_eq!(out.rewritten_loops, 0, "{source}: {}", out.source);
+        }
         Ok(())
     }
 
