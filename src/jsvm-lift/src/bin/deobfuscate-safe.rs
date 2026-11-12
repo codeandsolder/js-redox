@@ -8,7 +8,7 @@ use jsvm_lift::{
     safe_deob::{deobfuscate_source, SourceMode},
     sha256_hex,
     source_tree_aliases::{explain_captured_handler_origins, explain_property_aliases},
-    source_tree_call_spines::deepest_call_spine,
+    source_tree_call_spines::deepest_call_view,
     source_tree_callflow::{reconstruct_caller_views, CallerView},
     source_tree_context::{
         annotate_handler_helper_calls_with_specializations, reconstruct_context,
@@ -495,14 +495,17 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                     .or_default() += rewritten_loops;
             }
             fs::write(folder.join(relative), &code)?;
-            if let Some(outline) = deepest_call_spine(&code, relative) {
+            if let Some(view) = deepest_call_view(&code, relative) {
                 let stem = relative
                     .trim_start_matches("helpers/")
                     .trim_end_matches(".js");
                 let outline_path = format!("call-spines/{stem}.md");
+                let layout_path = format!("call-layouts/{stem}.js");
                 fs::create_dir_all(folder.join("call-spines"))?;
-                fs::write(folder.join(&outline_path), outline)?;
-                call_spine_rows.push((helper.name.clone(), outline_path));
+                fs::create_dir_all(folder.join("call-layouts"))?;
+                fs::write(folder.join(&outline_path), view.markdown)?;
+                fs::write(folder.join(&layout_path), view.layout)?;
+                call_spine_rows.push((helper.name.clone(), outline_path, layout_path));
             }
             // Annotate references only where the helper's *own* AST resolves
             // the property key to the same symbol as its prior assignments.
@@ -558,9 +561,9 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                  rewrites or runtime traces. Click through to the readable \
                  original helper for conditional evaluation and receiver semantics.\n\n",
             );
-            for (name, path) in &call_spine_rows {
+            for (name, path, layout_path) in &call_spine_rows {
                 index.push_str(&format!(
-                    "- [{name}]({})\n",
+                    "- [{name}]({}) — [source layout](../{layout_path})\n",
                     path.trim_start_matches("call-spines/")
                 ));
             }
@@ -1827,6 +1830,9 @@ mod tests {
         let spine = fs::read_to_string(folder.join(format!("call-spines/{stem}.md")))?;
         assert!(spine.contains("| 8 | `h`"), "{spine}");
         assert!(spine.contains("argument 1"), "{spine}");
+        let layout = fs::read_to_string(folder.join(format!("call-layouts/{stem}.js")))?;
+        assert!(layout.lines().count() > 10, "{layout}");
+        assert!(spine.contains(&format!("../call-layouts/{stem}.js")));
         assert!(fs::read_to_string(folder.join("call-spines/README.md"))?.contains(stem));
         assert!(fs::read_to_string(output.join("README.md"))?
             .contains("lexical-context/call-spines/README.md"));

@@ -6,11 +6,22 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{ArrowFunctionExpression, CallExpression, Function};
 use oxc_ast_visit::{walk, Visit};
+use oxc_codegen::Codegen;
 use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::scope::ScopeFlags;
 use rolldown_redox::ecmascript::parse_program;
+use std::collections::BTreeMap;
 
 const MIN_DEPTH: usize = 8;
+const MAX_INDENT_DEPTH: usize = 18;
+
+/// Independent, non-executable navigation projections of the same original
+/// lexical helper. The layout only inserts whitespace between AST tokens.
+#[derive(Default)]
+pub struct DeepCallView {
+    pub markdown: String,
+    pub layout: String,
+}
 
 struct Call {
     span: Span,
@@ -92,7 +103,7 @@ fn label(raw: &str) -> String {
 /// The deepest call ancestry in a parsed helper. Only sufficiently deep
 /// chains get a Markdown sidecar, never replacing source or implying that
 /// nested calls are unconditional or execute in the printed order.
-pub fn deepest_call_spine(source: &str, helper_path: &str) -> Option<String> {
+pub fn deepest_call_view(source: &str, helper_path: &str) -> Option<DeepCallView> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::unambiguous());
     if !parsed.is_clean() {
@@ -118,10 +129,65 @@ pub fn deepest_call_spine(source: &str, helper_path: &str) -> Option<String> {
         cursor = collector.calls[index].parent;
     }
     path.reverse();
+    // Insert whitespace only at parsed argument boundaries or immediately
+    // before a call's closing paren. In particular, never rewrite callee
+    // expressions, so direct eval and receiver identity remain unchanged.
+    let mut breaks = BTreeMap::<usize, usize>::new();
+    for &index in &path {
+        let call = &collector.calls[index];
+        if call.argument_spans.is_empty() {
+            continue;
+        }
+        let end = usize::try_from(call.span.end).ok()?;
+        let close = end.checked_sub(1)?;
+        if source.as_bytes().get(close) != Some(&b')') {
+            return None;
+        }
+        let depth = call.nesting.min(MAX_INDENT_DEPTH);
+        for argument in &call.argument_spans {
+            let start = usize::try_from(argument.start).ok()?;
+            if !source.is_char_boundary(start) {
+                return None;
+            }
+            breaks
+                .entry(start)
+                .and_modify(|d| *d = (*d).max(depth))
+                .or_insert(depth);
+        }
+        breaks
+            .entry(close)
+            .and_modify(|d| *d = (*d).max(depth.saturating_sub(1)))
+            .or_insert(depth.saturating_sub(1));
+    }
+    let mut layout = String::with_capacity(source.len() + breaks.len() * 40);
+    let mut previous = 0;
+    for (position, depth) in breaks {
+        layout.push_str(source.get(previous..position)?);
+        layout.push('\n');
+        layout.push_str(&"  ".repeat(depth));
+        previous = position;
+    }
+    layout.push_str(source.get(previous..)?);
+    // Formatting is analyst-only, but it still must parse identically. The
+    // source bytes are all retained; reject unexpected lexical consequences.
+    let layout_arena = Allocator::default();
+    let layout_parsed = parse_program(&layout_arena, &layout, SourceType::unambiguous());
+    if !layout_parsed.is_clean()
+        || Codegen::new().build(&parsed.program).code
+            != Codegen::new().build(&layout_parsed.program).code
+    {
+        return None;
+    }
+    let layout_path = helper_path.trim_start_matches("helpers/");
     let mut markdown = format!(
         r"# Deep call nesting — {helper_path}
 
-[Open the readable lexical helper](../{helper_path}). This is the
+[Open the readable lexical helper](../{helper_path}) or
+[view its whitespace-only nested-call layout](../call-layouts/{layout_path}).
+Both preserve the original tokens; the layout is an analyst view, not the
+original executable or a valid replacement for byte-sensitive JavaScript.
+
+This is the
 **deepest AST call-containment chain**, not an execution trace or a
 suggested rewrite. Calls inside separate callback functions start
 independent chains. Conditions, argument evaluation, computed
@@ -147,35 +213,55 @@ in the original JavaScript. Byte ranges refer to that readable helper.
             call.span.end,
         ));
     }
-    Some(markdown)
+    Some(DeepCallView { markdown, layout })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::deepest_call_spine;
+    use super::deepest_call_view;
 
     #[test]
     fn shows_deep_argument_chain_with_exact_offsets() {
         let source = "function f(){return a(b(c(d(e(f(g(h(1))))))));}";
-        let outline = deepest_call_spine(source, "helpers/f.js");
+        let outline = deepest_call_view(source, "helpers/f.js");
         assert!(outline.is_some());
-        let outline = outline.unwrap_or_default();
-        assert!(outline.contains("| 8 | `h`"), "{outline}");
-        assert!(outline.contains("argument 1"), "{outline}");
-        assert!(outline.contains("bytes "), "{outline}");
-        assert!(outline.contains("../helpers/f.js"), "{outline}");
+        let view = outline.unwrap_or_default();
+        assert!(view.markdown.contains("| 8 | `h`"), "{}", view.markdown);
+        assert!(view.markdown.contains("argument 1"), "{}", view.markdown);
+        assert!(view.markdown.contains("bytes "), "{}", view.markdown);
+        assert!(
+            view.markdown.contains("../helpers/f.js"),
+            "{}",
+            view.markdown
+        );
+        assert!(
+            view.markdown.contains("../call-layouts/f.js"),
+            "{}",
+            view.markdown
+        );
+        assert!(view.layout.lines().count() > 10, "{}", view.layout);
+        assert_eq!(
+            source
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>(),
+            view.layout
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>(),
+        );
     }
 
     #[test]
     fn does_not_join_calls_across_callback_function_boundaries() {
         let source =
             "function f(){return outer(inner(function(){return a(b(c(d(e(f(g(1)))))));}));}";
-        assert!(deepest_call_spine(source, "helpers/f.js").is_none());
+        assert!(deepest_call_view(source, "helpers/f.js").is_none());
     }
 
     #[test]
     fn ignores_short_calls_and_invalid_javascript() {
-        assert!(deepest_call_spine("function f(){return a(b(c(1)));}", "helpers/f.js").is_none());
-        assert!(deepest_call_spine("function f({", "helpers/f.js").is_none());
+        assert!(deepest_call_view("function f(){return a(b(c(1)));}", "helpers/f.js").is_none());
+        assert!(deepest_call_view("function f({", "helpers/f.js").is_none());
     }
 }
