@@ -3,6 +3,7 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use jsvm_lift::{
     analysis_artifacts::{load_artifact, DEOBFUSCATION, JS_REFERENCES, SOURCE_INDEX},
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
+    observed_eval_import::{attach_observed_eval_sources, ObservedEvalInput},
     project_deob::{materialize_project_deobfuscation, ProjectDeobOptions},
     project_import_names::propagate_imported_names,
     safe_deob::{deobfuscate_source, SourceMode},
@@ -144,6 +145,13 @@ struct SourceTreeArgs {
     /// Does not modify executable JS or infer dynamic method dispatch.
     #[arg(long, requires = "context_source")]
     caller_view_entry: Option<String>,
+    /// Attach independently validated runtime-eval source evidence.
+    /// Repeat each group of three values for another capture.
+    /// Original sample JS is never executed; OXC validates the executable
+    /// eval callsite and lexical bindings within the exact inner VM.
+    #[arg(long = "observed-eval", num_args = 3, action = clap::ArgAction::Append,
+          value_names = ["EXPORTED_TREE", "OUTER_VM_JS", "INNER_VM_JS"])]
+    observed_eval: Vec<PathBuf>,
 }
 
 fn collect_js_sources(root: &Path) -> Result<Vec<PathBuf>> {
@@ -844,6 +852,20 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
         fs::write(folder.join("context.json"), context_json)?;
     }
     fs::write(out.join("README.md"), md)?;
+    let mut groups = args.observed_eval.chunks_exact(3);
+    let observed = groups
+        .by_ref()
+        .map(|paths| ObservedEvalInput {
+            observed_tree: paths[0].clone(),
+            outer_source: paths[1].clone(),
+            inner_source: paths[2].clone(),
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        groups.remainder().is_empty(),
+        "each observed-eval requires three paths"
+    );
+    attach_observed_eval_sources(&out, &observed)?;
     println!(
         "{}",
         json!({
@@ -1297,6 +1319,7 @@ mod tests {
             context_source: None,
             origin_source: None,
             caller_view_entry: None,
+            observed_eval: Vec::new(),
         })?;
 
         let index: serde_json::Value =
@@ -1341,6 +1364,7 @@ mod tests {
             context_source: Some(original),
             origin_source: None,
             caller_view_entry: None,
+            observed_eval: Vec::new(),
         })?;
         let context_dir = output.join("lexical-context");
         let metadata: serde_json::Value =
@@ -1405,6 +1429,7 @@ mod tests {
             context_source: Some(original),
             origin_source: None,
             caller_view_entry: None,
+            observed_eval: Vec::new(),
         })?;
         let ctx = output.join("lexical-context");
         let meta: serde_json::Value =
@@ -1476,6 +1501,7 @@ mod tests {
             context_source: Some(original.clone()),
             origin_source: Some(original),
             caller_view_entry: None,
+            observed_eval: Vec::new(),
         })?;
         let context_dir = output.join("lexical-context");
         let meta: serde_json::Value =
@@ -1515,6 +1541,7 @@ mod tests {
             context_source: Some(source),
             origin_source: None,
             caller_view_entry: Some("enter".into()),
+            observed_eval: Vec::new(),
         })?;
         let folder = output.join("lexical-context");
         let manifest: serde_json::Value =
@@ -1553,6 +1580,7 @@ mod tests {
             context_source: Some(original.clone()),
             origin_source: None,
             caller_view_entry: Some("enter".into()),
+            observed_eval: Vec::new(),
         })?;
         let dir = output.join("lexical-context");
         let index: serde_json::Value =
@@ -1609,6 +1637,7 @@ mod tests {
             context_source: Some(original),
             origin_source: None,
             caller_view_entry: Some("enter".into()),
+            observed_eval: Vec::new(),
         })?;
         let context = output.join("lexical-context");
         let info: serde_json::Value =
@@ -1657,6 +1686,7 @@ mod tests {
             context_source: Some(original),
             origin_source: None,
             caller_view_entry: Some("aoF_".into()),
+            observed_eval: Vec::new(),
         })?;
         let context = output.join("lexical-context");
         let info: serde_json::Value =
@@ -1708,6 +1738,7 @@ mod tests {
             context_source: Some(original),
             origin_source: None,
             caller_view_entry: Some("enter".into()),
+            observed_eval: Vec::new(),
         })?;
         let context = output.join("lexical-context");
         let info: serde_json::Value =
