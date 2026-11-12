@@ -70,10 +70,13 @@ executed five captured generated function expressions with Node parity.
 
 ## Native ZIPP dynamic-source capture pilot
 
-A separate engine-level observer now records bounded compiler-entry source
-bytes without rewriting guest JavaScript, including direct/indirect eval,
-Function constructors, nested eval and cache-hit attempts. Its diagnostic
-event stream has no source-correlated AST identity yet, so the Node v2/v3
-producer and native OXC importer remain the operative provenance pipeline.
+A separate engine-level observer records bounded compiler-entry source bytes
+without rewriting JavaScript, including direct/indirect eval, Function
+constructors, nested eval and cache-hit attempts. Direct eval events now
+carry original-vs-runtime-installed caller identity and stack-style UTF-16
+positions; indirect/constructor origin remains explicitly unavailable.
+**13/13 focused Rust tests pass.** This still lacks independently verified OXC
+AST identity, so Node v2/v3 capture and native OXC import remain the
+operative provenance pipeline.
 
 [Implementation, pinned ZIPP patch and proof boundaries](HOWTO-ZIPP-DYNAMIC-SOURCE-OBSERVER.md).

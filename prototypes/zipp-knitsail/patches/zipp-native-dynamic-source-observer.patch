@@ -1,33 +1,35 @@
-From 9acf2128e8fbd579941b706130ad2bc776de0377 Mon Sep 17 00:00:00 2001
+From be4fbb67997f94223ba1fa15de95e174cba9d861 Mon Sep 17 00:00:00 2001
 From: codeandsolder <codeandsolder@gmail.com>
-Date: Thu, 12 Nov 2026 23:19:43 +0100
-Subject: [PATCH] feat(embed): opt-in bounded runtime source compiler
- observations
+Date: Thu, 12 Nov 2026 23:49:13 +0100
+Subject: [PATCH] feat(embed): bounded native runtime-source capture with
+ direct-eval provenance
 
 ---
- crates/zipp-vm/src/embed.rs                   |  33 +++-
+ crates/zipp-vm/src/embed.rs                   |  34 ++-
+ crates/zipp-vm/src/vm/dispatch_cold.rs        |   7 +
  crates/zipp-vm/src/vm/engine/run.rs           |  16 ++
- crates/zipp-vm/src/vm/instrument.rs           |  96 ++++++++++++
- .../zipp-vm/tests/dynamic_source_capture.rs   | 143 ++++++++++++++++++
- 4 files changed, 287 insertions(+), 1 deletion(-)
+ crates/zipp-vm/src/vm/instrument.rs           | 175 +++++++++++
+ .../zipp-vm/tests/dynamic_source_capture.rs   | 272 ++++++++++++++++++
+ 5 files changed, 503 insertions(+), 1 deletion(-)
  create mode 100644 crates/zipp-vm/tests/dynamic_source_capture.rs
 
 diff --git a/crates/zipp-vm/src/embed.rs b/crates/zipp-vm/src/embed.rs
-index 7fbb273..1567b9f 100644
+index 7fbb273..f7fcb70 100644
 --- a/crates/zipp-vm/src/embed.rs
 +++ b/crates/zipp-vm/src/embed.rs
-@@ -47,7 +47,9 @@ pub use crate::vm::host_api::SandboxCaps;
+@@ -47,7 +47,10 @@ pub use crate::vm::host_api::SandboxCaps;
  /// expose the `ScriptState::start_trace` control API; the artifact-internal
  /// `meter-only` profile deliberately does not.
  #[cfg(feature = "instrument")]
 -pub use crate::vm::instrument::{op, TraceStep};
 +pub use crate::vm::instrument::{
-+    op, DynamicSourceCapture, DynamicSourceEvent, DynamicSourceKind, TraceStep,
++    op, DynamicCallerOrigin, DynamicSourceCaller, DynamicSourceCapture, DynamicSourceEvent,
++    DynamicSourceKind, TraceStep,
 +};
  pub use crate::vm::ConsoleStream;
  
  /// Decimal text to `f64`, exactly as `text.parse::<f64>().ok()` reads it (the
-@@ -1296,6 +1298,35 @@ impl ScriptState {
+@@ -1296,6 +1299,35 @@ impl ScriptState {
          });
      }
  
@@ -63,6 +65,24 @@ index 7fbb273..1567b9f 100644
      /// Start recording an execution trace, stopping at `max_steps` rows.
      ///
      /// Requires [`Self::set_limits`] first (that is what attaches the recorder);
+diff --git a/crates/zipp-vm/src/vm/dispatch_cold.rs b/crates/zipp-vm/src/vm/dispatch_cold.rs
+index 7e78949..b2b472a 100644
+--- a/crates/zipp-vm/src/vm/dispatch_cold.rs
++++ b/crates/zipp-vm/src/vm/dispatch_cold.rs
+@@ -2252,6 +2252,13 @@ impl<'p> Vm<'p> {
+                             #[cfg(feature = "instrument")]
+                             self.instrument_dynamic_code_attempt(code.len())
+                                 .map_err(|message| Thrown(message.into()))?;
++                            // Cached direct eval still executes the exact input.
++                            // Include it or a "complete" witness could be incomplete.
++                            #[cfg(feature = "instrument")]
++                            self.instrument_dynamic_source_attempt(
++                                crate::vm::instrument::DynamicSourceKind::DirectEval,
++                                exact.as_deref().unwrap_or(code.as_bytes()),
++                            );
+                             let r = self.execute_eval_program(
+                                 base_func,
+                                 Some(caller_this),
 diff --git a/crates/zipp-vm/src/vm/engine/run.rs b/crates/zipp-vm/src/vm/engine/run.rs
 index 99c3ca1..517d642 100644
 --- a/crates/zipp-vm/src/vm/engine/run.rs
@@ -91,10 +111,10 @@ index 99c3ca1..517d642 100644
          // function expression and runs it for the function object, so the
          // same parameters and body compiled, installed and retained the same
 diff --git a/crates/zipp-vm/src/vm/instrument.rs b/crates/zipp-vm/src/vm/instrument.rs
-index 416911a..03d9a47 100644
+index 416911a..ed04a41 100644
 --- a/crates/zipp-vm/src/vm/instrument.rs
 +++ b/crates/zipp-vm/src/vm/instrument.rs
-@@ -404,6 +404,73 @@ fn heap_walk_stride_for(slots: usize) -> u32 {
+@@ -404,6 +404,109 @@ fn heap_walk_stride_for(slots: usize) -> u32 {
      }
  }
  
@@ -109,12 +129,42 @@ index 416911a..03d9a47 100644
 +    FunctionConstructor,
 +}
 +
++/// Origin of the function that issued the dynamic-code request. The host may
++/// associate InitialProgram with the source bytes originally passed to
++/// compile_script; functions installed by eval, modules and later host
++/// scripts are *not* that source even if they have the same line and column.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum DynamicCallerOrigin {
++    InitialProgram,
++    RuntimeInstalled,
++}
++
++/// Executing JavaScript source location associated with one dynamic-code
++/// attempt. This is the *callee callsite's reported position*, from the same
++/// bytecode metadata as Error.stack. It is NOT an AST node interval or a
++/// source-file/content hash; the host must match that separately.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct DynamicSourceCaller {
++    /// VM-local function index (not stable across independent executions).
++    pub function_id: u32,
++    /// Which compilation unit supplied this function (not its source hash).
++    pub origin: DynamicCallerOrigin,
++    /// Bytecode instruction offset in the caller, when known.
++    pub instruction_ip: u32,
++    /// 1-based line and UTF-16 column, including embedding origin offsets.
++    pub line: u32,
++    pub column: u32,
++}
++
 +/// One attempt to compile or reuse a runtime source. The exact bytes may be
 +/// WTF-8 (including lone surrogate encodings), so do not assume UTF-8.
 +#[derive(Clone, Debug, PartialEq, Eq)]
 +pub struct DynamicSourceEvent {
 +    pub kind: DynamicSourceKind,
 +    pub source_bytes: Vec<u8>,
++    /// None for host-originated eval, an unavailable call position, or an
++    /// internal/plumbing frame. Never infer an original AST location from it.
++    pub caller: Option<DynamicSourceCaller>,
 +}
 +
 +/// An opt-in diagnostic capture, separate from the algebraic instruction
@@ -147,7 +197,12 @@ index 416911a..03d9a47 100644
 +        }
 +    }
 +
-+    fn record(&mut self, kind: DynamicSourceKind, bytes: &[u8]) {
++    fn record(
++        &mut self,
++        kind: DynamicSourceKind,
++        bytes: &[u8],
++        caller: Option<DynamicSourceCaller>,
++    ) {
 +        if self.captured.truncated {
 +            return;
 +        }
@@ -161,6 +216,7 @@ index 416911a..03d9a47 100644
 +        self.captured.events.push(DynamicSourceEvent {
 +            kind,
 +            source_bytes: bytes.to_vec(),
++            caller,
 +        });
 +    }
 +}
@@ -168,7 +224,7 @@ index 416911a..03d9a47 100644
  /// Per-VM instrumentation state. Allocated only when a host asks for it.
  pub(crate) struct Recorder {
      /// Instructions the script may still execute, NOT counting any chunk
-@@ -496,6 +563,7 @@ pub(crate) struct Recorder {
+@@ -496,6 +599,7 @@ pub(crate) struct Recorder {
      dynamic_limits: DynamicCodeLimits,
      dynamic_calls: usize,
      dynamic_source_bytes: usize,
@@ -176,7 +232,7 @@ index 416911a..03d9a47 100644
      #[cfg(not(feature = "meter-only"))]
      steps: Vec<TraceStep>,
      /// Whether to record rows at all — metering works without tracing.
-@@ -621,6 +689,7 @@ impl Recorder {
+@@ -621,6 +725,7 @@ impl Recorder {
              dynamic_limits: DynamicCodeLimits::UNLIMITED,
              dynamic_calls: 0,
              dynamic_source_bytes: 0,
@@ -184,7 +240,7 @@ index 416911a..03d9a47 100644
              #[cfg(not(feature = "meter-only"))]
              steps: Vec::new(),
              #[cfg(not(feature = "meter-only"))]
-@@ -862,6 +931,22 @@ impl Recorder {
+@@ -862,6 +967,27 @@ impl Recorder {
          self.dynamic_source_bytes = 0;
      }
  
@@ -192,9 +248,14 @@ index 416911a..03d9a47 100644
 +        self.dynamic_source_observer = Some(DynamicSourceObserver::new(max_events, max_bytes));
 +    }
 +
-+    pub(crate) fn record_dynamic_source(&mut self, kind: DynamicSourceKind, source: &[u8]) {
++    pub(crate) fn record_dynamic_source(
++        &mut self,
++        kind: DynamicSourceKind,
++        source: &[u8],
++        caller: Option<DynamicSourceCaller>,
++    ) {
 +        if let Some(observer) = &mut self.dynamic_source_observer {
-+            observer.record(kind, source);
++            observer.record(kind, source, caller);
 +        }
 +    }
 +
@@ -207,7 +268,7 @@ index 416911a..03d9a47 100644
      /// Charge a dynamic compilation attempt before parsing or compiler
      /// allocation. Failed parses count too: otherwise a guest can repeatedly
      /// spend parser work without consuming the lifetime allowance.
-@@ -1525,6 +1610,17 @@ impl super::Vm<'_> {
+@@ -1525,6 +1651,55 @@ impl super::Vm<'_> {
          }
      }
  
@@ -217,8 +278,46 @@ index 416911a..03d9a47 100644
 +        kind: DynamicSourceKind,
 +        source: &[u8],
 +    ) {
++        // The compiler path is extremely hot in code generators. No stack
++        // walk or position search unless a host explicitly enabled capture.
++        if !self
++            .instr_rec
++            .as_ref()
++            .is_some_and(|rec| rec.dynamic_source_observer.is_some())
++        {
++            return;
++        }
++        // Only the DirectEval bytecode arm explicitly syncs the executing
++        // frame's IP to the exact operation. Ordinary native calls do not
++        // always update it, so deriving an indirect-eval/Function callsite
++        // from the last frame could silently attach a DIFFERENT call.
++        let caller = if kind == DynamicSourceKind::DirectEval {
++            self.frames.last().and_then(|frame| {
++                let ip = u32::try_from(frame.ip.checked_sub(1)?).ok()?;
++                let (line, column) = self.func(frame.func as usize).position_at(ip)?;
++                if line == 0
++                    || line == crate::bytecode::CallSite::HIDDEN
++                    || line & crate::bytecode::CallSite::PLUMBING != 0
++                {
++                    return None;
++                }
++                Some(DynamicSourceCaller {
++                    function_id: frame.func,
++                    origin: if (frame.func as usize) < self.main_func_count {
++                        DynamicCallerOrigin::InitialProgram
++                    } else {
++                        DynamicCallerOrigin::RuntimeInstalled
++                    },
++                    instruction_ip: ip,
++                    line,
++                    column,
++                })
++            })
++        } else {
++            None
++        };
 +        if let Some(rec) = rec_mut!(self) {
-+            rec.record_dynamic_source(kind, source);
++            rec.record_dynamic_source(kind, source, caller);
 +        }
 +    }
 +
@@ -227,13 +326,13 @@ index 416911a..03d9a47 100644
          match rec_mut!(self) {
 diff --git a/crates/zipp-vm/tests/dynamic_source_capture.rs b/crates/zipp-vm/tests/dynamic_source_capture.rs
 new file mode 100644
-index 0000000..2dd1a62
+index 0000000..c7b1c4b
 --- /dev/null
 +++ b/crates/zipp-vm/tests/dynamic_source_capture.rs
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,272 @@
 +#![cfg(feature = "instrument")]
 +
-+use zipp_vm::embed::{compile_script, DynamicSourceKind};
++use zipp_vm::embed::{compile_script, DynamicCallerOrigin, DynamicSourceKind};
 +
 +#[test]
 +fn captures_original_eval_sources_without_guest_rewriting() {
@@ -373,6 +472,135 @@ index 0000000..2dd1a62
 +    let capture = state.take_dynamic_source_capture().expect("capture");
 +    assert!(capture.events.is_empty());
 +    assert!(capture.truncated);
++}
++
++#[test]
++fn callsite_locations_use_original_js_utf16_columns() {
++    let mut state = compile_script(
++        "const emoji = '💡';\nconst x = eval('3 + 4');\nif (x !== 7) throw Error('bad');",
++    )
++    .expect("compile");
++    state.set_limits(1_000_000, None);
++    state.start_dynamic_source_capture(8, 1024);
++    state.run_init().expect("execute");
++    let capture = state.take_dynamic_source_capture().expect("capture");
++    assert_eq!(capture.events.len(), 1);
++    let caller = capture.events[0].caller.expect("source-correlated call");
++    assert_eq!((caller.line, caller.column), (2, 11));
++}
++
++#[test]
++fn all_repeated_direct_eval_attempts_are_observed_even_with_cache() {
++    let mut state = compile_script(
++        r#"
++        function f(n) {
++            let captured = n;
++            return eval("captured + 1");
++        }
++        if (f(1) !== 2 || f(5) !== 6 || f(8) !== 9) throw Error("bad");
++        "#,
++    )
++    .expect("compile");
++    state.set_limits(1_000_000, None);
++    state.start_dynamic_source_capture(10, 1024);
++    state.run_init().expect("execute");
++    let capture = state.take_dynamic_source_capture().expect("capture");
++    assert!(!capture.truncated);
++    assert_eq!(capture.events.len(), 3, "cache hits must remain observable");
++    for event in &capture.events {
++        assert_eq!(event.kind, DynamicSourceKind::DirectEval);
++        assert_eq!(event.source_bytes, b"captured + 1");
++        let caller = event.caller.expect("source location");
++        assert_eq!(caller.line, 4);
++        assert_eq!(caller.column, 20);
++    }
++}
++
++#[test]
++fn nested_eval_callsites_remain_distinct() {
++    let mut state = compile_script(
++        "const source = '\"2+3\"'; const result = eval(eval(source)); if (result!==5) throw Error('bad');",
++    ).expect("compile");
++    state.set_limits(1_000_000, None);
++    state.start_dynamic_source_capture(10, 1024);
++    state.run_init().expect("execute");
++    let capture = state.take_dynamic_source_capture().expect("capture");
++    assert_eq!(capture.events.len(), 2);
++    let inner = capture.events[0].caller.expect("inner source");
++    let outer = capture.events[1].caller.expect("outer source");
++    assert_eq!(inner.line, 1);
++    assert_eq!(outer.line, 1);
++    assert!(inner.column > outer.column);
++}
++
++#[test]
++fn distinct_indirect_eval_and_function_construction_source_locations() {
++    let mut state = compile_script(
++        "const a = (0, eval)('8+2');\nconst f = Function('return 13;');\nif(a !== 10 || f() !== 13) throw Error('bad');",
++    ).expect("compile");
++    state.set_limits(1_000_000, None);
++    state.start_dynamic_source_capture(10, 1024);
++    state.run_init().expect("execute");
++    let capture = state.take_dynamic_source_capture().expect("capture");
++    assert_eq!(capture.events.len(), 2);
++    assert_eq!(
++        capture.events[0].kind,
++        DynamicSourceKind::IndirectEvalOrHost
++    );
++    assert_eq!(
++        capture.events[1].kind,
++        DynamicSourceKind::FunctionConstructor
++    );
++    // Indirect and Function calls run through native code. Their suspended
++    // frames may point at unrelated JS instructions; no fake attribution.
++    assert!(capture.events[0].caller.is_none());
++    assert!(capture.events[1].caller.is_none());
++}
++
++#[test]
++fn embedding_host_eval_is_not_misattributed_to_previous_guest_frame() {
++    let mut state = compile_script("function f(){return 5;} f();").expect("compile");
++    state.set_limits(1_000_000, None);
++    state.start_dynamic_source_capture(10, 1024);
++    state.run_init().expect("initial script");
++    state.eval_in_context("1+2").expect("host-originated eval");
++    let capture = state.take_dynamic_source_capture().expect("capture");
++    assert_eq!(capture.events.len(), 1);
++    assert_eq!(
++        capture.events[0].kind,
++        DynamicSourceKind::IndirectEvalOrHost
++    );
++    assert!(capture.events[0].caller.is_none());
++}
++
++#[test]
++fn distinguishes_original_functions_from_runtime_compiled_functions() {
++    let mut state = compile_script(
++        r#"
++        function initial() { return eval("40+2"); }
++        if (initial() !== 42) throw Error("initial");
++        eval("function later() { return eval('5+8'); }");
++        if (later() !== 13) throw Error("runtime");
++        "#,
++    )
++    .expect("compile");
++    state.set_limits(1_000_000, None);
++    state.start_dynamic_source_capture(10, 4096);
++    state.run_init().expect("execute");
++    let capture = state.take_dynamic_source_capture().expect("capture");
++    assert_eq!(capture.events.len(), 3);
++    assert_eq!(
++        capture.events[0].caller.expect("original caller").origin,
++        DynamicCallerOrigin::InitialProgram
++    );
++    assert_eq!(
++        capture.events[1].caller.expect("original loader").origin,
++        DynamicCallerOrigin::InitialProgram
++    );
++    assert_eq!(
++        capture.events[2].caller.expect("generated caller").origin,
++        DynamicCallerOrigin::RuntimeInstalled
++    );
 +}
 -- 
 2.56.0

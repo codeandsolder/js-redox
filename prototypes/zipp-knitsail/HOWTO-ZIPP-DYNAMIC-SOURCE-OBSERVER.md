@@ -8,7 +8,7 @@ not an importer or replacement for the original OXC/source-tree proofs.
 
 - ZIPP upstream repository: https://github.com/f2i-com/zipp.org
 - Patch base: `bcca68127fe86f0b8a59fd9e6c694f7518406647` (2026-11-12 ZIPP main, v0.0.35 line).
-- Local source commit that generated the patch: `9acf212`.
+- Local source commit that generated the patch: `be4fbb6`.
 - Patch: [zipp-native-dynamic-source-observer.patch](patches/zipp-native-dynamic-source-observer.patch).
 - It modifies **only** `zipp-vm` embedding/instrumentation and adds a focused
   Rust integration test; no copied full ZIPP source tree or private payload.
@@ -57,6 +57,31 @@ events when exhausted but does not change guest execution. The recorder must
 first be installed through `set_limits`; without it the capture request is
 a no-op.
 
+### Direct-eval caller identity and cached evaluations
+
+For **direct eval**, the VM has explicitly synchronized the caller instruction
+offset, so each event also exposes an optional `DynamicSourceCaller` with
+the VM-local function ID, bytecode IP and the exact stack-style **1-based
+source line / UTF-16 column**. The compiler's existing callsite table supplies
+the location; no second source mapping system was added. The caller's
+`DynamicCallerOrigin` distinguishes functions from the **initial compiled
+program** from functions **installed at runtime** (e.g. an eval-generated
+function). This matters before attempting to join a site to the original
+source's OXC AST.
+
+The optimized direct-eval compilation cache has a fast path that bypasses
+`do_eval`. This patch instruments that path too: otherwise repeated
+calls could disappear from a supposedly complete event history. The source
+bytes and event order are retained for cached attempts.
+
+**Indirect eval and Function constructor callsites remain explicitly
+unavailable**: their native call paths do not consistently synchronize
+the JS frame IP. Reusing a stale frame position risks falsely identifying a
+different call. Their exact compiler-input bytes and event ordering are still
+captured; the `caller` field is `None` until a correct native-callsite
+handoff is implemented. This is a deliberate evidence constraint, not a
+claim that those expressions are unobservable.
+
 ## Proof boundary and follow-up
 
 **This captures source bytes, not original AST callsite provenance.** The
@@ -66,18 +91,23 @@ or browser host effects. Therefore it is **not yet a source-tree importer
 input** and should not be promoted into PR #184 as if it were equivalent to
 the Node v2/v3 witnesses.
 
-The next valuable engine experiment is provenance: correlate the compiler
-event with an actual caller function and a verified original source callsite,
-including nested eval/Function and indirect cases. Compare against native
-OXC `eval-sites` discovery and Node capture before defining a shared witness
-schema. Do not add another bytecode-step counter or JIT benchmark as a proxy
-for source recovery.
+The next integration experiment is to pair **InitialProgram** direct-eval
+caller line/column with an **exact-hash-verified original executable** and
+OXC's lexical `eval-sites` inventory. The source location is a pointer
+to an existing executable callsite, not yet a full original AST interval or
+argument binding proof. Ambiguous/unmatched sites must remain unresolved.
+For indirect eval and Function, first add an explicit native call dispatch
+origin that does not fall back to stale frames. Compare against the Node
+v2/v3 witnesses before defining a shared importer schema; do not replace
+the proof-gated static reconstruction.
 
 The unrelated ZIPP Tier O preheader bug #93 was already fixed upstream
 in v0.0.35; **do not apply the old issue-93 patch** to this checkout.
 
 ## Verified validation (2026-11-12)
 
-- Rust 1.99, configured sccache: **7/7 focused native Rust tests PASS**.
+- Rust 1.99, configured sccache: **13/13 focused native Rust tests PASS**.
 - `cargo +1.99.0 clippy -p zipp-vm --no-default-features --features instrument --test dynamic_source_capture` completed, with three pre-existing build-script warnings in ZIPP `build/minify.rs` and `build/sha256.rs`. The strict `-D warnings` run fails on those same baseline warnings, not on the observer.
 - A clean pinned upstream ZIPP checkout accepted the patch with `git apply --check`. No full Knitsail corpus run was made.
+
+- New tests cover cached direct eval, nested caller positions, UTF-16 columns, unavailable native-call origins, and original-vs-runtime-installed function provenance.
