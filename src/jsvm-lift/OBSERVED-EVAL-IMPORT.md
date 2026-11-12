@@ -8,8 +8,11 @@ For optional observed-eval inputs, source-tree constructs its complete output
 in a temporary sibling directory and publishes it only after every witness
 and AST link has been validated. Rejected or incomplete captures leave no
 partial output or staging files. The requested destination must not exist,
-so an existing analyst result is never silently overwritten. Static-only
-source-tree retains its previous output behavior.
+so an existing analyst result is never silently overwritten. On Linux,
+Android and Apple platforms, the final publication uses the operating
+system's exclusive no-replace rename, so a concurrently created empty
+output directory is also protected. Static-only source-tree retains its
+previous output behavior.
 
 ## CLI
 
