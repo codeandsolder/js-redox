@@ -8,7 +8,7 @@ not an importer or replacement for the original OXC/source-tree proofs.
 
 - ZIPP upstream repository: https://github.com/f2i-com/zipp.org
 - Patch base: `bcca68127fe86f0b8a59fd9e6c694f7518406647` (2026-11-12 ZIPP main, v0.0.35 line).
-- Local source commit that generated the patch: `be4fbb6`.
+- Local source commit that generated the patch: `38aa7942c1f1d11b6c10a5bf2d4329e0ff7610ef`.
 - Patch: [zipp-native-dynamic-source-observer.patch](patches/zipp-native-dynamic-source-observer.patch).
 - It modifies **only** `zipp-vm` embedding/instrumentation and adds a focused
   Rust integration test; no copied full ZIPP source tree or private payload.
@@ -36,6 +36,10 @@ let capture = state.take_dynamic_source_capture().expect("observer enabled");
 assert!(!capture.truncated);
 assert_eq!(capture.events[0].kind, DynamicSourceKind::DirectEval);
 assert_eq!(capture.events[0].source_bytes, b"1+2");
+assert!(matches!(
+    capture.events[0].outcome,
+    Some(zipp_vm::embed::DynamicSourceOutcome::Returned { type_name: "number" })
+));
 ```
 
 This is **an observation of attempts reaching ZIPP's common runtime compiler**:
@@ -50,6 +54,18 @@ source is stored as exact bytes, not a lossy UTF-8 string: ZIPP may supply
 WTF-8 source containing unpaired UTF-16 surrogates. `Function` constructor
 events contain the assembled wrapper given to the compiler, not merely the
 literal body argument.
+
+**Runtime outcome extension (2026-11-13):** every captured event now has
+`outcome` = `Returned { type_name }`, `Threw`, or `None` while in
+flight. It observes the return from that *specific* runtime compiler
+attempt, including its compile/instantiation failures; it does not represent
+the success or failure of the outer script. The type name is ZIPP's
+side-effect-free internal JavaScript `typeof`, not a serialization or exact
+value. In particular, an object or function is **not** converted with
+`toString`, a thrown value is not reconstructed, and an asynchronous
+Promise resolution is not observed. Nested calls finish their own events by
+session-qualified event ticket, not by "last event" or textual source match;
+starting a new observer mid-flight cannot finish an unrelated event.
 
 The observer has independent maximum event-count and aggregate source-byte
 caps, both chosen by the host. It marks `truncated=true` and drops further
@@ -104,9 +120,9 @@ the proof-gated static reconstruction.
 The unrelated ZIPP Tier O preheader bug #93 was already fixed upstream
 in v0.0.35; **do not apply the old issue-93 patch** to this checkout.
 
-## Verified validation (2026-11-12)
+## Verified validation (2026-11-13)
 
-- Rust 1.99, configured sccache: **13/13 focused native Rust tests PASS**.
+- Rust 1.99, configured sccache: **18/18 focused native Rust integration tests PASS** on the outcome prototype before the recorder-session regression tests were added. Recorder-session edge tests were added separately; see the current checkpoint for their final result.
 - `cargo +1.99.0 clippy -p zipp-vm --no-default-features --features instrument --test dynamic_source_capture` completed, with three pre-existing build-script warnings in ZIPP `build/minify.rs` and `build/sha256.rs`. The strict `-D warnings` run fails on those same baseline warnings, not on the observer.
 - A clean pinned upstream ZIPP checkout accepted the patch with `git apply --check`. No full Knitsail corpus run was made.
 

@@ -31,6 +31,7 @@ function loc(span){
 }
 function event(index,kind,bytes,span,origin='initial-program'){
   return {index,kind,sourceHex:Buffer.from(bytes).toString('hex'),
+    outcome:{status:'returned',type:'number'},
     caller:span?{functionId:1,instructionIp:index+8,origin,...loc(span)}:null};
 }
 const original=[
@@ -41,13 +42,13 @@ const original=[
   event(4,'indirect-or-host','3+7',outer.evalSite),
   event(5,'function-constructor','return 4;',null),
 ];
-const observer={schemaVersion:1,engine:'zipp',sourceSha256:sha,
+const observer={schemaVersion:2,engine:'zipp',sourceSha256:sha,
   truncated:false,execution:{initial:{ok:true}},events:original};
 
 test('correlates nested direct eval, repeated cached calls and Unicode line positions',()=>{
   const report=correlateZippEvalSites(bytes,inventory,observer);
   assert.deepEqual(report.summary,
-    {total:6,matched:3,ambiguous:0,unmatched:0,unavailable:3});
+    {total:6,matched:3,ambiguous:0,unmatched:0,unavailable:3,returned:6,threw:0,pending:0});
   assert.deepEqual(report.events.slice(0,3).map(e=>e.correlation.inventoryIndex),
     [1,0,1]);
   for(const item of report.events.slice(0,3)){
@@ -88,7 +89,7 @@ test('ambiguous positions are never silently assigned to the first candidate',()
   const report=correlateZippEvalSites(bytes,duplicate,
     {...observer,events:[original[0]]});
   assert.deepEqual(report.summary,
-    {total:1,matched:0,ambiguous:1,unmatched:0,unavailable:0});
+    {total:1,matched:0,ambiguous:1,unmatched:0,unavailable:0,returned:1,threw:0,pending:0});
   assert.equal(report.events[0].correlation.candidateCount,2);
 });
 
@@ -98,7 +99,7 @@ test('unsupported direct eval is reported without pretending to be captured',()=
   const idx=src.indexOf('eval()');
   const inv={schemaVersion:1,sourceSha256:s,sites:[],
     unsupported:[{evalSite:{start:idx,end:idx+6,expression:'eval()'},reason:'missing first argument'}]};
-  const evt={schemaVersion:1,engine:'zipp',sourceSha256:s,truncated:false,
+  const evt={schemaVersion:2,engine:'zipp',sourceSha256:s,truncated:false,
     events:[event(0,'direct-eval','2+2',null)]};
   // An unavailable caller is not invented from inventory alone.
   assert.equal(correlateZippEvalSites(b,inv,evt).events[0].correlation.reason,'caller-unavailable');
@@ -142,9 +143,10 @@ test('BOM, CRLF and ECMAScript Unicode line breaks keep exact UTF-16 source posi
     ]};
   const make=(index,value,line,column)=>({index,kind:'direct-eval',
     sourceHex:Buffer.from(value).toString('hex'),
+    outcome:{status:'returned',type:'number'},
     caller:{functionId:0,instructionIp:index+1,origin:'initial-program',
       line,column}});
-  const z={schemaVersion:1,engine:'zipp',sourceSha256:h,truncated:false,
+  const z={schemaVersion:2,engine:'zipp',sourceSha256:h,truncated:false,
     events:[make(0,'1',2,9),make(1,'2',3,9)]};
   const result=correlateZippEvalSites(b,inv,z);
   assert.deepEqual(result.events.map(e=>e.correlation.status),['matched','matched']);
@@ -153,4 +155,47 @@ test('BOM, CRLF and ECMAScript Unicode line breaks keep exact UTF-16 source posi
 
 test('invalid original UTF-8 is refused, not silently replaced',()=>{
   assert.throws(()=>correlateZippEvalSites(Buffer.from([0xff]),inventory,observer),/UTF-8|encoded data/);
+});
+
+test('outcome type is preserved for each source even when AST callsite is unavailable',()=>{
+  const changed=[
+    {...original[0],outcome:{status:'returned',type:'string'}},
+    {...original[1],index:1,outcome:{status:'threw'}},
+    {...original[2],index:2,outcome:null},
+    {...original[3],index:3,outcome:{status:'returned',type:'object'}},
+  ];
+  const report=correlateZippEvalSites(bytes,inventory,
+    {...observer,events:changed});
+  assert.deepEqual(report.summary,{
+    total:4,matched:3,ambiguous:0,unmatched:0,unavailable:1,
+    returned:2,threw:1,pending:1,
+  });
+  assert.deepEqual(report.events.map(e=>e.outcome),
+    changed.map(e=>e.outcome));
+});
+
+test('rejects malformed or missing outcome instead of claiming a return',()=>{
+  for(const bad of [
+    undefined,{},'returned',{status:'returned'},
+    {status:'returned',type:'numberish'},
+    {status:'threw',type:'number'},
+    {status:'unknown'},
+  ]) {
+    assert.throws(()=>correlateZippEvalSites(bytes,inventory,
+      {...observer,events:[{...original[0],outcome:bad}]}),
+      /Invalid ZIPP attempt outcome/);
+  }
+  assert.throws(()=>correlateZippEvalSites(bytes,inventory,
+    {...observer,schemaVersion:1}),/Invalid ZIPP observer schema/);
+});
+
+test('exception counts preserve original caller without conflating later generated code',()=>{
+  const thrownOriginal={...original[0],outcome:{status:'threw'}};
+  const generated={...original[3],index:1,outcome:{status:'threw'}};
+  const report=correlateZippEvalSites(bytes,inventory,
+    {...observer,events:[thrownOriginal,generated]});
+  assert.equal(report.summary.matched,1);
+  assert.equal(report.summary.unavailable,1);
+  assert.equal(report.summary.threw,2);
+  assert.equal(report.summary.returned,0);
 });

@@ -4,7 +4,9 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{env, fs, io, path::PathBuf};
-use zipp_vm::embed::{compile_script, DynamicCallerOrigin, DynamicSourceKind};
+use zipp_vm::embed::{
+    compile_script, DynamicCallerOrigin, DynamicSourceKind, DynamicSourceOutcome,
+};
 
 fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -76,18 +78,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "column": caller.column,
                 })
             });
+            let event_outcome = event.outcome.as_ref().map(|outcome| match outcome {
+                DynamicSourceOutcome::Returned { type_name } => {
+                    json!({"status": "returned", "type": type_name})
+                }
+                DynamicSourceOutcome::Threw => json!({"status": "threw"}),
+            });
             json!({
                 "index": index,
                 "kind": kind,
                 "sourceHex": hex(&event.source_bytes),
                 "caller": caller,
+                "outcome": event_outcome,
             })
         })
         .collect();
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "engine": "zipp",
             "sourceSha256": digest(&bytes),
             "truncated": capture.truncated,

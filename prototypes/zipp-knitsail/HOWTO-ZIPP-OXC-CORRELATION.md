@@ -37,7 +37,11 @@ classified indirect/host and cannot be attributed to the original, but calls
 into original-program functions can produce attributable direct evals.
 The runner includes execution status (including exceptions), source SHA-256,
 ordered source attempts, raw WTF-8-capable source bytes as `sourceHex`,
-VM caller metadata, and the observer's truncation flag. It does **not**
+VM caller metadata, per-event outcome (`returned` with JS `typeof` category,
+`threw`, or `null` for in-flight), and the observer's truncation flag.
+This is a deliberately breaking **observer schema v2 / linker schema v2**
+transition. The linker rejects v1 observations rather than silently
+interpreting an absent outcome as a successful return. It does **not**
 enable a per-instruction execution trace or disable the JIT. Its fixed pilot
 budgets are 10 million VM steps, 10,000 captured events, and 32 MiB captured
 source; a truncated observation is explicitly incomplete.
@@ -61,8 +65,8 @@ source; a truncated observation is explicitly incomplete.
    generated function belongs to the original, classify an indirect eval as
    direct, or infer an original callsite from the last native stack frame.
 
-The result is an event-by-event **source correlation**, not a successful
-execution/return witness. The live syntax sweep discovered that OXC had
+The result is event-by-event **source correlation with compiler-attempt
+return/throw status**, not an exact returned-value/exception witness. The live syntax sweep discovered that OXC had
 omitted direct eval behind one or more plain parentheses: `(eval)(D)` and
 `((eval))(D)`. PR #184 now unwraps only these AST parentheses, preserving
 the same unresolved lexical identifier and keeping comma/optional calls
@@ -75,8 +79,9 @@ function ID alone is not stable between executions.
 ## Remaining integration boundary
 
 This is not yet a valid `--observed-direct-bundle` producer for PR #184:
-that importer requires additional dynamic source representations and
-runtime-result/throw outcome witnesses. The engine stream cannot replace
+that importer requires exact captured dynamic source files and richer
+runtime-result/throw *value* witnesses. Boolean completion and `typeof`
+alone are not equivalent to those imported source witnesses. The engine stream cannot replace
 the Node v2/v3 producer as-is. It only provides an independent and
 non-rewriting source-location observation channel. Do not treat the
 `matched` status as full original lexical binding proof or universal

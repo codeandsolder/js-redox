@@ -88,4 +88,7 @@ adds a native ZIPP runtime-source CLI and an exact-SHA-256/UTF-16 join against
 the native OXC `eval-sites` inventory. Direct eval events can be paired with
 one verified initial-program AST callsite; ambiguous, unsupported, generated,
 indirect and otherwise unlocatable events stay explicitly unresolved. This is
-diagnostic evidence, **not yet** an importer witness.
+diagnostic evidence, **not yet** an importer witness. Native runtime
+compiler-attempt outcomes are now attached individually (returned JavaScript
+type, threw, or in-flight) without assuming nested evals finish in event
+order. The observer/linker schema was deliberately revised to v2.

@@ -64,7 +64,7 @@ export function correlateZippEvalSites(originalBytes,inventory,capture){
   if(inventory?.schemaVersion!==1 || !Array.isArray(inventory.sites) ||
     !Array.isArray(inventory.unsupported))throw Error('Invalid OXC inventory schema');
   verifySha(inventory.sourceSha256,sourceSha256,'OXC inventory');
-  if(capture?.schemaVersion!==1 || capture.engine!=='zipp' ||
+  if(capture?.schemaVersion!==2 || capture.engine!=='zipp' ||
     !Array.isArray(capture.events) || typeof capture.truncated!=='boolean'){
     throw Error('Invalid ZIPP observer schema');
   }
@@ -91,9 +91,24 @@ export function correlateZippEvalSites(originalBytes,inventory,capture){
         !Number.isSafeInteger(event.caller.column)))){
       throw Error('Invalid ZIPP event at index '+index);
     }
+    // Outcome is an independent completion of *this compiler attempt*.
+    // It does not encode the exact returned JS value or the thrown value.
+    // null means the observation was taken while the attempt was in flight.
+    const resultOutcome=event.outcome;
+    if(resultOutcome!==null &&
+      (!resultOutcome || typeof resultOutcome!=='object' ||
+        !['returned','threw'].includes(resultOutcome.status) ||
+        (resultOutcome.status==='returned' &&
+          !['number','string','boolean','undefined','object','function','symbol','bigint']
+            .includes(resultOutcome.type)) ||
+        (resultOutcome.status==='threw' &&
+          Object.hasOwn(resultOutcome,'type')))){
+      throw Error('Invalid ZIPP attempt outcome at index '+index);
+    }
     const content=Buffer.from(event.sourceHex,'hex');
     const result={index,kind:event.kind,sourceSha256:hash(content),
-      sourceByteLength:content.length,caller:event.caller??null};
+      sourceByteLength:content.length,caller:event.caller??null,
+      outcome:resultOutcome};
     if(event.kind!=='direct-eval'){
       result.correlation={status:'unavailable',reason:'not-a-direct-eval'};
     }else if(event.caller===null || event.caller===undefined){
@@ -126,7 +141,7 @@ export function correlateZippEvalSites(originalBytes,inventory,capture){
     return result;
   });
   return {
-    schemaVersion:1,kind:'zipp-source-correlation',
+    schemaVersion:2,kind:'zipp-source-correlation',
     executableSha256:sourceSha256,
     observerTruncated:capture.truncated,
     execution:capture.execution??null,
@@ -136,6 +151,9 @@ export function correlateZippEvalSites(originalBytes,inventory,capture){
       ambiguous:events.filter(e=>e.correlation.status==='ambiguous').length,
       unmatched:events.filter(e=>e.correlation.status==='unmatched').length,
       unavailable:events.filter(e=>e.correlation.status==='unavailable').length,
+      returned:events.filter(e=>e.outcome?.status==='returned').length,
+      threw:events.filter(e=>e.outcome?.status==='threw').length,
+      pending:events.filter(e=>e.outcome===null).length,
     },
     events,
   };
