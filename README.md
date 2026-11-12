@@ -81,6 +81,11 @@ or lexical bindings are retained; dynamic tests are not guessed. The numeric
 state-graph reducer also handles `for (var state = initial; ...)`, state
 transitions inside `var` declaration initializers, and sequential terminating
 `return` cases, preserving function-scoped hoisted variables across branches.
+For a nonadjacent state initializer, a direct `eval` in an unrelated sibling
+callback does not block reconstruction of another callback's **own** numeric
+state. That exception is proven by the exact Oxc lexical state symbol and its
+owning function scope; captured ancestor state, direct eval, `with`, or mapped
+`arguments` in the state-owning function remain protected.
 An effect-aware primitive evaluator simplifies expressions with a known result
 while preserving original calls, getters and assignments in evaluation order,
 including logically dead RHS expressions; return-value comma expressions drop

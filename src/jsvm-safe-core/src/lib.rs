@@ -638,6 +638,8 @@ struct Collector<'s, 'c> {
     protected_spans: &'c [(usize, usize)],
     may_remove_dead_numeric_writes: bool,
     unsafe_numeric_functions: &'c HashSet<(u32, u32)>,
+    current_function_scope: Option<ScopeId>,
+    current_function_numeric_safe: bool,
     allow_effect_statements: bool,
     function_depth: usize,
     replacements: Vec<Replacement>,
@@ -667,14 +669,26 @@ impl Collector<'_, '_> {
         self.reconstruct_reaching_while_with(statements, &HashMap::<SymbolId, (u64, Span)>::new());
     }
 
+    /// A dynamic eval in an ancestor may inspect that ancestor's bindings,
+    /// but cannot inspect a *sibling child's* locally owned numeric state.
+    /// Require the exact Oxc symbol to belong to the current safe function
+    /// when the inherited general dead-write permission is unavailable.
+    fn safe_reaching_state_binding(&self, symbol: SymbolId) -> bool {
+        self.may_remove_dead_numeric_writes
+            || (self.current_function_numeric_safe
+                && self.current_function_scope.is_some_and(|function_scope| {
+                    self.scoping
+                        .scope_ancestors(self.scoping.symbol_scope_id(symbol))
+                        .any(|scope| scope == function_scope)
+                }))
+    }
+
     fn reconstruct_reaching_while_with(
         &mut self,
         statements: &[Statement<'_>],
         inherited: &HashMap<SymbolId, (u64, Span)>,
     ) {
-        if !self.may_remove_dead_numeric_writes {
-            // Direct eval and sloppy arguments aliasing can change a local
-            // numeric state without an ordinary lexically resolved write.
+        if !self.may_remove_dead_numeric_writes && !self.current_function_numeric_safe {
             return;
         }
         let mut reaching = inherited.clone();
@@ -690,7 +704,7 @@ impl Collector<'_, '_> {
                         )
                         .iter()
                         .any(|(other, _, _, _)| *other == symbol);
-                    if !immediately_preceded {
+                    if !immediately_preceded && self.safe_reaching_state_binding(symbol) {
                         if let Some(&(initial, init_span)) = reaching.get(&symbol) {
                             if self.reaching_state_is_stable(symbol, init_span, loop_stmt.span) {
                                 if let Some(code) =
@@ -714,7 +728,9 @@ impl Collector<'_, '_> {
             if let Statement::WhileStatement(loop_stmt) = stmt {
                 if let Statement::TryStatement(protected) = &loop_stmt.body {
                     for (&symbol, &(initial, init_span)) in &reaching {
-                        if !self.reaching_state_is_stable(symbol, init_span, loop_stmt.span) {
+                        if !self.safe_reaching_state_binding(symbol)
+                            || !self.reaching_state_is_stable(symbol, init_span, loop_stmt.span)
+                        {
                             continue;
                         }
                         let state = self.scoping.symbol_name(symbol);
@@ -759,6 +775,7 @@ impl Collector<'_, '_> {
                 if self.scoping.symbol_flags(symbol).is_variable()
                     && !self.scoping.symbol_flags(symbol).is_const_variable()
                     && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
+                    && self.safe_reaching_state_binding(symbol)
                 {
                     reaching.insert(symbol, (initial, init_span));
                 }
@@ -1083,25 +1100,37 @@ impl Collector<'_, '_> {
 impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_function(&mut self, it: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
         let enclosing_safe = self.may_remove_dead_numeric_writes;
-        self.may_remove_dead_numeric_writes = enclosing_safe
-            && !self
-                .unsafe_numeric_functions
-                .contains(&(it.span.start, it.span.end));
+        let previous_scope = self.current_function_scope;
+        let previous_local_safe = self.current_function_numeric_safe;
+        let own_safe = !self
+            .unsafe_numeric_functions
+            .contains(&(it.span.start, it.span.end));
+        self.may_remove_dead_numeric_writes = enclosing_safe && own_safe;
+        self.current_function_scope = it.scope_id.get();
+        self.current_function_numeric_safe = own_safe && self.current_function_scope.is_some();
         self.function_depth += 1;
         walk::walk_function(self, it, flags);
         self.function_depth -= 1;
+        self.current_function_scope = previous_scope;
+        self.current_function_numeric_safe = previous_local_safe;
         self.may_remove_dead_numeric_writes = enclosing_safe;
     }
 
     fn visit_arrow_function_expression(&mut self, it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
         let enclosing_safe = self.may_remove_dead_numeric_writes;
-        self.may_remove_dead_numeric_writes = enclosing_safe
-            && !self
-                .unsafe_numeric_functions
-                .contains(&(it.span.start, it.span.end));
+        let previous_scope = self.current_function_scope;
+        let previous_local_safe = self.current_function_numeric_safe;
+        let own_safe = !self
+            .unsafe_numeric_functions
+            .contains(&(it.span.start, it.span.end));
+        self.may_remove_dead_numeric_writes = enclosing_safe && own_safe;
+        self.current_function_scope = it.scope_id.get();
+        self.current_function_numeric_safe = own_safe && self.current_function_scope.is_some();
         self.function_depth += 1;
         walk::walk_arrow_function_expression(self, it);
         self.function_depth -= 1;
+        self.current_function_scope = previous_scope;
+        self.current_function_numeric_safe = previous_local_safe;
         self.may_remove_dead_numeric_writes = enclosing_safe;
     }
 
@@ -1850,6 +1879,8 @@ fn transform_once(
         // script syntax, including string contents, is not such a hazard.
         may_remove_dead_numeric_writes: !numeric_state_risks.unsafe_top_level,
         unsafe_numeric_functions: &numeric_state_risks.unsafe_functions,
+        current_function_scope: None,
+        current_function_numeric_safe: false,
         allow_effect_statements: options.allow_effect_statements,
         function_depth: 0,
         replacements: initial_replacements,
@@ -6346,6 +6377,105 @@ mod tests {
             "{result:?}"
         );
         assert!(!result.source.contains("dead=5"), "{}", result.source);
+    }
+
+    #[test]
+    fn reaching_numeric_state_proof_recovers_sibling_locals_despite_unrelated_eval() {
+        let fixtures = [
+            // A direct eval in a sibling marks the enclosing function unsafe,
+            // but it cannot inspect the named child's own parameter.
+            r#"function outer(log) {
+                const dynamic = function(input) { return eval(input); };
+                const healthy = function(state, counter) {
+                    state = 40;
+                    log("initialized");
+                    while (state != 29) {
+                        if (state == 40) { counter = 2; state = 9; }
+                        else if (state == 9) state = counter-- ? 7 : 26;
+                        else if (state == 7) { log("item"); state = 9; }
+                        else if (state == 26) { log("done"); state = 29; }
+                    }
+                    return counter;
+                };
+                return healthy;
+            }"#,
+            // The binding may also belong to a block nested in that child,
+            // provided it does not cross a function boundary.
+            r#"function outer(log) {
+                function dynamic(input) { return eval(input); }
+                function healthy(counter) {
+                    { let state = 40;
+                      log("initialized");
+                      while (state != 29) {
+                          if (state == 40) { counter = 2; state = 9; }
+                          else if (state == 9) state = counter-- ? 7 : 26;
+                          else if (state == 7) { log("item"); state = 9; }
+                          else if (state == 26) { log("done"); state = 29; }
+                      }
+                    }
+                    return counter;
+                }
+                return healthy;
+            }"#,
+        ];
+        for source in fixtures {
+            let result = deobfuscate(source, 12);
+            assert!(result.is_some(), "source must be parseable: {source}");
+            let Some(output) = result else {
+                continue;
+            };
+            assert!(
+                output
+                    .transforms
+                    .get("if_ladder_structured")
+                    .is_some_and(|count| *count >= 1),
+                "{} {:#?}",
+                output.source,
+                output.transforms
+            );
+            assert!(
+                !output.source.contains("while (state != 29)"),
+                "{}",
+                output.source
+            );
+            assert!(output.source.contains("eval(input)"), "{}", output.source);
+            assert!(output.source.contains("log(\"item\")"), "{}", output.source);
+        }
+    }
+
+    #[test]
+    fn reaching_numeric_state_proof_keeps_eval_visible_captured_and_aliased_state() {
+        let dispatcher = r#"while(state!=29){
+              if(state==40) state=26;
+              else if(state==26) state=29;
+           }"#;
+        for source in [
+            format!(
+                "function outer(log){{let state=0;function risky(){{return eval('state');}}function child(){{state=40;log();{dispatcher}}}return child;}}"
+            ),
+            format!(
+                "function outer(log){{function child(state){{state=40;log();eval('state=26');{dispatcher}}}return child;}}"
+            ),
+            format!(
+                "function outer(log){{function child(state){{state=40;log();arguments[0]=26;{dispatcher}}}return child;}}"
+            ),
+            format!(
+                "function outer(log){{function child(state){{state=40;log();const nested=()=>eval('state');{dispatcher}}}return child;}}"
+            ),
+        ] {
+            let result = deobfuscate(&source, 12);
+            assert!(result.is_some(), "source must be parseable: {source}");
+            let Some(output) = result else {
+                continue;
+            };
+            assert!(
+                !output.transforms.contains_key("if_ladder_structured"),
+                "unsafe state got reconstructed: {} {:#?}",
+                output.source,
+                output.transforms
+            );
+            assert!(output.source.contains("while(state!=29)"), "{}", output.source);
+        }
     }
 
     #[test]
