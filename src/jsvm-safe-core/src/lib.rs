@@ -673,7 +673,7 @@ impl Collector<'_, '_> {
     /// but cannot inspect a *sibling child's* locally owned numeric state.
     /// Require the exact Oxc symbol to belong to the current safe function
     /// when the inherited general dead-write permission is unavailable.
-    fn safe_reaching_state_binding(&self, symbol: SymbolId) -> bool {
+    fn safe_numeric_state_binding(&self, symbol: SymbolId) -> bool {
         self.may_remove_dead_numeric_writes
             || (self.current_function_numeric_safe
                 && self.current_function_scope.is_some_and(|function_scope| {
@@ -704,7 +704,7 @@ impl Collector<'_, '_> {
                         )
                         .iter()
                         .any(|(other, _, _, _)| *other == symbol);
-                    if !immediately_preceded && self.safe_reaching_state_binding(symbol) {
+                    if !immediately_preceded && self.safe_numeric_state_binding(symbol) {
                         if let Some(&(initial, init_span)) = reaching.get(&symbol) {
                             if self.reaching_state_is_stable(symbol, init_span, loop_stmt.span) {
                                 if let Some(code) =
@@ -728,7 +728,7 @@ impl Collector<'_, '_> {
             if let Statement::WhileStatement(loop_stmt) = stmt {
                 if let Statement::TryStatement(protected) = &loop_stmt.body {
                     for (&symbol, &(initial, init_span)) in &reaching {
-                        if !self.safe_reaching_state_binding(symbol)
+                        if !self.safe_numeric_state_binding(symbol)
                             || !self.reaching_state_is_stable(symbol, init_span, loop_stmt.span)
                         {
                             continue;
@@ -775,7 +775,7 @@ impl Collector<'_, '_> {
                 if self.scoping.symbol_flags(symbol).is_variable()
                     && !self.scoping.symbol_flags(symbol).is_const_variable()
                     && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
-                    && self.safe_reaching_state_binding(symbol)
+                    && self.safe_numeric_state_binding(symbol)
                 {
                     reaching.insert(symbol, (initial, init_span));
                 }
@@ -836,9 +836,6 @@ impl Collector<'_, '_> {
     // Avoid arguments aliasing and direct eval, both of which can observe
     // parameter/local writes without an ordinary identifier reference.
     fn dead_numeric_assignment(&self, expr: &Expression<'_>) -> bool {
-        if !self.may_remove_dead_numeric_writes {
-            return false;
-        }
         let Expression::AssignmentExpression(assign) = expr else {
             return false;
         };
@@ -856,7 +853,8 @@ impl Collector<'_, '_> {
         let Some(symbol) = self.scoping.get_reference(reference).symbol_id() else {
             return false;
         };
-        self.scoping.symbol_flags(symbol).is_variable()
+        self.safe_numeric_state_binding(symbol)
+            && self.scoping.symbol_flags(symbol).is_variable()
             && !self.scoping.symbol_flags(symbol).is_const_variable()
             && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
             && self
@@ -6437,6 +6435,15 @@ mod tests {
                 !output.source.contains("while (state != 29)"),
                 "{}",
                 output.source
+            );
+            assert!(
+                output
+                    .transforms
+                    .get("dead_numeric_state_write")
+                    .is_some_and(|count| *count >= 1),
+                "owned dispatcher writes should also disappear: {} {:#?}",
+                output.source,
+                output.transforms
             );
             assert!(output.source.contains("eval(input)"), "{}", output.source);
             assert!(output.source.contains("log(\"item\")"), "{}", output.source);
