@@ -6,7 +6,9 @@
 //! that the extracted snippets form an independently executable module.
 use anyhow::{ensure, Result};
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{BindingPattern, Function, IdentifierReference, VariableDeclarator};
+use oxc_ast::ast::{
+    BindingPattern, Expression, Function, IdentifierReference, Statement, VariableDeclarator,
+};
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
@@ -235,9 +237,242 @@ pub fn reconstruct_context(
     })
 }
 
+/// An executable-looking, but presentation-only, copy of an extracted handler.
+/// Every annotation is attached to an *unresolved lexical call* in the
+/// extracted AST and to a uniquely resolved original-source helper. This is
+/// not a replacement for the captured handler or proof-checked JS.
+#[derive(Debug)]
+pub struct AnnotatedHandlerCalls {
+    pub source: String,
+    pub call_count: usize,
+    pub helpers: Vec<String>,
+}
+
+/// Preserve the exact expression of a tiny, single-return original helper.
+/// Longer or effectful function bodies are linked instead of summarized.
+fn single_return_from_original(helper: &ContextHelper) -> Option<String> {
+    if helper.mutable_binding {
+        return None;
+    }
+    let allocator = Allocator::default();
+    let parsed = parse_program(&allocator, &helper.source, SourceType::unambiguous());
+    if !parsed.is_clean() {
+        return None;
+    }
+    let function = match parsed.program.body.first()? {
+        Statement::VariableDeclaration(declaration) => {
+            let Expression::FunctionExpression(function) =
+                declaration.declarations.first()?.init.as_ref()?
+            else {
+                return None;
+            };
+            function
+        }
+        Statement::FunctionDeclaration(function) => function,
+        _ => return None,
+    };
+    let statements = &function.body.as_ref()?.statements;
+    let [Statement::ReturnStatement(ret)] = statements.as_slice() else {
+        return None;
+    };
+    let expression = ret.argument.as_ref()?;
+    let text = helper
+        .source
+        .get(expression.span().start as usize..expression.span().end as usize)?
+        .trim();
+    (text.len() <= 140 && !text.contains('\n') && !text.contains('\r') && !text.contains("*/"))
+        .then(|| text.to_owned())
+}
+
+struct HandlerCallAnnotator<'s> {
+    scoping: &'s Scoping,
+    helpers: &'s BTreeMap<String, &'s ContextHelper>,
+    helper_prefix: String,
+    seen: BTreeSet<String>,
+    edits: Vec<(usize, String)>,
+}
+
+impl<'a> Visit<'a> for HandlerCallAnnotator<'_> {
+    fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+        if !call.optional {
+            let mut callee = &call.callee;
+            while let Expression::ParenthesizedExpression(inner) = callee {
+                callee = &inner.expression;
+            }
+            if let Expression::Identifier(identifier) = callee {
+                let external = identifier.reference_id.get().is_some_and(|reference| {
+                    self.scoping.get_reference(reference).symbol_id().is_none()
+                });
+                let name = identifier.name.as_str();
+                if external && !self.seen.contains(name) {
+                    if let Some(helper) = self.helpers.get(name) {
+                        let link = format!("{}{}", self.helper_prefix, helper.file);
+                        let detail = if helper.mutable_binding {
+                            format!("initial definition {link}; original binding reassigned")
+                        } else if let Some(expression) = single_return_from_original(helper) {
+                            format!("return {expression}; original definition {link}")
+                        } else {
+                            format!("original definition {link}")
+                        };
+                        self.edits.push((
+                            identifier.span.end as usize,
+                            format!(" /* lexical helper {name}: {detail} */"),
+                        ));
+                        self.seen.insert(name.to_owned());
+                    }
+                }
+            }
+        }
+        walk::walk_call_expression(self, call);
+    }
+}
+
+/// Generate local, inline provenance at direct helper calls, preserving the
+/// original program's binding distinction (including shadowed parameters).
+/// The context extractor supplies the unique original-name join, while this
+/// handler's own Oxc scoping checks the actual reference at each call.
+pub fn annotate_handler_helper_calls(
+    source: &str,
+    context: &ContextSourceTree,
+    handler: &HandlerContext,
+) -> Result<Option<AnnotatedHandlerCalls>> {
+    let allocator = Allocator::default();
+    let parsed = parse_program(&allocator, source, SourceType::unambiguous());
+    ensure!(
+        parsed.is_clean(),
+        "readable handler is not valid JavaScript"
+    );
+    let semantic = SemanticBuilder::new().build(&parsed.program);
+
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for helper in &context.helpers {
+        *counts.entry(&helper.name).or_default() += 1;
+    }
+    let linked = handler
+        .linked_helpers
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let helpers = context
+        .helpers
+        .iter()
+        .filter(|helper| {
+            linked.contains(helper.name.as_str()) && counts.get(helper.name.as_str()) == Some(&1)
+        })
+        .map(|helper| (helper.name.clone(), helper))
+        .collect::<BTreeMap<_, _>>();
+    let mut annotator = HandlerCallAnnotator {
+        scoping: semantic.semantic.scoping(),
+        helpers: &helpers,
+        // The emitted file is under annotated-handlers/<handler path>,
+        // while definitions live under sibling helpers/. Account for
+        // handlers originally located in arbitrarily nested folders.
+        helper_prefix: "../".repeat(handler.path.bytes().filter(|b| *b == b'/').count() + 1),
+        seen: BTreeSet::new(),
+        edits: Vec::new(),
+    };
+    annotator.visit_program(&parsed.program);
+    if annotator.edits.is_empty() {
+        return Ok(None);
+    }
+    let mut output = source.to_owned();
+    for (offset, comment) in annotator.edits.iter().rev() {
+        if !output.is_char_boundary(*offset) {
+            anyhow::bail!("original handler call span is not UTF-8 aligned");
+        }
+        output.insert_str(*offset, comment);
+    }
+    Ok(Some(AnnotatedHandlerCalls {
+        source: output,
+        call_count: annotator.edits.len(),
+        helpers: annotator.seen.into_iter().collect(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::reconstruct_context;
+    use super::{annotate_handler_helper_calls, reconstruct_context};
+    use anyhow::{Context as _, Result};
+    use oxc_allocator::Allocator;
+    use oxc_span::SourceType;
+    use rolldown_redox::ecmascript::parse_program;
+
+    #[test]
+    fn inline_call_context_uses_only_unique_unresolved_lexical_helpers() -> Result<()> {
+        let original = r#"
+            function parent() {
+                const AM = function(J) { return J.Y ? fast(J) : slow(J); };
+                const O = function(J, Q) { const v=read(J); return choose(v,Q); };
+                let mutable = function(J) { return J; };
+                mutable = function(J) { return J + 1; };
+                function one() { const duplicate = function(J) {return J;}; }
+                function two() { const duplicate = function(J) {return J+1;}; }
+            }
+        "#;
+        let source = r#"const capturedHandler = function(input) {
+            AM(input);
+            O(input, 24);
+            mutable(input);
+            duplicate(input);
+            function shadow(AM) { return AM(input); }
+            return AM(input);
+        };"#;
+        let context =
+            reconstruct_context(original, &[("nested/handler.js".into(), source.into())])?;
+        let handler = context.handlers.first().context("missing handler")?;
+        let output =
+            annotate_handler_helper_calls(source, &context, handler)?.context("no annotation")?;
+        assert_eq!(output.call_count, 3);
+        assert_eq!(output.helpers, ["AM", "O", "mutable"]);
+        assert!(
+            output.source.contains("AM /* lexical helper AM: return J.Y ? fast(J) : slow(J); original definition ../../helpers/AM-"),
+            "{}",
+            output.source
+        );
+        assert!(
+            output
+                .source
+                .contains("O /* lexical helper O: original definition ../../helpers/O-"),
+            "{}",
+            output.source
+        );
+        assert!(
+            output.source.contains(
+                "mutable /* lexical helper mutable: initial definition ../../helpers/mutable-"
+            ) && output.source.contains("original binding reassigned"),
+            "{}",
+            output.source
+        );
+        assert!(
+            output.source.contains("duplicate(input)"),
+            "{}",
+            output.source
+        );
+        assert!(
+            output.source.contains("return AM(input)"),
+            "{}",
+            output.source
+        );
+        assert!(
+            output.source.contains("return AM(input);"),
+            "{}",
+            output.source
+        );
+        let allocator = Allocator::default();
+        assert!(parse_program(&allocator, &output.source, SourceType::unambiguous()).is_clean());
+        Ok(())
+    }
+
+    #[test]
+    fn inline_call_context_skips_unresolved_without_confirmed_definition() -> Result<()> {
+        let source = "const capturedHandler=function(x){return missing(x)};";
+        let context = reconstruct_context(
+            "function original() { const helper = function(x) {return x}; }",
+            &[("handler.js".into(), source.into())],
+        )?;
+        assert!(annotate_handler_helper_calls(source, &context, &context.handlers[0])?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn traverses_exact_lexical_helpers_not_shadowed_parameters() {

@@ -9,7 +9,7 @@ use jsvm_lift::{
     sha256_hex,
     source_tree_aliases::{explain_captured_handler_origins, explain_property_aliases},
     source_tree_callflow::{reconstruct_caller_views, CallerView},
-    source_tree_context::reconstruct_context,
+    source_tree_context::{annotate_handler_helper_calls, reconstruct_context},
     source_tree_specialize::{specialize_calls, specialize_resolved_call_graph},
 };
 use serde_json::json;
@@ -411,6 +411,54 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             md.push_str("[Browse exact lexical-alias analysis views](lexical-context/explained/README.md). ");
             md.push_str("The original property expressions remain dynamic where needed.\n\n");
         }
+        // Show the original lexical behavior at *actual callsites* in a
+        // separate, non-executable browsing copy of each recovered handler.
+        // This never touches the semantic recovery file written above.
+        let mut annotated_call_rows = Vec::new();
+        let mut annotated_index = String::from(
+            "# Source-backed lexical calls in recovered handlers\n\n\
+             These are presentation-only copies of the recovered handlers. \
+             Comments at direct calls identify uniquely resolved original \
+             helpers; small single-return bodies are quoted verbatim, while \
+             larger helpers link to their actual original definitions. \
+             Reassigned helpers describe their *initial* definition only. \
+             Other closure references remain unresolved, not guessed.\n\n",
+        );
+        for handler in &context.handlers {
+            let code = fs::read_to_string(out.join(&handler.path))?;
+            let Some(annotated) = annotate_handler_helper_calls(&code, &context, handler)? else {
+                continue;
+            };
+            let relative = format!("annotated-handlers/{}", handler.path);
+            if let Some(parent) = folder.join(&relative).parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(folder.join(&relative), &annotated.source)?;
+            annotated_index.push_str(&format!(
+                "- [{}]({}) — {} original lexical helper call annotations: {}\n",
+                handler.path,
+                handler.path,
+                annotated.call_count,
+                annotated.helpers.join(", ")
+            ));
+            annotated_call_rows.push(json!({
+                "path": handler.path,
+                "annotated_path": relative,
+                "annotated_calls": annotated.call_count,
+                "helpers": annotated.helpers,
+            }));
+        }
+        if !annotated_call_rows.is_empty() {
+            fs::write(folder.join("annotated-handlers/README.md"), annotated_index)?;
+            helper_index.push_str(
+                "\n[Browse recovered handlers with inline lexical helper context](annotated-handlers/README.md).\n",
+            );
+            md.push_str(
+                "\n## Recovered handlers with original lexical helper call context\n\n\
+                 [Read annotated handler code](lexical-context/annotated-handlers/README.md). \
+                 The ordinary reconstructed handler files are unchanged.\n\n",
+            );
+        }
         fs::write(folder.join("README.md"), &helper_index)?;
         // A fixed-argument callsite can expose a more useful helper body than
         // its multipurpose definition. Materialize *both* source views.
@@ -755,6 +803,8 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             "origin_handler_count": origin_rows.len(),
             "origin_handlers": origin_rows,
             "schema": "jsvm-readable-lexical-context/v2",
+            "annotated_handler_count": annotated_call_rows.len(),
+            "annotated_handler_calls": annotated_call_rows,
             "explained_alias_count": explained_rows.len(),
             "explained_aliases": explained_rows,
             "source": "lexical-context/original.js",
@@ -1275,6 +1325,15 @@ mod tests {
         let metadata: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(context_dir.join("context.json"))?)?;
         assert_eq!(metadata["helper_count"], 2);
+        assert_eq!(metadata["annotated_handler_count"], 1);
+        let inline = fs::read_to_string(context_dir.join("annotated-handlers/handler.js"))?;
+        assert!(
+            inline.contains("helper /* lexical helper helper: return byte(x)+y; original definition ../helpers/helper-"),
+            "{inline}"
+        );
+        assert!(fs::read_to_string(output.join("handler.js"))?.contains("helper(x, 16)"));
+        assert!(fs::read_to_string(output.join("README.md"))?
+            .contains("lexical-context/annotated-handlers/README.md"));
         assert_eq!(metadata["specialization_count"], 1);
         assert_eq!(metadata["explained_alias_count"], 0);
         assert!(

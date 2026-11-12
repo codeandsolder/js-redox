@@ -373,6 +373,18 @@ Helper files are navigation views, not independently runnable modules.
 The original enclosing source remains available because captured variables,
 later reassignments, and top-level side effects can change their behavior.
 
+A separate `lexical-context/annotated-handlers/` tree puts confirmed helper
+context **at the first direct call** in each recovered handler. For a short
+original, stable, single-return function it quotes that exact return expression
+next to the call; for longer helpers it links directly to the original
+definition. Helpers whose bindings are subsequently reassigned explicitly
+identify the linked code as the *initial definition*, not necessarily the
+function called at runtime. Semantic symbol resolution prevents annotations
+on local/shadowed parameters or unrecognized call targets. These inline
+comments are presentation-only and do not modify the proof-checked handler.
+The `lexical-context/context.json` manifest records annotated files and call
+counts.
+
 For mutable computed-property aliases, the `lexical-context/explained/`
 views retain executable property expressions and annotate them with their
 **actual** lexical string assignments and conditional overrides. For example,
