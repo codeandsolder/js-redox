@@ -7,4 +7,7 @@ publish = false
 [dependencies]
 zipp-vm = { path = "../upstream-zipp/crates/zipp-vm", default-features = false, features = ["instrument", "jit"] }
 
+serde_json = "1"
+sha2 = "0.10"
+
 [workspace]

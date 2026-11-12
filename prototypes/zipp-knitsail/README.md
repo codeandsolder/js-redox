@@ -80,3 +80,12 @@ AST identity, so Node v2/v3 capture and native OXC import remain the
 operative provenance pipeline.
 
 [Implementation, pinned ZIPP patch and proof boundaries](HOWTO-ZIPP-DYNAMIC-SOURCE-OBSERVER.md).
+
+## Exact original-source correlation
+
+The optional [ZIPP → OXC callsite correlation pilot](HOWTO-ZIPP-OXC-CORRELATION.md)
+adds a native ZIPP runtime-source CLI and an exact-SHA-256/UTF-16 join against
+the native OXC `eval-sites` inventory. Direct eval events can be paired with
+one verified initial-program AST callsite; ambiguous, unsupported, generated,
+indirect and otherwise unlocatable events stay explicitly unresolved. This is
+diagnostic evidence, **not yet** an importer witness.
