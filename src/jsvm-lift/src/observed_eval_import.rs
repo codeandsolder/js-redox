@@ -241,11 +241,17 @@ impl<'a> Visit<'a> for Scan<'_> {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if !call.optional && matches!(&call.callee, Expression::Identifier(id) if id.name == "eval")
-        {
-            let eval_unresolved = if let Expression::Identifier(callee) = &call.callee {
-                callee
-                    .reference_id
+        // Parentheses preserve the identifier Reference used by direct eval:
+        // (eval)(code) and ((eval))(code) have the same lexical behavior as
+        // eval(code). A comma/sequence, optional call or shadowed local eval
+        // does not. Keep the original call AST span for source correlation.
+        let mut callee = &call.callee;
+        while let Expression::ParenthesizedExpression(paren) = callee {
+            callee = &paren.expression;
+        }
+        if !call.optional && matches!(callee, Expression::Identifier(id) if id.name == "eval") {
+            let eval_unresolved = if let Expression::Identifier(id) = callee {
+                id.reference_id
                     .get()
                     .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
                     .is_none()
@@ -1412,6 +1418,32 @@ mod tests {
                 source_files: vec![outer_source, inner_source],
             },
         ))
+    }
+
+    #[test]
+    fn parentheses_preserve_direct_eval_identity_not_comma_optional_or_shadowed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("original.js");
+        let code = concat!(
+            "function f(D) { return (eval)(D) + ((eval))(D) + eval(D); }",
+            "function shadow(eval,D) { return (eval)(D); }",
+            "function comma(D) { return (0,eval)(D); }",
+            "function optional(D) { return eval?.(D); }",
+            "function spread(D) { return (eval)(...D); }"
+        );
+        fs::write(&path, code)?;
+        let inventory = discover_direct_eval_sites(&path)?;
+        let selected = inventory["sites"].as_array().context("selected")?;
+        let unsupported = inventory["unsupported"].as_array().context("unsupported")?;
+        assert_eq!(selected.len(), 3);
+        assert_eq!(unsupported.len(), 1);
+        let expressions = selected
+            .iter()
+            .map(|site| site["evalSite"]["expression"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(expressions, ["(eval)(D)", "((eval))(D)", "eval(D)"]);
+        assert_eq!(unsupported[0]["evalSite"]["expression"], "(eval)(...D)");
+        Ok(())
     }
 
     #[test]
