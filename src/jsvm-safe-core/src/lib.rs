@@ -61,6 +61,7 @@ use value_eval::{
 };
 pub use value_eval::{
     eval as eval_static_primitive, eval_with_resolver as eval_static_primitive_with_resolver,
+    inert_literal_value as is_inert_static_literal,
     known_bool_with_resolver as known_static_bool_with_resolver, string_literal_value,
     template_element_value, Value as StaticPrimitiveValue,
 };

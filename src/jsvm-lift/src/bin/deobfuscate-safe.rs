@@ -1703,6 +1703,7 @@ mod tests {
         let recovered = fs::read_to_string(lexical.join(path))?;
         assert!(!recovered.contains("while"), "{recovered}");
         assert!(recovered.contains("trace(Q)"), "{recovered}");
+        assert!(!recovered.contains("({});"), "{recovered}");
         assert!(recovered.contains("return Q"), "{recovered}");
         assert_eq!(
             fs::read_to_string(lexical.join("original.js"))?,

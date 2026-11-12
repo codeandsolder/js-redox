@@ -6,7 +6,7 @@
 //! condition, and evaluation effects of guarded breaks while eliminating
 //! unreachable updates and the loop control frame. Original source is retained.
 use anyhow::Result;
-use jsvm_safe_core::known_static_bool_with_resolver;
+use jsvm_safe_core::{is_inert_static_literal, known_static_bool_with_resolver};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrowFunctionExpression, BreakStatement, DoWhileStatement, Expression, ForInStatement,
@@ -109,6 +109,9 @@ fn truthy_after_effects(test: &Expression<'_>) -> bool {
             .expressions
             .last()
             .is_some_and(truthy_after_effects),
+        // Each RegExp literal produces a fresh object (and is truthy), just
+        // like a proven inert array/object literal. Its value never escapes.
+        Expression::RegExpLiteral(_) => true,
         other => known_static_bool_with_resolver(other, &|_| None) == Some(true),
     }
 }
@@ -133,7 +136,42 @@ fn terminal_guard_test<'a>(statement: &'a Statement<'a>) -> Option<&'a Expressio
         .then_some(&guard.test)
 }
 
-fn single_trip_body(body: &Statement<'_>, source: &str) -> Option<String> {
+/// Evaluate only the effects of an expression whose result is discarded.
+/// Every comma operand still performs GetValue, including getters and direct
+/// eval calls. The shared inert-literal proof allows us to omit only operands
+/// that cannot invoke code, read bindings, or throw.
+fn discarded_guard_effects(test: &Expression<'_>, source: &str) -> Option<String> {
+    if is_inert_static_literal(test) {
+        return Some(String::new());
+    }
+    match test {
+        Expression::ParenthesizedExpression(paren) => {
+            discarded_guard_effects(&paren.expression, source)
+        }
+        Expression::SequenceExpression(sequence) => {
+            let mut effects = String::new();
+            for operand in &sequence.expressions {
+                effects.push_str(&discarded_guard_effects(operand, source)?);
+            }
+            Some(effects)
+        }
+        _ => {
+            let expression = source.get(test.span().start as usize..test.span().end as usize)?;
+            Some(format!("({expression});"))
+        }
+    }
+}
+
+fn single_trip_body(
+    body: &Statement<'_>,
+    source: &str,
+    completion_discarded: bool,
+) -> Option<String> {
+    // At script/eval top level, replacing a while with an if can change the
+    // observable completion value even when all expressions still execute.
+    if !completion_discarded {
+        return None;
+    }
     let (prefix, terminal) = if let Statement::BlockStatement(block) = body {
         let last = block.body.last()?;
         let mut escapes = Escapes::default();
@@ -154,13 +192,16 @@ fn single_trip_body(body: &Statement<'_>, source: &str) -> Option<String> {
         return Some(prefix.to_owned());
     }
     let test = terminal_guard_test(terminal)?;
-    let test_source = source.get(test.span().start as usize..test.span().end as usize)?;
-    Some(format!("{prefix} ({test_source});"))
+    Some(format!(
+        "{prefix} {}",
+        discarded_guard_effects(test, source)?
+    ))
 }
 
 struct LoopCandidate<'s> {
     source: &'s str,
     edits: Vec<(Span, String)>,
+    function_depth: usize,
 }
 
 impl LoopCandidate<'_> {
@@ -170,8 +211,20 @@ impl LoopCandidate<'_> {
 }
 
 impl<'a> Visit<'a> for LoopCandidate<'_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        self.function_depth += 1;
+        walk::walk_function(self, function, flags);
+        self.function_depth -= 1;
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        self.function_depth += 1;
+        walk::walk_arrow_function_expression(self, arrow);
+        self.function_depth -= 1;
+    }
+
     fn visit_for_statement(&mut self, stmt: &ForStatement<'a>) {
-        if let Some(body) = single_trip_body(&stmt.body, self.source) {
+        if let Some(body) = single_trip_body(&stmt.body, self.source, self.function_depth > 0) {
             // The initializer always runs once. The update cannot run because
             // the final break terminates the first iteration, if reached.
             let init = stmt
@@ -191,7 +244,7 @@ impl<'a> Visit<'a> for LoopCandidate<'_> {
     }
 
     fn visit_while_statement(&mut self, stmt: &WhileStatement<'a>) {
-        if let Some(body) = single_trip_body(&stmt.body, self.source) {
+        if let Some(body) = single_trip_body(&stmt.body, self.source, self.function_depth > 0) {
             if let Some(test) = self.slice(stmt.test.span()) {
                 self.edits
                     .push((stmt.span, format!("if ({test}) {{{body}}}")));
@@ -201,7 +254,7 @@ impl<'a> Visit<'a> for LoopCandidate<'_> {
     }
 
     fn visit_do_while_statement(&mut self, stmt: &DoWhileStatement<'a>) {
-        if let Some(body) = single_trip_body(&stmt.body, self.source) {
+        if let Some(body) = single_trip_body(&stmt.body, self.source, self.function_depth > 0) {
             // A terminating first iteration cannot reach the test.
             self.edits.push((stmt.span, format!("{{{body}}}")));
         }
@@ -232,6 +285,7 @@ pub fn reflow_single_trip_loops(source: &str) -> Result<ReflowedLoops> {
         let mut candidates = LoopCandidate {
             source: &output,
             edits: Vec::new(),
+            function_depth: 0,
         };
         candidates.visit_program(&parsed.program);
         // One innermost loop per pass: no overlapping text edits, and each
@@ -353,6 +407,61 @@ mod tests {
                 out.source
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn discards_inert_guard_values_but_keeps_every_effect() -> Result<()> {
+        let source = r#"function f(log, obj){
+            while (true) if ((log.push("first"), (obj.value, {}))) break;
+            while ("X") if ((log.push("second"), [])) break;
+            while (2) if ((log.push("third"), 17)) break;
+            while (true) if ((log.push("fourth"), "always")) break;
+            while (true) if ((log.push("fifth"), /x/)) break;
+        }"#;
+        let out = reflow_single_trip_loops(source)?;
+        assert_eq!(out.rewritten_loops, 5, "{}", out.source);
+        for preserved in [
+            "log.push(\"first\")",
+            "obj.value",
+            "log.push(\"second\")",
+            "log.push(\"third\")",
+            "log.push(\"fourth\")",
+            "log.push(\"fifth\")",
+        ] {
+            assert!(
+                out.source.contains(preserved),
+                "{preserved}: {}",
+                out.source
+            );
+        }
+        for inert in ["({});", "[];", "(17);", "(\"always\");", "(/x/);"] {
+            assert!(!out.source.contains(inert), "{inert}: {}", out.source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retains_completion_sensitive_guards_at_script_level() -> Result<()> {
+        let source = "while(true)if((trace(),{}))break;";
+        let out = reflow_single_trip_loops(source)?;
+        assert_eq!(out.rewritten_loops, 0);
+        assert_eq!(out.source, source);
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_direct_eval_and_accessor_effects_in_guard_prefixes() -> Result<()> {
+        let source = "function f(obj){while(true)if((eval('obj.seen=1'),obj.value,{}))break;}";
+        let out = reflow_single_trip_loops(source)?;
+        assert_eq!(out.rewritten_loops, 1);
+        assert!(
+            out.source.contains("(eval('obj.seen=1'));"),
+            "{}",
+            out.source
+        );
+        assert!(out.source.contains("(obj.value);"), "{}", out.source);
+        assert!(!out.source.contains("({});"), "{}", out.source);
         Ok(())
     }
 

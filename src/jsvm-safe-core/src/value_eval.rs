@@ -161,7 +161,7 @@ where
 /// A literal expression whose complete evaluation cannot access bindings,
 /// invoke user code, or throw. Fresh array/RegExp/object allocations have
 /// no externally visible effect until their values escape.
-pub(crate) fn inert_literal_value(expr: &Expression<'_>) -> bool {
+pub fn inert_literal_value(expr: &Expression<'_>) -> bool {
     match expr {
         Expression::StringLiteral(_)
         | Expression::NumericLiteral(_)
