@@ -191,6 +191,7 @@ struct PolishedHelperView {
     post_reflow_error: Option<String>,
     adjacent_returns: usize,
     labeled_return_joins: usize,
+    guarded_return_joins: usize,
     post_return_error: Option<String>,
 }
 
@@ -228,30 +229,32 @@ fn polish_lexical_helper_view(
     let returns = recover_terminal_returns(&source)?;
     let adjacent_returns = returns.adjacent_returns;
     let labeled_return_joins = returns.labeled_joins;
-    let (source, post_return_error) = if adjacent_returns + labeled_return_joins == 0 {
-        (returns.source, None)
-    } else {
-        let budget = budgets.operation(
-            AnalysisOperation::SafeDeobfuscation,
-            format!("post-return-flow {label}"),
-        );
-        match deobfuscate_source(
-            &returns.source,
-            format!("post-return-flow {label}"),
-            SourceMode::Auto,
-            max_iterations,
-            format_output,
-            &budget,
-        ) {
-            Ok(outcome) => {
-                for (kind, count) in outcome.report.transforms {
-                    *subsequent_transforms.entry(kind).or_default() += count;
+    let guarded_return_joins = returns.guarded_joins;
+    let (source, post_return_error) =
+        if adjacent_returns + labeled_return_joins + guarded_return_joins == 0 {
+            (returns.source, None)
+        } else {
+            let budget = budgets.operation(
+                AnalysisOperation::SafeDeobfuscation,
+                format!("post-return-flow {label}"),
+            );
+            match deobfuscate_source(
+                &returns.source,
+                format!("post-return-flow {label}"),
+                SourceMode::Auto,
+                max_iterations,
+                format_output,
+                &budget,
+            ) {
+                Ok(outcome) => {
+                    for (kind, count) in outcome.report.transforms {
+                        *subsequent_transforms.entry(kind).or_default() += count;
+                    }
+                    (outcome.source, None)
                 }
-                (outcome.source, None)
+                Err(error) => (returns.source, Some(error.to_string())),
             }
-            Err(error) => (returns.source, Some(error.to_string())),
-        }
-    };
+        };
     Ok(PolishedHelperView {
         source,
         single_trip_loops_reflowed: reflowed.rewritten_loops,
@@ -259,6 +262,7 @@ fn polish_lexical_helper_view(
         post_reflow_error,
         adjacent_returns,
         labeled_return_joins,
+        guarded_return_joins,
         post_return_error,
     })
 }
@@ -459,6 +463,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             let post_reflow_error = polished.post_reflow_error;
             let adjacent_returns = polished.adjacent_returns;
             let labeled_return_joins = polished.labeled_return_joins;
+            let guarded_return_joins = polished.guarded_return_joins;
             let post_return_error = polished.post_return_error;
             for (kind, count) in polished.subsequent_transforms {
                 *transforms.entry(kind).or_default() += count;
@@ -467,6 +472,11 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 *transforms
                     .entry("source_adjacent_return_flow".to_owned())
                     .or_default() += adjacent_returns;
+            }
+            if guarded_return_joins > 0 {
+                *transforms
+                    .entry("source_guarded_return_flow".to_owned())
+                    .or_default() += guarded_return_joins;
             }
             if labeled_return_joins > 0 {
                 *transforms
@@ -520,6 +530,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "post_reflow_error": post_reflow_error,
                 "adjacent_return_values": adjacent_returns,
                 "labeled_return_joins": labeled_return_joins,
+                "guarded_return_joins": guarded_return_joins,
                 "post_return_error": post_return_error,
                 "transforms": transforms,
                 "error": error,
@@ -730,6 +741,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             let post_reflow_error = polished.post_reflow_error;
             let adjacent_returns = polished.adjacent_returns;
             let labeled_return_joins = polished.labeled_return_joins;
+            let guarded_return_joins = polished.guarded_return_joins;
             let post_return_error = polished.post_return_error;
             for (kind, count) in polished.subsequent_transforms {
                 *transforms.entry(kind).or_default() += count;
@@ -738,6 +750,11 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 *transforms
                     .entry("source_adjacent_return_flow".to_owned())
                     .or_default() += adjacent_returns;
+            }
+            if guarded_return_joins > 0 {
+                *transforms
+                    .entry("source_guarded_return_flow".to_owned())
+                    .or_default() += guarded_return_joins;
             }
             if labeled_return_joins > 0 {
                 *transforms
@@ -783,6 +800,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "post_reflow_error": post_reflow_error,
                 "adjacent_return_values": adjacent_returns,
                 "labeled_return_joins": labeled_return_joins,
+                "guarded_return_joins": guarded_return_joins,
                 "post_return_error": post_return_error,
                 "transforms": transforms,
                 "error": error,
@@ -1576,6 +1594,52 @@ mod tests {
         assert_eq!(fs::read_to_string(output.join("lexical-context/original.js"))?,
                    "function root(){const modeHandler=function(x, selector, result){for(0;(selector&90)==selector;true){touch(x);break;}result=x;return result;};}");
         assert!(fs::read_to_string(output.join("handler.js"))?.contains("modeHandler(x, 9)"));
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_recovers_guarded_return_joins_from_original_helper() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let original_source = "function root(){const guarded=function(J,Q,Y,H){if((Q&3)==1){a:{if(J.Y){H=w8(J,J.D);break a;}H=Y;}}return H;};}";
+        fs::write(&original, original_source)?;
+        fs::write(
+            input.join("handler.js"),
+            "const capturedHandler=function(J,Y,H){return guarded(J,1,Y,H);};",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let lexical = output.join("lexical-context");
+        let context: serde_json::Value =
+            serde_json::from_slice(&fs::read(lexical.join("context.json"))?)?;
+        let row = &context["helpers"][0];
+        assert_eq!(row["name"], "guarded");
+        assert_eq!(row["guarded_return_joins"], 1, "{row}");
+        assert!(row["post_return_error"].is_null(), "{row}");
+        let path = row["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("helper view path missing"))?;
+        let recovered = fs::read_to_string(lexical.join(path))?;
+        assert!(recovered.contains("return w8(J, J.D)"), "{recovered}");
+        assert!(recovered.contains("return Y"), "{recovered}");
+        assert!(recovered.contains("return H"), "{recovered}");
+        assert!(!recovered.contains("break a"), "{recovered}");
+        assert_eq!(
+            fs::read_to_string(lexical.join("original.js"))?,
+            original_source
+        );
+        assert!(fs::read_to_string(output.join("handler.js"))?
+            .contains("guarded(J, 1, Y, H)"));
         Ok(())
     }
 

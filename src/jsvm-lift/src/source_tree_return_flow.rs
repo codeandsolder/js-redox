@@ -7,12 +7,17 @@
 use anyhow::Result;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    AssignmentTarget, Expression, FunctionBody, IdentifierReference, Statement, WithStatement,
+    ArrowFunctionExpression, AssignmentTarget, Expression, Function, FunctionBody,
+    IdentifierReference, Statement, WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType, Span};
-use oxc_syntax::{operator::AssignmentOperator, symbol::SymbolId};
+use oxc_syntax::{
+    operator::AssignmentOperator,
+    scope::{ScopeFlags, ScopeId},
+    symbol::SymbolId,
+};
 use rolldown_redox::ecmascript::parse_program;
 
 #[derive(Debug)]
@@ -20,6 +25,7 @@ pub struct RecoveredReturns {
     pub source: String,
     pub adjacent_returns: usize,
     pub labeled_joins: usize,
+    pub guarded_joins: usize,
 }
 
 #[derive(Default)]
@@ -80,6 +86,7 @@ fn snippet(source: &str, span: Span) -> Option<&str> {
 enum Kind {
     Adjacent,
     LabeledJoin,
+    GuardedJoin,
 }
 
 struct Candidate {
@@ -91,17 +98,100 @@ struct Candidate {
 struct ReturnFlow<'s> {
     scoping: &'s Scoping,
     source: &'s str,
+    function_scope: Option<ScopeId>,
     edits: Vec<Candidate>,
 }
 
 impl ReturnFlow<'_> {
+    /// Recover both edges of a labeled branch join, preserving the original
+    /// condition, intervening effects and lexical block scope.
+    fn labeled_join(
+        &self,
+        statement: &Statement<'_>,
+        symbol: SymbolId,
+        reference_count: usize,
+    ) -> Option<String> {
+        if reference_count != 3 {
+            return None;
+        }
+        let Statement::LabeledStatement(label) = statement else {
+            return None;
+        };
+        let Statement::BlockStatement(block) = &label.body else {
+            return None;
+        };
+        if block.body.len() < 2 {
+            return None;
+        }
+        let Statement::IfStatement(branch) = block.body.first()? else {
+            return None;
+        };
+        if branch.alternate.is_some() {
+            return None;
+        }
+        let Statement::BlockStatement(consequent) = &branch.consequent else {
+            return None;
+        };
+        let [first, Statement::BreakStatement(jump)] = consequent.body.as_slice() else {
+            return None;
+        };
+        if jump
+            .label
+            .as_ref()
+            .is_none_or(|name| name.name != label.label.name)
+        {
+            return None;
+        }
+        let (branch_target, branch_rhs) = assignment(first)?;
+        let (last_target, last_rhs) = assignment(block.body.last()?)?;
+        if binding(self.scoping, branch_target) != Some(symbol)
+            || binding(self.scoping, last_target) != Some(symbol)
+        {
+            return None;
+        }
+        let condition = snippet(self.source, branch.test.span())?;
+        let branch_value = snippet(self.source, branch_rhs.span())?;
+        let last_value = snippet(self.source, last_rhs.span())?;
+        let middle = if block.body.len() > 2 {
+            snippet(
+                self.source,
+                Span::new(
+                    block.body[1].span().start,
+                    block.body[block.body.len() - 2].span().end,
+                ),
+            )?
+        } else {
+            ""
+        };
+        // A second break to this label will fail syntax validation when the
+        // label is removed. Do not infer anything about unknown expressions.
+        Some(format!(
+            "{{ if ({condition}) {{ return ({branch_value}); }} {middle} return ({last_value}); }}"
+        ))
+    }
+
+    /// Only a single plain assignment, optionally wrapped in a block, is
+    /// eligible as one return edge. A nested declaration or effectful suffix
+    /// cannot accidentally be skipped.
+    fn branch_value<'a>(
+        &self,
+        statement: &'a Statement<'a>,
+        symbol: SymbolId,
+    ) -> Option<&'a Expression<'a>> {
+        let single = match statement {
+            Statement::BlockStatement(block) if block.body.len() == 1 => &block.body[0],
+            Statement::BlockStatement(_) => return None,
+            other => other,
+        };
+        let (target, rhs) = assignment(single)?;
+        (binding(self.scoping, target) == Some(symbol)).then_some(rhs)
+    }
+
     fn recover_body(&mut self, body: &FunctionBody<'_>) {
         let statements = &body.statements;
         let Some(returned) = statements.last().and_then(ident_return) else {
             return;
         };
-        // Direct eval / with / arguments may observe or mutate formals without
-        // explicit lexical references. Don't erase those assignments.
         let mut dynamic = DynamicScope::default();
         dynamic.visit_function_body(body);
         if dynamic.present {
@@ -110,7 +200,13 @@ impl ReturnFlow<'_> {
         let Some(symbol) = binding(self.scoping, returned) else {
             return;
         };
-        let references = self.scoping.get_resolved_reference_ids(symbol);
+        // A symbol defined in an enclosing function/module is externally
+        // observable even when only the current function writes and returns it.
+        // Only rewrite a binding owned by THIS function's lexical environment.
+        if self.function_scope != Some(self.scoping.symbol_scope_id(symbol)) {
+            return;
+        }
+        let reference_count = self.scoping.get_resolved_reference_ids(symbol).len();
         let Some(before) = statements.get(statements.len().saturating_sub(2)) else {
             return;
         };
@@ -118,9 +214,8 @@ impl ReturnFlow<'_> {
             return;
         };
 
-        // The only references must be the assignment write + terminal read.
         if let Some((target, rhs)) = assignment(before) {
-            if binding(self.scoping, target) == Some(symbol) && references.len() == 2 {
+            if binding(self.scoping, target) == Some(symbol) && reference_count == 2 {
                 if let Some(expr) = snippet(self.source, rhs.span()) {
                     self.edits.push(Candidate {
                         span: Span::new(before.span().start, return_statement.span().end),
@@ -132,99 +227,88 @@ impl ReturnFlow<'_> {
             return;
         }
 
-        // A last labeled block may use a branch exit followed by a terminal
-        // assignment feeding the final return:
-        //
-        // label: { if (predicate) { tmp = first; break label; }
-        //          <independent statements>; tmp = second; }
-        // return tmp;
-        //
-        // Keep the block scope, run predicate and expressions in their
-        // original order, replace the two join edges with direct returns.
-        let Statement::LabeledStatement(label) = before else {
-            return;
-        };
-        let Statement::BlockStatement(block) = &label.body else {
-            return;
-        };
-        let Some(first) = block.body.first() else {
-            return;
-        };
-        let Statement::IfStatement(branch) = first else {
-            return;
-        };
-        if branch.alternate.is_some() {
+        if let Some(replacement) = self.labeled_join(before, symbol, reference_count) {
+            self.edits.push(Candidate {
+                span: Span::new(before.span().start, return_statement.span().end),
+                replacement,
+                kind: Kind::LabeledJoin,
+            });
             return;
         }
-        let Statement::BlockStatement(consequent) = &branch.consequent else {
+
+        let Statement::IfStatement(branch) = before else {
             return;
         };
-        let [branch_assignment, Statement::BreakStatement(jump)] = consequent.body.as_slice()
-        else {
-            return;
-        };
-        if jump
-            .label
-            .as_ref()
-            .is_none_or(|name| name.name != label.label.name)
-        {
-            return;
-        }
-        let Some((branch_target, branch_rhs)) = assignment(branch_assignment) else {
-            return;
-        };
-        let Some(last_assignment) = block.body.last() else {
-            return;
-        };
-        let Some((last_target, last_rhs)) = assignment(last_assignment) else {
-            return;
-        };
-        if binding(self.scoping, branch_target) != Some(symbol)
-            || binding(self.scoping, last_target) != Some(symbol)
-            || references.len() != 3
-        {
-            return;
-        }
-        // Label must have at least the branch and fallthrough assignment.
-        if block.body.len() < 2 {
-            return;
-        }
         let Some(condition) = snippet(self.source, branch.test.span()) else {
             return;
         };
-        let Some(branch_value) = snippet(self.source, branch_rhs.span()) else {
-            return;
-        };
-        let Some(last_value) = snippet(self.source, last_rhs.span()) else {
-            return;
-        };
-        let middle = if block.body.len() > 2 {
-            snippet(
-                self.source,
-                Span::new(
-                    block.body[1].span().start,
-                    block.body[block.body.len() - 2].span().end,
+
+        // If both edges assign the returned temporary, replace the entire
+        // join. Otherwise keep the original terminal return as the false
+        // path's value (especially relevant for formal parameters).
+        if let Some(alternate) = branch.alternate.as_ref() {
+            if reference_count != 3 {
+                return;
+            }
+            let (Some(yes), Some(no)) = (
+                self.branch_value(&branch.consequent, symbol),
+                self.branch_value(alternate, symbol),
+            ) else {
+                return;
+            };
+            let (Some(yes), Some(no)) = (
+                snippet(self.source, yes.span()),
+                snippet(self.source, no.span()),
+            ) else {
+                return;
+            };
+            self.edits.push(Candidate {
+                span: Span::new(before.span().start, return_statement.span().end),
+                replacement: format!(
+                    "if ({condition}) {{ return ({yes}); }} else {{ return ({no}); }}"
                 ),
-            )
-        } else {
-            Some("")
-        };
-        let Some(middle) = middle else {
+                kind: Kind::GuardedJoin,
+            });
             return;
+        }
+
+        let new_consequent = if reference_count == 2 {
+            self.branch_value(&branch.consequent, symbol)
+                .and_then(|value| snippet(self.source, value.span()))
+                .map(|value| format!("return ({value});"))
+        } else {
+            let labeled = match &branch.consequent {
+                Statement::LabeledStatement(_) => Some(&branch.consequent),
+                Statement::BlockStatement(block) if block.body.len() == 1 => block.body.first(),
+                _ => None,
+            };
+            labeled.and_then(|stmt| self.labeled_join(stmt, symbol, reference_count))
         };
-        // An extra break to the removed label would fail the semantic
-        // verification below; nothing beyond the validated source is emitted.
-        self.edits.push(Candidate {
-            span: Span::new(before.span().start, return_statement.span().end),
-            replacement: format!(
-                "{{ if ({condition}) {{ return ({branch_value}); }} {middle} return ({last_value}); }}"
-            ),
-            kind: Kind::LabeledJoin,
-        });
+        if let Some(consequent) = new_consequent {
+            self.edits.push(Candidate {
+                span: before.span(),
+                replacement: format!("if ({condition}) {{ {consequent} }}"),
+                kind: Kind::GuardedJoin,
+            });
+        }
     }
 }
 
 impl<'a> Visit<'a> for ReturnFlow<'_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        let enclosing = self.function_scope;
+        self.function_scope = function.scope_id.get();
+        walk::walk_function(self, function, flags);
+        self.function_scope = enclosing;
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        let enclosing = self.function_scope;
+        self.function_scope = arrow.scope_id.get();
+        walk::walk_arrow_function_expression(self, arrow);
+        self.function_scope = enclosing;
+    }
+
     fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
         self.recover_body(body);
         walk::walk_function_body(self, body);
@@ -237,6 +321,7 @@ pub fn recover_terminal_returns(source: &str) -> Result<RecoveredReturns> {
     let mut output = source.to_owned();
     let mut adjacent_returns = 0;
     let mut labeled_joins = 0;
+    let mut guarded_joins = 0;
     loop {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, &output, SourceType::unambiguous());
@@ -252,6 +337,7 @@ pub fn recover_terminal_returns(source: &str) -> Result<RecoveredReturns> {
         let mut analyzer = ReturnFlow {
             scoping: semantic.semantic.scoping(),
             source: &output,
+            function_scope: None,
             edits: Vec::new(),
         };
         analyzer.visit_program(&parsed.program);
@@ -281,6 +367,7 @@ pub fn recover_terminal_returns(source: &str) -> Result<RecoveredReturns> {
             match edit.kind {
                 Kind::Adjacent => adjacent_returns += 1,
                 Kind::LabeledJoin => labeled_joins += 1,
+                Kind::GuardedJoin => guarded_joins += 1,
             }
             changed = true;
             break;
@@ -293,6 +380,7 @@ pub fn recover_terminal_returns(source: &str) -> Result<RecoveredReturns> {
         source: output,
         adjacent_returns,
         labeled_joins,
+        guarded_joins,
     })
 }
 
@@ -356,6 +444,90 @@ mod tests {
         for src in cases {
             let out = recover_terminal_returns(src)?;
             assert_eq!(out.source, src, "{src} -> {}", out.source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_assignment_preserves_initial_return_value_on_false_path() -> Result<()> {
+        let src = "function f(q, x){if(x){q=touch(x);}return q;}";
+        let out = recover_terminal_returns(src)?;
+        assert_eq!(out.guarded_joins, 1);
+        assert!(out.source.contains("return (touch(x));"), "{}", out.source);
+        assert!(out.source.ends_with("return q;}"), "{}", out.source);
+        Ok(())
+    }
+
+    #[test]
+    fn complete_if_else_join_returns_each_branch_directly() -> Result<()> {
+        let src = "function f(q, x){if(x)q=left();else{q=right();}return q;}";
+        let out = recover_terminal_returns(src)?;
+        assert_eq!(out.guarded_joins, 1);
+        assert!(out.source.contains("return (left());"), "{}", out.source);
+        assert!(out.source.contains("return (right());"), "{}", out.source);
+        assert!(!out.source.contains("return q;"), "{}", out.source);
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_labeled_join_recovers_original_multimode_helper() -> Result<()> {
+        let src = "const V=function(J,Q,Y,L,H){if((Q>>2&5)==1){a:{if(J.Y){H=w8(J,J.D);break a;}if((Y=$X(8,J,true),Y)&128){Y^=128;L=$X(2,J,true);Y=(Y<<2)+(L|0);}H=Y;}}return H;};";
+        let out = recover_terminal_returns(src)?;
+        assert_eq!(out.guarded_joins, 1, "{}", out.source);
+        assert_eq!(out.labeled_joins, 0);
+        assert!(out.source.contains("return (w8(J,J.D));"), "{}", out.source);
+        assert!(out.source.contains("return (Y);"), "{}", out.source);
+        assert!(out.source.contains("return H;"), "{}", out.source);
+        assert!(!out.source.contains("break a;"), "{}", out.source);
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_joins_reject_intermediate_effects_or_observable_bindings() -> Result<()> {
+        for src in [
+            "function f(x,q){if(x){q=left();after();}return q;}",
+            "function f(x,q){if(x){q=left();}else{right();}return q;}",
+            "function f(x,q){if(x){q=left();}else{q=right();observe(q);}return q;}",
+            "function f(x,q){if(x){q=left();}console.log(q);return q;}",
+            "function f(x,q){if(x){try{q=left();}finally{other();}}return q;}",
+            "function f(x,q){if(x){a:{if(x){q=left();break a;}q=right();}other();}return q;}",
+            "function f(x,q){if(x){q=left();}return arguments[0];}",
+        ] {
+            let out = recover_terminal_returns(src)?;
+            assert_eq!(out.source, src, "{src} -> {}", out.source);
+            assert_eq!(out.guarded_joins, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enclosing_lexical_assignments_are_observable_and_must_remain() -> Result<()> {
+        for src in [
+            "let shared;function f(){shared=touch();return shared;}",
+            "let shared;const f=()=>{shared=touch();return shared;};",
+            "function outer(){let q;function inner(){q=touch();return q;}return inner;}",
+            "function outer(){let q;const inner=()=>{if(flag){q=touch();}return q;};return inner;}",
+            "let state;function f(flag){if(flag){state=one();}else{state=two();}return state;}",
+        ] {
+            let out = recover_terminal_returns(src)?;
+            assert_eq!(out.source, src, "{src} -> {}", out.source);
+            assert_eq!(
+                out.adjacent_returns + out.labeled_joins + out.guarded_joins,
+                0
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn function_owned_bindings_work_in_arrows_methods_and_nested_functions() -> Result<()> {
+        for src in [
+            "const f=(q,x)=>{if(x){q=touch(x);}return q;};",
+            "class C{method(q,x){if(x){q=touch(x);}return q;}}",
+            "function outer(){const f=function(q,x){if(x){q=touch(x);}return q;};return f;}",
+        ] {
+            let out = recover_terminal_returns(src)?;
+            assert_eq!(out.guarded_joins, 1, "{src}: {}", out.source);
         }
         Ok(())
     }

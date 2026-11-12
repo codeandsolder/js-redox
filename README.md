@@ -557,9 +557,14 @@ that structural change (for example, a specialized `if (false)` branch).
 The source-backed helper views also recover direct values from terminal
 return temporaries. When Oxc proves a temporary has no other references,
 `temp = value; return temp` becomes `return value`. The same symbol-resolved
-dataflow applies to an adjacent labeled-branch join that assigns the
-temporary on either path before returning it. Dynamic scope, `eval`,
-`arguments` access, or extra reads/writes prevent those rewrites.
+dataflow applies to labeled branch joins, conditional assignments with a
+fallback return, and complete `if/else` joins. An outer guard may enclose a
+labeled join: the result is returned directly only when that guard executes,
+leaving the original fallback return intact. The temporary must belong to
+the function being rewritten; writes to captured or enclosing lexical
+bindings remain observable even if only written and returned once.
+Dynamic scope, `eval`, `arguments` access, or extra reads/writes also
+prevent these rewrites.
 These improvements are fed through the existing static deobfuscator again;
 they are not runtime-execution or value-guessing shortcuts.
 Any unsuccessful follow-up analysis is recorded rather than aborting
