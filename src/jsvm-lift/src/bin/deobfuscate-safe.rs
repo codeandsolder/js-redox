@@ -15,6 +15,7 @@ use jsvm_lift::{
     },
     source_tree_inline::expand_helper_returns,
     source_tree_reflow::reflow_single_trip_loops,
+    source_tree_return_flow::recover_terminal_returns,
     source_tree_specialize::{specialize_calls, specialize_resolved_call_graph},
 };
 use serde_json::json;
@@ -186,8 +187,11 @@ fn collect_js_sources(root: &Path) -> Result<Vec<PathBuf>> {
 struct PolishedHelperView {
     source: String,
     single_trip_loops_reflowed: usize,
-    post_reflow_transforms: BTreeMap<String, usize>,
+    subsequent_transforms: BTreeMap<String, usize>,
     post_reflow_error: Option<String>,
+    adjacent_returns: usize,
+    labeled_return_joins: usize,
+    post_return_error: Option<String>,
 }
 
 /// Re-run the existing static pass after loop structure has become explicit.
@@ -201,34 +205,61 @@ fn polish_lexical_helper_view(
     budgets: &AnalysisBudgets,
 ) -> Result<PolishedHelperView> {
     let reflowed = reflow_single_trip_loops(&source)?;
-    if reflowed.rewritten_loops == 0 {
-        return Ok(PolishedHelperView {
-            source,
-            single_trip_loops_reflowed: 0,
-            post_reflow_transforms: BTreeMap::new(),
-            post_reflow_error: None,
-        });
-    }
-    let budget = budgets.operation(
-        AnalysisOperation::SafeDeobfuscation,
-        format!("post-reflow {label}"),
-    );
-    let (source, post_reflow_transforms, post_reflow_error) = match deobfuscate_source(
-        &reflowed.source,
-        format!("post-reflow {label}"),
-        SourceMode::Auto,
-        max_iterations,
-        format_output,
-        &budget,
-    ) {
-        Ok(outcome) => (outcome.source, outcome.report.transforms, None),
-        Err(error) => (reflowed.source, BTreeMap::new(), Some(error.to_string())),
+    let (source, mut subsequent_transforms, post_reflow_error) = if reflowed.rewritten_loops == 0 {
+        (source, BTreeMap::new(), None)
+    } else {
+        let budget = budgets.operation(
+            AnalysisOperation::SafeDeobfuscation,
+            format!("post-reflow {label}"),
+        );
+        match deobfuscate_source(
+            &reflowed.source,
+            format!("post-reflow {label}"),
+            SourceMode::Auto,
+            max_iterations,
+            format_output,
+            &budget,
+        ) {
+            Ok(outcome) => (outcome.source, outcome.report.transforms, None),
+            Err(error) => (reflowed.source, BTreeMap::new(), Some(error.to_string())),
+        }
+    };
+
+    let returns = recover_terminal_returns(&source)?;
+    let adjacent_returns = returns.adjacent_returns;
+    let labeled_return_joins = returns.labeled_joins;
+    let (source, post_return_error) = if adjacent_returns + labeled_return_joins == 0 {
+        (returns.source, None)
+    } else {
+        let budget = budgets.operation(
+            AnalysisOperation::SafeDeobfuscation,
+            format!("post-return-flow {label}"),
+        );
+        match deobfuscate_source(
+            &returns.source,
+            format!("post-return-flow {label}"),
+            SourceMode::Auto,
+            max_iterations,
+            format_output,
+            &budget,
+        ) {
+            Ok(outcome) => {
+                for (kind, count) in outcome.report.transforms {
+                    *subsequent_transforms.entry(kind).or_default() += count;
+                }
+                (outcome.source, None)
+            }
+            Err(error) => (returns.source, Some(error.to_string())),
+        }
     };
     Ok(PolishedHelperView {
         source,
         single_trip_loops_reflowed: reflowed.rewritten_loops,
-        post_reflow_transforms,
+        subsequent_transforms,
         post_reflow_error,
+        adjacent_returns,
+        labeled_return_joins,
+        post_return_error,
     })
 }
 
@@ -426,8 +457,21 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             let code = polished.source;
             let rewritten_loops = polished.single_trip_loops_reflowed;
             let post_reflow_error = polished.post_reflow_error;
-            for (kind, count) in polished.post_reflow_transforms {
+            let adjacent_returns = polished.adjacent_returns;
+            let labeled_return_joins = polished.labeled_return_joins;
+            let post_return_error = polished.post_return_error;
+            for (kind, count) in polished.subsequent_transforms {
                 *transforms.entry(kind).or_default() += count;
+            }
+            if adjacent_returns > 0 {
+                *transforms
+                    .entry("source_adjacent_return_flow".to_owned())
+                    .or_default() += adjacent_returns;
+            }
+            if labeled_return_joins > 0 {
+                *transforms
+                    .entry("source_labeled_return_flow".to_owned())
+                    .or_default() += labeled_return_joins;
             }
             if rewritten_loops > 0 {
                 *transforms
@@ -474,6 +518,9 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "references": helper.references,
                 "single_trip_loops_reflowed": rewritten_loops,
                 "post_reflow_error": post_reflow_error,
+                "adjacent_return_values": adjacent_returns,
+                "labeled_return_joins": labeled_return_joins,
+                "post_return_error": post_return_error,
                 "transforms": transforms,
                 "error": error,
             }));
@@ -681,8 +728,21 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             let code = polished.source;
             let rewritten_loops = polished.single_trip_loops_reflowed;
             let post_reflow_error = polished.post_reflow_error;
-            for (kind, count) in polished.post_reflow_transforms {
+            let adjacent_returns = polished.adjacent_returns;
+            let labeled_return_joins = polished.labeled_return_joins;
+            let post_return_error = polished.post_return_error;
+            for (kind, count) in polished.subsequent_transforms {
                 *transforms.entry(kind).or_default() += count;
+            }
+            if adjacent_returns > 0 {
+                *transforms
+                    .entry("source_adjacent_return_flow".to_owned())
+                    .or_default() += adjacent_returns;
+            }
+            if labeled_return_joins > 0 {
+                *transforms
+                    .entry("source_labeled_return_flow".to_owned())
+                    .or_default() += labeled_return_joins;
             }
             if rewritten_loops > 0 {
                 *transforms
@@ -721,6 +781,9 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "specialized_source_changed": actual_changes,
                 "single_trip_loops_reflowed": rewritten_loops,
                 "post_reflow_error": post_reflow_error,
+                "adjacent_return_values": adjacent_returns,
+                "labeled_return_joins": labeled_return_joins,
+                "post_return_error": post_return_error,
                 "transforms": transforms,
                 "error": error,
             }));
@@ -1474,7 +1537,7 @@ mod tests {
         fs::create_dir_all(&input)?;
         fs::write(
             &original,
-            "function root(){const modeHandler=function(x, selector){for(0;(selector&90)==selector;true){touch(x);break;}return x;};}",
+            "function root(){const modeHandler=function(x, selector, result){for(0;(selector&90)==selector;true){touch(x);break;}result=x;return result;};}",
         )?;
         let handler = "const capturedHandler=function(x){return modeHandler(x,9);};";
         fs::write(input.join("handler.js"), handler)?;
@@ -1494,10 +1557,14 @@ mod tests {
         assert_eq!(original_helper["name"], "modeHandler");
         assert_eq!(original_helper["single_trip_loops_reflowed"], 1);
         assert!(original_helper["post_reflow_error"].is_null());
+        assert_eq!(original_helper["adjacent_return_values"], 1);
+        assert!(original_helper["post_return_error"].is_null());
         let specialization = &context["specializations"][0];
         assert_eq!(specialization["helper"], "modeHandler");
         assert_eq!(specialization["single_trip_loops_reflowed"], 1);
         assert!(specialization["post_reflow_error"].is_null());
+        assert_eq!(specialization["adjacent_return_values"], 1);
+        assert!(specialization["post_return_error"].is_null());
         let path = specialization["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("no specialized source path"))?;
@@ -1507,7 +1574,7 @@ mod tests {
         assert!(!readable.contains("touch("), "{readable}");
         assert!(readable.contains("return x;"), "{readable}");
         assert_eq!(fs::read_to_string(output.join("lexical-context/original.js"))?,
-                   "function root(){const modeHandler=function(x, selector){for(0;(selector&90)==selector;true){touch(x);break;}return x;};}");
+                   "function root(){const modeHandler=function(x, selector, result){for(0;(selector&90)==selector;true){touch(x);break;}result=x;return result;};}");
         assert!(fs::read_to_string(output.join("handler.js"))?.contains("modeHandler(x, 9)"));
         Ok(())
     }

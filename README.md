@@ -554,6 +554,14 @@ updates remain unreachable, and potential earlier breaks or continues
 prevent the rewrite. A second run of the existing proof-oriented static
 deobfuscator then folds dead conditions and redundant blocks exposed by
 that structural change (for example, a specialized `if (false)` branch).
+The source-backed helper views also recover direct values from terminal
+return temporaries. When Oxc proves a temporary has no other references,
+`temp = value; return temp` becomes `return value`. The same symbol-resolved
+dataflow applies to an adjacent labeled-branch join that assigns the
+temporary on either path before returning it. Dynamic scope, `eval`,
+`arguments` access, or extra reads/writes prevent those rewrites.
+These improvements are fed through the existing static deobfuscator again;
+they are not runtime-execution or value-guessing shortcuts.
 Any unsuccessful follow-up analysis is recorded rather than aborting
 other helpers. The lexical program remains byte-exact in
 `lexical-context/original.js`; reflow counts, follow-up transforms, and

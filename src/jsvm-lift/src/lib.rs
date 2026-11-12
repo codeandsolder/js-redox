@@ -59,6 +59,7 @@ pub mod source_tree_callflow;
 pub mod source_tree_context;
 pub mod source_tree_inline;
 pub mod source_tree_reflow;
+pub mod source_tree_return_flow;
 pub mod source_tree_specialize;
 pub mod tool_environment;
 pub mod vm_materialize;
