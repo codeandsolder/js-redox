@@ -80,6 +80,10 @@ struct CallerViewsArgs {
     /// lexical call edges (opt-in because it can produce many variants).
     #[arg(long)]
     specialize: bool,
+    /// Restrict call graph entries and generated specializations to helpers
+    /// with these resolved lexical names. Repeat for several helpers.
+    #[arg(long, requires = "specialize")]
+    only_helper: Vec<String>,
     #[arg(long, default_value_t = 12)]
     max_iterations: usize,
 }
@@ -902,9 +906,13 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 fs::create_dir_all(&dir)?;
                 // Same exact graph-based specialization writer as the
                 // standalone caller-views CLI; no second extraction logic.
-                for mut row in
-                    write_callsite_specializations(&original, &views, &dir, args.max_iterations)?
-                {
+                for mut row in write_callsite_specializations(
+                    &original,
+                    &views,
+                    &dir,
+                    args.max_iterations,
+                    &[],
+                )? {
                     for key in ["path", "original_path"] {
                         if let Some(path) = row[key].as_str() {
                             row[key] = json!(format!("caller-views/{path}"));
@@ -1176,6 +1184,7 @@ fn write_callsite_specializations(
     views: &[CallerView],
     output: &Path,
     max_iterations: usize,
+    only_helpers: &[String],
 ) -> Result<Vec<serde_json::Value>> {
     let mut specialization_rows = Vec::new();
     let candidates = specialize_resolved_call_graph(original, views)?;
@@ -1198,6 +1207,9 @@ fn write_callsite_specializations(
     fs::create_dir_all(destination.join("original"))?;
     let budgets = AnalysisBudgets::standard("deobfuscate-safe-graph-specializations");
     for candidate in candidates {
+        if !only_helpers.is_empty() && !only_helpers.contains(&candidate.helper) {
+            continue;
+        }
         let arguments_json = serde_json::to_string(&candidate.constants)?;
         let digest = sha256_hex(arguments_json.as_bytes());
         let filename = format!(
@@ -1311,7 +1323,14 @@ fn write_callsite_specializations(
 fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
     let original = fs::read_to_string(&args.input)
         .with_context(|| format!("reading caller source {}", args.input.display()))?;
-    let views = reconstruct_caller_views(&original, args.entry_member.as_deref())?;
+    let mut views = reconstruct_caller_views(&original, args.entry_member.as_deref())?;
+    if !args.only_helper.is_empty() {
+        views.retain(|view| {
+            view.reachable_functions
+                .iter()
+                .any(|function| args.only_helper.contains(&function.name))
+        });
+    }
     fs::create_dir_all(&args.output)
         .with_context(|| format!("creating caller output {}", args.output.display()))?;
     let mut index = String::from("# Source-resolved caller paths\n\n");
@@ -1337,8 +1356,13 @@ fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
         }));
     }
     let specialization_rows = if args.specialize {
-        let rows =
-            write_callsite_specializations(&original, &views, &args.output, args.max_iterations)?;
+        let rows = write_callsite_specializations(
+            &original,
+            &views,
+            &args.output,
+            args.max_iterations,
+            &args.only_helper,
+        )?;
         index.push_str(
             "\n[Browse callsite-specialized lexical helper bodies](specializations/README.md).\n",
         );
@@ -1390,6 +1414,7 @@ mod tests {
             output: output.clone(),
             entry_member: Some("run".into()),
             specialize: false,
+            only_helper: vec![],
             max_iterations: 12,
         })?;
         let manifest: serde_json::Value =
@@ -1441,6 +1466,7 @@ mod tests {
             output: output.clone(),
             entry_member: Some("run".into()),
             specialize: true,
+            only_helper: vec![],
             max_iterations: 12,
         })?;
         let manifest: serde_json::Value =
@@ -1480,6 +1506,50 @@ mod tests {
     }
 
     #[test]
+    fn standalone_caller_views_focuses_exact_resolved_helper_family() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source.js");
+        let output = temp.path().join("focused");
+        fs::write(
+            &input,
+            "const chosen=(mode,value)=>mode===4?value+1:value-1;\
+             const unrelated=(n)=>n*7;\
+             const api={};api.first=()=>chosen(4,3);\
+             api.second=()=>unrelated(9);api.third=()=>chosen(5,3);",
+        )?;
+        run_caller_views(CallerViewsArgs {
+            input,
+            output: output.clone(),
+            entry_member: None,
+            specialize: true,
+            only_helper: vec!["chosen".into()],
+            max_iterations: 12,
+        })?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("caller-views.json"))?)?;
+        let entries = manifest["entries"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("focused entries missing"))?;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|row| row["entry"] != ".second"));
+        assert_eq!(manifest["specialization_count"], 2);
+        let variants = manifest["specializations"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("focused variants missing"))?;
+        for row in variants {
+            assert_eq!(row["helper"], "chosen");
+            assert!(row["deobfuscation_error"].is_null(), "{row}");
+            let relative = row["path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("focused variant path missing"))?;
+            let recovered = fs::read_to_string(output.join(relative))?;
+            assert!(!recovered.contains("unrelated"), "{recovered}");
+        }
+        assert!(!output.join("entry-2.md").exists());
+        Ok(())
+    }
+
+    #[test]
     fn standalone_index_keeps_shadowed_same_named_helpers_distinct() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let source = tmp.path().join("source.js");
@@ -1490,6 +1560,7 @@ mod tests {
             output: output.clone(),
             entry_member: Some("run".into()),
             specialize: true,
+            only_helper: vec![],
             max_iterations: 12,
         })?;
         let meta: serde_json::Value =

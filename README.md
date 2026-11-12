@@ -483,6 +483,19 @@ cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
   path/to/original.js work/caller-views --entry-member someMethod --specialize
 ~~~
 
+When the source has many unrelated helper families, repeat `--only-helper NAME`
+to retain only source-resolved entrypoint paths and specialized implementations
+for the chosen helpers, without materializing hundreds of other variants.
+This filter changes only the analyst output selection; the same lexical symbol,
+callsite and exact-argument proofs still determine every variant. An example
+using more than one helper:
+
+~~~sh
+cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
+  path/to/original.js work/focused-helpers --specialize \
+  --only-helper da --only-helper eU
+~~~
+
 Exception-sensitive state dispatchers retain their original try/catch
 and one-state-per-iteration semantics. Exact lexical-state reachability
 includes catch-resume assignments as additional roots, so unreachable
