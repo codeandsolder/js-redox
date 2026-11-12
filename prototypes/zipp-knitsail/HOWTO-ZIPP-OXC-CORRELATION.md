@@ -85,3 +85,15 @@ metadata, checked against OXC's exact original AST inventory.
 
 See [js-redox PR #179](https://github.com/codeandsolder/js-redox/pull/179)
 and [the Notion ZIPP technical handoff](https://app.notion.com/p/416f74be902081d296edf930c0520607).
+
+### Automatic Node capture compatibility
+
+The `sites:"all"` capture producer now treats the already hash-verified OXC
+inventory as the syntactic authority. It no longer applies its old textual
+`^eval(...)$` preflight to those AST-selected sites; that regex wrongly rejected
+legitimate parenthesized eval and comments between callee and argument list.
+Explicit/manual site selection retains the old preflight until a native
+AST-validation contract is supplied for those manually chosen spans.
+The targeted real Node capture fixture executed all five AST-discovered
+ordinary, parenthesized, comment-separated and newline-separated direct
+calls and produced five independently attributed site reports (5/5).

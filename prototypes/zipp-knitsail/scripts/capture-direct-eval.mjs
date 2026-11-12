@@ -63,7 +63,8 @@ try {
   const context=vm.createContext(contextGlobals(config.globals));
   const observer=createObserver(context,source.bytes,path.join(stage,'sources'),
     config.maxEvents ?? 10000);
-  const instrumented=instrumentEvalSites(source.text,sites,observer.hooks);
+  const instrumented=instrumentEvalSites(source.text,sites,observer.hooks,
+  config.sites==='all');
   new vm.Script(instrumented.code,{filename:'instrumented-direct.js'});
   // Don't alter the original JS file, and don't run an injected wrapper:
   // eval() stays a direct call in the same lexical function and scope.

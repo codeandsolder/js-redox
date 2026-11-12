@@ -38,12 +38,14 @@ export function verifySite(code, site, expected) {
   }
 }
 
-export function instrumentEval(code, config, names, siteIndex=0) {
+export function instrumentEval(code, config, names, siteIndex=0, astVerified=false) {
   const site = config.evalSite ?? uniqueSite(code, config.evalExpression, 'executable');
   verifySite(code, site);
-  // Text checks restrict obvious mismatches; full AST proof belongs to the
-  // Rust/OXC importer and never uses the modified executable as an input.
-  if (!/^eval\s*\([\s\S]*\)$/u.test(site.expression)) {
+  // Only explicit/manual sites need this narrow textual preflight. In the
+  // automatic path OXC has already verified the *original* unresolved eval
+  // identifier, optionality, and exact source hash. Re-running a naive regex
+  // here wrongly rejects true direct calls such as ((eval))(x) or eval/*c*/(x).
+  if (!astVerified && !/^eval\s*\([\s\S]*\)$/u.test(site.expression)) {
     throw Error('Configured site must be a nonoptional direct eval call');
   }
   const first = config.firstArgumentSite ?? (() => {
@@ -74,12 +76,12 @@ export function instrumentEval(code, config, names, siteIndex=0) {
   };
 }
 
-export function instrumentEvalSites(code, configs, names) {
+export function instrumentEvalSites(code, configs, names, astVerified=false) {
   if (!Array.isArray(configs) || configs.length === 0) {
     throw Error('sites must be a nonempty array of eval-site configurations');
   }
   const sites = configs.map((cfg,siteIndex) => ({
-    siteIndex, ...instrumentEval(code,cfg,names,siteIndex),
+    siteIndex, ...instrumentEval(code,cfg,names,siteIndex,astVerified),
   }));
   // Every configured site is identified by its original UTF-16 interval.
   const ids = new Set(sites.map(({site})=>site.start+':'+site.end));

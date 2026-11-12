@@ -100,3 +100,32 @@ test('parentheses preserve direct-eval references; comma and optional calls do n
         {total:7,matched:5,ambiguous:0,unmatched:0,unavailable:2});
     }finally{fs.rmSync(dir,{recursive:true,force:true});}
   });
+
+test('OXC-verified automatic Node capture accepts every parenthesized direct eval',
+  {skip:!oxc},()=>{
+    const dir=fs.mkdtempSync(path.join(os.tmpdir(),'jsredox-paren-capture-'));
+    try{
+      const source=[
+        'let x=10;',
+        "const values=[eval('x+1'),(eval)('x+2'),((eval))('x+3'),",
+        "eval/*comment*/('x+4'),eval",
+        "('x+5')];",
+        'if(values.join()!="11,12,13,14,15")throw Error("bad");',
+      ].join('\n');
+      const src=path.join(dir,'original.js');
+      fs.writeFileSync(src,source);
+      const cfg=path.join(dir,'config.json'),out=path.join(dir,'captured');
+      fs.writeFileSync(cfg,JSON.stringify({
+        sourceFile:'original.js',sites:'all',parserBinary:oxc,
+      }));
+      const runner=path.resolve(import.meta.dirname,
+        '../scripts/capture-direct-eval.mjs');
+      const stats=exec(process.execPath,[runner,cfg,out]);
+      assert.equal(stats.truncated,false);
+      assert.equal(stats.events,5);
+      const bundle=JSON.parse(fs.readFileSync(path.join(out,'bundle.json'),'utf8'));
+      assert.equal(bundle.sites.length,5);
+      assert.equal(bundle.captures.length,5);
+      assert.deepEqual(bundle.sites.map(e=>e.eventCount),[1,1,1,1,1]);
+    }finally{fs.rmSync(dir,{recursive:true,force:true});}
+  });
