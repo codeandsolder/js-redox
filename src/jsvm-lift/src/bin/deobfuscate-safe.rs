@@ -8,13 +8,13 @@ use jsvm_lift::{
     safe_deob::{deobfuscate_source, SourceMode},
     sha256_hex,
     source_tree_aliases::{explain_captured_handler_origins, explain_property_aliases},
-    source_tree_call_spines::deepest_call_view,
     source_tree_callflow::{reconstruct_caller_views, CallerView},
     source_tree_context::{
         annotate_handler_helper_calls_with_specializations, reconstruct_context,
         SpecializedHelperCall,
     },
     source_tree_inline::expand_helper_returns,
+    source_tree_navigation::helper_navigation,
     source_tree_reflow::reflow_single_trip_loops,
     source_tree_return_flow::recover_terminal_returns,
     source_tree_specialize::{specialize_calls, specialize_resolved_call_graph},
@@ -422,6 +422,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
         );
         let mut helper_rows = Vec::new();
         let mut call_spine_rows = Vec::new();
+        let mut call_layout_rows = Vec::new();
         let mut helper_index = String::from("# Actual lexical helper implementations\n\n");
         helper_index.push_str("These definitions come from the supplied original program. ");
         helper_index.push_str(
@@ -495,17 +496,20 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                     .or_default() += rewritten_loops;
             }
             fs::write(folder.join(relative), &code)?;
-            if let Some(view) = deepest_call_view(&code, relative) {
+            if let Some(view) = helper_navigation(&code, relative) {
                 let stem = relative
                     .trim_start_matches("helpers/")
                     .trim_end_matches(".js");
-                let outline_path = format!("call-spines/{stem}.md");
-                let layout_path = format!("call-layouts/{stem}.js");
-                fs::create_dir_all(folder.join("call-spines"))?;
-                fs::create_dir_all(folder.join("call-layouts"))?;
-                fs::write(folder.join(&outline_path), view.markdown)?;
+                let layout_path = format!("expression-layouts/{stem}.js");
+                fs::create_dir_all(folder.join("expression-layouts"))?;
                 fs::write(folder.join(&layout_path), view.layout)?;
-                call_spine_rows.push((helper.name.clone(), outline_path, layout_path));
+                call_layout_rows.push((helper.name.clone(), layout_path.clone()));
+                if let Some(outline) = view.call_spine_markdown {
+                    let outline_path = format!("call-spines/{stem}.md");
+                    fs::create_dir_all(folder.join("call-spines"))?;
+                    fs::write(folder.join(&outline_path), outline)?;
+                    call_spine_rows.push((helper.name.clone(), outline_path, layout_path));
+                }
             }
             // Annotate references only where the helper's *own* AST resolves
             // the property key to the same symbol as its prior assignments.
@@ -553,6 +557,28 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "transforms": transforms,
                 "error": error,
             }));
+        }
+        if !call_layout_rows.is_empty() {
+            let mut index = String::from(
+                "# Whitespace-only helper expression layouts\n\n\
+                 These views insert only AST-confirmed whitespace and are checked \
+                 by reparsing and canonical-code comparison. The original \
+                 helper and executable bytes are unchanged.\n\n",
+            );
+            for (name, path) in &call_layout_rows {
+                index.push_str(&format!(
+                    "- [{name}]({})\n",
+                    path.trim_start_matches("expression-layouts/")
+                ));
+            }
+            fs::write(folder.join("expression-layouts/README.md"), index)?;
+            helper_index.push_str(
+                "\n[Browse long-expression source layouts](expression-layouts/README.md).\n",
+            );
+            md.push_str(
+                "\n## Readable lexical helper expression layouts\n\n\
+                 [Browse original-token expression layouts](lexical-context/expression-layouts/README.md).\n\n",
+            );
         }
         if !call_spine_rows.is_empty() {
             let mut index = String::from(
@@ -1830,9 +1856,10 @@ mod tests {
         let spine = fs::read_to_string(folder.join(format!("call-spines/{stem}.md")))?;
         assert!(spine.contains("| 8 | `h`"), "{spine}");
         assert!(spine.contains("argument 1"), "{spine}");
-        let layout = fs::read_to_string(folder.join(format!("call-layouts/{stem}.js")))?;
+        let layout = fs::read_to_string(folder.join(format!("expression-layouts/{stem}.js")))?;
         assert!(layout.lines().count() > 10, "{layout}");
-        assert!(spine.contains(&format!("../call-layouts/{stem}.js")));
+        assert!(spine.contains(&format!("../expression-layouts/{stem}.js")));
+        assert!(fs::read_to_string(folder.join("expression-layouts/README.md"))?.contains(stem));
         assert!(fs::read_to_string(folder.join("call-spines/README.md"))?.contains(stem));
         assert!(fs::read_to_string(output.join("README.md"))?
             .contains("lexical-context/call-spines/README.md"));
@@ -1844,6 +1871,56 @@ mod tests {
             fs::read_to_string(output.join("handler.js"))?.contains("stack(x)"),
             "the original helper call must remain in the executable tree"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_layouts_long_original_helper_without_deep_calls() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let assignments = ('a'..='z')
+            .enumerate()
+            .map(|(index, name)| format!("U.{name}={index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let original_source =
+            format!("function root(){{const init=function(U){{return ({assignments});}};}}");
+        fs::write(&original, &original_source)?;
+        fs::write(
+            input.join("handler.js"),
+            "const capturedHandler=function(U){return init(U);};",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let folder = output.join("lexical-context");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(folder.join("context.json"))?)?;
+        let helper = metadata["helpers"][0]["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing helper path"))?;
+        let stem = std::path::Path::new(helper)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow::anyhow!("missing helper stem"))?;
+        let layout = fs::read_to_string(folder.join(format!("expression-layouts/{stem}.js")))?;
+        assert!(layout.lines().count() > 10, "{layout}");
+        assert!(fs::read_to_string(folder.join("expression-layouts/README.md"))?.contains(stem));
+        assert!(!folder.join(format!("call-spines/{stem}.md")).exists());
+        assert_eq!(
+            fs::read_to_string(folder.join("original.js"))?,
+            original_source
+        );
+        assert!(fs::read_to_string(output.join("handler.js"))?.contains("init(U)"));
         Ok(())
     }
 

@@ -416,10 +416,14 @@ tree is always kept separate.
 For helpers with at least eight structurally nested calls, the optional
 `lexical-context/call-spines/` Markdown views identify the deepest AST call
 chain, its original helper line/byte offsets, and which enclosing argument
-contains each nested call. A companion `lexical-context/call-layouts/` JS
-source view breaks argument nesting across lines **only by inserting whitespace**
-at AST-confirmed boundaries. Its syntax must parse and regenerate the exact
-same canonical JavaScript; if not, the alternate view is refused. This makes
+contains each nested call. Independently, `lexical-context/expression-layouts/`
+contains alternate JS source views for either deep calls **or** long
+single-line assignments, sequences, comparisons, short-circuits or conditional
+operands, even without a deeply nested call. These views insert only
+whitespace at AST-confirmed boundaries.
+The view never hoists effects or changes binding, receiver or evaluation
+order. Its syntax must parse and regenerate the exact same canonical
+JavaScript; if not, the alternate view is refused. This makes
 enormous registration expressions navigable without inventing an equivalent
 sequence of statements. The list describes **syntax nesting**, not execution
 order: short-circuit guards, argument evaluation, computed keys, callback
