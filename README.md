@@ -464,8 +464,9 @@ whitespace at AST-confirmed boundaries.
 
 For helpers with long *nested assignment* expressions, the independent
 `lexical-context/assignment-outlines/` Markdown index lists the actual
-assignment targets and operators, their source-byte locations, lexical
-containment inside other assignment expressions, and nearest short-circuit
+assignment targets and operators, **exact assigned RHS expressions** when
+short (with AST-kind/byte-length summaries for complex RHS), source-byte
+locations, lexical containment inside other assignment expressions, and nearest short-circuit
 or ternary guard ancestry. It keeps assignments in nested callback bodies
 separate from the enclosing initializer. This is a source-backed structural
 map, not an execution trace or a claim that assignments can safely be hoisted:

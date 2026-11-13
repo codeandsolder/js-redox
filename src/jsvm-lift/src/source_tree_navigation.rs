@@ -19,6 +19,9 @@ use std::collections::BTreeMap;
 const MIN_DEPTH: usize = 8;
 const MAX_INDENT_DEPTH: usize = 18;
 const LONG_EXPRESSION_BYTES: usize = 160;
+/// Keep inline assignments inspectable without repeating a giant RHS into
+/// every ancestor row; the byte range still identifies its exact source.
+const MAX_INLINE_ASSIGNMENT_RHS_BYTES: usize = 96;
 
 /// Independent, non-executable navigation projections of the same original
 /// lexical helper. The layout only inserts whitespace between AST tokens.
@@ -99,6 +102,7 @@ struct AssignmentNode {
     target_span: Span,
     target: String,
     operator: String,
+    rhs: String,
     parent: Option<usize>,
     in_target_reference: bool,
     guard_depth: usize,
@@ -111,6 +115,41 @@ struct AssignmentOutlineCollector<'s> {
     nodes: Vec<AssignmentNode>,
     ancestors: Vec<usize>,
     guards: Vec<String>,
+}
+
+fn assignment_rhs_summary(source: &str, right: &Expression<'_>) -> String {
+    let span = right.span();
+    let length = span.end.saturating_sub(span.start) as usize;
+    let fragment = source.get(span.start as usize..span.end as usize);
+    if let Some(value) = fragment.filter(|value| {
+        value.len() <= MAX_INLINE_ASSIGNMENT_RHS_BYTES
+            && !value.contains(char::from(10))
+            && !value.contains(char::from(13))
+            && !value.contains(char::from(96))
+    }) {
+        // Code spans preserve JS operators (especially the pipe character)
+        // without interpreting them as Markdown table delimiters.
+        return format!(
+            "{}{}{}",
+            char::from(96),
+            value.replace('|', "\\|"),
+            char::from(96)
+        );
+    }
+    let kind = match right {
+        Expression::AssignmentExpression(_) => "assignment",
+        Expression::SequenceExpression(_) => "sequence",
+        Expression::BinaryExpression(_) => "binary",
+        Expression::LogicalExpression(_) => "logical",
+        Expression::ConditionalExpression(_) => "conditional",
+        Expression::CallExpression(_) => "call",
+        Expression::NewExpression(_) => "constructor",
+        Expression::ArrayExpression(_) => "array",
+        Expression::ObjectExpression(_) => "object",
+        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => "function",
+        _ => "expression",
+    };
+    format!("*{kind} ({length} bytes; see source range)*")
 }
 
 impl<'a> Visit<'a> for AssignmentOutlineCollector<'_> {
@@ -132,6 +171,7 @@ impl<'a> Visit<'a> for AssignmentOutlineCollector<'_> {
             target_span,
             target,
             operator: expression.operator.as_str().to_owned(),
+            rhs: assignment_rhs_summary(self.source, &expression.right),
             parent,
             in_target_reference,
             guard_depth: self.guards.len(),
@@ -216,7 +256,9 @@ Computed keys, getters and conversions may have effects. Logical and
 conditional operands can be skipped, and functions created inside an
 RHS have independent, deferred bodies. Guard annotations report only
 the nearest enclosing guard and the total guard nesting depth.
-Byte locations refer to the readable lexical helper.
+Byte locations refer to the readable lexical helper. The assigned RHS is
+quoted verbatim when short; long or multiline RHS expressions are described
+by AST type and byte length, not evaluated or silently truncated.
 
 ",
     );
@@ -250,11 +292,12 @@ Byte locations refer to the readable lexical helper.
             |guard| format!("{} ({} total)", guard, node.guard_depth),
         );
         output.push_str(&format!(
-            "| {} | {} | {} {} | {} | {} | {}:{} ({}–{}) |\n",
+            "| {} | {} | {} {} | {} | {} | {} | {}:{} ({}–{}) |\n",
             depth,
             index + 1,
             target,
             node.operator,
+            node.rhs,
             role,
             guard,
             line,
@@ -273,7 +316,7 @@ Byte locations refer to the readable lexical helper.
             "\n## Long assignment at {line}:{col} ({} source bytes)\n\n",
             node.span.end - node.span.start,
         ));
-        output.push_str("| Depth | ID | Assignment target/operator | Containment | Nearest guard | Source location |\n|---:|---:|---|---|---|---|\n");
+        output.push_str("| Depth | ID | Assignment target/operator | Assigned RHS | Containment | Nearest guard | Source location |\n|---:|---:|---|---|---|---|---|\n");
         emit(nodes, &children, source, root, 0, &mut output);
         output.push(char::from(10));
     }
@@ -605,6 +648,32 @@ mod tests {
         );
         assert!(outline.contains("not an execution trace"), "{outline}");
         assert!(outline.contains("Source location"), "{outline}");
+    }
+
+    #[test]
+    fn describes_real_assigned_values_and_bounded_complex_expression_rhs() {
+        let source = "function f(U){Hm=(U.a=void 0,U.b=[],U.c=false,U.d=0,U.e=(U.f=1,2),U.g=(U.h=1,U.i=2,U.j=3,U.k=4,U.l=5,U.m=6,U.n=7,U.o=8,U.p=9,U.q=10,U.r=11,U.s=12,U.t=13,U.u=14,U.v=15,U.w=16,U.x=17,U.y=18,U.z=19));return Hm;}";
+        let view = helper_navigation(source, "helpers/f.js").unwrap_or_default();
+        let outline = view.assignment_outline_markdown.unwrap_or_default();
+        for (target, expected) in [
+            ("U.a", "void 0"),
+            ("U.b", "[]"),
+            ("U.c", "false"),
+            ("U.d", "0"),
+        ] {
+            let text = format!(
+                "{target} = | {}{expected}{}",
+                char::from(96),
+                char::from(96)
+            );
+            assert!(
+                outline.contains(&text),
+                "missing exact assigned value {text}: {outline}"
+            );
+        }
+        assert!(outline.contains("Assigned RHS"), "{outline}");
+        assert!(outline.contains("bytes; see source range"), "{outline}");
+        assert!(outline.contains("U.f ="), "{outline}");
     }
 
     #[test]
