@@ -549,7 +549,14 @@ and byte offsets belong to the alternate *analyst* view only; the
 `lexical-context/original.js` and captured executable files remain exact.
 A detached helper can fail to prove an enclosing identifier binding,
 so it may retain an opaque assignment sequence that the context-aware
-view safely reconstructs.
+view safely reconstructs. The full-context **derived helper files** then
+go through the same single-trip loop reflow and post-reflow control-flow
+polishing as ordinary helper views. Each exact source-backed helper extract
+is kept separately in \`whole-program/source-helpers/\`, with a per-helper
+\`helpers.json\` report recording both source hashes, which polishing
+passes ran, and any remaining reflow errors. Thus the improved lexical
+statement boundaries and the previously proven loop/return recovery are
+combined, without losing their traceable source or changing captured code.
 
 For source-level direct-call and constructor forwarding, add
 `--caller-view-entry <member-property>` (for instance, a site's exposed API

@@ -328,18 +328,71 @@ fn materialize_full_lexical_context(
         "Source formatting can alter Function#toString, so this is not ",
         "a replacement executable.\n\n",
         "[Complete readable program](readable.js) · ",
-        "[Provenance and transformations](reconstruction.json)\n\n",
+        "[Provenance and transformations](reconstruction.json) · ",
+        "[per-helper polishing and source hashes](helpers.json)\n\n",
+        "The linked exact extracts are preserved under source-helpers/. ",
+        "The normal helpers/ files additionally use existing single-trip ",
+        "loop reflow and post-reflow simplification. They remain analyst-only ",
+        "views, never replacement executable code.\n\n",
         "## Resolved helpers\n\n",
     ));
     index = index.replace("](readable.js)", &format!("]({file_name})"));
+    let mut helper_rows = Vec::new();
+    let mut polished_count = 0usize;
+    let mut loop_reflows = 0usize;
+    fs::create_dir_all(directory.join("source-helpers"))?;
     for helper in &alternate.helpers {
+        let raw_path = helper.file.replacen("helpers/", "source-helpers/", 1);
+        let raw_target = directory.join(&raw_path);
+        if let Some(parent) = raw_target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Preserve the exact source-backed extract, whose byte spans refer
+        // to readable.js, separately from the polished analyst projection.
+        fs::write(&raw_target, &helper.source)?;
+        let label = format!("full lexical helper {}", helper.name);
+        let polished =
+            polish_lexical_helper_view(helper.source.clone(), &label, iterations, true, budgets)?;
+        let changed = polished.source != helper.source;
+        polished_count += usize::from(changed);
+        loop_reflows += polished.single_trip_loops_reflowed;
         let path = directory.join(&helper.file);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, &helper.source)?;
-        index.push_str(&format!("- [{}]({})\n", helper.name, helper.file));
+        fs::write(&path, &polished.source)?;
+        index.push_str(&format!(
+            "- [{}]({}) — [exact full-program extract]({raw_path}){}\n",
+            helper.name,
+            helper.file,
+            if changed { " (polished)" } else { "" },
+        ));
+        helper_rows.push(json!({
+            "name": helper.name,
+            "path": helper.file,
+            "source_path": raw_path,
+            "source_sha256": sha256_hex(helper.source.as_bytes()),
+            "polished_sha256": sha256_hex(polished.source.as_bytes()),
+            "polished": changed,
+            "single_trip_loops_reflowed": polished.single_trip_loops_reflowed,
+            "subsequent_transforms": polished.subsequent_transforms,
+            "post_reflow_error": polished.post_reflow_error,
+            "adjacent_returns": polished.adjacent_returns,
+            "labeled_return_joins": polished.labeled_return_joins,
+            "guarded_return_joins": polished.guarded_return_joins,
+            "post_return_error": polished.post_return_error,
+        }));
     }
+    let helper_report = json!({
+        "schema": "jsvm-whole-lexical-helper-projections/v1",
+        "source": file_name,
+        "polished_count": polished_count,
+        "loop_reflows": loop_reflows,
+        "helpers": helper_rows,
+    });
+    let mut helper_report_text = serde_json::to_string_pretty(&helper_report)?;
+    helper_report_text.push(char::from(10));
+    fs::write(directory.join("helpers.json"), helper_report_text)?;
     fs::write(directory.join("README.md"), index)?;
     Ok(json!({
         "path": format!("lexical-context/whole-program/{file_name}"),
@@ -350,6 +403,9 @@ fn materialize_full_lexical_context(
         "iterations": outcome.report.iterations,
         "max_iterations": iterations,
         "helper_count": alternate.helpers.len(),
+        "helper_polished_count": polished_count,
+        "helper_loop_reflows": loop_reflows,
+        "helper_report": "lexical-context/whole-program/helpers.json",
         "transforms": outcome.report.transforms,
     }))
 }
@@ -2109,7 +2165,7 @@ mod tests {
         let output = temp.path().join("readable");
         let original = temp.path().join("original.js");
         fs::create_dir_all(&input)?;
-        let full = "function root(){let Hm=97;const oU=function(log){Hm=(log.push('step'),42);return Hm;};}";
+        let full = "function root(){let Hm=97;const oU=function(log){Hm=(log.push('step'),42);while({})if((log.push('loop'),true))break;return Hm;};}";
         fs::write(&original, full)?;
         let captured = "const captured=()=>oU([]);";
         fs::write(input.join("handler.js"), captured)?;
@@ -2163,7 +2219,42 @@ mod tests {
         let derived_code = fs::read_to_string(derived)?;
         assert!(derived_code.contains("Hm = 42;"), "{derived_code}");
         assert!(derived_code.contains("log.push"), "{derived_code}");
-        assert!(fs::read_to_string(whole_path.join("README.md"))?.contains("readable.js"));
+        assert!(!derived_code.contains("while"), "{derived_code}");
+        let helper_report: serde_json::Value =
+            serde_json::from_slice(&fs::read(whole_path.join("helpers.json"))?)?;
+        let o_u = helper_report["helpers"]
+            .as_array()
+            .and_then(|helpers| helpers.iter().find(|helper| helper["name"] == "oU"))
+            .ok_or_else(|| anyhow::anyhow!("missing per-helper polish report"))?;
+        assert!(
+            o_u["single_trip_loops_reflowed"]
+                .as_u64()
+                .is_some_and(|n| n >= 1),
+            "{o_u}"
+        );
+        assert_eq!(o_u["post_reflow_error"], serde_json::Value::Null, "{o_u}");
+        assert_eq!(o_u["post_return_error"], serde_json::Value::Null, "{o_u}");
+        let exact = fs::read_to_string(
+            whole_path.join(
+                o_u["source_path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing exact source-backed helper path"))?,
+            ),
+        )?;
+        assert!(
+            exact.contains("while"),
+            "missing unmodified original extract: {exact}"
+        );
+        assert!(exact.contains("log.push('loop')"), "{exact}");
+        assert_eq!(sha256_hex(exact.as_bytes()), o_u["source_sha256"]);
+        assert_eq!(sha256_hex(derived_code.as_bytes()), o_u["polished_sha256"]);
+        assert!(whole["helper_polished_count"]
+            .as_u64()
+            .is_some_and(|n| n >= 1));
+        assert!(whole["helper_loop_reflows"]
+            .as_u64()
+            .is_some_and(|n| n >= 1));
+        assert!(fs::read_to_string(whole_path.join("README.md"))?.contains("helpers.json"));
         assert!(fs::read_to_string(output.join("README.md"))?.contains("whole-program/README.md"));
         Ok(())
     }

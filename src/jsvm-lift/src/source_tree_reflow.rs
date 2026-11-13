@@ -329,6 +329,21 @@ mod tests {
     use anyhow::Result;
 
     #[test]
+    fn reflow_const_function_with_resolved_outer_lexical_and_guarded_break() -> Result<()> {
+        let src = r#"const oU = function(log) {
+            log.push("step");
+            Hm = 42;
+            while ({}) if (log.push("loop"), true) break;
+            return Hm;
+        };"#;
+        let out = reflow_single_trip_loops(src)?;
+        assert_eq!(out.rewritten_loops, 1, "{:?}", out);
+        assert!(!out.source.contains("while"), "{}", out.source);
+        assert!(out.source.contains("log.push"), "{}", out.source);
+        Ok(())
+    }
+
+    #[test]
     fn for_preserves_initializer_and_guard_but_eliminates_update() -> Result<()> {
         let src = "function f(t){for (init(); t; update()) { work(); break; } return 2;}";
         let out = reflow_single_trip_loops(src)?;
