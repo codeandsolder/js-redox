@@ -76,6 +76,34 @@ unknown coordinate remains unmatched. A runtime-generated function needs
 its *own* compiled-source identity before it can be safely joined; a VM-local
 function ID alone is not stable between executions.
 
+## Native return/throw parity checkpoint (2026-11-13)
+
+The native observer and linker use **breaking schema v2**: each observed
+event has one of `{"status":"returned","type":"number"}` (the actual
+side-effect-free JS `typeof` name), `{"status":"threw"}`, or `null`
+while in flight. The report includes explicit returned/threw/pending counts.
+There are no implicit defaults for missing outcomes. A second observer
+started while a prior eval runs receives a distinct generation-qualified
+ticket so its events cannot be overwritten by the old completion.
+
+Verified with Rust 1.99, configured sccache: **18/18 engine observer
+integration tests** and **2/2 recorder session tests PASS**. The native ZIPP
+runner and OXC CLI were rebuilt for the final schema and all **19/19 JS
+tests PASS**, including **6/6 actual native/Node/OXC integrations**.
+
+The cross-engine return/throw differential executes one original script in
+both ZIPP and Node: five successful direct evals yielding number, string,
+boolean, undefined and object, followed by one caught syntax error. For all
+**six original AST callsites**, the independently observed source SHA-256,
+the event completion classification, and each returned JavaScript type
+agree. The test verifies genuine JS execution, not a synthetic replay of
+previous JSON.
+
+The patch's Rust return-type read never stringifies returned objects or
+invokes guest code. A Promise returned from an eval is an immediate object
+return, **not** an eventual asynchronous settlement. The result remains
+execution-conditioned, not universal source recovery.
+
 ## Remaining integration boundary
 
 This is not yet a valid `--observed-direct-bundle` producer for PR #184:

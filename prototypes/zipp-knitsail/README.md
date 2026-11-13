@@ -91,4 +91,8 @@ indirect and otherwise unlocatable events stay explicitly unresolved. This is
 diagnostic evidence, **not yet** an importer witness. Native runtime
 compiler-attempt outcomes are now attached individually (returned JavaScript
 type, threw, or in-flight) without assuming nested evals finish in event
-order. The observer/linker schema was deliberately revised to v2.
+order. The observer/linker schema was deliberately revised to v2. The engine has
+**18/18 integration plus 2/2 recorder-session Rust tests passing**;
+the source join has **19/19 JS tests passing**, including six real
+ZIPP/OXC/Node end-to-end integrations with matching per-site return/throw
+classification and return types.

@@ -122,7 +122,7 @@ in v0.0.35; **do not apply the old issue-93 patch** to this checkout.
 
 ## Verified validation (2026-11-13)
 
-- Rust 1.99, configured sccache: **18/18 focused native Rust integration tests PASS** on the outcome prototype before the recorder-session regression tests were added. Recorder-session edge tests were added separately; see the current checkpoint for their final result.
+- Rust 1.99 with configured sccache: **18/18 focused native Rust observer integration tests PASS**, plus **2/2 recorder-session edge tests PASS**. This includes return/throw attribution on nested eval, cached eval and Function constructors, parse failures, and caught/uncaught throws.
 - `cargo +1.99.0 clippy -p zipp-vm --no-default-features --features instrument --test dynamic_source_capture` completed, with three pre-existing build-script warnings in ZIPP `build/minify.rs` and `build/sha256.rs`. The strict `-D warnings` run fails on those same baseline warnings, not on the observer.
 - A clean pinned upstream ZIPP checkout accepted the patch with `git apply --check`. No full Knitsail corpus run was made.
 
