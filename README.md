@@ -383,6 +383,20 @@ Helper files are navigation views, not independently runnable modules.
 The original enclosing source remains available because captured variables,
 later reassignments, and top-level side effects can change their behavior.
 
+The safe static statement pass also separates a comma-expression prefix
+used as the **object of a property-assignment target**, when that entire
+assignment occupies a sibling statement slot inside a function or existing
+block. For example, `((setup(), object).field = value)` may become
+`(setup()); (object).field = value`: every prefix still performs GetValue
+before the property reference is created, and the original assignment RHS,
+computed property key, receiver and anonymous-function name inference stay
+in their original evaluation positions. The rewrite never adds an inner
+lexical block, applies to unbraced conditional/loop/label bodies or alters
+script/eval completion values. Ambiguous operand comments and nested
+assignments without a safe statement slot remain untouched. The
+`member_object_sequence_lowering` counter records these semantic rewrites,
+distinct from whitespace-only `expression-layouts/` navigation views.
+
 A separate `lexical-context/annotated-handlers/` tree puts confirmed helper
 context **at the first direct call** in each recovered handler. For a short
 original, stable, single-return function it quotes that exact return expression

@@ -8,7 +8,8 @@
 //! statement syntax. Dynamic branches are evaluated exactly once.
 use crate::{fragment, statically_resolved_symbol, value_eval::eval};
 use oxc_ast::ast::{
-    AssignmentTarget, Expression, ExpressionStatement, IfStatement, SequenceExpression,
+    AssignmentExpression, AssignmentTarget, Expression, ExpressionStatement, IfStatement,
+    SequenceExpression,
 };
 use oxc_semantic::Scoping;
 use oxc_span::GetSpan;
@@ -184,6 +185,76 @@ impl Lowered {
             }
         }
     }
+}
+
+/// Peel a comma sequence off the object *of an assignment target* only
+/// when the entire assignment is a discarded sibling expression statement.
+///
+/// `((first(), second(), object).field = rhs)` evaluates each prefix and
+/// performs GetValue before it obtains the object used for the property
+/// reference. Emitting those prefixes as preceding sibling statements keeps
+/// exactly that ordering, without moving a member/element lookup past the
+/// RHS or changing the assignment's `this`/name-inference context.
+///
+/// This is deliberately **not** generic RHS-assignment decomposition: the
+/// target reference must be evaluated before the RHS, and its object/key can
+/// run arbitrary user code (including proxy traps, getters and direct eval).
+/// Call only for an expression already occupying a function/block statement
+/// list, never an unbraced if/loop/label or script/eval top level.
+pub(crate) fn lower_member_object_sequence(
+    statement: &ExpressionStatement<'_>,
+    source: &str,
+) -> Option<String> {
+    fn assignment<'a, 'e>(expr: &'e Expression<'a>) -> Option<&'e AssignmentExpression<'a>> {
+        match expr {
+            Expression::ParenthesizedExpression(paren) => assignment(&paren.expression),
+            Expression::AssignmentExpression(assignment) => Some(assignment),
+            _ => None,
+        }
+    }
+    let assign = assignment(&statement.expression)?;
+    let object = match &assign.left {
+        AssignmentTarget::StaticMemberExpression(member) => &member.object,
+        AssignmentTarget::ComputedMemberExpression(member) => &member.object,
+        AssignmentTarget::PrivateFieldExpression(member) => &member.object,
+        _ => return None,
+    };
+    let sequence = sequence_rhs(object)?;
+    let (last, prefixes) = sequence.expressions.split_last()?;
+    if prefixes.is_empty() {
+        return None;
+    }
+    let object_span = object.span();
+    let mut previous_end = object_span.start as usize;
+    for operand in &sequence.expressions {
+        let start = operand.span().start as usize;
+        let gap = source.get(previous_end..start)?;
+        if gap.contains("/*") || gap.contains("//") {
+            return None;
+        }
+        previous_end = operand.span().end as usize;
+    }
+    let tail = source.get(previous_end..object_span.end as usize)?;
+    if tail.contains("/*") || tail.contains("//") {
+        return None;
+    }
+
+    let mut text = String::new();
+    for prefix in prefixes {
+        // Parentheses retain expression syntax (including anonymous function,
+        // object literal and strings that must not become directives).
+        // Each operand still performs GetValue, including direct eval/getters.
+        text.push_str(&format!("({});\n", fragment(source, prefix.span())));
+    }
+    let statement_span = statement.span;
+    text.push_str(source.get(statement_span.start as usize..object_span.start as usize)?);
+    // The final comma operand produced a value, not an assignable reference.
+    // It remains in the same object-position context after the prefix.
+    text.push('(');
+    text.push_str(fragment(source, last.span()));
+    text.push(')');
+    text.push_str(source.get(object_span.end as usize..statement_span.end as usize)?);
+    Some(text)
 }
 
 /// Split the side-effecting comma prefix of an if test from its final
@@ -369,6 +440,58 @@ mod tests {
             output.contains("offset === 56708 || view.setUint32(address,1,false)"),
             "{output}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn separates_effectful_object_prefix_before_member_assignment() -> Result<(), BudgetExceeded> {
+        let input = "function f(o,key,value){((first(),second(),o)[key()] = value);return o;}";
+        let output = rewritten(input)?;
+        assert!(output.contains("(first());"), "{output}");
+        assert!(output.contains("(second());"), "{output}");
+        assert!(output.contains("(o)[key()] = value"), "{output}");
+        assert!(
+            matches!(
+                (
+                    output.find("(first());"),
+                    output.find("(second());"),
+                    output.find("(o)[key()]")
+                ),
+                (Some(first), Some(second), Some(target)) if first < second && second < target
+            ),
+            "{output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retains_member_assignment_rhs_name_and_direct_eval_scope() -> Result<(), BudgetExceeded> {
+        let input = "function f(o){((eval('var marker = 19'),read(),o).fn = function() { return marker; });return [marker,o.fn.name];}";
+        let output = rewritten(input)?;
+        assert!(output.contains("(eval('var marker = 19'));"), "{output}");
+        assert!(output.contains("(read());"), "{output}");
+        assert!(output.contains("(o).fn = function()"), "{output}");
+        assert!(!output.contains("{{"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_ambiguous_comments_and_non_sibling_placements() -> Result<(), BudgetExceeded> {
+        let inputs = [
+            "function f(o){((first()/*between*/,o).p=1);}",
+            "function f(o){((first(),o/*after*/).p=1);}",
+            "function f(o){if(ready)((first(),o).p=1);}",
+            "function f(o){while(ready)((first(),o).p=1);}",
+            "function f(o){label:((first(),o).p=1);}",
+            "((first(),o).p=1);",
+        ];
+        for input in inputs {
+            let output = rewritten(input)?;
+            assert!(
+                !output.contains("(first());"),
+                "unsupported placement/comment must not be split: {output}"
+            );
+        }
         Ok(())
     }
 

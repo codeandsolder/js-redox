@@ -1925,6 +1925,62 @@ mod tests {
     }
 
     #[test]
+    fn source_tree_separates_effectful_member_target_initialization() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let original_source =
+            "function root(){const init=function(U,H){((Hm=(H.length<2&&(U.ready=1),H),U).Z_=function(){return Hm;});};}";
+        fs::write(&original, original_source)?;
+        fs::write(
+            input.join("handler.js"),
+            "const capturedHandler=function(U,H){return init(U,H);};",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let folder = output.join("lexical-context");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(folder.join("context.json"))?)?;
+        let helper = &metadata["helpers"][0];
+        let path = helper["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing helper path"))?;
+        let readable = fs::read_to_string(folder.join(path))?;
+        assert!(
+            helper["transforms"]["member_object_sequence_lowering"]
+                .as_u64()
+                .is_some_and(|count| count >= 1),
+            "{helper}"
+        );
+        assert!(readable.contains("U.Z_ = function"), "{readable}");
+        assert!(readable.contains("Hm ="), "{readable}");
+        assert!(!readable.contains("), U).Z_"), "{readable}");
+        assert_eq!(
+            fs::read_to_string(folder.join("original.js"))?,
+            original_source
+        );
+        let handler = fs::read_to_string(output.join("handler.js"))?;
+        assert!(
+            handler
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+                .contains("init(U,H)"),
+            "the executable handler must still invoke the original helper: {handler}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn source_tree_recovers_guarded_return_joins_from_original_helper() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let input = temp.path().join("source");

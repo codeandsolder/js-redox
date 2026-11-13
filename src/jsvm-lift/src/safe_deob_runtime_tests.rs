@@ -205,6 +205,63 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 }
 
 #[test]
+#[ignore = "requires Node; run the focused test explicitly"]
+fn member_object_sequence_runtime_equivalence() -> Result<()> {
+    let source = r#"
+function run(strict) {
+    const trace = [];
+    const write = (kind) => { trace.push(kind); return kind; };
+    const proxy = new Proxy({}, {
+        set(target,key,value) { trace.push('set:' + key); target[key] = value; return true; },
+        get(target,key) { trace.push('get:' + key); return target[key]; }
+    });
+    function outer() {
+        // The direct eval must still see the function lexical environment.
+        ((eval('var marker = 19'),write('prefix'),proxy).fn =
+            function(){ return marker; });
+        ((write('before'),proxy)[write('key')] = write('rhs'));
+        ((write('compound'),proxy)[write('key-compound')] += write('tail'));
+        ((write('logical'),proxy)[write('key')] ||= write('skipped'));
+        ((write('nullish'),proxy)[write('key')] ??= write('skipped-nullish'));
+        class C {
+            #value = 1;
+            add() { ((write('private'),this).#value += 2); return this.#value; }
+        }
+        trace.push('private-value:' + new C().add());
+        try {
+            ((write('throw'),(() => { throw Error('stop'); })(), proxy).bad = 1);
+        } catch (error) { trace.push('catch:' + error.message); }
+        const fn = proxy.fn;
+        trace.push(fn.name + ':' + fn());
+        return trace;
+    }
+    return outer();
+}
+console.log(JSON.stringify(run(false)));
+"#;
+    let result = deobfuscate_source(
+        source,
+        "member-object-sequence-runtime",
+        SourceMode::Auto,
+        12,
+        false,
+        &budget("member-object-sequence-runtime"),
+    )?;
+    assert!(
+        count(&result.report, "member_object_sequence_lowering") >= 2,
+        "{:?}",
+        result.report.transforms
+    );
+    let scratch = TempDir::new()?;
+    runtime_equivalent(
+        scratch.path(),
+        "member-object-sequence",
+        source,
+        &result.source,
+    )
+}
+
+#[test]
 #[ignore = "requires Node; semantic CI invokes explicitly"]
 fn depythonify_safe_deob_generated_runtime_equivalence() -> Result<()> {
     let scratch = TempDir::new()?;
