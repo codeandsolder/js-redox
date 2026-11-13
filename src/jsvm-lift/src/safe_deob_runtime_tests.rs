@@ -206,6 +206,50 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
+fn if_guard_first_member_object_runtime_equivalence() -> Result<()> {
+    let source = r#"
+function execute(gate) {
+    const trace = [];
+    const note = name => { trace.push(name); return name; };
+    const obj = new Proxy({value: 3}, {
+        get(target, key) { trace.push('get:' + String(key)); return target[key]; }
+    });
+    if (((note('start'),obj).value < 5)) trace.push('first-yes');
+    if (gate && ((note('guarded'),obj).value < 5)) trace.push('second-yes');
+    if (note('left').length + ((note('right'),obj).value) > 0) trace.push('sum-yes');
+    if (((eval('var lexical = 17'),obj).value < 5)) trace.push('eval:' + lexical);
+    try {
+        if (((note('throw'),(() => { throw Error('abort'); })(),obj).value < 5))
+            trace.push('unreachable');
+    } catch (error) { trace.push('caught:' + error.message); }
+    return trace;
+}
+console.log(JSON.stringify([execute(false), execute(true)]));
+"#;
+    let result = deobfuscate_source(
+        source,
+        "if-guard-member-prefix-runtime",
+        SourceMode::Auto,
+        12,
+        false,
+        &budget("if-guard-member-prefix-runtime"),
+    )?;
+    assert!(
+        count(&result.report, "if_guard_member_prefix_lowering") >= 1,
+        "{:?}",
+        result.report.transforms
+    );
+    let scratch = TempDir::new()?;
+    runtime_equivalent(
+        scratch.path(),
+        "if-guard-member-prefix",
+        source,
+        &result.source,
+    )
+}
+
+#[test]
+#[ignore = "requires Node; run the focused test explicitly"]
 fn member_object_sequence_runtime_equivalence() -> Result<()> {
     let source = r#"
 function run(strict) {

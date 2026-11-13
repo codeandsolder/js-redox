@@ -397,6 +397,19 @@ assignments without a safe statement slot remain untouched. The
 `member_object_sequence_lowering` counter records these semantic rewrites,
 distinct from whitespace-only `expression-layouts/` navigation views.
 
+An analogous `if_guard_member_prefix_lowering` pass handles a comma
+sequence in a property object that is **guaranteed to be evaluated first**
+within a function/block sibling `if` test. For example,
+`if (((prepare(), object).length < bound)) {...}` can evaluate
+`(prepare());` before the same comparison using `(object).length`.
+Only the test's unconditional leftmost evaluation path is eligible:
+binary/logical left operands, conditional tests, unary operands and
+nonoptional property objects. Guarded branches, right operands, call
+callees, computed keys, optional chains and ambiguous inter-operand
+comments cannot be hoisted. The property access and branch bodies keep their
+original evaluation context. In source-tree mode, captured source and the
+protected executable are stored independently of rewritten helper views.
+
 A separate `lexical-context/annotated-handlers/` tree puts confirmed helper
 context **at the first direct call** in each recovered handler. For a short
 original, stable, single-return function it quotes that exact return expression

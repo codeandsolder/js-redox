@@ -257,6 +257,86 @@ pub(crate) fn lower_member_object_sequence(
     Some(text)
 }
 
+/// Only descend through operands evaluated *first*, with no other
+/// possibly-effectful expression or reference creation before them.
+///
+/// In particular, walking a right operand, a computed key, a call callee,
+/// or an optional chain could move effects across user code or even change
+/// direct/indirect eval and receiver identity. An ordinary property object's
+/// comma sequence is a value computation, so the prefix can be evaluated as
+/// preceding sibling statements without changing a property reference.
+fn first_member_object_sequence<'a, 'e>(
+    expr: &'e Expression<'a>,
+) -> Option<&'e SequenceExpression<'a>> {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => {
+            first_member_object_sequence(&paren.expression)
+        }
+        Expression::BinaryExpression(binary) => first_member_object_sequence(&binary.left),
+        Expression::LogicalExpression(logical) => first_member_object_sequence(&logical.left),
+        Expression::ConditionalExpression(conditional) => {
+            first_member_object_sequence(&conditional.test)
+        }
+        Expression::UnaryExpression(unary) => first_member_object_sequence(&unary.argument),
+        Expression::StaticMemberExpression(member) if !member.optional => {
+            sequence_rhs(&member.object).or_else(|| first_member_object_sequence(&member.object))
+        }
+        Expression::ComputedMemberExpression(member) if !member.optional => {
+            sequence_rhs(&member.object).or_else(|| first_member_object_sequence(&member.object))
+        }
+        Expression::PrivateFieldExpression(member) if !member.optional => {
+            sequence_rhs(&member.object).or_else(|| first_member_object_sequence(&member.object))
+        }
+        _ => None,
+    }
+}
+
+/// Extract a comma prefix from an unconditionally first-evaluated property
+/// object in a sibling if-statement test.
+///
+/// E.g. if (((initialize(), object).length < bound)) body;
+/// becomes (initialize()); if ((((object)).length < bound)) body;
+///
+/// Nothing from the original test runs before the selected prefix; this is
+/// why we only follow the leftmost guaranteed-evaluation path. The original
+/// branch source is kept verbatim, with one expression replacement. A
+/// function/block statement-list parent is required (verified by the caller).
+pub(crate) fn lower_if_test_first_member_object(
+    statement: &IfStatement<'_>,
+    source: &str,
+) -> Option<String> {
+    let sequence = first_member_object_sequence(&statement.test)?;
+    let (last, prefixes) = sequence.expressions.split_last()?;
+    if prefixes.is_empty() {
+        return None;
+    }
+    let sequence_start = sequence.span.start as usize;
+    let sequence_end = sequence.span.end as usize;
+    let mut previous_end = sequence_start;
+    for operand in &sequence.expressions {
+        let start = operand.span().start as usize;
+        let gap = source.get(previous_end..start)?;
+        if gap.contains("/*") || gap.contains("//") {
+            return None;
+        }
+        previous_end = operand.span().end as usize;
+    }
+    let tail = source.get(previous_end..sequence_end)?;
+    if tail.contains("/*") || tail.contains("//") {
+        return None;
+    }
+    let mut result = String::new();
+    for prefix in prefixes {
+        result.push_str(&format!("({});\n", fragment(source, prefix.span())));
+    }
+    result.push_str(source.get(statement.span.start as usize..sequence_start)?);
+    result.push('(');
+    result.push_str(fragment(source, last.span()));
+    result.push(')');
+    result.push_str(source.get(sequence_end..statement.span.end as usize)?);
+    Some(result)
+}
+
 /// Split the side-effecting comma prefix of an if test from its final
 /// condition. The caller must prove this is a sibling statement in an
 /// existing function/block statement list: emitting several statements
@@ -492,6 +572,66 @@ mod tests {
                 "unsupported placement/comment must not be split: {output}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn unfolds_unconditionally_first_member_object_in_if_test() -> Result<(), BudgetExceeded> {
+        let input = "function f(o,bound){if(((record('prefix'),o).length<bound)){record('yes');}else{record('no');}}";
+        let output = rewritten(input)?;
+        assert!(output.contains("(record('prefix'));"), "{output}");
+        assert!(!output.contains("record('prefix'),o"), "{output}");
+        assert!(output.contains(".length<bound"), "{output}");
+        assert!(
+            matches!(
+                (
+                    output.find("(record('prefix'));"),
+                    output.find("if("),
+                    output.find("record('yes')")
+                ),
+                (Some(prefix), Some(guard), Some(yes)) if prefix < guard && guard < yes
+            ),
+            "{output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn never_hoists_noninitial_guard_effects_or_call_callee() -> Result<(), BudgetExceeded> {
+        let inputs = [
+            "function f(o,flag){if(flag&&((record('late'),o).length<3))act();}",
+            "function f(o,flag){if(flag?((record('late'),o).length<3):false)act();}",
+            "function f(o){if(read()+((record('late'),o).length<3))act();}",
+            "function f(o){if((record('callee'),eval)('o'))act();}",
+            "function f(o){if(obj[(record('key'),name)]<3)act();}",
+            "function f(o){if(((record('prefix')/*note*/,o).length<3))act();}",
+            "function f(o){if(((record('prefix'),o).length<3))/*branch*/act();}",
+        ];
+        for (index, input) in inputs.into_iter().enumerate() {
+            let output = rewritten(input)?;
+            if index == 6 {
+                // The branch annotation survives a correct rewrite.
+                assert!(output.contains("/*branch*/"), "{output}");
+                continue;
+            }
+            assert!(
+                !output.contains("(record('late'));")
+                    && !output.contains("(record('key'));")
+                    && !output.contains("(record('callee'));")
+                    && !output.contains("(record('prefix'));"),
+                "must not move guarded or ordered effects: {output}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn first_member_test_preserves_direct_eval_binding() -> Result<(), BudgetExceeded> {
+        let input = "function f(o){if(((eval('var flag = 7'),o).value<3)){return flag;}return 0;}";
+        let output = rewritten(input)?;
+        assert!(output.contains("(eval('var flag = 7'));"), "{output}");
+        assert!(output.contains("return flag"), "{output}");
+        assert!(!output.contains("eval('var flag = 7'),o"), "{output}");
         Ok(())
     }
 
