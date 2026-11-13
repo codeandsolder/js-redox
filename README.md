@@ -484,6 +484,20 @@ boundaries and JavaScript receiver identity remain governed by the linked
 helper source. Captured source and executable files remain unchanged; the
 layout is not suitable where Function#toString or exact source bytes matter.
 
+The `lexical-context/binding-writes/` index adds **original lexical binding
+mutation provenance** for every linked symbol that receives a resolved write.
+Each report links the original declaration, exact write and operation byte
+spans, assignment/update operator, and nearest enclosing function. All
+lookups use Oxc symbol identity: shadowed names do not become writes to the
+outer binding. Reports include writes inside deferred closures but identify
+those function boundaries. Declaration initializers live in the linked
+initial-definition helper, not in this reference-write table. Unknown
+execution order, direct eval, dynamic scope, and external code must not be
+mistaken for a proven reaching definition; the maps are navigation evidence,
+not constant-propagation permission. Structured `write_sites` are also
+recorded in the source-tree `context.json` helper rows, without changing the
+original source, recovered helper code, or captured executable.
+
 For mutable computed-property aliases, the `lexical-context/explained/`
 views retain executable property expressions and annotate them with their
 **actual** lexical string assignments and conditional overrides. For example,

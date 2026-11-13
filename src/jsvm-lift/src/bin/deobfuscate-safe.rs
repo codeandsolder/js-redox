@@ -424,6 +424,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
         let mut call_spine_rows = Vec::new();
         let mut call_layout_rows = Vec::new();
         let mut assignment_outline_rows = Vec::new();
+        let mut binding_write_rows = Vec::new();
         let mut helper_index = String::from("# Actual lexical helper implementations\n\n");
         helper_index.push_str("These definitions come from the supplied original program. ");
         helper_index.push_str(
@@ -550,10 +551,63 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 helper_index.push_str(&format!(" — uses {}", helper.references.join(", ")));
             }
             helper_index.push('\n');
+            if !helper.write_sites.is_empty() {
+                let report_path = format!(
+                    "binding-writes/{}.md",
+                    relative
+                        .trim_start_matches("helpers/")
+                        .trim_end_matches(".js"),
+                );
+                fs::create_dir_all(folder.join("binding-writes"))?;
+                let mut report = format!(
+                    "# Resolved lexical writes to {}\n\n                     [Original source](../original.js) · [initial definition](../{})\n\n                     Source-resolved syntactic write sites, not an execution                      trace or reaching-definition proof. Nested functions                      execute only when invoked. Byte spans refer to the                      original lexical source.\n\n                     | Reference bytes | Operation bytes | Kind | Function | Expression |\n                     |---|---|---|---|---|\n",
+                    helper.name, relative,
+                );
+                for site in &helper.write_sites {
+                    let operation = original
+                        .get(site.operation[0] as usize..site.operation[1] as usize)
+                        .unwrap_or("");
+                    let value = if operation.len() <= 100
+                        && !operation.contains(char::from(10))
+                        && !operation.contains(char::from(13))
+                        && !operation.contains(char::from(96))
+                    {
+                        format!(
+                            "{}{}{}",
+                            char::from(96),
+                            operation.replace('|', "\\|"),
+                            char::from(96)
+                        )
+                    } else {
+                        format!("*{} source bytes; see original*", operation.len())
+                    };
+                    let owner = site
+                        .enclosing_function
+                        .as_deref()
+                        .unwrap_or("no enclosing function (could be a class initializer)");
+                    let owner = site.enclosing_function_span.map_or_else(
+                        || owner.to_owned(),
+                        |span| format!("{owner} ({}..{})", span[0], span[1]),
+                    );
+                    report.push_str(&format!(
+                        "| {}..{} | {}..{} | {} | {} | {} |\n",
+                        site.reference[0],
+                        site.reference[1],
+                        site.operation[0],
+                        site.operation[1],
+                        site.operation_kind,
+                        owner,
+                        value,
+                    ));
+                }
+                fs::write(folder.join(&report_path), report)?;
+                binding_write_rows.push((helper.name.clone(), report_path));
+            }
             helper_rows.push(json!({
                 "name": helper.name,
                 "path": relative,
                 "binding_mutable": helper.mutable_binding,
+                "write_sites": helper.write_sites,
                 "references": helper.references,
                 "single_trip_loops_reflowed": rewritten_loops,
                 "post_reflow_error": post_reflow_error,
@@ -564,6 +618,25 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "transforms": transforms,
                 "error": error,
             }));
+        }
+        if !binding_write_rows.is_empty() {
+            let mut index = String::from(
+                "# Original lexical binding writes\n\n                 Linked mutable bindings with all source-resolved syntactic                  write sites. Function nesting is lexical, not a reaching-definition                  or execution-order proof.\n\n",
+            );
+            for (name, path) in &binding_write_rows {
+                index.push_str(&format!(
+                    "- [{}]({})\n",
+                    name,
+                    path.trim_start_matches("binding-writes/"),
+                ));
+            }
+            fs::write(folder.join("binding-writes/README.md"), index)?;
+            helper_index.push_str(
+                "\n[Browse original resolved binding writes](binding-writes/README.md).\n",
+            );
+            md.push_str(
+                "\n## Mutable lexical binding provenance\n\n                 [Inspect source-resolved write sites](lexical-context/binding-writes/README.md).                  These are not executed-write or reaching-definition guarantees.\n\n",
+            );
         }
         if !call_layout_rows.is_empty() {
             let mut index = String::from(
@@ -1896,6 +1969,58 @@ mod tests {
             fs::read_to_string(output.join("handler.js"))?.contains("stack(x)"),
             "the original helper call must remain in the executable tree"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_emits_original_resolved_binding_writes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let original_source = "function root(){let Hm=97;const oU=function(){Hm=88>>2;const later=()=>Hm++;return Hm;};}";
+        fs::write(&original, original_source)?;
+        fs::write(input.join("handler.js"), "const captured=()=>oU();")?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 4,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let folder = output.join("lexical-context");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(folder.join("context.json"))?)?;
+        let helper = metadata["helpers"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["name"] == "Hm"))
+            .ok_or_else(|| anyhow::anyhow!("missing Hm helper"))?;
+        let sites = helper["write_sites"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing bound write metadata"))?;
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        assert_eq!(sites[0]["enclosing_function"], "oU");
+        assert_eq!(sites[1]["enclosing_function"], "later");
+        let path = helper["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing original definition path"))?;
+        let report = folder.join(format!(
+            "binding-writes/{}.md",
+            path.trim_start_matches("helpers/").trim_end_matches(".js"),
+        ));
+        let content = fs::read_to_string(report)?;
+        assert!(content.contains("Hm=88>>2"), "{content}");
+        assert!(content.contains("Hm++"), "{content}");
+        assert!(content.contains("not an execution"), "{content}");
+        assert!(fs::read_to_string(folder.join("binding-writes/README.md"))?.contains("Hm"));
+        assert_eq!(
+            fs::read_to_string(folder.join("original.js"))?,
+            original_source
+        );
+        assert!(fs::read_to_string(output.join("README.md"))?.contains("binding-writes/README.md"));
         Ok(())
     }
 

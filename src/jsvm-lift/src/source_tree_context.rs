@@ -7,7 +7,8 @@
 use anyhow::{ensure, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    BindingPattern, Expression, Function, IdentifierReference, Statement, VariableDeclarator,
+    ArrowFunctionExpression, AssignmentExpression, BindingPattern, Expression, Function,
+    IdentifierReference, Statement, UpdateExpression, VariableDeclarator,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_semantic::{Scoping, SemanticBuilder};
@@ -15,6 +16,7 @@ use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::scope::ScopeFlags;
 use oxc_syntax::symbol::SymbolId;
 use rolldown_redox::ecmascript::parse_program;
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone)]
@@ -77,6 +79,97 @@ impl<'a> Visit<'a> for ReferenceVisitor<'_> {
     }
 }
 
+/// An original-program resolved write, *not* a proven executed write.
+#[derive(Debug, Clone, Serialize)]
+pub struct BindingWriteSite {
+    /// Exact original-source span of the written lexical identifier.
+    pub reference: [u32; 2],
+    /// Nearest enclosing assignment/update or the reference itself for
+    /// destructuring/loop writes.
+    pub operation: [u32; 2],
+    pub operation_kind: String,
+    /// Nearest syntactically enclosing function, if any. Never infer when
+    /// that function actually executes.
+    pub enclosing_function: Option<String>,
+    pub enclosing_function_span: Option<[u32; 2]>,
+}
+
+struct MutationCollector<'s> {
+    scoping: &'s Scoping,
+    function_names: &'s BTreeMap<(u32, u32), String>,
+    functions: Vec<Span>,
+    operations: Vec<(Span, String)>,
+    writes: BTreeMap<SymbolId, Vec<BindingWriteSite>>,
+}
+
+impl<'a> Visit<'a> for MutationCollector<'_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        self.functions.push(function.span);
+        walk::walk_function(self, function, flags);
+        self.functions.pop();
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        self.functions.push(arrow.span);
+        walk::walk_arrow_function_expression(self, arrow);
+        self.functions.pop();
+    }
+
+    fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
+        self.operations.push((
+            expression.span,
+            format!("assignment {}", expression.operator.as_str()),
+        ));
+        walk::walk_assignment_expression(self, expression);
+        self.operations.pop();
+    }
+
+    fn visit_update_expression(&mut self, expression: &UpdateExpression<'a>) {
+        self.operations.push((
+            expression.span,
+            format!("update {}", expression.operator.as_str()),
+        ));
+        walk::walk_update_expression(self, expression);
+        self.operations.pop();
+    }
+
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        let Some(reference_id) = id.reference_id.get() else {
+            return;
+        };
+        let reference = self.scoping.get_reference(reference_id);
+        if !reference.is_write() {
+            return;
+        }
+        let Some(symbol) = reference.symbol_id() else {
+            return;
+        };
+        let operation = self
+            .operations
+            .last()
+            .filter(|(span, _)| span.start <= id.span.start && id.span.end <= span.end);
+        let (span, kind) = operation.map_or((id.span, "other resolved write"), |(span, kind)| {
+            (*span, kind.as_str())
+        });
+        let owner = self.functions.last();
+        self.writes
+            .entry(symbol)
+            .or_default()
+            .push(BindingWriteSite {
+                reference: [id.span.start, id.span.end],
+                operation: [span.start, span.end],
+                operation_kind: kind.to_owned(),
+                enclosing_function: owner.map(|function| {
+                    self.function_names
+                        .get(&(function.start, function.end))
+                        .cloned()
+                        .unwrap_or_else(|| "anonymous/nested function".to_owned())
+                }),
+                enclosing_function_span: owner.map(|span| [span.start, span.end]),
+            });
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ContextHelper {
     pub name: String,
@@ -85,6 +178,7 @@ pub struct ContextHelper {
     pub references: Vec<String>,
     /// This binding receives a later resolved write in the original program.
     pub mutable_binding: bool,
+    pub write_sites: Vec<BindingWriteSite>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +247,23 @@ pub fn reconstruct_context(
             .push(definition);
     }
 
+    let function_names = by_symbol
+        .values()
+        .map(|definition| {
+            (
+                (definition.value_span.start, definition.value_span.end),
+                definition.name.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut mutations = MutationCollector {
+        scoping,
+        function_names: &function_names,
+        functions: Vec::new(),
+        operations: Vec::new(),
+        writes: BTreeMap::new(),
+    };
+    mutations.visit_program(&parsed.program);
     let mut references = ReferenceVisitor {
         scoping,
         references: Vec::new(),
@@ -227,6 +338,7 @@ pub fn reconstruct_context(
             source,
             references: dependencies.into_iter().collect(),
             mutable_binding,
+            write_sites: mutations.writes.remove(&symbol).unwrap_or_default(),
         });
     }
     helpers.sort_by(|left, right| left.name.cmp(&right.name));
@@ -666,6 +778,56 @@ mod tests {
             let mutable = context.helpers.iter().find(|item| item.name == "mutable");
             assert!(mutable.is_some_and(|item| item.mutable_binding));
         }
+    }
+
+    #[test]
+    fn mutation_sites_follow_exact_symbols_and_separate_deferred_functions() -> Result<()> {
+        let original = r#"function program() {
+            let Hm = 97;
+            const oU = function() {
+                Hm = 88 >> 2;
+                const delayed = () => { Hm += 2; };
+                { let Hm = 3; Hm = 4; }
+                return Hm;
+            };
+        }"#;
+        let handlers = vec![(
+            "captured.js".to_owned(),
+            "const captured = () => oU();".to_owned(),
+        )];
+        let context = reconstruct_context(original, &handlers)?;
+        let state = context
+            .helpers
+            .iter()
+            .find(|helper| helper.name == "Hm" && helper.source.contains("97"))
+            .context("missing outer Hm declaration")?;
+        assert_eq!(state.write_sites.len(), 2, "{:?}", state.write_sites);
+        let direct = &state.write_sites[0];
+        let deferred = &state.write_sites[1];
+        assert_eq!(direct.operation_kind, "assignment =");
+        assert_eq!(direct.enclosing_function.as_deref(), Some("oU"));
+        assert_eq!(
+            &original[direct.operation[0] as usize..direct.operation[1] as usize],
+            "Hm = 88 >> 2"
+        );
+        assert_eq!(deferred.operation_kind, "assignment +=");
+        assert_eq!(deferred.enclosing_function.as_deref(), Some("delayed"));
+        assert_eq!(
+            &original[deferred.operation[0] as usize..deferred.operation[1] as usize],
+            "Hm += 2"
+        );
+        let shadowed = context
+            .helpers
+            .iter()
+            .find(|helper| helper.name == "Hm" && helper.source.contains("3"))
+            .context("missing shadowed Hm")?;
+        assert_eq!(shadowed.write_sites.len(), 1);
+        assert_eq!(
+            &original[shadowed.write_sites[0].operation[0] as usize
+                ..shadowed.write_sites[0].operation[1] as usize],
+            "Hm = 4"
+        );
+        Ok(())
     }
 
     #[test]
