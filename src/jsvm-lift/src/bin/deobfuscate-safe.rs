@@ -423,6 +423,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
         let mut helper_rows = Vec::new();
         let mut call_spine_rows = Vec::new();
         let mut call_layout_rows = Vec::new();
+        let mut assignment_outline_rows = Vec::new();
         let mut helper_index = String::from("# Actual lexical helper implementations\n\n");
         helper_index.push_str("These definitions come from the supplied original program. ");
         helper_index.push_str(
@@ -510,6 +511,12 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                     fs::write(folder.join(&outline_path), outline)?;
                     call_spine_rows.push((helper.name.clone(), outline_path, layout_path));
                 }
+                if let Some(outline) = view.assignment_outline_markdown {
+                    let outline_path = format!("assignment-outlines/{stem}.md");
+                    fs::create_dir_all(folder.join("assignment-outlines"))?;
+                    fs::write(folder.join(&outline_path), outline)?;
+                    assignment_outline_rows.push((helper.name.clone(), outline_path));
+                }
             }
             // Annotate references only where the helper's *own* AST resolves
             // the property key to the same symbol as its prior assignments.
@@ -578,6 +585,24 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             md.push_str(
                 "\n## Readable lexical helper expression layouts\n\n\
                  [Browse original-token expression layouts](lexical-context/expression-layouts/README.md).\n\n",
+            );
+        }
+        if !assignment_outline_rows.is_empty() {
+            let mut index = String::from(
+                "# Assignment containment in long expressions\n\nThese source-backed AST outlines show nested writes, enclosing assignment relationships and conditional guard ancestry, not execution order.\n\n",
+            );
+            for (name, path) in &assignment_outline_rows {
+                index.push_str(&format!(
+                    "- [{name}]({})\n",
+                    path.trim_start_matches("assignment-outlines/")
+                ));
+            }
+            fs::write(folder.join("assignment-outlines/README.md"), index)?;
+            helper_index.push_str(
+                "\n[Browse nested assignment structure](assignment-outlines/README.md).\n",
+            );
+            md.push_str(
+                "\n## Nested lexical-helper assignments\n\n[Browse the long-expression assignment outlines](lexical-context/assignment-outlines/README.md). This is a source-backed containment map, not evaluation order.\n\n",
             );
         }
         if !call_spine_rows.is_empty() {
@@ -1870,6 +1895,64 @@ mod tests {
         assert!(
             fs::read_to_string(output.join("handler.js"))?.contains("stack(x)"),
             "the original helper call must remain in the executable tree"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_tree_links_guarded_assignment_structure_without_changing_original() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let writes = ('c'..='z')
+            .enumerate()
+            .map(|(index, name)| format!("U.{name}={index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let original_source = format!(
+            "function root(){{const init=function(U,flag){{Hm=(U.a=1,flag&&(U.b=2),U.c=(U.d=3),{writes});return Hm;}};}}"
+        );
+        fs::write(&original, &original_source)?;
+        fs::write(
+            input.join("handler.js"),
+            "const capturedHandler=function(U,flag){return init(U,flag);};",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let folder = output.join("lexical-context");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(folder.join("context.json"))?)?;
+        let helper = metadata["helpers"][0]["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing helper path"))?;
+        let stem = std::path::Path::new(helper)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow::anyhow!("missing helper stem"))?;
+        let outline = fs::read_to_string(folder.join(format!("assignment-outlines/{stem}.md")))?;
+        assert!(outline.contains("Hm ="), "{outline}");
+        assert!(outline.contains("U.b ="), "{outline}");
+        assert!(outline.contains("logical && right operand"), "{outline}");
+        assert!(outline.contains("U.d ="), "{outline}");
+        assert!(fs::read_to_string(folder.join("assignment-outlines/README.md"))?.contains(stem));
+        assert!(fs::read_to_string(output.join("README.md"))?
+            .contains("lexical-context/assignment-outlines/README.md"));
+        assert_eq!(
+            fs::read_to_string(folder.join("original.js"))?,
+            original_source
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("handler.js"))?,
+            "const capturedHandler=function(U,flag){return init(U,flag);};"
         );
         Ok(())
     }

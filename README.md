@@ -461,6 +461,18 @@ contains alternate JS source views for either deep calls **or** long
 single-line assignments, sequences, comparisons, short-circuits or conditional
 operands, even without a deeply nested call. These views insert only
 whitespace at AST-confirmed boundaries.
+
+For helpers with long *nested assignment* expressions, the independent
+`lexical-context/assignment-outlines/` Markdown index lists the actual
+assignment targets and operators, their source-byte locations, lexical
+containment inside other assignment expressions, and nearest short-circuit
+or ternary guard ancestry. It keeps assignments in nested callback bodies
+separate from the enclosing initializer. This is a source-backed structural
+map, not an execution trace or a claim that assignments can safely be hoisted:
+outer assignment targets (including free/global names such as `Hm`) are
+resolved before their RHS, computed property references can be effectful,
+and branch-guarded writes may not run. Original helper and captured
+executable remain unchanged.
 The view never hoists effects or changes binding, receiver or evaluation
 order. Its syntax must parse and regenerate the exact same canonical
 JavaScript; if not, the alternate view is refused. This makes
