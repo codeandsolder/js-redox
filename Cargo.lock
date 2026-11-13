@@ -1513,7 +1513,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "string_wizard"
 version = "1.2.12-redox.1"
-source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=458c995#458c995026700f10e5d3c4b32ef631e687aef351"
+source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=9405f935043c836865fdc9697d4ac902e8467b83#9405f935043c836865fdc9697d4ac902e8467b83"
 dependencies = [
  "memchr",
  "regex",
