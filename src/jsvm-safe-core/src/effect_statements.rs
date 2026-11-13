@@ -172,8 +172,12 @@ impl Lowered {
                 for prefix in prefixes {
                     self.emit(prefix, source, scoping, depth + 1)?;
                 }
+                // With a proved lexical identifier and no anonymous
+                // name-inference hazard, an assignment is valid statement
+                // syntax as-is. Avoid redundant wrapping around the target
+                // and the selected value.
                 self.statements.push(format!(
-                    "({} = ({}));",
+                    "{} = {};",
                     fragment(source, assign.left.span()),
                     fragment(source, last.span())
                 ));
@@ -234,7 +238,11 @@ fn conditional_assignment_branch(
         return None;
     }
     let Some(conditional) = conditional_rhs(expr) else {
-        return Some(format!("({target} = ({}));", fragment(source, expr.span())));
+        // The target is proven to be a plain lexical identifier, so this
+        // is already a valid statement expression. Extra parentheses around
+        // both sides make the recovered code harder to read and turn
+        // downstream structural assertions into formatting checks.
+        return Some(format!("{target} = {};", fragment(source, expr.span())));
     };
     let test = fragment(source, conditional.test.span());
     let yes = conditional_assignment_branch(&conditional.consequent, target, source, depth + 1)?;
@@ -601,6 +609,20 @@ mod tests {
         // RHS; the essential invariant is that the assignment is separate.
         assert!(output.contains("U = "), "{output}");
         assert!(!output.contains("U=(L=U&127,v="), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_sequence_recovery_emits_plain_lexical_assignment() -> Result<(), BudgetExceeded> {
+        let input = "function f(log,flag){let state;state=flag?(log.push('true'),3):(log.push('false'),5);return state;}";
+        let output = rewritten(input)?;
+        assert!(output.contains("if (flag)"), "{output}");
+        assert!(output.contains("state = 3;"), "{output}");
+        assert!(output.contains("state = 5;"), "{output}");
+        assert!(!output.contains("(state = (3))"), "{output}");
+        assert!(!output.contains("(state = (5))"), "{output}");
+        assert!(output.contains("log.push('true')"), "{output}");
+        assert!(output.contains("log.push('false')"), "{output}");
         Ok(())
     }
 

@@ -2527,7 +2527,12 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(!flat.contains("state==2"), "{}", result.source);
-        assert!(flat.contains("flag?3:"), "{}", result.source);
+        // The nested ternary assignment is now explicit control flow.
+        // The dispatcher retargets the true arm to 3 (not 2), and the
+        // false arm still logs before assigning 5. Do not assert a
+        // particular parenthesization of the original ternary syntax.
+        assert!(flat.contains("if(flag){state=3;"), "{}", result.source);
+        assert!(flat.contains("state=5;"), "{}", result.source);
         assert!(
             flat.contains("log.push(\"condition-false\")"),
             "{}",
