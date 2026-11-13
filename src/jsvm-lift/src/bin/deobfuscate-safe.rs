@@ -3361,7 +3361,8 @@ mod tests {
         assert!(phases.contains("Ordered evaluation phases"), "{phases}");
         assert!(phases.contains("PutValue target"), "{phases}");
         assert!(phases.contains("U.n0"), "{phases}");
-        assert!(phases.contains("opaque expression"), "{phases}");
+        assert!(phases.contains("| inert literal |"), "{phases}");
+        assert!(!phases.contains("| opaque expression |"), "{phases}");
         assert!(outline.contains("U.R"), "{outline}");
         assert!(outline.contains("U.n0"), "{outline}");
         assert!(outline.contains("containment"), "{outline}");

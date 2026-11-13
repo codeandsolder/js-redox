@@ -598,8 +598,13 @@ subtrees remain opaque; direct eval's lexical semantics are not rewritten.
 Computed assignment-target key coercion remains deferred until GetValue or
 PutValue, so simple assignment may evaluate its RHS *before* ToPropertyKey,
 while compound or logical assignment can convert the same key **twice**.
-These are plans for possible evaluation order, not a runtime execution trace.
-The plans are analyst navigation, not observed traces or executable rewrites.
+Numeric, BigInt, boolean, string and null literals are labeled as effect-free
+values rather than unknown effects; RegExp literals are fresh object creations.
+Unary void evaluates its operand (which may read getters, call functions,
+write data or throw) before discarding the result. Coercing unary operators
+and reference-sensitive typeof/delete retain opaque behavior until their
+individual steps can be modeled. These remain plans for possible evaluation
+order and analyst navigation, not runtime traces or executable rewrites.
 Each view records its source hash and generated artifact hash in the
 whole-program `helpers.json` v4 report, without modifying the polished
 helper or its source-backed extract. Every exact source-backed helper extract

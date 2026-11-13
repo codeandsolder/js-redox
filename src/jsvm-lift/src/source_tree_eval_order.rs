@@ -443,6 +443,31 @@ impl<'s> Plan<'s> {
             Expression::Identifier(id) => {
                 self.mark(id.span, "GetValue identifier", id.name.to_string());
             }
+            // Evaluating a primitive literal neither reads a binding nor
+            // invokes user code. Preserve it in the phase sequence as an
+            // effect-free value instead of calling it an opaque side effect.
+            Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::StringLiteral(_) => {
+                self.mark(expr.span(), "inert literal", self.snippet(expr.span()));
+            }
+            Expression::RegExpLiteral(_) => {
+                // A RegExp literal creates a fresh object; don't conflate
+                // allocation/identity with a primitive constant or callback.
+                self.mark(expr.span(), "create regexp", "fresh RegExp literal value");
+            }
+            Expression::UnaryExpression(unary) if unary.operator.is_void() => {
+                // void still evaluates GetValue of its operand, even if
+                // it contains assignments, calls or references that throw.
+                self.expression(&unary.argument);
+                self.mark(
+                    unary.span,
+                    "discard value",
+                    "void produces undefined only if its operand completes",
+                );
+            }
             Expression::UpdateExpression(update) => {
                 if self.simple_target(&update.argument) {
                     if let SimpleAssignmentTarget::ComputedMemberExpression(member) =
@@ -462,9 +487,9 @@ impl<'s> Plan<'s> {
                     self.opaque(update.span, "extended update expression");
                 }
             }
-            // Unary delete/typeof, optional chains, constructors, templates,
-            // class initializers, etc. remain opaque rather than pretending
-            // we know their nested effect/exception order.
+            // Delete/typeof and coercing unary operators, optional chains,
+            // constructors, templates, class initializers, etc. remain opaque
+            // rather than pretending we know their effect/exception order.
             _ => self.opaque(expr.span(), "unexpanded AST subtree"),
         }
     }
@@ -526,7 +551,12 @@ pub(super) fn ordered_assignment_phases(source: &str, program: &Program<'_>) -> 
          before RHS at GetValue and AGAIN after RHS at PutValue; the same \
          object key can yield different names. Logical assignments gate \
          RHS/PutValue. \
-         Spans refer to the derived readable helper, not the captured source.\n\n",
+         Primitive literals are marked inert, while RegExp literals create \
+         distinct objects. The void operator evaluates its operand (including \
+         calls, binding reads and exceptions) before discarding its value; \
+         delete/typeof and coercing unary operators retain their own \
+         unexpanded semantics. Spans refer to the derived readable helper, \
+         not the captured source.\n\n",
     );
     collector.sections.sort_by_key(|(span, _)| span.start);
     for (root, phases) in &collector.sections {
@@ -853,6 +883,90 @@ mod tests {
         let phases = plan(&source);
         assert!(phases.contains("opaque expression"), "{phases}");
         assert!(!phases.contains("side.bad = (setter may run)"), "{phases}");
+    }
+
+    #[test]
+    fn literal_values_and_void_operands_have_distinct_evaluation_phases() {
+        let source = format!(
+            "function f(side,emit){{root=(side.a=0,side.b=false,side.c='name',             side.d=null,side.e=12n,side.f=/a/g,side.g=void 0,             side.h=void (side.inner=emit(),1),{});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let literals = phases.matches("| inert literal |").count();
+        assert!(literals >= 5, "missing primitive literal phases: {phases}");
+        assert!(phases.contains("| inert literal | false |"), "{phases}");
+        assert!(phases.contains("| inert literal | 'name' |"), "{phases}");
+        assert!(phases.contains("| inert literal | null |"), "{phases}");
+        assert!(phases.contains("| inert literal | 12n |"), "{phases}");
+        assert!(phases.contains("| create regexp |"), "{phases}");
+        assert_eq!(phases.matches("| discard value |").count(), 2, "{phases}");
+        let call = position(&phases, "| Call | emit;");
+        let inner = position(&phases, "side.inner = (setter may run)");
+        let discard = phases.rfind("| discard value |").unwrap_or(usize::MAX);
+        let outer_write = position(&phases, "side.h = (setter may run)");
+        assert!(
+            call < inner && inner < discard && discard < outer_write,
+            "{phases}"
+        );
+        assert!(!phases.contains("unexpanded AST subtree: void"), "{phases}");
+    }
+
+    #[test]
+    fn void_reads_effectful_operands_but_typeof_delete_and_coercions_stay_opaque() {
+        let source = format!(
+            "function f(obj,side){{root=(side.a=void missing,             side.b=typeof missing,side.c=delete obj.x,             side.d=+obj,side.e=void obj.value,{});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let missing = position(&phases, "| GetValue identifier | missing |");
+        let first_discard = position(&phases, "| discard value |");
+        assert!(missing < first_discard, "{phases}");
+        assert!(
+            phases.contains("unexpanded AST subtree: typeof missing"),
+            "{phases}"
+        );
+        assert!(
+            phases.contains("unexpanded AST subtree: delete obj.x"),
+            "{phases}"
+        );
+        assert!(phases.contains("unexpanded AST subtree: +obj"), "{phases}");
+        let getter = position(&phases, "| GetValue member | property .value");
+        let last_discard = phases.rfind("| discard value |").unwrap_or(usize::MAX);
+        assert!(getter < last_discard, "{phases}");
+    }
+
+    #[test]
+    #[ignore = "requires installed Node; void and getter runtime oracle"]
+    fn node_confirms_void_evaluates_reads_calls_setters_and_can_throw() -> anyhow::Result<()> {
+        use std::process::Command;
+        let source = r#"
+const log = [];
+const target = new Proxy({}, {
+  set(o,k,v){ log.push('set:'+k);return Reflect.set(o,k,v);}
+});
+const obj = {get value(){log.push('getter');return 4}};
+const emit = () => {log.push('call');return 9};
+const value = void (obj.value, emit(), target.out = 3);
+log.push('result:'+String(value));
+try {void noSuchBindingOfAnyKind} catch(e) {log.push('throw:'+e.name)}
+log.push('typeof:'+typeof noSuchBindingOfAnyKind);
+console.log(JSON.stringify(log));
+"#;
+        let result = Command::new("node").arg("-e").arg(source).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let values: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            values,
+            serde_json::json!([
+                "getter",
+                "call",
+                "set:out",
+                "result:undefined",
+                "throw:ReferenceError",
+                "typeof:undefined"
+            ])
+        );
+        Ok(())
     }
 
     #[test]
