@@ -539,6 +539,11 @@ impl<'a> Visit<'a> for Calls<'_> {
     }
 }
 
+struct PathOrigins {
+    entry: Vec<Option<usize>>,
+    constructed: Vec<Option<ConstructedReceiver>>,
+}
+
 struct PathWalker<'s> {
     defs: &'s BTreeMap<FunctionKey, Definition>,
     edges: &'s BTreeMap<FunctionKey, Vec<(FunctionKey, CallLink)>>,
@@ -550,8 +555,7 @@ impl PathWalker<'_> {
     fn walk(
         &mut self,
         current: FunctionKey,
-        origin: &[Option<usize>],
-        constructed: &[Option<ConstructedReceiver>],
+        origins: &PathOrigins,
         names: &mut Vec<String>,
         spans: &mut Vec<[u32; 2]>,
         links: &mut Vec<CallLink>,
@@ -580,7 +584,7 @@ impl PathWalker<'_> {
                         edge.arguments.get(index).and_then(|argument| {
                             argument
                                 .caller_param_index
-                                .and_then(|i| origin.get(i).copied().flatten())
+                                .and_then(|i| origins.entry.get(i).copied().flatten())
                         })
                     })
                 })
@@ -604,7 +608,7 @@ impl PathWalker<'_> {
                         edge.arguments.get(index).and_then(|argument| {
                             argument
                                 .caller_param_index
-                                .and_then(|i| constructed.get(i).cloned().flatten())
+                                .and_then(|i| origins.constructed.get(i).cloned().flatten())
                                 .or_else(|| {
                                     (argument.is_direct_this && argument.positional)
                                         .then(|| constructor_here.clone())
@@ -644,15 +648,11 @@ impl PathWalker<'_> {
                     leaf_parameters,
                 });
             }
-            self.walk(
-                *next,
-                &next_origins,
-                &next_constructed,
-                names,
-                spans,
-                links,
-                visited,
-            );
+            let next_sources = PathOrigins {
+                entry: next_origins,
+                constructed: next_constructed,
+            };
+            self.walk(*next, &next_sources, names, spans, links, visited);
             names.pop();
             spans.pop();
             links.pop();
@@ -1025,7 +1025,10 @@ pub fn reconstruct_caller_views(
         {
             continue;
         }
-        let origin = (0..def.params.len()).map(Some).collect::<Vec<_>>();
+        let origins = PathOrigins {
+            entry: (0..def.params.len()).map(Some).collect(),
+            constructed: vec![None; def.params.len()],
+        };
         let mut walker = PathWalker {
             defs: &finder.functions,
             edges: &collector.edges,
@@ -1034,8 +1037,7 @@ pub fn reconstruct_caller_views(
         };
         walker.walk(
             *root,
-            &origin,
-            &vec![None; def.params.len()],
+            &origins,
             &mut vec![def.label.clone()],
             &mut vec![[root.0, root.1]],
             &mut Vec::new(),
