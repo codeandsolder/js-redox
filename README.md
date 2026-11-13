@@ -585,10 +585,20 @@ Both original and whole-program lexical helpers now also offer
 `evaluation-phases/` static phase plans for long nested assignments.
 These show target-reference formation, GetValue, RHS evaluation and PutValue
 within each possible branch path. Mutually exclusive branches are marked;
-any step may throw, and complex calls/destructuring/optional chains remain
-opaque instead of inventing an order. Computed property key coercion is
-deferred until target GetValue or PutValue, so simple assignment may evaluate
-its RHS *before* ToPropertyKey while compound assignment does not.
+any step may throw. The phase planner additionally expands ordinary calls,
+array initializers and object initializers: it evaluates the callee (and
+member getter) before call arguments, retains method receivers through
+parentheses but not comma-value expressions, evaluates arguments and iterable
+spreads left-to-right, and distinguishes computed object keys (ToPropertyKey
+*before* the value), object spread property copying, array holes and deferred
+function/getter bodies. Spread iteration and CopyDataProperties are explicit
+atomic phases because their internal iterator/getter/Proxy effects are
+dynamic. Destructuring, optional chains, constructors and other unmodeled
+subtrees remain opaque; direct eval's lexical semantics are not rewritten.
+Computed assignment-target key coercion remains deferred until GetValue or
+PutValue, so simple assignment may evaluate its RHS *before* ToPropertyKey,
+while compound or logical assignment can convert the same key **twice**.
+These are plans for possible evaluation order, not a runtime execution trace.
 The plans are analyst navigation, not observed traces or executable rewrites.
 Each view records its source hash and generated artifact hash in the
 whole-program `helpers.json` v4 report, without modifying the polished
