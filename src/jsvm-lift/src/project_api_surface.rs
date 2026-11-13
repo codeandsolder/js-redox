@@ -304,6 +304,9 @@ fetch("https://api.example.test/forbidden", { method: "trace" });
 navigator.sendBeacon("https://api.example.test/beacon", body);
 const xhr = new XMLHttpRequest();
 xhr.open("PATCH", "https://api.example.test/items");
+const escapedXhr = new XMLHttpRequest();
+window.storedXhr = escapedXhr;
+escapedXhr.open("POST", "https://api.example.test/candidate-only");
 new WebSocket("wss://socket.example.test/ws");
 function shadow(fetch) { fetch("https://fake.invalid/"); }
 "#;
@@ -384,15 +387,16 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             &AnalysisBudgets::standard("api-surface-graph-test"),
         )?;
         assert_eq!(summary["units"], 2);
-        assert_eq!(summary["callsites"], 8);
+        assert_eq!(summary["callsites"], 9);
         assert_eq!(summary["failures"], 1);
-        assert_eq!(summary["static_urls"], 8);
+        assert_eq!(summary["static_urls"], 9);
         assert_eq!(summary["kinds"]["fetch"], 5);
         assert_eq!(summary["kinds"]["send_beacon"], 1);
         assert_eq!(summary["kinds"]["websocket"], 1);
         assert_eq!(summary["kinds"]["xhr_open"], 1);
-        assert_eq!(summary["absolute_network_urls"], 6);
-        assert_eq!(summary["static_methods"], 5);
+        assert_eq!(summary["kinds"]["xhr_open_candidate"], 1);
+        assert_eq!(summary["absolute_network_urls"], 7);
+        assert_eq!(summary["static_methods"], 6);
         assert_eq!(summary["invalid_methods"], 1);
 
         let artifact = read_artifact(&project.join(API_SURFACE.relative_path), API_SURFACE)?;
@@ -452,8 +456,23 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
             .iter()
             .filter(|edge| edge["kind"] == "api_target")
             .count();
-        assert_eq!(api_nodes, 8);
+        assert_eq!(api_nodes, 9);
+        // Candidate sites remain inspectable even if the XHR object escaped.
+        // Their string-literal URLs must NOT create verified network edges.
         assert_eq!(target_edges, 5);
+        assert!(graph["nodes"].as_array().is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                node["type"] == "api_callsite"
+                    && node["sink_kind"] == "xhr_open_candidate"
+                    && node["url"] == "https://api.example.test/candidate-only"
+            })
+        }));
+        assert!(!graph["nodes"].as_array().is_some_and(|nodes| {
+            nodes.iter().any(|node| {
+                node["type"] == "external_url"
+                    && node["url"] == "https://api.example.test/candidate-only"
+            })
+        }));
         assert!(graph["nodes"].as_array().is_some_and(|nodes| {
             nodes.iter().any(|node| {
                 node["type"] == "external_url" && node["url"] == "wss://socket.example.test/ws"
@@ -472,8 +491,8 @@ function shadow(fetch) { fetch("https://fake.invalid/"); }
         )?;
         let readme = fs::read_to_string(project.join("README.md"))?;
         assert!(readme.contains("[analysis/api-surface.json](analysis/api-surface.json)"));
-        assert!(readme.contains("Static browser API callsites: **8**"));
-        assert!(readme.contains("callsites with exact absolute network URLs: **6**"));
+        assert!(readme.contains("Static browser API callsites: **9**"));
+        assert!(readme.contains("callsites with exact absolute network URLs: **7**"));
         assert!(readme.contains("proven invalid methods: **1**"));
         assert!(readme.contains("failed source units: **1**"));
         Ok(())

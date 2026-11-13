@@ -65,6 +65,81 @@ Its JSON reports `conditional_phases`: `compatible_return_structure=true` means 
 
 This deliberately stays outside the fast default browser-project pipeline. Its `analysis.json` records SHA-256-bound source spans, exact constructor/receiver origin, specialized lazy-cell factory calls, original registry-install provenance, and individually proven captured handler functions. `handlers/` contains independently formatted readable views of those original function literals with a local navigation README. A proof that a wrapper **captured** a handler is not a proof that a given browser invocation **returned or executed** that handler: dynamic resolver phases, registry-slot persistence, and observed control flow remain separate obligations. An existing nonempty output directory is refused to avoid stale generated files.
 
+## Readable JavaScript source-tree reconstruction
+
+A browser capture is **not** required to statically reconstruct ordinary JavaScript files.
+The source-tree mode recursively scans JS, MJS, and CJS files, applies AST-driven
+constant recovery, nested numeric-state control-flow reconstruction (for and
+adjacent-initializer while dispatch), and removal of unread dispatcher-state
+writes, then writes a **navigable directory of real transformed JavaScript**.
+The regular safe transform also evaluates ECMAScript abstract equality across
+statically known primitive values (`null`, `undefined`, strings, numbers,
+booleans), restructures constant `switch` dispatch with strict-case matching
+and source-order fallthrough, and simplifies empty `if` arms without losing
+the condition's side effects. Unselected switch cases with observable hoisted
+or lexical bindings are retained; dynamic tests are not guessed. The numeric
+state-graph reducer also handles `for (var state = initial; ...)`, state
+transitions inside `var` declaration initializers, and sequential terminating
+`return` cases, preserving function-scoped hoisted variables across branches.
+For a nonadjacent state initializer, a direct `eval` in an unrelated sibling
+callback does not block reconstruction of another callback's **own** numeric
+state. That exception is proven by the exact Oxc lexical state symbol and its
+owning function scope; captured ancestor state, direct eval, `with`, or mapped
+`arguments` in the state-owning function remain protected.
+An effect-aware primitive evaluator simplifies expressions with a known result
+while preserving original calls, getters and assignments in evaluation order,
+including logically dead RHS expressions; return-value comma expressions drop
+inert prefixes without altering the indirect-call semantics of callee commas.
+Within function bodies, discarded expression values can also be lowered to
+normal statements: comma sequences become ordered statements, `&&`/`||`
+become conditional branches, and ternaries become `if/else`. Dynamic tests
+are evaluated once, direct/indirect calls preserve their syntax, and generated
+blocks cannot accidentally introduce string directives. The original
+statement is left intact at top level, where its completion value can be
+observable through JavaScript `eval`. An `if ((setup(), ..., condition))`
+whose `if` already occupies a statement slot in a function/block is likewise
+split into ordered setup statements followed by the original final test and
+branch bodies, without creating a new lexical scope. Bare nested/unbraced
+`if`, loop and labelled bodies retain their original single-statement shape.
+Assignment-right comma expressions are also split for lexically resolved,
+stable identifier targets, retaining
+operation order; dynamic/computed member targets and RHS anonymous function
+or class name-inference hazards remain intact. Semantic recovery always
+runs first to a fixed point, with presentation-level expression lowering only
+on subsequent no-op semantic passes; this prevents cosmetic AST rewrites from
+hiding decoder calls or other semantic patterns before they are recovered.
+A bounded bitwise algebra pass recovers simpler 32-bit formulas from
+symbol-resolved, locally established primitive Int32 assignments. It compares
+linear combinations of bitwise Boolean expressions against shorter formulas
+using an exhaustive per-bit identity check (not random sampling), while
+rejecting possible BigInt/object coercions, direct eval, captured bindings,
+intervening writes, potentially observable negative zero, and arithmetic
+outside the exact JS Number range. This can turn obfuscated byte composition
+into ordinary `low | high` without special-casing any provider or function.
+A complementary effect-preserving algebra pass rewrites bounded affine
+combinations involving complemented bitwise XOR, retaining the original
+number and evaluation order of JavaScript coercions even when operand values
+are objects with stateful `valueOf` methods. Proven-primitive Int32 bindings
+can additionally simplify control-flow bit-mask tests; unproven return values
+remain in the two-coercion form instead of making unsafe assumptions.
+These passes apply to ordinary JS, not a framework or specific obfuscator.
+The original source directory is not modified.
+
+```sh
+cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- source-tree   path/to/original-js-tree work/readable-js-tree --max-iterations 12 --format-output
+```
+
+The output preserves relative source paths and contains linked README.md
+navigation plus reconstruction.json with per-file transformation counts.
+The --format-output flag creates an **analyst presentation view**: it may alter
+behavior in code that inspects Function#toString. Omit it when textual fidelity
+matters. Unknown control-flow shapes are left intact and inputs that could not
+be recovered are preserved, explicitly labeled rather than silently omitted.
+
+This mode starts from local JavaScript sources. Acquiring HTML/script URLs
+and resolving indirect dynamic imports remain separate tasks, and a static
+reconstruction does not prove a particular browser execution.
+
 ## Pinned real-corpus evaluation
 
 `corpus-eval` is the single engine-facing evaluator for pinned private/real-world JavaScript corpora. The manifest owns capture hashes and acceptance policy; the evaluator formats, safe-deobfuscates, and structurally scans each raw sample through the Rust library APIs in-process. Node is used only as an independent syntax check for generated analyst/deobfuscated source. Reference samples are hash-verified but never executed.
@@ -153,6 +228,41 @@ The directory contract is intentionally simple:
 - `src/` contains parser-validated/readable or recovered source.
 - `src/_deobfuscated/` contains semantics-preserving recovery from the exact captured JS bytes.
 - `src/_readable/` is the formatted human-facing view of those safe-deobfuscated outputs.
+  It now recovers meaningful lexical component names from embedded constant
+  `__name`, `displayName`, or `name` metadata through nested factory wrappers
+  (e.g. `var v = define({__name:'Footer'})` becomes `var Footer = define(...)`).
+  It additionally recovers descriptive lexical names from explicit object
+  destructuring (`{footerBg: v}` → `{footerBg: footerBg}`, including defaulted
+  and nested bindings) and static property-reference aliases
+  (`var x = Object.create` → `var objectCreate = Object.create`). These work
+  with ordinary source objects and member paths, not a framework or built-in
+  whitelist. Renaming follows Oxc lexical identities and preserves shorthand
+  object keys and public export names through explicit aliases. Existing
+  meaningful identifiers, name collisions, reserved words and dynamic scopes
+  are respected. The presentation layer also eliminates redundant aliases of
+  unshadowed standard intrinsic properties, e.g. a stable
+  objectCreate = Object.create binding becomes direct Object.create references.
+  A formerly detached call stays detached as (0, Object.create)(...), so its
+  receiver is not accidentally rebound. It rejects alias writes/redeclarations,
+  exports, dynamic scope, shadowed intrinsics, direct local builtin mutations,
+  and conditionally initialized aliases. This last simplification deliberately
+  assumes standard intrinsic members have not been monkeypatched by other
+  scripts and are ordinary native data properties: it is for source reading,
+  **not a proof of cross-script runtime equivalence**. Arbitrary object
+  getters/properties are not inlined. **Only this analyst view** changes;
+  the proof-checked deobfuscation and captured bytes remain unchanged.
+  When a captured ESM dependency exports a descriptive lexical name
+  (such as `export {Footer as t}`), the same project stage also recovers that
+  name in importing modules (`import {t as b}` → `import {t as Footer}`).
+  It handles functions and helpers as well as components, and can recover
+  descriptive public export keys when the source binding is minified (e.g.
+  `export {S as createApp}`). An explicit source/forwarded identity takes
+  precedence over a different public alias. This works through named
+  reexports and unambiguous star barrels. It preserves ESM
+  public names, import specifiers, object-property keys and export aliases,
+  uses the existing captured module resolver rather than guessing URLs, and
+  does not rewrite the shared formatter cache or exact deobfuscated source.
+  For an individual file, use `js-format --semantic-names INPUT OUTPUT`.
 - `src/_modules/` contains explicit Webpack/Next modules from chunk/direct-table shapes plus named factories recovered from global AMD `define("name", [...], factory)` and structurally proven member-loader calls such as `LWR.define(...)`, `Ya.define(...)`, or local `.define + .require/.loadModules` loaders.
 - `src/_dynamic_deobfuscated/` contains proven safe recovery of generated-code children; exact recovered bytes remain the fallback when validation refuses a child.
 - `src/_dynamic/` contains formatted analyst views of generated-code children after the selected safe stage.
@@ -168,15 +278,35 @@ Build the Rust tools, then use the one-command driver:
 ```sh
 .cargo-target-nodebug/debug/capture-project capture.har work/capture-project
 .cargo-target-nodebug/debug/capture-project "Saved Page.html" work/saved-project
+# No Chromium needed: fetch the HTML, linked scripts and module dependency graph with HTTP:
+.cargo-target-nodebug/debug/capture-project https://example.org/ work/example-site
+# Tune bounded network acquisition for large sites:
+.cargo-target-nodebug/debug/capture-project https://example.org/ work/example-large --http-max-resources 512 --http-max-resource-mib 32 --http-max-total-mib 256
 # Large captures / intentional oversubscription of content-only subprocess stages:
 .cargo-target-nodebug/debug/capture-project capture.har work/capture-project --jobs 8
 ```
+
+The URL form runs an HTTP-only acquisition using a browser-like request and a cookie jar,
+follows the HTML's explicit `script src` declarations, `modulepreload` links,
+inline/imported literal ES module dependencies, static worker references, and
+import maps (including scoped and prefix mappings via the existing resolver).
+It persists the fetched HAR in `analysis/http-capture.har` and a concise
+coverage/failure report in `analysis/http-static.json` before presenting the
+normal deobfuscated `src/` project. **Start in `src/ENTRYPOINTS.md`**: it links
+HTML script declarations to the actual formatted/recovered JavaScript files and
+follows statically resolvable imports through the captured module tree. HTML
+`modulepreload` and `preload as=script` hints are included as separately labeled
+roots, so page and framework chunks are discoverable even without a direct
+import from an entrypoint. Preload hints do not establish actual execution.
+It does **not** run JavaScript; client-generated script URLs and computed
+imports may require the browser recorder. Request count and per-resource/total
+response size are bounded.
 
 For a normal browser **Save Page / Webpage, Complete** export, the companion `Saved Page_files/` directory is discovered automatically. `--assets-dir` can override it. Saved-page files get stable synthetic URLs for graph resolution; an original page URL from Chromium's `saved from url=(...)` marker is retained separately when available.
 
 The driver runs capture normalization, readable-source materialization, source-map recovery, literal module/worker reference analysis, document import-map resolution, safe deobfuscation, explicit bundle-module extraction, generated-code recovery, VM triage/devirtualization, WASM correlation, static browser-API callsite recovery, provenance-graph construction, and an analyst-facing project README. Import maps are resolved with exact, prefix and scoped mappings; multiple maps keep earlier exact definitions, and document context is propagated only through captured module imports so worker graphs do not accidentally inherit page import maps.
 
-`api-surface --project` analyzes the selected safe-deobfuscated source when available and otherwise the parser-validated source view. Its first contract, `capture-api-surface/v2`, is deliberately narrow: it recognizes unshadowed standard `fetch`, `navigator.sendBeacon`, and `WebSocket` plus scope-proven stable, non-escaping `XMLHttpRequest` receivers; suppresses a sink family when the same source visibly assigns, updates, or deletes an equivalent standard sink path; resolves only exact proof-gated primitive expressions and already-available immutable `const` aliases for URL or method values; and preserves unresolved argument expressions and exact source spans instead of guessing. A one-argument `fetch(...)` is reported as default `GET` only when its input itself is an exact static string—a prebuilt `Request` remains method-unknown because it may already carry another method. Standard browser API semantics remain an explicit assumption on accepted callsites, including mutations not statically proven by this first contract. Relative URLs remain relative unless a real document base is proven, and only exact absolute `http`/`https`/`ws`/`wss` URLs become `api_target` edges in the source graph. Inline `fetch(..., { method: ... })` now follows ordered object-literal overwrite semantics: later exact own `method` values may override earlier spreads/dynamic keys or inherited-method ambiguity, while later spreads or dynamic computed keys make the method unknown. Object-literal prototype setters and visible direct `Object.prototype.method` mutation are treated as inherited-method ambiguity unless an exact own `method` shadows them. Exact methods are validated using Fetch/XHR method-token, forbidden-method, and legacy normalization semantics; callsites with a proven invalid/forbidden method are retained with `method_status=invalid` for provenance but do not produce `api_target` graph edges. Other RequestInit fields, non-literal options dataflow, wrapper libraries, axios/GraphQL inference, generated-code recursion, and speculative URL reconstruction are intentionally outside v2.
+`api-surface --project` analyzes the selected safe-deobfuscated source when available and otherwise the parser-validated source view. Its first contract, `capture-api-surface/v2`, is deliberately narrow: it recognizes unshadowed standard `fetch`, `navigator.sendBeacon`, and `WebSocket` plus scope-proven stable, non-escaping `XMLHttpRequest` receivers; suppresses a sink family when the same source visibly assigns, updates, or deletes an equivalent standard sink path; resolves only exact proof-gated primitive expressions and already-available immutable `const` aliases for URL or method values; and preserves unresolved argument expressions and exact source spans instead of guessing. XHR objects constructed with a standard `XMLHttpRequest` binding but subsequently passed to callbacks, stored in application state or otherwise exposed are still shown as `xhr_open_candidate` callsites, with their method and URL expressions preserved. These are distinct from verified `xhr_open` calls and do not create `api_target` graph edges even when the source contains a literal absolute URL; locally reassigned bindings and shadowed constructors are excluded. A one-argument `fetch(...)` is reported as default `GET` only when its input itself is an exact static string—a prebuilt `Request` remains method-unknown because it may already carry another method. Standard browser API semantics remain an explicit assumption on accepted callsites, including mutations not statically proven by this first contract. Relative URLs remain relative unless a real document base is proven, and only exact absolute `http`/`https`/`ws`/`wss` URLs become `api_target` edges in the source graph. Inline `fetch(..., { method: ... })` now follows ordered object-literal overwrite semantics: later exact own `method` values may override earlier spreads/dynamic keys or inherited-method ambiguity, while later spreads or dynamic computed keys make the method unknown. Object-literal prototype setters and visible direct `Object.prototype.method` mutation are treated as inherited-method ambiguity unless an exact own `method` shadows them. Exact methods are validated using Fetch/XHR method-token, forbidden-method, and legacy normalization semantics; callsites with a proven invalid/forbidden method are retained with `method_status=invalid` for provenance but do not produce `api_target` graph edges. Other RequestInit fields, non-literal options dataflow, wrapper libraries, axios/GraphQL inference, generated-code recursion, and speculative URL reconstruction are intentionally outside v2.
 
 `capture-import` normalizes HAR files, recorder bundles, and saved HTML plus its companion resource directory into the same `capture-project/v1` contract in `capture-manifest.json`. `capture-project` is the supported Rust orchestration front door; the supported capture-to-analysis processing path is Python-free. It combines in-process Rust stages with sibling Rust tools and keeps capture-kind dispatch owned by the normalized manifest rather than duplicating importer detection.
 
@@ -187,6 +317,8 @@ The driver runs capture normalization, readable-source materialization, source-m
 Safe deobfuscation resolves ambiguous JavaScript as browser Script vs ES Module from syntax/semantic validation before rewriting, then pins that resolved source mode across all iterations; CommonJS is only a fallback for genuinely CJS-only syntax. This avoids rejecting valid classic-script patterns such as duplicate top-level function declarations merely because they are invalid under module strictness. Classic scripts containing `with` fail closed before semantic rewriting or classic string-decoder recovery because identifier resolution inside `with` is environment-dependent; the pipeline preserves exact captured bytes instead of routing around that boundary with textual heuristics.
 
 The string-recovery path likewise reads and writes explicit UTF-8 bytes rather than newline-normalizing text I/O, so unchanged CRLF captures remain byte-identical and hash/provenance validation stays exact. Classic javascript-obfuscator table, Base64/RC4, alias and rotation recovery and flattened rotated-Base91 recovery are owned by the Rust `static-string-recover` proof engine. Base91 is an independent local proof rather than an exception to safe deobfuscation: the generic deobfuscator still rejects dynamic `with`, while the Base91 stage may analyze such a file only to prove a decoder scaffold and rewrites a call only when Oxc resolves that exact decoder symbol without crossing a `with` scope. The old Python text/table/concat pass is gone; immutable string-table exposure and literal concatenation use the existing Oxc-backed Rust pass. `deobfuscate-safe source` owns the single-source proof/report contract, while `deobfuscate-safe project` owns mode-sensitive capture-project grouping, exact/readable materialization, and the `STRING_RECOVERY`/`DEOBFUSCATION` artifacts in Rust.
+
+To refresh *only* the presentation-layer ESM names in an already materialized capture, run `deobfuscate-safe project-names path/to/project`. It reads the existing source index, deobfuscation manifest, and resolved JavaScript references, then links explicit captured export identities to the importing local bindings under `src/_readable/`. It does not fetch resources, rerun proof-oriented deobfuscation, change `src/_deobfuscated/`, or rewrite public ESM export keys. It also generates a navigable `src/ESM_SYMBOLS.md` index linking source-backed names, public export keys, and captured importing modules. Repeating it is idempotent; the underlying readable files must already contain the source-backed names produced by the local naming/formatter pass.
 
 `capture-project` owns recursive VM scanning in Rust and prefers a proven safe-deobfuscated view for captured units while retaining the captured file as provenance. Core scanning, static string recovery, safe deobfuscation, formatting, hashing, deduplication, and artifact emission run in-process; `switch-ir` and `table-ir` remain sibling Rust stages. Static `Function(...)` payloads become bounded recursive code units: each exact recovered child is passed through the same Rust string-recovery + deob stack, hash/provenance validated, and scanned from the furthest proven-safe result. Base91 recovery is gated by an Oxc string literal containing exactly 91 unique symbols, proves an exact rotated literal-string provider and rotator binding, resolves decoder/provider/transform links by Oxc symbol identity, and accepts affine/CFF-hidden decoder constants only when their semantic positions uniquely determine the backing-array state. Rewrites are limited to ASCII-safe decoded strings and statically resolved decoder calls; references whose lookup may be intercepted by dynamic `with` are left untouched. Proven immutable literal-table reads and literal concatenations then use the shared Oxc string-exposure pass, which is itself `with`-aware. Recovery is bounded to a fixed point so one proven rewrite can expose later safe work without creating an unbounded deobfuscation loop. On the flattened-Base91 VM regression this stricter Rust path proves 408 top-level `olQJbc` calls (656 Base91 calls total) and still recovers the 74-handler opcode registry plus both confirmed function-table dispatchers, without the Python implementation's blanket dynamic-scope table substitutions. Supported direct-switch VMs are lifted with `switch-ir`; linked function-table VMs use `table-ir`. The scanner also reports `lazy_registry_indirect_calls` separately from confirmed `table_vms`: these candidates combine an exact allocation-origin handler registry, a recognized lazy registry-accessor result, and an indirect invocation reachable on a CFG path without intervening writes. They intentionally do not prove the accessor returned an installed handler, the path is feasible, or a particular call executed. Each edge retains the registry identity, source spans, local binding, and exact-key/definite-result flags, leaving real dispatcher proof and devirtualization for stronger evidence. Large unlinked handler tables remain explicit VM candidates only when they are handler-dense (at least 75% function entries) and also have runtime-indexed calls from a loop; exact spans already proven to be Webpack module tables are excluded from candidate scoring. Base VM scanning is exact-content cached when no generated-code dumps are present, while generated-code-bearing units keep independent dump provenance. Generated child recovery is separately exact-content cached by raw child SHA: duplicate children still receive distinct occurrence paths/recovery rows/graph edges, but string recovery, safe deobfuscation and readable formatting execute once per exact body. Rust classic-decoder recovery remains an independent proof stage: if the generic safe stage rejects a source, it emits an exact identity result with zero rewrites; Base91 can still proceed only under its own narrower proof and never relaxes the global deobfuscator's safety boundary. Every derived output is hash/provenance checked. Unconfirmed numeric direct-switch maps remain visible in scanner JSON, but weak VM-candidate promotion requires evidence score >=3 rather than treating every numeric switch as suspicious; this excludes codec enum/bitstream tables such as H.264 aspect-ratio parsing without changing confirmed VM thresholds.
 
@@ -227,3 +359,447 @@ Current families include:
 - aggressive non-VM js-confuser CFF negative.
 
 See the Notion page **JavaScript VM obfuscation & static devirtualization — current** and its implementation-log child for detailed findings and pinned third-party revisions.
+
+### Link extracted handlers to their original lexical helpers
+
+The generated source tree can also include real lexical helper implementations from
+the full original JavaScript, without Chromium:
+
+~~~sh
+cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- source-tree \
+  path/to/extracted-handlers work/readable-handlers \
+  --context-source path/to/original.pretty.js \
+  --max-iterations 12 --format-output
+~~~
+
+The generated lexical-context/ directory contains the original enclosing
+program and transformed helper source, with links from each handler to the
+helper definitions it actually references. Lookup begins with unresolved
+identifiers in the extracted handler and follows *exact original lexical
+symbols* through dependencies. Shadowed parameters are not confused with
+external helper calls, and ambiguous names are not guessed.
+
+Helper files are navigation views, not independently runnable modules.
+The original enclosing source remains available because captured variables,
+later reassignments, and top-level side effects can change their behavior.
+
+The safe static statement pass also separates a comma-expression prefix
+used as the **object of a property-assignment target**, when that entire
+assignment occupies a sibling statement slot inside a function or existing
+block. For example, `((setup(), object).field = value)` may become
+`(setup()); (object).field = value`: every prefix still performs GetValue
+before the property reference is created, and the original assignment RHS,
+computed property key, receiver and anonymous-function name inference stay
+in their original evaluation positions. The rewrite never adds an inner
+lexical block, applies to unbraced conditional/loop/label bodies or alters
+script/eval completion values. Ambiguous operand comments and nested
+assignments without a safe statement slot remain untouched. The
+`member_object_sequence_lowering` counter records these semantic rewrites,
+distinct from whitespace-only `expression-layouts/` navigation views.
+
+An analogous `if_guard_member_prefix_lowering` pass handles a comma
+sequence in a property object that is **guaranteed to be evaluated first**
+within a function/block sibling `if` test. For example,
+`if (((prepare(), object).length < bound)) {...}` can evaluate
+`(prepare());` before the same comparison using `(object).length`.
+Only the test's unconditional leftmost evaluation path is eligible:
+binary/logical left operands, conditional tests, unary operands and
+nonoptional property objects. Guarded branches, right operands, call
+callees, computed keys, optional chains and ambiguous inter-operand
+comments cannot be hoisted. The property access and branch bodies keep their
+original evaluation context. In source-tree mode, captured source and the
+protected executable are stored independently of rewritten helper views.
+
+The related `if_guard_binary_left_sequence_lowering` extracts a comma
+prefix which is the **entire first operand of a binary expression** in
+a sibling `if` test. Unlike a comma on the comparison's right, these
+effects are unconditionally evaluated before the second operand.
+The original second operand, getter order and branch semantics
+remain intact; only a syntactically first sequence with unambiguous
+comment boundaries is eligible. This exposes initializer effects
+hidden inside comparisons without guessing assigned values.
+
+The new if_binary_rhs_effect_lifting pass recovers comma effects on the
+**right** side of nested binary comparisons, where hoisting without
+capturing earlier values would reorder property getters and coercions.
+It captures each earlier operand through GetValue (without ToPrimitive) in
+fresh block-scoped const bindings, then evaluates the comma-prefix effects
+before the original comparison. Conditional/logical branches are not lifted.
+A direct eval or Annex-B function declaration inside the affected if tree
+blocks the rewrite because the introduced scope might be observable.
+The names are unique across the complete source, and the existing inert
+comma optimizer now preserves commas that suppress anonymous function,
+arrow, class, and conditional-branch name inference.
+All emitted source remains a separate analyst-only view; original captured
+bytes and precise source-backed extracts are retained separately.
+
+The `assignment_conditional_lowering` pass restores ordinary `if/else`
+control flow from a discarded assignment statement whose right-hand side
+is a nested conditional expression. The assignment target must be a
+statically resolved lexical identifier without an intervening dynamic
+`with` scope; member/computed targets and unresolved names are not moved.
+Every selected leaf is assigned once, and all condition effects and
+throwing fallbacks (including a numeric call such as `2()`) remain under
+their original guards. Anonymous function, class and arrow leaves are
+left intact because splitting them could introduce assignment-inferred
+names. Non-sibling placements, script/eval completion and comments at
+changed syntax boundaries also stay unchanged. Source-backed helper
+recovery never edits the captured executable itself.
+
+A separate `lexical-context/annotated-handlers/` tree puts confirmed helper
+context **at the first direct call** in each recovered handler. For a short
+original, stable, single-return function it quotes that exact return expression
+next to the call; for longer helpers it links directly to the original
+definition. When a recovered direct call has statically proven literal
+arguments, its annotation additionally links to the already generated,
+argument-specialized helper body. This applies at **every matching callsite**,
+not only the first use of a helper. Helpers whose bindings are subsequently reassigned explicitly
+identify the linked code as the *initial definition*, not necessarily the
+function called at runtime. Semantic symbol resolution prevents annotations
+on local/shadowed parameters or unrecognized call targets. These inline
+comments are presentation-only and do not modify the proof-checked handler.
+The `lexical-context/context.json` manifest records annotated files and call
+counts.
+
+For small, source-backed helpers, `lexical-context/expanded-handlers/` goes
+further: it places the **original return expression directly into the
+recovered code**, substituting formal parameters by Oxc binding identity.
+The expansion requires a stable original helper, side-effect-free and
+non-reassigned arguments, and no conflicting lexical captures, dynamic scope
+or call-frame-dependent syntax. For shorthand object properties, the original
+key is retained (for example, `{J}` becomes `{J: P}`, never `{P}`). The
+special `__proto__` shorthand uses a computed key instead of invoking the
+object-literal prototype setter. Free-name
+collisions are checked in each callsite's actual Oxc lexical scope, so an
+unrelated nested binding does not suppress otherwise valid expansion. Calls
+without those proofs stay untouched.
+This is an analyst projection only; the executable/proof-checked source
+tree is always kept separate.
+
+For helpers with at least eight structurally nested calls, the optional
+`lexical-context/call-spines/` Markdown views identify the deepest AST call
+chain, its original helper line/byte offsets, and which enclosing argument
+contains each nested call. Independently, `lexical-context/expression-layouts/`
+contains alternate JS source views for either deep calls **or** long
+single-line assignments, sequences, comparisons, short-circuits or conditional
+operands, even without a deeply nested call. These views insert only
+whitespace at AST-confirmed boundaries.
+
+For helpers with long *nested assignment* expressions, the independent
+`lexical-context/assignment-outlines/` Markdown index lists the actual
+assignment targets and operators, **exact assigned RHS expressions** when
+short (with AST-kind/byte-length summaries for complex RHS), source-byte
+locations, lexical containment inside other assignment expressions, and nearest short-circuit
+or ternary guard ancestry. It keeps assignments in nested callback bodies
+separate from the enclosing initializer. This is a source-backed structural
+map, not an execution trace or a claim that assignments can safely be hoisted:
+outer assignment targets (including free/global names such as `Hm`) are
+resolved before their RHS, computed property references can be effectful,
+and branch-guarded writes may not run. Original helper and captured
+executable remain unchanged.
+The view never hoists effects or changes binding, receiver or evaluation
+order. Its syntax must parse and regenerate the exact same canonical
+JavaScript; if not, the alternate view is refused. This makes
+enormous registration expressions navigable without inventing an equivalent
+sequence of statements. The list describes **syntax nesting**, not execution
+order: short-circuit guards, argument evaluation, computed keys, callback
+boundaries and JavaScript receiver identity remain governed by the linked
+helper source. Captured source and executable files remain unchanged; the
+layout is not suitable where Function#toString or exact source bytes matter.
+
+The `lexical-context/binding-writes/` index adds **original lexical binding
+mutation provenance** for every linked symbol that receives a resolved write.
+Each report links the original declaration, exact write and operation byte
+spans, assignment/update operator, and nearest enclosing function. All
+lookups use Oxc symbol identity: shadowed names do not become writes to the
+outer binding. Reports include writes inside deferred closures but identify
+those function boundaries. Declaration initializers live in the linked
+initial-definition helper, not in this reference-write table. Unknown
+execution order, direct eval, dynamic scope, and external code must not be
+mistaken for a proven reaching definition; the maps are navigation evidence,
+not constant-propagation permission. Structured `write_sites` are also
+recorded in the source-tree `context.json` helper rows, without changing the
+original source, recovered helper code, or captured executable.
+
+For mutable computed-property aliases, the `lexical-context/explained/`
+views retain executable property expressions and annotate them with their
+**actual** lexical string assignments and conditional overrides. For example,
+`target[key /* property alias: "push"; H when (H.length < 2) truthy */]`
+shows why blindly replacing `key` with `.push` would be incorrect. The
+analysis resolves writes and uses by the same Oxc symbol ID (including nested
+closures), so an unrelated shadowed `key` is never joined by spelling. The
+`lexical-context/context.json` v2 manifest exposes each original literal,
+dynamic write, condition and annotated read count for tools. These are
+**alternate browsing views**; the ordinary transformed JS and original
+context remain byte-for-byte unchanged, including any source-sensitive
+`Function.prototype.toString` behavior.
+
+When original function-capture headers include the unformatted source SHA-256
+and exact byte spans, pass `--origin-source path/to/raw-original.js` alongside
+`--context-source` to produce `lexical-context/handler-origins/` annotated
+views **directly in the individual recovered handlers**. The tool verifies
+the raw original hash, exact function span and enclosing lexical symbol,
+then annotates a property only if the readable handler still has an unresolved
+reference to that same proven external binding. This avoids confusing a
+shadowed parameter with the original `push`/`length` alias. A pretty-printed
+version of the original is useful for browsing but must not be used as the
+span provenance source. `context.json` records the original declaration
+spans, assignment alternatives, and linked handler paths.
+
+An opt-in **whole-program lexical reconstruction** can prove additional
+statement boundaries which are invisible in detached helper expressions.
+Supply `--context-source original.js --context-full-iterations 48` to
+`deobfuscate-safe source-tree`. The whole original lexical source is passed
+through the existing safe-deobfuscation engine to a checked fixed point
+and *then* its functions are re-extracted under their original lexical
+symbol identities. The alternate `lexical-context/whole-program/` contains
+`readable.js`, a transformation/source-hash report, and a helper index
+with extracted source. The whole-program helper index distinguishes original lexical helpers
+from derived internal bindings using parsed declaration identities from
+the preserved original source, never generated-name prefixes. Derived
+bindings remain navigable because transformed code may depend on them, but
+they are not counted as recovered original helpers. The v4 helpers.json
+report records binding_origin per entry and separates original_helper_count,
+derived_internal_binding_count and total_definition_count. The whole-context
+summary exposes the same distinction through helper_count (original only),
+derived_internal_binding_count and total_definition_count.
+
+The iteration argument is a **cap**, not a requested
+rewrite count: if a validated fixed point is not reached below it, the
+command fails rather than claiming completion. This additional work is
+opt-in so ordinary source-tree capture runs do not needlessly process the
+whole enclosing program again. Function#toString-sensitive formatting
+and byte offsets belong to the alternate *analyst* view only; the
+`lexical-context/original.js` and captured executable files remain exact.
+A detached helper can fail to prove an enclosing identifier binding,
+so it may retain an opaque assignment sequence that the context-aware
+view safely reconstructs. The full-context **derived helper files** then
+go through the same single-trip loop reflow and post-reflow control-flow
+polishing as ordinary helper views. Long derived expressions also get the
+same AST-verified, whitespace-only `expression-layouts/`, nested assignment
+`assignment-outlines/`, and deep-call `call-spines/` as original lexical
+helpers. These links are included in the whole-program helper index. The
+layouts insert whitespace only, retaining identical AST code generation;
+the assignment outlines describe containment, **not execution order**.
+Both original and whole-program lexical helpers now also offer
+`evaluation-phases/` static phase plans for long nested assignments.
+These show target-reference formation, GetValue, RHS evaluation and PutValue
+within each possible branch path. Mutually exclusive branches are marked;
+any step may throw. The phase planner additionally expands ordinary calls,
+array initializers and object initializers: it evaluates the callee (and
+member getter) before call arguments, retains method receivers through
+parentheses but not comma-value expressions, evaluates arguments and iterable
+spreads left-to-right, and distinguishes computed object keys (ToPropertyKey
+*before* the value), object spread property copying, array holes and deferred
+function/getter bodies. Spread iteration and CopyDataProperties are explicit
+atomic phases because their internal iterator/getter/Proxy effects are
+dynamic. Destructuring, optional chains, constructors and other unmodeled
+subtrees remain opaque; direct eval's lexical semantics are not rewritten.
+Computed assignment-target key coercion remains deferred until GetValue or
+PutValue, so simple assignment may evaluate its RHS *before* ToPropertyKey,
+while compound or logical assignment can convert the same key **twice**.
+Numeric, BigInt, boolean, string and null literals are labeled as effect-free
+values rather than unknown effects; RegExp literals are fresh object creations.
+Unary void evaluates its operand (which may read getters, call functions,
+write data or throw) before discarding the result. Coercing unary operators
+and reference-sensitive typeof/delete retain opaque behavior until their
+individual steps can be modeled. These remain plans for possible evaluation
+order and analyst navigation, not runtime traces or executable rewrites.
+Each view records its source hash and generated artifact hash in the
+whole-program `helpers.json` v4 report, without modifying the polished
+helper or its source-backed extract. Every exact source-backed helper extract
+is kept separately in \`whole-program/source-helpers/\`, with a per-helper
+\`helpers.json\` report recording both source hashes, which polishing
+passes ran, and any remaining reflow errors. Thus the improved lexical
+statement boundaries and the previously proven loop/return recovery are
+combined, without losing their traceable source or changing captured code.
+
+For source-level direct-call and constructor forwarding, add
+`--caller-view-entry <member-property>` (for instance, a site's exposed API
+method name). The output `lexical-context/caller-views/` traces Oxc-resolved
+function-to-function calls and explains which final callee parameters still
+originate at entrypoint parameters, preserving unknown/dynamic arguments.
+This gives an actual caller-oriented view of obfuscated helper plumbing
+without making an executable replacement from incomplete lexical fragments.
+The same forwarding information is available in `context.json` as
+`caller_views`. When the source-tree command specifies
+`--caller-view-entry`, it also materializes readable, original-callsite
+specialized helper implementations at
+`lexical-context/caller-views/specializations/`, including the variants
+reached beyond four direct calls. These use the **same shared implementation**
+as the standalone `caller-views --specialize` mode; unlike the separately
+preserved captured-handler specializations, they are joined by original
+function spans and carry original lexical callsites in `context.json` under
+`graph_specializations`. This runs only when a caller entrypoint is requested.
+The analysis resolves stable function and argument aliases
+through direct lexical assignments such as `const local = original`, and also
+accepts `let`/`var` aliases when they have no subsequent resolved writes and
+the program does not use direct `eval` or `with`. It does not infer dynamic
+property dispatch, runtime reassignment, or computed argument values.
+
+To inspect a standalone source file without reconstructing the full handler
+tree, use the focused caller-view command:
+
+~~~sh
+cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views   path/to/already-formatted-original.js work/caller-views --entry-member someMethod
+~~~
+
+The output includes linked Markdown source excerpts and a machine-readable
+`caller-views.json` with function spans, exact callsite locations, and
+parameter-origin chains. Every entry also exposes all statically reachable
+`reachable_edges` in a finite call graph: each distinct callsite is recorded
+once, including recursive cycles and edges beyond the short path listing.
+`reachable_functions` additionally propagates entry-parameter origins
+through arbitrary call depth using a finite fixed-point calculation, retaining
+multiple possible source parameters and unknown/non-entry values rather than
+guessing a single caller. The analysis distinguishes positional arguments
+from spreads, and does not falsely treat default/destructured parameters as
+unchanged forwarding. This is a static may-flow analysis, not evidence that
+all syntactic paths execute. The browsable path examples intentionally stop
+after four call edges to avoid exponential path enumeration; the complete
+graph and parameter origins do not.
+On individual resolved paths, the caller report can also recognize a
+**fresh constructor receiver** passed as an actual this-expression argument.
+For example, when an exported function invokes a stable function with new
+and that constructor immediately passes its own this to a helper, the helper's
+parameter is tagged with the constructor's original callsite byte span.
+The label follows exact unchanged parameter forwarding, but never treats a
+supplied object or an ordinary function call as a newly allocated receiver.
+This proves the receiver's allocation along that path, **not** the absence
+of effectful inherited setters or proxies in its prototype chain, and does
+not imply all runtime invocations follow that path. The complete may-flow
+table retains unknown/non-entry possibilities from other callsites.
+
+The entry member is optional; no provider-specific code or entrypoint name
+is baked in.
+
+To turn resolved constant selectors into **actual simplified helper bodies**,
+use the same standalone command with `--specialize`:
+
+~~~sh
+cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
+  path/to/original.js work/caller-views --entry-member someMethod --specialize
+~~~
+
+When the source has many unrelated helper families, repeat `--only-helper NAME`
+to retain only source-resolved entrypoint paths and specialized implementations
+for the chosen helpers, without materializing hundreds of other variants.
+This filter changes only the analyst output selection; the same lexical symbol,
+callsite and exact-argument proofs still determine every variant. An example
+using more than one helper:
+
+~~~sh
+cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
+  path/to/original.js work/focused-helpers --specialize \
+  --only-helper da --only-helper eU
+~~~
+
+Exception-sensitive state dispatchers retain their original try/catch
+and one-state-per-iteration semantics. Exact lexical-state reachability
+includes catch-resume assignments as additional roots, so unreachable
+case comparisons can be removed without erasing recovery paths or moving
+potentially throwing operations across the handler.
+
+Numeric-state control-flow recovery also structures single-entry reducible
+cycles with early exits from the middle of their bodies. The original
+state-transition graph determines a common exit; every emitted path must
+reach either that exit or the loop header, so irreducible or multi-entry
+cycles remain unchanged. Early exits render as ordinary break/continue
+without losing the effects of intermediate states.
+
+The tool recovers source-resolved direct calls, constructors, and eligible
+Function.prototype.call forwarding through original lexical function bindings
+throughout the reachable graph, not only calls in extracted handlers. For a
+function.call(receiver, args...) edge, the receiver is linked separately from
+the actual callee formal arguments, preserving their correct parameter indices.
+Direct property writes/deletions overriding a function's call method, or dynamic
+eval/with, prevent this exact call-method inference. Each callsite's
+**primitive arguments and side-effect-free constant expressions** are matched
+to the original function's formal parameter symbols. This includes immutable
+lexical constants and their chained aliases, resolved by semantic symbol
+identity (not spelling); pure JavaScript arithmetic, logical and conditional
+expressions use the same value evaluator as the deobfuscator. It also **carries
+those values through further helper calls whose arguments are unchanged,
+lexically resolved caller parameters**. It also **evaluates pure expressions
+of known caller parameters at each original callsite**, including arithmetic,
+bitwise, comparison and conditional operators. Original AST symbol references
+are matched to formal parameters before any substitution, so shadowed
+identifiers do not become unrelated constants.
+This works at arbitrary graph depth, including cycles, and preserves each
+reachable constant tuple separately rather than combining unrelated caller
+values into impossible variants. Recursive computed selectors use
+constant-invariant widening after a representative recursion, rather than
+enumerating unbounded values from expressions such as f(x + 1). Callers using
+mapped arguments, direct eval,
+or dynamic with-scope do not forward inferred parameter constants; programs
+with dynamic eval/with do not infer lexical-identifier constants. Reassigned
+bindings and effects cannot become inferred values. An
+example_call_chain in the JSON metadata links each variant to one real
+original callsite sequence; the original program stays intact. It can still use stable constants when other formal
+parameters are reassigned; shadowed same-name functions are distinguished
+by source span, and spread arguments never shift inferred parameter indices.
+The output contains `specializations/*.js` with deobfuscated, formatted
+original helper bodies, `specializations/original/` for comparison, and
+per-variant callsite, source-span, constant-argument, and transform metadata
+in `caller-views.json`. The generated specialization index lists the
+**20 largest source reductions first**, then all variants grouped by resolved
+helper, with direct links to readable and original bodies, call depth,
+rewrite count, callsite count and byte-size change. These are also included
+as the semantic_rewrites, source_depth, saved_bytes, original_bytes and
+readable_bytes fields in the machine-readable metadata. These are
+closure-context *reading views*, not standalone executable replacements.
+Expensive variant generation is opt-in.
+
+### Specialize original helper code at constant-argument callsites
+
+When the original enclosing JavaScript is supplied with --context-source,
+the same source-tree pass also generates a lexical-context/specializations
+directory. Each JS file is a rewritten helper body: literal arguments from
+an actual extracted handler call replace references to the corresponding
+unchanged lexical parameter symbols, and the regular static deobfuscator
+then simplifies the result. Derived original-helper and specialized-helper views
+also structurally reduce single-trip `for`/`while`/`do-while` loops when an
+unconditional terminal break proves that a second iteration is impossible.
+This includes a final break guarded by a provably truthy test: every
+effectful comma operand is evaluated in order (such as `record()` in
+`if ((record(), {})) break`), but provably inert discarded operands are
+removed in function contexts. Top-level script/eval loops are left
+unchanged because replacing a loop with an `if` can itself change an
+observable completion value. The original initializer and loop condition
+are evaluated exactly once in eligible functions; updates remain
+unreachable, and potential earlier breaks or continues prevent the rewrite.
+A second run of the existing proof-oriented static deobfuscator then folds dead conditions and redundant blocks exposed by
+that structural change (for example, a specialized `if (false)` branch).
+The source-backed helper views also recover direct values from terminal
+return temporaries. An assignment immediately feeding a return can become
+a direct return even when the function previously read or wrote that
+variable: those earlier effects remain in place. Oxc verifies that the
+binding belongs to the function being rewritten and that no nested
+closure can observe its terminal write. The same symbol-resolved
+dataflow applies to labeled branch joins, conditional assignments with a
+fallback return, and complete `if/else` joins. Branch blocks may contain
+earlier side effects, calls, declarations, and conditional exits: their
+original source and lexical scope are retained, and only the final plain
+assignment is replaced by a direct return. An outer guard may enclose a
+labeled join: the result is returned directly only when that guard executes,
+leaving the original fallback return intact. The temporary must belong to
+the function being rewritten; writes to captured or enclosing lexical
+bindings remain observable even if only written and returned once.
+Dynamic scope, `eval`, `arguments` access, or extra reads/writes also
+prevent these rewrites.
+These improvements are fed through the existing static deobfuscator again;
+they are not runtime-execution or value-guessing shortcuts.
+Any unsuccessful follow-up analysis is recorded rather than aborting
+other helpers. The lexical program remains byte-exact in
+`lexical-context/original.js`; reflow counts, follow-up transforms, and
+errors are recorded per helper and specialization in
+`lexical-context/context.json`. Both original helper and specialized body
+are kept and linked by original handler callsite.
+
+Specialization handles primitive literal arguments, including multiple
+constant parameters in a call. It rejects parameter writes, direct eval,
+arguments aliasing, dynamically scoped with blocks, and substitutions that
+would produce invalid JavaScript. Mutable or ambiguously named helper
+bindings remain linked to the unspecialized original. A specialized helper
+view applies to its recorded fixed arguments; it is not a universal
+replacement for the general helper.

@@ -6,6 +6,7 @@ use crate::{
     },
     analysis_budget::{AnalysisBudgets, AnalysisOperation},
     capture_project::load_manifest,
+    project_entrypoints::write_entrypoint_index,
 };
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -288,6 +289,8 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         .map(|unit| array(unit, "arithmetic_state_proofs").len())
         .sum::<usize>();
 
+    let declared_scripts =
+        write_entrypoint_index(&project, &manifest_value, &source_index, &deob, &jsrefs)?;
     let source = manifest_value
         .get("source")
         .context("capture manifest source missing")?;
@@ -323,12 +326,21 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
             lines.push(format!(
                 "Original page URL recorded by the saved page: {url}."
             ));
+        } else if source_kind == "http_static" {
+            lines.push(format!("HTTP requested URL: {url}."));
         } else {
             lines.push(format!("Observed browser entrypoint URL: {url}."));
         }
     }
     if let Some(url) = final_url {
-        lines.push(format!("Browser final navigation URL: {url}."));
+        lines.push(format!(
+            "{}: {url}.",
+            if source_kind == "http_static" {
+                "Final HTTP URL"
+            } else {
+                "Browser final navigation URL"
+            }
+        ));
     }
     lines.extend([
         String::new(),
@@ -336,6 +348,7 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         String::new(),
         "## Start here".into(),
         String::new(),
+        format!("- [src/ENTRYPOINTS.md](src/ENTRYPOINTS.md) — navigable HTML-declared entrypoints and their transitive captured JavaScript dependencies (**{declared_scripts}** script declarations). Start here for the actual code loading structure."),
         "- [src/](src/) — Oxc-formatted baseline view of captured text/code resources.".into(),
         "- [src/_deobfuscated/](src/_deobfuscated/) — semantics-preserving static recovery run from the exact captured JS bytes; formatting is intentionally left untouched here.".into(),
         "- [src/_readable/](src/_readable/) — formatted analyst view of the safe-deobfuscated result; use this as the normal human reading tree.".into(),
@@ -371,6 +384,26 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
     }
     if wasm_resource_provenance.is_some() {
         lines.push("- [analysis/wasm-resource-provenance.json](analysis/wasm-resource-provenance.json) — runtime-observed exact WASM responses linked to their CDP script initiators.".into());
+    }
+
+    if source_kind == "http_static" {
+        let capture = source.get("http_static").unwrap_or(&Value::Null);
+        lines.extend([
+            String::new(),
+            "## HTTP-only acquisition".into(),
+            String::new(),
+            format!("- HTTP responses: **{}**; request failures: **{}**; pending due to limits: **{}**; response bytes: **{}**", usize_field(capture, "resources"), usize_field(capture, "failed_resources"), usize_field(capture, "pending_resources"), usize_field(capture, "bytes")),
+            "- [Raw HTTP capture](analysis/http-capture.har) and [fetch details](analysis/http-static.json).".into(),
+            "- This is HTTP-discovered source, not a browser execution trace. Runtime-generated scripts may require a browser capture.".into(),
+        ]);
+        for warning in array(capture, "warnings") {
+            if let Some(message) = warning.as_str() {
+                lines.push(format!(
+                    "- Acquisition note: {}",
+                    message.replace('\n', " ")
+                ));
+            }
+        }
     }
 
     lines.extend([
@@ -567,6 +600,46 @@ mod tests {
     use crate::capture_project::{validate_manifest_value, write_manifest};
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn http_project_readme_uses_original_url_and_exposes_entrypoints() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        let document = json!({
+            "schema": "capture-project/v1",
+            "source": {
+                "kind": "http_static",
+                "input": "https://fixture.invalid/app/index.html",
+                "requested_url": "https://fixture.invalid/app/index.html",
+                "final_url": "https://fixture.invalid/app/index.html",
+                "http_static": {"resources": 2, "failed_resources": 0, "pending_resources": 0, "bytes": 128, "warnings": []},
+                "captured_har": "analysis/http-capture.har",
+                "salvaged": false
+            },
+            "pages": [],
+            "resources": [
+                {"id": 0, "kind": "html", "url": "https://fixture.invalid/app/index.html", "output_path": "resources/index.html"},
+                {"id": 1, "kind": "javascript", "url": "https://fixture.invalid/app/main.js", "output_path": "resources/main.js"}
+            ],
+            "inline_scripts": [{"parent_resource_id": 0, "ordinal": 1, "src": "main.js", "resolved_src": "https://fixture.invalid/app/main.js", "script_type": "module"}],
+            "counts": {}
+        });
+        let manifest = validate_manifest_value(&document, "HTTP README test")?;
+        write_manifest(&project.join("capture-manifest.json"), &manifest)?;
+        refresh_project_readme(project, &AnalysisBudgets::standard("HTTP README test"))?;
+        let readme = fs::read_to_string(project.join("README.md"))?;
+        assert!(readme.contains("Input kind: **http_static**"));
+        assert!(readme.contains("HTTP requested URL: https://fixture.invalid/app/index.html."));
+        assert!(readme.contains("Final HTTP URL: https://fixture.invalid/app/index.html."));
+        assert!(readme.contains("## HTTP-only acquisition"));
+        assert!(readme.contains("HTTP responses: **2**"));
+        assert!(readme.contains("[src/ENTRYPOINTS.md](src/ENTRYPOINTS.md)"));
+        assert!(!readme.contains("Observed browser entrypoint URL"));
+        let entrypoints = fs::read_to_string(project.join("src/ENTRYPOINTS.md"))?;
+        assert!(entrypoints.contains("https://fixture.invalid/app/main.js"));
+        assert!(entrypoints.contains("Source body not present in this capture"));
+        Ok(())
+    }
 
     #[test]
     fn renders_minimal_salvaged_project_without_optional_artifacts() -> Result<()> {

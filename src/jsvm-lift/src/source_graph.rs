@@ -1121,6 +1121,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
             graph.add_edge(&parent, &node_id, "api_callsite", json!({}))?;
         }
         if bool_field(row, "absolute_network_url")
+            && string_field(row, "kind") != Some("xhr_open_candidate")
             && string_field(row, "method_status") != Some("invalid")
         {
             if let Some(url) = string_field(row, "url") {

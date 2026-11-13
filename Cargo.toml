@@ -55,6 +55,7 @@ sha2 = "0.11"
 string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "458c995", default-features = false }
 rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "458c995", default-features = false }
 url = "2"
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "cookies", "rustls", "gzip", "brotli", "deflate"] }
 wasmparser = "0.263.0"
 wasmprinter = "0.263.0"
 waffle = { git = "https://github.com/codeandsolder/waffle.git", rev = "528b09ab97a67cda251fea2772040d29f7148851" }

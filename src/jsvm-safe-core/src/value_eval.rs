@@ -7,8 +7,8 @@
 //! may resolve identifiers only after independently proving their bindings safe.
 
 use oxc_ast::ast::{
-    Expression, IdentifierReference, LogicalExpression, StringLiteral, TemplateElement,
-    UnaryExpression,
+    ArrayExpressionElement, Expression, IdentifierReference, LogicalExpression, StringLiteral,
+    TemplateElement, UnaryExpression,
 };
 use oxc_ecmascript::{StringToNumber, ToInt32, ToUint32};
 use oxc_syntax::number::ToJsString;
@@ -158,6 +158,59 @@ where
     }
 }
 
+/// A literal expression whose complete evaluation cannot access bindings,
+/// invoke user code, or throw. Fresh array/RegExp/object allocations have
+/// no externally visible effect until their values escape.
+pub fn inert_literal_value(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::StringLiteral(_)
+        | Expression::NumericLiteral(_)
+        | Expression::BigIntLiteral(_)
+        | Expression::RegExpLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::BooleanLiteral(_) => true,
+        Expression::TemplateLiteral(template) => template.expressions.is_empty(),
+        Expression::ArrayExpression(array) => array.elements.iter().all(inert_array_element),
+        Expression::ObjectExpression(object) => object.properties.is_empty(),
+        Expression::ParenthesizedExpression(paren) => inert_literal_value(&paren.expression),
+        Expression::UnaryExpression(unary)
+            if matches!(unary.operator.as_str(), "!" | "void" | "typeof") =>
+        {
+            inert_literal_value(&unary.argument)
+        }
+        Expression::UnaryExpression(unary)
+            if matches!(unary.operator.as_str(), "+" | "-" | "~") =>
+        {
+            inert_literal_value(&unary.argument) && eval(&unary.argument).is_some()
+        }
+        Expression::BinaryExpression(binary) => {
+            inert_literal_value(&binary.left)
+                && inert_literal_value(&binary.right)
+                && eval(expr).is_some()
+        }
+        Expression::LogicalExpression(logical) => {
+            inert_literal_value(&logical.left) && inert_literal_value(&logical.right)
+        }
+        Expression::ConditionalExpression(conditional) => {
+            inert_literal_value(&conditional.test)
+                && inert_literal_value(&conditional.consequent)
+                && inert_literal_value(&conditional.alternate)
+        }
+        Expression::SequenceExpression(sequence) => {
+            sequence.expressions.iter().all(inert_literal_value)
+        }
+        _ => false,
+    }
+}
+
+fn inert_array_element(element: &ArrayExpressionElement<'_>) -> bool {
+    match element {
+        ArrayExpressionElement::Elision(_) => true,
+        ArrayExpressionElement::SpreadElement(_) => false,
+        _ => element.as_expression().is_some_and(inert_literal_value),
+    }
+}
+
 pub fn known_bool_with_resolver<'a, F>(expr: &Expression<'a>, resolve: &F) -> Option<bool>
 where
     F: Fn(&IdentifierReference<'a>) -> Option<Value>,
@@ -166,7 +219,7 @@ where
         return Some(v.truthy());
     }
     match expr {
-        Expression::ArrayExpression(v) if v.elements.is_empty() => Some(true),
+        Expression::ArrayExpression(v) if v.elements.iter().all(inert_array_element) => Some(true),
         Expression::ObjectExpression(v) if v.properties.is_empty() => Some(true),
         Expression::ParenthesizedExpression(v) => known_bool_with_resolver(&v.expression, resolve),
         _ => None,
@@ -222,6 +275,27 @@ pub fn js_to_int32(n: f64) -> i32 {
     n.to_int_32()
 }
 
+/// ECMAScript Abstract Equality for the complete primitive domain modeled by
+/// this evaluator. Object, Symbol and BigInt equality is deliberately handled
+/// outside this domain, never guessed from source text.
+fn abstract_primitive_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null | Value::Undefined, Value::Null | Value::Undefined) => true,
+        (Value::Bool(value), other) => {
+            abstract_primitive_equal(&Value::Number(if *value { 1.0 } else { 0.0 }), other)
+        }
+        (other, Value::Bool(value)) => {
+            abstract_primitive_equal(other, &Value::Number(if *value { 1.0 } else { 0.0 }))
+        }
+        (Value::String(text), Value::Number(number))
+        | (Value::Number(number), Value::String(text)) => {
+            text.as_str().string_to_number() == *number
+        }
+        (Value::Null | Value::Undefined, _) | (_, Value::Null | Value::Undefined) => false,
+        _ => same_value(left, right),
+    }
+}
+
 pub fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
     match op {
         "+" => {
@@ -270,15 +344,8 @@ pub fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
         "===" => Some(Value::Bool(same_value(&left, &right))),
         "!==" => Some(Value::Bool(!same_value(&left, &right))),
         "==" | "!=" => {
-            let equal = same_value(&left, &right)
-                || matches!(
-                    (&left, &right),
-                    (Value::Null, Value::Undefined) | (Value::Undefined, Value::Null)
-                );
-            if !equal {
-                return None;
-            }
-            Some(Value::Bool(op == "=="))
+            let equal = abstract_primitive_equal(&left, &right);
+            Some(Value::Bool(if op == "==" { equal } else { !equal }))
         }
         "<" | "<=" | ">" | ">=" => {
             let result = if let (Value::String(a), Value::String(b)) = (&left, &right) {

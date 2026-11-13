@@ -1,15 +1,23 @@
 mod base91;
 mod base91_recovery;
+mod binary_rhs_reflow;
+mod bitwise_algebra;
+mod bitwise_effects;
 mod browser_legacy;
 mod control_flow;
 mod decoder;
 mod decoder_encoding;
+mod effect_statements;
+mod effectful_constant;
+mod if_ladder_structure;
 mod numeric;
 mod proxy;
 mod pure_function;
 mod rewrite;
 mod selector;
 mod string_exposure;
+mod switch_constant;
+mod trivial_loops;
 mod value_eval;
 
 pub use browser_legacy::{
@@ -54,6 +62,7 @@ use value_eval::{
 };
 pub use value_eval::{
     eval as eval_static_primitive, eval_with_resolver as eval_static_primitive_with_resolver,
+    inert_literal_value as is_inert_static_literal,
     known_bool_with_resolver as known_static_bool_with_resolver, string_literal_value,
     template_element_value, Value as StaticPrimitiveValue,
 };
@@ -531,6 +540,84 @@ enum CallRewriteTraversal {
     WalkChildren,
 }
 
+/// Dynamic eval and mapped arguments are function-local hazards for
+/// numeric-state proofs. An unrelated bundled helper must not disable
+/// source reconstruction throughout an entire source file.
+#[derive(Default)]
+struct NumericStateAliasRisks {
+    /// The nearest ordinary function owns the arguments object; arrows share
+    /// it, whereas an ordinary nested function has its own arguments object.
+    stack: Vec<(Span, bool)>,
+    unsafe_functions: HashSet<(u32, u32)>,
+    unsafe_top_level: bool,
+}
+
+impl NumericStateAliasRisks {
+    fn mark_eval_or_with(&mut self) {
+        if self.stack.is_empty() {
+            self.unsafe_top_level = true;
+        }
+        // Direct eval (or with) in a nested function may mutate lexical
+        // bindings of any enclosing function, so include every ancestor.
+        for (span, _) in &self.stack {
+            self.unsafe_functions.insert((span.start, span.end));
+        }
+    }
+
+    fn mark_arguments(&mut self) {
+        // A reference in an arrow resolves the nearest ordinary function's
+        // arguments object; only that function and the enclosed arrows can
+        // observe or modify the mapped parameters through that object.
+        let start = self.stack.iter().rposition(|(_, ordinary)| *ordinary);
+        if let Some(start) = start {
+            for (span, _) in &self.stack[start..] {
+                self.unsafe_functions.insert((span.start, span.end));
+            }
+        } else if self.stack.is_empty() {
+            self.unsafe_top_level = true;
+        } else {
+            for (span, _) in &self.stack {
+                self.unsafe_functions.insert((span.start, span.end));
+            }
+        }
+    }
+}
+
+impl<'a> Visit<'a> for NumericStateAliasRisks {
+    fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        self.stack.push((function.span, true));
+        walk::walk_function(self, function, flags);
+        self.stack.pop();
+    }
+
+    fn visit_arrow_function_expression(
+        &mut self,
+        function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        self.stack.push((function.span, false));
+        walk::walk_arrow_function_expression(self, function);
+        self.stack.pop();
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if matches!(&call.callee, Expression::Identifier(id) if id.name == "eval") {
+            self.mark_eval_or_with();
+        }
+        walk::walk_call_expression(self, call);
+    }
+
+    fn visit_with_statement(&mut self, statement: &WithStatement<'a>) {
+        self.mark_eval_or_with();
+        walk::walk_with_statement(self, statement);
+    }
+
+    fn visit_identifier_reference(&mut self, id: &oxc_ast::ast::IdentifierReference<'a>) {
+        if id.name == "arguments" {
+            self.mark_arguments();
+        }
+    }
+}
+
 struct Collector<'s, 'c> {
     source: &'s str,
     scoping: &'c Scoping,
@@ -550,10 +637,280 @@ struct Collector<'s, 'c> {
     var_number_initializers: &'c HashMap<SymbolId, VarNumberInitializer>,
     reference_spans: &'c HashMap<ReferenceId, Span>,
     protected_spans: &'c [(usize, usize)],
+    may_remove_dead_numeric_writes: bool,
+    unsafe_numeric_functions: &'c HashSet<(u32, u32)>,
+    current_function_scope: Option<ScopeId>,
+    current_function_numeric_safe: bool,
+    allow_effect_statements: bool,
+    function_depth: usize,
     replacements: Vec<Replacement>,
 }
 
 impl Collector<'_, '_> {
+    fn lower_if_test_statements(&mut self, statements: &[Statement<'_>]) {
+        if !self.allow_effect_statements || self.function_depth == 0 {
+            return;
+        }
+        for statement in statements {
+            if let Statement::IfStatement(branch) = statement {
+                if let Some(code) = effect_statements::lower_if_test(branch, self.source) {
+                    self.push(branch.span, code, "if_test_sequence_lowering");
+                } else if let Some(code) =
+                    effect_statements::lower_if_test_first_binary_left_sequence(branch, self.source)
+                {
+                    self.push(branch.span, code, "if_guard_binary_left_sequence_lowering");
+                } else if let Some(code) =
+                    effect_statements::lower_if_test_first_member_object(branch, self.source)
+                {
+                    self.push(branch.span, code, "if_guard_member_prefix_lowering");
+                } else if let Some(code) =
+                    binary_rhs_reflow::lower_if_binary_rhs_sequences(branch, self.source)
+                {
+                    self.push(branch.span, code, "if_binary_rhs_effect_lifting");
+                }
+            }
+        }
+    }
+
+    fn lower_sibling_expression_statements(&mut self, statements: &[Statement<'_>]) {
+        if !self.allow_effect_statements || self.function_depth == 0 {
+            return;
+        }
+        for statement in statements {
+            if let Statement::ExpressionStatement(expression) = statement {
+                if let Some(code) = effect_statements::lower_conditional_assignment(
+                    expression,
+                    self.source,
+                    self.scoping,
+                ) {
+                    self.push(expression.span, code, "assignment_conditional_lowering");
+                } else if let Some(code) =
+                    effect_statements::lower_member_object_sequence(expression, self.source)
+                {
+                    self.push(expression.span, code, "member_object_sequence_lowering");
+                }
+            }
+        }
+    }
+
+    fn reconstruct_while_pairs(&mut self, statements: &[Statement<'_>]) {
+        for pair in statements.windows(2) {
+            if let [initial, Statement::WhileStatement(loop_stmt)] = pair {
+                if let Some(code) =
+                    if_ladder_structure::reconstruct_while_adjacent(initial, loop_stmt, self.source)
+                {
+                    self.push(
+                        Span::new(initial.span().start, loop_stmt.span.end),
+                        code,
+                        "if_ladder_structured",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Preserve a numeric state initialized before arbitrary intervening
+    /// statements or an enclosing block. The real proof obligation is on
+    /// the same semantic binding, not adjacency of source statements.
+    fn reconstruct_reaching_while(&mut self, statements: &[Statement<'_>]) {
+        self.reconstruct_reaching_while_with(statements, &HashMap::<SymbolId, (u64, Span)>::new());
+    }
+
+    /// A dynamic eval in an ancestor may inspect that ancestor's bindings,
+    /// but cannot inspect a *sibling child's* locally owned numeric state.
+    /// Require the exact Oxc symbol to belong to the current safe function
+    /// when the inherited general dead-write permission is unavailable.
+    fn safe_numeric_state_binding(&self, symbol: SymbolId) -> bool {
+        self.may_remove_dead_numeric_writes
+            || (self.current_function_numeric_safe
+                && self.current_function_scope.is_some_and(|function_scope| {
+                    self.scoping
+                        .scope_ancestors(self.scoping.symbol_scope_id(symbol))
+                        .any(|scope| scope == function_scope)
+                }))
+    }
+
+    fn reconstruct_reaching_while_with(
+        &mut self,
+        statements: &[Statement<'_>],
+        inherited: &HashMap<SymbolId, (u64, Span)>,
+    ) {
+        if !self.may_remove_dead_numeric_writes && !self.current_function_numeric_safe {
+            return;
+        }
+        let mut reaching = inherited.clone();
+        for (index, stmt) in statements.iter().enumerate() {
+            if let Statement::WhileStatement(loop_stmt) = stmt {
+                if let Some((symbol, name)) =
+                    if_ladder_structure::while_state_binding(loop_stmt, self.scoping)
+                {
+                    let immediately_preceded = index > 0
+                        && if_ladder_structure::state_initializers(
+                            &statements[index - 1],
+                            self.scoping,
+                        )
+                        .iter()
+                        .any(|(other, _, _, _)| *other == symbol);
+                    if !immediately_preceded && self.safe_numeric_state_binding(symbol) {
+                        if let Some(&(initial, init_span)) = reaching.get(&symbol) {
+                            if self.reaching_state_is_stable(symbol, init_span, loop_stmt.span) {
+                                if let Some(code) =
+                                    if_ladder_structure::reconstruct_while_with_known_state(
+                                        loop_stmt,
+                                        name,
+                                        initial,
+                                        self.source,
+                                    )
+                                {
+                                    self.push(loop_stmt.span, code, "if_ladder_structured");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Exception-driven dispatchers often use a constant-true loop,
+            // rather than testing the state in the condition. The original
+            // lexical initializer and write-provenance still prove its entry.
+            if let Statement::WhileStatement(loop_stmt) = stmt {
+                if let Statement::TryStatement(protected) = &loop_stmt.body {
+                    for (&symbol, &(initial, init_span)) in &reaching {
+                        if !self.safe_numeric_state_binding(symbol)
+                            || !self.reaching_state_is_stable(symbol, init_span, loop_stmt.span)
+                        {
+                            continue;
+                        }
+                        let state = self.scoping.symbol_name(symbol);
+                        if let Some(code) = if_ladder_structure::prune_exception_dispatcher(
+                            loop_stmt,
+                            state,
+                            initial,
+                            symbol,
+                            self.scoping,
+                            self.source,
+                            if_ladder_structure::CatchScopeEvidence {
+                                reaching: &reaching,
+                                reference_spans: self.reference_spans,
+                            },
+                        ) {
+                            if let Some(dispatcher) = protected.block.body.first() {
+                                self.push(dispatcher.span(), code, "exception_state_pruned");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            match stmt {
+                Statement::BlockStatement(block) => {
+                    self.reconstruct_reaching_while_with(&block.body, &reaching);
+                }
+                Statement::IfStatement(branch) => {
+                    self.reconstruct_nested_reaching(&branch.consequent, &reaching);
+                    if let Some(alternate) = &branch.alternate {
+                        self.reconstruct_nested_reaching(alternate, &reaching);
+                    }
+                }
+                _ => {}
+            }
+            // Kill any state whose value could have changed in this
+            // statement before processing the next sibling statement.
+            reaching.retain(|&symbol, _| !self.symbol_written_in_span(symbol, stmt.span()));
+            for (symbol, _, initial, init_span) in
+                if_ladder_structure::state_initializers(stmt, self.scoping)
+            {
+                if self.scoping.symbol_flags(symbol).is_variable()
+                    && !self.scoping.symbol_flags(symbol).is_const_variable()
+                    && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
+                    && self.safe_numeric_state_binding(symbol)
+                {
+                    reaching.insert(symbol, (initial, init_span));
+                }
+            }
+        }
+    }
+
+    fn reconstruct_nested_reaching(
+        &mut self,
+        stmt: &Statement<'_>,
+        reaching: &HashMap<SymbolId, (u64, Span)>,
+    ) {
+        if let Statement::BlockStatement(block) = stmt {
+            self.reconstruct_reaching_while_with(&block.body, reaching);
+        } else {
+            self.reconstruct_reaching_while_with(std::slice::from_ref(stmt), reaching);
+        }
+    }
+
+    fn symbol_written_in_span(&self, symbol: SymbolId, span: Span) -> bool {
+        self.scoping
+            .get_resolved_reference_ids(symbol)
+            .iter()
+            .any(|&ref_id| {
+                let reference = self.scoping.get_reference(ref_id);
+                reference.is_write()
+                    && self
+                        .reference_spans
+                        .get(&ref_id)
+                        .is_some_and(|reference_span| {
+                            span.start <= reference_span.start && reference_span.end <= span.end
+                        })
+            })
+    }
+
+    fn reaching_state_is_stable(&self, symbol: SymbolId, init: Span, loop_span: Span) -> bool {
+        self.scoping.symbol_flags(symbol).is_variable()
+            && !self.scoping.symbol_flags(symbol).is_const_variable()
+            && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
+            && self
+                .scoping
+                .get_resolved_reference_ids(symbol)
+                .iter()
+                .all(|&ref_id| {
+                    let reference = self.scoping.get_reference(ref_id);
+                    if !reference.is_write() {
+                        return true;
+                    }
+                    self.reference_spans.get(&ref_id).is_some_and(|span| {
+                        (init.start <= span.start && span.end <= init.end)
+                            || (loop_span.start <= span.start && span.end <= loop_span.end)
+                    })
+                })
+    }
+
+    // A local scalar that has no remaining lexical reads after structural
+    // reconstruction cannot make numeric state assignments observable.
+    // Avoid arguments aliasing and direct eval, both of which can observe
+    // parameter/local writes without an ordinary identifier reference.
+    fn dead_numeric_assignment(&self, expr: &Expression<'_>) -> bool {
+        let Expression::AssignmentExpression(assign) = expr else {
+            return false;
+        };
+        if assign.operator.as_str() != "="
+            || !matches!(&assign.right, Expression::NumericLiteral(_))
+        {
+            return false;
+        }
+        let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left else {
+            return false;
+        };
+        let Some(reference) = id.reference_id.get() else {
+            return false;
+        };
+        let Some(symbol) = self.scoping.get_reference(reference).symbol_id() else {
+            return false;
+        };
+        self.safe_numeric_state_binding(symbol)
+            && self.scoping.symbol_flags(symbol).is_variable()
+            && !self.scoping.symbol_flags(symbol).is_const_variable()
+            && self.scoping.symbol_scope_id(symbol) != self.scoping.root_scope_id()
+            && self
+                .scoping
+                .get_resolved_reference_ids(symbol)
+                .iter()
+                .all(|reference_id| !self.scoping.get_reference(*reference_id).is_read())
+    }
+
     fn is_protected(&self, start: usize, end: usize) -> bool {
         self.protected_spans
             .iter()
@@ -786,7 +1143,47 @@ impl Collector<'_, '_> {
 }
 
 impl<'a> Visit<'a> for Collector<'_, '_> {
+    fn visit_function(&mut self, it: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        let enclosing_safe = self.may_remove_dead_numeric_writes;
+        let previous_scope = self.current_function_scope;
+        let previous_local_safe = self.current_function_numeric_safe;
+        let own_safe = !self
+            .unsafe_numeric_functions
+            .contains(&(it.span.start, it.span.end));
+        self.may_remove_dead_numeric_writes = enclosing_safe && own_safe;
+        self.current_function_scope = it.scope_id.get();
+        self.current_function_numeric_safe = own_safe && self.current_function_scope.is_some();
+        self.function_depth += 1;
+        walk::walk_function(self, it, flags);
+        self.function_depth -= 1;
+        self.current_function_scope = previous_scope;
+        self.current_function_numeric_safe = previous_local_safe;
+        self.may_remove_dead_numeric_writes = enclosing_safe;
+    }
+
+    fn visit_arrow_function_expression(&mut self, it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+        let enclosing_safe = self.may_remove_dead_numeric_writes;
+        let previous_scope = self.current_function_scope;
+        let previous_local_safe = self.current_function_numeric_safe;
+        let own_safe = !self
+            .unsafe_numeric_functions
+            .contains(&(it.span.start, it.span.end));
+        self.may_remove_dead_numeric_writes = enclosing_safe && own_safe;
+        self.current_function_scope = it.scope_id.get();
+        self.current_function_numeric_safe = own_safe && self.current_function_scope.is_some();
+        self.function_depth += 1;
+        walk::walk_arrow_function_expression(self, it);
+        self.function_depth -= 1;
+        self.current_function_scope = previous_scope;
+        self.current_function_numeric_safe = previous_local_safe;
+        self.may_remove_dead_numeric_writes = enclosing_safe;
+    }
+
     fn visit_expression(&mut self, it: &Expression<'a>) {
+        if let Some(replacement) = effectful_constant::fold(it, self.source) {
+            self.push(it.span(), replacement, "effectful_constant_fold");
+            return;
+        }
         if let Expression::Identifier(id) = it {
             if self.shorthand_spans.contains(&(id.span.start, id.span.end)) {
                 walk::walk_expression(self, it);
@@ -815,6 +1212,12 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_binary_expression(&mut self, it: &oxc_ast::ast::BinaryExpression<'a>) {
+        if self.allow_effect_statements {
+            if let Some(text) = bitwise_effects::normalize(it, self.source) {
+                self.push(it.span, text, "bitwise_effects");
+                return;
+            }
+        }
         if matches!(it.operator.as_str(), "==" | "===" | "!=" | "!==") {
             let left_reference =
                 reference_identity(&it.left, self.scoping, self.reference_identity_tables);
@@ -867,6 +1270,14 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_logical_expression(self, it);
     }
 
+    fn visit_sequence_expression(&mut self, it: &oxc_ast::ast::SequenceExpression<'a>) {
+        if let Some(replacement) = trivial_loops::prune_inert_sequence_values(it, self.source) {
+            self.push(it.span, replacement, "prune_inert_sequence_values");
+            return;
+        }
+        walk::walk_sequence_expression(self, it);
+    }
+
     fn visit_conditional_expression(&mut self, it: &oxc_ast::ast::ConditionalExpression<'a>) {
         if let Some(test) = known_bool(&it.test) {
             let selected = if test { &it.consequent } else { &it.alternate };
@@ -879,7 +1290,34 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_conditional_expression(self, it);
     }
 
+    fn visit_return_statement(&mut self, it: &oxc_ast::ast::ReturnStatement<'a>) {
+        if let Some(Expression::SequenceExpression(sequence)) = it.argument.as_ref() {
+            if let Some((last, preceding)) = sequence.expressions.split_last() {
+                if !preceding.is_empty()
+                    && preceding.iter().all(|expr| {
+                        trivial_loops::inert_literal_statement(expr)
+                            || matches!(expr, Expression::StringLiteral(_))
+                    })
+                {
+                    // Return always performs GetValue; unlike a call
+                    // callee, it cannot observe reference/this identity.
+                    self.push(
+                        sequence.span,
+                        fragment(self.source, last.span()).to_owned(),
+                        "return_inert_sequence_prefix",
+                    );
+                    return;
+                }
+            }
+        }
+        walk::walk_return_statement(self, it);
+    }
+
     fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
+        if let Some(replacement) = trivial_loops::normalize_empty_if(it, self.source) {
+            self.push(it.span, replacement, "normalize_empty_if");
+            return;
+        }
         if let Some(test) = known_bool(&it.test) {
             let text = if test {
                 fragment(self.source, it.consequent.span()).to_string()
@@ -894,7 +1332,27 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_if_statement(self, it);
     }
 
+    fn visit_switch_statement(&mut self, it: &oxc_ast::ast::SwitchStatement<'a>) {
+        if let Some(text) = switch_constant::select_constant_switch(it, self.source) {
+            self.push(it.span, text, "constant_switch");
+            return;
+        }
+        if let Some(text) = switch_constant::structure_boolean_switch(it, self.source) {
+            self.push(it.span, text, "boolean_switch_structured");
+            return;
+        }
+        walk::walk_switch_statement(self, it);
+    }
+
     fn visit_for_statement(&mut self, it: &oxc_ast::ast::ForStatement<'a>) {
+        if let Some(text) = trivial_loops::single_iteration_for(it, self.source) {
+            self.push(it.span, text, "single_iteration_for");
+            return;
+        }
+        if let Some(text) = if_ladder_structure::reconstruct_for(it, self.source) {
+            self.push(it.span, text, "if_ladder_structured");
+            return;
+        }
         if let Some(text) = self.reference_state_replacement(it) {
             self.push(it.span, text, "reference_state_unflatten");
             return;
@@ -911,6 +1369,10 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     }
 
     fn visit_while_statement(&mut self, it: &oxc_ast::ast::WhileStatement<'a>) {
+        if let Some(text) = trivial_loops::never_entered_while(it) {
+            self.push(it.span, text, "never_entered_loop");
+            return;
+        }
         if let Some(text) = self.ordered_switch_while_replacement(it) {
             self.push(it.span, text, "ordered_switch_unflatten");
             return;
@@ -918,7 +1380,107 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_while_statement(self, it);
     }
 
+    fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
+        self.lower_if_test_statements(&it.statements);
+        self.lower_sibling_expression_statements(&it.statements);
+        self.reconstruct_while_pairs(&it.statements);
+        self.reconstruct_reaching_while(&it.statements);
+        if self.allow_effect_statements
+            && self.function_depth > 0
+            && self.may_remove_dead_numeric_writes
+        {
+            for (span, expression) in
+                bitwise_algebra::scan(&it.statements, self.source, self.scoping)
+            {
+                self.push(span, expression, "bitwise_algebra");
+            }
+        }
+        for stmt in &it.statements {
+            match stmt {
+                Statement::EmptyStatement(empty) => {
+                    self.push(empty.span, String::new(), "remove_empty_function_statement");
+                }
+                // A standalone empty block has no bindings, declarations,
+                // effects, or control transfers. Do not rewrite blocks used
+                // as branch, loop, labelled, or try/catch bodies.
+                Statement::BlockStatement(block) if block.body.is_empty() => {
+                    self.push(block.span, String::new(), "remove_empty_block_statement");
+                }
+                Statement::BlockStatement(block) => {
+                    if let Some(flattened) =
+                        trivial_loops::flatten_standalone_block(block, self.source, self.scoping)
+                    {
+                        self.push(block.span, flattened, "flatten_redundant_block");
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk::walk_function_body(self, it);
+    }
+
+    fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
+        self.lower_if_test_statements(&it.body);
+        self.lower_sibling_expression_statements(&it.body);
+        self.reconstruct_while_pairs(&it.body);
+        self.reconstruct_reaching_while(&it.body);
+        if self.allow_effect_statements
+            && self.function_depth > 0
+            && self.may_remove_dead_numeric_writes
+        {
+            // Top-level var declarations may alias global object properties.
+            // Direct eval, mapped arguments, and dynamic with-environments
+            // may change local bindings outside the visible statement list.
+            for (span, expression) in bitwise_algebra::scan(&it.body, self.source, self.scoping) {
+                self.push(span, expression, "bitwise_algebra");
+            }
+        }
+        for stmt in &it.body {
+            match stmt {
+                Statement::EmptyStatement(empty) => {
+                    self.push(empty.span, String::new(), "remove_empty_block_statement");
+                }
+                Statement::BlockStatement(block) if block.body.is_empty() => {
+                    self.push(block.span, String::new(), "remove_empty_block_statement");
+                }
+                Statement::BlockStatement(block) => {
+                    if let Some(flattened) =
+                        trivial_loops::flatten_standalone_block(block, self.source, self.scoping)
+                    {
+                        self.push(block.span, flattened, "flatten_redundant_block");
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk::walk_block_statement(self, it);
+    }
+
     fn visit_expression_statement(&mut self, it: &ExpressionStatement<'a>) {
+        if trivial_loops::inert_literal_statement(&it.expression) {
+            self.push(it.span, String::new(), "remove_inert_literal_statement");
+            return;
+        }
+        // Script/eval Completion values can expose the result of a top-level
+        // expression statement. Inside a function, a normal completion is
+        // discarded; the statement may be safely normalized to if/blocks.
+        if self.allow_effect_statements
+            && self.function_depth > 0
+            && effectful_constant::fold(&it.expression, self.source).is_none()
+        {
+            // A known-result effectful expression can eliminate enormous
+            // dead RHS subtrees. Give it precedence over presentation-only
+            // statement lowering; the next fixed-point iteration may then
+            // lower the surviving effects into readable statements.
+            if let Some(replacement) = effect_statements::lower(it, self.source, self.scoping) {
+                self.push(it.span, replacement, "effect_statement_lowering");
+                return;
+            }
+        }
+        if self.dead_numeric_assignment(&it.expression) {
+            self.push(it.span, ";".to_owned(), "dead_numeric_state_write");
+            return;
+        }
         if let Expression::SequenceExpression(seq) = &it.expression {
             let text = seq
                 .expressions
@@ -1269,13 +1831,19 @@ pub fn safe_source_rejection(source: &str, mode: SafeSourceMode) -> Option<SafeS
     }
 }
 
+#[derive(Clone, Copy)]
+struct TransformOptions {
+    standard_numeric_builtins: bool,
+    allow_effect_statements: bool,
+}
+
 fn transform_once(
     source: &str,
     source_type: SourceType,
     counts: &mut Counts,
     arithmetic_state_proofs: &mut Vec<ArithmeticStateProof>,
     iteration: usize,
-    standard_numeric_builtins: bool,
+    options: TransformOptions,
     budget: &WorkBudget,
 ) -> Result<Option<String>, BudgetExceeded> {
     budget.checkpoint()?;
@@ -1325,11 +1893,14 @@ fn transform_once(
     let selector_dispatchers = collect_selector_dispatchers(&program, scoping, &stable_var_numbers);
     let (dispatch_orders, zero_counters) = collect_dispatch_bindings(&program);
     budget.checkpoint()?;
+    let direct_eval_present = has_direct_eval(&program);
+    let mut numeric_state_risks = NumericStateAliasRisks::default();
+    numeric_state_risks.visit_program(&program);
     initial_replacements.extend(remove_unused_proven_helpers(
         scoping,
         &decoder_analysis.removable_helpers,
         &pure_functions,
-        has_direct_eval(&program),
+        direct_eval_present,
     ));
     budget.checkpoint()?;
 
@@ -1344,7 +1915,7 @@ fn transform_once(
         pure_functions: &pure_functions,
         from_char_code_aliases: &from_char_code_aliases,
         global_object_aliases: &global_object_aliases,
-        standard_numeric_builtins,
+        standard_numeric_builtins: options.standard_numeric_builtins,
         reference_identity_tables: &reference_identity_tables,
         selector_dispatchers: &selector_dispatchers,
         dispatch_orders: &dispatch_orders,
@@ -1352,6 +1923,15 @@ fn transform_once(
         var_number_initializers: &var_number_initializers,
         reference_spans: &reference_spans,
         protected_spans: &protected_spans,
+        // Only dynamic scopes or arguments aliases in the *relevant lexical
+        // function* can expose otherwise dead local state writes. Nonlocal
+        // script syntax, including string contents, is not such a hazard.
+        may_remove_dead_numeric_writes: !numeric_state_risks.unsafe_top_level,
+        unsafe_numeric_functions: &numeric_state_risks.unsafe_functions,
+        current_function_scope: None,
+        current_function_numeric_safe: false,
+        allow_effect_statements: options.allow_effect_statements,
+        function_depth: 0,
         replacements: initial_replacements,
     };
     collector.visit_program(&program);
@@ -1507,18 +2087,45 @@ fn deobfuscate_with_mode(
 
     for iteration in 1..=max_iterations {
         budget.consume(1)?;
-        let Some(next) = transform_once(
+        // Semantic recovery (decoder calls, constant folding, control-flow
+        // reconstruction, and pure-function evaluation) always gets the
+        // original AST first. Only once that work reaches a fixed point do
+        // we normalize the remaining discarded expressions for readability.
+        // An eager presentation rewrite can hide source shapes required by
+        // other analyzers (notably the decoder and WASM import recognizers).
+        let Some(mut next) = transform_once(
             &current,
             source_type,
             &mut counts,
             &mut arithmetic_state_proofs,
             iteration,
-            standard_numeric_builtins,
+            TransformOptions {
+                standard_numeric_builtins,
+                allow_effect_statements: false,
+            },
             budget,
         )?
         else {
             return Ok(None);
         };
+        if next == current {
+            let Some(presented) = transform_once(
+                &current,
+                source_type,
+                &mut counts,
+                &mut arithmetic_state_proofs,
+                iteration,
+                TransformOptions {
+                    standard_numeric_builtins,
+                    allow_effect_statements: true,
+                },
+                budget,
+            )?
+            else {
+                return Ok(None);
+            };
+            next = presented;
+        }
         if next == current {
             break;
         }
@@ -1652,6 +2259,4381 @@ mod tests {
         expose_static_strings_budgeted(source, max_iterations, &test_budget())
             .ok()
             .flatten()
+    }
+
+    #[test]
+    fn exception_dispatcher_prunes_unreachable_state_but_keeps_catch_resume_root() {
+        let source = r#"
+            function f(flag, log) {
+                let state=1;
+                let recovery=0;
+                while(true) try {
+                    if(state==99) {log.push("dead");return log;}
+                    else if(state==1) state=flag?2:4;
+                    else if(state==2) {
+                        recovery=1;
+                        log.push("try");
+                        throw Error("caught");
+                    } else if(state==3) {
+                        log.push("recovered");
+                        state=4;
+                    } else if(state==4) return log;
+                } catch(error) {
+                    if(recovery==1) {
+                        log.push(error.message);
+                        state=3;
+                    } else throw error;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert_eq!(
+            result.transforms.get("exception_state_pruned"),
+            Some(&1),
+            "{result:?}"
+        );
+        assert!(!result.source.contains("dead"), "{}", result.source);
+        assert!(result.source.contains("state==3"), "{}", result.source);
+        assert!(result.source.contains("catch"), "{}", result.source);
+        assert!(result.source.contains("while"), "{}", result.source);
+    }
+
+    #[test]
+    fn folds_inert_nonempty_array_truthiness_without_skipping_evaluation() {
+        let source = r#"
+            function f(log) {
+                let n=0;
+                while(!["", null, 1, false, [2], {}, /x/, void 0] == 0) {
+                    log.push(++n);
+                    if(n==2) break;
+                }
+                return log;
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(
+            result.is_some(),
+            "inert array should allow constant folding"
+        );
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(flat.contains("while(true)"), "{}", result.source);
+    }
+
+    #[test]
+    fn non_inert_array_truthiness_keeps_observable_effects_and_tdz_reads() {
+        for source in [
+            "function f(log){let n=0;while(![log.push('tick')]==0){if(++n==2)break;}return log;}",
+            "function f(iter){while(![...iter]==0){break;}}",
+            "function f(){try{while(![later]==0){break;}}catch(e){return e.name;}let later=1;}",
+        ] {
+            let result = deobfuscate(source, 12);
+            let output = result.map_or_else(|| source.to_owned(), |result| result.source);
+            let compact: String = output.chars().filter(|ch| !ch.is_whitespace()).collect();
+            assert!(compact.contains("while(!["), "{source} -> {output}");
+        }
+    }
+
+    #[test]
+    fn exception_dispatcher_collapses_only_silent_finite_transition_chains() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 57;
+                let recovery = 0;
+                while (![""] == 0) try {
+                    if (state == 57) state = 73;
+                    else if (state == 73) state = 37;
+                    else if (state == 37) state = 25;
+                    else if (state == 25) {
+                        log.push("work");
+                        state = flag ? 92 : 90;
+                    } else if (state == 92) {
+                        recovery = 1;
+                        throw Error("catch");
+                    } else if (state == 90) return log;
+                } catch (error) {
+                    log.push(error.message);
+                    if (recovery == 1) state = 90;
+                    else throw error;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(!compact.contains("state==73"), "{}", result.source);
+        assert!(!compact.contains("state==37"), "{}", result.source);
+        assert!(compact.contains("state=25"), "{}", result.source);
+        assert!(compact.contains("catch(error)"), "{}", result.source);
+        assert!(
+            result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_catch_entry_into_a_silent_chain() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                let raised = false;
+                while (true) try {
+                    if (state == 1) {
+                        if (!raised) { raised = true; throw Error("once"); }
+                        state = 2;
+                    } else if (state == 2) state = 3;
+                    else if (state == 3) state = 4;
+                    else if (state == 4) return log;
+                } catch (error) {
+                    log.push(error.message);
+                    state = 2;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("state==2"),
+            "catch target must remain: {}",
+            result.source
+        );
+        assert!(!compact.contains("state==3"), "{}", result.source);
+        assert!(compact.contains("state=4"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_keeps_silent_cycles_and_effectful_loop_tests() {
+        let cycle = r#"
+            function f() {
+                let state=1;
+                while(true) try {
+                    if(state==1) state=2;
+                    else if(state==2) state=1;
+                } catch(error) { throw error; }
+            }
+        "#;
+        let output = deobfuscate(cycle, 12);
+        assert!(output.is_some(), "valid source");
+        let Some(output) = output else { unreachable!() };
+        assert!(
+            output.source.contains("state=2") && output.source.contains("state=1"),
+            "{}",
+            output.source
+        );
+        let effectful = r#"
+            function f(log) {
+                let state=1;
+                while(log.push("test")) try {
+                    if(state==1) state=2;
+                    else if(state==2) state=3;
+                    else if(state==3) return log;
+                } catch(error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(effectful, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(compact.contains("state==2"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_does_not_coerce_boolean_state_assignments() {
+        let source = r#"
+            function f() {
+                let state=1;
+                while(true) try {
+                    if(state===1) state=true;
+                    else if(state===true) state=3;
+                    else if(state===3) return 3;
+                } catch(error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(compact.contains("state=true"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_retargets_effectful_terminal_assignment() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) { log.push("start"); state = 2; }
+                    else if (state == 2) state = 3;
+                    else if (state == 3) { log.push("finish"); state = 4; }
+                    else if (state == 4) return log;
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("state==2"), "{}", result.source);
+        assert!(
+            flat.contains("log.push(\"start\");state=3"),
+            "{}",
+            result.source
+        );
+        assert!(flat.contains("log.push(\"finish\")"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_retargets_conditional_and_sequence_terminals() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        log.push("enter");
+                        state = flag ? 2 : (log.push("condition-false"), 5);
+                    } else if (state == 2) state = 3;
+                    else if (state == 3) { log.push("true"); state = 6; }
+                    else if (state == 5) { log.push("false"); state = 6; }
+                    else if (state == 6) return log;
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("state==2"), "{}", result.source);
+        // The nested ternary assignment is now explicit control flow.
+        // The dispatcher retargets the true arm to 3 (not 2), and the
+        // false arm still logs before assigning 5. Do not assert a
+        // particular parenthesization of the original ternary syntax.
+        assert!(flat.contains("if(flag){state=3;"), "{}", result.source);
+        assert!(flat.contains("state=5;"), "{}", result.source);
+        assert!(
+            flat.contains("log.push(\"condition-false\")"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_retains_catch_root_even_if_other_entries_skip_it() {
+        let source = r#"
+            function f(log) {
+                let state = 1, first = true;
+                while (true) try {
+                    if (state == 1) {
+                        log.push("normal");
+                        if (first) { first = false; throw Error("once"); }
+                        state = 2;
+                    } else if (state == 2) state = 3;
+                    else if (state == 3) return log;
+                } catch (error) {
+                    log.push(error.message);
+                    state = 2;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(flat.contains("state==2"), "{}", result.source);
+        assert!(flat.contains("state=3"), "{}", result.source);
+        assert!(flat.contains("log.push(\"normal\")"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_effectful_predecessor_with_return() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) { log.push("before"); state = 2; }
+                    else if (state == 2) return log;
+                } catch (error) { log.push("caught"); throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("state=2")
+                && compact.contains("returnlog;")
+                && compact.contains("log.push(\"before\")"),
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("returnlog;").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_catch_entry_to_inlined_return() {
+        let source = r#"
+            function f(log) {
+                let state = 1, first = true;
+                while (true) try {
+                    if (state == 1) {
+                        if (first) { first = false; throw Error("once"); }
+                        state = 2;
+                    } else if (state == 2) return log;
+                } catch (error) { log.push(error.message); state = 2; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("state==2"),
+            "catch target must remain: {}",
+            result.source
+        );
+        assert!(compact.contains("returnlog;"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_throwing_return_in_original_catch_scope() {
+        let source = r#"
+            function f(object, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = 2;
+                    else if (state == 2) return object.value;
+                } catch (error) { log.push(state); return log; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("state=2") && compact.contains("returnobject.value"),
+            "getter must retain state and expression: {}",
+            result.source
+        );
+        assert!(compact.contains("returnobject.value"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_enclosing_finally_state() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                try {
+                    while (true) try {
+                        if (state == 1) state = 2;
+                        else if (state == 2) return "done";
+                    } catch (error) { throw error; }
+                } finally {
+                    log.push(state);
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("state=2;") && compact.contains("return\"done\";"),
+            "{}",
+            result.source
+        );
+        assert!(compact.contains("log.push(state)"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_merged_return_handles_automatic_semicolon_insertion() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        log.push("before");
+                        state = 2
+                    } else if (state == 2) return log;
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("state=2") && compact.contains("returnlog;"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_does_not_move_return_into_shadowing_block() {
+        let source = r#"
+            function f(value, log) {
+                let state = 0;
+                while (true) try {
+                    if (state == 0) {
+                        let value = "inner";
+                        log.push(value);
+                        state = 1;
+                    } else if (state == 1) return value;
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("state==1"),
+            "original return binding must survive: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_factors_convergent_return_region_once() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = flag ? 2 : 3;
+                    else if (state === 2) { log.push("left"); state = 4; }
+                    else if (state === 3) { log.push("right"); state = 4; }
+                    else if (state === 4) return log;
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            compact.matches("returnlog;").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(!compact.contains("elseif(state===4)"), "{}", result.source);
+        assert!(
+            compact.contains("state=4") && compact.contains("returnlog;"),
+            "{}",
+            result.source
+        );
+        assert!(
+            compact.contains("log.push(\"left\")") && compact.contains("log.push(\"right\")"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_factors_multiple_inert_literal_returns() {
+        let source = r#"
+            function f(flag) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) return ["left", true];
+                    else if (state == 3) return ["right", false];
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(compact.matches("return[").count(), 2, "{}", result.source);
+        assert!(compact.contains("if(state==2)return["), "{}", result.source);
+        assert!(compact.contains("if(state==3)return["), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_strict_return_state_comparison() {
+        let source = r#"
+            function f(flag) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = flag ? 2 : 3;
+                    else if (state === 2) return "two";
+                    else if (state === 3) return "three";
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("if(state===2)return\"two\";"),
+            "{}",
+            result.source
+        );
+        assert!(
+            compact.contains("if(state===3)return\"three\";"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_single_entry_effectful_region() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) { state = 2; }
+                    else if (state == 2) {
+                        log.push("effect");
+                        state = flag ? 3 : 4;
+                    } else if (state == 3) return "left";
+                    else if (state == 4) return "right";
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state==2)"), "{}", result.source);
+        assert!(
+            flat.contains("state=2;") && flat.contains("log.push(\"effect\")"),
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"effect\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_multiple_incoming_region() {
+        let source = r#"
+            function f(flag) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) state = 4;
+                    else if (state == 3) state = 4;
+                    else if (state == 4) return flag;
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // Two independent incoming edges must share, not clone, the terminal.
+        assert_eq!(flat.matches("returnflag;").count(), 1, "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_catch_root_to_single_entry_candidate() {
+        let source = r#"
+            function f(log) {
+                let state = 1, first = true;
+                while (true) try {
+                    if (state == 1) {
+                        if (first) { first = false; throw Error("retry"); }
+                        state = 2;
+                    } else if (state == 2) { log.push("resumed"); state = 3; }
+                    else if (state == 3) return log;
+                } catch (error) { log.push(error.message); state = 2; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==2)"),
+            "catch-entry body remains: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"resumed\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_target_that_can_throw() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = 2;
+                    else if (state === 2) {
+                        log.push("at-two");
+                        throw Error("oops");
+                    }
+                } catch (error) { log.push(error.message); return [state, log]; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("state=2") && flat.contains("throwError("),
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"at-two\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_effectful_predecessor_prefix() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        log.push("prefix");
+                        state = 2;
+                    } else if (state == 2) {
+                        log.push("successor");
+                        return log;
+                    }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state==2)"), "{}", result.source);
+        assert!(flat.contains("state=2"), "{}", result.source);
+        assert_eq!(
+            flat.matches("log.push(\"prefix\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"successor\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_convergent_conditional_arms_once() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        if (flag) { log.push("left"); state = 2; }
+                        else { log.push("right"); state = 2; }
+                    } else if (state === 2) {
+                        log.push("tail");
+                        return log;
+                    }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state===2)"), "{}", result.source);
+        assert_eq!(
+            flat.matches("log.push(\"tail\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"left\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"right\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_keeps_nonconvergent_conditional_target() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        if (flag) { log.push("left"); state = 2; }
+                        else { log.push("right"); state = 3; }
+                    } else if (state == 2) return "two";
+                    else if (state == 3) return "three";
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("state=2") && flat.contains("state=3"),
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("return\"two\";").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("return\"three\";").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_convergent_throw_preserves_catch_visible_state() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        if (flag) { log.push("left"); state = 2; }
+                        else { log.push("right"); state = 2; }
+                    } else if (state == 2) {
+                        log.push("before-throw");
+                        throw Error("oops");
+                    }
+                } catch (error) { log.push(error.message); return [state, log]; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state==2)"), "{}", result.source);
+        assert_eq!(
+            flat.matches("log.push(\"before-throw\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(flat.contains("return[state,log]"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_single_entry_diamond_shared_effectful_join() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = flag ? 2 : 3;
+                    else if (state === 2) { log.push("left"); state = 4; }
+                    else if (state === 3) { log.push("right"); state = 4; }
+                    else if (state === 4) { log.push("join"); return log; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state===4)"), "{}", result.source);
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"left\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"right\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(flat.matches("returnlog;").count(), 1, "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_triangle_without_cloning_join() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 4;
+                    else if (state == 2) { log.push("detour"); state = 4; }
+                    else if (state == 4) { log.push("join"); return [state, log]; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state==4)"), "{}", result.source);
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"detour\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(flat.contains("return[state,log]"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_diamond_retains_competing_catch_entry() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("left"); state = 4; }
+                    else if (state == 3) { log.push("right"); state = 4; }
+                    else if (state == 4) { log.push("join"); return log; }
+                    else if (state == 6) { state = 4; }
+                } catch (error) { log.push(error.message); state = 6; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==4)"),
+            "shared catch-reachable join cannot be absorbed: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_diamond_throw_preserves_original_catch_state() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("left"); state = 4; }
+                    else if (state == 3) { log.push("right"); state = 4; }
+                    else if (state == 4) {
+                        log.push("before-throw");
+                        throw Error("expected");
+                    }
+                } catch (error) { log.push(error.message); return [state, log]; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(!flat.contains("if(state==4)"), "{}", result.source);
+        assert_eq!(
+            flat.matches("log.push(\"before-throw\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(flat.contains("return[state,log]"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_diamond_preserves_backedge_and_effect_count() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1, rounds = 0;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("left"); state = 4; }
+                    else if (state == 3) { log.push("right"); state = 4; }
+                    else if (state == 4) {
+                        log.push("join");
+                        if (rounds++ < 1) state = 1;
+                        else return log;
+                    }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(
+            flat.contains("state=1"),
+            "backedge must survive: {}",
+            result.source
+        );
+        assert!(flat.contains("returnlog;"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_diamond_preserves_independent_side_catch_root() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1, first = true;
+                while (true) try {
+                    if (state == 1) {
+                        if (first) { first = false; throw Error("retry"); }
+                        state = flag ? 2 : 3;
+                    } else if (state == 2) { log.push("left"); state = 4; }
+                    else if (state == 3) { log.push("right"); state = 4; }
+                    else if (state == 4) { log.push("join"); return log; }
+                } catch (error) { log.push(error.message); state = 2; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==2)"),
+            "catch-root entry must survive: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_composes_diamond_with_disjoint_linear_region() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = flag ? 2 : 3;
+                    else if (state === 2) { log.push("left"); state = 4; }
+                    else if (state === 3) { log.push("right"); state = 4; }
+                    else if (state === 4) { log.push("join"); state = 5; }
+                    else if (state === 5) { log.push("tail"); state = 6; }
+                    else if (state === 6) { log.push("finish"); return log; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("if(state===4)"),
+            "diamond's shared join must be emitted only once: {}",
+            result.source
+        );
+        assert!(
+            !compact.contains("if(state===6)"),
+            "disjoint linear region must also be merged: {}",
+            result.source
+        );
+        for effect in ["left", "right", "join", "tail", "finish"] {
+            assert_eq!(
+                compact.matches(&format!("log.push(\"{effect}\")")).count(),
+                1,
+                "{}",
+                result.source
+            );
+        }
+        assert_eq!(
+            compact.matches("returnlog;").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_arbitrary_depth_shared_join() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = flag ? 2 : 3;
+                    else if (state === 2) { log.push("L1"); state = 5; }
+                    else if (state === 3) { log.push("R1"); state = 6; }
+                    else if (state === 5) { log.push("L2"); state = 7; }
+                    else if (state === 6) { log.push("R2"); state = 7; }
+                    else if (state === 7) { log.push("join"); return [state, log]; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !flat.contains("if(state===7)"),
+            "shared join was not merged: {}",
+            result.source
+        );
+        for effect in ["L1", "L2", "R1", "R2", "join"] {
+            assert_eq!(
+                flat.matches(&format!("log.push(\"{effect}\")")).count(),
+                1,
+                "{}",
+                result.source
+            );
+        }
+        assert!(
+            flat.contains("state=7"),
+            "catch-visible state writes lost: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("return[state,log]").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_merges_deep_triangle_with_conditional_side_effects() {
+        let source = r#"
+            function f(flag, extra, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 7;
+                    else if (state == 2) {
+                        if (extra) { log.push("left"); state = 5; }
+                        else { log.push("right"); state = 5; }
+                    } else if (state == 5) { log.push("detour"); state = 7; }
+                    else if (state == 7) { log.push("join"); return [state, log]; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !flat.contains("if(state==7)"),
+            "shared join was not merged: {}",
+            result.source
+        );
+        for effect in ["left", "right", "detour", "join"] {
+            assert_eq!(
+                flat.matches(&format!("log.push(\"{effect}\")")).count(),
+                1,
+                "{}",
+                result.source
+            );
+        }
+        assert_eq!(
+            flat.matches("return[state,log]").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_deep_region_rejects_external_side_predecessor() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("L1"); state = 5; }
+                    else if (state == 3) { log.push("R1"); state = 6; }
+                    else if (state == 5) { log.push("L2"); state = 7; }
+                    else if (state == 6) { log.push("R2"); state = 7; }
+                    else if (state == 7) { log.push("join"); return log; }
+                    else if (state == 9) state = 5;
+                } catch (error) { log.push(error.message); state = 9; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==7)"),
+            "external side entry was absorbed: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"L2\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_deep_region_preserves_throwing_join_state() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("L1"); state = 5; }
+                    else if (state == 3) { log.push("R1"); state = 6; }
+                    else if (state == 5) { log.push("L2"); state = 7; }
+                    else if (state == 6) { log.push("R2"); state = 7; }
+                    else if (state == 7) { log.push("join"); throw Error("expected"); }
+                } catch (error) { log.push(error.message); return [state, log]; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !flat.contains("if(state==7)"),
+            "throwing join was not merged: {}",
+            result.source
+        );
+        assert!(
+            flat.contains("state=7") && flat.contains("throwError("),
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_deep_region_rejects_internal_cycle() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("loop"); if (log.length > 2) return log; state = 5; }
+                    else if (state == 5) { state = 2; }
+                    else if (state == 3) { log.push("other"); state = 7; }
+                    else if (state == 7) { log.push("join"); return log; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("state=2")
+                && flat.contains("if(state==2)")
+                && flat.contains("while(true)"),
+            "cycle semantics lost: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"loop\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_structures_three_way_branching_join_once() {
+        let source = r#"
+            function f(choice, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) state = choice === 0 ? 2 : choice === 1 ? 3 : 4;
+                    else if (state === 2) { log.push("a"); state = 7; }
+                    else if (state === 3) { log.push("b"); state = 7; }
+                    else if (state === 4) { log.push("c"); state = 7; }
+                    else if (state === 7) { log.push("join"); return [state, log]; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("if(state===7)"),
+            "join should appear once: {}",
+            result.source
+        );
+        for effect in ["a", "b", "c", "join"] {
+            assert_eq!(
+                compact.matches(&format!("log.push(\"{effect}\")")).count(),
+                1,
+                "{}",
+                result.source,
+            );
+        }
+        assert_eq!(
+            compact.matches("return[state,log]").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_structures_nested_branching_dag_without_cloning() {
+        let source = r#"
+            function f(outer, inner, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = outer ? 2 : 3;
+                    else if (state == 2) state = inner ? 4 : 5;
+                    else if (state == 3) { log.push("right"); state = 6; }
+                    else if (state == 4) { { let scoped = "left"; log.push(scoped); } state = 7; }
+                    else if (state == 5) { log.push("middle"); state = 7; }
+                    else if (state == 6) { log.push("detour"); state = 7; }
+                    else if (state == 7) { log.push("join"); return log; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("if(state==7)"),
+            "multi-branch join should be coalesced: {}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("letscoped=\"left\"").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("returnlog;").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_dag_rejects_independent_catch_entry_inside_region() {
+        let source = r#"
+            function f(choice, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = choice === 0 ? 2 : choice === 1 ? 3 : 4;
+                    else if (state == 2) { log.push("a"); state = 7; }
+                    else if (state == 3) { log.push("b"); state = 7; }
+                    else if (state == 4) { log.push("c"); state = 7; }
+                    else if (state == 7) { log.push("join"); return log; }
+                    else if (state == 9) state = 4;
+                } catch (error) { log.push(error.message); state = 9; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("if(state==7)"),
+            "multi-entry join must remain: {}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_dag_rejects_internal_cycle() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = flag ? 2 : 3;
+                    else if (state == 2) { log.push("spin"); state = log.length > 2 ? 7 : 4; }
+                    else if (state == 4) state = 2;
+                    else if (state == 3) { log.push("other"); state = 7; }
+                    else if (state == 7) { log.push("join"); return [state, log]; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("while(true)"),
+            "cyclic region cannot become a DAG: {}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"spin\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_dag_preserves_throwing_intermediate_state() {
+        let source = r#"
+            function f(choice, log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) state = choice === 0 ? 2 : choice === 1 ? 3 : 4;
+                    else if (state == 2) { log.push("a"); state = 7; }
+                    else if (state == 3) { log.push("throw"); throw Error("expected"); state = 7; }
+                    else if (state == 4) { log.push("c"); state = 7; }
+                    else if (state == 7) { log.push("join"); return [state, log]; }
+                } catch (error) { log.push(error.message); return [state, log]; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("if(state==7)"),
+            "shared join not emitted once: {}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"throw\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(compact.contains("throwError("), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_implicit_same_state_catch_retry() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                let attempts = 0, caught = 0;
+                while (true) try {
+                    if (state == 1) state = 2;
+                    else if (state == 2) {
+                        attempts++;
+                        if (attempts == 1) throw Error("retry");
+                        state = 3;
+                    } else if (state == 3) return [state, attempts, caught];
+                } catch (error) { caught++; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            result.source.contains("state == 2") || result.source.contains("state==2"),
+            "catch may retry state 2; its dispatcher case cannot disappear: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_retry_of_intermediate_numeric_write() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                let attempts = 0, caught = 0;
+                while (true) try {
+                    if (state == 1) {
+                        state = 2;
+                        attempts++;
+                        if (attempts == 1) throw Error("retry");
+                        state = 3;
+                    } else if (state == 2) {
+                        return ["resumed-intermediate", state, attempts, caught];
+                    } else if (state == 3) {
+                        return ["normal", state, attempts, caught];
+                    }
+                } catch (error) { caught++; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            result.source.contains("state == 2") || result.source.contains("state==2"),
+            "a throw after state=2 allows implicit catch retry at state 2: {}",
+            result.source
+        );
+        assert!(
+            result.source.contains("resumed-intermediate"),
+            "intermediate exceptional entry must be retained: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_prunes_unobservable_later_write() {
+        let source = r#"
+            function f(log) {
+                let state = 1, caught = 0;
+                while (true) try {
+                    if (state == 1) {
+                        state = 2;
+                        log.push("may-throw");
+                        state = 4;
+                        state = 5;
+                    } else if (state == 2) return ["retry", caught, log];
+                    else if (state == 4) return ["unobservable-post-throw", caught, log];
+                    else if (state == 5) return ["normal", caught, log];
+                } catch (error) { caught++; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            !result.source.contains("unobservable-post-throw"),
+            "state=4 is written only after the last possible throw: {}",
+            result.source
+        );
+        assert!(
+            result.source.contains("retry"),
+            "throw after state=2 must retain the catch-resume case: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_keeps_pre_and_post_write_roots() {
+        let source = r#"
+            function f(log, flag) {
+                let state = 1, caught = 0;
+                while (true) try {
+                    if (state == 1) {
+                        log.push("before");
+                        state = 2;
+                        if (flag) throw Error("after");
+                        state = 4;
+                        state = 5;
+                    } else if (state == 2) return ["retry-after", caught, log];
+                    else if (state == 4) return ["never-at-throw", caught, log];
+                    else if (state == 5) return ["normal", caught, log];
+                } catch (error) { caught++; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("retry-after"),
+            "throw after state=2 must retain that case: {}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("never-at-throw"),
+            "later numeric state is never observable at throw: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_nested_write_falls_back() {
+        let source = r#"
+            function f(log, flag) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        if (flag) state = 4;
+                        log.push("may-throw");
+                        state = 5;
+                    } else if (state == 4) return "nested-write-retry";
+                    else if (state == 5) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("nested-write-retry"),
+            "conditional state write can precede a throw: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_rejects_captured_mutator() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                function changeAndThrow() { state = 4; throw Error("via-closure"); }
+                while (true) try {
+                    if (state == 1) {
+                        state = 2;
+                        changeAndThrow();
+                        state = 4;
+                        state = 5;
+                    } else if (state == 2) return "wrong-retry";
+                    else if (state == 4) return "captured-state-resume";
+                    else if (state == 5) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("captured-state-resume"),
+            "a closure can mutate the state before throwing: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_rejects_destructuring_write() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        state = 2;
+                        [state] = [4];
+                        log.push("may-throw");
+                        state = 4;
+                        state = 5;
+                    } else if (state == 2) return "wrong-retry";
+                    else if (state == 4) return "destructured-state-resume";
+                    else if (state == 5) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("destructured-state-resume"),
+            "destructuring writes cannot use straight-line state-at-throw inference: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_rejects_nested_direct_eval() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                function changeAndThrow() { eval("state = 4; throw Error('eval')"); }
+                while (true) try {
+                    if (state == 1) {
+                        state = 2;
+                        changeAndThrow();
+                        state = 4;
+                        state = 5;
+                    } else if (state == 2) return "wrong-retry";
+                    else if (state == 4) return "eval-state-resume";
+                    else if (state == 5) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("eval-state-resume"),
+            "direct eval in an accessible closure invalidates state confinement: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_preserves_tdz_reads() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                while (true) try {
+                    if (state == 1) {
+                        state = 2;
+                        {
+                            // A lexical reference can throw before initialization.
+                            discarded;
+                            let discarded = 1;
+                        }
+                        state = 4;
+                        state = 5;
+                    } else if (state == 2) return "tdz-catch-resume";
+                    else if (state == 4) return "never";
+                    else if (state == 5) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("tdz-catch-resume"),
+            "a TDZ exception observes the previous numeric state: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_conditional_arms_prune_post_throw_writes() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        state = 2;
+                        if (flag) { state = 4; } else { state = 5; }
+                        log.push("may-throw-after-branch");
+                        state = 6;
+                        state = 7;
+                    } else if (state === 2) return "test-throw-retry";
+                    else if (state === 4) return "left-resume";
+                    else if (state === 5) return "right-resume";
+                    else if (state === 6) return "impossible-after-last-throw";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        for value in ["left-resume", "right-resume", "test-throw-retry"] {
+            assert!(
+                result.source.contains(value),
+                "reachable catch-state case {value} was dropped: {}",
+                result.source
+            );
+        }
+        assert!(
+            !result.source.contains("impossible-after-last-throw"),
+            "the later state=6 cannot be caught: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_conditional_without_else_keeps_entry() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        state = 2;
+                        if (flag) { state = 4; }
+                        log.push("may-throw");
+                        state = 6;
+                        state = 7;
+                    } else if (state === 2) return "unchanged-side-resume";
+                    else if (state === 4) return "changed-side-resume";
+                    else if (state === 6) return "unobservable-post-throw";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("unchanged-side-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("changed-side-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-post-throw"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_test_write_uses_conservative_roots() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        state = 2;
+                        if ((state = 4, flag)) log.push("throw?");
+                        else log.push("also throw?");
+                        state = 5;
+                    } else if (state === 2) return "before-test";
+                    else if (state === 4) return "test-mutated-state-resume";
+                    else if (state === 5) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("test-mutated-state-resume"),
+            "a state write within the test precedes the call that may throw: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_return_arm_has_no_normal_successor() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        state = 2;
+                        if (flag) {
+                            state = 4;
+                            return "early-normal-return";
+                        } else {
+                            state = 5;
+                        }
+                        log.push("after-conditional");
+                        state = 6;
+                        state = 7;
+                    } else if (state === 2) return "test-throw-resume";
+                    else if (state === 4) return "return-expression-throw-resume";
+                    else if (state === 5) return "other-arm-resume";
+                    else if (state === 6) return "unobservable-after-last-throw";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("return-expression-throw-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("other-arm-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-last-throw"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_destructuring_assignment_is_exceptional_entry() {
+        let source = r#"
+            function f() {
+                let state = 1, thrown = 0;
+                while (true) try {
+                    if (state === 1) {
+                        [state] = [4];
+                        if (thrown++ === 0) throw Error("interrupt");
+                        state = 2;
+                    } else if (state === 4) return "destructuring-catch-resume";
+                    else if (state === 2) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("destructuring-catch-resume"),
+            "unmodeled destructuring must not discard a catch-resumable state: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_destructuring_in_catch_is_independent_root() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) throw Error("interrupt");
+                    else if (state === 4) return "catch-destructuring-target";
+                } catch (error) { [state] = [4]; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("catch-destructuring-target"),
+            "the catch's destructured state is independently reachable: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_iteration_target_write_is_exceptional_entry() {
+        let source = r#"
+            function f() {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        for (state of [4]) {}
+                        throw Error("interrupt");
+                    } else if (state === 4) return "loop-target-catch-resume";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("loop-target-catch-resume"),
+            "iteration targets may update state before an exception: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_sequence_prunes_later_write() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        (state = 4, log.push("may-throw"), state = 6);
+                        state = 7;
+                    } else if (state === 4) return "sequence-catch-resume";
+                    else if (state === 6) return "never-at-throw";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("sequence-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("never-at-throw"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_ternary_arms_prune_later_write() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        flag ? (state = 4, log.push("left")) : (state = 5, log.push("right"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "ternary-left-resume";
+                    else if (state === 5) return "ternary-right-resume";
+                    else if (state === 6) return "unobservable-after-ternary";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("ternary-left-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("ternary-right-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-ternary"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_short_circuit_prunes_later_write() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        flag && (state = 4, log.push("maybe"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "short-circuit-catch-resume";
+                    else if (state === 6) return "never-after-short-circuit";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("short-circuit-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("never-after-short-circuit"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_test_sequence_preserves_throw_state() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        if ((state = 4, log.push("test"), flag)) state = 6;
+                        else state = 6;
+                        state = 7;
+                    } else if (state === 4) return "test-sequence-catch-resume";
+                    else if (state === 6) return "unobservable-test-successor";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("test-sequence-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-test-successor"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_return_expression_preserves_catch_state() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) return (state = 4, log.push("return"), "normal");
+                    else if (state === 4) return "return-expression-catch-resume";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("return-expression-catch-resume"),
+            "a call in a return argument may throw after the state assignment: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_computed_assignment_falls_back() {
+        let source = r#"
+            function f(obj) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[state = 4] = obj.throwing;
+                        state = 7;
+                    } else if (state === 4) return "computed-lhs-catch-resume";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("computed-lhs-catch-resume"),
+            "complex computed assignment evaluation must retain exceptional state: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_call_arguments_preserve_order() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        log.push(state = 4, mightThrow(log));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "call-argument-catch-resume";
+                    else if (state === 6) return "unobservable-after-call";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("call-argument-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-call"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_computed_getter_after_key() {
+        let source = r#"
+            function f(obj) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[(state = 4, "dangerous")];
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "getter-catch-resume";
+                    else if (state === 6) return "unobservable-after-getter";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("getter-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-getter"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_method_getter_before_arguments() {
+        let source = r#"
+            function f(obj) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[(state = 4, "fn")](state = 5);
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "getter-before-args-resume";
+                    else if (state === 5) return "invocation-after-args-resume";
+                    else if (state === 6) return "unobservable-after-invocation";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("getter-before-args-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("invocation-after-args-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-invocation"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_constructor_arguments() {
+        let source = r#"
+            function f(Constructor, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        new Constructor(state = 4, log.push("ctor"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "constructor-catch-resume";
+                    else if (state === 6) return "unobservable-after-constructor";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("constructor-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-constructor"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_computed_assignment_lhs_before_rhs() {
+        let source = r#"
+            function f(obj, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[(state = 4, "prop")] = log.push("setter");
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "setter-catch-resume";
+                    else if (state === 6) return "unobservable-after-setter";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("setter-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-setter"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_spread_iteration_after_write() {
+        let source = r#"
+            function f(fn, iterator) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        fn(...(state = 4, iterator));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "spread-catch-resume";
+                    else if (state === 6) return "unobservable-after-spread";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("spread-catch-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unobservable-after-spread"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_optional_call_keeps_skipped_argument() {
+        let source = r#"
+            function f(fn, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        fn?.(state = 4, log.push("maybe"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "optional-call-catch-resume";
+                    else if (state === 6) return "potential-successor";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("optional-call-catch-resume"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_binary_left_before_right() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        (state = 4, 7) + log.push("possible throw");
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "binary-left-catch";
+                    else if (state === 6) return "binary-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("binary-left-catch"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("binary-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_binary_coercion_after_right() {
+        let source = r#"
+            function f(value) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        (state = 4, value) + (state = 5, 1);
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "binary-right-evaluation";
+                    else if (state === 5) return "binary-coercion-catch";
+                    else if (state === 6) return "binary-unobservable-after-operator";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("binary-coercion-catch"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("binary-unobservable-after-operator"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_binary_in_operator_checks_right() {
+        let source = r#"
+            function f(target) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        "key" in (state = 4, target);
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "in-right-catch";
+                    else if (state === 6) return "in-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("in-right-catch"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("in-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_array_element_order() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        [state = 4, log.push("may throw"), state = 6];
+                        state = 7;
+                    } else if (state === 4) return "array-element-catch";
+                    else if (state === 6) return "array-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("array-element-catch"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("array-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_array_spread_iterator_throw() {
+        let source = r#"
+            function f(iterator) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        [...(state = 4, iterator), state = 6];
+                        state = 7;
+                    } else if (state === 4) return "spread-iterator-catch";
+                    else if (state === 6) return "spread-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("spread-iterator-catch"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("spread-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_array_elision_does_not_shift_state() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        [,, state = 4, log.push("may throw")];
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "array-elision-catch";
+                    else if (state === 6) return "array-elision-unobservable";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("array-elision-catch"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("array-elision-unobservable"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_object_computed_key() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        ({[(state = 4, "key")]: log.push("value")});
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "object-computed-key-resume";
+                    else if (state === 6) return "object-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("object-computed-key-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("object-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_object_key_coercion_before_value() {
+        let source = r#"
+            function f(key, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        ({[(state = 4, key)]: (state = 5, log.push("value"))});
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "coercion-before-value-resume";
+                    else if (state === 5) return "value-after-coercion-resume";
+                    else if (state === 6) return "object-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("coercion-before-value-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("value-after-coercion-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("object-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_object_value_order() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        ({a: state = 4, b: log.push("may throw"), c: state = 6});
+                        state = 7;
+                    } else if (state === 4) return "object-value-resume";
+                    else if (state === 6) return "object-unobservable-after-value";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("object-value-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("object-unobservable-after-value"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_object_spread_getter() {
+        let source = r#"
+            function f(source) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        ({... (state = 4, source), following: state = 6});
+                        state = 7;
+                    } else if (state === 4) return "object-spread-getter-resume";
+                    else if (state === 6) return "object-unobservable-after-spread";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("object-spread-getter-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("object-unobservable-after-spread"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_object_computed_method_key() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        ({[(state = 4, "method")]() {return 42;}, x: log.push("may throw")});
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "object-method-key-resume";
+                    else if (state === 6) return "object-unobservable-after-method";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("object-method-key-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("object-unobservable-after-method"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_object_unknown_key_write_fallback() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        ({[(state += 3, "key")]: log.push("may throw")});
+                        state = 7;
+                    } else if (state === 4) return "object-unknown-write-resume";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("object-unknown-write-resume"),
+            "unknown compound writes must not delete catch-state roots: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_unary_operand_before_operation() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        +(state = 4, log.push("possible throw"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "unary-operand-resume";
+                    else if (state === 6) return "unary-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("unary-operand-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unary-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_unary_coercion_after_state_write() {
+        let source = r#"
+            function f(value) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        +(state = 4, value);
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "unary-conversion-resume";
+                    else if (state === 6) return "unary-unobservable-after-coercion";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("unary-conversion-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("unary-unobservable-after-coercion"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_unary_delete_proxy_trap() {
+        let source = r#"
+            function f(obj) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        delete obj[(state = 4, "key")];
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "delete-proxy-resume";
+                    else if (state === 6) return "delete-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("delete-proxy-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("delete-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_template_coercion_between_substitutions() {
+        let source = r#"
+            function f(value, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        `first ${(state = 4, value)} second ${(state = 5, log.push("later"))}`;
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "template-first-coercion-resume";
+                    else if (state === 5) return "template-second-resume";
+                    else if (state === 6) return "template-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("template-first-coercion-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("template-second-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("template-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_template_symbol_conversion() {
+        let source = r#"
+            function f(value) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        `conversion: ${(state = 4, value)}`;
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "template-symbol-resume";
+                    else if (state === 6) return "template-unobservable-after-symbol";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("template-symbol-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("template-unobservable-after-symbol"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_tagged_template_getter_before_substitutions() {
+        let source = r#"
+            function f(obj) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[(state = 4, "tag")]`sub ${(state = 5, 10)}`;
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "tag-getter-resume";
+                    else if (state === 5) return "tag-call-resume";
+                    else if (state === 6) return "tag-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("tag-getter-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("tag-call-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("tag-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_tagged_template_throwing_substitution() {
+        let source = r#"
+            function f(tag, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        tag`first ${(state = 4, log.push("may throw"))} second ${(state = 5, 2)}`;
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "tag-substitution-resume";
+                    else if (state === 5) return "tag-invocation-resume";
+                    else if (state === 6) return "tag-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("tag-substitution-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("tag-invocation-resume"),
+            "{}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("tag-unobservable-later"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_throw_boundary_unary_unknown_write_fallback() {
+        let source = r#"
+            function f(value) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        +(state += 3, value);
+                        state = 7;
+                    } else if (state === 4) return "unary-compound-resume";
+                    else if (state === 7) return "normal";
+                } catch (error) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("unary-compound-resume"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_ordered_assignment_update_optional_chain_cases() {
+        let cases: &[(&str, &str, &str, Option<&str>, &str)] = &[
+            (
+                "property-compound",
+                r#"function f(obj, log) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj[(state = 4, "x")] += log.push("may throw");
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "compound-key-resume";
+                        else if (state === 6) return "compound-unobservable-later";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "compound-key-resume",
+                None,
+                "compound-unobservable-later",
+            ),
+            (
+                "property-logical",
+                r#"function f(obj, log) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj[(state = 4, "x")] ||= (state = 5, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "logical-getter-resume";
+                        else if (state === 5) return "logical-rhs-resume";
+                        else if (state === 6) return "logical-unobservable-later";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "logical-getter-resume",
+                Some("logical-rhs-resume"),
+                "logical-unobservable-later",
+            ),
+            (
+                "property-nullish",
+                r#"function f(obj, log) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj[(state = 4, "x")] ??= (state = 5, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "nullish-getter-resume";
+                        else if (state === 5) return "nullish-rhs-resume";
+                        else if (state === 6) return "nullish-unobservable-later";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "nullish-getter-resume",
+                Some("nullish-rhs-resume"),
+                "nullish-unobservable-later",
+            ),
+            (
+                "other-identifier-rhs",
+                r#"function f(log) {
+                    let state = 1;
+                    let other;
+                    while (true) try {
+                        if (state === 1) {
+                            other = (state = 4, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "identifier-rhs-resume";
+                        else if (state === 6) return "identifier-unobservable-later";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "identifier-rhs-resume",
+                None,
+                "identifier-unobservable-later",
+            ),
+            (
+                "other-identifier-logical",
+                r#"function f(log, truthy) {
+                    let state = 1;
+                    let other = truthy;
+                    while (true) try {
+                        if (state === 1) {
+                            other &&= (state = 4, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "identifier-logical-rhs-resume";
+                        else if (state === 6) return "identifier-logical-unobservable";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "identifier-logical-rhs-resume",
+                None,
+                "identifier-logical-unobservable",
+            ),
+            (
+                "computed-property-update",
+                r#"function f(obj) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj[(state = 4, "x")]++;
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "update-member-resume";
+                        else if (state === 6) return "update-unobservable-later";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "update-member-resume",
+                None,
+                "update-unobservable-later",
+            ),
+            (
+                "optional-computed-member",
+                r#"function f(obj) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj?.[(state = 4, "x")];
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "optional-computed-resume";
+                        else if (state === 6) return "optional-unobservable-later";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "optional-computed-resume",
+                None,
+                "optional-unobservable-later",
+            ),
+            (
+                "optional-call-argument",
+                r#"function f(fn, log) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            fn?.(state = 4, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "optional-call-resume";
+                        else if (state === 6) return "optional-call-unobservable";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "optional-call-resume",
+                None,
+                "optional-call-unobservable",
+            ),
+            (
+                "nested-optional-call",
+                r#"function f(obj, log) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj?.[(state = 4, "child")].method(state = 5, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "nested-optional-getter-resume";
+                        else if (state === 5) return "nested-optional-call-resume";
+                        else if (state === 6) return "nested-optional-unobservable";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "nested-optional-getter-resume",
+                Some("nested-optional-call-resume"),
+                "nested-optional-unobservable",
+            ),
+            (
+                "optional-computed-call",
+                r#"function f(obj, log) {
+                    let state = 1;
+                    while (true) try {
+                        if (state === 1) {
+                            obj?.[(state = 4, "method")]?.(state = 5, log.push("may throw"));
+                            state = 6;
+                            state = 7;
+                        } else if (state === 4) return "optional-method-getter-resume";
+                        else if (state === 5) return "optional-method-argument-resume";
+                        else if (state === 6) return "optional-method-unobservable";
+                        else if (state === 7) return "normal";
+                    } catch (e) {}
+                }"#,
+                "optional-method-getter-resume",
+                Some("optional-method-argument-resume"),
+                "optional-method-unobservable",
+            ),
+        ];
+        for (case, source, first_catch, second_catch, unobservable) in cases {
+            let Some(result) = deobfuscate(source, 12) else {
+                unreachable!("valid source for case {case}")
+            };
+            assert!(
+                result.source.contains(first_catch),
+                "missing first catch root in {case}: {}",
+                result.source
+            );
+            if let Some(second_catch) = second_catch {
+                assert!(
+                    result.source.contains(second_catch),
+                    "missing second catch root in {case}: {}",
+                    result.source
+                );
+            }
+            assert!(
+                !result.source.contains(unobservable),
+                "retained a post-throw unreachable root in {case}: {}",
+                result.source
+            );
+        }
+    }
+
+    #[test]
+    fn exception_dispatcher_update_of_state_binding_still_falls_back() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        state++;
+                        log.push("may throw");
+                        state = 7;
+                    } else if (state === 2) return "update-dispatcher-resume";
+                    else if (state === 7) return "normal";
+                } catch (e) {}
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("update-dispatcher-resume"),
+            "an update to the dispatch binding is not a proved numeric assignment: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_const_write_does_not_advance_catch_state() {
+        let source = r#"
+            function f() {
+                const state = 1;
+                let caught = 0;
+                while (true) try {
+                    if (state === 1) {
+                        state = 4;
+                    } else if (state === 4) return "wrong-destination";
+                } catch (error) {
+                    if (++caught === 2) return ["const-write-retry", error.name, caught];
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("const-write-retry"),
+            "assignment to an immutable state must still throw into catch: {}",
+            result.source
+        );
+        assert!(
+            !result.source.contains("return \"wrong-destination\""),
+            "a const state never commits a numeric successor: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_domain_allows_effectful_merge() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                let selector = 46;
+                while (true) try {
+                    if (state == 1) { if (flag) selector = 92; state = 2; }
+                    else if (state == 2) { log.push("effect"); state = 3; }
+                    else if (state == 3) return [state, log];
+                } catch (error) {
+                    if (selector === 46) throw error;
+                    if (selector == 92) { state = 3; }
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("syntactically valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !flat.contains("if(state==2)"),
+            "finite exhaustive catch must permit unique successor merge: {}",
+            result.source
+        );
+        assert_eq!(
+            flat.matches("log.push(\"effect\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_domain_rejects_unhandled_value() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                let selector = 46;
+                while (true) try {
+                    if (state == 1) { selector = flag ? 13 : 92; state = 2; }
+                    else if (state == 2) { log.push("effect"); state = 3; }
+                    else if (state == 3) return [state, log];
+                } catch (error) {
+                    if (selector === 46) throw error;
+                    if (selector == 92) { state = 3; }
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("syntactically valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==2)"),
+            "unhandled 13 permits same-state catch retry: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_domain_rejects_selector_mutation_in_catch() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                let selector = 46;
+                while (true) try {
+                    if (state == 1) { selector = flag ? 92 : 46; state = 2; }
+                    else if (state == 2) { log.push("effect"); state = 3; }
+                    else if (state == 3) return [state, log];
+                } catch (error) {
+                    selector = 13;
+                    if (selector == 46) throw error;
+                    if (selector == 92) { state = 3; }
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("syntactically valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==2)"),
+            "catch can overwrite selector before comparing: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_domain_rejects_unknown_outside_write() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                let selector = 46;
+                function overwrite() { selector = 13; }
+                while (true) try {
+                    if (state == 1) { if (flag) selector = 92; state = 2; }
+                    else if (state == 2) { log.push("effect"); state = 3; }
+                    else if (state == 3) return [state, log];
+                } catch (error) {
+                    if (selector == 46) throw error;
+                    if (selector == 92) { state = 3; }
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("syntactically valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==2)"),
+            "external lexical write breaks finite-domain proof: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_rejects_captured_selector_mutator() {
+        let source = r#"
+            function f(log) {
+                let state = 1;
+                let selector = 46;
+                let change;
+                let attempts = 0;
+                while (true) try {
+                    if (state == 1) {
+                        change = () => { selector = 46; };
+                        selector = 92;
+                        state = 2;
+                    } else if (state == 2) {
+                        log.push("effect");
+                        if (attempts++ == 0) throw Error("retry");
+                        state = 3;
+                    } else if (state == 3) return [state, selector, attempts, log];
+                } catch (error) {
+                    if (selector == 46) throw error;
+                    change();
+                    if (selector == 92) { state = 3; }
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("syntactically valid source")
+        };
+        let flat: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("if(state==2)"),
+            "captured selector mutation must retain catch retry entry: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_handles_short_circuit_sequence() {
+        let source = r#"
+            function f(flag, log, selector, state, observed) {
+                state = 1;
+                {
+                    selector = 46;
+                    while (true) try {
+                        if (state == 1) { if (flag) selector = 92; state = 2; }
+                        else if (state == 2) { log.push("effect"); state = 3; }
+                        else if (state == 3) return [state, observed, log];
+                    } catch (error) {
+                        if (selector == 46) throw error;
+                        selector == 92 && (observed = error.message, state = 3);
+                    }
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid input");
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("if(state==2)"),
+            "finite exhaustive catch with short-circuit assignment should allow a unique-region merge: {}",
+            result.source,
+        );
+        assert_eq!(
+            compact.matches("log.push(\"effect\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_finite_catch_preserves_nonexecuted_short_circuit_write() {
+        let source = r#"
+            function f(flag, log) {
+                let state = 1;
+                let selector = 46;
+                while (true) try {
+                    if (state == 1) { if (flag) selector = 92; state = 2; }
+                    else if (state == 2) { log.push("effect"); state = 3; }
+                    else if (state == 3) return [state, log];
+                } catch (error) {
+                    if (selector == 46) throw error;
+                    selector == 92 || (state = 3);
+                }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid input");
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("if(state==2)"),
+            "true || must NOT be treated as executing the state assignment: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_absorbs_unique_backedge_arm() {
+        let source = r#"
+            function f(limit, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state == 1) state = count < limit ? 2 : 3;
+                    else if (state == 2) { log.push(count); count++; state = 1; }
+                    else if (state == 3) return [count, log];
+                } catch (error) { throw error; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("if(state==2)else") && !compact.contains("elseif(state==2)"),
+            "unique loop-side case must be absorbed: {}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(count)").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(
+            compact.contains("state=1"),
+            "backedge write must remain: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_absorbs_two_hop_backedge_with_throw() {
+        let source = r#"
+            function f(limit, abort, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state === 1) state = count < limit ? 2 : 3;
+                    else if (state === 2) { log.push("side"); state = 4; }
+                    else if (state === 4) {
+                        log.push("tail");
+                        if (abort) throw Error("expected");
+                        count++;
+                        state = 1;
+                    } else if (state === 3) return [state, count, log];
+                } catch (error) { return [state, error.message, log]; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("elseif(state===2)") && !compact.contains("elseif(state===4)"),
+            "single-entry two-hop backedge should be absorbed: {}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"side\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            compact.matches("log.push(\"tail\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(
+            compact.contains("state=1"),
+            "original backedge lost: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_absorbs_branching_reconvergent_backedge_once() {
+        let source = r#"
+            function f(limit, choose, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state === 1) state = count < limit ? 2 : 3;
+                    else if (state === 2) {
+                        log.push("branch");
+                        state = ((count + choose) % 2) ? 4 : 5;
+                    }
+                    else if (state === 4) { log.push("left"); state = 6; }
+                    else if (state === 5) { log.push("right"); state = 6; }
+                    else if (state === 6) {
+                        log.push("join");
+                        count++;
+                        state = 1;
+                    }
+                    else if (state === 3) return [count, log];
+                } catch (error) { return [state, error.message, log]; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for label in [2, 4, 5, 6] {
+            assert!(
+                !compact.contains(&format!("elseif(state==={label})")),
+                "side case {label} should be absorbed: {}",
+                result.source
+            );
+        }
+        for effect in ["branch", "left", "right", "join"] {
+            assert_eq!(
+                compact.matches(&format!("log.push(\"{effect}\")")).count(),
+                1,
+                "source effect {effect} should appear exactly once: {}",
+                result.source
+            );
+        }
+        assert!(compact.contains("state=1"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_rejects_independent_catch_entry_at_shared_join() {
+        let source = r#"
+            function f(limit, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state === 1) state = count < limit ? 2 : 3;
+                    else if (state === 2) state = count % 2 ? 4 : 5;
+                    else if (state === 4) { log.push("left"); state = 6; }
+                    else if (state === 5) { log.push("right"); state = 6; }
+                    else if (state === 6) { count++; state = 1; }
+                    else if (state === 3) return [count, log];
+                } catch (error) { state = 6; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("elseif(state===6)"),
+            "catch can independently resume at shared join: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_rejects_nested_side_cycle() {
+        let source = r#"
+            function f(limit, spin, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state === 1) state = count < limit ? 2 : 3;
+                    else if (state === 2) state = 4;
+                    else if (state === 4) state = spin() ? 5 : 6;
+                    else if (state === 5) { log.push("again"); state = 4; }
+                    else if (state === 6) { count++; state = 1; }
+                    else if (state === 3) return [count, log];
+                } catch (error) { throw error; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("elseif(state===5)"),
+            "side cycle must remain distinct: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_absorbs_split_backedges_to_header() {
+        // Both branch arms jump directly to the header. There is no
+        // internal side join for the earlier diamond/DAG passes to recover.
+        let source = r#"
+            function f(limit, choose, abort, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state === 1) state = count < limit ? 2 : 3;
+                    else if (state === 2) {
+                        log.push("fork");
+                        state = ((count + choose) % 2) ? 4 : 5;
+                    }
+                    else if (state === 4) {
+                        log.push("left");
+                        if (abort && count === 1) throw Error("interrupted-left");
+                        count++;
+                        state = 1;
+                    }
+                    else if (state === 5) {
+                        log.push("right");
+                        if (abort && count === 1) throw Error("interrupted-right");
+                        count++;
+                        state = 1;
+                    }
+                    else if (state === 3) return [count, log];
+                } catch (error) { return [state, error.message, log]; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for label in [2, 4, 5] {
+            assert!(
+                !compact.contains(&format!("elseif(state==={label})")),
+                "branch-side {label} should be recovered: {}",
+                result.source
+            );
+        }
+        for effect in ["fork", "left", "right"] {
+            assert_eq!(
+                compact.matches(&format!("log.push(\"{effect}\")")).count(),
+                1,
+                "effect {effect} should occur once in the emitted source: {}",
+                result.source
+            );
+        }
+        assert!(
+            compact.contains("state=1"),
+            "backedge lost: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_rejects_catch_root_into_backedge_arm() {
+        let source = r#"
+            function f(limit, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state == 1) state = count < limit ? 2 : 3;
+                    else if (state == 2) { log.push(count); count++; state = 1; }
+                    else if (state == 3) return [count, log];
+                } catch (error) { state = 2; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("if(state==2)"),
+            "independent catch entry into cyclic side cannot be absorbed: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_rejects_irreducible_second_entry() {
+        let source = r#"
+            function f(limit, log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state == 1) state = count < limit ? 2 : 3;
+                    else if (state == 2) { log.push(count); count++; state = 1; }
+                    else if (state == 3) return [count, log];
+                    else if (state == 4) state = 2;
+                } catch (error) { state = 4; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("if(state==2)"),
+            "external path from state 4 makes the cycle multi-entry: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_multi_declarator_initializer_tracks_later_write() {
+        let source = r#"
+            function f(log) {
+                let state = 1, other = (state = 2);
+                while (true) try {
+                    if (state == 1) { log.push("wrong"); return log; }
+                    else if (state == 2) { log.push("correct"); return log; }
+                } catch (error) { throw error; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        assert!(
+            result.source.contains("state == 2") || result.source.contains("state==2"),
+            "later declarator writes state; the earlier initializer is not a reaching value: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_multi_declarator_initializer_in_second_position() {
+        let source = r#"
+            function f(limit, log) {
+                let count = 0, state = 1;
+                while (true) try {
+                    if (state == 1) state = count < limit ? 2 : 3;
+                    else if (state == 2) { log.push(count); count++; state = 1; }
+                    else if (state == 3) return [count, log];
+                } catch (error) { throw error; }
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source")
+        };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !compact.contains("elseif(state==2)"),
+            "numeric initializer in any declarator position must be available: {}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_handles_inert_array_literal_loop_test() {
+        let source = r#"
+            function f(flag) {
+                let state=1;
+                while(![""]==0) try {
+                    if(state==99) return "unreachable";
+                    else if(state==1) state=flag?2:3;
+                    else if(state==2) return "two";
+                    else if(state==3) return "three";
+                } catch(error) { state=3; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert_eq!(
+            result.transforms.get("exception_state_pruned"),
+            Some(&1),
+            "{result:?}"
+        );
+        assert!(!result.source.contains("unreachable"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_preserves_destructured_var_hoists_from_dead_states() {
+        let source = r#"
+            const shadowed = "outer";
+            function f() {
+                let state=1;
+                while(true) try {
+                    if(state==99) {
+                        var {shadowed, spare} = {shadowed:"inner", spare:42};
+                        state=2;
+                    } else if(state==1) return [typeof shadowed, typeof spare];
+                } catch(error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert_eq!(
+            result.transforms.get("exception_state_pruned"),
+            Some(&1),
+            "{result:?}"
+        );
+        assert!(!result.source.contains("state==99"), "{}", result.source);
+        assert!(
+            result.source.contains("var shadowed, spare;"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_refuses_unknown_reachable_transitions() {
+        let source = r#"
+            function f(value) {
+                let state=1;
+                let other=0;
+                while(true) try {
+                    if(state==1) state=value;
+                    else if(state==2) return 2;
+                    else if(state==3) return 3;
+                } catch(error) {
+                    other++;
+                    state=3;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            !result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_refuses_loop_condition_that_mutates_state() {
+        let source = r#"
+            function f(log) {
+                let state=1;
+                while((state=99,true)) try {
+                    if(state==1) return "initial";
+                    else if(state==99) return "condition";
+                    else if(state==2) return "other";
+                } catch(error) { state=2; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            !result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+        assert!(result.source.contains("state==99"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_refuses_effectful_property_read_in_condition() {
+        let source = r#"
+            function f(guard) {
+                let state=1;
+                while(guard.enabled) try {
+                    if(state==1) state=2;
+                    else if(state==2) return 2;
+                    else if(state==99) return 99;
+                } catch(error) { state=2; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            !result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_refuses_dynamic_catch_state() {
+        let source = r#"
+            function f(value) {
+                let state=1;
+                let other=0;
+                while(true) try {
+                    if(state==1) throw Error("x");
+                    else if(state==2) return 2;
+                    else if(state==3) return 3;
+                } catch(error) {
+                    other++;
+                    state=value;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            !result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn numeric_state_proofs_ignore_unrelated_eval_and_literal_arguments_text() {
+        let fixtures = [
+            // A direct eval in another function cannot observe this helper's
+            // unreferenced local variable.
+            "function unrelated(x){return eval(x);}function healthy(){let dead=0;dead=5;return 1;}",
+            // An occurrence in string content is not an arguments reference.
+            "function unrelated(){return 'arguments';}function healthy(){let dead=0;dead=5;return 1;}",
+            // A nested ordinary function owns its own arguments object.
+            "function healthy(){let dead=0;function inner(){return arguments[0];}dead=5;return 1;}",
+        ];
+        for source in fixtures {
+            let result = deobfuscate(source, 12);
+            assert!(result.is_some(), "fixture not recovered: {source}");
+            let Some(output) = result else {
+                unreachable!();
+            };
+            assert!(
+                output
+                    .transforms
+                    .get("dead_numeric_state_write")
+                    .is_some_and(|count| *count >= 1),
+                "{source} -> {} {:#?}",
+                output.source,
+                output.transforms
+            );
+            assert!(!output.source.contains("dead=5"), "{}", output.source);
+        }
+    }
+
+    #[test]
+    fn numeric_state_proofs_keep_writes_visible_to_eval_and_mapped_arguments() {
+        let fixtures = [
+            "function f(x){x=5;eval('x');return 1;}",
+            "function f(x){x=5;arguments[0];return 1;}",
+            "function f(x){const change=()=>eval('x');x=5;return change();}",
+            "function f(x){const nested=()=>arguments[0];x=5;return nested();}",
+            // An ancestor direct eval may inspect a local written by a
+            // nested ordinary function, even without a static identifier read.
+            "function outer(){let state=0;function inner(){state=5;}inner();return eval('state');}",
+        ];
+        for source in fixtures {
+            let result = deobfuscate(source, 12);
+            assert!(result.is_some(), "fixture not recovered: {source}");
+            let Some(output) = result else {
+                unreachable!();
+            };
+            assert!(
+                !output.transforms.contains_key("dead_numeric_state_write"),
+                "{source} -> {} {:#?}",
+                output.source,
+                output.transforms
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_state_proofs_keep_independent_sibling_function_regions() {
+        let source = r#"
+            function outer(){
+                function risky(x){arguments[0]=3;x=5;}
+                function healthy(){let dead=0;dead=5;return 1;}
+                return healthy();
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else {
+            unreachable!();
+        };
+        assert_eq!(
+            result.transforms.get("dead_numeric_state_write"),
+            Some(&1),
+            "{result:?}"
+        );
+        assert!(!result.source.contains("dead=5"), "{}", result.source);
+    }
+
+    #[test]
+    fn reaching_numeric_state_proof_recovers_sibling_locals_despite_unrelated_eval() {
+        let fixtures = [
+            // A direct eval in a sibling marks the enclosing function unsafe,
+            // but it cannot inspect the named child's own parameter.
+            r#"function outer(log) {
+                const dynamic = function(input) { return eval(input); };
+                const healthy = function(state, counter) {
+                    state = 40;
+                    log("initialized");
+                    while (state != 29) {
+                        if (state == 40) { counter = 2; state = 9; }
+                        else if (state == 9) state = counter-- ? 7 : 26;
+                        else if (state == 7) { log("item"); state = 9; }
+                        else if (state == 26) { log("done"); state = 29; }
+                    }
+                    return counter;
+                };
+                return healthy;
+            }"#,
+            // The binding may also belong to a block nested in that child,
+            // provided it does not cross a function boundary.
+            r#"function outer(log) {
+                function dynamic(input) { return eval(input); }
+                function healthy(counter) {
+                    { let state = 40;
+                      log("initialized");
+                      while (state != 29) {
+                          if (state == 40) { counter = 2; state = 9; }
+                          else if (state == 9) state = counter-- ? 7 : 26;
+                          else if (state == 7) { log("item"); state = 9; }
+                          else if (state == 26) { log("done"); state = 29; }
+                      }
+                    }
+                    return counter;
+                }
+                return healthy;
+            }"#,
+        ];
+        for source in fixtures {
+            let result = deobfuscate(source, 12);
+            assert!(result.is_some(), "source must be parseable: {source}");
+            let Some(output) = result else {
+                continue;
+            };
+            assert!(
+                output
+                    .transforms
+                    .get("if_ladder_structured")
+                    .is_some_and(|count| *count >= 1),
+                "{} {:#?}",
+                output.source,
+                output.transforms
+            );
+            assert!(
+                !output.source.contains("while (state != 29)"),
+                "{}",
+                output.source
+            );
+            assert!(
+                output
+                    .transforms
+                    .get("dead_numeric_state_write")
+                    .is_some_and(|count| *count >= 1),
+                "owned dispatcher writes should also disappear: {} {:#?}",
+                output.source,
+                output.transforms
+            );
+            assert!(output.source.contains("eval(input)"), "{}", output.source);
+            assert!(output.source.contains("log(\"item\")"), "{}", output.source);
+        }
+    }
+
+    #[test]
+    fn reaching_numeric_state_proof_keeps_eval_visible_captured_and_aliased_state() {
+        let dispatcher = r#"while(state!=29){
+              if(state==40) state=26;
+              else if(state==26) state=29;
+           }"#;
+        for source in [
+            format!(
+                "function outer(log){{let state=0;function risky(){{return eval('state');}}function child(){{state=40;log();{dispatcher}}}return child;}}"
+            ),
+            format!(
+                "function outer(log){{function child(state){{state=40;log();eval('state=26');{dispatcher}}}return child;}}"
+            ),
+            format!(
+                "function outer(log){{function child(state){{state=40;log();arguments[0]=26;{dispatcher}}}return child;}}"
+            ),
+            format!(
+                "function outer(log){{function child(state){{state=40;log();const nested=()=>eval('state');{dispatcher}}}return child;}}"
+            ),
+        ] {
+            let result = deobfuscate(&source, 12);
+            assert!(result.is_some(), "source must be parseable: {source}");
+            let Some(output) = result else {
+                continue;
+            };
+            assert!(
+                !output.transforms.contains_key("if_ladder_structured"),
+                "unsafe state got reconstructed: {} {:#?}",
+                output.source,
+                output.transforms
+            );
+            assert!(output.source.contains("while(state!=29)"), "{}", output.source);
+        }
+    }
+
+    #[test]
+    fn eliminates_only_standalone_empty_blocks_after_deobfuscation() {
+        let input = "function recovered(flag){ {} { {} } {}; if(flag) {} else {}                     for(;flag;) {} label: {} return 7; }";
+        let result = deobfuscate(input, 12);
+        assert!(result.is_some(), "fixture should be valid JavaScript");
+        let Some(output) = result else {
+            unreachable!();
+        };
+        assert!(!output.source.contains("{} {"), "{}", output.source);
+        assert!(!output.source.contains("{ {} }"), "{}", output.source);
+        // Branches and labelled bodies are not anonymous direct statements;
+        // their meaning must not be changed by a blanket brace stripper.
+        // The preexisting empty-if simplifier evaluates flag once;
+        // an empty loop/label body is NOT a removable standalone block.
+        assert!(output.source.contains("(flag);"), "{}", output.source);
+        assert!(
+            output.source.contains("for(;flag;) {}"),
+            "{}",
+            output.source
+        );
+        assert!(output.source.contains("label: {}"), "{}", output.source);
+        assert!(
+            output
+                .transforms
+                .get("remove_empty_block_statement")
+                .copied()
+                .unwrap_or_default()
+                >= 2,
+            "{:?}",
+            output.transforms
+        );
+    }
+
+    #[test]
+    fn flattens_unnecessary_nested_blocks_with_real_effects() {
+        let input = "function recovered(x){ { { x+=1; } x*=2; } return x; }";
+        let result = deobfuscate(input, 12);
+        assert!(result.is_some());
+        let Some(output) = result else {
+            unreachable!();
+        };
+        assert!(!output.source.contains("{ {"), "{}", output.source);
+        assert!(output.source.contains("x+=1"), "{}", output.source);
+        assert!(output.source.contains("x*=2"), "{}", output.source);
+        assert_eq!(output.transforms.get("flatten_redundant_block"), Some(&2));
+    }
+
+    #[test]
+    fn retains_lexical_scopes_directives_and_control_flow_blocks() {
+        let fixtures = [
+            "function f(){let x=3;{let x=4;run(x);}return x;}",
+            "function f(){let x=3;{const y=4;run(y);}return x;}",
+            "function f(){ {class C{};run(C);}return 1;}",
+            "function f(){ {function inner(){return globalThis.value;} inner.tag=1; run(inner);}return 2;}",
+            "function f(){ {\"use strict\";return this;} }",
+            "function f(x){if(x){return 1;}else{return 2;}}",
+            "function f(x){while(x){x--;}}",
+            "function f(){label:{run();break label;}}",
+            "function f(){try{run();}catch(e){throw e;}}",
+        ];
+        for input in fixtures {
+            let result = deobfuscate(input, 12);
+            assert!(result.is_some(), "{input}");
+            let Some(output) = result else {
+                unreachable!();
+            };
+            assert_eq!(
+                output.transforms.get("flatten_redundant_block"),
+                None,
+                "{input} -> {}",
+                output.source
+            );
+        }
+    }
+
+    #[test]
+    fn permits_var_hoisting_and_direct_break_targets_after_block_flattening() {
+        let input = "function f(flag){var count=0;while(true){{var x=++count;if(flag)break;}break;}return [x,count];}";
+        let result = deobfuscate(input, 12);
+        assert!(result.is_some());
+        let Some(output) = result else {
+            unreachable!();
+        };
+        assert!(output.source.contains("var x=++count"), "{}", output.source);
+        assert!(output.source.contains("if(flag)break"), "{}", output.source);
+        assert!(
+            output
+                .transforms
+                .get("flatten_redundant_block")
+                .copied()
+                .unwrap_or_default()
+                >= 1
+        );
     }
 
     #[test]
