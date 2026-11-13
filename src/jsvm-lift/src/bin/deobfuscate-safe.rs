@@ -142,6 +142,11 @@ struct SourceTreeArgs {
     /// Materializes lexical helper implementations alongside the readable tree.
     #[arg(long)]
     context_source: Option<PathBuf>,
+    /// Optional fixed-point cap for additionally reconstructing the entire
+    /// enclosing lexical program before extracting a second set of helpers.
+    /// Retains the original context and captured files unchanged.
+    #[arg(long, requires = "context_source")]
+    context_full_iterations: Option<usize>,
     /// Raw original source, byte-for-byte matching source hashes and spans
     /// in captured-handler provenance headers. Pretty-printed source does
     /// not have the same offsets and must not be substituted here.
@@ -270,6 +275,83 @@ fn polish_lexical_helper_view(
         guarded_return_joins,
         post_return_error,
     })
+}
+
+/// Derive a full-lexical-context view, retaining original symbol identities
+/// while lowering large expressions. All derived offsets belong to the
+/// transformed readable program, never the separately preserved original.
+fn materialize_full_lexical_context(
+    original: &str,
+    source_inputs: &[(String, String)],
+    folder: &Path,
+    iterations: usize,
+    source_mode: SourceMode,
+    budgets: &AnalysisBudgets,
+) -> Result<serde_json::Value> {
+    anyhow::ensure!(
+        iterations > 0,
+        "context full iteration cap must be positive"
+    );
+    let budget = budgets.operation(
+        AnalysisOperation::SafeDeobfuscation,
+        "full original lexical context",
+    );
+    let outcome = deobfuscate_source(
+        original,
+        "original lexical context",
+        source_mode,
+        iterations,
+        true,
+        &budget,
+    )?;
+    anyhow::ensure!(
+        outcome.report.analysis_complete && outcome.report.iterations < iterations,
+        "full lexical context did not reach a validated fixed point within {iterations} iterations",
+    );
+    let alternate = reconstruct_context(&outcome.source, source_inputs)?;
+    let directory = folder.join("whole-program");
+    fs::create_dir_all(directory.join("helpers"))?;
+    let file_name = format!("readable{}", source_mode.suffix());
+    fs::write(directory.join(&file_name), &outcome.source)?;
+    let mut report = serde_json::to_string_pretty(&outcome.report)?;
+    report.push(char::from(10));
+    fs::write(directory.join("reconstruction.json"), report)?;
+    let mut index = String::from(concat!(
+        "# Full-program lexical reconstruction\n\n",
+        "A separate proof-checked analyst view of the entire original ",
+        "lexical program, followed by extraction of its helper definitions. ",
+        "Whole-program semantic resolution can structure operations that ",
+        "isolated helper views cannot justify.\n\n",
+        "The captured executable and [original lexical program](../original.js) ",
+        "remain unchanged. **Byte offsets in derived helpers refer to the ",
+        "transformed readable program**, not the captured original. ",
+        "Source formatting can alter Function#toString, so this is not ",
+        "a replacement executable.\n\n",
+        "[Complete readable program](readable.js) · ",
+        "[Provenance and transformations](reconstruction.json)\n\n",
+        "## Resolved helpers\n\n",
+    ));
+    index = index.replace("](readable.js)", &format!("]({file_name})"));
+    for helper in &alternate.helpers {
+        let path = directory.join(&helper.file);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, &helper.source)?;
+        index.push_str(&format!("- [{}]({})\n", helper.name, helper.file));
+    }
+    fs::write(directory.join("README.md"), index)?;
+    Ok(json!({
+        "path": format!("lexical-context/whole-program/{file_name}"),
+        "helper_index": "lexical-context/whole-program/README.md",
+        "report": "lexical-context/whole-program/reconstruction.json",
+        "input_sha256": outcome.report.input_sha256,
+        "output_sha256": outcome.report.output_sha256,
+        "iterations": outcome.report.iterations,
+        "max_iterations": iterations,
+        "helper_count": alternate.helpers.len(),
+        "transforms": outcome.report.transforms,
+    }))
 }
 
 fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
@@ -1223,7 +1305,30 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 ));
             }
         }
-        let mut context_json = serde_json::to_string_pretty(&json!({
+        let full_context = if let Some(iterations) = args.context_full_iterations {
+            let result = materialize_full_lexical_context(
+                &original,
+                &source_inputs,
+                &folder,
+                iterations,
+                SourceMode::for_path(context_path),
+                &budgets,
+            )?;
+            helper_index
+                .push_str("\n[Whole-program lexical reconstruction](whole-program/README.md).\n");
+            fs::write(folder.join("README.md"), &helper_index)?;
+            md.push_str(concat!(
+                "\n## Whole-program lexical reconstruction\n\n",
+                "[Browse complete-context readable helper bodies]",
+                "(lexical-context/whole-program/README.md). ",
+                "These are separate analyst views, not changes to ",
+                "the original lexical or captured executable code.\n",
+            ));
+            Some(result)
+        } else {
+            None
+        };
+        let mut context_json_value = json!({
             "caller_view_count": caller_view_rows.len(),
             "caller_views": caller_view_rows,
             "graph_specialization_count": graph_specialization_rows.len(),
@@ -1249,7 +1354,14 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 "unresolved_references": handler.unresolved_references,
             })).collect::<Vec<_>>(),
             "unmatched_names": context.unmatched_names,
-        }))?;
+        });
+        if let Some(derived) = full_context {
+            context_json_value
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("context JSON must be an object"))?
+                .insert("full_context".to_owned(), derived);
+        }
+        let mut context_json = serde_json::to_string_pretty(&context_json_value)?;
         context_json.push('\n');
         fs::write(folder.join("context.json"), context_json)?;
     }
@@ -1768,6 +1880,7 @@ mod tests {
             max_iterations: 12,
             format_output: false,
             context_source: None,
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -1810,6 +1923,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -1861,6 +1975,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -1904,6 +2019,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -1951,6 +2067,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -1986,6 +2103,72 @@ mod tests {
     }
 
     #[test]
+    fn source_tree_whole_context_resolves_enclosing_lexical_assignments() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let full = "function root(){let Hm=97;const oU=function(log){Hm=(log.push('step'),42);return Hm;};}";
+        fs::write(&original, full)?;
+        let captured = "const captured=()=>oU([]);";
+        fs::write(input.join("handler.js"), captured)?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            context_full_iterations: Some(48),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let lexical = output.join("lexical-context");
+        assert_eq!(fs::read_to_string(lexical.join("original.js"))?, full);
+        assert!(fs::read_to_string(output.join("handler.js"))?.contains("oU([])"));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(lexical.join("context.json"))?)?;
+        let whole = &manifest["full_context"];
+        assert!(whole["iterations"].as_u64().is_some_and(|n| n > 0));
+        assert!(
+            whole["iterations"].as_u64().unwrap_or(u64::MAX)
+                < whole["max_iterations"].as_u64().unwrap_or_default()
+        );
+        let whole_path = lexical.join("whole-program");
+        let full_view = fs::read_to_string(whole_path.join("readable.js"))?;
+        assert!(full_view.contains("Hm = 42;"), "{full_view}");
+        assert!(full_view.contains("log.push"), "{full_view}");
+        let code = fs::read_to_string(
+            lexical.join(
+                manifest["helpers"]
+                    .as_array()
+                    .and_then(|helpers| helpers.iter().find(|helper| helper["name"] == "oU"))
+                    .and_then(|helper| helper["path"].as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing original oU"))?,
+            ),
+        )?;
+        assert!(
+            !code.contains("Hm = 42;"),
+            "isolated helper must remain conservatively unresolved: {code}"
+        );
+        let derived = fs::read_dir(whole_path.join("helpers"))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("oU-"))
+            })
+            .ok_or_else(|| anyhow::anyhow!("derived oU missing"))?;
+        let derived_code = fs::read_to_string(derived)?;
+        assert!(derived_code.contains("Hm = 42;"), "{derived_code}");
+        assert!(derived_code.contains("log.push"), "{derived_code}");
+        assert!(fs::read_to_string(whole_path.join("README.md"))?.contains("readable.js"));
+        assert!(fs::read_to_string(output.join("README.md"))?.contains("whole-program/README.md"));
+        Ok(())
+    }
+
+    #[test]
     fn source_tree_emits_original_resolved_binding_writes() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let input = temp.path().join("source");
@@ -2001,6 +2184,7 @@ mod tests {
             max_iterations: 4,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2069,6 +2253,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2127,6 +2312,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2172,6 +2358,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2243,6 +2430,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2289,6 +2477,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2336,6 +2525,7 @@ mod tests {
             max_iterations: 8,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2406,6 +2596,7 @@ mod tests {
             max_iterations: 8,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2477,6 +2668,7 @@ mod tests {
             max_iterations: 8,
             format_output: true,
             context_source: Some(original.clone()),
+            context_full_iterations: None,
             origin_source: Some(original),
             caller_view_entry: None,
         })?;
@@ -2516,6 +2708,7 @@ mod tests {
             max_iterations: 8,
             format_output: true,
             context_source: Some(source),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: Some("enter".into()),
         })?;
@@ -2554,6 +2747,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original.clone()),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: Some("enter".into()),
         })?;
@@ -2610,6 +2804,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: Some("enter".into()),
         })?;
@@ -2658,6 +2853,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: Some("aoF_".into()),
         })?;
@@ -2709,6 +2905,7 @@ mod tests {
             max_iterations: 12,
             format_output: true,
             context_source: Some(original),
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: Some("enter".into()),
         })?;
@@ -2752,6 +2949,7 @@ mod tests {
             max_iterations: 1,
             format_output: false,
             context_source: None,
+            context_full_iterations: None,
             origin_source: None,
             caller_view_entry: None,
         });

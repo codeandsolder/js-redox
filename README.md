@@ -523,6 +523,25 @@ version of the original is useful for browsing but must not be used as the
 span provenance source. `context.json` records the original declaration
 spans, assignment alternatives, and linked handler paths.
 
+An opt-in **whole-program lexical reconstruction** can prove additional
+statement boundaries which are invisible in detached helper expressions.
+Supply `--context-source original.js --context-full-iterations 48` to
+`deobfuscate-safe source-tree`. The whole original lexical source is passed
+through the existing safe-deobfuscation engine to a checked fixed point
+and *then* its functions are re-extracted under their original lexical
+symbol identities. The alternate `lexical-context/whole-program/` contains
+`readable.js`, a transformation/source-hash report, and a helper index
+with extracted source. The iteration argument is a **cap**, not a requested
+rewrite count: if a validated fixed point is not reached below it, the
+command fails rather than claiming completion. This additional work is
+opt-in so ordinary source-tree capture runs do not needlessly process the
+whole enclosing program again. Function#toString-sensitive formatting
+and byte offsets belong to the alternate *analyst* view only; the
+`lexical-context/original.js` and captured executable files remain exact.
+A detached helper can fail to prove an enclosing identifier binding,
+so it may retain an opaque assignment sequence that the context-aware
+view safely reconstructs.
+
 For source-level direct-call and constructor forwarding, add
 `--caller-view-entry <member-property>` (for instance, a site's exposed API
 method name). The output `lexical-context/caller-views/` traces Oxc-resolved
