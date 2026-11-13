@@ -29,6 +29,7 @@ const MAX_INLINE_ASSIGNMENT_RHS_BYTES: usize = 96;
 pub struct HelperNavigation {
     pub call_spine_markdown: Option<String>,
     pub assignment_outline_markdown: Option<String>,
+    pub ordered_assignment_phases_markdown: Option<String>,
     pub layout: String,
 }
 
@@ -219,6 +220,33 @@ impl<'a> Visit<'a> for AssignmentOutlineCollector<'_> {
         self.ancestors = ancestors;
         self.guards = guards;
     }
+}
+
+pub(crate) fn long_assignment_roots(
+    source: &str,
+    program: &oxc_ast::ast::Program<'_>,
+) -> std::collections::BTreeSet<(u32, u32)> {
+    let mut collector = AssignmentOutlineCollector {
+        source,
+        ..AssignmentOutlineCollector::default()
+    };
+    collector.visit_program(program);
+    let parents = collector
+        .nodes
+        .iter()
+        .filter_map(|node| node.parent)
+        .collect::<std::collections::BTreeSet<_>>();
+    collector
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            (node.parent.is_none()
+                && node.span.end.saturating_sub(node.span.start) as usize > LONG_EXPRESSION_BYTES
+                && parents.contains(&index))
+            .then_some((node.span.start, node.span.end))
+        })
+        .collect()
 }
 
 fn assignment_outline(source: &str, program: &oxc_ast::ast::Program<'_>) -> Option<String> {
@@ -429,6 +457,8 @@ pub fn helper_navigation(source: &str, helper_path: &str) -> Option<HelperNaviga
         return None;
     }
     let assignment_outline_markdown = assignment_outline(source, &parsed.program);
+    let ordered_assignment_phases_markdown =
+        crate::source_tree_eval_order::ordered_assignment_phases(source, &parsed.program);
     let mut collector = Collector {
         source,
         ..Collector::default()
@@ -553,6 +583,7 @@ in the original JavaScript. Byte ranges refer to that readable helper.
     Some(HelperNavigation {
         call_spine_markdown,
         assignment_outline_markdown,
+        ordered_assignment_phases_markdown,
         layout,
     })
 }

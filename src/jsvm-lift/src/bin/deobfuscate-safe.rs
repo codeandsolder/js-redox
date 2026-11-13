@@ -349,6 +349,7 @@ fn materialize_full_lexical_context(
     let mut internal_count = 0usize;
     let mut layout_rows = Vec::new();
     let mut assignment_outline_rows = Vec::new();
+    let mut ordered_phase_rows = Vec::new();
     let mut call_spine_rows = Vec::new();
     let mut helper_rows = Vec::new();
     let mut polished_count = 0usize;
@@ -379,6 +380,7 @@ fn materialize_full_lexical_context(
         // by original lexical helpers, applied after whole-context polishing.
         let mut layout_path = None;
         let mut outline_path = None;
+        let mut ordered_phase_path = None;
         let mut call_spine_path = None;
         if let Some(view) = helper_navigation(&polished.source, &helper.file) {
             let stem = helper
@@ -416,6 +418,21 @@ fn materialize_full_lexical_context(
                 }));
                 outline_path = Some(relative);
             }
+            if let Some(phases) = view.ordered_assignment_phases_markdown {
+                let relative = format!("evaluation-phases/{stem}.md");
+                let target = directory.join(&relative);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(target, &phases)?;
+                ordered_phase_rows.push(json!({
+                    "name": helper.name,
+                    "path": relative,
+                    "source_sha256": sha256_hex(polished.source.as_bytes()),
+                    "phase_plan_sha256": sha256_hex(phases.as_bytes()),
+                }));
+                ordered_phase_path = Some(relative);
+            }
             if let Some(spine) = view.call_spine_markdown {
                 let relative = format!("call-spines/{stem}.md");
                 let target = directory.join(&relative);
@@ -450,6 +467,9 @@ fn materialize_full_lexical_context(
         if let Some(path) = &outline_path {
             entry.push_str(&format!(" · [assignment outline]({path})"));
         }
+        if let Some(path) = &ordered_phase_path {
+            entry.push_str(&format!(" · [evaluation phases]({path})"));
+        }
         if let Some(path) = &call_spine_path {
             entry.push_str(&format!(" · [call spine]({path})"));
         }
@@ -464,6 +484,7 @@ fn materialize_full_lexical_context(
             "binding_origin": if from_original { "original_lexical" } else { "derived_internal" },
             "layout_path": layout_path,
             "assignment_outline_path": outline_path,
+            "ordered_evaluation_path": ordered_phase_path,
             "call_spine_path": call_spine_path,
             "path": helper.file,
             "source_path": raw_path,
@@ -489,16 +510,18 @@ fn materialize_full_lexical_context(
         index.push_str(&internal_index);
     }
     let helper_report = json!({
-        "schema": "jsvm-whole-lexical-helper-projections/v3",
+        "schema": "jsvm-whole-lexical-helper-projections/v4",
         "source": file_name,
         "original_helper_count": original_count,
         "derived_internal_binding_count": internal_count,
         "total_definition_count": alternate.helpers.len(),
         "layout_count": layout_rows.len(),
         "assignment_outline_count": assignment_outline_rows.len(),
+        "ordered_evaluation_count": ordered_phase_rows.len(),
         "call_spine_count": call_spine_rows.len(),
         "expression_layouts": layout_rows,
         "assignment_outlines": assignment_outline_rows,
+        "ordered_evaluation_phases": ordered_phase_rows,
         "call_spines": call_spine_rows,
         "polished_count": polished_count,
         "loop_reflows": loop_reflows,
@@ -521,6 +544,7 @@ fn materialize_full_lexical_context(
         "total_definition_count": alternate.helpers.len(),
         "helper_layout_count": helper_report["layout_count"],
         "helper_assignment_outline_count": helper_report["assignment_outline_count"],
+        "helper_ordered_evaluation_count": helper_report["ordered_evaluation_count"],
         "helper_call_spine_count": helper_report["call_spine_count"],
         "helper_polished_count": polished_count,
         "helper_loop_reflows": loop_reflows,
@@ -681,6 +705,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
         let mut call_spine_rows = Vec::new();
         let mut call_layout_rows = Vec::new();
         let mut assignment_outline_rows = Vec::new();
+        let mut ordered_phase_rows = Vec::new();
         let mut binding_write_rows = Vec::new();
         let mut helper_index = String::from("# Actual lexical helper implementations\n\n");
         helper_index.push_str("These definitions come from the supplied original program. ");
@@ -774,6 +799,12 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                     fs::create_dir_all(folder.join("assignment-outlines"))?;
                     fs::write(folder.join(&outline_path), outline)?;
                     assignment_outline_rows.push((helper.name.clone(), outline_path));
+                }
+                if let Some(phases) = view.ordered_assignment_phases_markdown {
+                    let phase_path = format!("evaluation-phases/{stem}.md");
+                    fs::create_dir_all(folder.join("evaluation-phases"))?;
+                    fs::write(folder.join(&phase_path), phases)?;
+                    ordered_phase_rows.push((helper.name.clone(), phase_path));
                 }
             }
             // Annotate references only where the helper's *own* AST resolves
@@ -946,6 +977,24 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             );
             md.push_str(
                 "\n## Nested lexical-helper assignments\n\n[Browse the long-expression assignment outlines](lexical-context/assignment-outlines/README.md). This is a source-backed containment map, not evaluation order.\n\n",
+            );
+        }
+        if !ordered_phase_rows.is_empty() {
+            let mut index = String::from(
+                "# Ordered evaluation phases in long assignments\n\n                 Static AST-derived phase plans, not runtime traces. Guards                  identify mutually exclusive branches and opaque subtrees                  preserve unknown internal ordering. Source offsets belong                  to the readable lexical helper, not the captured original.\n\n",
+            );
+            for (name, path) in &ordered_phase_rows {
+                index.push_str(&format!(
+                    "- [{name}]({})\n",
+                    path.trim_start_matches("evaluation-phases/")
+                ));
+            }
+            fs::write(folder.join("evaluation-phases/README.md"), index)?;
+            helper_index.push_str(
+                "\n[Browse ordered assignment evaluation phases](evaluation-phases/README.md).\n",
+            );
+            md.push_str(
+                "\n## Ordered assignment evaluation phases\n\n                 [Browse original lexical helper phase plans](lexical-context/evaluation-phases/README.md).                  These are path-guarded static evaluation phases, not observed events.\n\n",
             );
         }
         if !call_spine_rows.is_empty() {
@@ -1512,7 +1561,12 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             "origin_source_sha256": origin_source_sha256,
             "origin_handler_count": origin_rows.len(),
             "origin_handlers": origin_rows,
-            "schema": "jsvm-readable-lexical-context/v2",
+            "schema": "jsvm-readable-lexical-context/v3",
+            "ordered_evaluation_count": ordered_phase_rows.len(),
+            "ordered_evaluation_phases": ordered_phase_rows.iter().map(|(name, path)| json!({
+                "name": name,
+                "path": path,
+            })).collect::<Vec<_>>(),
             "annotated_handler_count": annotated_call_rows.len(),
             "annotated_handler_calls": annotated_call_rows,
             "expanded_handler_count": expanded_rows.len(),
@@ -2814,7 +2868,7 @@ mod tests {
         let ctx = output.join("lexical-context");
         let meta: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(ctx.join("context.json"))?)?;
-        assert_eq!(meta["schema"], "jsvm-readable-lexical-context/v2");
+        assert_eq!(meta["schema"], "jsvm-readable-lexical-context/v3");
         assert_eq!(meta["explained_alias_count"], 1);
         let alias = &meta["explained_aliases"][0]["aliases"][0];
         assert_eq!(alias["binding"], "key");
@@ -3206,7 +3260,7 @@ mod tests {
         let folder = lexical.join("whole-program");
         let report: serde_json::Value =
             serde_json::from_slice(&fs::read(folder.join("helpers.json"))?)?;
-        assert_eq!(report["schema"], "jsvm-whole-lexical-helper-projections/v3");
+        assert_eq!(report["schema"], "jsvm-whole-lexical-helper-projections/v4");
         assert_eq!(whole["helper_count"], 1, "{whole}");
         assert_eq!(report["original_helper_count"], 1, "{report}");
         assert_eq!(report["derived_internal_binding_count"], 2, "{report}");
@@ -3282,7 +3336,7 @@ mod tests {
         let whole = lexical.join("whole-program");
         let report: serde_json::Value =
             serde_json::from_slice(&fs::read(whole.join("helpers.json"))?)?;
-        assert_eq!(report["schema"], "jsvm-whole-lexical-helper-projections/v3");
+        assert_eq!(report["schema"], "jsvm-whole-lexical-helper-projections/v4");
         let helper = report["helpers"]
             .as_array()
             .and_then(|rows| rows.iter().find(|row| row["name"] == "init"))
@@ -3297,9 +3351,17 @@ mod tests {
         let outline_path = helper["assignment_outline_path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing derived assignment outline"))?;
+        let phases_path = helper["ordered_evaluation_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing derived ordered evaluation plan"))?;
         let polished = fs::read_to_string(whole.join(source_path))?;
         let layout = fs::read_to_string(whole.join(layout_path))?;
         let outline = fs::read_to_string(whole.join(outline_path))?;
+        let phases = fs::read_to_string(whole.join(phases_path))?;
+        assert!(phases.contains("Ordered evaluation phases"), "{phases}");
+        assert!(phases.contains("PutValue target"), "{phases}");
+        assert!(phases.contains("U.n0"), "{phases}");
+        assert!(phases.contains("opaque expression"), "{phases}");
         assert!(outline.contains("U.R"), "{outline}");
         assert!(outline.contains("U.n0"), "{outline}");
         assert!(outline.contains("containment"), "{outline}");
@@ -3328,9 +3390,19 @@ mod tests {
             outline_record["outline_sha256"],
             sha256_hex(outline.as_bytes())
         );
+        let phase_record = report["ordered_evaluation_phases"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == "init"))
+            .ok_or_else(|| anyhow::anyhow!("missing evaluation plan metadata"))?;
+        assert_eq!(phase_record["source_sha256"], helper["polished_sha256"]);
+        assert_eq!(
+            phase_record["phase_plan_sha256"],
+            sha256_hex(phases.as_bytes())
+        );
         let index = fs::read_to_string(whole.join("README.md"))?;
         assert!(index.contains(layout_path), "{index}");
         assert!(index.contains(outline_path), "{index}");
+        assert!(index.contains(phases_path), "{index}");
         Ok(())
     }
 }

@@ -57,6 +57,7 @@ pub mod source_materialize;
 pub mod source_tree_aliases;
 pub mod source_tree_callflow;
 pub mod source_tree_context;
+mod source_tree_eval_order;
 pub mod source_tree_inline;
 pub mod source_tree_navigation;
 pub mod source_tree_reflow;

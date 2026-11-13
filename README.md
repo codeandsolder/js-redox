@@ -558,7 +558,7 @@ with extracted source. The whole-program helper index distinguishes original lex
 from derived internal bindings using parsed declaration identities from
 the preserved original source, never generated-name prefixes. Derived
 bindings remain navigable because transformed code may depend on them, but
-they are not counted as recovered original helpers. The v3 helpers.json
+they are not counted as recovered original helpers. The v4 helpers.json
 report records binding_origin per entry and separates original_helper_count,
 derived_internal_binding_count and total_definition_count. The whole-context
 summary exposes the same distinction through helper_count (original only),
@@ -581,8 +581,17 @@ same AST-verified, whitespace-only `expression-layouts/`, nested assignment
 helpers. These links are included in the whole-program helper index. The
 layouts insert whitespace only, retaining identical AST code generation;
 the assignment outlines describe containment, **not execution order**.
+Both original and whole-program lexical helpers now also offer
+`evaluation-phases/` static phase plans for long nested assignments.
+These show target-reference formation, GetValue, RHS evaluation and PutValue
+within each possible branch path. Mutually exclusive branches are marked;
+any step may throw, and complex calls/destructuring/optional chains remain
+opaque instead of inventing an order. Computed property key coercion is
+deferred until target GetValue or PutValue, so simple assignment may evaluate
+its RHS *before* ToPropertyKey while compound assignment does not.
+The plans are analyst navigation, not observed traces or executable rewrites.
 Each view records its source hash and generated artifact hash in the
-whole-program `helpers.json` v3 report, without modifying the polished
+whole-program `helpers.json` v4 report, without modifying the polished
 helper or its source-backed extract. Every exact source-backed helper extract
 is kept separately in \`whole-program/source-helpers/\`, with a per-helper
 \`helpers.json\` report recording both source hashes, which polishing
