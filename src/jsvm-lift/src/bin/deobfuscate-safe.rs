@@ -2245,7 +2245,7 @@ mod tests {
             exact.contains("while"),
             "missing unmodified original extract: {exact}"
         );
-        assert!(exact.contains("log.push('loop')"), "{exact}");
+        assert!(exact.contains("log.push(\"loop\")"), "{exact}");
         assert_eq!(sha256_hex(exact.as_bytes()), o_u["source_sha256"]);
         assert_eq!(sha256_hex(derived_code.as_bytes()), o_u["polished_sha256"]);
         assert!(whole["helper_polished_count"]
