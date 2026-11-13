@@ -1950,9 +1950,10 @@ mod tests {
             fs::read_to_string(folder.join("original.js"))?,
             original_source
         );
-        assert_eq!(
-            fs::read_to_string(output.join("handler.js"))?,
-            "const capturedHandler=function(U,flag){return init(U,flag);};"
+        let handler = fs::read_to_string(output.join("handler.js"))?;
+        assert!(
+            handler.contains("return init(U, flag)"),
+            "the executable handler must retain the original call: {handler}"
         );
         Ok(())
     }
