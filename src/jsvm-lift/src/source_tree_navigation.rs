@@ -25,6 +25,7 @@ const LONG_EXPRESSION_BYTES: usize = 160;
 #[derive(Default)]
 pub struct HelperNavigation {
     pub call_spine_markdown: Option<String>,
+    pub assignment_outline_markdown: Option<String>,
     pub layout: String,
 }
 
@@ -88,6 +89,195 @@ impl<'a> Visit<'a> for Collector<'_> {
         walk::walk_arrow_function_expression(self, arrow);
         self.ancestors = ancestors;
     }
+}
+
+/// A source-backed containment tree of writes inside long expressions.
+/// This is *not* execution order. Assignment target references form before
+/// the RHS is evaluated; nested RHS writes may also be conditional.
+struct AssignmentNode {
+    span: Span,
+    target_span: Span,
+    target: String,
+    operator: String,
+    parent: Option<usize>,
+    in_target_reference: bool,
+    guard_depth: usize,
+    nearest_guard: Option<String>,
+}
+
+#[derive(Default)]
+struct AssignmentOutlineCollector<'s> {
+    source: &'s str,
+    nodes: Vec<AssignmentNode>,
+    ancestors: Vec<usize>,
+    guards: Vec<String>,
+}
+
+impl<'a> Visit<'a> for AssignmentOutlineCollector<'_> {
+    fn visit_assignment_expression(&mut self, expression: &AssignmentExpression<'a>) {
+        let target_span = expression.left.span();
+        let parent = self.ancestors.last().copied();
+        let in_target_reference = parent.is_some_and(|index| {
+            let parent_target = self.nodes[index].target_span;
+            expression.span.start >= parent_target.start && expression.span.end <= parent_target.end
+        });
+        let target = self
+            .source
+            .get(target_span.start as usize..target_span.end as usize)
+            .unwrap_or("<unavailable target>")
+            .to_owned();
+        let index = self.nodes.len();
+        self.nodes.push(AssignmentNode {
+            span: expression.span,
+            target_span,
+            target,
+            operator: expression.operator.as_str().to_owned(),
+            parent,
+            in_target_reference,
+            guard_depth: self.guards.len(),
+            nearest_guard: self.guards.last().cloned(),
+        });
+        self.ancestors.push(index);
+        walk::walk_assignment_expression(self, expression);
+        self.ancestors.pop();
+    }
+
+    fn visit_logical_expression(&mut self, expression: &LogicalExpression<'a>) {
+        self.visit_expression(&expression.left);
+        self.guards.push(format!(
+            "logical {} right operand",
+            expression.operator.as_str()
+        ));
+        self.visit_expression(&expression.right);
+        self.guards.pop();
+    }
+
+    fn visit_conditional_expression(&mut self, expression: &ConditionalExpression<'a>) {
+        self.visit_expression(&expression.test);
+        self.guards.push("conditional true arm".to_owned());
+        self.visit_expression(&expression.consequent);
+        self.guards.pop();
+        self.guards.push("conditional false arm".to_owned());
+        self.visit_expression(&expression.alternate);
+        self.guards.pop();
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        // A nested function body is deferred and must not be listed as part
+        // of the enclosing initializer. It can have independent root writes.
+        let ancestors = std::mem::take(&mut self.ancestors);
+        let guards = std::mem::take(&mut self.guards);
+        walk::walk_function(self, function, flags);
+        self.ancestors = ancestors;
+        self.guards = guards;
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        let ancestors = std::mem::take(&mut self.ancestors);
+        let guards = std::mem::take(&mut self.guards);
+        walk::walk_arrow_function_expression(self, arrow);
+        self.ancestors = ancestors;
+        self.guards = guards;
+    }
+}
+
+fn assignment_outline(source: &str, program: &oxc_ast::ast::Program<'_>) -> Option<String> {
+    let mut collector = AssignmentOutlineCollector {
+        source,
+        ..AssignmentOutlineCollector::default()
+    };
+    collector.visit_program(program);
+    let nodes = &collector.nodes;
+    let mut children = vec![Vec::new(); nodes.len()];
+    for (index, node) in nodes.iter().enumerate() {
+        if let Some(parent) = node.parent {
+            children[parent].push(index);
+        }
+    }
+    let roots = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            (node.parent.is_none()
+                && node.span.end.saturating_sub(node.span.start) as usize > LONG_EXPRESSION_BYTES
+                && !children[index].is_empty())
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return None;
+    }
+    let mut output = String::from(
+        r"# Nested assignment structure in long expressions
+
+These are AST containment relationships, **not an execution trace** or a
+proposed rewrite. Assignment references are resolved before their RHS.
+Computed keys, getters and conversions may have effects. Logical and
+conditional operands can be skipped, and functions created inside an
+RHS have independent, deferred bodies. Guard annotations report only
+the nearest enclosing guard and the total guard nesting depth.
+Byte locations refer to the readable lexical helper.
+
+",
+    );
+    fn emit(
+        nodes: &[AssignmentNode],
+        children: &[Vec<usize>],
+        source: &str,
+        index: usize,
+        depth: usize,
+        output: &mut String,
+    ) {
+        let node = &nodes[index];
+        let (line, col) = line_col(source, node.span.start as usize);
+        let target = if node.target.len() > 80
+            || node.target.contains(char::from(96))
+            || node.target.contains(char::from(10))
+        {
+            "<complex target>".to_owned()
+        } else {
+            node.target.replace('|', r"\|")
+        };
+        let role = if node.parent.is_none() {
+            "root"
+        } else if node.in_target_reference {
+            "target reference"
+        } else {
+            "assignment value"
+        };
+        let guard = node.nearest_guard.as_ref().map_or_else(
+            || "none".to_owned(),
+            |guard| format!("{} ({} total)", guard, node.guard_depth),
+        );
+        output.push_str(&format!(
+            "| {} | {} | {} {} | {} | {} | {}:{} ({}–{}) |\n",
+            depth,
+            index + 1,
+            target,
+            node.operator,
+            role,
+            guard,
+            line,
+            col,
+            node.span.start,
+            node.span.end,
+        ));
+        for &child in &children[index] {
+            emit(nodes, children, source, child, depth + 1, output);
+        }
+    }
+    for root in roots {
+        let node = &nodes[root];
+        let (line, col) = line_col(source, node.span.start as usize);
+        output.push_str(&format!(
+            "\n## Long assignment at {line}:{col} ({} source bytes)\n\n",
+            node.span.end - node.span.start,
+        ));
+        output.push_str("| Depth | ID | Assignment target/operator | Containment | Nearest guard | Source location |\n|---:|---:|---|---|---|---|\n");
+        emit(nodes, &children, source, root, 0, &mut output);
+        output.push(char::from(10));
+    }
+    Some(output)
 }
 
 /// Line-break opportunities at AST-verified operand boundaries. These are
@@ -195,6 +385,7 @@ pub fn helper_navigation(source: &str, helper_path: &str) -> Option<HelperNaviga
     if !parsed.is_clean() {
         return None;
     }
+    let assignment_outline_markdown = assignment_outline(source, &parsed.program);
     let mut collector = Collector {
         source,
         ..Collector::default()
@@ -225,7 +416,7 @@ pub fn helper_navigation(source: &str, helper_path: &str) -> Option<HelperNaviga
     };
     expressions.visit_program(&parsed.program);
     let mut breaks = expressions.positions;
-    if path.is_empty() && breaks.is_empty() {
+    if path.is_empty() && breaks.is_empty() && assignment_outline_markdown.is_none() {
         return None;
     }
     for &index in &path {
@@ -318,6 +509,7 @@ in the original JavaScript. Byte ranges refer to that readable helper.
     };
     Some(HelperNavigation {
         call_spine_markdown,
+        assignment_outline_markdown,
         layout,
     })
 }
@@ -396,6 +588,23 @@ mod tests {
         let source =
             "function f(){return outer(inner(function(){return a(b(c(d(e(f(g(1)))))));}));}";
         assert!(helper_navigation(source, "helpers/f.js").is_none());
+    }
+
+    #[test]
+    fn outlines_nested_writes_with_guards_without_merging_callback_bodies() {
+        let source = "function f(U,flag){let result;result=(U.a=1,flag&&(U.b=2),U.c=(U.d=3),U.e=4,U.f=5,U.g=6,U.h=7,U.i=8,U.j=9,U.k=10,U.l=11,U.m=12,U.n=13,U.o=14,U.p=15,U.q=16,U.r=17,U.s=18,U.t=19,U.fn=function(){hidden=123;},U.u=20);return result;}";
+        let view = helper_navigation(source, "helpers/f.js").unwrap_or_default();
+        let outline = view.assignment_outline_markdown.unwrap_or_default();
+        assert!(outline.contains("result ="), "{outline}");
+        assert!(outline.contains("U.b ="), "{outline}");
+        assert!(outline.contains("logical && right operand"), "{outline}");
+        assert!(outline.contains("U.d ="), "{outline}");
+        assert!(
+            !outline.contains("hidden ="),
+            "nested function assignments are deferred: {outline}"
+        );
+        assert!(outline.contains("not an execution trace"), "{outline}");
+        assert!(outline.contains("Source location"), "{outline}");
     }
 
     #[test]
