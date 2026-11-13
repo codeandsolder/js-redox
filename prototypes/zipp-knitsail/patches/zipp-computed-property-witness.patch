@@ -1,0 +1,191 @@
+From ea868eb15ad7f0376101cb4fc3b0bf1f8d47956b Mon Sep 17 00:00:00 2001
+From: codeandsolder <codeandsolder@gmail.com>
+Date: Tue, 10 Nov 2026 18:53:41 +0100
+Subject: [PATCH] experiment(zipp): bounded source-correlated computed-property
+ witnesses
+
+---
+ crates/zipp-vm/src/embed.rs            | 24 ++++++++++
+ crates/zipp-vm/src/vm/dispatch.rs      |  4 ++
+ crates/zipp-vm/src/vm/dispatch_cold.rs |  2 +
+ crates/zipp-vm/src/vm/engine/boot.rs   |  2 +
+ crates/zipp-vm/src/vm/instrument.rs    | 61 ++++++++++++++++++++++++++
+ crates/zipp-vm/src/vm/mod.rs           |  3 ++
+ 6 files changed, 96 insertions(+)
+
+diff --git a/crates/zipp-vm/src/embed.rs b/crates/zipp-vm/src/embed.rs
+index 7fbb273..3dfd876 100644
+--- a/crates/zipp-vm/src/embed.rs
++++ b/crates/zipp-vm/src/embed.rs
+@@ -48,6 +48,8 @@ pub use crate::vm::host_api::SandboxCaps;
+ /// `meter-only` profile deliberately does not.
+ #[cfg(feature = "instrument")]
+ pub use crate::vm::instrument::{op, TraceStep};
++#[cfg(all(feature = "instrument", not(feature = "meter-only")))]
++pub use crate::vm::instrument::{PropertyWitness, PropertyWitnessReport};
+ pub use crate::vm::ConsoleStream;
+ 
+ /// Decimal text to `f64`, exactly as `text.parse::<f64>().ok()` reads it (the
+@@ -1326,6 +1328,28 @@ impl ScriptState {
+         });
+     }
+ 
++    /// Start bounded raw computed-property observations. Each event names its
++    /// bytecode site and source function range. JIT is disabled so native code
++    /// cannot silently escape observation. ToPropertyKey is never invoked here.
++    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
++    pub fn start_property_witnesses(&mut self, limit: usize) {
++        self.with_vm(|vm| {
++            vm.enter_trace_mode();
++            vm.property_witnesses = Some(crate::vm::instrument::PropertyWitnessRecorder {
++                events: Vec::new(), limit, truncated: false,
++            });
++        });
++    }
++
++    /// Take events with an explicit incompleteness signal.
++    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
++    pub fn take_property_witnesses(&mut self) -> Option<PropertyWitnessReport> {
++        self.with_vm(|vm| vm.property_witnesses.take().map(|r| PropertyWitnessReport {
++            events: r.events,
++            truncated: r.truncated,
++        })).flatten()
++    }
++
+     /// Stop recording and take the trace, appending a terminal halt row that
+     /// carries `result`.
+     ///
+diff --git a/crates/zipp-vm/src/vm/dispatch.rs b/crates/zipp-vm/src/vm/dispatch.rs
+index 58bdadf..0e2cd74 100644
+--- a/crates/zipp-vm/src/vm/dispatch.rs
++++ b/crates/zipp-vm/src/vm/dispatch.rs
+@@ -3499,6 +3499,8 @@ impl<'p> Vm<'p> {
+                     Instr::GetIndex { dst, obj, key } => {
+                         let o = self.get(base, obj);
+                         let k = self.get(base, key);
++                        #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
++                        self.observe_computed_property(func_id, ip, "get", k);
+                         // Numeric TypedArray indices are integer-indexed exotic
+                         // accesses, so an in/out-of-bounds result never consults
+                         // a user prototype. Serve non-BigInt kinds directly;
+@@ -3576,6 +3578,8 @@ impl<'p> Vm<'p> {
+                     Instr::SetIndex { obj, key, val } => {
+                         let o = self.get(base, obj);
+                         let k = self.get(base, key);
++                        #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
++                        self.observe_computed_property(func_id, ip, "set", k);
+                         let v = self.get(base, val);
+                         if o.is_heap() && v.is_number() {
+                             let ta_idx = o.heap_index();
+diff --git a/crates/zipp-vm/src/vm/dispatch_cold.rs b/crates/zipp-vm/src/vm/dispatch_cold.rs
+index 7e78949..192e89e 100644
+--- a/crates/zipp-vm/src/vm/dispatch_cold.rs
++++ b/crates/zipp-vm/src/vm/dispatch_cold.rs
+@@ -4204,6 +4204,8 @@ impl<'p> Vm<'p> {
+             } => {
+                 let recv = self.get(base, obj);
+                 let k = self.get(base, key);
++                #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
++                self.observe_computed_property(func_id, ip, "call", k);
+                 // A NUMERIC key cannot name a builtin method, and finding
+                 // that out the long way is not cheap: `display` formats the
+                 // number into a fresh String, `try_builtin_method` copies the
+diff --git a/crates/zipp-vm/src/vm/engine/boot.rs b/crates/zipp-vm/src/vm/engine/boot.rs
+index 1307e14..e036167 100644
+--- a/crates/zipp-vm/src/vm/engine/boot.rs
++++ b/crates/zipp-vm/src/vm/engine/boot.rs
+@@ -373,6 +373,8 @@ impl<'p> Vm<'p> {
+             #[cfg(feature = "instrument")]
+             instr_rec: None,
+             #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
++            property_witnesses: None,
++            #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+             step_hot: i64::MAX,
+             heap_audit_extra: std::cell::Cell::new(0),
+             #[cfg(feature = "instrument")]
+diff --git a/crates/zipp-vm/src/vm/instrument.rs b/crates/zipp-vm/src/vm/instrument.rs
+index 416911a..b41abbb 100644
+--- a/crates/zipp-vm/src/vm/instrument.rs
++++ b/crates/zipp-vm/src/vm/instrument.rs
+@@ -404,6 +404,67 @@ fn heap_walk_stride_for(slots: usize) -> u32 {
+     }
+ }
+ 
++/// Raw computed-property operand observed at an interpreter instruction.
++/// key_text displays the input operand; object keys may undergo user-defined
++/// ToPropertyKey later, so this is not always the final resolved property name.
++#[cfg(not(feature = "meter-only"))]
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct PropertyWitness {
++    pub function_id: u32,
++    pub function_name: String,
++    pub source_start: usize,
++    pub source_end: usize,
++    pub bytecode_ip: usize,
++    pub operation: &'static str,
++    pub key_bits: u64,
++    pub key_text: String,
++    pub object_key: bool,
++}
++
++#[cfg(not(feature = "meter-only"))]
++#[derive(Debug)]
++pub struct PropertyWitnessReport {
++    pub events: Vec<PropertyWitness>,
++    pub truncated: bool,
++}
++
++#[cfg(not(feature = "meter-only"))]
++pub(crate) struct PropertyWitnessRecorder {
++    pub(crate) events: Vec<PropertyWitness>,
++    pub(crate) limit: usize,
++    pub(crate) truncated: bool,
++}
++
++#[cfg(not(feature = "meter-only"))]
++impl<'p> super::Vm<'p> {
++    pub(crate) fn observe_computed_property(&mut self, fid: u32, ip: usize, operation: &'static str, key: crate::value::Value) {
++        let Some(rec) = self.property_witnesses.as_ref() else { return; };
++        if rec.events.len() >= rec.limit {
++            self.property_witnesses.as_mut().unwrap().truncated = true;
++            return;
++        }
++        let f = self.func(fid as usize);
++        let (_, start, end) = f.source.parts();
++        let function_name = f.name.clone();
++        let object_key = self.is_object_value(key);
++        // Diagnostic display is non-coercing: unlike ToPropertyKey this
++        // never runs user-defined JS. Keep raw bits to distinguish identities.
++        let key_text = self.display(key);
++        let event = PropertyWitness {
++            function_id: fid,
++            function_name,
++            source_start: start,
++            source_end: end,
++            bytecode_ip: ip,
++            operation,
++            key_bits: key.bits(),
++            key_text,
++            object_key,
++        };
++        self.property_witnesses.as_mut().unwrap().events.push(event);
++    }
++}
++
+ /// Per-VM instrumentation state. Allocated only when a host asks for it.
+ pub(crate) struct Recorder {
+     /// Instructions the script may still execute, NOT counting any chunk
+diff --git a/crates/zipp-vm/src/vm/mod.rs b/crates/zipp-vm/src/vm/mod.rs
+index 1161d14..15c6ebc 100644
+--- a/crates/zipp-vm/src/vm/mod.rs
++++ b/crates/zipp-vm/src/vm/mod.rs
+@@ -1997,6 +1997,9 @@ pub struct Vm<'p> {
+     /// pointer in the hot struct rather than the recorder's whole footprint.
+     #[cfg(feature = "instrument")]
+     pub(crate) instr_rec: Option<Box<instrument::Recorder>>,
++    /// Optional semantic property-observation pilot, separate from ZK traces.
++    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
++    pub(crate) property_witnesses: Option<instrument::PropertyWitnessRecorder>,
+     /// The dispatch hook's countdown, held here rather than in the boxed
+     /// recorder so the per-instruction cost is one decrement and one test
+     /// with no load through the box. With a recorder installed the real
