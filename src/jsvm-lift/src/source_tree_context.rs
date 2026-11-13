@@ -191,6 +191,9 @@ pub struct HandlerContext {
 #[derive(Debug, Clone)]
 pub struct ContextSourceTree {
     pub helpers: Vec<ContextHelper>,
+    /// Names of every helper-capable lexical declaration in this parsed source,
+    /// including definitions not reachable from a captured handler.
+    pub definition_names: BTreeSet<String>,
     pub handlers: Vec<HandlerContext>,
     pub unmatched_names: BTreeSet<String>,
 }
@@ -344,6 +347,7 @@ pub fn reconstruct_context(
     helpers.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(ContextSourceTree {
         helpers,
+        definition_names: by_name.keys().cloned().collect(),
         handlers,
         unmatched_names,
     })
@@ -849,5 +853,38 @@ mod tests {
                 vec!["helper".to_owned()]
             );
         }
+    }
+
+    #[test]
+    fn definition_provenance_comes_from_ast_not_name_prefix_or_string_text() -> Result<()> {
+        let original = concat!(
+            "function root(){",
+            "const __jsvm_binary_rhs_user_0=function(){return 9;};",
+            "const reachable=function(){return __jsvm_binary_rhs_user_0();};",
+            "const quoted='not_a_lexical_definition';",
+            "function disconnected(){return 11;}",
+            "}"
+        );
+        let context = reconstruct_context(
+            original,
+            &[(
+                "handler.js".to_owned(),
+                "const captured=()=>reachable();".to_owned(),
+            )],
+        )?;
+        let definitions = &context.definition_names;
+        assert!(definitions.contains("__jsvm_binary_rhs_user_0"));
+        assert!(definitions.contains("disconnected"));
+        assert!(definitions.contains("reachable"));
+        assert!(!definitions.contains("not_a_lexical_definition"));
+        assert!(context
+            .helpers
+            .iter()
+            .any(|helper| helper.name == "reachable"));
+        assert!(!context
+            .helpers
+            .iter()
+            .any(|helper| helper.name == "disconnected"));
+        Ok(())
     }
 }

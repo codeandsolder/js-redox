@@ -554,7 +554,17 @@ through the existing safe-deobfuscation engine to a checked fixed point
 and *then* its functions are re-extracted under their original lexical
 symbol identities. The alternate `lexical-context/whole-program/` contains
 `readable.js`, a transformation/source-hash report, and a helper index
-with extracted source. The iteration argument is a **cap**, not a requested
+with extracted source. The whole-program helper index distinguishes original lexical helpers
+from derived internal bindings using parsed declaration identities from
+the preserved original source, never generated-name prefixes. Derived
+bindings remain navigable because transformed code may depend on them, but
+they are not counted as recovered original helpers. The v2 helpers.json
+report records binding_origin per entry and separates original_helper_count,
+derived_internal_binding_count and total_definition_count. The whole-context
+summary exposes the same distinction through helper_count (original only),
+derived_internal_binding_count and total_definition_count.
+
+The iteration argument is a **cap**, not a requested
 rewrite count: if a validated fixed point is not reached below it, the
 command fails rather than claiming completion. This additional work is
 opt-in so ordinary source-tree capture runs do not needlessly process the

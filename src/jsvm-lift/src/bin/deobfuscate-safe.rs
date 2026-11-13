@@ -21,7 +21,7 @@ use jsvm_lift::{
 };
 use serde_json::json;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -284,6 +284,7 @@ fn materialize_full_lexical_context(
     original: &str,
     source_inputs: &[(String, String)],
     folder: &Path,
+    original_definition_names: &BTreeSet<String>,
     iterations: usize,
     source_mode: SourceMode,
     budgets: &AnalysisBudgets,
@@ -334,9 +335,13 @@ fn materialize_full_lexical_context(
         "The normal helpers/ files additionally use existing single-trip ",
         "loop reflow and post-reflow simplification. They remain analyst-only ",
         "views, never replacement executable code.\n\n",
-        "## Resolved helpers\n\n",
+        "## Original lexical helpers\n\n",
     ));
     index = index.replace("](readable.js)", &format!("]({file_name})"));
+    let mut original_index = String::new();
+    let mut internal_index = String::new();
+    let mut original_count = 0usize;
+    let mut internal_count = 0usize;
     let mut helper_rows = Vec::new();
     let mut polished_count = 0usize;
     let mut loop_reflows = 0usize;
@@ -361,14 +366,26 @@ fn materialize_full_lexical_context(
             fs::create_dir_all(parent)?;
         }
         fs::write(&path, &polished.source)?;
-        index.push_str(&format!(
+        let from_original = original_definition_names.contains(&helper.name);
+        if from_original {
+            original_count += 1;
+        } else {
+            internal_count += 1;
+        }
+        let entry = format!(
             "- [{}]({}) — [exact full-program extract]({raw_path}){}\n",
             helper.name,
             helper.file,
             if changed { " (polished)" } else { "" },
-        ));
+        );
+        if from_original {
+            original_index.push_str(&entry);
+        } else {
+            internal_index.push_str(&entry);
+        }
         helper_rows.push(json!({
             "name": helper.name,
+            "binding_origin": if from_original { "original_lexical" } else { "derived_internal" },
             "path": helper.file,
             "source_path": raw_path,
             "source_sha256": sha256_hex(helper.source.as_bytes()),
@@ -383,9 +400,21 @@ fn materialize_full_lexical_context(
             "post_return_error": polished.post_return_error,
         }));
     }
+    index.push_str(&original_index);
+    if internal_count > 0 {
+        index
+            .push_str("\n## Derived internal bindings\n\nThese bindings occur in the transformed ");
+        index.push_str("readable program, but not among the declarations of the exact original ");
+        index.push_str("lexical program. They remain navigable dependencies, not recovered ");
+        index.push_str("original helpers.\n\n");
+        index.push_str(&internal_index);
+    }
     let helper_report = json!({
-        "schema": "jsvm-whole-lexical-helper-projections/v1",
+        "schema": "jsvm-whole-lexical-helper-projections/v2",
         "source": file_name,
+        "original_helper_count": original_count,
+        "derived_internal_binding_count": internal_count,
+        "total_definition_count": alternate.helpers.len(),
         "polished_count": polished_count,
         "loop_reflows": loop_reflows,
         "helpers": helper_rows,
@@ -402,7 +431,9 @@ fn materialize_full_lexical_context(
         "output_sha256": outcome.report.output_sha256,
         "iterations": outcome.report.iterations,
         "max_iterations": iterations,
-        "helper_count": alternate.helpers.len(),
+        "helper_count": original_count,
+        "derived_internal_binding_count": internal_count,
+        "total_definition_count": alternate.helpers.len(),
         "helper_polished_count": polished_count,
         "helper_loop_reflows": loop_reflows,
         "helper_report": "lexical-context/whole-program/helpers.json",
@@ -1366,6 +1397,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 &original,
                 &source_inputs,
                 &folder,
+                &context.definition_names,
                 iterations,
                 SourceMode::for_path(context_path),
                 &budgets,
@@ -3046,6 +3078,87 @@ mod tests {
         });
         assert!(error.is_err());
         assert_eq!(fs::read_to_string(input.join("a.js"))?, "const a=1;");
+        Ok(())
+    }
+    #[test]
+    fn source_tree_whole_context_separates_original_helpers_from_generated_bindings() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let full = concat!(
+            "function root(){const helper=function(H,log){",
+            "if(H.length<(H.length<(log.push('effect'),2)))",
+            "log.push('then');return log.length;",
+            "};const irrelevant='__jsvm_binary_rhs_0_0';}"
+        );
+        fs::write(&original, full)?;
+        let captured = "const captured=()=>helper([],[]);";
+        fs::write(input.join("handler.js"), captured)?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            context_full_iterations: Some(48),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+
+        let lexical = output.join("lexical-context");
+        assert_eq!(fs::read_to_string(lexical.join("original.js"))?, full);
+        assert!(fs::read_to_string(output.join("handler.js"))?.contains("helper([], [])"));
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(lexical.join("context.json"))?)?;
+        assert_eq!(metadata["helper_count"], 1, "{metadata}");
+        let whole = &metadata["full_context"];
+        let folder = lexical.join("whole-program");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(folder.join("helpers.json"))?)?;
+        assert_eq!(report["schema"], "jsvm-whole-lexical-helper-projections/v2");
+        assert_eq!(whole["helper_count"], 1, "{whole}");
+        assert_eq!(report["original_helper_count"], 1, "{report}");
+        assert_eq!(report["derived_internal_binding_count"], 2, "{report}");
+        assert_eq!(whole["derived_internal_binding_count"], 2, "{whole}");
+        assert_eq!(whole["total_definition_count"], 3, "{whole}");
+        let helpers = report["helpers"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("missing helper projections"))?;
+        assert_eq!(helpers.len(), 3, "{report}");
+        for row in helpers {
+            let origin = row["binding_origin"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing binding origin"))?;
+            if row["name"] == "helper" {
+                assert_eq!(origin, "original_lexical");
+            } else {
+                assert_eq!(origin, "derived_internal");
+            }
+            let relative = row["source_path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing raw source path"))?;
+            let exact = fs::read(folder.join(relative))?;
+            assert_eq!(sha256_hex(&exact), row["source_sha256"]);
+            let relative = row["path"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing polished source path"))?;
+            let polished = fs::read(folder.join(relative))?;
+            assert_eq!(sha256_hex(&polished), row["polished_sha256"]);
+        }
+        let index = fs::read_to_string(folder.join("README.md"))?;
+        let original_heading = index
+            .find("## Original lexical helpers")
+            .ok_or_else(|| anyhow::anyhow!("original helper section missing"))?;
+        let internal_heading = index
+            .find("## Derived internal bindings")
+            .ok_or_else(|| anyhow::anyhow!("internal binding section missing"))?;
+        let original_helper = index
+            .find("- [helper]")
+            .ok_or_else(|| anyhow::anyhow!("original helper navigation missing"))?;
+        assert!(original_heading < original_helper && original_helper < internal_heading);
         Ok(())
     }
 }
