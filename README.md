@@ -558,7 +558,7 @@ with extracted source. The whole-program helper index distinguishes original lex
 from derived internal bindings using parsed declaration identities from
 the preserved original source, never generated-name prefixes. Derived
 bindings remain navigable because transformed code may depend on them, but
-they are not counted as recovered original helpers. The v2 helpers.json
+they are not counted as recovered original helpers. The v3 helpers.json
 report records binding_origin per entry and separates original_helper_count,
 derived_internal_binding_count and total_definition_count. The whole-context
 summary exposes the same distinction through helper_count (original only),
@@ -575,7 +575,15 @@ A detached helper can fail to prove an enclosing identifier binding,
 so it may retain an opaque assignment sequence that the context-aware
 view safely reconstructs. The full-context **derived helper files** then
 go through the same single-trip loop reflow and post-reflow control-flow
-polishing as ordinary helper views. Each exact source-backed helper extract
+polishing as ordinary helper views. Long derived expressions also get the
+same AST-verified, whitespace-only `expression-layouts/`, nested assignment
+`assignment-outlines/`, and deep-call `call-spines/` as original lexical
+helpers. These links are included in the whole-program helper index. The
+layouts insert whitespace only, retaining identical AST code generation;
+the assignment outlines describe containment, **not execution order**.
+Each view records its source hash and generated artifact hash in the
+whole-program `helpers.json` v3 report, without modifying the polished
+helper or its source-backed extract. Every exact source-backed helper extract
 is kept separately in \`whole-program/source-helpers/\`, with a per-helper
 \`helpers.json\` report recording both source hashes, which polishing
 passes ran, and any remaining reflow errors. Thus the improved lexical

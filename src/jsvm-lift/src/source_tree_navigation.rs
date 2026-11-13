@@ -1,4 +1,4 @@
-//! Structural source-navigation views for original lexical helpers.
+//! Structural source-navigation views for original or derived lexical helpers.
 //!
 //! A deep-call spine and optional whitespace-only expression layout are
 //! derived independently. Neither represents a proposed evaluation order or
@@ -23,7 +23,7 @@ const LONG_EXPRESSION_BYTES: usize = 160;
 /// every ancestor row; the byte range still identifies its exact source.
 const MAX_INLINE_ASSIGNMENT_RHS_BYTES: usize = 96;
 
-/// Independent, non-executable navigation projections of the same original
+/// Independent, non-executable navigation projections of the same supplied
 /// lexical helper. The layout only inserts whitespace between AST tokens.
 #[derive(Default)]
 pub struct HelperNavigation {

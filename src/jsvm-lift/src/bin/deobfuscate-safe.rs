@@ -335,6 +335,11 @@ fn materialize_full_lexical_context(
         "The normal helpers/ files additionally use existing single-trip ",
         "loop reflow and post-reflow simplification. They remain analyst-only ",
         "views, never replacement executable code.\n\n",
+        "Expression layouts insert only AST-verified whitespace, checked against ",
+        "the original AST code generation. Assignment outlines describe source ",
+        "containment rather than execution order or safe assignments to hoist. ",
+        "Their spans refer to each derived helper source, not the captured ",
+        "original.\n\n",
         "## Original lexical helpers\n\n",
     ));
     index = index.replace("](readable.js)", &format!("]({file_name})"));
@@ -342,6 +347,9 @@ fn materialize_full_lexical_context(
     let mut internal_index = String::new();
     let mut original_count = 0usize;
     let mut internal_count = 0usize;
+    let mut layout_rows = Vec::new();
+    let mut assignment_outline_rows = Vec::new();
+    let mut call_spine_rows = Vec::new();
     let mut helper_rows = Vec::new();
     let mut polished_count = 0usize;
     let mut loop_reflows = 0usize;
@@ -366,18 +374,86 @@ fn materialize_full_lexical_context(
             fs::create_dir_all(parent)?;
         }
         fs::write(&path, &polished.source)?;
+        // Structural navigation is byte-preserving source layout, not
+        // another semantic pass. Reuse the same AST-verified projection used
+        // by original lexical helpers, applied after whole-context polishing.
+        let mut layout_path = None;
+        let mut outline_path = None;
+        let mut call_spine_path = None;
+        if let Some(view) = helper_navigation(&polished.source, &helper.file) {
+            let stem = helper
+                .file
+                .strip_prefix("helpers/")
+                .unwrap_or(helper.file.as_str())
+                .trim_end_matches(".js");
+            if view.layout != polished.source {
+                let relative = format!("expression-layouts/{stem}.js");
+                let target = directory.join(&relative);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&target, &view.layout)?;
+                layout_rows.push(json!({
+                    "name": helper.name,
+                    "path": relative,
+                    "source_sha256": sha256_hex(polished.source.as_bytes()),
+                    "layout_sha256": sha256_hex(view.layout.as_bytes()),
+                }));
+                layout_path = Some(relative);
+            }
+            if let Some(outline) = view.assignment_outline_markdown {
+                let relative = format!("assignment-outlines/{stem}.md");
+                let target = directory.join(&relative);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(target, &outline)?;
+                assignment_outline_rows.push(json!({
+                    "name": helper.name,
+                    "path": relative,
+                    "source_sha256": sha256_hex(polished.source.as_bytes()),
+                    "outline_sha256": sha256_hex(outline.as_bytes()),
+                }));
+                outline_path = Some(relative);
+            }
+            if let Some(spine) = view.call_spine_markdown {
+                let relative = format!("call-spines/{stem}.md");
+                let target = directory.join(&relative);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(target, &spine)?;
+                call_spine_rows.push(json!({
+                    "name": helper.name,
+                    "path": relative,
+                    "source_sha256": sha256_hex(polished.source.as_bytes()),
+                    "spine_sha256": sha256_hex(spine.as_bytes()),
+                }));
+                call_spine_path = Some(relative);
+            }
+        }
         let from_original = original_definition_names.contains(&helper.name);
         if from_original {
             original_count += 1;
         } else {
             internal_count += 1;
         }
-        let entry = format!(
-            "- [{}]({}) — [exact full-program extract]({raw_path}){}\n",
+        let mut entry = format!(
+            "- [{}]({}) — [exact full-program extract]({raw_path}){}",
             helper.name,
             helper.file,
             if changed { " (polished)" } else { "" },
         );
+        if let Some(path) = &layout_path {
+            entry.push_str(&format!(" · [expression layout]({path})"));
+        }
+        if let Some(path) = &outline_path {
+            entry.push_str(&format!(" · [assignment outline]({path})"));
+        }
+        if let Some(path) = &call_spine_path {
+            entry.push_str(&format!(" · [call spine]({path})"));
+        }
+        entry.push('\n');
         if from_original {
             original_index.push_str(&entry);
         } else {
@@ -386,6 +462,9 @@ fn materialize_full_lexical_context(
         helper_rows.push(json!({
             "name": helper.name,
             "binding_origin": if from_original { "original_lexical" } else { "derived_internal" },
+            "layout_path": layout_path,
+            "assignment_outline_path": outline_path,
+            "call_spine_path": call_spine_path,
             "path": helper.file,
             "source_path": raw_path,
             "source_sha256": sha256_hex(helper.source.as_bytes()),
@@ -410,11 +489,17 @@ fn materialize_full_lexical_context(
         index.push_str(&internal_index);
     }
     let helper_report = json!({
-        "schema": "jsvm-whole-lexical-helper-projections/v2",
+        "schema": "jsvm-whole-lexical-helper-projections/v3",
         "source": file_name,
         "original_helper_count": original_count,
         "derived_internal_binding_count": internal_count,
         "total_definition_count": alternate.helpers.len(),
+        "layout_count": layout_rows.len(),
+        "assignment_outline_count": assignment_outline_rows.len(),
+        "call_spine_count": call_spine_rows.len(),
+        "expression_layouts": layout_rows,
+        "assignment_outlines": assignment_outline_rows,
+        "call_spines": call_spine_rows,
         "polished_count": polished_count,
         "loop_reflows": loop_reflows,
         "helpers": helper_rows,
@@ -434,6 +519,9 @@ fn materialize_full_lexical_context(
         "helper_count": original_count,
         "derived_internal_binding_count": internal_count,
         "total_definition_count": alternate.helpers.len(),
+        "helper_layout_count": helper_report["layout_count"],
+        "helper_assignment_outline_count": helper_report["assignment_outline_count"],
+        "helper_call_spine_count": helper_report["call_spine_count"],
         "helper_polished_count": polished_count,
         "helper_loop_reflows": loop_reflows,
         "helper_report": "lexical-context/whole-program/helpers.json",
@@ -3118,7 +3206,7 @@ mod tests {
         let folder = lexical.join("whole-program");
         let report: serde_json::Value =
             serde_json::from_slice(&fs::read(folder.join("helpers.json"))?)?;
-        assert_eq!(report["schema"], "jsvm-whole-lexical-helper-projections/v2");
+        assert_eq!(report["schema"], "jsvm-whole-lexical-helper-projections/v3");
         assert_eq!(whole["helper_count"], 1, "{whole}");
         assert_eq!(report["original_helper_count"], 1, "{report}");
         assert_eq!(report["derived_internal_binding_count"], 2, "{report}");
@@ -3159,6 +3247,90 @@ mod tests {
             .find("- [helper]")
             .ok_or_else(|| anyhow::anyhow!("original helper navigation missing"))?;
         assert!(original_heading < original_helper && original_helper < internal_heading);
+        Ok(())
+    }
+    #[test]
+    fn source_tree_derived_assignment_layout_retains_code_and_provenance() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("readable");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let long_sequence = (0..26)
+            .map(|index| format!("U.member{index}={index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let full = format!(
+            "function root(){{const init=function(U){{\
+             U.R=(U.n0=(U.deep=({long_sequence})));return U;\
+             }};}}"
+        );
+        fs::write(&original, &full)?;
+        fs::write(input.join("handler.js"), "const captured=()=>init({});")?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            context_full_iterations: Some(48),
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let lexical = output.join("lexical-context");
+        assert_eq!(fs::read_to_string(lexical.join("original.js"))?, full);
+        let whole = lexical.join("whole-program");
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(whole.join("helpers.json"))?)?;
+        assert_eq!(report["schema"], "jsvm-whole-lexical-helper-projections/v3");
+        let helper = report["helpers"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == "init"))
+            .ok_or_else(|| anyhow::anyhow!("missing initial helper"))?;
+        assert_eq!(helper["binding_origin"], "original_lexical");
+        let source_path = helper["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing helper path"))?;
+        let layout_path = helper["layout_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing derived expression layout"))?;
+        let outline_path = helper["assignment_outline_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing derived assignment outline"))?;
+        let polished = fs::read_to_string(whole.join(source_path))?;
+        let layout = fs::read_to_string(whole.join(layout_path))?;
+        let outline = fs::read_to_string(whole.join(outline_path))?;
+        assert!(outline.contains("U.R"), "{outline}");
+        assert!(outline.contains("U.n0"), "{outline}");
+        assert!(outline.contains("containment"), "{outline}");
+        assert!(layout.lines().count() > polished.lines().count());
+        let max_line = |source: &str| source.lines().map(str::len).max().unwrap_or_default();
+        assert!(max_line(&layout) < max_line(&polished), "{layout}");
+        let expected = super::helper_navigation(&polished, source_path)
+            .ok_or_else(|| anyhow::anyhow!("expected AST-derived navigation"))?;
+        assert_eq!(layout, expected.layout);
+        assert_eq!(helper["polished_sha256"], sha256_hex(polished.as_bytes()));
+        let layout_record = report["expression_layouts"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == "init"))
+            .ok_or_else(|| anyhow::anyhow!("missing layout report"))?;
+        assert_eq!(layout_record["source_sha256"], helper["polished_sha256"]);
+        assert_eq!(
+            layout_record["layout_sha256"],
+            sha256_hex(layout.as_bytes())
+        );
+        let outline_record = report["assignment_outlines"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == "init"))
+            .ok_or_else(|| anyhow::anyhow!("missing outline report"))?;
+        assert_eq!(outline_record["source_sha256"], helper["polished_sha256"]);
+        assert_eq!(
+            outline_record["outline_sha256"],
+            sha256_hex(outline.as_bytes())
+        );
+        let index = fs::read_to_string(whole.join("README.md"))?;
+        assert!(index.contains(layout_path), "{index}");
+        assert!(index.contains(outline_path), "{index}");
         Ok(())
     }
 }
