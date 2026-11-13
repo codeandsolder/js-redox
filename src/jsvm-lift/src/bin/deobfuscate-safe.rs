@@ -560,7 +560,15 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 );
                 fs::create_dir_all(folder.join("binding-writes"))?;
                 let mut report = format!(
-                    "# Resolved lexical writes to {}\n\n                     [Original source](../original.js) · [initial definition](../{})\n\n                     Source-resolved syntactic write sites, not an execution                      trace or reaching-definition proof. Nested functions                      execute only when invoked. Byte spans refer to the                      original lexical source.\n\n                     | Reference bytes | Operation bytes | Kind | Function | Expression |\n                     |---|---|---|---|---|\n",
+                    concat!(
+                        "# Resolved lexical writes to {}\n\n",
+                        "[Original source](../original.js) · [initial definition](../{})\n\n",
+                        "Source-resolved syntactic write sites, not an execution trace ",
+                        "or reaching-definition proof. Nested functions execute only ",
+                        "when invoked. Byte spans refer to the original lexical source.\n\n",
+                        "| Reference bytes | Operation bytes | Kind | Function | Expression |\n",
+                        "|---|---|---|---|---|\n",
+                    ),
                     helper.name, relative,
                 );
                 for site in &helper.write_sites {
@@ -620,9 +628,12 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             }));
         }
         if !binding_write_rows.is_empty() {
-            let mut index = String::from(
-                "# Original lexical binding writes\n\n                 Linked mutable bindings with all source-resolved syntactic                  write sites. Function nesting is lexical, not a reaching-definition                  or execution-order proof.\n\n",
-            );
+            let mut index = String::from(concat!(
+                "# Original lexical binding writes\n\n",
+                "Linked mutable bindings with all source-resolved syntactic ",
+                "write sites. Function nesting is lexical, not a reaching-definition ",
+                "or execution-order proof.\n\n",
+            ));
             for (name, path) in &binding_write_rows {
                 index.push_str(&format!(
                     "- [{}]({})\n",
@@ -634,9 +645,11 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
             helper_index.push_str(
                 "\n[Browse original resolved binding writes](binding-writes/README.md).\n",
             );
-            md.push_str(
-                "\n## Mutable lexical binding provenance\n\n                 [Inspect source-resolved write sites](lexical-context/binding-writes/README.md).                  These are not executed-write or reaching-definition guarantees.\n\n",
-            );
+            md.push_str(concat!(
+                "\n## Mutable lexical binding provenance\n\n",
+                "[Inspect source-resolved write sites](lexical-context/binding-writes/README.md). ",
+                "These are not executed-write or reaching-definition guarantees.\n\n",
+            ));
         }
         if !call_layout_rows.is_empty() {
             let mut index = String::from(
@@ -2013,6 +2026,12 @@ mod tests {
         ));
         let content = fs::read_to_string(report)?;
         assert!(content.contains("Hm=88>>2"), "{content}");
+        assert!(
+            content.lines().any(|line| line
+                == "| Reference bytes | Operation bytes | Kind | Function | Expression |"),
+            "the write-site Markdown must have an actual table header: {content}"
+        );
+
         assert!(content.contains("Hm++"), "{content}");
         assert!(content.contains("not an execution"), "{content}");
         assert!(fs::read_to_string(folder.join("binding-writes/README.md"))?.contains("Hm"));
