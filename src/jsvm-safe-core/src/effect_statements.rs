@@ -213,7 +213,7 @@ fn conditional_rhs<'a, 'e>(
 /// A conditional expression is not an anonymous function definition, whereas
 /// a new assignment at a leaf could infer a name for an anonymous function,
 /// class or arrow. Reject any tree containing such a leaf.
-fn conditional_has_name_hazard(expr: &Expression<'_>, depth: usize) -> bool {
+pub(crate) fn conditional_has_name_hazard(expr: &Expression<'_>, depth: usize) -> bool {
     if depth > 96 {
         return true;
     }
@@ -808,7 +808,7 @@ mod tests {
                     output.find("trace.push('right')")
                 ),
                 (Some(first), Some(assign), Some(test), Some(right))
-                    if first < assign && assign < test && test < right
+                    if first < assign && assign < right && right < test
             ),
             "initial comma must stay before the right operand: {output}"
         );
@@ -816,9 +816,8 @@ mod tests {
     }
 
     #[test]
-    fn never_splits_conditional_or_second_binary_operand_comma() -> Result<(), BudgetExceeded> {
+    fn never_splits_guarded_or_noninitial_comma_effects() -> Result<(), BudgetExceeded> {
         for input in [
-            "function f(a,b){if(a<(log('right'),b))ok();}",
             "function f(a,b){if(a&&((log('guarded'),b)<3))ok();}",
             "function f(a,b){if((read()+((log('late'),b)))<3)ok();}",
             "function f(a,b){if(((log('callee'),eval)('a'))<3)ok();}",
@@ -826,8 +825,7 @@ mod tests {
         ] {
             let output = rewritten(input)?;
             assert!(
-                !output.contains("(log('right'));")
-                    && !output.contains("(log('guarded'));")
+                !output.contains("(log('guarded'));")
                     && !output.contains("(log('late'));")
                     && !output.contains("(log('callee'));")
                     && !output.contains("(log('part'));"),

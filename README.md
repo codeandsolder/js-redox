@@ -419,6 +419,20 @@ remain intact; only a syntactically first sequence with unambiguous
 comment boundaries is eligible. This exposes initializer effects
 hidden inside comparisons without guessing assigned values.
 
+The new if_binary_rhs_effect_lifting pass recovers comma effects on the
+**right** side of nested binary comparisons, where hoisting without
+capturing earlier values would reorder property getters and coercions.
+It captures each earlier operand through GetValue (without ToPrimitive) in
+fresh block-scoped const bindings, then evaluates the comma-prefix effects
+before the original comparison. Conditional/logical branches are not lifted.
+A direct eval or Annex-B function declaration inside the affected if tree
+blocks the rewrite because the introduced scope might be observable.
+The names are unique across the complete source, and the existing inert
+comma optimizer now preserves commas that suppress anonymous function,
+arrow, class, and conditional-branch name inference.
+All emitted source remains a separate analyst-only view; original captured
+bytes and precise source-backed extracts are retained separately.
+
 The `assignment_conditional_lowering` pass restores ordinary `if/else`
 control flow from a discarded assignment statement whose right-hand side
 is a nested conditional expression. The assignment target must be a

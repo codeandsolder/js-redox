@@ -1,5 +1,6 @@
 mod base91;
 mod base91_recovery;
+mod binary_rhs_reflow;
 mod bitwise_algebra;
 mod bitwise_effects;
 mod browser_legacy;
@@ -662,6 +663,10 @@ impl Collector<'_, '_> {
                     effect_statements::lower_if_test_first_member_object(branch, self.source)
                 {
                     self.push(branch.span, code, "if_guard_member_prefix_lowering");
+                } else if let Some(code) =
+                    binary_rhs_reflow::lower_if_binary_rhs_sequences(branch, self.source)
+                {
+                    self.push(branch.span, code, "if_binary_rhs_effect_lifting");
                 }
             }
         }

@@ -85,9 +85,11 @@ fn runtime_equivalent(scratch: &Path, label: &str, before: &str, after: &str) ->
     let after_path = scratch.join(format!("{label}.after.js"));
     fs::write(&before_path, before)?;
     fs::write(&after_path, after)?;
+    let before_output = node(&before_path, false)?;
+    let after_output = node(&after_path, false)?;
     assert_eq!(
-        node(&before_path, false)?,
-        node(&after_path, false)?,
+        String::from_utf8_lossy(&before_output),
+        String::from_utf8_lossy(&after_output),
         "{label}"
     );
     Ok(())
@@ -649,4 +651,83 @@ fn depythonify_safe_deob_real_et_external_corpus() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[test]
+#[ignore = "requires Node; run the focused test explicitly"]
+fn if_binary_rhs_effect_lifting_runtime_equivalence() -> Result<()> {
+    let source = r#"
+function run(mode) {
+  const events = [];
+  let reads = 0;
+  const U = {};
+  const H = new Proxy({}, {
+    get(_, key) {
+      if (key !== 'length') return undefined;
+      const n = ++reads;
+      events.push('getter:' + n);
+      if (mode === 4 && n === 2) throw new Error('getter-failed');
+      return {
+        [Symbol.toPrimitive](hint) {
+          events.push('primitive:' + n + ':' + hint);
+          if (mode === 3) throw new Error('coercion-failed');
+          return mode === 1 ? 1 - n : n;
+        }
+      };
+    }
+  });
+  function effect(name) { events.push('effect:' + name); return 2; }
+  try {
+    if (H.length < (H.length < (U.fO = void 0, (U.Bn = [], (effect('third'), 2)))))
+        events.push('then');
+    else events.push('else');
+  } catch (e) { events.push('catch:' + e.message); }
+  events.push('fields:' + Object.keys(U).join(','));
+
+  const prior = Function.prototype[Symbol.toPrimitive];
+  Function.prototype[Symbol.toPrimitive] = function() {
+    events.push('function-name:' + this.name);
+    return 1;
+  };
+  try {
+    if (function(){} < (effect('anonymous'), 3))
+      events.push('fn-matched');
+    if ((()=>1) < (effect('arrow'),3)) events.push('arrow-matched');
+    if ((class {}) < (effect('class'),3)) events.push('class-matched');
+    if ((mode ? function(){} : class {}) < (effect('conditional-name'),3))
+      events.push('conditional-matched');
+  } finally {
+    if (prior === undefined) delete Function.prototype[Symbol.toPrimitive];
+    else Function.prototype[Symbol.toPrimitive] = prior;
+  }
+
+  try {
+    if (mode < (effect('first'), (mode < (effect('second'), 2))))
+      events.push('numbers-then');
+    else events.push('numbers-else');
+  } catch (e) { events.push('numbers-throw:' + e.message); }
+  return events;
+}
+console.log(JSON.stringify(Array.from({length:5},(_, mode) => run(mode))));
+"#;
+    let result = deobfuscate_source(
+        source,
+        "if-binary-rhs-effect-lifting-runtime",
+        SourceMode::Auto,
+        32,
+        false,
+        &budget("if-binary-rhs-effect-lifting-runtime"),
+    )?;
+    assert!(
+        count(&result.report, "if_binary_rhs_effect_lifting") >= 2,
+        "{:?}",
+        result.report.transforms
+    );
+    let scratch = TempDir::new()?;
+    runtime_equivalent(
+        scratch.path(),
+        "if-binary-rhs-effect-lifting",
+        source,
+        &result.source,
+    )
 }

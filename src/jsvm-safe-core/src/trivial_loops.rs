@@ -125,7 +125,14 @@ pub(crate) fn prune_inert_sequence_values(
             retained.push(fragment(source, candidate.span()));
         }
     }
-    if removed == 0 || (retained.is_empty() && !inherently_value(last)) {
+    // Removing the final comma would expose a NamedEvaluation context if
+    // a const or assignment receives an anonymous function/class/arrow.
+    // Retain the comma when it is the only thing suppressing name inference.
+    if removed == 0
+        || (retained.is_empty()
+            && (!inherently_value(last)
+                || crate::effect_statements::conditional_has_name_hazard(last, 0)))
+    {
         return None;
     }
     retained.push(fragment(source, last.span()));
