@@ -156,6 +156,8 @@ pub struct ArgumentLink {
     pub positional: bool,
     pub caller_param_index: Option<usize>,
     pub caller_param: Option<String>,
+    /// Syntactically direct this, not an aliased or spread expression.
+    pub is_direct_this: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -169,6 +171,12 @@ pub struct CallLink {
     pub arguments: Vec<ArgumentLink>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ConstructedReceiver {
+    pub constructor: String,
+    pub new_call_span: [u32; 2],
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ForwardedParameter {
     pub param: String,
@@ -178,6 +186,9 @@ pub struct ForwardedParameter {
     pub from_entry_index: Option<usize>,
     pub from_entry: Option<String>,
     pub input_expression: String,
+    /// Only proven along this exact statically resolved path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constructed_receiver: Option<ConstructedReceiver>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -478,6 +489,11 @@ impl Calls<'_> {
                     positional,
                     caller_param: forward.map(|idx| caller.params[idx].0.clone()),
                     caller_param_index: forward,
+                    is_direct_this: positional
+                        && matches!(
+                            arg.as_expression().map(unparen),
+                            Some(Expression::ThisExpression(_))
+                        ),
                 }
             })
             .collect();
@@ -535,6 +551,7 @@ impl PathWalker<'_> {
         &mut self,
         current: FunctionKey,
         origin: &[Option<usize>],
+        constructed: &[Option<ConstructedReceiver>],
         names: &mut Vec<String>,
         spans: &mut Vec<[u32; 2]>,
         links: &mut Vec<CallLink>,
@@ -568,6 +585,35 @@ impl PathWalker<'_> {
                     })
                 })
                 .collect::<Vec<_>>();
+            // The preceding edge must construct precisely this resolved
+            // function. Its own direct this argument is then a fresh receiver.
+            let constructor_here = links.last().and_then(|incoming| {
+                (incoming.kind == "new" && incoming.callee == edge.caller).then(|| {
+                    ConstructedReceiver {
+                        constructor: incoming.callee.clone(),
+                        new_call_span: incoming.span,
+                    }
+                })
+            });
+            let next_constructed = target
+                .params
+                .iter()
+                .enumerate()
+                .map(|(index, (_, binding))| {
+                    binding.and_then(|_| {
+                        edge.arguments.get(index).and_then(|argument| {
+                            argument
+                                .caller_param_index
+                                .and_then(|i| constructed.get(i).cloned().flatten())
+                                .or_else(|| {
+                                    (argument.is_direct_this && argument.positional)
+                                        .then(|| constructor_here.clone())
+                                        .flatten()
+                                })
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
             names.push(target.label.clone());
             spans.push([next.0, next.1]);
             links.push(edge.clone());
@@ -587,6 +633,7 @@ impl PathWalker<'_> {
                                 .arguments
                                 .get(index)
                                 .map_or_else(|| "<omitted>".into(), |a| a.expression.clone()),
+                            constructed_receiver: next_constructed[index].clone(),
                         }
                     })
                     .collect();
@@ -597,7 +644,15 @@ impl PathWalker<'_> {
                     leaf_parameters,
                 });
             }
-            self.walk(*next, &next_origins, names, spans, links, visited);
+            self.walk(
+                *next,
+                &next_origins,
+                &next_constructed,
+                names,
+                spans,
+                links,
+                visited,
+            );
             names.pop();
             spans.pop();
             links.pop();
@@ -760,6 +815,14 @@ fn format_view(view: &CallerView, original: &str) -> String {
         }
         output.push_str("\n**Leaf parameter provenance:**\n\n");
         for param in &path.leaf_parameters {
+            if let Some(receiver) = &param.constructed_receiver {
+                output.push_str(&format!(
+                    "- {} (parameter {}) comes from fresh receiver of new {} at source bytes {}..{}; inherited property behavior remains dynamic\n",
+                    param.param, param.index, receiver.constructor,
+                    receiver.new_call_span[0], receiver.new_call_span[1]
+                ));
+                continue;
+            }
             match (&param.from_entry, &param.from_entry_index) {
                 (Some(name), Some(index)) => output.push_str(&format!(
                     "- `{}` (parameter {}) ← entry `{}` (parameter {})\n",
@@ -972,6 +1035,7 @@ pub fn reconstruct_caller_views(
         walker.walk(
             *root,
             &origin,
+            &vec![None; def.params.len()],
             &mut vec![def.label.clone()],
             &mut vec![[root.0, root.1]],
             &mut Vec::new(),
@@ -1321,6 +1385,46 @@ mod tests {
         assert!(views[0]
             .source
             .contains("`a` (parameter 0) ← entry `J` (parameter 0)"));
+        Ok(())
+    }
+
+    #[test]
+    fn construction_receiver_propagates_through_exact_forwarding() -> anyhow::Result<()> {
+        let source = r#"function outer() {
+          const leaf = state => state;
+          const middle = value => leaf(value);
+          const Wd = function(input) { middle((this)); };
+          const AV = {}; AV.aoF_ = function(arg) { return new Wd(arg); };
+        }"#;
+        let view = reconstruct_caller_views(source, Some("aoF_"))?.remove(0);
+        let path = view
+            .paths
+            .iter()
+            .find(|p| p.functions == [".aoF_", "Wd", "middle", "leaf"])
+            .ok_or_else(|| anyhow::anyhow!("missing resolved path"))?;
+        let receiver = path.leaf_parameters[0]
+            .constructed_receiver
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("fresh this origin missing"))?;
+        assert_eq!(receiver.constructor, "Wd");
+        assert!(path.leaf_parameters[0].from_entry_index.is_none());
+        assert!(view.source.contains("fresh receiver of new Wd"));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_calls_and_forwarded_objects_do_not_prove_fresh_receivers() -> anyhow::Result<()> {
+        for source in [
+          "const leaf=x=>x;const Wd=function(){leaf(this)};const api={};api.run=()=>Wd();",
+          "const leaf=x=>x;const Wd=function(x){leaf(x)};const api={};api.run=(obj)=>new Wd(obj);",
+        ] {
+            let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
+            let path = view.paths.iter()
+                .find(|p| p.functions.last().is_some_and(|name| name == "leaf"))
+                .ok_or_else(|| anyhow::anyhow!("missing leaf"))?;
+            assert!(path.leaf_parameters[0].constructed_receiver.is_none(),
+                "unsound construction proof: {path:?}");
+        }
         Ok(())
     }
 

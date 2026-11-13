@@ -553,6 +553,18 @@ unchanged forwarding. This is a static may-flow analysis, not evidence that
 all syntactic paths execute. The browsable path examples intentionally stop
 after four call edges to avoid exponential path enumeration; the complete
 graph and parameter origins do not.
+On individual resolved paths, the caller report can also recognize a
+**fresh constructor receiver** passed as an actual this-expression argument.
+For example, when an exported function invokes a stable function with new
+and that constructor immediately passes its own this to a helper, the helper's
+parameter is tagged with the constructor's original callsite byte span.
+The label follows exact unchanged parameter forwarding, but never treats a
+supplied object or an ordinary function call as a newly allocated receiver.
+This proves the receiver's allocation along that path, **not** the absence
+of effectful inherited setters or proxies in its prototype chain, and does
+not imply all runtime invocations follow that path. The complete may-flow
+table retains unknown/non-entry possibilities from other callsites.
+
 The entry member is optional; no provider-specific code or entrypoint name
 is baked in.
 
