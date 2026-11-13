@@ -272,6 +272,54 @@ for (const selector of [0,1,2,3,4,5,-1]) {
 
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
+fn if_guard_binary_left_sequence_runtime_equivalence() -> Result<()> {
+    let source = r#"
+function run(flag) {
+    const events = [];
+    const obj = new Proxy({value: 3}, {
+        get(target,key) { events.push('get:' + String(key)); return target[key]; }
+    });
+    const right = { valueOf() { events.push('right-value'); return 5; } };
+    let assigned = 0;
+    if (((assigned = (events.push('prepare'), obj), obj.value) < right))
+        events.push('matched');
+    events.push('same:' + (assigned === obj));
+    if (((eval('var lexical = 17'),obj.value) < right))
+        events.push('direct-eval:' + lexical);
+    if (flag && ((events.push('guarded'),obj.value) < right))
+        events.push('guarded-yes');
+    try {
+        if (((events.push('throw'),(() => { throw Error('stop'); })(),obj.value) < right))
+            events.push('unreachable');
+    } catch (error) { events.push('caught:' + error.message); }
+    return events;
+}
+console.log(JSON.stringify([run(false), run(true)]));
+"#;
+    let result = deobfuscate_source(
+        source,
+        "if-guard-binary-left-sequence-runtime",
+        SourceMode::Auto,
+        16,
+        false,
+        &budget("if-guard-binary-left-sequence-runtime"),
+    )?;
+    assert!(
+        count(&result.report, "if_guard_binary_left_sequence_lowering") >= 1,
+        "{:?}",
+        result.report.transforms
+    );
+    let scratch = TempDir::new()?;
+    runtime_equivalent(
+        scratch.path(),
+        "if-guard-binary-left-sequence",
+        source,
+        &result.source,
+    )
+}
+
+#[test]
+#[ignore = "requires Node; run the focused test explicitly"]
 fn if_guard_first_member_object_runtime_equivalence() -> Result<()> {
     let source = r#"
 function execute(gate) {

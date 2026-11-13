@@ -442,6 +442,27 @@ fn first_member_object_sequence<'a, 'e>(
     }
 }
 
+/// Split a comma prefix that is the complete first operand of any binary
+/// expression. The left operand is evaluated before the right operand,
+/// so extraction cannot move effects across getters or binary evaluation.
+/// Never descend into second operands, call callees, or guarded branches.
+pub(crate) fn lower_if_test_first_binary_left_sequence(
+    statement: &IfStatement<'_>,
+    source: &str,
+) -> Option<String> {
+    fn binary_left_sequence<'a, 'e>(
+        expression: &'e Expression<'a>,
+    ) -> Option<&'e SequenceExpression<'a>> {
+        match expression {
+            Expression::ParenthesizedExpression(paren) => binary_left_sequence(&paren.expression),
+            Expression::BinaryExpression(binary) => sequence_rhs(&binary.left),
+            _ => None,
+        }
+    }
+    let sequence = binary_left_sequence(&statement.test)?;
+    lower_if_test_first_sequence(statement, sequence, source)
+}
+
 /// Extract a comma prefix from an unconditionally first-evaluated property
 /// object in a sibling if-statement test.
 ///
@@ -457,6 +478,15 @@ pub(crate) fn lower_if_test_first_member_object(
     source: &str,
 ) -> Option<String> {
     let sequence = first_member_object_sequence(&statement.test)?;
+    lower_if_test_first_sequence(statement, sequence, source)
+}
+
+/// The caller must prove the comma is unconditionally first in a sibling if.
+fn lower_if_test_first_sequence(
+    statement: &IfStatement<'_>,
+    sequence: &SequenceExpression<'_>,
+    source: &str,
+) -> Option<String> {
     let (last, prefixes) = sequence.expressions.split_last()?;
     if prefixes.is_empty() {
         return None;
@@ -758,6 +788,52 @@ mod tests {
             ),
             "{output}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn separates_first_binary_left_sequence_preserving_right_operand_order(
+    ) -> Result<(), BudgetExceeded> {
+        let input = "function f(o,limit,trace){let p;if(((p=(trace.push('left'),o),o.value)<(trace.push('right'),limit))){trace.push('yes');}return p;}";
+        let output = rewritten(input)?;
+        assert!(!output.contains("),o.value)<"), "{output}");
+        assert!(output.contains("trace.push('left')"), "{output}");
+        assert!(output.contains("trace.push('right')"), "{output}");
+        assert!(
+            matches!(
+                (
+                    output.find("(trace.push('left'))"),
+                    output.find("p = o;"),
+                    output.find("if("),
+                    output.find("trace.push('right')")
+                ),
+                (Some(first), Some(assign), Some(test), Some(right))
+                    if first < assign && assign < test && test < right
+            ),
+            "initial comma must stay before the right operand: {output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn never_splits_conditional_or_second_binary_operand_comma() -> Result<(), BudgetExceeded> {
+        for input in [
+            "function f(a,b){if(a<(log('right'),b))ok();}",
+            "function f(a,b){if(a&&((log('guarded'),b)<3))ok();}",
+            "function f(a,b){if((read()+((log('late'),b)))<3)ok();}",
+            "function f(a,b){if(((log('callee'),eval)('a'))<3)ok();}",
+            "function f(a,b){if(((log('part')/*comment*/,b))<3)ok();}",
+        ] {
+            let output = rewritten(input)?;
+            assert!(
+                !output.contains("(log('right'));")
+                    && !output.contains("(log('guarded'));")
+                    && !output.contains("(log('late'));")
+                    && !output.contains("(log('callee'));")
+                    && !output.contains("(log('part'));"),
+                "unsafe hoist: {output}"
+            );
+        }
         Ok(())
     }
 

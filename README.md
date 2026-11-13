@@ -410,6 +410,15 @@ comments cannot be hoisted. The property access and branch bodies keep their
 original evaluation context. In source-tree mode, captured source and the
 protected executable are stored independently of rewritten helper views.
 
+The related `if_guard_binary_left_sequence_lowering` extracts a comma
+prefix which is the **entire first operand of a binary expression** in
+a sibling `if` test. Unlike a comma on the comparison's right, these
+effects are unconditionally evaluated before the second operand.
+The original second operand, getter order and branch semantics
+remain intact; only a syntactically first sequence with unambiguous
+comment boundaries is eligible. This exposes initializer effects
+hidden inside comparisons without guessing assigned values.
+
 The `assignment_conditional_lowering` pass restores ordinary `if/else`
 control flow from a discarded assignment statement whose right-hand side
 is a nested conditional expression. The assignment target must be a

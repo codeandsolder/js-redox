@@ -655,6 +655,10 @@ impl Collector<'_, '_> {
                 if let Some(code) = effect_statements::lower_if_test(branch, self.source) {
                     self.push(branch.span, code, "if_test_sequence_lowering");
                 } else if let Some(code) =
+                    effect_statements::lower_if_test_first_binary_left_sequence(branch, self.source)
+                {
+                    self.push(branch.span, code, "if_guard_binary_left_sequence_lowering");
+                } else if let Some(code) =
                     effect_statements::lower_if_test_first_member_object(branch, self.source)
                 {
                     self.push(branch.span, code, "if_guard_member_prefix_lowering");
