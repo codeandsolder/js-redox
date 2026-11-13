@@ -408,6 +408,78 @@ pub(crate) fn lower_member_object_sequence(
     Some(text)
 }
 
+/// Reassociate a member assignment's object comma prefix without escaping
+/// the assignment expression that contains it. Unlike sibling-statement
+/// extraction this works even inside another assignment with an unresolved
+/// global target: the outer LHS reference is still created at the same point.
+///
+/// ((first(), last).property = rhs)
+///    -> (first(), (last).property = rhs)
+///
+/// Every prefix still performs GetValue before the last object value is used
+/// to form the *same* property reference, including computed keys and private
+/// fields. RHS evaluation, setter invocation, compound assignment GetValue,
+/// returned assignment value, and branch/expression completion stay inside
+/// their original expression context. Do not touch call/member *reads*:
+/// commas moved around a call callee can change its receiver (this).
+///
+/// Comments between comma operands or in removed parenthesis boundaries
+/// cannot yet be attached unambiguously, so we refuse such expressions.
+pub(crate) fn reassociate_member_target_comma(
+    assignment: &AssignmentExpression<'_>,
+    source: &str,
+) -> Option<String> {
+    let object = match &assignment.left {
+        AssignmentTarget::StaticMemberExpression(member) if !member.optional => &member.object,
+        AssignmentTarget::ComputedMemberExpression(member) if !member.optional => &member.object,
+        AssignmentTarget::PrivateFieldExpression(member) if !member.optional => &member.object,
+        _ => return None,
+    };
+    let sequence = sequence_rhs(object)?;
+    let (last, prefixes) = sequence.expressions.split_last()?;
+    if prefixes.is_empty() {
+        return None;
+    }
+    let object_start = object.span().start as usize;
+    let object_end = object.span().end as usize;
+    let assignment_start = assignment.span.start as usize;
+    let assignment_end = assignment.span.end as usize;
+    let leading = source.get(assignment_start..object_start)?;
+    if !leading.is_empty() {
+        // If the AST target contains extra leading syntax, rebuilding only
+        // the object and tail might drop parentheses or comments.
+        return None;
+    }
+    let mut cursor = object_start;
+    for operand in &sequence.expressions {
+        let gap = source.get(cursor..operand.span().start as usize)?;
+        if gap.contains("/*") || gap.contains("//") {
+            return None;
+        }
+        cursor = operand.span().end as usize;
+    }
+    let tail = source.get(cursor..object_end)?;
+    if tail.contains("/*") || tail.contains("//") {
+        return None;
+    }
+    let target_and_rhs = source.get(object_end..assignment_end)?;
+    // Parenthesizing a comma expression is valid in every assignment
+    // expression context, including arguments, nested binary operations,
+    // optional guards, and script-level completion values.
+    let mut result = String::from("(");
+    for prefix in prefixes {
+        result.push('(');
+        result.push_str(fragment(source, prefix.span()));
+        result.push_str("), ");
+    }
+    result.push('(');
+    result.push_str(fragment(source, last.span()));
+    result.push(')');
+    result.push_str(target_and_rhs);
+    result.push(')');
+    Some(result)
+}
+
 /// Only descend through operands evaluated *first*, with no other
 /// possibly-effectful expression or reference creation before them.
 ///
@@ -639,6 +711,84 @@ mod tests {
         let source = "function f(o){o.prop=(sideEffect(),value());}";
         let output = rewritten(source)?;
         assert!(output.contains("o.prop=(sideEffect(),value())"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn nested_member_target_reassociation_stays_inside_outer_assignment(
+    ) -> Result<(), BudgetExceeded> {
+        // The outer target is deliberately unresolved: no safe transformation
+        // is allowed to pull the side effects before its reference lookup.
+        let source = "function f(U,log){root = 1 + ((log('pre'), U).x = log('rhs'));return root;}";
+        let output = rewritten(source)?;
+        assert!(output.contains("root = 1 +"), "{output}");
+        assert!(!output.contains("((log('pre'), U).x"), "{output}");
+        assert!(output.contains("log('pre')"), "{output}");
+        assert!(output.contains("(U).x = log('rhs')"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn nested_member_target_reassociation_keeps_member_assignment_kinds(
+    ) -> Result<(), BudgetExceeded> {
+        let inputs = [
+            "function f(obj,log){return ((log('pre'),obj).x += log('rhs'));}",
+            "function f(obj,log,key){return ((log('pre'),obj)[key()] = log('rhs'));}",
+            "function f(obj,log){return ((log('pre'),obj).x = function(){}).name;}",
+            "class Box{#x=1;f(log){return ((log('pre'),this).#x += 2);}}",
+            "function f(obj,log){return ((log('a'),log('b'),obj).x = 3);}",
+        ];
+        for source in inputs {
+            let output = rewritten(source)?;
+            assert!(
+                !output.contains("log('pre'),obj") && !output.contains("log('pre'),this"),
+                "member object comma should have been reassociated: {output}"
+            );
+            let expected_prefix = if source.contains("log('a')") {
+                "log('a')"
+            } else {
+                "log('pre')"
+            };
+            assert!(
+                output.contains(expected_prefix),
+                "prefix effect must remain: {output}"
+            );
+            assert!(
+                output.contains(").x += ")
+                    || output.contains(").x = ")
+                    || output.contains(")[key()] = ")
+                    || output.contains(").#x += "),
+                "assignment target must remain a member: {output}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nested_member_target_reassociation_preserves_comment_boundaries_and_callees(
+    ) -> Result<(), BudgetExceeded> {
+        for source in [
+            "function f(obj,log){return ((log('pre')/*annotation*/,obj).x=2);}",
+            "function f(obj,log){return ((log('pre'),/*annotation*/obj).x=2);}",
+            "function f(obj,log){return ((log('pre'),obj/*annotation*/).x=2);}",
+        ] {
+            let output = rewritten(source)?;
+            assert!(output.contains("/*annotation*/"), "{output}");
+            assert!(
+                !output.contains("member_target_comma_reassociation"),
+                "{output}"
+            );
+            assert!(
+                output.contains("obj).x") || output.contains("obj/*annotation*/"),
+                "comments must retain original object sequence: {output}"
+            );
+        }
+        let callee = "function f(obj,log){return ((log('pre'),obj).fn)();}";
+        let output = rewritten(callee)?;
+        assert!(
+            output.contains("obj).fn"),
+            "callee receiver changed: {output}"
+        );
         Ok(())
     }
 

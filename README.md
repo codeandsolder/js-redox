@@ -397,6 +397,20 @@ assignments without a safe statement slot remain untouched. The
 `member_object_sequence_lowering` counter records these semantic rewrites,
 distinct from whitespace-only `expression-layouts/` navigation views.
 
+Nested property assignments use a separate
+`member_target_comma_reassociation` pass: `((prepare(), object).field = rhs)`
+becomes `(prepare(), (object).field = rhs)` **within the same expression**,
+without introducing statements or new bindings. This also works when an
+enclosing assignment target is unresolved/global and its reference cannot
+safely be evaluated later. Computed/private keys, compound operators,
+setters, assignment expression values, direct eval, branch guards and
+script/eval completion remain at their original evaluation points.
+Member *reads/call callees* are not reassociated because their receiver
+identity can differ. Ambiguous comments around the rewritten object
+sequence are not moved. This semantic pass can expose initialization
+effects within heavily nested RHS expressions, including Knitsail's
+`Hm` initializer, without hoisting across the enclosing target lookup.
+
 An analogous `if_guard_member_prefix_lowering` pass handles a comma
 sequence in a property object that is **guaranteed to be evaluated first**
 within a function/block sibling `if` test. For example,

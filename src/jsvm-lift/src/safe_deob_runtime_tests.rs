@@ -206,6 +206,62 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
+fn nested_member_target_reassociation_runtime_equivalence() -> Result<()> {
+    let source = r#"
+function execute(mode) {
+    const events = [];
+    const note = name => { events.push('note:' + name); return name; };
+    const state = {value: 1, fn() { events.push('receiver:' + (this === proxy)); }};
+    const proxy = new Proxy(state, {
+        get(target,key) { events.push('get:' + String(key)); return Reflect.get(target,key); },
+        set(target,key,value) {
+            events.push('set:' + String(key) + ':' + typeof value);
+            return Reflect.set(target,key,value);
+        }
+    });
+    const key = () => { events.push('computed-key'); return 'value'; };
+    try {
+        const result = mode === 0 ? (((note('object'),proxy).value += (note('rhs'),3))) :
+                       mode === 1 ? (((note('computed'),proxy)[key()] = note('write'))) :
+                       mode === 2 ? (((note('throw'), (() => {throw Error('abort')})(),proxy).value = note('unreached'))) :
+                       mode === 3 ? (((eval('var directLocal = 29'),proxy).value = directLocal)) :
+                       mode === 4 ? (((note('callee'),proxy).fn)(), 'called') :
+                       mode === 5 ? (((note('function'),proxy).fn = function(){}).name) :
+                                    (((note('first'),note('second'),proxy).value = 'ok'));
+        events.push('result:' + String(result));
+    } catch (error) {
+        events.push('throw:' + error.name + ':' + error.message);
+    }
+    return events;
+}
+for (const mode of [0,1,2,3,4,5,6]) {
+    console.log(JSON.stringify([mode,execute(mode)]));
+}
+"#;
+    let result = deobfuscate_source(
+        source,
+        "member-target-comma-reassociation",
+        SourceMode::Auto,
+        16,
+        false,
+        &budget("member-target-comma-reassociation"),
+    )?;
+    assert!(
+        count(&result.report, "member_target_comma_reassociation") >= 2,
+        "{:?}",
+        result.report.transforms
+    );
+    let scratch = TempDir::new()?;
+    runtime_equivalent(
+        scratch.path(),
+        "member-target-comma-reassociation",
+        source,
+        &result.source,
+    )
+}
+
+#[test]
+#[ignore = "requires Node; run the focused test explicitly"]
 fn nested_conditional_assignment_runtime_equivalence() -> Result<()> {
     let source = r#"
 function run(selector) {

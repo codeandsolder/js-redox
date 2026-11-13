@@ -1447,6 +1447,17 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         walk::walk_block_statement(self, it);
     }
 
+    fn visit_assignment_expression(&mut self, it: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if self.allow_effect_statements {
+            if let Some(replacement) =
+                effect_statements::reassociate_member_target_comma(it, self.source)
+            {
+                self.push(it.span, replacement, "member_target_comma_reassociation");
+            }
+        }
+        walk::walk_assignment_expression(self, it);
+    }
+
     fn visit_expression_statement(&mut self, it: &ExpressionStatement<'a>) {
         if trivial_loops::inert_literal_statement(&it.expression) {
             self.push(it.span, String::new(), "remove_inert_literal_statement");
