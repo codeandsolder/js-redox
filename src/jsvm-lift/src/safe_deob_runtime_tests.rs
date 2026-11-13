@@ -206,6 +206,72 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
+fn nested_conditional_assignment_runtime_equivalence() -> Result<()> {
+    let source = r#"
+function run(selector) {
+    const events = [];
+    function Constructor(...args) { events.push('new:' + args.join(',')); this.args = args; }
+    const obj = {Ctor: Constructor};
+    let chosen;
+    const note = (value) => { events.push('eval:' + value); return value; };
+    function choose() {
+        let target;
+        target = selector === 0 ? new obj.Ctor() :
+                 selector === 1 ? new obj.Ctor(note('a')) :
+                 selector === 2 ? (note('outer'), selector > 1 ? note('inner') : note('no')) :
+                 selector === 3 ? (eval('var introduced=31'), introduced) :
+                 selector === 4 ? (() => { throw Error('branch error'); })() :
+                 2();
+        return target;
+    }
+    try {
+        chosen = choose();
+        events.push('value:' + (chosen && chosen.args ? chosen.args.join('|') : chosen));
+    } catch (error) {
+        events.push('throw:' + error.name + ':' + error.message);
+    }
+    let named;
+    named = selector === 0 ? function ExactlyNamed() {} : class AlsoNamed {};
+    events.push('named:' + named.name);
+    function withVariableEnvironment() {
+        let assigned;
+        assigned = selector === 2 ?
+            (eval('var dynamicLocal=23; function runtimeFunction() { return dynamicLocal }'),
+             runtimeFunction() ) : 0;
+        events.push('direct-eval:' + assigned);
+    }
+    try { withVariableEnvironment(); }
+    catch (error) { events.push('eval-throw:' + error.name); }
+    return events;
+}
+for (const selector of [0,1,2,3,4,5,-1]) {
+    console.log(JSON.stringify([selector, run(selector)]));
+}
+"#;
+    let result = deobfuscate_source(
+        source,
+        "nested-conditional-assignment-runtime",
+        SourceMode::Auto,
+        16,
+        false,
+        &budget("nested-conditional-assignment-runtime"),
+    )?;
+    assert!(
+        count(&result.report, "assignment_conditional_lowering") >= 2,
+        "{:?}",
+        result.report.transforms
+    );
+    let scratch = TempDir::new()?;
+    runtime_equivalent(
+        scratch.path(),
+        "nested-conditional-assignment",
+        source,
+        &result.source,
+    )
+}
+
+#[test]
+#[ignore = "requires Node; run the focused test explicitly"]
 fn if_guard_first_member_object_runtime_equivalence() -> Result<()> {
     let source = r#"
 function execute(gate) {

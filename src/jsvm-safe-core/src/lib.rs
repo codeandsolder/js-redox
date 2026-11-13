@@ -663,13 +663,19 @@ impl Collector<'_, '_> {
         }
     }
 
-    fn lower_member_object_statements(&mut self, statements: &[Statement<'_>]) {
+    fn lower_sibling_expression_statements(&mut self, statements: &[Statement<'_>]) {
         if !self.allow_effect_statements || self.function_depth == 0 {
             return;
         }
         for statement in statements {
             if let Statement::ExpressionStatement(expression) = statement {
-                if let Some(code) =
+                if let Some(code) = effect_statements::lower_conditional_assignment(
+                    expression,
+                    self.source,
+                    self.scoping,
+                ) {
+                    self.push(expression.span, code, "assignment_conditional_lowering");
+                } else if let Some(code) =
                     effect_statements::lower_member_object_sequence(expression, self.source)
                 {
                     self.push(expression.span, code, "member_object_sequence_lowering");
@@ -1367,7 +1373,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
 
     fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
         self.lower_if_test_statements(&it.statements);
-        self.lower_member_object_statements(&it.statements);
+        self.lower_sibling_expression_statements(&it.statements);
         self.reconstruct_while_pairs(&it.statements);
         self.reconstruct_reaching_while(&it.statements);
         if self.allow_effect_statements
@@ -1406,7 +1412,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
 
     fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
         self.lower_if_test_statements(&it.body);
-        self.lower_member_object_statements(&it.body);
+        self.lower_sibling_expression_statements(&it.body);
         self.reconstruct_while_pairs(&it.body);
         self.reconstruct_reaching_while(&it.body);
         if self.allow_effect_statements

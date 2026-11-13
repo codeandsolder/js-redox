@@ -410,6 +410,19 @@ comments cannot be hoisted. The property access and branch bodies keep their
 original evaluation context. In source-tree mode, captured source and the
 protected executable are stored independently of rewritten helper views.
 
+The `assignment_conditional_lowering` pass restores ordinary `if/else`
+control flow from a discarded assignment statement whose right-hand side
+is a nested conditional expression. The assignment target must be a
+statically resolved lexical identifier without an intervening dynamic
+`with` scope; member/computed targets and unresolved names are not moved.
+Every selected leaf is assigned once, and all condition effects and
+throwing fallbacks (including a numeric call such as `2()`) remain under
+their original guards. Anonymous function, class and arrow leaves are
+left intact because splitting them could introduce assignment-inferred
+names. Non-sibling placements, script/eval completion and comments at
+changed syntax boundaries also stay unchanged. Source-backed helper
+recovery never edits the captured executable itself.
+
 A separate `lexical-context/annotated-handlers/` tree puts confirmed helper
 context **at the first direct call** in each recovered handler. For a short
 original, stable, single-return function it quotes that exact return expression

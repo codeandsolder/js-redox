@@ -1932,7 +1932,7 @@ mod tests {
         let original = temp.path().join("original.js");
         fs::create_dir_all(&input)?;
         let original_source =
-            "function root(){const init=function(U,H){if(((announce(),U).ready<3)){U.allow=1;}((Hm=(H.length<2&&(U.ready=1),H),U).Z_=function(){return Hm;});};}";
+            "function root(){const init=function(U,H){let chosen;chosen=H.length<2?new U.Factory():H.length<3?U.create():2();U.choice=chosen;if(((announce(),U).ready<3)){U.allow=1;}((Hm=(H.length<2&&(U.ready=1),H),U).Z_=function(){return Hm;});};}";
         fs::write(&original, original_source)?;
         fs::write(
             input.join("handler.js"),
@@ -1967,6 +1967,14 @@ mod tests {
                 .is_some_and(|count| count >= 1),
             "{helper}"
         );
+        assert!(
+            helper["transforms"]["assignment_conditional_lowering"]
+                .as_u64()
+                .is_some_and(|count| count >= 1),
+            "{helper}"
+        );
+        assert!(readable.contains("2()"), "{readable}");
+        assert!(readable.contains("U.choice"), "{readable}");
         assert!(readable.contains("announce()"), "{readable}");
         assert!(!readable.contains("announce(), U"), "{readable}");
         assert!(readable.contains("U.Z_ = function"), "{readable}");

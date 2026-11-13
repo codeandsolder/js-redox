@@ -30,9 +30,9 @@ fn sequence_rhs<'a, 'e>(expr: &'e Expression<'a>) -> Option<&'e SequenceExpressi
 fn name_inference_hazard(expr: &Expression<'_>) -> bool {
     match expr {
         Expression::ParenthesizedExpression(paren) => name_inference_hazard(&paren.expression),
-        Expression::FunctionExpression(_)
-        | Expression::ArrowFunctionExpression(_)
-        | Expression::ClassExpression(_) => true,
+        Expression::FunctionExpression(function) => function.id.is_none(),
+        Expression::ClassExpression(class) => class.id.is_none(),
+        Expression::ArrowFunctionExpression(_) => true,
         _ => false,
     }
 }
@@ -187,6 +187,156 @@ impl Lowered {
     }
 }
 
+/// Unwrap only transparent parentheses, without changing eval or receivers.
+fn assignment_rhs<'a, 'e>(expr: &'e Expression<'a>) -> Option<&'e AssignmentExpression<'a>> {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => assignment_rhs(&paren.expression),
+        Expression::AssignmentExpression(assignment) => Some(assignment),
+        _ => None,
+    }
+}
+
+fn conditional_rhs<'a, 'e>(
+    expr: &'e Expression<'a>,
+) -> Option<&'e oxc_ast::ast::ConditionalExpression<'a>> {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => conditional_rhs(&paren.expression),
+        Expression::ConditionalExpression(conditional) => Some(conditional),
+        _ => None,
+    }
+}
+
+/// A conditional expression is not an anonymous function definition, whereas
+/// a new assignment at a leaf could infer a name for an anonymous function,
+/// class or arrow. Reject any tree containing such a leaf.
+fn conditional_has_name_hazard(expr: &Expression<'_>, depth: usize) -> bool {
+    if depth > 96 {
+        return true;
+    }
+    if let Some(conditional) = conditional_rhs(expr) {
+        return conditional_has_name_hazard(&conditional.consequent, depth + 1)
+            || conditional_has_name_hazard(&conditional.alternate, depth + 1);
+    }
+    name_inference_hazard(expr)
+}
+
+/// Each arm assigns exactly its own selected value. Preserve all exception
+/// paths, including an intentionally invalid numeric call in a fallback arm.
+/// The braces contain no declarations and the original function variable
+/// environment (including direct eval) is retained.
+fn conditional_assignment_branch(
+    expr: &Expression<'_>,
+    target: &str,
+    source: &str,
+    depth: usize,
+) -> Option<String> {
+    if depth > 96 {
+        return None;
+    }
+    let Some(conditional) = conditional_rhs(expr) else {
+        return Some(format!("({target} = ({}));", fragment(source, expr.span())));
+    };
+    let test = fragment(source, conditional.test.span());
+    let yes = conditional_assignment_branch(&conditional.consequent, target, source, depth + 1)?;
+    let no = conditional_assignment_branch(&conditional.alternate, target, source, depth + 1)?;
+    if conditional_rhs(&conditional.alternate).is_some() {
+        // A nested alternate is already an if statement. Emit it as an
+        // else-if chain instead of inventing redundant block nesting.
+        Some(format!("if ({test}) {{\n{yes}\n}} else {no}"))
+    } else {
+        Some(format!("if ({test}) {{\n{yes}\n}} else {{\n{no}\n}}"))
+    }
+}
+
+/// Recover nested conditional assignments as ordinary if/else control flow.
+/// Only a function/block sibling statement with a statically resolved
+/// identifier target can be rewritten: no member/computed/dynamic reference,
+/// script/eval completion or unbraced statement body may change.
+///
+/// Comments inside test/arm expressions remain in original source fragments.
+/// Refuse comments at changed operator/parentheses boundaries, since their
+/// attachment could otherwise change in the newly structured source.
+pub(crate) fn lower_conditional_assignment(
+    statement: &ExpressionStatement<'_>,
+    source: &str,
+    scoping: &Scoping,
+) -> Option<String> {
+    let assignment = assignment_rhs(&statement.expression)?;
+    if assignment.operator.as_str() != "=" {
+        return None;
+    }
+    let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left else {
+        return None;
+    };
+    let symbol = statically_resolved_symbol(scoping, identifier.reference_id.get()?)?;
+    // A script-global var/function can be backed by a global-object property:
+    // resolving it may run proxy-like HasProperty hooks. Only an actual
+    // lexical/import binding has the same fixed reference at root scope.
+    if scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
+        && !scoping
+            .symbol_flags(symbol)
+            .intersects(oxc_semantic::SymbolFlags::BlockScoped | oxc_semantic::SymbolFlags::Import)
+    {
+        return None;
+    }
+    conditional_rhs(&assignment.right)?;
+    if conditional_has_name_hazard(&assignment.right, 0) {
+        return None;
+    }
+    let comments = |start: usize, end: usize| -> Option<bool> {
+        let gap = source.get(start..end)?;
+        Some(gap.contains("/*") || gap.contains("//"))
+    };
+    if comments(
+        statement.span.start as usize,
+        assignment.span.start as usize,
+    )? || comments(
+        assignment.left.span().end as usize,
+        assignment.right.span().start as usize,
+    )? || comments(assignment.span.end as usize, statement.span.end as usize)?
+    {
+        return None;
+    }
+    fn clean_boundaries(expr: &Expression<'_>, source: &str, depth: usize) -> Option<()> {
+        if depth > 96 {
+            return None;
+        }
+        let Some(conditional) = conditional_rhs(expr) else {
+            return Some(());
+        };
+        let comments = |start: usize, end: usize| -> Option<bool> {
+            let gap = source.get(start..end)?;
+            Some(gap.contains("/*") || gap.contains("//"))
+        };
+        if comments(expr.span().start as usize, conditional.span.start as usize)?
+            || comments(conditional.span.end as usize, expr.span().end as usize)?
+            || comments(
+                conditional.span.start as usize,
+                conditional.test.span().start as usize,
+            )?
+            || comments(
+                conditional.test.span().end as usize,
+                conditional.consequent.span().start as usize,
+            )?
+            || comments(
+                conditional.consequent.span().end as usize,
+                conditional.alternate.span().start as usize,
+            )?
+            || comments(
+                conditional.alternate.span().end as usize,
+                conditional.span.end as usize,
+            )?
+        {
+            return None;
+        }
+        clean_boundaries(&conditional.consequent, source, depth + 1)?;
+        clean_boundaries(&conditional.alternate, source, depth + 1)
+    }
+    clean_boundaries(&assignment.right, source, 0)?;
+    let target = fragment(source, assignment.left.span());
+    conditional_assignment_branch(&assignment.right, target, source, 0)
+}
+
 /// Peel a comma sequence off the object *of an assignment target* only
 /// when the entire assignment is a discarded sibling expression statement.
 ///
@@ -205,14 +355,7 @@ pub(crate) fn lower_member_object_sequence(
     statement: &ExpressionStatement<'_>,
     source: &str,
 ) -> Option<String> {
-    fn assignment<'a, 'e>(expr: &'e Expression<'a>) -> Option<&'e AssignmentExpression<'a>> {
-        match expr {
-            Expression::ParenthesizedExpression(paren) => assignment(&paren.expression),
-            Expression::AssignmentExpression(assignment) => Some(assignment),
-            _ => None,
-        }
-    }
-    let assign = assignment(&statement.expression)?;
+    let assign = assignment_rhs(&statement.expression)?;
     let object = match &assign.left {
         AssignmentTarget::StaticMemberExpression(member) => &member.object,
         AssignmentTarget::ComputedMemberExpression(member) => &member.object,
@@ -632,6 +775,138 @@ mod tests {
         assert!(output.contains("(eval('var flag = 7'));"), "{output}");
         assert!(output.contains("return flag"), "{output}");
         assert!(!output.contains("eval('var flag = 7'),o"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn unfolds_nested_conditional_assignment_to_stable_binding() -> Result<(), BudgetExceeded> {
+        let input = "function f(a,b,c,d){let h;h=a==0?new c[d]():a==1?new c[d](b):a==2?side():2();return h;}";
+        let output = rewritten(input)?;
+        assert!(!output.contains("?new c[d]"), "{output}");
+        assert!(output.contains("if (a==0)"), "{output}");
+        assert!(output.contains("if (a==1)"), "{output}");
+        assert!(output.contains("else if (a==1)"), "{output}");
+        assert!(output.contains("if (a==2)"), "{output}");
+        assert!(output.contains("new c[d](b)"), "{output}");
+        assert!(
+            output.contains("2()"),
+            "throwing fallback must survive: {output}"
+        );
+        assert!(
+            output.matches("h =").count() >= 4,
+            "each selected leaf must write h: {output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_assignment_retains_names_and_reference_semantics() -> Result<(), BudgetExceeded>
+    {
+        let sources = [
+            "function f(flag){let named;named=flag?function(){}:function(){};return named.name;}",
+            "function f(flag){let named;named=flag?()=>1:()=>2;return named.name;}",
+            "function f(flag){let named;named=flag?class{}:class{};return named.name;}",
+            "function f(flag){named=flag?yes():no();return named;}",
+            "function f(o,flag){o.slot=flag?yes():no();}",
+            "function f(o,flag){o[key()]=flag?yes():no();}",
+            "function f(o,flag){let result;with(o){result=flag?yes():no();}}",
+            "function f(flag){let result;if(flag)result=other?yes():no();}",
+            "result=flag?yes():no();",
+            "function f(flag){let result;result=flag/*boundary*/?yes():no();}",
+            "function f(flag){let result;result=flag?yes()/*boundary*/:no();}",
+        ];
+        for source in sources {
+            let output = rewritten(source)?;
+            assert!(
+                !output.contains("assignment_conditional_lowering")
+                    && !output.contains("if (other)")
+                    && !output.contains("if (flag) {\n(result ="),
+                "unsafe or non-sibling assignment was split: {output}"
+            );
+            if source.contains("named=flag?") {
+                assert!(
+                    output.contains("named=flag?"),
+                    "name inference changed: {output}"
+                );
+            }
+            if source.contains("result=flag?") {
+                assert!(
+                    output.contains("result=flag?"),
+                    "source must remain unsplit: {output}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_assignment_preserves_comments_inside_selected_arms() -> Result<(), BudgetExceeded>
+    {
+        let source =
+            "function f(flag){let output;output=flag?note(/*inside*/1):note(2);return output;}";
+        let result = rewritten(source)?;
+        assert!(result.contains("/*inside*/"), "{result}");
+        assert!(result.contains("if (flag)"), "{result}");
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_assignment_skips_global_property_backed_bindings() -> Result<(), BudgetExceeded>
+    {
+        let global_var = "var result;function f(flag){result=flag?yes():no();return result;}";
+        let output = rewritten(global_var)?;
+        assert!(
+            output.contains("result=flag?"),
+            "script global var is not a safe static lexical target: {output}"
+        );
+        let global_lexical = "let result;function f(flag){result=flag?yes():no();return result;}";
+        let output = rewritten(global_lexical)?;
+        assert!(
+            output.contains("if (flag)"),
+            "root lexical let is a stable target: {output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_assignment_named_function_and_class_leaves_remain_named(
+    ) -> Result<(), BudgetExceeded> {
+        let source = "function f(flag){let chosen;chosen=flag?function Exact(){}:class Visible{};return chosen.name;}";
+        let output = rewritten(source)?;
+        assert!(output.contains("if (flag)"), "{output}");
+        assert!(output.contains("function Exact()"), "{output}");
+        assert!(output.contains("class Visible"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_assignment_preserves_comments_in_parenthesis_wrappers(
+    ) -> Result<(), BudgetExceeded> {
+        for source in [
+            "function f(flag){let chosen;chosen=(/*wrapper*/flag?yes():no());return chosen;}",
+            "function f(flag){let chosen;chosen=(flag?yes():no()/*tail*/);return chosen;}",
+        ] {
+            let output = rewritten(source)?;
+            assert!(
+                output.contains("chosen=("),
+                "parenthesized comment must not be discarded: {output}"
+            );
+            assert!(
+                output.contains("/*wrapper*/") || output.contains("/*tail*/"),
+                "{output}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_assignment_handles_nested_consequents() -> Result<(), BudgetExceeded> {
+        let source = "function f(a,b,c){let x;x=a?(b?one():two()):(c?three():2());return x;}";
+        let result = rewritten(source)?;
+        assert!(result.contains("if (a)"), "{result}");
+        assert!(result.contains("if (b)"), "{result}");
+        assert!(result.contains("if (c)"), "{result}");
+        assert!(result.contains("2()"), "{result}");
         Ok(())
     }
 
