@@ -53,7 +53,7 @@ serde_json = "1"
 tempfile = "3"
 sha2 = "0.11"
 string_wizard = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "12bc555c4dd448a67fddb6330e9e3b3c0d90f164", default-features = false }
-rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "458c995", default-features = false }
+rolldown_redox = { git = "https://github.com/codeandsolder/rolldown-crates-redox.git", rev = "12bc555c4dd448a67fddb6330e9e3b3c0d90f164", default-features = false }
 url = "2"
 wasmparser = "0.263.0"
 wasmprinter = "0.263.0"
