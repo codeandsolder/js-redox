@@ -53,7 +53,7 @@ mod tests {
 
     fn semantic_runtime_values(expression: &SemanticExpression) -> BTreeSet<usize> {
         match expression {
-            SemanticExpression::Runtime { value, .. } => [*value].into_iter().collect(),
+            SemanticExpression::Runtime { value, .. } => std::iter::once(*value).collect(),
             SemanticExpression::Operation { arguments, .. } => {
                 arguments.iter().flat_map(semantic_runtime_values).collect()
             }
@@ -526,145 +526,9 @@ mod tests {
 
     #[test]
     fn reports_memory_import_for_structural_bulk_copy_candidate() -> Result<()> {
-        let bytes = wat::parse_str(
-            r#"(module
-                (import "wbg" "__wbindgen_memory" (func $memory (result externref)))
-                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
-                (import "wbg" "set" (func $set (param externref externref i32)))
-                (table 4 externref)
-                (memory (export "memory") 1)
-                (func $memory_slot (result i32)
-                    (local $slot i32)
-                    i32.const 2
-                    local.tee $slot
-                    call $memory
-                    table.set
-                    local.get $slot)
-                (func $buffer_slot (param $slot i32) (result i32)
-                    local.get $slot)
-                (func (export "copy") (param $source externref) (param $base i32) (result i32)
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    nop
-                    i32.const 0
-                    local.get $source
-                    table.set
-
-                    i32.const 1
-                    call $memory_slot
-                    call $buffer_slot
-                    table.get
-                    call $ctor
-                    table.set
-
-                    i32.const 1
-                    table.get
-                    i32.const 0
-                    table.get
-                    local.get $base
-                    i32.const 2
-                    i32.shr_u
-                    call $set
-
-                    local.get $base
-                    i32.load
-                    local.get $base
-                    i32.load offset=4
-                    i32.add))"#,
-        )?;
+        let bytes = wat::parse_str(include_str!(
+            "../tests/fixtures/structural-memory-import.wat"
+        ))?;
         let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         assert_eq!(analysis.externref_bulk_copy_candidates.len(), 1);
         let candidate = &analysis.externref_bulk_copy_candidates[0];
@@ -689,90 +553,9 @@ mod tests {
 
     #[test]
     fn reports_fresh_cleanup_disjointness_recipe() -> Result<()> {
-        let bytes = wat::parse_str(
-            r#"(module
-                (import "wbg" "__wbindgen_memory" (func $memory (result externref)))
-                (import "wbg" "__wbg_buffer_fixture" (func $buffer (param externref) (result externref)))
-                (import "wbg" "ctor" (func $ctor (param externref) (result externref)))
-                (import "wbg" "set" (func $set (param externref externref i32)))
-                (table 16 externref)
-                (memory 1)
-                (global $next_slot (mut i32) (i32.const 4))
-                (func $slot_alloc (result i32)
-                    (local $slot i32)
-                    global.get $next_slot
-                    local.tee $slot
-                    i32.const 1
-                    i32.add
-                    global.set $next_slot
-                    local.get $slot)
-                (func $memory_slot (result i32)
-                    (local $slot i32)
-                    call $slot_alloc
-                    local.tee $slot
-                    call $memory
-                    table.set
-                    local.get $slot)
-                (func $buffer_slot (param $memory_slot i32) (result i32)
-                    (local $value externref)
-                    (local $slot i32)
-                    local.get $memory_slot
-                    table.get
-                    call $buffer
-                    local.set $value
-                    call $slot_alloc
-                    local.tee $slot
-                    local.get $value
-                    table.set
-                    local.get $slot)
-                (func $cleanup (param $slot i32)
-                    local.get $slot
-                    i32.const 2
-                    i32.shl
-                    i32.const 4096
-                    i32.add
-                    i32.const 0
-                    i32.store)
-                (func (export "copy") (param $source externref) (param $base i32) (result i32)
-                    (local $memory_slot i32)
-                    (local $buffer_slot i32)
-                    (local $receiver_slot i32)
-                    (local $receiver externref)
-                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
-                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
-                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
-                    nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop nop
-                    i32.const 0
-                    local.get $source
-                    table.set
-                    call $memory_slot
-                    local.tee $memory_slot
-                    call $buffer_slot
-                    local.tee $buffer_slot
-                    table.get
-                    call $ctor
-                    local.set $receiver
-                    call $slot_alloc
-                    local.tee $receiver_slot
-                    local.get $receiver
-                    table.set
-                    local.get $buffer_slot
-                    call $cleanup
-                    local.get $receiver_slot
-                    table.get
-                    i32.const 0
-                    table.get
-                    local.get $base
-                    i32.const 2
-                    i32.shr_u
-                    call $set
-                    local.get $receiver_slot
-                    call $cleanup
-                    local.get $memory_slot
-                    call $cleanup
-                    local.get $base
-                    i32.load))"#,
-        )?;
+        let bytes = wat::parse_str(include_str!(
+            "../tests/fixtures/fresh-cleanup-disjointness.wat"
+        ))?;
         let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
         let [candidate] = analysis.externref_bulk_copy_candidates.as_slice() else {
             return Err(anyhow::anyhow!("expected one copied-input candidate"));
@@ -836,7 +619,7 @@ mod tests {
                     call $set))"#,
         )?;
         let analysis = analyze_export_semantics(&bytes, "copy", &test_budget())?;
-        assert!(analysis.externref_bulk_copy_candidates.is_empty());
+        assert_eq!(analysis.externref_bulk_copy_candidates.len(), 0);
         Ok(())
     }
 
@@ -893,11 +676,9 @@ mod tests {
         assert_eq!(machine.cases[0].successors, BTreeSet::from([20]));
         assert_eq!(machine.cases[0].transitions.len(), 1);
         assert_eq!(machine.cases[0].transitions[0].successor, 20);
-        assert!(!machine.cases[0].transitions[0]
-            .composed_arguments
-            .is_empty());
-        assert!(machine.cases[0].nested_machines.is_empty());
-        assert!(machine.cases[0].direct_nested_machines.is_empty());
+        assert_ne!(machine.cases[0].transitions[0].composed_arguments.len(), 0);
+        assert_eq!(machine.cases[0].nested_machines.len(), 0);
+        assert_eq!(machine.cases[0].direct_nested_machines.len(), 0);
         assert_eq!(root_machine_indices(machines), vec![0]);
         Ok(())
     }
@@ -1056,7 +837,7 @@ mod tests {
 
         let analysis = analyze_export_semantics(&bytes, "reverse", &test_budget())?;
         assert_eq!(return_expressions(&analysis), ["reverse_bits32($arg0)"]);
-        assert!(analysis.state_machines.is_empty());
+        assert_eq!(analysis.state_machines.len(), 0);
         Ok(())
     }
 
@@ -1268,7 +1049,7 @@ mod tests {
             return_expressions(&analysis),
             ["wrapping_add($runtime0, $runtime0)"]
         );
-        assert!(analysis.runtime_bindings[0].runtime_dependencies.is_empty());
+        assert_eq!(analysis.runtime_bindings[0].runtime_dependencies.len(), 0);
         assert_eq!(
             analysis.returns[0].runtime_dependencies,
             [analysis.runtime_bindings[0].value]
@@ -1309,7 +1090,7 @@ mod tests {
         )?;
 
         let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
-        assert!(analysis.returns[0].runtime_dependencies.is_empty());
+        assert_eq!(analysis.returns[0].runtime_dependencies.len(), 0);
         let SemanticExpression::Operation {
             operator,
             arguments,
@@ -1354,7 +1135,7 @@ mod tests {
         let inner = &analysis.runtime_bindings[0];
         let outer = &analysis.runtime_bindings[1];
         assert_eq!(inner.expression, "host.read(0x00000003)");
-        assert!(inner.runtime_dependencies.is_empty());
+        assert_eq!(inner.runtime_dependencies.len(), 0);
         assert_eq!(outer.expression, "host.transform($runtime0)");
         assert_eq!(outer.runtime_dependencies, [inner.value]);
         assert_eq!(
@@ -1729,19 +1510,19 @@ mod tests {
         .map_err(Into::into)
     }
 
-    const STRAIGHT_HOST_EFFECT: &str = r#"
+    const STRAIGHT_HOST_EFFECT: &str = r"
         local.get $slot
         table.get 0
         local.get $base
         local.get $offset
         call $opaque_signal
-    "#;
+    ";
 
     #[test]
     fn reports_same_block_opaque_host_effect_before_memory_read() -> Result<()> {
         let bytes = host_effect_memory_fixture(
             STRAIGHT_HOST_EFFECT,
-            r#"
+            r"
                 local.get $slot
                 local.get $base
                 i32.const 3536
@@ -1750,7 +1531,7 @@ mod tests {
                 i32.const 3536
                 i32.or
                 call $memory_get
-            "#,
+            ",
         )?;
         let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
         assert_eq!(analysis.opaque_host_effect_memory_reads.len(), 1);
@@ -1768,7 +1549,7 @@ mod tests {
     fn rejects_host_effect_memory_read_with_different_offset() -> Result<()> {
         let bytes = host_effect_memory_fixture(
             STRAIGHT_HOST_EFFECT,
-            r#"
+            r"
                 local.get $slot
                 local.get $base
                 i32.const 3536
@@ -1777,10 +1558,10 @@ mod tests {
                 i32.const 3540
                 i32.or
                 call $memory_get
-            "#,
+            ",
         )?;
         let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
-        assert!(analysis.opaque_host_effect_memory_reads.is_empty());
+        assert_eq!(analysis.opaque_host_effect_memory_reads.len(), 0);
         Ok(())
     }
 
@@ -1788,7 +1569,7 @@ mod tests {
     fn rejects_host_effect_with_different_memory_slot() -> Result<()> {
         let bytes = host_effect_memory_fixture(
             STRAIGHT_HOST_EFFECT,
-            r#"
+            r"
                 i32.const 3
                 local.get $base
                 i32.const 3536
@@ -1797,10 +1578,10 @@ mod tests {
                 i32.const 3536
                 i32.or
                 call $memory_get
-            "#,
+            ",
         )?;
         let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
-        assert!(analysis.opaque_host_effect_memory_reads.is_empty());
+        assert_eq!(analysis.opaque_host_effect_memory_reads.len(), 0);
         Ok(())
     }
 
@@ -1808,7 +1589,7 @@ mod tests {
     fn rejects_memory_read_before_host_effect() -> Result<()> {
         let bytes = host_effect_memory_fixture(
             STRAIGHT_HOST_EFFECT,
-            r#"
+            r"
                 local.get $base
                 i32.const 3536
                 i32.or
@@ -1819,17 +1600,17 @@ mod tests {
                 i32.const 3536
                 call $host_effect
                 i32.const 0
-            "#,
+            ",
         )?;
         let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
-        assert!(analysis.opaque_host_effect_memory_reads.is_empty());
+        assert_eq!(analysis.opaque_host_effect_memory_reads.len(), 0);
         Ok(())
     }
 
     #[test]
     fn rejects_conditional_opaque_host_effect_wrapper() -> Result<()> {
         let bytes = host_effect_memory_fixture(
-            r#"
+            r"
                 local.get $offset
                 if
                     local.get $slot
@@ -1838,8 +1619,8 @@ mod tests {
                     local.get $offset
                     call $opaque_signal
                 end
-            "#,
-            r#"
+            ",
+            r"
                 local.get $slot
                 local.get $base
                 i32.const 3536
@@ -1848,10 +1629,10 @@ mod tests {
                 i32.const 3536
                 i32.or
                 call $memory_get
-            "#,
+            ",
         )?;
         let analysis = analyze_export_semantics(&bytes, "run", &test_budget())?;
-        assert!(analysis.opaque_host_effect_memory_reads.is_empty());
+        assert_eq!(analysis.opaque_host_effect_memory_reads.len(), 0);
         Ok(())
     }
 

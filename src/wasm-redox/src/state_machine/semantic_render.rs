@@ -7,7 +7,7 @@ use super::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use waffle::{entity::EntityRef, FunctionBody, Operator, Terminator, Value, ValueDef};
+use waffle::{entity::EntityRef, Block, FunctionBody, Operator, Terminator, Value, ValueDef};
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -34,7 +34,7 @@ pub enum SemanticExpression {
     Operation {
         value: usize,
         operator: String,
-        arguments: Vec<SemanticExpression>,
+        arguments: Vec<Self>,
     },
 }
 
@@ -137,71 +137,7 @@ fn build_semantic_expression(
 
     match &body.values[value] {
         ValueDef::BlockParam(block, index, _) => {
-            if *block == body.entry
-                && usize::try_from(*index).is_ok_and(|index| index < body.n_params)
-            {
-                return SemanticExpression::Argument {
-                    index: usize::try_from(*index).unwrap_or_default(),
-                };
-            }
-            let incoming_edges = incoming_block_param_edges(body, *block, value);
-            let incoming_values = incoming_edges
-                .iter()
-                .map(|(_, incoming)| *incoming)
-                .collect::<BTreeSet<_>>();
-            match incoming_values.len() {
-                0 => SemanticExpression::Symbol {
-                    name: format!("$block{}p{index}", block.index()),
-                },
-                1 => {
-                    let incoming = incoming_values.into_iter().next().unwrap_or(value);
-                    build_semantic_expression(body, incoming, depth.saturating_sub(1), context)
-                }
-                _ => {
-                    if !context.expanded.insert(value) || !context.visiting.insert(value) {
-                        return SemanticExpression::SsaValue {
-                            value: value.index(),
-                        };
-                    }
-                    let conditional = conditional_phi_inputs(body, &incoming_edges);
-                    let arguments = if let Some((condition, if_true, if_false)) = conditional {
-                        [condition, if_true, if_false]
-                            .into_iter()
-                            .map(|input| {
-                                build_semantic_expression(
-                                    body,
-                                    input,
-                                    depth.saturating_sub(1),
-                                    context,
-                                )
-                            })
-                            .collect()
-                    } else {
-                        incoming_values
-                            .into_iter()
-                            .map(|incoming| {
-                                build_semantic_expression(
-                                    body,
-                                    incoming,
-                                    depth.saturating_sub(1),
-                                    context,
-                                )
-                            })
-                            .collect()
-                    };
-                    context.visiting.remove(&value);
-                    SemanticExpression::Operation {
-                        value: value.index(),
-                        operator: if conditional.is_some() {
-                            "phi_if"
-                        } else {
-                            "phi"
-                        }
-                        .to_owned(),
-                        arguments,
-                    }
-                }
-            }
+            semantic_block_param_expression(body, value, *block, *index, depth, context)
         }
         ValueDef::Operator(op, arg_ref, _) => {
             if !context.expanded.insert(value) || !context.visiting.insert(value) {
@@ -210,7 +146,9 @@ fn build_semantic_expression(
                 };
             }
             let expression = if let Some(source) = reverse_bits_source(body, value) {
-                if source != value {
+                if source == value {
+                    semantic_operator_expression(body, value, op, *arg_ref, depth, context)
+                } else {
                     SemanticExpression::Operation {
                         value: value.index(),
                         operator: "reverse_bits32".to_owned(),
@@ -221,8 +159,6 @@ fn build_semantic_expression(
                             context,
                         )],
                     }
-                } else {
-                    semantic_operator_expression(body, value, op, *arg_ref, depth, context)
                 }
             } else {
                 semantic_operator_expression(body, value, op, *arg_ref, depth, context)
@@ -255,6 +191,69 @@ fn build_semantic_expression(
         ValueDef::Placeholder(_) | ValueDef::None => SemanticExpression::SsaValue {
             value: value.index(),
         },
+    }
+}
+
+fn semantic_block_param_expression(
+    body: &FunctionBody,
+    value: Value,
+    block: Block,
+    index: u32,
+    depth: usize,
+    context: &mut SemanticExpressionContext<'_>,
+) -> SemanticExpression {
+    if block == body.entry && usize::try_from(index).is_ok_and(|index| index < body.n_params) {
+        return SemanticExpression::Argument {
+            index: usize::try_from(index).unwrap_or_default(),
+        };
+    }
+    let incoming_edges = incoming_block_param_edges(body, block, value);
+    let incoming_values = incoming_edges
+        .iter()
+        .map(|(_, incoming)| *incoming)
+        .collect::<BTreeSet<_>>();
+    match incoming_values.len() {
+        0 => SemanticExpression::Symbol {
+            name: format!("$block{}p{index}", block.index()),
+        },
+        1 => {
+            let incoming = incoming_values.into_iter().next().unwrap_or(value);
+            build_semantic_expression(body, incoming, depth.saturating_sub(1), context)
+        }
+        _ => {
+            if !context.expanded.insert(value) || !context.visiting.insert(value) {
+                return SemanticExpression::SsaValue {
+                    value: value.index(),
+                };
+            }
+            let conditional = conditional_phi_inputs(body, &incoming_edges);
+            let arguments = if let Some((condition, if_true, if_false)) = conditional {
+                <[Value; 3]>::from((condition, if_true, if_false))
+                    .into_iter()
+                    .map(|input| {
+                        build_semantic_expression(body, input, depth.saturating_sub(1), context)
+                    })
+                    .collect()
+            } else {
+                incoming_values
+                    .into_iter()
+                    .map(|incoming| {
+                        build_semantic_expression(body, incoming, depth.saturating_sub(1), context)
+                    })
+                    .collect()
+            };
+            context.visiting.remove(&value);
+            SemanticExpression::Operation {
+                value: value.index(),
+                operator: if conditional.is_some() {
+                    "phi_if"
+                } else {
+                    "phi"
+                }
+                .to_owned(),
+                arguments,
+            }
+        }
     }
 }
 
@@ -366,7 +365,7 @@ fn discover_runtime_roots(
         return BTreeSet::new();
     }
     if discovery.names.contains_key(&value) {
-        return [value].into_iter().collect();
+        return std::iter::once(value).collect();
     }
     if let Some(source) = reverse_bits_source(body, value) {
         if source != value {
@@ -444,7 +443,7 @@ fn discover_runtime_roots(
                 discovery.names.insert(value, name);
                 discovery.ordered.push(value);
                 discovery.dependencies.insert(value, dependencies);
-                [value].into_iter().collect()
+                std::iter::once(value).collect()
             } else {
                 dependencies
             }

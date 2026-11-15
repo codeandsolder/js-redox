@@ -146,66 +146,38 @@ pub(super) fn transitions_for(
         if !seen.insert(block) {
             continue;
         }
-        let term = &body.blocks[block].terminator;
-        match term {
-            Terminator::Br { target } => {
-                if target.block == dispatcher {
-                    if !record_backedge(
-                        body,
-                        state,
-                        param_index,
-                        current,
-                        target,
-                        &mut next,
-                        &mut transitions,
-                    ) {
-                        unresolved_backedges += 1;
-                    }
-                } else {
-                    push_target(&mut queue, &seen, target);
+        // All branches use exactly the same backedge and reachability rules.
+        // Keep the evaluation of each conditional separate from edge recording.
+        let mut follow_target = |target: &BlockTarget| {
+            if target.block == dispatcher {
+                if !record_backedge(
+                    body,
+                    state,
+                    param_index,
+                    current,
+                    target,
+                    &mut next,
+                    &mut transitions,
+                ) {
+                    unresolved_backedges += 1;
                 }
+            } else {
+                push_target(&mut queue, &seen, target);
             }
+        };
+        match &body.blocks[block].terminator {
+            Terminator::Br { target } => follow_target(target),
             Terminator::CondBr {
                 cond,
                 if_true,
                 if_false,
             } => {
                 if let Some(take_true) = eval_state_cond(body, state, *cond, current) {
-                    let target = if take_true { if_true } else { if_false };
-                    if target.block == dispatcher {
-                        if !record_backedge(
-                            body,
-                            state,
-                            param_index,
-                            current,
-                            target,
-                            &mut next,
-                            &mut transitions,
-                        ) {
-                            unresolved_backedges += 1;
-                        }
-                    } else {
-                        push_target(&mut queue, &seen, target);
-                    }
+                    follow_target(if take_true { if_true } else { if_false });
                 } else {
                     data_forks += 1;
-                    for target in [if_true, if_false] {
-                        if target.block == dispatcher {
-                            if !record_backedge(
-                                body,
-                                state,
-                                param_index,
-                                current,
-                                target,
-                                &mut next,
-                                &mut transitions,
-                            ) {
-                                unresolved_backedges += 1;
-                            }
-                        } else {
-                            push_target(&mut queue, &seen, target);
-                        }
-                    }
+                    follow_target(if_true);
+                    follow_target(if_false);
                 }
             }
             Terminator::Select {
@@ -213,21 +185,7 @@ pub(super) fn transitions_for(
             } => {
                 data_forks += 1;
                 for target in targets.iter().chain(std::iter::once(default)) {
-                    if target.block == dispatcher {
-                        if !record_backedge(
-                            body,
-                            state,
-                            param_index,
-                            current,
-                            target,
-                            &mut next,
-                            &mut transitions,
-                        ) {
-                            unresolved_backedges += 1;
-                        }
-                    } else {
-                        push_target(&mut queue, &seen, target);
-                    }
+                    follow_target(target);
                 }
             }
             Terminator::Return { .. } | Terminator::Unreachable | Terminator::None => {}

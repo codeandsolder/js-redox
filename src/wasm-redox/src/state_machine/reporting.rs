@@ -263,7 +263,7 @@ pub(super) fn annotate_composed_machine_flows(machines: &mut [StateMachineReport
         }
         let mut environment = initial_environment(machine);
         for case in &mut machine.cases {
-            case.entry_arguments = environment.clone();
+            case.entry_arguments.clone_from(&environment);
             for transition in &mut case.transitions {
                 transition.composed_arguments =
                     substitute_arguments(&transition.arguments, &environment);
@@ -272,7 +272,7 @@ pub(super) fn annotate_composed_machine_flows(machines: &mut [StateMachineReport
                 entry.composed_arguments = substitute_arguments(&entry.arguments, &environment);
             }
             match case.transitions.as_slice() {
-                [transition] => environment = transition.composed_arguments.clone(),
+                [transition] => environment.clone_from(&transition.composed_arguments),
                 [] => {}
                 _ => break,
             }
@@ -304,6 +304,7 @@ fn unique_direct_entry(machine: &StateMachineReport) -> Option<&NestedMachineEnt
     entries.next().is_none().then_some(first)
 }
 
+#[must_use]
 pub fn compose_machine_pipelines(
     machines: &[StateMachineReport],
 ) -> Vec<StateMachinePipelineReport> {
@@ -322,8 +323,7 @@ pub fn compose_machine_pipelines(
             let terminal_local = machine
                 .cases
                 .last()
-                .map(|case| case.entry_arguments.as_slice())
-                .unwrap_or_default();
+                .map_or_default(|case| case.entry_arguments.as_slice());
             let terminal_absolute = substitute_arguments(terminal_local, &environment);
 
             let (next_machine, next_environment, exit_arguments) =
@@ -362,11 +362,10 @@ pub fn compose_machine_pipelines(
 }
 
 fn terminal_environment(machine: &StateMachineReport) -> Vec<String> {
-    machine
-        .cases
-        .last()
-        .map(|case| case.entry_arguments.clone())
-        .unwrap_or_else(|| initial_environment(machine))
+    machine.cases.last().map_or_else(
+        || initial_environment(machine),
+        |case| case.entry_arguments.clone(),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -414,6 +413,7 @@ pub(super) fn terminal_bindings(
     (bindings, reports)
 }
 
+#[must_use]
 pub fn root_machine_indices(machines: &[StateMachineReport]) -> Vec<usize> {
     (0..machines.len())
         .filter(|&candidate| {

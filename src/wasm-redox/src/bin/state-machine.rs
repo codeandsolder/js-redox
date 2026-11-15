@@ -24,7 +24,7 @@ fn main() -> Result<()> {
             machine.data_forks
         );
         for (from, to) in machine.graph.iter().take(64) {
-            println!("  {from:10} -> {:?}", to);
+            println!("  {from:10} -> {to:?}");
         }
     }
     Ok(())

@@ -20,7 +20,9 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     panic::{catch_unwind, AssertUnwindSafe},
 };
-use waffle::{entity::EntityRef, ExportKind, FrontendOptions, Module, OptOptions};
+use waffle::{
+    entity::EntityRef, Block, ExportKind, FrontendOptions, FunctionBody, Module, OptOptions, Value,
+};
 use work_budget::WorkBudget;
 
 #[derive(Debug, Serialize)]
@@ -35,6 +37,11 @@ pub struct ExportSemanticAnalysis {
     pub returns: Vec<SemanticReturnReport>,
 }
 
+/// Recover provable state transitions and observable return semantics for an export.
+///
+/// # Errors
+/// Returns an error on invalid modules, unavailable exports, exhausted budgets,
+/// or a failure in the underlying WAFFLE analysis.
 pub fn analyze_export_semantics(
     bytes: &[u8],
     export_name: &str,
@@ -56,36 +63,10 @@ pub fn analyze_export_semantics(
     }
 }
 
-fn analyze_inner(
-    bytes: &[u8],
-    export_name: &str,
+fn find_state_candidates(
+    body: &FunctionBody,
     budget: &WorkBudget,
-) -> Result<ExportSemanticAnalysis> {
-    budget.checkpoint()?;
-    let mut module = Module::from_wasm_bytes(bytes, &FrontendOptions::default())?;
-    budget.checkpoint()?;
-    let func = module
-        .exports
-        .iter()
-        .find_map(|e| match e.kind {
-            ExportKind::Func(f) if e.name == export_name => Some(f),
-            _ => None,
-        })
-        .context("export")?;
-    // Copied-input byte-integrity proofs summarize side effects through the
-    // reachable internal call graph. Expand lazy defined bodies up front so an
-    // unparsed internal helper is never mistaken for an opaque host import.
-    module.expand_all_funcs()?;
-    budget.checkpoint()?;
-    module.funcs[func]
-        .body_mut()
-        .context("body")?
-        .optimize(&OptOptions::default());
-    budget.checkpoint()?;
-    let call_names = build_semantic_call_names(&mut module, func);
-    let body = module.funcs[func].body().context("body")?;
-    let externref_bulk_copy_candidates = externref_bulk_copy_candidates(&module, body, &call_names);
-
+) -> Result<Vec<(usize, Block, usize, Value)>> {
     let mut candidates = Vec::new();
     for (block, def) in body.blocks.entries() {
         budget.consume(1)?;
@@ -98,9 +79,48 @@ fn analyze_inner(
     }
     candidates.sort_by_key(|(n, _, _, _)| std::cmp::Reverse(*n));
 
+    Ok(candidates)
+}
+
+fn trace_state_graph(
+    body: &FunctionBody,
+    dispatcher: Block,
+    state: Value,
+    param_index: usize,
+    initial: &BTreeSet<u32>,
+    budget: &WorkBudget,
+) -> Result<(BTreeMap<u32, BTreeSet<u32>>, usize, usize)> {
+    let mut states = initial.iter().copied().collect::<VecDeque<_>>();
+    let mut seen = BTreeSet::new();
+    let mut graph: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    let mut unresolved = 0usize;
+    let mut forks = 0usize;
+    while let Some(current) = states.pop_front() {
+        budget.consume(1)?;
+        if !seen.insert(current) || seen.len() > 256 {
+            continue;
+        }
+        let trace = transitions_for(body, dispatcher, state, param_index, current);
+        unresolved = unresolved.saturating_add(trace.unresolved_backedges);
+        forks = forks.saturating_add(trace.data_forks);
+        for n in &trace.next {
+            if !seen.contains(n) {
+                states.push_back(*n);
+            }
+        }
+        graph.insert(current, trace.next);
+    }
+
+    Ok((graph, unresolved, forks))
+}
+
+fn discover_state_machines(
+    body: &FunctionBody,
+    budget: &WorkBudget,
+) -> Result<(Vec<StateMachineReport>, Vec<MachineMeta>)> {
     let mut machines = Vec::new();
     let mut metadata = Vec::new();
-    for (cmp_count, dispatcher, param_index, state) in candidates {
+    for (cmp_count, dispatcher, param_index, state) in find_state_candidates(body, budget)? {
         budget.consume(1)?;
         let mut initial = BTreeSet::new();
         for (_, pred) in body.blocks.entries() {
@@ -118,26 +138,8 @@ fn analyze_inner(
         if initial.is_empty() {
             continue;
         }
-        let mut states = initial.iter().copied().collect::<VecDeque<_>>();
-        let mut seen = BTreeSet::new();
-        let mut graph: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
-        let mut unresolved = 0usize;
-        let mut forks = 0usize;
-        while let Some(current) = states.pop_front() {
-            budget.consume(1)?;
-            if !seen.insert(current) || seen.len() > 256 {
-                continue;
-            }
-            let trace = transitions_for(body, dispatcher, state, param_index, current);
-            unresolved = unresolved.saturating_add(trace.unresolved_backedges);
-            forks = forks.saturating_add(trace.data_forks);
-            for n in &trace.next {
-                if !seen.contains(n) {
-                    states.push_back(*n);
-                }
-            }
-            graph.insert(current, trace.next);
-        }
+        let (graph, unresolved, forks) =
+            trace_state_graph(body, dispatcher, state, param_index, &initial, budget)?;
 
         let incoming = graph
             .values()
@@ -193,6 +195,40 @@ fn analyze_inner(
             param_index,
         });
     }
+    Ok((machines, metadata))
+}
+
+fn analyze_inner(
+    bytes: &[u8],
+    export_name: &str,
+    budget: &WorkBudget,
+) -> Result<ExportSemanticAnalysis> {
+    budget.checkpoint()?;
+    let mut module = Module::from_wasm_bytes(bytes, &FrontendOptions::default())?;
+    budget.checkpoint()?;
+    let func = module
+        .exports
+        .iter()
+        .find_map(|e| match e.kind {
+            ExportKind::Func(f) if e.name == export_name => Some(f),
+            _ => None,
+        })
+        .context("export")?;
+    // Copied-input byte-integrity proofs summarize side effects through the
+    // reachable internal call graph. Expand lazy defined bodies up front so an
+    // unparsed internal helper is never mistaken for an opaque host import.
+    module.expand_all_funcs()?;
+    budget.checkpoint()?;
+    module.funcs[func]
+        .body_mut()
+        .context("body")?
+        .optimize(&OptOptions::default());
+    budget.checkpoint()?;
+    let call_names = build_semantic_call_names(&mut module, func);
+    let body = module.funcs[func].body().context("body")?;
+    let externref_bulk_copy_candidates = externref_bulk_copy_candidates(&module, body, &call_names);
+
+    let (mut machines, metadata) = discover_state_machines(body, budget)?;
     budget.checkpoint()?;
     annotate_initial_entries(body, &mut machines, &metadata);
     budget.checkpoint()?;

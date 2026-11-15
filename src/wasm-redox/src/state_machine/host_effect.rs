@@ -90,8 +90,7 @@ pub(super) fn opaque_host_effect_memory_reads(
                 host_import_function: host_import.index(),
                 host_import: names
                     .label(host_import)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("func{}", host_import.index())),
+                    .map_or_else(|| format!("func{}", host_import.index()), str::to_owned),
                 memory_read_value: value.index(),
                 memory_read_helper: function_index.index(),
                 base_value: base.index(),

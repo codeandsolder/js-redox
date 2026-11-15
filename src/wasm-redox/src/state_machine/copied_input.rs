@@ -22,7 +22,7 @@ pub struct StructuralInputCopyLoadReport {
     /// wasm-bindgen helper on paths from the proven set-like call to this load.
     /// Cross-language correlation may discharge these only with an exact pure
     /// `length` handler proof for the same module/import object and a proven
-    /// Uint32Array source.
+    /// `Uint32Array` source.
     pub source_length_import_barriers: Vec<usize>,
     /// Other imported calls reachable before this load. These remain opaque
     /// memory barriers and prevent byte-integrity claims.
@@ -474,10 +474,10 @@ fn provider_chain(
     };
     let memory_import = nested
         .and_then(|function| names.memory_slot_import(function))
-        .map(|function| function.index());
+        .map(waffle::entity::EntityRef::index);
     (
         Some(provider.index()),
-        nested.map(|function| function.index()),
+        nested.map(waffle::entity::EntityRef::index),
         memory_import,
     )
 }
@@ -562,6 +562,92 @@ fn binary_argument_bits(
     ))
 }
 
+fn operator_trailing_zero_bits(
+    module: &Module<'_>,
+    body: &FunctionBody,
+    value: Value,
+    function_cache: &mut BTreeMap<Func, u32>,
+    visiting_functions: &mut BTreeSet<Func>,
+    value_cache: &mut BTreeMap<Value, u32>,
+    visiting_values: &mut BTreeSet<Value>,
+) -> u32 {
+    let ValueDef::Operator(operator, args, _) = &body.values[value] else {
+        return 0;
+    };
+    let args = &body.arg_pool[*args];
+    match operator {
+        Operator::I32Add | Operator::I32Sub | Operator::I32Or | Operator::I32Xor => {
+            binary_argument_bits(
+                module,
+                body,
+                args,
+                function_cache,
+                visiting_functions,
+                value_cache,
+                visiting_values,
+            )
+            .map_or(0, |(left, right)| left.min(right))
+        }
+        Operator::I32Mul => binary_argument_bits(
+            module,
+            body,
+            args,
+            function_cache,
+            visiting_functions,
+            value_cache,
+            visiting_values,
+        )
+        .map_or(0, |(left, right)| left.saturating_add(right).min(32)),
+        Operator::I32And => binary_argument_bits(
+            module,
+            body,
+            args,
+            function_cache,
+            visiting_functions,
+            value_cache,
+            visiting_values,
+        )
+        .map_or(0, |(left, right)| left.max(right)),
+        Operator::I32Shl => match args {
+            [input, shift] => i32_const(body, *shift).map_or(0, |shift| {
+                let input_bits = value_trailing_zero_bits(
+                    module,
+                    body,
+                    *input,
+                    function_cache,
+                    visiting_functions,
+                    value_cache,
+                    visiting_values,
+                );
+                input_bits.saturating_add(shift & 31).min(32)
+            }),
+            _ => 0,
+        },
+        Operator::I32ShrS | Operator::I32ShrU => match args {
+            [input, shift] => i32_const(body, *shift).map_or(0, |shift| {
+                value_trailing_zero_bits(
+                    module,
+                    body,
+                    *input,
+                    function_cache,
+                    visiting_functions,
+                    value_cache,
+                    visiting_values,
+                )
+                .saturating_sub(shift & 31)
+            }),
+            _ => 0,
+        },
+        Operator::Call { function_index } => function_return_trailing_zero_bits(
+            module,
+            *function_index,
+            function_cache,
+            visiting_functions,
+        ),
+        _ => 0,
+    }
+}
+
 fn value_trailing_zero_bits(
     module: &Module<'_>,
     body: &FunctionBody,
@@ -610,82 +696,16 @@ fn value_trailing_zero_bits(
                 })
             }
         }
-        ValueDef::BlockParam(..) => 0,
         ValueDef::Operator(Operator::I32Const { value }, _, _) => value.trailing_zeros(),
-        ValueDef::Operator(operator, args, _) => {
-            let args = &body.arg_pool[*args];
-            match operator {
-                Operator::I32Add | Operator::I32Sub | Operator::I32Or | Operator::I32Xor => {
-                    binary_argument_bits(
-                        module,
-                        body,
-                        args,
-                        function_cache,
-                        visiting_functions,
-                        value_cache,
-                        visiting_values,
-                    )
-                    .map_or(0, |(left, right)| left.min(right))
-                }
-                Operator::I32Mul => binary_argument_bits(
-                    module,
-                    body,
-                    args,
-                    function_cache,
-                    visiting_functions,
-                    value_cache,
-                    visiting_values,
-                )
-                .map_or(0, |(left, right)| left.saturating_add(right).min(32)),
-                Operator::I32And => binary_argument_bits(
-                    module,
-                    body,
-                    args,
-                    function_cache,
-                    visiting_functions,
-                    value_cache,
-                    visiting_values,
-                )
-                .map_or(0, |(left, right)| left.max(right)),
-                Operator::I32Shl => match args {
-                    [input, shift] => i32_const(body, *shift).map_or(0, |shift| {
-                        let input_bits = value_trailing_zero_bits(
-                            module,
-                            body,
-                            *input,
-                            function_cache,
-                            visiting_functions,
-                            value_cache,
-                            visiting_values,
-                        );
-                        input_bits.saturating_add(shift & 31).min(32)
-                    }),
-                    _ => 0,
-                },
-                Operator::I32ShrS | Operator::I32ShrU => match args {
-                    [input, shift] => i32_const(body, *shift).map_or(0, |shift| {
-                        value_trailing_zero_bits(
-                            module,
-                            body,
-                            *input,
-                            function_cache,
-                            visiting_functions,
-                            value_cache,
-                            visiting_values,
-                        )
-                        .saturating_sub(shift & 31)
-                    }),
-                    _ => 0,
-                },
-                Operator::Call { function_index } => function_return_trailing_zero_bits(
-                    module,
-                    *function_index,
-                    function_cache,
-                    visiting_functions,
-                ),
-                _ => 0,
-            }
-        }
+        ValueDef::Operator(..) => operator_trailing_zero_bits(
+            module,
+            body,
+            value,
+            function_cache,
+            visiting_functions,
+            value_cache,
+            visiting_values,
+        ),
         ValueDef::PickOutput(source, index, _) if *index == 0 => {
             let source = body.resolve_alias(*source);
             match &body.values[source] {
@@ -700,7 +720,10 @@ fn value_trailing_zero_bits(
                 _ => 0,
             }
         }
-        ValueDef::PickOutput(..) | ValueDef::Placeholder(_) | ValueDef::None => 0,
+        ValueDef::BlockParam(..)
+        | ValueDef::PickOutput(..)
+        | ValueDef::Placeholder(_)
+        | ValueDef::None => 0,
     };
     visiting_values.remove(&value);
     value_cache.insert(value, bits);
@@ -781,8 +804,9 @@ fn operator_direct_memory_mutation(operator: &Operator, target_memory: usize) ->
         // memory.grow preserves every pre-existing byte. The JS copy has already
         // completed at the start of this proof interval, so buffer replacement is
         // not itself a content mutation for subsequent WASM loads.
-        Operator::MemoryGrow { .. } => false,
-        Operator::Call { .. } | Operator::CallIndirect { .. } => false,
+        Operator::MemoryGrow { .. } | Operator::Call { .. } | Operator::CallIndirect { .. } => {
+            false
+        }
         _ => operator
             .effects()
             .iter()
@@ -962,12 +986,11 @@ fn barriers_before_load(
             let barriers = analyzer.instruction(block_definition.insts[position]);
             next.merge(&barriers);
             let next_key = (block.index(), position + 1);
-            let changed = match states.get_mut(&next_key) {
-                Some(existing) => existing.merge(&next),
-                None => {
-                    states.insert(next_key, next);
-                    true
-                }
+            let changed = if let Some(existing) = states.get_mut(&next_key) {
+                existing.merge(&next)
+            } else {
+                states.insert(next_key, next);
+                true
             };
             if changed {
                 queue.push_back((block, position + 1));
@@ -976,10 +999,12 @@ fn barriers_before_load(
         }
         block_definition.terminator.visit_targets(|target| {
             let next_key = (target.block.index(), 0);
-            let changed = match states.get_mut(&next_key) {
-                Some(existing) => existing.merge(&state),
-                None => {
-                    states.insert(next_key, state.clone());
+            let changed = match states.entry(next_key) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().merge(&state)
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(state.clone());
                     true
                 }
             };
@@ -1079,6 +1104,78 @@ fn provider_wrapper_imports_around_allocator(
     Some(imports)
 }
 
+fn exact_cleanup_role_order(
+    body: &FunctionBody,
+    cleanup_function: Func,
+    slots: [Value; 3],
+    copy: CopySite,
+    receiver_store: TableStoreSite,
+) -> bool {
+    let copy_point = ProgramPoint {
+        block: copy.block,
+        position: copy.position,
+    };
+    let after_copy = ProgramPoint {
+        block: copy.block,
+        position: copy.position + 1,
+    };
+    let after_receiver_store = ProgramPoint {
+        block: receiver_store.block,
+        position: receiver_store.position + 1,
+    };
+
+    let mut pre_roles = Vec::new();
+    let mut post_roles = Vec::new();
+    for (block, definition) in body.blocks.entries() {
+        for (position, instruction) in definition.insts.iter().copied().enumerate() {
+            let value = body.resolve_alias(instruction);
+            let ValueDef::Operator(Operator::Call { function_index }, args, _) =
+                &body.values[value]
+            else {
+                continue;
+            };
+            if *function_index != cleanup_function {
+                continue;
+            }
+            let [argument] = &body.arg_pool[*args] else {
+                return false;
+            };
+            let argument = unique_transparent_origin(body, *argument, 8);
+            let role = if same_carried_origin(body, argument, slots[0]) {
+                FreshCleanupSlotRole::Memory
+            } else if same_carried_origin(body, argument, slots[1]) {
+                FreshCleanupSlotRole::Buffer
+            } else if same_carried_origin(body, argument, slots[2]) {
+                FreshCleanupSlotRole::Receiver
+            } else {
+                continue;
+            };
+            let call = ProgramPoint { block, position };
+            let after_call = ProgramPoint {
+                block,
+                position: position + 1,
+            };
+            let is_pre = point_reachable_without_crossing(
+                body,
+                after_receiver_store,
+                call,
+                Some(copy_point),
+            ) && point_reachable_without_crossing(body, after_call, copy_point, None);
+            let is_post =
+                point_reachable_without_crossing(body, after_copy, call, Some(copy_point));
+            match (is_pre, is_post) {
+                (true, false) => pre_roles.push(role),
+                (false, true) => post_roles.push(role),
+                _ => return false,
+            }
+        }
+    }
+    pre_roles.sort();
+    post_roles.sort();
+    pre_roles == [FreshCleanupSlotRole::Buffer]
+        && post_roles == [FreshCleanupSlotRole::Memory, FreshCleanupSlotRole::Receiver]
+}
+
 fn fresh_cleanup_disjointness_recipe(
     module: &Module<'_>,
     body: &FunctionBody,
@@ -1120,70 +1217,13 @@ fn fresh_cleanup_disjointness_recipe(
     }
     let cleanup_function = Func::new(*cleanup_functions.iter().next()?);
 
-    let copy_point = ProgramPoint {
-        block: copy.block,
-        position: copy.position,
-    };
-    let after_copy = ProgramPoint {
-        block: copy.block,
-        position: copy.position + 1,
-    };
-    let after_receiver_store = ProgramPoint {
-        block: context.receiver_store.block,
-        position: context.receiver_store.position + 1,
-    };
-
-    let mut pre_roles = Vec::new();
-    let mut post_roles = Vec::new();
-    for (block, definition) in body.blocks.entries() {
-        for (position, instruction) in definition.insts.iter().copied().enumerate() {
-            let value = body.resolve_alias(instruction);
-            let ValueDef::Operator(Operator::Call { function_index }, args, _) =
-                &body.values[value]
-            else {
-                continue;
-            };
-            if *function_index != cleanup_function {
-                continue;
-            }
-            let [argument] = &body.arg_pool[*args] else {
-                return None;
-            };
-            let argument = unique_transparent_origin(body, *argument, 8);
-            let role = if same_carried_origin(body, argument, memory_slot) {
-                FreshCleanupSlotRole::Memory
-            } else if same_carried_origin(body, argument, buffer_slot) {
-                FreshCleanupSlotRole::Buffer
-            } else if same_carried_origin(body, argument, receiver_slot) {
-                FreshCleanupSlotRole::Receiver
-            } else {
-                continue;
-            };
-            let call = ProgramPoint { block, position };
-            let after_call = ProgramPoint {
-                block,
-                position: position + 1,
-            };
-            let is_pre = point_reachable_without_crossing(
-                body,
-                after_receiver_store,
-                call,
-                Some(copy_point),
-            ) && point_reachable_without_crossing(body, after_call, copy_point, None);
-            let is_post =
-                point_reachable_without_crossing(body, after_copy, call, Some(copy_point));
-            match (is_pre, is_post) {
-                (true, false) => pre_roles.push(role),
-                (false, true) => post_roles.push(role),
-                _ => return None,
-            }
-        }
-    }
-    pre_roles.sort();
-    post_roles.sort();
-    if pre_roles != [FreshCleanupSlotRole::Buffer]
-        || post_roles != [FreshCleanupSlotRole::Memory, FreshCleanupSlotRole::Receiver]
-    {
+    if !exact_cleanup_role_order(
+        body,
+        cleanup_function,
+        [memory_slot, buffer_slot, receiver_slot],
+        copy,
+        context.receiver_store,
+    ) {
         return None;
     }
 
@@ -1280,6 +1320,101 @@ fn destination_loads_dominated_by_set(
     loads
 }
 
+fn candidate_for_set_call(
+    module: &Module<'_>,
+    body: &FunctionBody,
+    names: &SemanticCallNames,
+    cfg: &CFGInfo,
+    imported: &BTreeSet<Func>,
+    location: (Block, usize),
+    instruction: Value,
+) -> Option<ExternrefBulkCopyCandidateReport> {
+    let (block, position) = location;
+    let call_value = body.resolve_alias(instruction);
+    let ValueDef::Operator(Operator::Call { function_index }, args, _) = &body.values[call_value]
+    else {
+        return None;
+    };
+    if !imported.contains(function_index) {
+        return None;
+    }
+    let [receiver, source, element_offset] = &body.arg_pool[*args] else {
+        return None;
+    };
+    let receiver_slot = table_get_slot(body, *receiver)?;
+    let source_slot = table_get_slot(body, *source)?;
+    let source_store = safe_store_before(body, cfg, block, position, source_slot)?;
+    let source_entry_parameter = entry_parameter_index(body, source_store.stored)?;
+    let destination_base = base_shifted_right_by_two(body, *element_offset)?;
+    let receiver_store = safe_store_before(body, cfg, block, position, receiver_slot)?;
+    let (constructor_import, constructor_args) = direct_call(body, receiver_store.stored, 4)?;
+    let [constructor_input] = constructor_args.as_slice() else {
+        return None;
+    };
+    if !imported.contains(&constructor_import) || constructor_import == *function_index {
+        return None;
+    }
+    let constructor_input_slot = table_get_slot(body, *constructor_input)?;
+    let (slot_provider, provider_argument, memory_import) =
+        provider_chain(body, constructor_input_slot, names);
+    let copy = CopySite {
+        block,
+        position,
+        destination_base,
+        source_slot,
+    };
+    let destination_loads = destination_loads_dominated_by_set(module, names, body, cfg, copy);
+    let fresh_cleanup_disjointness_recipe = fresh_cleanup_disjointness_recipe(
+        module,
+        body,
+        copy,
+        FreshCleanupContext {
+            receiver_store,
+            receiver_slot,
+            constructor_input_slot,
+            slot_provider,
+            provider_argument,
+        },
+        &destination_loads,
+    );
+    Some(ExternrefBulkCopyCandidateReport {
+        block: block.index(),
+        set_instruction_index: position,
+        set_call_value: call_value.index(),
+        set_import_function: function_index.index(),
+        constructor_import_function: constructor_import.index(),
+        source_entry_parameter,
+        source_slot_value: source_slot.index(),
+        source_store_block: source_store.block.index(),
+        source_store_instruction_index: source_store.position,
+        source_store_value: source_store.value.index(),
+        receiver_slot_value: receiver_slot.index(),
+        receiver_store_block: receiver_store.block.index(),
+        receiver_store_instruction_index: receiver_store.position,
+        receiver_store_value: receiver_store.value.index(),
+        destination_base_value: destination_base.index(),
+        destination_element_index_shift: 2,
+        destination_base_guaranteed_trailing_zero_bits: guaranteed_trailing_zero_bits(
+            module,
+            body,
+            destination_base,
+        ),
+        fresh_destination_base_recipe: fresh_destination_base_recipe(
+            module,
+            body,
+            destination_base,
+            source_slot,
+            names,
+        ),
+        constructor_input_slot_value: constructor_input_slot.index(),
+        constructor_input_slot_provider_function: slot_provider,
+        constructor_input_provider_argument_function: provider_argument,
+        constructor_input_memory_import_function: memory_import,
+        fresh_cleanup_disjointness_recipe,
+        destination_loads,
+    })
+}
+
 pub(super) fn externref_bulk_copy_candidates(
     module: &Module<'_>,
     body: &FunctionBody,
@@ -1298,113 +1433,17 @@ pub(super) fn externref_bulk_copy_candidates(
     let mut reports = Vec::new();
     for (block, block_definition) in body.blocks.entries() {
         for (position, instruction) in block_definition.insts.iter().enumerate() {
-            let call_value = body.resolve_alias(*instruction);
-            let ValueDef::Operator(Operator::Call { function_index }, args, _) =
-                &body.values[call_value]
-            else {
-                continue;
-            };
-            if !imported.contains(function_index) {
-                continue;
-            }
-            let [receiver, source, element_offset] = &body.arg_pool[*args] else {
-                continue;
-            };
-            let Some(receiver_slot) = table_get_slot(body, *receiver) else {
-                continue;
-            };
-            let Some(source_slot) = table_get_slot(body, *source) else {
-                continue;
-            };
-            let Some(source_store) = safe_store_before(body, &cfg, block, position, source_slot)
-            else {
-                continue;
-            };
-            let Some(source_entry_parameter) = entry_parameter_index(body, source_store.stored)
-            else {
-                continue;
-            };
-            let Some(destination_base) = base_shifted_right_by_two(body, *element_offset) else {
-                continue;
-            };
-            let Some(receiver_store) =
-                safe_store_before(body, &cfg, block, position, receiver_slot)
-            else {
-                continue;
-            };
-            let Some((constructor_import, constructor_args)) =
-                direct_call(body, receiver_store.stored, 4)
-            else {
-                continue;
-            };
-            let [constructor_input] = constructor_args.as_slice() else {
-                continue;
-            };
-            if !imported.contains(&constructor_import) || constructor_import == *function_index {
-                continue;
-            }
-            let Some(constructor_input_slot) = table_get_slot(body, *constructor_input) else {
-                continue;
-            };
-            let (slot_provider, provider_argument, memory_import) =
-                provider_chain(body, constructor_input_slot, names);
-            let copy = CopySite {
-                block,
-                position,
-                destination_base,
-                source_slot,
-            };
-            let destination_loads =
-                destination_loads_dominated_by_set(module, names, body, &cfg, copy);
-            let fresh_cleanup_disjointness_recipe = fresh_cleanup_disjointness_recipe(
+            if let Some(report) = candidate_for_set_call(
                 module,
                 body,
-                copy,
-                FreshCleanupContext {
-                    receiver_store,
-                    receiver_slot,
-                    constructor_input_slot,
-                    slot_provider,
-                    provider_argument,
-                },
-                &destination_loads,
-            );
-            reports.push(ExternrefBulkCopyCandidateReport {
-                block: block.index(),
-                set_instruction_index: position,
-                set_call_value: call_value.index(),
-                set_import_function: function_index.index(),
-                constructor_import_function: constructor_import.index(),
-                source_entry_parameter,
-                source_slot_value: source_slot.index(),
-                source_store_block: source_store.block.index(),
-                source_store_instruction_index: source_store.position,
-                source_store_value: source_store.value.index(),
-                receiver_slot_value: receiver_slot.index(),
-                receiver_store_block: receiver_store.block.index(),
-                receiver_store_instruction_index: receiver_store.position,
-                receiver_store_value: receiver_store.value.index(),
-                destination_base_value: destination_base.index(),
-                destination_element_index_shift: 2,
-                destination_base_guaranteed_trailing_zero_bits: guaranteed_trailing_zero_bits(
-                    module,
-                    body,
-                    destination_base,
-                ),
-                fresh_destination_base_recipe: fresh_destination_base_recipe(
-                    module,
-                    body,
-                    destination_base,
-                    source_slot,
-                    names,
-                ),
-                constructor_input_slot_value: constructor_input_slot.index(),
-                constructor_input_slot_provider_function: slot_provider,
-                constructor_input_provider_argument_function: provider_argument,
-                constructor_input_memory_import_function: memory_import,
-                fresh_cleanup_disjointness_recipe,
-                destination_loads,
-            });
+                names,
+                &cfg,
+                &imported,
+                (block, position),
+                *instruction,
+            ) {
+                reports.push(report);
+            }
         }
     }
     reports.sort();

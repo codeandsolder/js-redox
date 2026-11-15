@@ -15,7 +15,7 @@ struct Args {
     function_index: usize,
 
     #[arg(long = "i32-arg")]
-    i32_args: Vec<u32>,
+    arguments: Vec<u32>,
 
     #[arg(long = "initial-table-grow", value_parser = parse_table_grow)]
     initial_table_grows: Vec<FreshTableGrowRequest>,
@@ -85,7 +85,7 @@ fn main() -> Result<()> {
         let report = wasm_redox::fresh_eval::evaluate_fresh_i32_call(
             &bytes,
             args.function_index,
-            &args.i32_args,
+            &args.arguments,
             Some(args.fuel),
             &budget,
         )?;
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
         calls.push(FreshI32CallRequest {
             function_index: args.function_index,
             i32_args: args
-                .i32_args
+                .arguments
                 .into_iter()
                 .map(|value| FreshI32Arg::Literal { value })
                 .collect(),
