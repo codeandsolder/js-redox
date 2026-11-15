@@ -1028,7 +1028,7 @@ fn statement_has_loop_control(stmt: &Statement<'_>) -> bool {
     detector.found
 }
 
-pub(super) fn direct_assignment_name<'a>(
+pub fn direct_assignment_name<'a>(
     target: &'a oxc_ast::ast::AssignmentTarget<'a>,
 ) -> Option<&'a str> {
     match target {

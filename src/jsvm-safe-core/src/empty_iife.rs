@@ -41,7 +41,7 @@ fn immediate_empty_function(callee: &Expression<'_>) -> bool {
     }
 }
 
-pub(super) fn simplify_empty_iife(call: &CallExpression<'_>, source: &str) -> Option<String> {
+pub fn simplify_empty_iife(call: &CallExpression<'_>, source: &str) -> Option<String> {
     if call.arguments.iter().any(oxc_ast::ast::Argument::is_spread)
         || !immediate_empty_function(&call.callee)
     {

@@ -14,11 +14,11 @@ use oxc_ecmascript::{StringToNumber, ToInt32, ToUint32};
 use oxc_syntax::number::ToJsString;
 
 /// A JavaScript array index is a canonical decimal property key in
-/// [0, 2^32 - 2]. Computed members use ToPropertyKey, *not* ToNumber:
-/// arr[true] reads "true", not index 1, and arr["01"] is not arr[1].
+/// [0, 2^32 - 2]. Computed members use `ToPropertyKey`, *not* `ToNumber`:
+/// `arr[true]` reads `"true"`, not index 1, and `arr["01"]` is not `arr[1]`.
 /// Signed numeric zero becomes "0"; the string "-0" remains distinct.
 #[must_use]
-pub(crate) fn canonical_array_index(value: &Value) -> Option<u32> {
+pub fn canonical_array_index(value: &Value) -> Option<u32> {
     let key = value.js_string()?;
     let index = key.parse::<u32>().ok()?;
     (index != u32::MAX && index.to_string() == key).then_some(index)
@@ -33,10 +33,11 @@ pub fn string_literal_value(literal: &StringLiteral<'_>) -> Option<String> {
     literal.value.as_str().map(str::to_owned)
 }
 
-/// Recover a template quasi using the same semantics as the pre-`JSStr` AST:
-/// prefer cooked text, and fall back to raw source spelling when cooked is absent.
-/// A cooked value containing a lone surrogate is not representable in the Rust
-/// string proof domain and therefore fails closed.
+/// Recover a template quasi with the original AST's cooked/raw semantics.
+///
+/// Prefer cooked text, falling back to raw spelling when cooked is absent.
+/// A lone surrogate in cooked text cannot be represented in Rust's string
+/// proof domain, so the recovery fails closed.
 #[must_use]
 pub fn template_element_value(quasi: &TemplateElement<'_>) -> Option<String> {
     match quasi.value.cooked.as_ref() {
@@ -55,6 +56,7 @@ pub enum Value {
 }
 
 impl Value {
+    #[must_use]
     pub fn truthy(&self) -> bool {
         match self {
             Self::String(s) => !s.is_empty(),
@@ -64,6 +66,7 @@ impl Value {
         }
     }
 
+    #[must_use]
     pub fn number(&self) -> Option<f64> {
         match self {
             Self::Number(n) => Some(*n),
@@ -74,6 +77,7 @@ impl Value {
         }
     }
 
+    #[must_use]
     pub fn js_string(&self) -> Option<String> {
         Some(match self {
             Self::String(s) => s.clone(),
@@ -84,6 +88,7 @@ impl Value {
         })
     }
 
+    #[must_use]
     pub fn render(&self) -> Option<String> {
         match self {
             Self::String(s) => serde_json::to_string(s).ok(),
@@ -111,7 +116,7 @@ pub fn same_value(a: &Value, b: &Value) -> bool {
         (Value::String(a), Value::String(b)) => a == b,
         // JavaScript Strict Equality: NaN is never equal to itself, while
         // +0 and -0 compare equal.
-        (Value::Number(a), Value::Number(b)) => a == b,
+        (Value::Number(a), Value::Number(b)) => crate::numeric::js_number_equal(*a, *b),
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Null, Value::Null) | (Value::Undefined, Value::Undefined) => true,
         _ => false,
@@ -130,6 +135,7 @@ pub fn render_value_array(values: &[Value]) -> Option<String> {
     Some(format!("[{}]", rendered.join(", ")))
 }
 
+#[must_use]
 pub fn eval(expr: &Expression<'_>) -> Option<Value> {
     eval_with_resolver(expr, &|_| None)
 }
@@ -241,7 +247,7 @@ pub fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
     eval_unary_with_resolver(v, &|_| None)
 }
 
-pub(crate) fn eval_unary_value(op: &str, value: Value) -> Option<Value> {
+pub fn eval_unary_value(op: &str, value: Value) -> Option<Value> {
     match op {
         "!" => Some(Value::Bool(!value.truthy())),
         "+" => value.number().map(Value::Number),
@@ -287,7 +293,7 @@ pub fn js_to_int32(n: f64) -> i32 {
 }
 
 /// ECMAScript Abstract Equality for the complete primitive domain modeled by
-/// this evaluator. Object, Symbol and BigInt equality is deliberately handled
+/// this evaluator. Object, Symbol and `BigInt` equality is deliberately handled
 /// outside this domain, never guessed from source text.
 fn abstract_primitive_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
@@ -300,7 +306,7 @@ fn abstract_primitive_equal(left: &Value, right: &Value) -> bool {
         }
         (Value::String(text), Value::Number(number))
         | (Value::Number(number), Value::String(text)) => {
-            text.as_str().string_to_number() == *number
+            crate::numeric::js_number_equal(text.as_str().string_to_number(), *number)
         }
         (Value::Null | Value::Undefined, _) | (_, Value::Null | Value::Undefined) => false,
         _ => same_value(left, right),
@@ -388,12 +394,12 @@ pub fn eval_logical(v: &LogicalExpression<'_>) -> Option<Value> {
     eval_logical_with_resolver(v, &|_| None)
 }
 
-pub(crate) enum LogicalStep {
+pub enum LogicalStep {
     Value(Value),
     EvaluateRight,
 }
 
-pub(crate) fn eval_logical_left(op: &str, left: Value) -> Option<LogicalStep> {
+pub fn eval_logical_left(op: &str, left: Value) -> Option<LogicalStep> {
     match op {
         "&&" if left.truthy() => Some(LogicalStep::EvaluateRight),
         "&&" => Some(LogicalStep::Value(left)),

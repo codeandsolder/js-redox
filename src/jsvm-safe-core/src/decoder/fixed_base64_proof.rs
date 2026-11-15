@@ -30,10 +30,10 @@ use std::collections::{HashMap, HashSet};
 enum FixedBase64Value {
     Const(u32),
     Sextet(u8),
-    And(Box<FixedBase64Value>, Box<FixedBase64Value>),
-    Or(Box<FixedBase64Value>, Box<FixedBase64Value>),
-    Shl(Box<FixedBase64Value>, Box<FixedBase64Value>),
-    Shr(Box<FixedBase64Value>, Box<FixedBase64Value>),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+    Shl(Box<Self>, Box<Self>),
+    Shr(Box<Self>, Box<Self>),
 }
 
 fn fixed_base64_commutative(
@@ -367,7 +367,7 @@ fn fixed_base64_sentinel_append(
     if !matches!(test.operator.as_str(), "!=" | "!==") {
         return None;
     }
-    let is_64 = |expression: &Expression<'_>| matches!(unparenthesized(expression), Expression::NumericLiteral(value) if value.value == 64.0);
+    let is_64 = |expression: &Expression<'_>| matches!(unparenthesized(expression), Expression::NumericLiteral(value) if crate::numeric::js_number_equal(value.value, 64.0));
     let sextet_matches = |expression: &Expression<'_>| {
         let symbol = statically_resolved_identifier_symbol(expression, evaluator.scoping)?;
         (evaluator.values.get(&symbol) == Some(&FixedBase64Value::Sextet(sextet))).then_some(())

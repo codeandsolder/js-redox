@@ -1442,12 +1442,12 @@ impl Decoder {
     }
 }
 
-pub(super) struct DecoderCallRewrite {
+pub struct DecoderCallRewrite {
     pub(super) text: String,
     pub(super) stop: bool,
 }
 
-pub(super) fn decoder_call_rewrite(
+pub fn decoder_call_rewrite(
     source: &str,
     scoping: &Scoping,
     decoders: &HashMap<SymbolId, Decoder>,
@@ -1530,12 +1530,12 @@ impl<'a> Visit<'a> for DecoderOnlyCallCollector<'_> {
     }
 }
 
-pub(super) struct StaticDecoderPass {
+pub struct StaticDecoderPass {
     pub(super) replacements: Vec<Replacement>,
     pub(super) decoder_count: usize,
 }
 
-pub(super) fn static_decoder_pass(
+pub fn static_decoder_pass(
     source: &str,
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
@@ -1947,7 +1947,7 @@ fn parse_i64_literal(text: &str) -> Option<i64> {
     Some(if negative { -value } else { value })
 }
 
-pub(super) fn js_parse_int(text: &str, radix: u32) -> Option<f64> {
+pub fn js_parse_int(text: &str, radix: u32) -> Option<f64> {
     if !(2..=36).contains(&radix) {
         return None;
     }
@@ -2863,7 +2863,7 @@ fn simple_direct_decoder_offset(
     parse_i64_literal(captures.name("offset")?.as_str())
 }
 
-fn span_contains(outer: Span, inner: Span) -> bool {
+const fn span_contains(outer: Span, inner: Span) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 

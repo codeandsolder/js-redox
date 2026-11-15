@@ -36,11 +36,10 @@ fn expression_is_call(source: &str) -> bool {
     is_call(&statement.expression)
 }
 
-/// Build an offset-preserving parser view for the legacy web syntax where a
-/// call expression appears as an assignment target (`callee() = value`). V8
-/// still accepts this syntax and raises at runtime if the invalid reference is
-/// actually assigned. Oxc intentionally rejects it because it is not a modern
-/// ECMAScript AssignmentTarget.
+/// Build an offset-preserving parser view for legacy call-assignment syntax.
+///
+/// V8 accepts `callee() = value` but raises when the invalid reference is
+/// assigned. Oxc rejects this syntax as a modern ECMAScript `AssignmentTarget`.
 ///
 /// The returned source is analysis-only: each invalid target is replaced by an
 /// identifier of exactly the same byte length, and the replaced spans are

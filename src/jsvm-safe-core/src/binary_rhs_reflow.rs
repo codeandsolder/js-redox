@@ -139,10 +139,7 @@ fn linearize_rhs(
 /// Caller guarantees a sibling if statement in a function/block body.
 /// A fresh block prevents newly introduced bindings leaking to siblings.
 /// Dynamic eval and Annex-B declarations in the moved subtree are excluded.
-pub(crate) fn lower_if_binary_rhs_sequences(
-    statement: &IfStatement<'_>,
-    source: &str,
-) -> Option<String> {
+pub fn lower_if_binary_rhs_sequences(statement: &IfStatement<'_>, source: &str) -> Option<String> {
     fn root_is_binary(expression: &Expression<'_>) -> bool {
         match expression {
             Expression::ParenthesizedExpression(paren) => root_is_binary(&paren.expression),

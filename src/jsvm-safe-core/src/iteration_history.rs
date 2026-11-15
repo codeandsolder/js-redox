@@ -18,7 +18,7 @@ pub struct IterationCycle {
 }
 
 #[derive(Default)]
-pub(crate) struct IterationHistory {
+pub struct IterationHistory {
     by_sha256: HashMap<[u8; 32], Vec<(usize, String)>>,
 }
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
-pub(crate) struct Base91Alphabet {
+pub struct Base91Alphabet {
     indices: HashMap<char, u16>,
 }
 

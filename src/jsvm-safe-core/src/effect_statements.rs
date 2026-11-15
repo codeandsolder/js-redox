@@ -13,6 +13,7 @@ use oxc_ast::ast::{
 };
 use oxc_semantic::Scoping;
 use oxc_span::GetSpan;
+use std::fmt::Write as _;
 
 /// Parentheses are value-neutral here, but the original call syntax is
 /// preserved in all emitted fragments so they cannot change direct eval.
@@ -213,7 +214,7 @@ fn conditional_rhs<'a, 'e>(
 /// A conditional expression is not an anonymous function definition, whereas
 /// a new assignment at a leaf could infer a name for an anonymous function,
 /// class or arrow. Reject any tree containing such a leaf.
-pub(crate) fn conditional_has_name_hazard(expr: &Expression<'_>, depth: usize) -> bool {
+pub fn conditional_has_name_hazard(expr: &Expression<'_>, depth: usize) -> bool {
     if depth > 96 {
         return true;
     }
@@ -264,7 +265,7 @@ fn conditional_assignment_branch(
 /// Comments inside test/arm expressions remain in original source fragments.
 /// Refuse comments at changed operator/parentheses boundaries, since their
 /// attachment could otherwise change in the newly structured source.
-pub(crate) fn lower_conditional_assignment(
+pub fn lower_conditional_assignment(
     statement: &ExpressionStatement<'_>,
     source: &str,
     scoping: &Scoping,
@@ -349,7 +350,7 @@ pub(crate) fn lower_conditional_assignment(
 /// when the entire assignment is a discarded sibling expression statement.
 ///
 /// `((first(), second(), object).field = rhs)` evaluates each prefix and
-/// performs GetValue before it obtains the object used for the property
+/// performs `GetValue` before it obtains the object used for the property
 /// reference. Emitting those prefixes as preceding sibling statements keeps
 /// exactly that ordering, without moving a member/element lookup past the
 /// RHS or changing the assignment's `this`/name-inference context.
@@ -359,7 +360,7 @@ pub(crate) fn lower_conditional_assignment(
 /// run arbitrary user code (including proxy traps, getters and direct eval).
 /// Call only for an expression already occupying a function/block statement
 /// list, never an unbraced if/loop/label or script/eval top level.
-pub(crate) fn lower_member_object_sequence(
+pub fn lower_member_object_sequence(
     statement: &ExpressionStatement<'_>,
     source: &str,
 ) -> Option<String> {
@@ -395,7 +396,7 @@ pub(crate) fn lower_member_object_sequence(
         // Parentheses retain expression syntax (including anonymous function,
         // object literal and strings that must not become directives).
         // Each operand still performs GetValue, including direct eval/getters.
-        text.push_str(&format!("({});\n", fragment(source, prefix.span())));
+        writeln!(&mut text, "({});", fragment(source, prefix.span())).ok()?;
     }
     let statement_span = statement.span;
     text.push_str(source.get(statement_span.start as usize..object_span.start as usize)?);
@@ -413,19 +414,19 @@ pub(crate) fn lower_member_object_sequence(
 /// extraction this works even inside another assignment with an unresolved
 /// global target: the outer LHS reference is still created at the same point.
 ///
-/// ((first(), last).property = rhs)
-///    -> (first(), (last).property = rhs)
+/// `((first(), last).property = rhs)`
+///    -> `(first(), (last).property = rhs)`
 ///
-/// Every prefix still performs GetValue before the last object value is used
+/// Every prefix still performs `GetValue` before the last object value is used
 /// to form the *same* property reference, including computed keys and private
-/// fields. RHS evaluation, setter invocation, compound assignment GetValue,
+/// fields. RHS evaluation, setter invocation, compound assignment `GetValue`,
 /// returned assignment value, and branch/expression completion stay inside
 /// their original expression context. Do not touch call/member *reads*:
 /// commas moved around a call callee can change its receiver (this).
 ///
 /// Comments between comma operands or in removed parenthesis boundaries
 /// cannot yet be attached unambiguously, so we refuse such expressions.
-pub(crate) fn reassociate_member_target_comma(
+pub fn reassociate_member_target_comma(
     assignment: &AssignmentExpression<'_>,
     source: &str,
 ) -> Option<String> {
@@ -518,7 +519,7 @@ fn first_member_object_sequence<'a, 'e>(
 /// expression. The left operand is evaluated before the right operand,
 /// so extraction cannot move effects across getters or binary evaluation.
 /// Never descend into second operands, call callees, or guarded branches.
-pub(crate) fn lower_if_test_first_binary_left_sequence(
+pub fn lower_if_test_first_binary_left_sequence(
     statement: &IfStatement<'_>,
     source: &str,
 ) -> Option<String> {
@@ -538,14 +539,14 @@ pub(crate) fn lower_if_test_first_binary_left_sequence(
 /// Extract a comma prefix from an unconditionally first-evaluated property
 /// object in a sibling if-statement test.
 ///
-/// E.g. if (((initialize(), object).length < bound)) body;
-/// becomes (initialize()); if ((((object)).length < bound)) body;
+/// E.g. `if (((initialize(), object).length < bound)) body;`
+/// becomes `(initialize()); if ((((object)).length < bound)) body;`
 ///
 /// Nothing from the original test runs before the selected prefix; this is
 /// why we only follow the leftmost guaranteed-evaluation path. The original
 /// branch source is kept verbatim, with one expression replacement. A
 /// function/block statement-list parent is required (verified by the caller).
-pub(crate) fn lower_if_test_first_member_object(
+pub fn lower_if_test_first_member_object(
     statement: &IfStatement<'_>,
     source: &str,
 ) -> Option<String> {
@@ -580,7 +581,7 @@ fn lower_if_test_first_sequence(
     }
     let mut result = String::new();
     for prefix in prefixes {
-        result.push_str(&format!("({});\n", fragment(source, prefix.span())));
+        writeln!(&mut result, "({});", fragment(source, prefix.span())).ok()?;
     }
     result.push_str(source.get(statement.span.start as usize..sequence_start)?);
     result.push('(');
@@ -596,10 +597,10 @@ fn lower_if_test_first_sequence(
 /// in-place under an unbraced if/loop/label would change control flow, and
 /// inserting a new block could change direct-eval/Annex-B binding behavior.
 ///
-/// Every prefix still performs GetValue and can throw. Keep the exact source
+/// Every prefix still performs `GetValue` and can throw. Keep the exact source
 /// of each operand and of the original branches, without changing reference
 /// identity, short-circuit behavior, or lexical scope.
-pub(crate) fn lower_if_test(statement: &IfStatement<'_>, source: &str) -> Option<String> {
+pub fn lower_if_test(statement: &IfStatement<'_>, source: &str) -> Option<String> {
     let sequence = sequence_rhs(&statement.test)?;
     let (condition, prefixes) = sequence.expressions.split_last()?;
     if prefixes.is_empty() {
@@ -629,7 +630,7 @@ pub(crate) fn lower_if_test(statement: &IfStatement<'_>, source: &str) -> Option
         // An inert known primitive cannot have observable effects. Keep
         // comments within such an operand rather than deleting annotations.
         if eval(expression).is_none() || original.contains("/*") || original.contains("//") {
-            text.push_str(&format!("({original});\n"));
+            writeln!(&mut text, "({original});").ok()?;
         }
     }
     // Preserve every original byte outside the test itself, including
@@ -660,7 +661,7 @@ fn simple_guarded_call(expr: &Expression<'_>) -> bool {
 /// Lower an expression statement only when it actually contains conditional
 /// or sequencing structure. Plain assignments, calls, property accesses and
 /// existing idiomatic JavaScript expressions remain in their original form.
-pub(crate) fn lower(
+pub fn lower(
     statement: &ExpressionStatement<'_>,
     source: &str,
     scoping: &Scoping,

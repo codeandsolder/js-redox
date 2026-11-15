@@ -25,6 +25,7 @@ use oxc_span::{GetSpan, Span};
 use oxc_syntax::reference::ReferenceId;
 use oxc_syntax::symbol::SymbolId;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fmt::Write as _;
 
 #[derive(Debug, Clone)]
 enum Next {
@@ -58,7 +59,7 @@ impl Route {
             }
         }
     }
-    fn plain_target(&self) -> Option<u64> {
+    const fn plain_target(&self) -> Option<u64> {
         match self.next {
             Next::State(state) => Some(state),
             Next::Choose { .. } => None,
@@ -73,7 +74,7 @@ impl Route {
 }
 
 /// Numeric *state values* must actually be JavaScript Numbers. Abstract
-/// ToNumber is only valid for the other operand of a loose comparison, not
+/// `ToNumber` is only valid for the other operand of a loose comparison, not
 /// for a state assignment or an initializer ("2" and 2 are different states).
 fn number(expr: &Expression<'_>) -> Option<u64> {
     match eval(expr)? {
@@ -403,7 +404,7 @@ fn parse_statement_route(
 /// Early-case statements are only interchangeable with a graph exit when
 /// they *unconditionally* complete the current function (return or throw).
 /// Preserve all preceding expressions in a block; their lexical-scope
-/// restrictions are independently validated by parse_statement_route.
+/// restrictions are independently validated by `parse_statement_route`.
 fn has_terminal_completion(stmt: &Statement<'_>) -> bool {
     match stmt {
         Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => true,
@@ -690,9 +691,11 @@ impl MultiExitEmitter<'_> {
             Next::Choose { condition, yes, no } => {
                 let then_body = self.route(yes)?;
                 let else_body = self.route(no)?;
-                text.push_str(&format!(
+                write!(
+                    &mut text,
                     "\nif ({condition}) {{\n{then_body}\n}} else {{\n{else_body}\n}}"
-                ));
+                )
+                .ok()?;
             }
         }
         Some(text)
@@ -1019,9 +1022,11 @@ impl Emitter<'_> {
                 let join = branch_join(left, right, self.exit, self.graph, self.loops)?;
                 let yes_text = self.branch_lines(yes, join)?;
                 let no_text = self.branch_lines(no, join)?;
-                text.push_str(&format!(
+                write!(
+                    &mut text,
                     "\nif ({condition}) {{\n{yes_text}\n}} else {{\n{no_text}\n}}"
-                ));
+                )
+                .ok()?;
                 text.push_str(&self.walk(join, stop)?);
             }
         }
@@ -1043,7 +1048,7 @@ impl Emitter<'_> {
                 // nested loops; both return to the header on every path.
                 match &loop_plan.body {
                     LoopBody::MultiExit { body } => {
-                        out.push_str(&format!("\nfor (;;) {{\n{body}\n}}\n"));
+                        write!(&mut out, "\nfor (;;) {{\n{body}\n}}\n").ok()?;
                     }
                     LoopBody::Natural {
                         condition,
@@ -1069,15 +1074,17 @@ impl Emitter<'_> {
                             format!("!({condition})")
                         };
                         if header_effects.is_empty() {
-                            out.push_str(&format!("\nwhile ({cond}) {{\n{body}\n}}\n"));
+                            write!(&mut out, "\nwhile ({cond}) {{\n{body}\n}}\n").ok()?;
                             out.push_str(&exiting.effects.join("\n"));
                         } else {
                             out.push_str("\nfor (;;) {\n");
                             out.push_str(&header_effects.join("\n"));
-                            out.push_str(&format!(
+                            write!(
+                                &mut out,
                                 "\nif (!({cond})) {{\n{}\nbreak;\n}}\n{body}\n}}\n",
                                 exiting.effects.join("\n")
-                            ));
+                            )
+                            .ok()?;
                         }
                     }
                 }
@@ -1096,9 +1103,11 @@ impl Emitter<'_> {
                         let join = branch_join(left, right, self.exit, self.graph, self.loops)?;
                         let yes_text = self.branch_lines(yes, join)?;
                         let no_text = self.branch_lines(no, join)?;
-                        out.push_str(&format!(
+                        write!(
+                            &mut out,
                             "\nif ({condition}) {{\n{yes_text}\n}} else {{\n{no_text}\n}}"
-                        ));
+                        )
+                        .ok()?;
                         cursor = join;
                     }
                 }
@@ -1110,7 +1119,7 @@ impl Emitter<'_> {
 
 /// Turn a reducible numeric-state for/ternary dispatcher into ordinary JavaScript
 /// statement sequencing and while/if control flow, retaining assignment effects.
-pub(crate) fn reconstruct_for(it: &ForStatement<'_>, source: &str) -> Option<String> {
+pub fn reconstruct_for(it: &ForStatement<'_>, source: &str) -> Option<String> {
     if it.update.is_some() {
         return None;
     }
@@ -1145,7 +1154,7 @@ pub(crate) fn reconstruct_for(it: &ForStatement<'_>, source: &str) -> Option<Str
 /// Enumerate numeric initializers by exact lexical binding and *individual*
 /// declarator span. An entire multi-declarator statement is not a safe
 /// initializer region: subsequent declarators may write the same symbol.
-pub(crate) fn state_initializers<'a>(
+pub fn state_initializers<'a>(
     stmt: &'a Statement<'a>,
     scoping: &Scoping,
 ) -> Vec<(SymbolId, &'a str, u64, Span)> {
@@ -1191,7 +1200,7 @@ pub(crate) fn state_initializers<'a>(
 }
 
 /// Match the loop's tested state to the same semantic symbol as its initializer.
-pub(crate) fn while_state_binding<'a>(
+pub fn while_state_binding<'a>(
     it: &'a WhileStatement<'a>,
     scoping: &Scoping,
 ) -> Option<(SymbolId, &'a str)> {
@@ -1215,7 +1224,7 @@ pub(crate) fn while_state_binding<'a>(
 
 /// The original initializer stays where it was. The intervening statements
 /// also stay in execution order, and only the while statement is rewritten.
-pub(crate) fn reconstruct_while_with_known_state(
+pub fn reconstruct_while_with_known_state(
     it: &WhileStatement<'_>,
     state: &str,
     initial: u64,
@@ -2596,12 +2605,14 @@ fn exception_branching_dag_regions(
             }
             let mut text = format!("{{ {};", original_text(start)?);
             for &node in &ordered {
-                text.push_str(&format!(
+                write!(
+                    &mut text,
                     "\nif ({state} == {node}) {{ {}; }}",
                     original_text(node)?
-                ));
+                )
+                .ok()?;
             }
-            text.push_str(&format!("\n{}; }}", original_text(join)?));
+            write!(&mut text, "\n{}; }}", original_text(join)?).ok()?;
             let join_route = cases.get(&join)?.as_ref()?.clone();
             let absorbed = ordered
                 .into_iter()
@@ -2808,10 +2819,12 @@ fn exception_scc_backedge_regions(
 
         let mut text = format!("{{ {};", original_text(header)?);
         for &member in &ordered {
-            text.push_str(&format!(
+            write!(
+                &mut text,
                 "\nif ({state} == {member}) {{ {}; }}",
                 original_text(member)?
-            ));
+            )
+            .ok()?;
         }
         text.push_str("\n}");
         *cases.get_mut(&header)?.as_mut()? = composed;
@@ -2959,7 +2972,7 @@ fn exception_multi_entry_cycle_regions(
             if index > 0 {
                 text.push_str("else ");
             }
-            text.push_str(&format!("if ({}) {{ {original} }}\n", tests.get(label)?));
+            writeln!(&mut text, "if ({}) {{ {original} }}", tests.get(label)?).ok()?;
         }
         text.push_str("else break;\n} }");
         let absorbed = region
@@ -3577,7 +3590,7 @@ fn state_binding_read(
 /// A local/parameter binding must not be captured by nested functions, or
 /// visible through direct eval/with. The caller has already excluded mapped
 /// arguments and function-local dynamic-eval aliases before CFG recovery.
-pub(crate) fn exception_state_is_unaliased(symbol: SymbolId, scoping: &Scoping) -> bool {
+pub fn exception_state_is_unaliased(symbol: SymbolId, scoping: &Scoping) -> bool {
     let owner = scoping.symbol_scope_id(symbol);
     if owner == scoping.root_scope_id() {
         return false;
@@ -3752,7 +3765,7 @@ fn composite_state_dispatch_guard(
 /// A catch that can read or resume that value, or an aliased state binding,
 /// prohibits all removals. There is no output when structural CFG
 /// reconstruction already handled the case earlier in the same pass.
-pub(crate) fn dead_intermediate_writes_in_structured_try(
+pub fn dead_intermediate_writes_in_structured_try(
     loop_stmt: &WhileStatement<'_>,
     symbol: SymbolId,
     scoping: &Scoping,
@@ -3829,12 +3842,12 @@ pub(crate) fn dead_intermediate_writes_in_structured_try(
 /// This deliberately leaves the try/catch in place: combining states into a
 /// single iteration could alter catch-visible intermediate state or a loop
 /// condition's evaluation count.
-pub(crate) struct CatchScopeEvidence<'a> {
+pub struct CatchScopeEvidence<'a> {
     pub reaching: &'a HashMap<SymbolId, (u64, Span)>,
     pub reference_spans: &'a HashMap<ReferenceId, Span>,
 }
 
-pub(crate) fn prune_exception_dispatcher(
+pub fn prune_exception_dispatcher(
     loop_stmt: &WhileStatement<'_>,
     state: &str,
     initial: u64,
@@ -4127,9 +4140,7 @@ pub(crate) fn prune_exception_dispatcher(
     let (combined_regions, absorbed_regions) = if known_bool(&loop_stmt.test) == Some(true) {
         // The source of a trailing completion is *outside* the dispatcher.
         // Its synthetic CFG exit must never be moved into an inlined region.
-        let excluded = trailing_exit
-            .map(|(target, _)| BTreeSet::from([target]))
-            .unwrap_or_default();
+        let excluded = trailing_exit.map_or_default(|(target, _)| BTreeSet::from([target]));
         let (mut combined, mut absorbed) = exception_diamond_regions(
             dispatcher,
             state,
@@ -4361,7 +4372,7 @@ pub(crate) fn prune_exception_dispatcher(
         text
     };
     for (_, test, completion) in completion_tail {
-        text.push_str(&format!("\nif ({test}) {completion}"));
+        write!(&mut text, "\nif ({test}) {completion}").ok()?;
     }
     if !hoisted.names.is_empty() {
         text = format!(
@@ -4374,7 +4385,7 @@ pub(crate) fn prune_exception_dispatcher(
 
 /// Recover a while loop preceded by a numeric state initializer in the same
 /// lexical block. Both syntaxes share the same control-flow reconstruction.
-pub(crate) fn reconstruct_while_adjacent(
+pub fn reconstruct_while_adjacent(
     init: &Statement<'_>,
     loop_stmt: &WhileStatement<'_>,
     source: &str,
@@ -4684,7 +4695,7 @@ mod tests {
 
     #[test]
     fn structures_nested_reducible_loops_with_branch_reconvergence() {
-        let source = r#"
+        let source = r"
             function process(flags, limit) {
                 var s, out=[], i=0, x=0, arr=[];
                 for(s=86;s!=50;)
@@ -4703,7 +4714,7 @@ mod tests {
                     :s==41&&(s=50);
                 return out;
             }
-        "#;
+        ";
         let output = recover(source);
         assert!(output.contains("while (i<limit)"), "{output}");
         assert!(output.contains("while (x>=arr.length)"), "{output}");
@@ -4896,7 +4907,7 @@ mod tests {
 
     #[test]
     fn structures_alternate_exit_from_inside_single_entry_cycle() {
-        let source = r#"
+        let source = r"
             function f(flag, log) {
                 let state=20;
                 while(state!=90)
@@ -4907,7 +4918,7 @@ mod tests {
                     else if(state==24) {log.push(24);state=90;}
                 return log;
             }
-        "#;
+        ";
         let result = deobfuscate(source, 12, &WorkBudget::unlimited("multiple-cycle-exits"));
         assert!(result.is_ok(), "{result:?}");
         let Ok(Some(value)) = result else {
@@ -4924,7 +4935,7 @@ mod tests {
 
     #[test]
     fn rejects_irreducible_cycle_with_multiple_entry_states() {
-        let source = r#"
+        let source = r"
             function f(flag) {
                 let state=1;
                 while(state!=9) {
@@ -4934,7 +4945,7 @@ mod tests {
                 }
                 return state;
             }
-        "#;
+        ";
         let result = deobfuscate(source, 12, &WorkBudget::unlimited("multiple-cycle-entries"));
         assert!(result.is_ok(), "{result:?}");
         let Ok(Some(value)) = result else {
@@ -5045,7 +5056,7 @@ mod tests {
 
     #[test]
     fn does_not_claim_a_reachable_unmodelled_state_is_recoverable() {
-        let original = r#"
+        let original = r"
           function f(log) {
             let state=1;
             while(state!=9)
@@ -5054,7 +5065,7 @@ mod tests {
               else if(state==7){state=unmodelled();}
             return log;
           }
-        "#;
+        ";
         let result = deobfuscate(
             original,
             12,
@@ -5073,12 +5084,12 @@ mod tests {
 
     #[test]
     fn reconstructs_for_dispatcher_with_dead_unsupported_branch() {
-        let source = r#"function f(x){
+        let source = r"function f(x){
           for(var s=1;s!=9;)s==1?(x.push(1),s=2)
              :s==2?(x.push(2),s=9)
              :s==7&&(x.push(7),s=unmodelled());
           return x;
-        }"#;
+        }";
         let result = deobfuscate(source, 12, &WorkBudget::unlimited("for-dead-unknown"));
         assert!(result.is_ok(), "deobfuscation should succeed");
         let Ok(Some(value)) = result else {

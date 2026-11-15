@@ -132,7 +132,7 @@ impl<'a> Visit<'a> for AnnexBFunctionDeclarations {
 /// The original arm bodies are retained inside their own nested scopes. The
 /// sole guard body is moved into its matching arm, without duplication.
 /// There are no new calls or comparisons, including for effectful test values.
-pub(crate) fn fold_adjacent_state_guard(
+pub fn fold_adjacent_state_guard(
     before: &Statement<'_>,
     after: &Statement<'_>,
     source: &str,
@@ -157,8 +157,8 @@ pub(crate) fn fold_adjacent_state_guard(
     {
         return None;
     }
-    let match_yes = yes_value == tested_value;
-    let match_no = no_value == tested_value;
+    let match_yes = crate::numeric::js_number_equal(yes_value, tested_value);
+    let match_no = crate::numeric::js_number_equal(no_value, tested_value);
     // Only move an effect executed on exactly one path. Do not duplicate the
     // body or silently erase its declarations in always/never guards.
     if match_yes == match_no {
