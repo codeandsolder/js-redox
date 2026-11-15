@@ -2945,7 +2945,11 @@ fn exception_multi_entry_cycle_regions(
             .map(|label| Some(format!("({})", tests.get(label)?)))
             .collect::<Option<Vec<_>>>()?
             .join(" || ");
-        let mut text = format!("{{ while ({condition}) {{\n");
+        // The outer dispatch guard has already selected this component.
+        // Run exactly one member per iteration, and leave as soon as the
+        // state no longer matches. This avoids evaluating every state test
+        // twice per iteration (once in while, again in if/else-if).
+        let mut text = "{ for (;;) {\n".to_owned();
         for (index, label) in ordered.iter().enumerate() {
             let statement = *statements.get(label)?;
             let original = match edits.get(label) {
@@ -2957,7 +2961,7 @@ fn exception_multi_entry_cycle_regions(
             }
             text.push_str(&format!("if ({}) {{ {original} }}\n", tests.get(label)?));
         }
-        text.push_str("} }");
+        text.push_str("else break;\n} }");
         let absorbed = region
             .iter()
             .copied()

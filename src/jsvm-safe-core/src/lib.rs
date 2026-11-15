@@ -6330,13 +6330,7 @@ mod tests {
             unreachable!("valid source");
         };
         assert_eq!(result.transforms.get("exception_state_pruned"), Some(&1));
-        assert!(
-            result
-                .source
-                .contains("while ((state === 1) || (state === 2))"),
-            "{}",
-            result.source
-        );
+        assert!(result.source.contains("for (;;) {"), "{}", result.source);
         assert_eq!(
             result
                 .source
@@ -6351,6 +6345,31 @@ mod tests {
         assert_eq!(result.source.matches("log.push(\"resume\")").count(), 1);
         assert!(result.source.contains("catch (error)"), "{}", result.source);
         assert!(result.source.contains("state = 4"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_groups_multi_entry_branching_join_once() {
+        let source = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/exception-state-multi-entry-branching.js"
+        );
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source");
+        };
+        assert_eq!(result.transforms.get("exception_state_pruned"), Some(&1));
+        assert!(result.source.contains("for (;;) {"), "{}", result.source);
+        assert!(result.source.contains("else break;"), "{}", result.source);
+        for effect in ["head:", "left:", "right:", "join:", "resume:"] {
+            assert_eq!(
+                result
+                    .source
+                    .matches(&format!("log.push('{effect}' + count)"))
+                    .count(),
+                1,
+                "each effect must appear once: {effect}: {}",
+                result.source
+            );
+        }
+        assert!(result.source.contains("catch (error)"), "{}", result.source);
     }
 
     #[test]
@@ -6374,9 +6393,7 @@ mod tests {
             unreachable!("valid source");
         };
         assert!(
-            !result
-                .source
-                .contains("while ((state === 1) || (state === 2))"),
+            !result.source.contains("for (;;) {"),
             "break cannot be retargeted to an inner state loop: {}",
             result.source
         );

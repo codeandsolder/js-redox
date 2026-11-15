@@ -763,7 +763,9 @@ Multi-entry cyclic components can also be reconstructed when every entry and
 normal transition is proven. Rather than picking an invalid single loop
 header, the recovery groups the original cycle cases behind their combined
 pure state guard and executes one original case per inner iteration, still
-inside the original try. It retains every state write, external/catch entry,
+inside the original try. The inner loop exits through the final unmatched
+else arm, so it does not reevaluate the entire set of state comparisons at
+the loop header before doing so again in the case dispatch. It retains every state write, external/catch entry,
 exception handler and early exit, and requires a constant-true outer loop
 predicate and pure trailing completion. Unrelocatable break/continue targets
 and Annex B function declarations block the merge. This lets a catch retry
