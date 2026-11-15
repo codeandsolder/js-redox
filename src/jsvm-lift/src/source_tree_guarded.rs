@@ -240,7 +240,12 @@ pub fn install_guarded_specializations(
         slots: BTreeMap::new(),
     };
     collector.visit_program(&parsed.program);
-    let mut grouped = BTreeMap::<[u32; 2], Vec<(usize, String)>>::new();
+    struct ProvenFastPath {
+        constants: Vec<(usize, String)>,
+        test: String,
+        body: String,
+    }
+    let mut grouped = BTreeMap::<[u32; 2], Vec<ProvenFastPath>>::new();
     for variant in variants {
         let Some(slot) = collector.slots.get(&variant.function_span) else {
             continue;
@@ -270,33 +275,68 @@ pub fn install_guarded_specializations(
         let Some(body) = optimized_body(&variant.optimized_wrapper) else {
             continue;
         };
-        // Explicit return also handles the specialized function's normal
-        // fallthrough as undefined, without continuing into the fallback.
-        let branch = format!("\nif ({test}) {{\n{body}\nreturn;\n}}\n");
-        grouped
-            .entry(slot.span)
-            .or_default()
-            .push((variant.constants.len(), branch));
+        grouped.entry(slot.span).or_default().push(ProvenFastPath {
+            constants: variant.constants.clone(),
+            test,
+            body,
+        });
     }
     if grouped.is_empty() {
         return Ok(None);
     }
     let mut placements = Vec::new();
     let mut fast_paths = 0usize;
-    for (key, mut branches) in grouped {
-        branches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        branches.dedup();
+    for (key, mut paths) in grouped {
+        // Each verified specialization is sound for *all* inputs matching
+        // its guard, not only for the observed callsite. A less-specific
+        // guard therefore subsumes a more-specific one, regardless of the
+        // optimized bodies. Only consider validated candidates, so a
+        // rejected generic variant never suppresses a valid specific one.
+        paths.sort_by(|a, b| {
+            a.constants
+                .len()
+                .cmp(&b.constants.len())
+                .then_with(|| a.constants.cmp(&b.constants))
+                .then_with(|| a.body.cmp(&b.body))
+        });
+        let mut retained = Vec::<ProvenFastPath>::new();
+        for path in paths {
+            if retained.iter().any(|generic| {
+                generic
+                    .constants
+                    .iter()
+                    .all(|literal| path.constants.contains(literal))
+            }) {
+                continue;
+            }
+            retained.push(path);
+        }
+        // Identical executable bodies can share a disjunction of pure
+        // selector checks. Source identity and every constant-substitution
+        // proof were validated above; only the branch test is combined.
+        let mut by_body = BTreeMap::<String, Vec<String>>::new();
+        for path in retained {
+            by_body.entry(path.body).or_default().push(path.test);
+        }
+        let mut branches = Vec::new();
+        for (body, mut tests) in by_body {
+            tests.sort();
+            tests.dedup();
+            let combined = tests
+                .into_iter()
+                .map(|test| format!("({test})"))
+                .collect::<Vec<_>>()
+                .join(" || ");
+            // The extra return handles fallthrough from the optimized
+            // function body without entering the original fallback.
+            branches.push(format!("\nif ({combined}) {{\n{body}\nreturn;\n}}\n"));
+        }
+        branches.sort();
         fast_paths += branches.len();
         let Some(slot) = collector.slots.get(&key) else {
             continue;
         };
-        placements.push((
-            slot.insertion,
-            branches
-                .into_iter()
-                .map(|(_, branch)| branch)
-                .collect::<String>(),
-        ));
+        placements.push((slot.insertion, branches.concat()));
     }
     let targeted_functions = placements.len();
     placements.sort_by_key(|item| std::cmp::Reverse(item.0));
@@ -373,6 +413,48 @@ mod tests {
                 && output.source.contains("mQ.call(this,56,Q,29,J,Y)")
         );
         ensure!(output.source.contains("IE.call(this,L,Q||xX.Za(),v)"));
+        Ok(())
+    }
+
+    #[test]
+    fn general_proven_guard_subsumes_more_specific_guards_with_different_bodies() -> Result<()> {
+        let raw = "function(mode,argument){if(mode===3){return argument+1;}return argument-1;}";
+        let source = format!("const f={raw};");
+        let general = variant(
+            &source,
+            raw,
+            "function(mode,argument){return argument+1;}",
+            &[(0, "3")],
+        )?;
+        let specific = variant(
+            &source,
+            raw,
+            "function(mode,argument){return 5;}",
+            &[(0, "3"), (1, "4")],
+        )?;
+        // The generic proof remains sound even where the specific optimized
+        // expression would be shorter. Do not emit redundant nested guards.
+        let result = install_guarded_specializations(&source, &[specific, general])?
+            .ok_or_else(|| anyhow::anyhow!("missing general fast path"))?;
+        ensure!(result.fast_paths == 1 && result.targeted_functions == 1);
+        ensure!(!result.source.contains("return 5;"), "{result:?}");
+        ensure!(result.source.contains("return argument+1;"), "{result:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn identical_proven_bodies_share_an_or_guard() -> Result<()> {
+        let raw = "function(selector){if(selector===3||selector===4){return 1;}return 0;}";
+        let source = format!("const f={raw};");
+        let a = variant(&source, raw, "function(selector){return 1;}", &[(0, "3")])?;
+        let b = variant(&source, raw, "function(selector){return 1;}", &[(0, "4")])?;
+        let result = install_guarded_specializations(&source, &[a, b])?
+            .ok_or_else(|| anyhow::anyhow!("missing grouped fast path"))?;
+        ensure!(result.fast_paths == 1 && result.targeted_functions == 1);
+        ensure!(result.source.contains("selector === (3)"), "{result:?}");
+        ensure!(result.source.contains("selector === (4)"), "{result:?}");
+        ensure!(result.source.contains(" || "), "{result:?}");
+        ensure!(result.source.contains("return 0;"), "{result:?}");
         Ok(())
     }
 

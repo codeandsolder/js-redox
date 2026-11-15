@@ -846,8 +846,13 @@ re-simplified through the safe core, and guarded inside their original call
 frames. The normal `lexical-context/whole-program/readable.js`, original
 lexical source and protected capture stay unchanged. A separate
 `readable-guarded.js` contains executable optimized paths with original
-fallbacks. The original and result SHA-256, helper names, and installed
-fast-path counts are in `lexical-context/context.json` under
+fallbacks. Only verified guards participate in compaction: a broader
+source-proven selector replaces redundant narrower guards, and identical
+optimized bodies share a disjunction of their pure selector checks. The
+manifest distinguishes the original `candidate_variants` from actually
+emitted `fast_paths`, so merging cannot be mistaken for lost coverage.
+The original and result SHA-256, helper names, and installed fast-path
+counts are in `lexical-context/context.json` under
 `full_context.guarded_executable`.
 
 For example:
