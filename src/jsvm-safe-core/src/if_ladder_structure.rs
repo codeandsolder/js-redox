@@ -271,6 +271,44 @@ fn parse_statement_route(
         }
         Statement::BlockStatement(block) => {
             let (last, prefix) = block.body.split_last()?;
+            // A state-selecting branch can be followed by a guard against
+            // the numeric state it just assigned. Compose the guard's
+            // normal transition only on matching predecessor arms; the
+            // actual source statements remain in their original order
+            // and try/catch region. Earlier scope-affecting declarations
+            // prohibit the composition just as in ordinary block routes.
+            if let Statement::IfStatement(guard) = last {
+                if guard.alternate.is_none() && !prefix.is_empty() {
+                    if let Some(matched) = state_test(&guard.test, state) {
+                        let (prior, earlier) = prefix.split_last()?;
+                        if earlier.iter().any(|statement| {
+                            matches!(
+                                statement,
+                                Statement::VariableDeclaration(declaration)
+                                    if declaration.kind != VariableDeclarationKind::Var
+                            ) || matches!(
+                                statement,
+                                Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_)
+                            )
+                        }) {
+                            return None;
+                        }
+                        let mut route = parse_statement_route(prior, state, exit, source)?;
+                        let follow_up =
+                            parse_statement_route(&guard.consequent, state, exit, source)?;
+                        if !splice_conditional_successor(&mut route, matched, &follow_up) {
+                            return None;
+                        }
+                        let mut effects = earlier
+                            .iter()
+                            .map(|statement| fragment(source, statement.span()).to_owned())
+                            .collect::<Vec<_>>();
+                        effects.append(&mut route.effects);
+                        route.effects = effects;
+                        return Some(route);
+                    }
+                }
+            }
             // Moving a block-local declaration outside its original block
             // changes temporal-dead-zone/closure semantics. Retain those
             // structures until the graph emitter can render lexical regions.

@@ -722,7 +722,13 @@ proof also recognizes a single nonthrowing numeric-state return guard
 terminal. Its actual source remains at the original position after the
 normal state case; catch handlers and the one-iteration boundary are
 untouched. Effectful return expressions, duplicate case labels and
-unmodelled trailing statements block this extension.
+unmodelled trailing statements block this extension. The normal-state CFG
+also composes a modeled state-selection statement followed by a pure
+numeric-state guard without an else: only predecessor arms that establish
+the guarded state receive the follow-up transition. Source statements,
+exceptional roots, and original try/catch evaluation stay in place; this
+allows later region recovery in the **complete** lexical program, not only
+isolated helper projections.
 
 Within that same exception-preserving CFG, an independently proven
 single-entry successor on just one arm of a conditional state assignment can

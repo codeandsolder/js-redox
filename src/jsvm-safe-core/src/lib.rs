@@ -2273,6 +2273,71 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_composes_guarded_numeric_state_suffix() {
+        let source = r#"
+            function f(select, log) {
+                let state=1;
+                while(true) try {
+                    if(state==1){
+                        if(select){state=2;}else{state=3;}
+                        if(state==2){log.push("follow-up");state=3;}
+                    } else if(state==2) {
+                        log.push("unreachable");
+                        state=3;
+                    } else if(state==3) return log;
+                } catch(error) {throw error;}
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+        assert!(!result.source.contains("unreachable"), "{}", result.source);
+        assert_eq!(
+            result.source.matches("log.push(\"follow-up\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(result.source.contains("catch(error)"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_guarded_suffix_preserves_held_state_on_catch() {
+        let source = r#"
+            function f(select, boom, log) {
+                let state=1, keep=true;
+                while(true) try {
+                    if(state==1){
+                        if(select){state=2;}else{state=3;}
+                        if(state==2) {
+                            log.push("effect");
+                            if(boom)throw Error("caught");
+                            state=3;
+                        }
+                    } else if(state==2) {
+                        log.push("resumed");
+                        state=3;
+                    } else if(state==3) return log;
+                } catch(error) {
+                    log.push(error.message);
+                    if(keep)keep=false;
+                    else throw error;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        // The catch leaves the numeric state unchanged, so case 2 has
+        // another live entry, despite the normal suffix reaching state 3.
+        assert!(result.source.contains("resumed"), "{}", result.source);
+    }
+
+    #[test]
     fn exception_dispatcher_prunes_with_trailing_nonthrowing_return() {
         let source = r#"
             function f(log) {
