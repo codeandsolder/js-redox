@@ -2468,6 +2468,10 @@ fn closed_exception_dag_region(
         ordered.push(current);
         let mut targets = Vec::new();
         cases.get(&current)?.as_ref()?.targets(&mut targets);
+        // Incoming predecessors are sets: both arms of a conditional may
+        // target the same state, and must reduce its in-degree only once.
+        targets.sort_unstable();
+        targets.dedup();
         for successor in targets {
             if let Some(degree) = indegrees.get_mut(&successor) {
                 *degree -= 1;
@@ -4533,14 +4537,55 @@ fn reconstruct_state_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::reconstruct_for;
+    use super::{closed_exception_dag_region, reconstruct_for, ExceptionEntryProof, Next, Route};
     use crate::deobfuscate;
     use oxc_allocator::Allocator;
     use oxc_ast::ast::Statement;
     use oxc_ast_visit::{walk, Visit};
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
+    use std::collections::{BTreeMap, BTreeSet};
     use work_budget::WorkBudget;
+
+    #[test]
+    fn duplicate_conditional_successors_count_as_one_incoming_edge() {
+        let choose = |yes, no| Route {
+            effects: Vec::new(),
+            next: Next::Choose {
+                condition: "pick()".to_owned(),
+                yes: Box::new(Route::jump("state", yes)),
+                no: Box::new(Route::jump("state", no)),
+            },
+        };
+        let cases = BTreeMap::from([
+            (1, Some(choose(2, 3))),
+            (2, Some(choose(4, 4))),
+            (3, Some(Route::jump("state", 5))),
+            (4, Some(Route::jump("state", 5))),
+            (5, Some(Route::jump("state", 9))),
+        ]);
+        let roots = BTreeSet::from([1]);
+        let reachable = BTreeSet::from([1, 2, 3, 4, 5]);
+        let excluded = BTreeSet::new();
+        let incoming = BTreeMap::from([
+            (2, BTreeSet::from([1])),
+            (3, BTreeSet::from([1])),
+            (4, BTreeSet::from([2])),
+            (5, BTreeSet::from([3, 4])),
+        ]);
+        let ordered = closed_exception_dag_region(
+            1,
+            5,
+            &cases,
+            ExceptionEntryProof {
+                roots: &roots,
+                reachable: &reachable,
+                excluded: &excluded,
+            },
+            &incoming,
+        );
+        assert_eq!(ordered, Some(vec![2, 3, 4]));
+    }
 
     #[derive(Default)]
     struct FindFor<'s> {
