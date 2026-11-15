@@ -28,4 +28,9 @@ function run(value) {
   }
   return out;
 }
-console.log(run(0), run(1));
+// The earlier negative fixture is now recoverable: its IIFE updates an
+// already-known outer binding, with no local variable shadowing. Exercise
+// both exits and different primitive argument types in the Node oracle.
+console.log(run(0), run(1), run(-0), run("0"), run(null),
+  run(undefined), run(true), run(false), run(NaN), run(Infinity),
+  run({}), run([]));

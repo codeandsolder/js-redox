@@ -7251,6 +7251,43 @@ mod tests {
     }
 
     #[test]
+    fn static_array_lookup_respects_javascript_property_keys() {
+        for (index, expected) in [
+            ("0", "ZERO"),
+            ("-0", "ZERO"),
+            ("\"1\"", "ONE"),
+            ("1", "ONE"),
+            ("1.0", "ONE"),
+        ] {
+            let source = format!("const table = [\"ZERO\", \"ONE\"]; sink(table[{index}]);");
+            let result = deobfuscate(&source, 4);
+            assert!(result.is_some(), "index={index}");
+            let Some(result) = result else { unreachable!() };
+            assert!(
+                result.source.contains(&format!("sink(\"{expected}\")")),
+                "index={index}; {}",
+                result.source
+            );
+            assert_eq!(result.transforms.get("static_array_lookup"), Some(&1));
+        }
+
+        // ToPropertyKey never coerces these values into numeric array indices.
+        for index in [
+            "true", "false", "null", "void 0", "\"01\"", "\"1.0\"", "\" 1 \"", "\"-0\"",
+        ] {
+            let source = format!("const table = [\"ZERO\", \"ONE\"]; sink(table[{index}]);");
+            let result = deobfuscate(&source, 4);
+            assert!(result.is_some(), "index={index}");
+            let Some(result) = result else { unreachable!() };
+            assert!(
+                !result.transforms.contains_key("static_array_lookup"),
+                "index={index}; {}",
+                result.source
+            );
+        }
+    }
+
+    #[test]
     fn decoder_only_recovery_proves_rotation_and_rejects_bad_checksum() {
         let source = include_str!(
             "../../../corpus/generated/reversible-obfuscation/rotated-base64-string-array.js"

@@ -598,7 +598,7 @@ fn depythonify_safe_deob_safety_runtime_equivalence() -> Result<()> {
             &["arithmetic_state_unflatten"][..],
         ),
         (
-            "arithmetic-state-iife-safety.js",
+            "arithmetic-state-iife-shadow-safety.js",
             &["arithmetic_state_unflatten"][..],
         ),
     ] {
@@ -614,6 +614,14 @@ fn depythonify_safe_deob_safety_runtime_equivalence() -> Result<()> {
         &["remove_unused_proven_helper"],
     )?;
     assert!(eval.source.contains("function hiddenHelper"));
+
+    let iife = deob_fixture(scratch.path(), "arithmetic-state-iife-recovery.js")?;
+    assert_eq!(count(&iife.report, "arithmetic_state_unflatten"), 1);
+    assert_eq!(iife.report.arithmetic_state_proofs.len(), 1);
+    let proof = &iife.report.arithmetic_state_proofs[0];
+    assert_eq!(proof.termination, "conditional");
+    assert_eq!(proof.state_path, ["2", "0", "1"]);
+    assert_eq!(proof.branch_paths, [vec!["3".to_owned()], vec![]]);
 
     let arithmetic = deob_fixture(scratch.path(), "arithmetic-state-safety.js")?;
     assert_eq!(count(&arithmetic.report, "arithmetic_state_unflatten"), 1);
