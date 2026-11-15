@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 39] = [
+const MAIN_FIXTURES: [&str; 40] = [
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
@@ -41,6 +41,7 @@ const MAIN_FIXTURES: [&str; 39] = [
     "exception-state-multi-entry-branching.js",
     "exception-state-write-liveness.js",
     "exception-state-structured-liveness.js",
+    "numeric-state-sibling-guard-fold.js",
     "boolean-switch.js",
     "inert-array-truthiness.js",
     "static-alias-installer-calls.js",
@@ -201,6 +202,15 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
             assert!(count(report, "arithmetic_state_unflatten") >= 1, "{file}");
             assert!(!report.arithmetic_state_proofs.is_empty(), "{file}");
         }
+        "numeric-state-sibling-guard-fold.js" => {
+            assert!(
+                count(report, "numeric_state_guard_fold") >= 4,
+                "{file}: {:#?}",
+                report.transforms
+            );
+            assert_eq!(outcome.source.matches("log.push('guard')").count(), 1);
+            assert_eq!(outcome.source.matches("get value()").count(), 1);
+        }
         "exception-state-structured-liveness.js" => {
             assert!(
                 count(report, "dead_intermediate_state_write") >= 3,
@@ -217,11 +227,11 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
                 "{file}: {}",
                 outcome.source
             );
-            assert!(
-                outcome.source.contains("state = 69;"),
-                "{file}: {}",
-                outcome.source
-            );
+            // The immediate state-69 guard has been moved into the arm
+            // that sets it. Later liveness removes the now-unused value,
+            // but the effect must still execute exactly once.
+            assert!(count(report, "numeric_state_guard_fold") >= 1, "{file}");
+            assert_eq!(outcome.source.matches("trace.push('left')").count(), 1);
             assert!(
                 outcome.source.contains("state = 25;"),
                 "{file}: {}",

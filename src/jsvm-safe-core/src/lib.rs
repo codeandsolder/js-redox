@@ -16,6 +16,7 @@ mod proxy;
 mod pure_function;
 mod rewrite;
 mod selector;
+mod state_guard_folding;
 mod string_exposure;
 mod switch_constant;
 mod trivial_loops;
@@ -689,6 +690,26 @@ impl Collector<'_, '_> {
                     effect_statements::lower_member_object_sequence(expression, self.source)
                 {
                     self.push(expression.span, code, "member_object_sequence_lowering");
+                }
+            }
+        }
+    }
+
+    fn fold_sibling_state_guards(&mut self, statements: &[Statement<'_>]) {
+        if !self.allow_effect_statements || self.function_depth == 0 {
+            return;
+        }
+        for pair in statements.windows(2) {
+            if let [before, after] = pair {
+                if let Some((span, code, symbol)) = state_guard_folding::fold_adjacent_state_guard(
+                    before,
+                    after,
+                    self.source,
+                    self.scoping,
+                ) {
+                    if self.safe_numeric_state_binding(symbol) {
+                        self.push(span, code, "numeric_state_guard_fold");
+                    }
                 }
             }
         }
@@ -1423,6 +1444,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_function_body(&mut self, it: &oxc_ast::ast::FunctionBody<'a>) {
         self.lower_if_test_statements(&it.statements);
         self.lower_sibling_expression_statements(&it.statements);
+        self.fold_sibling_state_guards(&it.statements);
         self.reconstruct_while_pairs(&it.statements);
         self.reconstruct_reaching_while(&it.statements);
         if self.allow_effect_statements
@@ -1462,6 +1484,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
         self.lower_if_test_statements(&it.body);
         self.lower_sibling_expression_statements(&it.body);
+        self.fold_sibling_state_guards(&it.body);
         self.reconstruct_while_pairs(&it.body);
         self.reconstruct_reaching_while(&it.body);
         if self.allow_effect_statements
@@ -3316,7 +3339,13 @@ mod tests {
             "{result:?}"
         );
         assert!(!compact.contains("elseif(state==2)"), "{}", result.source);
-        assert!(compact.contains("if(state==2)"), "{}", result.source);
+        assert!(
+            result.transforms.contains_key("numeric_state_guard_fold"),
+            "the uniquely chosen numeric successor can now enter its effect
+             without reevaluating the assigned state: {}",
+            result.source
+        );
+        assert!(!compact.contains("if(state==2)"), "{}", result.source);
         assert_eq!(
             compact.matches("log.push(\"selected\")").count(),
             1,
@@ -6352,6 +6381,47 @@ mod tests {
     }
 
     #[test]
+    fn numeric_sibling_guard_folds_only_matching_arm_without_duplicate_test() {
+        let source = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/numeric-state-sibling-guard-fold.js"
+        );
+        let Some(result) = deobfuscate(source, 16) else {
+            unreachable!("valid source");
+        };
+        assert!(
+            result
+                .transforms
+                .get("numeric_state_guard_fold")
+                .is_some_and(|count| *count >= 4),
+            "{:#?}",
+            result.transforms
+        );
+        assert_eq!(result.source.matches("log.push('guard')").count(), 1);
+        assert_eq!(result.source.matches("get value()").count(), 1);
+        assert!(result.source.contains("arguments[0]"), "{}", result.source);
+    }
+
+    #[test]
+    fn numeric_sibling_guard_retains_annex_b_function_declarations() {
+        let source = r#"
+            function f(flag) {
+                let state = 0;
+                if (flag) { state = 3; } else { state = 7; }
+                if (state === 3) { function hoisted() { return 42; } }
+                return typeof hoisted;
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 16) else {
+            unreachable!("valid source");
+        };
+        assert!(
+            !result.transforms.contains_key("numeric_state_guard_fold"),
+            "Annex B function declaration must keep its original scope: {}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_revisits_multi_entry_structured_state_liveness() {
         let source = include_str!(
             "../../../corpus/generated/reversible-obfuscation/exception-state-structured-liveness.js"
@@ -6363,7 +6433,16 @@ mod tests {
         assert_eq!(source.matches("state = 94;").count(), 1);
         assert!(!result.source.contains("state = 73;"), "{}", result.source);
         assert!(!result.source.contains("state = 94;"), "{}", result.source);
-        assert!(result.source.contains("state = 69;"), "{}", result.source);
+        // The original state-69 guard is folded into the assigning arm.
+        // Its dead assignment then disappears on a later liveness pass,
+        // while its effect and the real SCC transition are kept once.
+        assert!(result.transforms.contains_key("numeric_state_guard_fold"));
+        assert!(
+            result.source.contains("trace.push('left')"),
+            "{}",
+            result.source
+        );
+        assert_eq!(result.source.matches("trace.push('left')").count(), 1);
         assert!(result.source.contains("state = 25;"), "{}", result.source);
         assert!(
             result

@@ -3577,7 +3577,7 @@ fn state_binding_read(
 /// A local/parameter binding must not be captured by nested functions, or
 /// visible through direct eval/with. The caller has already excluded mapped
 /// arguments and function-local dynamic-eval aliases before CFG recovery.
-fn exception_state_is_unaliased(symbol: SymbolId, scoping: &Scoping) -> bool {
+pub(crate) fn exception_state_is_unaliased(symbol: SymbolId, scoping: &Scoping) -> bool {
     let owner = scoping.symbol_scope_id(symbol);
     if owner == scoping.root_scope_id() {
         return false;

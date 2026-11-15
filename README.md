@@ -762,6 +762,16 @@ inner `for (;;)` dispatcher. This handles later dead writes whose original
 compressed expressions were not yet separate statements, while leaving
 ordinary single-entry CFG reductions and their transition evidence intact.
 
+Adjacent two-arm numeric state selection followed immediately by a comparison
+of that exact lexical state can be folded into the matching arm, without
+duplicating or reevaluating the original (possibly effectful) branch test.
+Both original inert numeric state assignments remain in execution order,
+and the guarded body stays within its original function and try/catch.
+Strict/loose primitive numeric equality, signed zero, lexical binding
+identity, Annex B declaration scope and aliased/mapped state bindings are
+checked independently. Later backward liveness can then remove state writes
+whose only previous read was the folded guard.
+
 Within that same exception-preserving CFG, an independently proven
 single-entry successor on just one arm of a conditional state assignment can
 be inlined behind an exact numeric-state guard. The other arms remain intact,
