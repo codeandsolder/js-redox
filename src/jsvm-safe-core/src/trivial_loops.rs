@@ -55,7 +55,7 @@ impl<'a> Visit<'a> for ControlTransfers {
 }
 
 /// Discard a primitive literal statement only if it cannot be a directive.
-pub(crate) fn inert_literal_statement(expr: &Expression<'_>) -> bool {
+pub fn inert_literal_statement(expr: &Expression<'_>) -> bool {
     match expr {
         Expression::BooleanLiteral(_)
         | Expression::NumericLiteral(_)
@@ -68,7 +68,7 @@ pub(crate) fn inert_literal_statement(expr: &Expression<'_>) -> bool {
 }
 
 /// A comma expression discards its operands' values but preserves their
-/// effects, and GetValue on the final operand. Dropping the final comma
+/// effects, and `GetValue` on the final operand. Dropping the final comma
 /// entirely can change direct eval and member-method receiver identity.
 /// Only collapse to the final expression if its AST produces a value, not a
 /// Reference. Otherwise keep an effectful prefix to retain comma semantics.
@@ -111,10 +111,7 @@ fn inherently_value(expr: &Expression<'_>) -> bool {
     }
 }
 
-pub(crate) fn prune_inert_sequence_values(
-    expr: &SequenceExpression<'_>,
-    source: &str,
-) -> Option<String> {
+pub fn prune_inert_sequence_values(expr: &SequenceExpression<'_>, source: &str) -> Option<String> {
     let (last, preceding) = expr.expressions.split_last()?;
     let mut retained = Vec::new();
     let mut removed = 0usize;
@@ -153,11 +150,11 @@ fn empty_statement(stmt: &Statement<'_>) -> bool {
 ///
 /// Preserve nested control-flow syntax (if/loop/switch/label/try) unchanged:
 /// the caller invokes this only on direct children of a function body or
-/// another BlockStatement, never on a branch or labeled statement body.
+/// another `BlockStatement`, never on a branch or labeled statement body.
 /// String expression statements are retained inside braces because lifting
 /// them to the beginning of a function can create a new strict directive.
 /// Comments and formatting inside the braces are preserved byte-for-byte.
-pub(crate) fn flatten_standalone_block(
+pub fn flatten_standalone_block(
     block: &BlockStatement<'_>,
     source: &str,
     scoping: &Scoping,
@@ -198,7 +195,7 @@ pub(crate) fn flatten_standalone_block(
 /// this statement is the consequent of another `if`: otherwise removing an
 /// `else` creates a different dangling-else parse. A retained branch keeps its
 /// original braces, lexical bindings, and control transfers.
-pub(crate) fn normalize_empty_if(stmt: &IfStatement<'_>, source: &str) -> Option<String> {
+pub fn normalize_empty_if(stmt: &IfStatement<'_>, source: &str) -> Option<String> {
     let then_empty = empty_statement(&stmt.consequent);
     let else_empty = stmt
         .alternate
@@ -236,7 +233,7 @@ fn literal_bool(expr: &Expression<'_>, expected: bool) -> bool {
 
 /// Only literal false; this preserves JS var-hoisting and Annex-B function
 /// declarations by declining bodies where removing the syntax changes binding.
-pub(crate) fn never_entered_while(it: &WhileStatement<'_>) -> Option<String> {
+pub fn never_entered_while(it: &WhileStatement<'_>) -> Option<String> {
     if !literal_bool(&it.test, false) {
         return None;
     }
@@ -249,7 +246,7 @@ pub(crate) fn never_entered_while(it: &WhileStatement<'_>) -> Option<String> {
 /// an earlier unlabeled break/continue targets the for statement. Require an
 /// immediate final unlabeled break, with no earlier unlabeled break or continue.
 /// Keep the original enclosing lexical block.
-pub(crate) fn single_iteration_for(it: &ForStatement<'_>, source: &str) -> Option<String> {
+pub fn single_iteration_for(it: &ForStatement<'_>, source: &str) -> Option<String> {
     let init = it.init.as_ref()?.as_expression()?;
     if !matches!(init, Expression::NumericLiteral(_))
         || !literal_bool(it.test.as_ref()?, true)

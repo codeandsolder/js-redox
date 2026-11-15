@@ -1,3 +1,20 @@
+/// ECMAScript strict numeric equality without approximate float comparisons.
+///
+/// Equal finite or infinite IEEE-754 encodings compare equal, either signed
+/// zero compares equal to the other, and NaN never compares equal (even when
+/// its payload bits happen to match). This is *not* SameValue/Object.is.
+#[must_use]
+pub fn js_number_equal(left: f64, right: f64) -> bool {
+    if left.is_nan() || right.is_nan() {
+        return false;
+    }
+    let left_bits = left.to_bits();
+    let right_bits = right.to_bits();
+    const ABS_MASK: u64 = 0x7fff_ffff_ffff_ffff;
+    left_bits == right_bits || ((left_bits & ABS_MASK) == 0 && (right_bits & ABS_MASK) == 0)
+}
+
+#[must_use]
 pub fn exact_u64(value: f64) -> Option<u64> {
     if !value.is_finite() || value < 0.0 {
         return None;
@@ -23,6 +40,7 @@ pub fn exact_u64(value: f64) -> Option<u64> {
     }
 }
 
+#[must_use]
 pub fn exact_i64(value: f64) -> Option<i64> {
     if value == 0.0 {
         return Some(0);
@@ -40,17 +58,33 @@ pub fn exact_i64(value: f64) -> Option<i64> {
     }
 }
 
+#[must_use]
 pub fn exact_u32(value: f64) -> Option<u32> {
     u32::try_from(exact_u64(value)?).ok()
 }
 
+#[must_use]
 pub fn exact_usize(value: f64) -> Option<usize> {
     usize::try_from(exact_u64(value)?).ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{exact_i64, exact_u32, exact_u64, exact_usize};
+    use super::{exact_i64, exact_u32, exact_u64, exact_usize, js_number_equal};
+
+    #[test]
+    fn js_number_equality_preserves_signed_zero_and_nan_rules() {
+        assert!(js_number_equal(-0.0, 0.0));
+        assert!(js_number_equal(f64::INFINITY, f64::INFINITY));
+        assert!(!js_number_equal(f64::INFINITY, f64::NEG_INFINITY));
+        assert!(!js_number_equal(f64::NAN, f64::NAN));
+        assert!(!js_number_equal(
+            f64::from_bits(0x7ff8_0000_0000_0001),
+            f64::from_bits(0x7ff8_0000_0000_0001)
+        ));
+        assert!(js_number_equal(42.0, 42.0));
+        assert!(!js_number_equal(42.0, 42.00000000000001));
+    }
 
     #[test]
     fn exact_unsigned_conversions_reject_fractional_and_out_of_range_values() {

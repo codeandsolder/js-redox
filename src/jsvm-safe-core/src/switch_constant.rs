@@ -53,7 +53,7 @@ impl<'a> Visit<'a> for SwitchBreakHazard {
     fn visit_arrow_function_expression(&mut self, _: &oxc_ast::ast::ArrowFunctionExpression<'a>) {}
 }
 
-pub(crate) fn select_constant_switch(node: &SwitchStatement<'_>, source: &str) -> Option<String> {
+pub fn select_constant_switch(node: &SwitchStatement<'_>, source: &str) -> Option<String> {
     // eval() only admits pure, statically modeled primitives; an expression
     // that can invoke user JS or observe mutable state isn't folded.
     let discriminant = eval(&node.discriminant)?;
@@ -383,7 +383,7 @@ fn structure_boolean_switch_with_dynamic_suffix(
     ))
 }
 
-pub(crate) fn structure_boolean_switch(node: &SwitchStatement<'_>, source: &str) -> Option<String> {
+pub fn structure_boolean_switch(node: &SwitchStatement<'_>, source: &str) -> Option<String> {
     if !is_boolean_valued(&node.discriminant) || node.cases.is_empty() {
         return None;
     }

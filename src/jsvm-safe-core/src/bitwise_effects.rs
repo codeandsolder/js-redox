@@ -3,8 +3,8 @@
 //!
 //! For Number bitwise operands, `~x ^ m = -1 - (x ^ m)`. `x` is evaluated
 //! exactly once on either side, and `m` must be a primitive Number literal.
-//! A BigInt-valued `x` throws on XOR with a Number on either side; no
-//! successful BigInt path is changed. The other arithmetic operands must be
+//! A `BigInt`-valued `x` throws on XOR with a Number on either side; no
+//! successful `BigInt` path is changed. The other arithmetic operands must be
 //! established primitive numbers so `+` cannot be string concatenation.
 use crate::{fragment, numeric::exact_i64};
 use oxc_ast::ast::{BinaryExpression, Expression};
@@ -28,7 +28,7 @@ fn literal_int(expr: &Expression<'_>) -> Option<i64> {
 }
 
 /// Expression is known to yield a Number whenever its evaluation succeeds.
-/// The checked numeric literal rules out successful BigInt-bitwise results.
+/// The checked numeric literal rules out successful `BigInt`-bitwise results.
 fn number_bitwise(expr: &Expression<'_>) -> bool {
     let Expression::BinaryExpression(binary) = unparen(expr) else {
         return false;
@@ -39,7 +39,7 @@ fn number_bitwise(expr: &Expression<'_>) -> bool {
     ) && (literal_int(&binary.left).is_some() || literal_int(&binary.right).is_some())
 }
 
-pub(crate) fn normalize(expr: &BinaryExpression<'_>, source: &str) -> Option<String> {
+pub fn normalize(expr: &BinaryExpression<'_>, source: &str) -> Option<String> {
     if expr.operator.as_str() != "+" {
         return None;
     }

@@ -96,7 +96,7 @@ fn evaluate(expr: &Expression<'_>, source: &str) -> Option<KnownEffects> {
     }
 }
 
-pub(crate) fn fold(expr: &Expression<'_>, source: &str) -> Option<String> {
+pub fn fold(expr: &Expression<'_>, source: &str) -> Option<String> {
     let result = evaluate(expr, source)?;
     if result.effects.is_empty() {
         return None;

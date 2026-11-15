@@ -391,7 +391,7 @@ fn root_assignment<'e, 'a>(
     Some((symbol, &assign.right))
 }
 
-/// Bitwise operators can return BigInt when both operands are BigInt.
+/// Bitwise operators can return `BigInt` when both operands are `BigInt`.
 /// Only mark a result as primitive Int32 if at least one operand is proven
 /// Number: on the successful path the other operand must have been coerced to
 /// Number as well (otherwise JavaScript throws before the assignment).
@@ -460,11 +460,7 @@ fn has_nested_writes(expr: &Expression<'_>) -> bool {
 /// Visit a straight-line statement list. Facts are invalidated at every
 /// control-flow or unmodelled statement boundary. This deliberately does not
 /// infer branch convergence, loop invariants, aliasing, or interprocedural state.
-pub(super) fn scan(
-    statements: &[Statement<'_>],
-    source: &str,
-    scoping: &Scoping,
-) -> Vec<(Span, String)> {
+pub fn scan(statements: &[Statement<'_>], source: &str, scoping: &Scoping) -> Vec<(Span, String)> {
     let mut numeric = BTreeSet::<SymbolId>::new();
     let mut replacements = Vec::new();
     for stmt in statements {

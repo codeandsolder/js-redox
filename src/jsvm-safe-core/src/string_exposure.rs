@@ -71,7 +71,7 @@ impl<'a> Visit<'a> for StaticArrayReadCollector {
     }
 }
 
-pub(crate) fn static_readonly_arrays(
+pub fn static_readonly_arrays(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
 ) -> HashMap<SymbolId, Vec<Value>> {
@@ -92,7 +92,7 @@ pub(crate) fn static_readonly_arrays(
     out
 }
 
-pub(crate) fn static_array_lookup_text(
+pub fn static_array_lookup_text(
     member: &ComputedMemberExpression<'_>,
     scoping: &Scoping,
     arrays: &HashMap<SymbolId, Vec<Value>>,
@@ -153,7 +153,7 @@ impl<'a> Visit<'a> for StaticStringExposureCollector<'_> {
     }
 }
 
-pub(crate) fn static_string_exposure_pass(
+pub fn static_string_exposure_pass(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
 ) -> Vec<Replacement> {
@@ -232,6 +232,8 @@ fn expose_static_strings_with_mode(
     }))
 }
 
+/// # Errors
+/// Returns `BudgetExceeded` if the configured work budget is exhausted.
 pub fn expose_static_strings(
     source: &str,
     max_iterations: usize,
@@ -240,6 +242,8 @@ pub fn expose_static_strings(
     expose_static_strings_with_mode(source, max_iterations, SafeSourceMode::Auto, budget)
 }
 
+/// # Errors
+/// Returns `BudgetExceeded` if the configured work budget is exhausted.
 pub fn expose_static_strings_with_source_mode(
     source: &str,
     max_iterations: usize,

@@ -522,7 +522,9 @@ fn semantic_affine_base91_signature_matches(
             .filter_map(|(index, value)| {
                 let expected = u32::try_from(expected).ok().map(f64::from);
                 let matches = expected.is_some_and(|expected| {
-                    value.number().is_some_and(|number| number == expected)
+                    value
+                        .number()
+                        .is_some_and(|number| crate::numeric::js_number_equal(number, expected))
                 });
                 matches
                     .then(|| i64::try_from(index).ok()?.checked_sub(offset))
@@ -935,6 +937,8 @@ fn expose_static_strings_allow_with(
     Ok(Some((current, total)))
 }
 
+/// # Errors
+/// Returns `BudgetExceeded` if the configured work budget is exhausted.
 pub fn recover_base91_strings_with_source_mode(
     source: &str,
     max_iterations: usize,

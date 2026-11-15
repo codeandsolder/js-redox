@@ -1826,7 +1826,7 @@ impl SafeSourceRejection {
     }
 }
 
-fn source_type_candidates(mode: SafeSourceMode) -> [Option<SourceType>; 2] {
+const fn source_type_candidates(mode: SafeSourceMode) -> [Option<SourceType>; 2] {
     match mode {
         SafeSourceMode::Auto => [Some(SourceType::unambiguous()), Some(SourceType::cjs())],
         SafeSourceMode::Module => [Some(SourceType::mjs()), None],
@@ -2106,6 +2106,8 @@ fn recover_static_decoders_with_mode(
     }))
 }
 
+/// # Errors
+/// Returns `BudgetExceeded` if the configured work budget is exhausted.
 pub fn recover_static_decoders(
     source: &str,
     max_iterations: usize,
@@ -2114,6 +2116,8 @@ pub fn recover_static_decoders(
     recover_static_decoders_with_mode(source, max_iterations, SafeSourceMode::Auto, budget)
 }
 
+/// # Errors
+/// Returns `BudgetExceeded` if the configured work budget is exhausted.
 pub fn recover_static_decoders_with_source_mode(
     source: &str,
     max_iterations: usize,
@@ -2260,6 +2264,8 @@ fn deobfuscate_with_mode(
     }))
 }
 
+/// # Errors
+/// Returns `BudgetExceeded` if the configured work budget is exhausted.
 pub fn deobfuscate(
     source: &str,
     max_iterations: usize,
@@ -2270,6 +2276,8 @@ pub fn deobfuscate(
 
 /// Proof-oriented deobfuscation with an explicit host-language source mode.
 /// Use this when filename semantics make module/CommonJS mode authoritative.
+/// # Errors
+/// Returns `BudgetExceeded` if the configured work budget is exhausted.
 pub fn deobfuscate_with_source_mode(
     source: &str,
     max_iterations: usize,
@@ -2279,10 +2287,13 @@ pub fn deobfuscate_with_source_mode(
     deobfuscate_with_mode(source, max_iterations, false, source_mode, budget)
 }
 
-/// Proof-oriented variant that may evaluate standard numeric globals such as
-/// `Number`, `parseInt`, and `Math.floor` through a proven stable global-object
-/// alias. Callers must surface this assumption in any claim derived from the
-/// transformed source; ordinary source rewriting must use [`deobfuscate`].
+/// Proof-oriented deobfuscation with explicitly supported numeric globals.
+///
+/// This may evaluate `Number`, `parseInt`, and `Math.floor` through a proven
+/// stable global-object alias. Derived claims must disclose that assumption;
+/// ordinary source rewriting uses [`deobfuscate`].
+/// # Errors
+/// Returns `BudgetExceeded` if the configured work budget is exhausted.
 pub fn deobfuscate_with_standard_numeric_builtins(
     source: &str,
     max_iterations: usize,
@@ -2789,7 +2800,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_keeps_silent_cycles_and_effectful_loop_tests() {
-        let cycle = r#"
+        let cycle = r"
             function f() {
                 let state=1;
                 while(true) try {
@@ -2797,7 +2808,7 @@ mod tests {
                     else if(state==2) state=1;
                 } catch(error) { throw error; }
             }
-        "#;
+        ";
         let output = deobfuscate(cycle, 12);
         assert!(output.is_some(), "valid source");
         let Some(output) = output else { unreachable!() };
@@ -2829,7 +2840,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_does_not_coerce_boolean_state_assignments() {
-        let source = r#"
+        let source = r"
             function f() {
                 let state=1;
                 while(true) try {
@@ -2838,7 +2849,7 @@ mod tests {
                     else if(state===3) return 3;
                 } catch(error) { throw error; }
             }
-        "#;
+        ";
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -3091,7 +3102,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_merges_throwing_return_in_original_catch_scope() {
-        let source = r#"
+        let source = r"
             function f(object, log) {
                 let state = 1;
                 while (true) try {
@@ -3099,7 +3110,7 @@ mod tests {
                     else if (state == 2) return object.value;
                 } catch (error) { log.push(state); return log; }
             }
-        "#;
+        ";
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -3456,7 +3467,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_preserves_multiple_incoming_region() {
-        let source = r#"
+        let source = r"
             function f(flag) {
                 let state = 1;
                 while (true) try {
@@ -3466,7 +3477,7 @@ mod tests {
                     else if (state == 4) return flag;
                 } catch (error) { throw error; }
             }
-        "#;
+        ";
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -6436,14 +6447,14 @@ mod tests {
 
     #[test]
     fn numeric_sibling_guard_retains_annex_b_function_declarations() {
-        let source = r#"
+        let source = r"
             function f(flag) {
                 let state = 0;
                 if (flag) { state = 3; } else { state = 7; }
                 if (state === 3) { function hoisted() { return 42; } }
                 return typeof hoisted;
             }
-        "#;
+        ";
         let Some(result) = deobfuscate(source, 16) else {
             unreachable!("valid source");
         };
@@ -6560,7 +6571,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_scc_preserves_break_target_in_multi_entry_cycle() {
-        let source = r#"
+        let source = r"
             function f(log) {
                 let state = 1, count = 0;
                 while (true) try {
@@ -6574,7 +6585,7 @@ mod tests {
                 } catch (error) { state = 4; }
                 return log;
             }
-        "#;
+        ";
         let Some(result) = deobfuscate(source, 12) else {
             unreachable!("valid source");
         };
@@ -6588,7 +6599,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_scc_absorbs_unique_backedge_arm() {
-        let source = r#"
+        let source = r"
             function f(limit, log) {
                 let state = 1, count = 0;
                 while (true) try {
@@ -6597,7 +6608,7 @@ mod tests {
                     else if (state == 3) return [count, log];
                 } catch (error) { throw error; }
             }
-        "#;
+        ";
         let Some(result) = deobfuscate(source, 12) else {
             unreachable!("valid source")
         };
@@ -6842,7 +6853,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_scc_rejects_catch_root_into_backedge_arm() {
-        let source = r#"
+        let source = r"
             function f(limit, log) {
                 let state = 1, count = 0;
                 while (true) try {
@@ -6851,7 +6862,7 @@ mod tests {
                     else if (state == 3) return [count, log];
                 } catch (error) { state = 2; }
             }
-        "#;
+        ";
         let Some(result) = deobfuscate(source, 12) else {
             unreachable!("valid source")
         };
@@ -6869,7 +6880,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_scc_rejects_irreducible_second_entry() {
-        let source = r#"
+        let source = r"
             function f(limit, log) {
                 let state = 1, count = 0;
                 while (true) try {
@@ -6879,7 +6890,7 @@ mod tests {
                     else if (state == 4) state = 2;
                 } catch (error) { state = 4; }
             }
-        "#;
+        ";
         let Some(result) = deobfuscate(source, 12) else {
             unreachable!("valid source")
         };
@@ -6918,7 +6929,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_multi_declarator_initializer_in_second_position() {
-        let source = r#"
+        let source = r"
             function f(limit, log) {
                 let count = 0, state = 1;
                 while (true) try {
@@ -6927,7 +6938,7 @@ mod tests {
                     else if (state == 3) return [count, log];
                 } catch (error) { throw error; }
             }
-        "#;
+        ";
         let Some(result) = deobfuscate(source, 12) else {
             unreachable!("valid source")
         };
@@ -6999,7 +7010,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_refuses_unknown_reachable_transitions() {
-        let source = r#"
+        let source = r"
             function f(value) {
                 let state=1;
                 let other=0;
@@ -7012,7 +7023,7 @@ mod tests {
                     state=3;
                 }
             }
-        "#;
+        ";
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -7046,7 +7057,7 @@ mod tests {
 
     #[test]
     fn exception_dispatcher_refuses_effectful_property_read_in_condition() {
-        let source = r#"
+        let source = r"
             function f(guard) {
                 let state=1;
                 while(guard.enabled) try {
@@ -7055,7 +7066,7 @@ mod tests {
                     else if(state==99) return 99;
                 } catch(error) { state=2; }
             }
-        "#;
+        ";
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else { unreachable!() };
@@ -7148,13 +7159,13 @@ mod tests {
 
     #[test]
     fn numeric_state_proofs_keep_independent_sibling_function_regions() {
-        let source = r#"
+        let source = r"
             function outer(){
                 function risky(x){arguments[0]=3;x=5;}
                 function healthy(){let dead=0;dead=5;return 1;}
                 return healthy();
             }
-        "#;
+        ";
         let result = deobfuscate(source, 12);
         assert!(result.is_some(), "valid source");
         let Some(result) = result else {
@@ -7243,10 +7254,10 @@ mod tests {
 
     #[test]
     fn reaching_numeric_state_proof_keeps_eval_visible_captured_and_aliased_state() {
-        let dispatcher = r#"while(state!=29){
+        let dispatcher = r"while(state!=29){
               if(state==40) state=26;
               else if(state==26) state=29;
-           }"#;
+           }";
         for source in [
             format!(
                 "function outer(log){{let state=0;function risky(){{return eval('state');}}function child(){{state=40;log();{dispatcher}}}return child;}}"
@@ -7484,7 +7495,7 @@ mod tests {
         let result = deobfuscate(source, 2);
         assert!(result.is_some());
         let result = result.unwrap_or_else(|| unreachable!());
-        assert_eq!(result.source, r#"sink((1).fetchLater, (1.5).toString);"#);
+        assert_eq!(result.source, r"sink((1).fetchLater, (1.5).toString);");
         assert_eq!(result.transforms.get("computed_property"), Some(&2));
         assert_eq!(
             safe_source_rejection(&result.source, SafeSourceMode::Auto),
@@ -7694,14 +7705,14 @@ sink(alias(0x10), alias(0x11));
         let mut source = original.to_string();
         source.replace_range(
             rotation_start..rotation_end,
-            r#"!function() {
+            r"!function() {
   for (var alias = d, table = p();;) try {
     if (2454246 === parseInt(alias(0x10)) * 10 + parseInt(alias(0x11))) break;
     table.push(table.shift());
   } catch (error) {
     table.push(table.shift());
   }
-}();"#,
+}();",
         );
 
         let recovered = recover_static_decoders(&source, 8);
@@ -7742,7 +7753,7 @@ sink(alias(0x10), alias(0x11));
 
     #[test]
     fn decoder_only_recovery_generalizes_split_provider_sequence_accessor_and_nested_rotation() {
-        let source = r#"
+        let source = r"
 function provider(table) {
     return table = `12!34!56!78`.split(`!`), provider = function() { return table; }, provider();
 }
@@ -7772,7 +7783,7 @@ for (
     false;
 ) {}
 sink(decode(0x10), decode(0x11));
-"#;
+";
         let recovered = recover_static_decoders(source, 8);
         assert!(recovered.is_some());
         let recovered = recovered.unwrap_or_else(|| unreachable!());
@@ -7929,7 +7940,7 @@ sink(decode(0x10), decode(0x11));
 
     #[test]
     fn decoder_alias_assigned_in_for_initializer_is_dominating_and_stable() {
-        let source = r#"
+        let source = r"
 function provider(table) {
     return table = `alpha!beta`.split(`!`), provider = function() { return table; }, provider();
 }
@@ -7943,7 +7954,7 @@ function use(alias) {
     }
 }
 use();
-"#;
+";
         let recovered = recover_static_decoders(source, 8);
         assert!(recovered.is_some());
         let recovered = recovered.unwrap_or_else(|| unreachable!());
@@ -7962,7 +7973,7 @@ use();
 
     #[test]
     fn decoder_alias_first_statement_dominates_closure_reads() {
-        let source = r#"
+        let source = r"
 function provider(table) {
     return table = `alpha!beta`.split(`!`), provider = function() { return table; }, provider();
 }
@@ -7977,7 +7988,7 @@ function use(alias) {
     sink(later(), alias(0x11));
 }
 use();
-"#;
+";
         let recovered = recover_static_decoders(source, 8);
         assert!(recovered.is_some());
         let recovered = recovered.unwrap_or_else(|| unreachable!());

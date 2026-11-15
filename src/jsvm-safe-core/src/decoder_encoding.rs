@@ -182,9 +182,7 @@ mod tests {
         let key = "k€y";
         let plain = "hello λ";
         let cipher = rc4_utf16(plain, key).unwrap_or_default();
-        let encoded = lower_engine()
-            .map(|engine| engine.encode(cipher.as_bytes()))
-            .unwrap_or_default();
+        let encoded = lower_engine().map_or_default(|engine| engine.encode(cipher.as_bytes()));
         assert_eq!(
             decode_lower_alphabet_base64_rc4(&encoded, key),
             Some(plain.into())
@@ -215,9 +213,7 @@ mod tests {
 
     #[test]
     fn lower_first_alphabet_uses_library_engine_without_changing_sentinel_shape() {
-        let encoded = lower_engine()
-            .map(|engine| engine.encode("hello"))
-            .unwrap_or_default();
+        let encoded = lower_engine().map_or_default(|engine| engine.encode("hello"));
         assert_eq!(
             decode_lower_alphabet_base64_uri(&encoded),
             Some("hello".into())
