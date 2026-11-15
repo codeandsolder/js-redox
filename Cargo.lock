@@ -1996,7 +1996,7 @@ dependencies = [
 [[package]]
 name = "rolldown_redox"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=c1bacc679295fb5e119a373feb538c88549ec70a#c1bacc679295fb5e119a373feb538c88549ec70a"
+source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=db8664c202c2175bcc0818ddc95d07ac25746143#db8664c202c2175bcc0818ddc95d07ac25746143"
 dependencies = [
  "memchr",
  "oxc_allocator",
