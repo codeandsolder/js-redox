@@ -1,0 +1,8 @@
+/upstream-zipp/
+/build/
+/target/
+/inputs/
+
+/harness/Cargo.lock
+
+/upstream-zipp
