@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 35] = [
+const MAIN_FIXTURES: [&str; 36] = [
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
@@ -37,6 +37,7 @@ const MAIN_FIXTURES: [&str; 35] = [
     "multi-exit-reducible-state.js",
     "early-abrupt-state-dispatch.js",
     "exception-resume-state.js",
+    "exception-state-multi-entry-cycle.js",
     "boolean-switch.js",
     "inert-array-truthiness.js",
     "static-alias-installer-calls.js",
@@ -196,6 +197,23 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
         | "arithmetic-state-conditional.js" => {
             assert!(count(report, "arithmetic_state_unflatten") >= 1, "{file}");
             assert!(!report.arithmetic_state_proofs.is_empty(), "{file}");
+        }
+        "exception-state-multi-entry-cycle.js" => {
+            assert_eq!(count(report, "exception_state_pruned"), 1);
+            assert!(
+                outcome
+                    .source
+                    .contains("while ((state === 1) || (state === 2))"),
+                "{}",
+                outcome.source
+            );
+            assert_eq!(
+                outcome
+                    .source
+                    .matches("log.push(\"body:\" + count)")
+                    .count(),
+                1
+            );
         }
         "arithmetic-state-primitive-branches.js" => {
             assert_eq!(count(report, "arithmetic_state_unflatten"), 5);

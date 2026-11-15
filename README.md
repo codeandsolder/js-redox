@@ -724,7 +724,8 @@ cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
 ~~~
 
 Exception-sensitive state dispatchers retain their original try/catch
-and one-state-per-iteration semantics. Exact lexical-state reachability
+and preserve catch-visible state assignments and case execution order.
+Exact lexical-state reachability
 includes catch-resume assignments as additional roots, so unreachable
 case comparisons can be removed without erasing recovery paths or moving
 potentially throwing operations across the handler. Numeric-state proofs
@@ -758,11 +759,23 @@ initializer entry to that successor prevents the merge. This applies to
 general state graphs, including loops, without moving statements outside the
 original try/catch or inventing additional state paths.
 
+Multi-entry cyclic components can also be reconstructed when every entry and
+normal transition is proven. Rather than picking an invalid single loop
+header, the recovery groups the original cycle cases behind their combined
+pure state guard and executes one original case per inner iteration, still
+inside the original try. It retains every state write, external/catch entry,
+exception handler and early exit, and requires a constant-true outer loop
+predicate and pure trailing completion. Unrelocatable break/continue targets
+and Annex B function declarations block the merge. This lets a catch retry
+enter the middle of the same cycle without cloning or losing its recovery
+case; the remaining outer dispatcher handles states outside that cycle.
+
 Numeric-state control-flow recovery also structures single-entry reducible
 cycles with early exits from the middle of their bodies. The original
 state-transition graph determines a common exit; every emitted path must
-reach either that exit or the loop header, so irreducible or multi-entry
-cycles remain unchanged. Early exits render as ordinary break/continue
+reach either that exit or the loop header, so the separate for/ternary
+reducer leaves irreducible or multi-entry cycles unchanged. Early exits
+render as ordinary break/continue
 without losing the effects of intermediate states.
 
 The tool recovers source-resolved direct calls, constructors, and eligible

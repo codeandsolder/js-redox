@@ -6322,6 +6322,68 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_scc_groups_multi_entry_catch_retry_without_duplication() {
+        let source = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/exception-state-multi-entry-cycle.js"
+        );
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source");
+        };
+        assert_eq!(result.transforms.get("exception_state_pruned"), Some(&1));
+        assert!(
+            result
+                .source
+                .contains("while ((state === 1) || (state === 2))"),
+            "{}",
+            result.source
+        );
+        assert_eq!(
+            result
+                .source
+                .matches("log.push(\"header:\" + count)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            result.source.matches("log.push(\"body:\" + count)").count(),
+            1
+        );
+        assert_eq!(result.source.matches("log.push(\"resume\")").count(), 1);
+        assert!(result.source.contains("catch (error)"), "{}", result.source);
+        assert!(result.source.contains("state = 4"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_scc_preserves_break_target_in_multi_entry_cycle() {
+        let source = r#"
+            function f(log) {
+                let state = 1, count = 0;
+                while (true) try {
+                    if (state === 1) {
+                        if (count === 2) break;
+                        state = 2;
+                    } else if (state === 2) {
+                        log.push(count++);
+                        state = 1;
+                    } else if (state === 4) state = 2;
+                } catch (error) { state = 4; }
+                return log;
+            }
+        "#;
+        let Some(result) = deobfuscate(source, 12) else {
+            unreachable!("valid source");
+        };
+        assert!(
+            !result
+                .source
+                .contains("while ((state === 1) || (state === 2))"),
+            "break cannot be retargeted to an inner state loop: {}",
+            result.source
+        );
+        assert!(result.source.contains("break;"), "{}", result.source);
+    }
+
+    #[test]
     fn exception_dispatcher_scc_absorbs_unique_backedge_arm() {
         let source = r#"
             function f(limit, log) {

@@ -2820,6 +2820,162 @@ fn exception_scc_backedge_regions(
     Some((BTreeMap::new(), BTreeSet::new()))
 }
 
+/// Recover a cyclic component even when catch or an external source case
+/// can enter at more than one member. A single-entry natural-loop rewrite
+/// would silently discard those independent entries.
+///
+/// Instead of choosing a header or cloning shared effects, move every
+/// original case into one guarded inner while *inside the original try*.
+/// One case executes per inner iteration; each original state write remains
+/// observable to code that throws and reaches the original catch. Only the
+/// constant-true outer loop test, side-effect-free case comparisons, and the
+/// pure trailing return test may be skipped between these internal states.
+///
+/// No state or graph edges are deleted here: the replacement is source-only.
+/// All component labels stay in the proof graph, while one shared source
+/// region owns their bodies. Other regions must exclude every member.
+#[derive(Default)]
+struct UnrelocatableLoopControl {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for UnrelocatableLoopControl {
+    fn visit_break_statement(&mut self, _: &oxc_ast::ast::BreakStatement<'a>) {
+        self.found = true;
+    }
+    fn visit_continue_statement(&mut self, _: &oxc_ast::ast::ContinueStatement<'a>) {
+        self.found = true;
+    }
+    fn visit_function(&mut self, _: &oxc_ast::ast::Function<'a>, _: oxc_syntax::scope::ScopeFlags) {
+    }
+    fn visit_arrow_function_expression(&mut self, _: &oxc_ast::ast::ArrowFunctionExpression<'a>) {}
+}
+
+struct ExceptionCycleRewrite {
+    combined: BTreeMap<u64, String>,
+    absorbed: BTreeSet<u64>,
+    guards: BTreeMap<u64, String>,
+}
+
+fn exception_multi_entry_cycle_regions(
+    dispatcher: &Statement<'_>,
+    state: &str,
+    entry: ExceptionEntryProof<'_>,
+    cases: &BTreeMap<u64, Option<Route>>,
+    edits: &BTreeMap<u64, Vec<TerminalStateEdit>>,
+    effects: &ExceptionLoopEffectContext<'_>,
+    source: &str,
+) -> Option<ExceptionCycleRewrite> {
+    let mut statements = BTreeMap::new();
+    let mut tests = BTreeMap::new();
+    let mut cursor = dispatcher;
+    loop {
+        let Statement::IfStatement(branch) = cursor else {
+            return None;
+        };
+        if branch.test.may_have_side_effects(effects) {
+            return None;
+        }
+        let label = state_test(&branch.test, state)?;
+        statements.insert(label, &branch.consequent);
+        tests.insert(label, fragment(source, branch.test.span()).to_owned());
+        match branch.alternate.as_ref() {
+            Some(other @ Statement::IfStatement(_)) => cursor = other,
+            None => break,
+            Some(_) => return None,
+        }
+    }
+
+    let graph = entry
+        .reachable
+        .iter()
+        .map(|&node| Some((node, cases.get(&node)?.as_ref()?.clone())))
+        .collect::<Option<BTreeMap<_, _>>>()?;
+    for region in strongly_connected_regions(&graph, entry.reachable) {
+        if region.len() < 2 || !region.is_disjoint(entry.excluded) {
+            continue;
+        }
+        let mut entrances = entry
+            .roots
+            .intersection(&region)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for (&outside, route) in &graph {
+            if region.contains(&outside) {
+                continue;
+            }
+            let mut targets = Vec::new();
+            route.targets(&mut targets);
+            entrances.extend(targets.into_iter().filter(|target| region.contains(target)));
+        }
+        if entrances.len() < 2 {
+            continue;
+        }
+
+        // The source text of every member must be relocatable into a new
+        // nested while. Unlabelled or labelled break/continue could otherwise
+        // acquire a different target; Annex B function declarations can
+        // acquire different bindings when moved to another block.
+        let mut safe = true;
+        for label in &region {
+            let Some(&statement) = statements.get(label) else {
+                safe = false;
+                break;
+            };
+            let mut control = UnrelocatableLoopControl::default();
+            control.visit_statement(statement);
+            let mut declarations = HoistedVars::default();
+            declarations.visit_statement(statement);
+            if control.found || declarations.function_declaration {
+                safe = false;
+                break;
+            }
+        }
+        if !safe {
+            continue;
+        }
+
+        let start = *region
+            .iter()
+            .min_by_key(|label| statements.get(label).map(|stmt| stmt.span().start))?;
+        let mut ordered = region.iter().copied().collect::<Vec<_>>();
+        ordered.sort_by_key(|label| statements.get(label).map(|stmt| stmt.span().start));
+        let condition = ordered
+            .iter()
+            .map(|label| Some(format!("({})", tests.get(label)?)))
+            .collect::<Option<Vec<_>>>()?
+            .join(" || ");
+        let mut text = format!("{{ while ({condition}) {{\n");
+        for (index, label) in ordered.iter().enumerate() {
+            let statement = *statements.get(label)?;
+            let original = match edits.get(label) {
+                Some(replacements) => print_terminal_edits(statement, source, replacements)?,
+                None => fragment(source, statement.span()).to_owned(),
+            };
+            if index > 0 {
+                text.push_str("else ");
+            }
+            text.push_str(&format!("if ({}) {{ {original} }}\n", tests.get(label)?));
+        }
+        text.push_str("} }");
+        let absorbed = region
+            .iter()
+            .copied()
+            .filter(|label| *label != start)
+            .collect::<BTreeSet<_>>();
+        return Some(ExceptionCycleRewrite {
+            combined: BTreeMap::from([(start, text)]),
+            absorbed,
+            guards: BTreeMap::from([(start, condition)]),
+        });
+    }
+    Some(ExceptionCycleRewrite {
+        combined: BTreeMap::new(),
+        absorbed: BTreeSet::new(),
+        guards: BTreeMap::new(),
+    })
+}
+
 /// Recover a reducible two-arm SESE region from source-case CFG transitions.
 ///
 /// Branch paths may contain any number of modeled states (including effectful
@@ -3643,6 +3799,7 @@ pub(crate) fn prune_exception_dispatcher(
     // regions against the UPDATED CFG. Protect the diamond's entry and
     // absorbed states so a second rewrite cannot discard its source body.
     // This preserves disjoint straight-line improvements in the same pass.
+    let mut expanded_tests = BTreeMap::new();
     let (combined_regions, absorbed_regions) = if known_bool(&loop_stmt.test) == Some(true) {
         // The source of a trailing completion is *outside* the dispatcher.
         // Its synthetic CFG exit must never be moved into an inlined region.
@@ -3695,6 +3852,24 @@ pub(crate) fn prune_exception_dispatcher(
             )?;
             combined = regions;
             absorbed = members;
+        }
+        if absorbed.is_empty() {
+            let rewrite = exception_multi_entry_cycle_regions(
+                dispatcher,
+                state,
+                ExceptionEntryProof {
+                    roots: &roots,
+                    reachable: &reachable,
+                    excluded: &excluded,
+                },
+                &cases,
+                &retargeted,
+                &effects,
+                source,
+            )?;
+            combined = rewrite.combined;
+            absorbed = rewrite.absorbed;
+            expanded_tests = rewrite.guards;
         }
         let mut after_diamond = reachable.clone();
         if !absorbed.is_empty() {
@@ -3823,10 +3998,11 @@ pub(crate) fn prune_exception_dispatcher(
                     None => fragment(source, branch.consequent.span()).to_owned(),
                 }
             };
-            alternatives.push(format!(
-                "if ({}) {consequent}",
-                fragment(source, branch.test.span()),
-            ));
+            let test = expanded_tests
+                .get(&label)
+                .map(String::as_str)
+                .unwrap_or_else(|| fragment(source, branch.test.span()));
+            alternatives.push(format!("if ({test}) {consequent}"));
         } else {
             hoisted.visit_statement(&branch.consequent);
         }
