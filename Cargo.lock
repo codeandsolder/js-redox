@@ -1349,7 +1349,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rolldown_redox"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=8bd56cfbda20b83727a02c97e6f0259d8d4c9794#8bd56cfbda20b83727a02c97e6f0259d8d4c9794"
+source = "git+https://github.com/codeandsolder/rolldown-crates-redox.git?rev=c1bacc679295fb5e119a373feb538c88549ec70a#c1bacc679295fb5e119a373feb538c88549ec70a"
 dependencies = [
  "memchr",
  "oxc_allocator",
