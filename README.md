@@ -834,3 +834,30 @@ would produce invalid JavaScript. Mutable or ambiguously named helper
 bindings remain linked to the unspecialized original. A specialized helper
 view applies to its recorded fixed arguments; it is not a universal
 replacement for the general helper.
+
+
+### Guarded specialization in whole-program source-tree recovery
+
+The opt-in source-tree flag `--context-guarded-helper NAME` (repeatable,
+requires `--context-source` and `--context-full-iterations`) uses the exact
+lexical call graph and constant-argument proofs from caller-views against
+the fully reconstructed program. Its real helper bodies are specialized,
+re-simplified through the safe core, and guarded inside their original call
+frames. The normal `lexical-context/whole-program/readable.js`, original
+lexical source and protected capture stay unchanged. A separate
+`readable-guarded.js` contains executable optimized paths with original
+fallbacks. The original and result SHA-256, helper names, and installed
+fast-path counts are in `lexical-context/context.json` under
+`full_context.guarded_executable`.
+
+For example:
+
+```
+cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- source-tree \
+  path/to/handlers output/tree --context-source path/to/original.js \
+  --context-full-iterations 48 --context-guarded-helper mQ \
+  --max-iterations 12 --format-output
+```
+
+The generated executable is a reconstructed source variant, not an
+identical replacement for scripts reflecting `Function#toString`.

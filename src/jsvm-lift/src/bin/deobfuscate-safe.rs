@@ -155,6 +155,12 @@ struct SourceTreeArgs {
     /// Raw original source, byte-for-byte matching source hashes and spans
     /// in captured-handler provenance headers. Pretty-printed source does
     /// not have the same offsets and must not be substituted here.
+    /// Name(s) of source-resolved helpers whose proven constant-selector
+    /// variants are installed as guarded fast paths in an additional
+    /// whole-program executable view. Repeat for multiple helper names.
+    /// This never changes original.js or the ordinary readable.js.
+    #[arg(long = "context-guarded-helper", requires = "context_full_iterations")]
+    context_guarded_helpers: Vec<String>,
     #[arg(long, requires = "context_source")]
     origin_source: Option<PathBuf>,
     /// Optional AST property name of a member-assigned function entrypoint.
@@ -1534,7 +1540,7 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
                 ));
             }
         }
-        let full_context = if let Some(iterations) = args.context_full_iterations {
+        let mut full_context = if let Some(iterations) = args.context_full_iterations {
             let result = materialize_full_lexical_context(
                 &original,
                 &source_inputs,
@@ -1558,6 +1564,50 @@ fn run_source_tree(args: SourceTreeArgs) -> Result<()> {
         } else {
             None
         };
+        if !args.context_guarded_helpers.is_empty() {
+            let whole_dir = folder.join("whole-program");
+            let suffix = SourceMode::for_path(context_path).suffix();
+            let plain_file = format!("readable{suffix}");
+            let plain = fs::read_to_string(whole_dir.join(&plain_file))?;
+            let views = reconstruct_caller_views(&plain, None)?;
+            let variants = recover_guarded_context_variants(
+                &plain,
+                &views,
+                &args.context_guarded_helpers,
+                args.max_iterations,
+            )?;
+            let guarded = install_guarded_specializations(&plain, &variants)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no source-proven guarded fast paths for requested helpers: {:?}",
+                    args.context_guarded_helpers,
+                )
+            })?;
+            let relative = format!("readable-guarded{suffix}");
+            fs::write(whole_dir.join(&relative), &guarded.source)?;
+            let metadata = json!({
+                "path": format!("lexical-context/whole-program/{relative}"),
+                "base_path": format!("lexical-context/whole-program/{plain_file}"),
+                "base_sha256": sha256_hex(plain.as_bytes()),
+                "sha256": sha256_hex(guarded.source.as_bytes()),
+                "helpers": args.context_guarded_helpers,
+                "candidate_variants": variants.len(),
+                "fast_paths": guarded.fast_paths,
+                "targeted_functions": guarded.targeted_functions,
+            });
+            if let Some(report) = full_context.as_mut() {
+                report["guarded_executable"] = metadata.clone();
+            }
+            let mut index = fs::read_to_string(whole_dir.join("README.md"))?;
+            index.push_str(&format!(
+                "\n[Guarded executable whole-program recovery]({relative}): {} proven fast paths in {} original function(s). Original fallback retained; captured source untouched.\n",
+                guarded.fast_paths, guarded.targeted_functions,
+            ));
+            fs::write(whole_dir.join("README.md"), index)?;
+            md.push_str(&format!(
+                "\n[Browse source-proven guarded whole-program executable](lexical-context/whole-program/{relative}): {} fast paths.\n",
+                guarded.fast_paths,
+            ));
+        }
         let mut context_json_value = json!({
             "caller_view_count": caller_view_rows.len(),
             "caller_views": caller_view_rows,
@@ -1697,6 +1747,54 @@ fn run_project(args: ProjectArgs) -> Result<()> {
         summary.string_recovery_replacements,
     );
     Ok(())
+}
+
+/// Reuse the same original-symbol and constant-substitution proof as
+/// caller-views. Unlike the browsing specializations, return only verified
+/// executable fast-path candidates, without materializing dozens of files.
+fn recover_guarded_context_variants(
+    original: &str,
+    views: &[CallerView],
+    helpers: &[String],
+    max_iterations: usize,
+) -> Result<Vec<GuardedVariant>> {
+    let budgets = AnalysisBudgets::standard("deobfuscate-safe-guarded-context");
+    let mut result = Vec::new();
+    for candidate in specialize_resolved_call_graph(original, views)? {
+        if !helpers.contains(&candidate.helper) {
+            continue;
+        }
+        let budget = budgets.operation(
+            AnalysisOperation::SafeDeobfuscation,
+            format!("guarded context {}", candidate.helper),
+        );
+        let outcome = deobfuscate_source(
+            &candidate.specialized,
+            format!("guarded context {}", candidate.helper),
+            SourceMode::Auto,
+            max_iterations,
+            true,
+            &budget,
+        )?;
+        // A specialization with no actual semantic simplification has no
+        // reason to add a runtime guard to the reconstructed program.
+        if !outcome
+            .report
+            .transforms
+            .iter()
+            .any(|(kind, count)| kind != "presentation_codegen" && *count > 0)
+        {
+            continue;
+        }
+        result.push(GuardedVariant {
+            function_span: candidate.function_span,
+            constants: candidate.constants,
+            original_wrapper: candidate.original,
+            specialized_wrapper: candidate.specialized,
+            optimized_wrapper: outcome.source,
+        });
+    }
+    Ok(result)
 }
 
 /// One shared writer for original-lexical, callsite-specific helper variants.
@@ -1964,6 +2062,62 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn source_tree_materializes_guarded_whole_program_from_real_lexical_edges() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("source");
+        let output = temp.path().join("output");
+        let original = temp.path().join("original.js");
+        fs::create_dir_all(&input)?;
+        let original_source = concat!(
+            "const helper=function(selector,value){",
+            "if(selector===3){return value+1;}return value-1;};",
+            "const api={};api.run=function(value){return helper(3,value);};",
+        );
+        fs::write(&original, original_source)?;
+        fs::write(
+            input.join("handler.js"),
+            "const recovered=function(value){return helper(3,value);};",
+        )?;
+        run_source_tree(SourceTreeArgs {
+            input,
+            output: output.clone(),
+            max_iterations: 12,
+            format_output: true,
+            context_source: Some(original),
+            context_full_iterations: Some(24),
+            context_guarded_helpers: vec!["helper".into()],
+            origin_source: None,
+            caller_view_entry: None,
+        })?;
+        let lexical = output.join("lexical-context");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(lexical.join("context.json"))?)?;
+        let guarded = &metadata["full_context"]["guarded_executable"];
+        assert_eq!(guarded["fast_paths"], 1, "{guarded}");
+        assert_eq!(guarded["targeted_functions"], 1, "{guarded}");
+        assert_eq!(guarded["candidate_variants"], 1, "{guarded}");
+        let ordinary = fs::read_to_string(lexical.join("whole-program/readable.js"))?;
+        let executable = fs::read_to_string(lexical.join("whole-program/readable-guarded.js"))?;
+        assert_ne!(ordinary, executable);
+        assert!(executable.contains("selector === (3)"), "{executable}");
+        assert!(
+            executable.contains("value - 1") || executable.contains("value-1"),
+            "{executable}"
+        );
+        assert!(executable.contains("api.run"), "{executable}");
+        assert_eq!(guarded["base_sha256"], sha256_hex(ordinary.as_bytes()));
+        assert_eq!(guarded["sha256"], sha256_hex(executable.as_bytes()));
+        assert_eq!(
+            fs::read_to_string(lexical.join("original.js"))?,
+            original_source
+        );
+        assert!(fs::read_to_string(output.join("handler.js"))?.contains("helper(3"));
+        assert!(fs::read_to_string(lexical.join("whole-program/README.md"))?
+            .contains("readable-guarded.js"));
+        Ok(())
+    }
+
+    #[test]
     fn standalone_caller_views_trace_immutable_aliases_without_source_tree() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let input = temp.path().join("source.js");
@@ -2162,6 +2316,7 @@ mod tests {
             format_output: false,
             context_source: None,
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2205,6 +2360,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2257,6 +2413,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2301,6 +2458,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2349,6 +2507,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2401,6 +2560,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: Some(48),
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2501,6 +2661,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2570,6 +2731,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2629,6 +2791,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2675,6 +2838,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2747,6 +2911,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2794,6 +2959,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2842,6 +3008,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2913,6 +3080,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -2985,6 +3153,7 @@ mod tests {
             format_output: true,
             context_source: Some(original.clone()),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: Some(original),
             caller_view_entry: None,
         })?;
@@ -3025,6 +3194,7 @@ mod tests {
             format_output: true,
             context_source: Some(source),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: Some("enter".into()),
         })?;
@@ -3064,6 +3234,7 @@ mod tests {
             format_output: true,
             context_source: Some(original.clone()),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: Some("enter".into()),
         })?;
@@ -3121,6 +3292,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: Some("enter".into()),
         })?;
@@ -3170,6 +3342,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: Some("aoF_".into()),
         })?;
@@ -3222,6 +3395,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: Some("enter".into()),
         })?;
@@ -3266,6 +3440,7 @@ mod tests {
             format_output: false,
             context_source: None,
             context_full_iterations: None,
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         });
@@ -3297,6 +3472,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: Some(48),
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;
@@ -3379,6 +3555,7 @@ mod tests {
             format_output: true,
             context_source: Some(original),
             context_full_iterations: Some(48),
+            context_guarded_helpers: vec![],
             origin_source: None,
             caller_view_entry: None,
         })?;

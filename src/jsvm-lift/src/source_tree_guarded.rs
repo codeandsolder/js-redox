@@ -72,7 +72,13 @@ impl<'a> Visit<'a> for Functions<'_> {
                         Some(id.name.to_string())
                     })
                     .collect::<Option<Vec<_>>>();
-                if let Some(parameters) = parameters {
+                // Duplicate sloppy-mode formals can refer to the same
+                // runtime binding at different argument positions. Guarding
+                // by textual formal name would conflate those positions.
+                if let Some(parameters) = parameters.filter(|names| {
+                    let mut seen = BTreeSet::new();
+                    names.iter().all(|name| seen.insert(name.as_str()))
+                }) {
                     let insertion = body
                         .directives
                         .last()
@@ -393,6 +399,29 @@ mod tests {
             "function(x){function injected(){}return x+1;}",
         ] {
             let candidate = variant(&source, raw, optimized, &[(0, "2")])?;
+            ensure!(install_guarded_specializations(&source, &[candidate])?.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_formal_names_never_install_a_guard() -> Result<()> {
+        let raw = "function(x,x){return x===4?1:2;}";
+        let source = format!("const f={raw};");
+        let original_wrapper = format!("const __redox_lexical_helper = ({raw});");
+        let constants = vec![(1, "4".to_owned())];
+        if let Some(specialized_wrapper) = specialize_function(&original_wrapper, &constants)? {
+            let start = source
+                .find(raw)
+                .ok_or_else(|| anyhow::anyhow!("missing function"))?;
+            let candidate = GuardedVariant {
+                function_span: [u32::try_from(start)?, u32::try_from(start + raw.len())?],
+                constants,
+                original_wrapper,
+                specialized_wrapper,
+                optimized_wrapper: "const __redox_lexical_helper = (function(x,x){return 1;});"
+                    .to_owned(),
+            };
             ensure!(install_guarded_specializations(&source, &[candidate])?.is_none());
         }
         Ok(())
