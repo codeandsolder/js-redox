@@ -2034,13 +2034,36 @@ fn splice_unique_successor(route: &mut Route, target: u64, successor: &Route) ->
     }
 }
 
+/// A conditional predecessor may enter a source case only along one of its
+/// modeled numeric-state arms. Splice *only* that arm, keeping the original
+/// conditional tests and other destinations. Unlike the all-arm splice above,
+/// the caller must emit a matching state guard around the successor source.
+fn splice_conditional_successor(route: &mut Route, target: u64, successor: &Route) -> bool {
+    match &mut route.next {
+        Next::State(state) if *state == target => {
+            route.effects.extend(successor.effects.iter().cloned());
+            route.next = successor.next.clone();
+            true
+        }
+        Next::Choose { yes, no, .. } => {
+            let yes_changed = splice_conditional_successor(yes, target, successor);
+            let no_changed = splice_conditional_successor(no, target, successor);
+            yes_changed || no_changed
+        }
+        Next::State(_) => false,
+    }
+}
+
 /// Merge a state with its sole entering predecessor, without cloning its body.
 ///
-/// All successful predecessor CFG arms must reach the same state, which
-/// must have exactly one distinct incoming source case and no
-/// independent initializer/catch entry. The original target statement runs
-/// inside the same try block after the assignment, so a thrown exception
-/// observes the same state as in the original next iteration.
+/// The target must have exactly one distinct incoming source case and no
+/// independent initializer/catch entry. If every predecessor arm reaches
+/// it, merge directly; otherwise guard the inlined successor by its
+/// original pure state test, preserving alternative destinations.
+/// Terminal returns and immediate backedges remain with their dedicated
+/// CFG passes. The original target statement runs inside the same try block
+/// after the assignment, so a thrown exception observes the same state as
+/// in the original next iteration.
 ///
 /// A new wrapper block contains two *sibling* source statements. Neither the
 /// predecessor nor the wrapper creates lexical bindings, and the target's
@@ -2061,6 +2084,7 @@ fn single_entry_exception_regions(
     source: &str,
 ) -> Option<(BTreeMap<u64, String>, BTreeSet<u64>)> {
     let mut statements = BTreeMap::new();
+    let mut source_tests = BTreeMap::new();
     let mut cursor = dispatcher;
     loop {
         let Statement::IfStatement(branch) = cursor else {
@@ -2071,6 +2095,7 @@ fn single_entry_exception_regions(
         }
         let label = state_test(&branch.test, state)?;
         statements.insert(label, &branch.consequent);
+        source_tests.insert(label, fragment(source, branch.test.span()));
         match branch.alternate.as_ref() {
             Some(other @ Statement::IfStatement(_)) => cursor = other,
             None => break,
@@ -2099,52 +2124,85 @@ fn single_entry_exception_regions(
         let Some(&body) = statements.get(&predecessor) else {
             continue;
         };
-        let Some(target) = cases
-            .get(&predecessor)?
-            .as_ref()
-            .and_then(single_numeric_destination)
-        else {
+        let Some(route) = cases.get(&predecessor)?.as_ref() else {
             continue;
         };
-        if target == predecessor
-            || !entry.reachable.contains(&target)
-            || entry.roots.contains(&target)
-            || occupied.contains(&target)
-            || entry.excluded.contains(&target)
-            || edits.contains_key(&predecessor)
-        {
-            continue;
+        let mut targets = Vec::new();
+        route.targets(&mut targets);
+        let targets = targets.into_iter().collect::<BTreeSet<_>>();
+        let unconditional = targets.len() == 1;
+        for target in targets {
+            if target == predecessor
+                || !entry.reachable.contains(&target)
+                || entry.roots.contains(&target)
+                || occupied.contains(&target)
+                || entry.excluded.contains(&target)
+                || edits.contains_key(&predecessor)
+            {
+                continue;
+            }
+            if incoming
+                .get(&target)
+                .is_none_or(|sources| sources.len() != 1 || !sources.contains(&predecessor))
+            {
+                continue;
+            }
+            let Some(&successor) = statements.get(&target) else {
+                continue;
+            };
+            // Both cases have modeled numeric transitions and exact lexical
+            // source bodies; the successor must not have an independent
+            // initializer/catch entry or competing source predecessor.
+            let Some(successor_route) = cases.get(&target)?.as_ref().cloned() else {
+                continue;
+            };
+            if !unconditional {
+                // Keep terminal-return factoring and explicit SCC backedges
+                // in their own exception-aware CFG passes. A direct return
+                // must not be relocated into a narrower predecessor arm,
+                // and a backedge to the predecessor requires SCC analysis.
+                if has_terminal_completion(successor) {
+                    continue;
+                }
+                let mut successor_targets = Vec::new();
+                successor_route.targets(&mut successor_targets);
+                if successor_targets.contains(&predecessor) {
+                    continue;
+                }
+            }
+            let first = fragment(source, body.span());
+            let second = match edits.get(&target) {
+                Some(replacements) => print_terminal_edits(successor, source, replacements)?,
+                None => fragment(source, successor.span()).to_owned(),
+            };
+            let predecessor_route = cases.get_mut(&predecessor)?.as_mut()?;
+            let changed = if unconditional {
+                splice_unique_successor(predecessor_route, target, &successor_route)
+            } else {
+                splice_conditional_successor(predecessor_route, target, &successor_route)
+            };
+            if !changed {
+                return None;
+            }
+            let region = if unconditional {
+                format!("{{ {first};\n{second} }}")
+            } else {
+                // The original while predicate and the numeric dispatch
+                // tests are pure. Execute only the selected successor within
+                // the same original try; thrown exceptions still see the
+                // exact state and recovery selector left by the predecessor.
+                // Reuse the exact original state comparison, including
+                // strict versus coercing equality, after proving its test
+                // side-effect-free via the source dispatcher scan.
+                let test = source_tests.get(&target)?;
+                format!("{{ {first};\nif ({test}) {{ {second} }} }}")
+            };
+            combined.insert(predecessor, region);
+            absorbed.insert(target);
+            occupied.insert(predecessor);
+            occupied.insert(target);
+            break;
         }
-        if incoming
-            .get(&target)
-            .is_none_or(|sources| sources.len() != 1 || !sources.contains(&predecessor))
-        {
-            continue;
-        }
-        let Some(&successor) = statements.get(&target) else {
-            continue;
-        };
-        // Both cases must have modeled routes. The original source bodies
-        // are preserved in their existing lexical blocks without cloning.
-        let Some(successor_route) = cases.get(&target)?.as_ref().cloned() else {
-            continue;
-        };
-        let first = fragment(source, body.span());
-        let second = match edits.get(&target) {
-            Some(replacements) => print_terminal_edits(successor, source, replacements)?,
-            None => fragment(source, successor.span()).to_owned(),
-        };
-        if !splice_unique_successor(
-            cases.get_mut(&predecessor)?.as_mut()?,
-            target,
-            &successor_route,
-        ) {
-            return None;
-        }
-        combined.insert(predecessor, format!("{{ {first};\n{second} }}"));
-        absorbed.insert(target);
-        occupied.insert(predecessor);
-        occupied.insert(target);
     }
     Some((combined, absorbed))
 }

@@ -3008,6 +3008,116 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_merges_unique_conditional_arm_with_throwing_successor() {
+        let source = r#"
+            function f(flag, boom, log) {
+                let state=1, recovery=0;
+                while(true) try {
+                    if(state==1) state=flag?2:4;
+                    else if(state==2) {
+                        log.push("selected");
+                        recovery=1;
+                        if(boom)throw Error("caught");
+                        state=3;
+                    } else if(state==3) return log;
+                    else if(state==4) return log;
+                } catch(error) {
+                    log.push(error.message);
+                    if(recovery==1) state=4;
+                    else throw error;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+        assert!(!compact.contains("elseif(state==2)"), "{}", result.source);
+        assert!(compact.contains("if(state==2)"), "{}", result.source);
+        assert_eq!(
+            compact.matches("log.push(\"selected\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        assert!(compact.contains("catch(error)"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_does_not_clone_multi_entry_conditional_successor() {
+        let source = r#"
+            function f(mode, log) {
+                let state=1;
+                while(true) try {
+                    if(state==1)state=mode?2:3;
+                    else if(state==2){log.push("join");state=4;}
+                    else if(state==3)state=2;
+                    else if(state==4)return log;
+                } catch(error) {throw error;}
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            compact.matches("log.push(\"join\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+        // State 2 has two independent source predecessors, hence must not
+        // be embedded under either one as an additional copy.
+        // Multiple incoming source paths can be factored together through
+        // a shared join, but must never duplicate that join's effects.
+    }
+
+    #[test]
+    fn exception_dispatcher_does_not_absorb_conditional_catch_root() {
+        let source = r#"
+            function f(flag, log) {
+                let state=1;
+                while(true) try {
+                    if(state==1)state=flag?2:3;
+                    else if(state==2){log.push("selected");state=4;}
+                    else if(state==3)state=4;
+                    else if(state==4)return log;
+                } catch(error) {
+                    log.push(error.message);
+                    state=2;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        let compact: String = result
+            .source
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(compact.contains("elseif(state==2)"), "{}", result.source);
+        assert_eq!(
+            compact.matches("log.push(\"selected\")").count(),
+            1,
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
     fn exception_dispatcher_preserves_multiple_incoming_region() {
         let source = r#"
             function f(flag) {

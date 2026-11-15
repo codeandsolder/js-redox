@@ -724,6 +724,14 @@ normal state case; catch handlers and the one-iteration boundary are
 untouched. Effectful return expressions, duplicate case labels and
 unmodelled trailing statements block this extension.
 
+Within that same exception-preserving CFG, an independently proven
+single-entry successor on just one arm of a conditional state assignment can
+be inlined behind an exact numeric-state guard. The other arms remain intact,
+the absorbed successor's source is emitted only once, and any catch or
+initializer entry to that successor prevents the merge. This applies to
+general state graphs, including loops, without moving statements outside the
+original try/catch or inventing additional state paths.
+
 Numeric-state control-flow recovery also structures single-entry reducible
 cycles with early exits from the middle of their bodies. The original
 state-transition graph determines a common exit; every emitted path must
