@@ -17,6 +17,18 @@
       "automerge": false
     },
     {
+      "description": "Update both crates pinned to the same rolldown-redox fork commit together",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchDepNames": [
+        "rolldown_redox",
+        "string_wizard"
+      ],
+      "groupName": "Rolldown redox fork crates",
+      "automerge": false
+    },
+    {
       "description": "Group wasmparser and wasmprinter lockstep updates",
       "matchManagers": [
         "cargo"
@@ -36,29 +48,12 @@
       "enabled": false
     },
     {
-      "description": "Keep the Rust compiler baseline synchronized and review upgrades",
+      "description": "Review Rust compiler upgrades through Renovate's built-in toolchain manager",
       "matchManagers": [
-        "custom.regex"
-      ],
-      "matchDepNames": [
-        "Rust toolchain"
+        "rust-toolchain"
       ],
       "groupName": "Rust toolchain",
       "automerge": false
-    }
-  ],
-  "customManagers": [
-    {
-      "customType": "regex",
-      "managerFilePatterns": [
-        "/(^|\\/)(Cargo\\.toml|rust-toolchain\\.toml)$/"
-      ],
-      "matchStrings": [
-        "(?:rust-version|channel)\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
-      ],
-      "depNameTemplate": "Rust toolchain",
-      "packageNameTemplate": "rust-lang/rust",
-      "datasourceTemplate": "github-releases"
     }
   ]
 }
