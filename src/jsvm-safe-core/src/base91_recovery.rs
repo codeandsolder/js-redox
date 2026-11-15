@@ -388,11 +388,12 @@ fn rotator_matches(source: &str, function: &FunctionInfo) -> bool {
 
 fn parse_number(text: &str) -> Option<i64> {
     let text = text.trim();
-    if let Some(value) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        i64::from_str_radix(value, 16).ok()
-    } else {
-        text.parse().ok()
-    }
+    text.strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .map_or_else(
+            || text.parse().ok(),
+            |value| i64::from_str_radix(value, 16).ok(),
+        )
 }
 
 fn value_text(value: &Value) -> Option<String> {
@@ -442,9 +443,10 @@ fn normalize_affine_signs(text: &str) -> String {
         || text.to_string(),
         |re| re.replace_all(text, "-$1").into_owned(),
     );
-    minus_minus
-        .as_ref()
-        .map_or(out.clone(), |re| re.replace_all(&out, "+$1").into_owned())
+    minus_minus.as_ref().map_or_else(
+        || out.clone(),
+        |re| re.replace_all(&out, "+$1").into_owned(),
+    )
 }
 
 fn parse_affine_ref(text: &str) -> Option<(String, String, i64)> {
@@ -731,15 +733,13 @@ fn discover_decoders(
                 if declaration_start >= provider.assignment_start {
                     continue;
                 }
-            } else {
-                if !scope_is_descendant_of(
-                    context.scoping,
-                    decoder.owner_scope,
-                    provider.owner_scope,
-                ) || scope_start <= provider.assignment_end
-                {
-                    continue;
-                }
+            } else if !scope_is_descendant_of(
+                context.scoping,
+                decoder.owner_scope,
+                provider.owner_scope,
+            ) || scope_start <= provider.assignment_end
+            {
+                continue;
             }
             let body = function_body(context.source, decoder);
             if body.len() > 4096 || !body.contains("typeof") || !body.contains("return") {

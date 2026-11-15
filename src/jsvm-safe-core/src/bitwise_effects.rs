@@ -101,7 +101,7 @@ mod tests {
         assert!(transformed.contains("128 + "), "{transformed}");
         assert!(transformed.contains("U&-129"), "{transformed}");
         assert!(transformed.contains(" - ((U) ^ (128))"), "{transformed}");
-        assert_eq!(transformed.matches("U").count(), 3, "{transformed}");
+        assert_eq!(transformed.matches('U').count(), 3, "{transformed}");
         Ok(())
     }
 

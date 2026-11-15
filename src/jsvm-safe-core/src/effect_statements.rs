@@ -270,6 +270,41 @@ pub fn lower_conditional_assignment(
     source: &str,
     scoping: &Scoping,
 ) -> Option<String> {
+    fn clean_boundaries(expr: &Expression<'_>, source: &str, depth: usize) -> Option<()> {
+        if depth > 96 {
+            return None;
+        }
+        let Some(conditional) = conditional_rhs(expr) else {
+            return Some(());
+        };
+        let comments = |start: usize, end: usize| -> Option<bool> {
+            let gap = source.get(start..end)?;
+            Some(gap.contains("/*") || gap.contains("//"))
+        };
+        if comments(expr.span().start as usize, conditional.span.start as usize)?
+            || comments(conditional.span.end as usize, expr.span().end as usize)?
+            || comments(
+                conditional.span.start as usize,
+                conditional.test.span().start as usize,
+            )?
+            || comments(
+                conditional.test.span().end as usize,
+                conditional.consequent.span().start as usize,
+            )?
+            || comments(
+                conditional.consequent.span().end as usize,
+                conditional.alternate.span().start as usize,
+            )?
+            || comments(
+                conditional.alternate.span().end as usize,
+                conditional.span.end as usize,
+            )?
+        {
+            return None;
+        }
+        clean_boundaries(&conditional.consequent, source, depth + 1)?;
+        clean_boundaries(&conditional.alternate, source, depth + 1)
+    }
     let assignment = assignment_rhs(&statement.expression)?;
     if assignment.operator.as_str() != "=" {
         return None;
@@ -305,41 +340,6 @@ pub fn lower_conditional_assignment(
     )? || comments(assignment.span.end as usize, statement.span.end as usize)?
     {
         return None;
-    }
-    fn clean_boundaries(expr: &Expression<'_>, source: &str, depth: usize) -> Option<()> {
-        if depth > 96 {
-            return None;
-        }
-        let Some(conditional) = conditional_rhs(expr) else {
-            return Some(());
-        };
-        let comments = |start: usize, end: usize| -> Option<bool> {
-            let gap = source.get(start..end)?;
-            Some(gap.contains("/*") || gap.contains("//"))
-        };
-        if comments(expr.span().start as usize, conditional.span.start as usize)?
-            || comments(conditional.span.end as usize, expr.span().end as usize)?
-            || comments(
-                conditional.span.start as usize,
-                conditional.test.span().start as usize,
-            )?
-            || comments(
-                conditional.test.span().end as usize,
-                conditional.consequent.span().start as usize,
-            )?
-            || comments(
-                conditional.consequent.span().end as usize,
-                conditional.alternate.span().start as usize,
-            )?
-            || comments(
-                conditional.alternate.span().end as usize,
-                conditional.span.end as usize,
-            )?
-        {
-            return None;
-        }
-        clean_boundaries(&conditional.consequent, source, depth + 1)?;
-        clean_boundaries(&conditional.alternate, source, depth + 1)
     }
     clean_boundaries(&assignment.right, source, 0)?;
     let target = fragment(source, assignment.left.span());

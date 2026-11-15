@@ -110,7 +110,7 @@ fn literal_string_concat_text(binary: &oxc_ast::ast::BinaryExpression<'_>) -> Op
     if binary.operator.as_str() != "+" {
         return None;
     }
-    let value = eval_binary("+", eval(&binary.left)?, eval(&binary.right)?)?;
+    let value = eval_binary("+", &eval(&binary.left)?, &eval(&binary.right)?)?;
     match value {
         Value::String(_) => value.render(),
         _ => None,

@@ -65,7 +65,7 @@ impl PureExpr {
                 Some(value)
             }
             Self::Unary { operator, argument } => {
-                eval_unary_value(operator, argument.eval(params)?)
+                eval_unary_value(operator, &argument.eval(params)?)
             }
             Self::Binary {
                 operator,
@@ -74,7 +74,7 @@ impl PureExpr {
             } => {
                 let left = left.eval(params)?;
                 let right = right.eval(params)?;
-                eval_binary(operator, left, right)
+                eval_binary(operator, &left, &right)
             }
             Self::Logical {
                 operator,

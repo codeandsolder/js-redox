@@ -623,6 +623,14 @@ impl<'a> Visit<'a> for NumericStateAliasRisks {
     }
 }
 
+/// Ephemeral lexical-function context; restored after every visitor descent.
+#[derive(Clone, Copy, Default)]
+struct FunctionContext {
+    scope: Option<ScopeId>,
+    numeric_safe: bool,
+    depth: usize,
+}
+
 struct Collector<'s, 'c> {
     source: &'s str,
     scoping: &'c Scoping,
@@ -644,16 +652,37 @@ struct Collector<'s, 'c> {
     protected_spans: &'c [(usize, usize)],
     may_remove_dead_numeric_writes: bool,
     unsafe_numeric_functions: &'c HashSet<(u32, u32)>,
-    current_function_scope: Option<ScopeId>,
-    current_function_numeric_safe: bool,
+    function_context: FunctionContext,
     allow_effect_statements: bool,
-    function_depth: usize,
     replacements: Vec<Replacement>,
 }
 
 impl Collector<'_, '_> {
+    /// Apply the same lexical-risk envelope to ordinary and arrow functions.
+    fn within_function(
+        &mut self,
+        span: Span,
+        scope: Option<ScopeId>,
+        visit: impl FnOnce(&mut Self),
+    ) {
+        let previous_context = self.function_context;
+        let enclosing_safe = self.may_remove_dead_numeric_writes;
+        let own_safe = !self
+            .unsafe_numeric_functions
+            .contains(&(span.start, span.end));
+        self.may_remove_dead_numeric_writes = enclosing_safe && own_safe;
+        self.function_context = FunctionContext {
+            scope,
+            numeric_safe: own_safe && scope.is_some(),
+            depth: previous_context.depth + 1,
+        };
+        visit(self);
+        self.function_context = previous_context;
+        self.may_remove_dead_numeric_writes = enclosing_safe;
+    }
+
     fn lower_if_test_statements(&mut self, statements: &[Statement<'_>]) {
-        if !self.allow_effect_statements || self.function_depth == 0 {
+        if !self.allow_effect_statements || self.function_context.depth == 0 {
             return;
         }
         for statement in statements {
@@ -678,7 +707,7 @@ impl Collector<'_, '_> {
     }
 
     fn lower_sibling_expression_statements(&mut self, statements: &[Statement<'_>]) {
-        if !self.allow_effect_statements || self.function_depth == 0 {
+        if !self.allow_effect_statements || self.function_context.depth == 0 {
             return;
         }
         for statement in statements {
@@ -699,7 +728,7 @@ impl Collector<'_, '_> {
     }
 
     fn fold_sibling_state_guards(&mut self, statements: &[Statement<'_>]) {
-        if !self.allow_effect_statements || self.function_depth == 0 {
+        if !self.allow_effect_statements || self.function_context.depth == 0 {
             return;
         }
         for pair in statements.windows(2) {
@@ -747,8 +776,8 @@ impl Collector<'_, '_> {
     /// when the inherited general dead-write permission is unavailable.
     fn safe_numeric_state_binding(&self, symbol: SymbolId) -> bool {
         self.may_remove_dead_numeric_writes
-            || (self.current_function_numeric_safe
-                && self.current_function_scope.is_some_and(|function_scope| {
+            || (self.function_context.numeric_safe
+                && self.function_context.scope.is_some_and(|function_scope| {
                     self.scoping
                         .scope_ancestors(self.scoping.symbol_scope_id(symbol))
                         .any(|scope| scope == function_scope)
@@ -760,7 +789,7 @@ impl Collector<'_, '_> {
         statements: &[Statement<'_>],
         inherited: &HashMap<SymbolId, (u64, Span)>,
     ) {
-        if !self.may_remove_dead_numeric_writes && !self.current_function_numeric_safe {
+        if !self.may_remove_dead_numeric_writes && !self.function_context.numeric_safe {
             return;
         }
         let mut reaching = inherited.clone();
@@ -1208,39 +1237,15 @@ impl Collector<'_, '_> {
 
 impl<'a> Visit<'a> for Collector<'_, '_> {
     fn visit_function(&mut self, it: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
-        let enclosing_safe = self.may_remove_dead_numeric_writes;
-        let previous_scope = self.current_function_scope;
-        let previous_local_safe = self.current_function_numeric_safe;
-        let own_safe = !self
-            .unsafe_numeric_functions
-            .contains(&(it.span.start, it.span.end));
-        self.may_remove_dead_numeric_writes = enclosing_safe && own_safe;
-        self.current_function_scope = it.scope_id.get();
-        self.current_function_numeric_safe = own_safe && self.current_function_scope.is_some();
-        self.function_depth += 1;
-        walk::walk_function(self, it, flags);
-        self.function_depth -= 1;
-        self.current_function_scope = previous_scope;
-        self.current_function_numeric_safe = previous_local_safe;
-        self.may_remove_dead_numeric_writes = enclosing_safe;
+        self.within_function(it.span, it.scope_id.get(), |visitor| {
+            walk::walk_function(visitor, it, flags);
+        });
     }
 
     fn visit_arrow_function_expression(&mut self, it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
-        let enclosing_safe = self.may_remove_dead_numeric_writes;
-        let previous_scope = self.current_function_scope;
-        let previous_local_safe = self.current_function_numeric_safe;
-        let own_safe = !self
-            .unsafe_numeric_functions
-            .contains(&(it.span.start, it.span.end));
-        self.may_remove_dead_numeric_writes = enclosing_safe && own_safe;
-        self.current_function_scope = it.scope_id.get();
-        self.current_function_numeric_safe = own_safe && self.current_function_scope.is_some();
-        self.function_depth += 1;
-        walk::walk_arrow_function_expression(self, it);
-        self.function_depth -= 1;
-        self.current_function_scope = previous_scope;
-        self.current_function_numeric_safe = previous_local_safe;
-        self.may_remove_dead_numeric_writes = enclosing_safe;
+        self.within_function(it.span, it.scope_id.get(), |visitor| {
+            walk::walk_arrow_function_expression(visitor, it);
+        });
     }
 
     fn visit_expression(&mut self, it: &Expression<'a>) {
@@ -1307,7 +1312,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             }
         }
         if let (Some(left), Some(right)) = (eval(&it.left), eval(&it.right)) {
-            if let Some(value) = eval_binary(it.operator.as_str(), left, right) {
+            if let Some(value) = eval_binary(it.operator.as_str(), &left, &right) {
                 if let Some(text) = value.render() {
                     self.push(it.span, text, "constant_fold");
                 }
@@ -1451,7 +1456,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         self.reconstruct_while_pairs(&it.statements);
         self.reconstruct_reaching_while(&it.statements);
         if self.allow_effect_statements
-            && self.function_depth > 0
+            && self.function_context.depth > 0
             && self.may_remove_dead_numeric_writes
         {
             for (span, expression) in
@@ -1491,7 +1496,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         self.reconstruct_while_pairs(&it.body);
         self.reconstruct_reaching_while(&it.body);
         if self.allow_effect_statements
-            && self.function_depth > 0
+            && self.function_context.depth > 0
             && self.may_remove_dead_numeric_writes
         {
             // Top-level var declarations may alias global object properties.
@@ -1542,7 +1547,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         // expression statement. Inside a function, a normal completion is
         // discarded; the statement may be safely normalized to if/blocks.
         if self.allow_effect_statements
-            && self.function_depth > 0
+            && self.function_context.depth > 0
             && effectful_constant::fold(&it.expression, self.source).is_none()
         {
             // A known-result effectful expression can eliminate enormous
@@ -1659,7 +1664,7 @@ fn eval_static_argument(arg: &Argument<'_>) -> Option<Value> {
         Argument::ParenthesizedExpression(v) => eval(&v.expression),
         Argument::UnaryExpression(v) => eval_unary(v),
         Argument::BinaryExpression(v) => {
-            eval_binary(v.operator.as_str(), eval(&v.left)?, eval(&v.right)?)
+            eval_binary(v.operator.as_str(), &eval(&v.left)?, &eval(&v.right)?)
         }
         Argument::LogicalExpression(v) => eval_logical(v),
         Argument::ConditionalExpression(v) => {
@@ -1689,13 +1694,10 @@ fn decoder_argument_integer(arg: &Argument<'_>) -> Option<i64> {
         return None;
     };
     let text = literal.value.as_str()?.trim();
-    let (negative, text) = if let Some(rest) = text.strip_prefix('-') {
-        (true, rest)
-    } else if let Some(rest) = text.strip_prefix('+') {
-        (false, rest)
-    } else {
-        (false, text)
-    };
+    let (negative, text) = text.strip_prefix('-').map_or_else(
+        || (false, text.strip_prefix('+').unwrap_or(text)),
+        |rest| (true, rest),
+    );
     let value = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         i64::from_str_radix(hex, 16).ok()?
     } else {
@@ -2006,10 +2008,8 @@ fn transform_once(
         // script syntax, including string contents, is not such a hazard.
         may_remove_dead_numeric_writes: !numeric_state_risks.unsafe_top_level,
         unsafe_numeric_functions: &numeric_state_risks.unsafe_functions,
-        current_function_scope: None,
-        current_function_numeric_safe: false,
+        function_context: FunctionContext::default(),
         allow_effect_statements: options.allow_effect_statements,
-        function_depth: 0,
         replacements: initial_replacements,
     };
     collector.visit_program(&program);
@@ -7395,6 +7395,27 @@ mod tests {
 
     #[test]
     fn proven_constant_environment_respects_identity_and_declaration_order() {
+        struct Probe<'c> {
+            scoping: &'c Scoping,
+            constants: &'c ProvenConstantEnvironment,
+            values: Vec<Option<String>>,
+        }
+        impl<'a> Visit<'a> for Probe<'_> {
+            fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+                if matches!(&call.callee, Expression::Identifier(id) if id.name == "sink") {
+                    self.values.push(
+                        call.arguments
+                            .first()
+                            .and_then(|argument| argument.as_expression())
+                            .and_then(|expression| {
+                                self.constants.exact_string(expression, self.scoping)
+                            }),
+                    );
+                }
+                walk::walk_call_expression(self, call);
+            }
+        }
+
         let source = r#"
             const scheme = "https://";
             const host = "api.example.test";
@@ -7418,27 +7439,6 @@ mod tests {
         assert!(semantic.diagnostics.is_empty());
         let scoping = semantic.semantic.scoping();
         let constants = ProvenConstantEnvironment::collect(&parsed.program, scoping);
-
-        struct Probe<'c> {
-            scoping: &'c Scoping,
-            constants: &'c ProvenConstantEnvironment,
-            values: Vec<Option<String>>,
-        }
-        impl<'a> Visit<'a> for Probe<'_> {
-            fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-                if matches!(&call.callee, Expression::Identifier(id) if id.name == "sink") {
-                    self.values.push(
-                        call.arguments
-                            .first()
-                            .and_then(|argument| argument.as_expression())
-                            .and_then(|expression| {
-                                self.constants.exact_string(expression, self.scoping)
-                            }),
-                    );
-                }
-                walk::walk_call_expression(self, call);
-            }
-        }
 
         let mut probe = Probe {
             scoping,
@@ -7700,8 +7700,7 @@ sink(alias(0x10), alias(0x11));
             .unwrap_or_else(|| unreachable!());
         let rotation_end = original[rotation_start..]
             .find("\n\nconsole.log")
-            .map(|offset| rotation_start + offset)
-            .unwrap_or_else(|| unreachable!());
+            .map_or_else(|| unreachable!(), |offset| rotation_start + offset);
         let mut source = original.to_string();
         source.replace_range(
             rotation_start..rotation_end,
@@ -8172,24 +8171,6 @@ console.log(d(0x10,"k"),d(0x11,"k"));
 
     #[test]
     fn proven_constants_fail_closed_on_lone_surrogate_strings() {
-        let source = r#"
-            const normal = "hello";
-            const lone = "\uD800";
-            const cooked = `world`;
-            sink(normal);
-            sink(lone);
-            sink(cooked);
-        "#;
-        let allocator = Allocator::default();
-        let parsed = parse_program(&allocator, source, SourceType::unambiguous());
-        assert!(parsed.is_clean());
-        let semantic = SemanticBuilder::new()
-            .with_check_syntax_error(true)
-            .build(&parsed.program);
-        assert!(semantic.diagnostics.is_empty());
-        let scoping = semantic.semantic.scoping();
-        let constants = ProvenConstantEnvironment::collect(&parsed.program, scoping);
-
         struct Probe<'c> {
             scoping: &'c Scoping,
             constants: &'c ProvenConstantEnvironment,
@@ -8210,6 +8191,24 @@ console.log(d(0x10,"k"),d(0x11,"k"));
                 walk::walk_call_expression(self, call);
             }
         }
+
+        let source = r#"
+            const normal = "hello";
+            const lone = "\uD800";
+            const cooked = `world`;
+            sink(normal);
+            sink(lone);
+            sink(cooked);
+        "#;
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::unambiguous());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new()
+            .with_check_syntax_error(true)
+            .build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let scoping = semantic.semantic.scoping();
+        let constants = ProvenConstantEnvironment::collect(&parsed.program, scoping);
 
         let mut probe = Probe {
             scoping,

@@ -175,14 +175,14 @@ pub fn fold_adjacent_state_guard(
     let yes = fragment(source, branch.consequent.span());
     let no = fragment(source, alternate.span());
     let effect = fragment(source, guard.consequent.span());
-    let text = if match_yes {
+    let rewritten = if match_yes {
         format!("if ({test}) {{\n{yes}\n{effect}\n}} else {{\n{no}\n}}")
     } else {
         format!("if ({test}) {{\n{yes}\n}} else {{\n{no}\n{effect}\n}}")
     };
     Some((
         Span::new(before.span().start, after.span().end),
-        text,
+        rewritten,
         yes_symbol,
     ))
 }

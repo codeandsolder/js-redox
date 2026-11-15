@@ -34,6 +34,16 @@ impl IterationHistory {
         self.observe_fingerprint(iteration, source, fingerprint)
     }
 
+    fn fingerprint_hex(fingerprint: &[u8; 32]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(64);
+        for byte in fingerprint {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
+
     fn observe_fingerprint(
         &mut self,
         iteration: usize,
@@ -46,10 +56,7 @@ impl IterationHistory {
                 first_seen_iteration: *first,
                 repeated_at_iteration: iteration,
                 period: iteration.saturating_sub(*first),
-                source_sha256: fingerprint
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect(),
+                source_sha256: Self::fingerprint_hex(&fingerprint),
             });
         }
         candidates.push((iteration, source.to_owned()));

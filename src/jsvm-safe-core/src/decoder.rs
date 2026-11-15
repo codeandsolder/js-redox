@@ -275,12 +275,11 @@ impl<'a> Visit<'a> for FixedDecoderCallProbe<'_> {
                 let property = member.property.name.as_str();
                 if matches!(property, "replace" | "indexOf" | "charAt") {
                     true
-                } else if property == "fromCharCode" {
-                    matches!(&member.object, Expression::Identifier(object)
+                } else {
+                    property == "fromCharCode"
+                        && matches!(&member.object, Expression::Identifier(object)
                         if object.name.as_str() == "String"
                             && symbol_of(self.scoping, &member.object).is_none())
-                } else {
-                    false
                 }
             }
             _ => false,
@@ -886,28 +885,6 @@ fn fixed_decoder_iife_wrapper_proven(
     scoping: &Scoping,
     aliases: &HashMap<SymbolId, u32>,
 ) -> bool {
-    let Some(body) = function.body.as_ref() else {
-        return false;
-    };
-    let Some(nested) = fixed_decoder_iife_function(body) else {
-        return false;
-    };
-    if !fixed_decoder_iife_calls_proven(nested, scoping, aliases) {
-        return false;
-    }
-    let Some(Statement::ReturnStatement(statement)) = body.statements.last() else {
-        return false;
-    };
-    let Some(Expression::ConditionalExpression(conditional)) = statement.argument.as_ref() else {
-        return false;
-    };
-    let Expression::BinaryExpression(test) = unparenthesized(&conditional.test) else {
-        return false;
-    };
-    if !matches!(test.operator.as_str(), "==" | "===") {
-        return false;
-    }
-
     fn string_literal_via_aliases(
         expression: &Expression<'_>,
         scoping: &Scoping,
@@ -995,6 +972,28 @@ fn fixed_decoder_iife_wrapper_proven(
             return None;
         };
         Some((table.name.as_str(), index.name.as_str()))
+    }
+
+    let Some(body) = function.body.as_ref() else {
+        return false;
+    };
+    let Some(nested) = fixed_decoder_iife_function(body) else {
+        return false;
+    };
+    if !fixed_decoder_iife_calls_proven(nested, scoping, aliases) {
+        return false;
+    }
+    let Some(Statement::ReturnStatement(statement)) = body.statements.last() else {
+        return false;
+    };
+    let Some(Expression::ConditionalExpression(conditional)) = statement.argument.as_ref() else {
+        return false;
+    };
+    let Expression::BinaryExpression(test) = unparenthesized(&conditional.test) else {
+        return false;
+    };
+    if !matches!(test.operator.as_str(), "==" | "===") {
+        return false;
     }
 
     let guard = if let Some(parts) = typeof_table_assignment(&test.left) {
@@ -1187,19 +1186,6 @@ fn indexed_table_symbols_for_function(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
 ) -> Vec<SymbolId> {
-    let Some(first_param) = function.params.items.first() else {
-        return Vec::new();
-    };
-    let BindingPattern::BindingIdentifier(first_param) = &first_param.pattern else {
-        return Vec::new();
-    };
-    let Some(index_symbol) = first_param.symbol_id.get() else {
-        return Vec::new();
-    };
-    let Some(body) = function.body.as_ref() else {
-        return Vec::new();
-    };
-
     struct Probe<'c> {
         scoping: &'c Scoping,
         index_symbol: SymbolId,
@@ -1243,6 +1229,19 @@ fn indexed_table_symbols_for_function(
             walk::walk_computed_member_expression(self, member);
         }
     }
+
+    let Some(first_param) = function.params.items.first() else {
+        return Vec::new();
+    };
+    let BindingPattern::BindingIdentifier(first_param) = &first_param.pattern else {
+        return Vec::new();
+    };
+    let Some(index_symbol) = first_param.symbol_id.get() else {
+        return Vec::new();
+    };
+    let Some(body) = function.body.as_ref() else {
+        return Vec::new();
+    };
 
     let mut probe = Probe {
         scoping,
@@ -1399,18 +1398,21 @@ impl Decoder {
             (DecoderTransform::LowerAlphabetBase64Uri, Value::String(encoded)) => {
                 decode_lower_alphabet_base64_uri(&encoded).map(Value::String)
             }
-            (DecoderTransform::LowerAlphabetBase64Uri, _) => None,
             (DecoderTransform::LowerAlphabetBase64Rc4, Value::String(encoded)) => {
                 decode_lower_alphabet_base64_rc4(&encoded, key?).map(Value::String)
             }
-            (DecoderTransform::LowerAlphabetBase64Rc4, _) => None,
             (DecoderTransform::StandardBase64, Value::String(encoded)) => {
                 decode_standard_base64_latin1(&encoded).map(Value::String)
             }
-            (DecoderTransform::StandardBase64, _) => None,
             (DecoderTransform::FixedBase64Alphabet(alphabet), Value::String(encoded)) => {
                 decode_fixed_base64_latin1(&encoded, alphabet).map(Value::String)
             }
+            (
+                DecoderTransform::LowerAlphabetBase64Uri
+                | DecoderTransform::LowerAlphabetBase64Rc4
+                | DecoderTransform::StandardBase64,
+                _,
+            ) => None,
             (DecoderTransform::Plain | DecoderTransform::FixedBase64Alphabet(_), value) => {
                 Some(value)
             }
@@ -1932,13 +1934,10 @@ fn detect_direct_table_decoders(
 
 fn parse_i64_literal(text: &str) -> Option<i64> {
     let text = text.trim();
-    let (negative, text) = if let Some(rest) = text.strip_prefix('-') {
-        (true, rest)
-    } else if let Some(rest) = text.strip_prefix('+') {
-        (false, rest)
-    } else {
-        (false, text)
-    };
+    let (negative, text) = text.strip_prefix('-').map_or_else(
+        || (false, text.strip_prefix('+').unwrap_or(text)),
+        |rest| (true, rest),
+    );
     let value = if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         i64::from_str_radix(hex, 16).ok()?
     } else {
@@ -1952,13 +1951,10 @@ pub fn js_parse_int(text: &str, radix: u32) -> Option<f64> {
         return None;
     }
     let text = text.trim_start();
-    let (negative, text) = if let Some(rest) = text.strip_prefix('-') {
-        (true, rest)
-    } else if let Some(rest) = text.strip_prefix('+') {
-        (false, rest)
-    } else {
-        (false, text)
-    };
+    let (negative, text) = text.strip_prefix('-').map_or_else(
+        || (false, text.strip_prefix('+').unwrap_or(text)),
+        |rest| (true, rest),
+    );
     let mut value = 0u64;
     let mut digits = 0usize;
     for ch in text.chars() {
@@ -2102,7 +2098,7 @@ fn eval_rotation_expression(
             let Expression::CallExpression(decoded_call) = unparenthesized(decoded_call) else {
                 return None;
             };
-            let decoded =
+            let decoded_value =
                 rotation_decoder_call(decoded_call, alias, decoder, numeric_members, rotation)?;
             let radix = match call.arguments.get(1) {
                 Some(argument) => {
@@ -2111,7 +2107,7 @@ fn eval_rotation_expression(
                 }
                 None => 10,
             };
-            js_parse_int(&decoded, radix)
+            js_parse_int(&decoded_value, radix)
         }
         _ => None,
     }
@@ -2258,10 +2254,6 @@ fn rotation_parse_int_references_are_global(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
 ) -> bool {
-    let Some(body) = &function.body else {
-        return false;
-    };
-
     struct Probe<'c> {
         scoping: &'c Scoping,
         valid: bool,
@@ -2287,6 +2279,10 @@ fn rotation_parse_int_references_are_global(
         ) {
         }
     }
+
+    let Some(body) = &function.body else {
+        return false;
+    };
 
     let mut probe = Probe {
         scoping,
@@ -3385,7 +3381,7 @@ fn decoder_transform(body: &str, keyed_decode_call: bool) -> Option<DecoderTrans
             let key = &captures[1];
             let argument = &captures[2];
             argument.contains('%')
-                && compile_regex(&format!(r"\b{}\s*\.\s*length\b", regex::escape(key),))
+                && compile_regex(&format!(r"\b{}\s*\.\s*length\b", regex::escape(key)))
                     .is_some_and(|length| length.is_match(argument))
         })
     });
@@ -3713,7 +3709,7 @@ struct DirectForContextCollector {
 }
 
 impl DirectForContextCollector {
-    fn collect_statements<'a>(&mut self, statements: &[Statement<'a>], container_span: Span) {
+    fn collect_statements(&mut self, statements: &[Statement<'_>], container_span: Span) {
         let Some(Statement::ForStatement(for_statement)) = statements.first() else {
             return;
         };
@@ -3888,7 +3884,9 @@ fn leading_mutable_aliases_in_statements(
     let mut aliases = Vec::new();
     let mut prior_initializer = false;
     for declarator in &declaration.declarations {
-        let candidate = if !prior_initializer {
+        let candidate = if prior_initializer {
+            None
+        } else {
             let BindingPattern::BindingIdentifier(alias) = &declarator.id else {
                 prior_initializer |= declarator.init.is_some();
                 continue;
@@ -3929,8 +3927,6 @@ fn leading_mutable_aliases_in_statements(
                         })
                     });
             stable.then_some((alias_symbol, target_symbol))
-        } else {
-            None
         };
         if let Some(alias) = candidate {
             aliases.push(alias);
