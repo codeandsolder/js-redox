@@ -593,8 +593,14 @@ spreads left-to-right, and distinguishes computed object keys (ToPropertyKey
 *before* the value), object spread property copying, array holes and deferred
 function/getter bodies. Spread iteration and CopyDataProperties are explicit
 atomic phases because their internal iterator/getter/Proxy effects are
-dynamic. Destructuring, optional chains, constructors and other unmodeled
-subtrees remain opaque; direct eval's lexical semantics are not rewritten.
+dynamic. General constructor expressions now evaluate the constructor
+reference and GetValue first, then each argument/spread left-to-right, then
+IsConstructor (which may reject the value after argument side effects), and
+finally Construct (whose Proxy traps, allocation, prototype handling, body
+and returned-object override are dynamic). Unlike method calls, new does
+not forward a member receiver as this. Destructuring, optional chains and
+other unmodeled subtrees remain opaque; direct eval's lexical semantics
+are not rewritten.
 Computed assignment-target key coercion remains deferred until GetValue or
 PutValue, so simple assignment may evaluate its RHS *before* ToPropertyKey,
 while compound or logical assignment can convert the same key **twice**.

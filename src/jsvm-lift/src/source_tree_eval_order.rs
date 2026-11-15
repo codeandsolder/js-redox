@@ -2,8 +2,8 @@
 //! No executable rewrite, inferred branch outcome or runtime trace.
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, AssignmentExpression, AssignmentTarget,
-    CallExpression, ComputedMemberExpression, Expression, ObjectExpression, ObjectPropertyKind,
-    Program, SimpleAssignmentTarget,
+    CallExpression, ComputedMemberExpression, Expression, NewExpression, ObjectExpression,
+    ObjectPropertyKind, Program, SimpleAssignmentTarget,
 };
 use oxc_ast_visit::{walk, Visit};
 use oxc_span::{GetSpan, Span};
@@ -201,6 +201,33 @@ impl<'s> Plan<'s> {
         );
     }
 
+    /// Evaluate a constructor reference and its value before the arguments.
+    /// Unlike a Call, Construct does not use a property receiver as this.
+    /// A non-constructor is rejected *after* evaluating all argument
+    /// expressions and consuming every spread (including possible throws).
+    fn construct(&mut self, construct: &NewExpression<'_>) {
+        self.expression(&construct.callee);
+        self.mark(
+            construct.callee.span(),
+            "constructor ready",
+            format!(
+                "{}; GetValue complete; no member receiver is passed to Construct",
+                self.snippet(construct.callee.span()),
+            ),
+        );
+        self.arguments(&construct.arguments);
+        self.mark(
+            construct.callee.span(),
+            "IsConstructor",
+            "check after argument evaluation; non-constructible values throw TypeError here",
+        );
+        self.mark(
+            construct.span,
+            "Construct",
+            "construct with evaluated arguments and newTarget; Proxy trap, allocation, prototype lookup, constructor effects and returned-object override are dynamic",
+        );
+    }
+
     fn arguments(&mut self, arguments: &[Argument<'_>]) {
         for (index, argument) in arguments.iter().enumerate() {
             match argument {
@@ -384,6 +411,7 @@ impl<'s> Plan<'s> {
             }
             Expression::AssignmentExpression(assign) => self.assignment(assign),
             Expression::CallExpression(call) => self.call(call),
+            Expression::NewExpression(construct) => self.construct(construct),
             Expression::ArrayExpression(array) => self.array(array),
             Expression::ObjectExpression(object) => self.object(object),
             Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {
@@ -488,8 +516,8 @@ impl<'s> Plan<'s> {
                 }
             }
             // Delete/typeof and coercing unary operators, optional chains,
-            // constructors, templates, class initializers, etc. remain opaque
-            // rather than pretending we know their effect/exception order.
+            // templates and class initializers remain opaque rather than
+            // pretending we know their effect/exception order.
             _ => self.opaque(expr.span(), "unexpanded AST subtree"),
         }
     }
@@ -555,8 +583,10 @@ pub(super) fn ordered_assignment_phases(source: &str, program: &Program<'_>) -> 
          distinct objects. The void operator evaluates its operand (including \
          calls, binding reads and exceptions) before discarding its value; \
          delete/typeof and coercing unary operators retain their own \
-         unexpanded semantics. Spans refer to the derived readable helper, \
-         not the captured source.\n\n",
+         unexpanded semantics. New expressions evaluate the constructor \
+         value and argument list (including spreads) before IsConstructor \
+         validation and Construct; a member receiver is not forwarded. \
+         Spans refer to the derived readable helper, not captured source.\n\n",
     );
     collector.sections.sort_by_key(|(span, _)| span.start);
     for (root, phases) in &collector.sections {
@@ -868,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_call_and_constructor_internals_remain_opaque() {
+    fn optional_call_remains_opaque_but_regular_constructor_is_expanded() {
         let source = format!(
             "function f(obj,side){{root=obj?.method((side.bad=1,{}));}}",
             long_effects()
@@ -881,8 +911,179 @@ mod tests {
             long_effects()
         );
         let phases = plan(&source);
-        assert!(phases.contains("opaque expression"), "{phases}");
-        assert!(!phases.contains("side.bad = (setter may run)"), "{phases}");
+        let ready = position(&phases, "| constructor ready | C;");
+        let nested = position(&phases, "side.bad = (setter may run)");
+        let check = position(&phases, "| IsConstructor |");
+        let construct = position(&phases, "| Construct |");
+        let root = position(&phases, "root = (setter may run)");
+        assert!(
+            ready < nested && nested < check && check < construct && construct < root,
+            "{phases}"
+        );
+        assert!(!phases.contains("| opaque expression |"), "{phases}");
+    }
+
+    #[test]
+    fn constructor_lookup_key_and_getter_precede_arguments_and_spread() {
+        let source = format!(
+            "function f(holder,key,iter,side){{root = new (holder[key()])             (side.first=1,...iter,side.last=2,{});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let get_key = position(&phases, "| Call | key;");
+        let coercion = position(&phases, "| ToPropertyKey |");
+        let getter = position(&phases, "| GetValue member |");
+        let ready = position(&phases, "| constructor ready |");
+        let first_write = position(&phases, "side.first = (setter may run)");
+        let spread = position(&phases, "| expand spread argument |");
+        let last_write = position(&phases, "side.last = (setter may run)");
+        let check = position(&phases, "| IsConstructor |");
+        let construct = position(&phases, "| Construct |");
+        let root = position(&phases, "root = (setter may run)");
+        assert!(
+            get_key < coercion
+                && coercion < getter
+                && getter < ready
+                && ready < first_write
+                && first_write < spread
+                && spread < last_write
+                && last_write < check
+                && check < construct
+                && construct < root,
+            "{phases}"
+        );
+        assert!(
+            phases.contains("no member receiver is passed to Construct"),
+            "{phases}"
+        );
+    }
+
+    #[test]
+    fn nested_construct_and_call_evaluate_inside_outer_argument_list() {
+        let source = format!(
+            "function f(C,D,side){{root=new C(side.first=1, new D(side.nested=2),             side.last=3,{});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        let outer_ready = position(&phases, "| constructor ready | C;");
+        let first = position(&phases, "side.first = (setter may run)");
+        let inner_ready = position(&phases, "| constructor ready | D;");
+        let inner_write = position(&phases, "side.nested = (setter may run)");
+        let first_construct = position(&phases, "| Construct |");
+        let last = position(&phases, "side.last = (setter may run)");
+        let second_construct = phases.rfind("| Construct |").unwrap_or(usize::MAX);
+        assert!(
+            outer_ready < first
+                && first < inner_ready
+                && inner_ready < inner_write
+                && inner_write < first_construct
+                && first_construct < last
+                && last < second_construct,
+            "{phases}"
+        );
+        assert_eq!(phases.matches("| Construct |").count(), 2, "{phases}");
+    }
+
+    #[test]
+    fn constructor_with_no_explicit_args_and_conditional_callee() {
+        let source = format!(
+            "function f(side,C,D,choose){{root=(side.pre=1,              new (choose?C:D), {});}}",
+            long_effects()
+        );
+        let phases = plan(&source);
+        assert!(phases.contains("| test truthy |"), "{phases}");
+        assert!(phases.contains("| test falsy |"), "{phases}");
+        let check = position(&phases, "| IsConstructor |");
+        let construct = position(&phases, "| Construct |");
+        assert!(check < construct, "{phases}");
+        assert_eq!(phases.matches("| Construct |").count(), 1, "{phases}");
+    }
+
+    #[test]
+    #[ignore = "requires Node; ECMAScript constructor evaluation-order oracle"]
+    fn node_confirms_construct_after_spreads_and_invalid_callee_args() -> anyhow::Result<()> {
+        use std::process::Command;
+        let script = r#"
+const output=[];
+function scenario(name,run) {
+  const events=[];
+  const mark=(tag,value)=>{events.push(tag);return value;};
+  const iter={ [Symbol.iterator](){events.push('iterator');let i=0;return{
+    next(){events.push('next:'+i);return i++<2?{value:i,done:false}:{done:true};}
+  }}};
+  class C { constructor(...args){events.push('ctor:'+args.length);} }
+  const holder={get C(){events.push('getter');return C}};
+  try {run({events,mark,iter,C,holder})}
+  catch(e) {events.push('throw:'+e.name)}
+  output.push([name,events]);
+}
+scenario('member',({mark,iter,holder})=>{
+  new (holder.C)(mark('first',1),...iter,mark('last',4));
+});
+scenario('not-a-constructor',({mark})=>{
+  new (mark('ctor-value',null))(mark('argument',1));
+});
+scenario('nonconstructible-function',({mark})=>{
+  new (mark('ctor-value',()=>{}))(mark('argument',1));
+});
+scenario('callee-throws',({mark})=>{
+  new (function(){throw Error('lookup')}())(mark('argument',1));
+});
+scenario('arg-throws',({mark})=>{
+  new (mark('ctor-value',null))((()=>{throw Error('arg')})());
+});
+scenario('proxy',({events,mark,iter,C})=>{
+  const p=new Proxy(C,{construct(t,a,n){
+    events.push('construct-trap:'+a.length);
+    return Reflect.construct(t,a,n);
+  }});
+  new (mark('ctor-value',p))(...iter,mark('last',5));
+});
+scenario('no-args',({mark,C})=>{
+  new (mark('ctor-value',C));
+});
+console.log(JSON.stringify(output));
+"#;
+        let result = Command::new("node").arg("-e").arg(script).output()?;
+        assert!(result.status.success(), "{result:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        assert_eq!(
+            actual,
+            serde_json::json!([
+                [
+                    "member",
+                    [
+                        "getter", "first", "iterator", "next:0", "next:1", "next:2", "last",
+                        "ctor:4"
+                    ]
+                ],
+                [
+                    "not-a-constructor",
+                    ["ctor-value", "argument", "throw:TypeError"]
+                ],
+                [
+                    "nonconstructible-function",
+                    ["ctor-value", "argument", "throw:TypeError"]
+                ],
+                ["callee-throws", ["throw:Error"]],
+                ["arg-throws", ["ctor-value", "throw:Error"]],
+                [
+                    "proxy",
+                    [
+                        "ctor-value",
+                        "iterator",
+                        "next:0",
+                        "next:1",
+                        "next:2",
+                        "last",
+                        "construct-trap:3",
+                        "ctor:3"
+                    ]
+                ],
+                ["no-args", ["ctor-value", "ctor:0"]]
+            ])
+        );
+        Ok(())
     }
 
     #[test]
