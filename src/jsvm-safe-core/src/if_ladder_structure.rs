@@ -64,6 +64,12 @@ impl Route {
             Next::Choose { .. } => None,
         }
     }
+    fn has_target(&self, target: u64) -> bool {
+        match &self.next {
+            Next::State(state) => *state == target,
+            Next::Choose { yes, no, .. } => yes.has_target(target) || no.has_target(target),
+        }
+    }
 }
 
 fn number(expr: &Expression<'_>) -> Option<u64> {
@@ -271,43 +277,61 @@ fn parse_statement_route(
         }
         Statement::BlockStatement(block) => {
             let (last, prefix) = block.body.split_last()?;
-            // A state-selecting branch can be followed by a guard against
-            // the numeric state it just assigned. Compose the guard's
-            // normal transition only on matching predecessor arms; the
-            // actual source statements remain in their original order
-            // and try/catch region. Earlier scope-affecting declarations
-            // prohibit the composition just as in ordinary block routes.
-            if let Statement::IfStatement(guard) = last {
-                if guard.alternate.is_none() && !prefix.is_empty() {
-                    if let Some(matched) = state_test(&guard.test, state) {
-                        let (prior, earlier) = prefix.split_last()?;
-                        if earlier.iter().any(|statement| {
-                            matches!(
-                                statement,
-                                Statement::VariableDeclaration(declaration)
-                                    if declaration.kind != VariableDeclarationKind::Var
-                            ) || matches!(
-                                statement,
-                                Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_)
-                            )
-                        }) {
-                            return None;
-                        }
-                        let mut route = parse_statement_route(prior, state, exit, source)?;
-                        let follow_up =
-                            parse_statement_route(&guard.consequent, state, exit, source)?;
-                        if !splice_conditional_successor(&mut route, matched, &follow_up) {
-                            return None;
-                        }
-                        let mut effects = earlier
-                            .iter()
-                            .map(|statement| fragment(source, statement.span()).to_owned())
-                            .collect::<Vec<_>>();
-                        effects.append(&mut route.effects);
-                        route.effects = effects;
-                        return Some(route);
+            // Compose any number of ordered numeric-state guards after a
+            // modeled state selection. Each guard observes the state left
+            // by its predecessor, including earlier guard writes. The
+            // source statements stay in their original try/catch region.
+            let mut guard_start = block.body.len();
+            while guard_start > 0 {
+                let Statement::IfStatement(guard) = &block.body[guard_start - 1] else {
+                    break;
+                };
+                if guard.alternate.is_some() || state_test(&guard.test, state).is_none() {
+                    break;
+                }
+                guard_start -= 1;
+            }
+            if guard_start > 0 && guard_start < block.body.len() {
+                let (before, guards) = block.body.split_at(guard_start);
+                let (prior, earlier) = before.split_last()?;
+                if earlier.iter().any(|statement| {
+                    matches!(
+                        statement,
+                        Statement::VariableDeclaration(declaration)
+                            if declaration.kind != VariableDeclarationKind::Var
+                    ) || matches!(
+                        statement,
+                        Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_)
+                    )
+                }) {
+                    return None;
+                }
+                let mut route = parse_statement_route(prior, state, exit, source)?;
+                for statement in guards {
+                    let Statement::IfStatement(guard) = statement else {
+                        return None;
+                    };
+                    let matched = state_test(&guard.test, state)?;
+                    // The numeric comparison itself is pure. A guard that
+                    // cannot match any modeled normal successor contributes
+                    // no transition, even if its body is otherwise opaque.
+                    // The synthetic exit is an abrupt completion, not a
+                    // numeric state that a following statement can observe.
+                    if matched == exit || !route.has_target(matched) {
+                        continue;
+                    }
+                    let follow_up = parse_statement_route(&guard.consequent, state, exit, source)?;
+                    if !splice_conditional_successor(&mut route, matched, &follow_up) {
+                        return None;
                     }
                 }
+                let mut effects = earlier
+                    .iter()
+                    .map(|statement| fragment(source, statement.span()).to_owned())
+                    .collect::<Vec<_>>();
+                effects.append(&mut route.effects);
+                route.effects = effects;
+                return Some(route);
             }
             // Moving a block-local declaration outside its original block
             // changes temporal-dead-zone/closure semantics. Retain those

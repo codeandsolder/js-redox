@@ -2338,6 +2338,109 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_composes_multiple_ordered_state_guards() {
+        let source = r#"
+            function f(select, log) {
+                let state=1;
+                while(true) try {
+                    if(state==1) {
+                        state=select?2:5;
+                        if(state==2){log.push("first");state=3;}
+                        if(state==3){log.push("second");state=4;}
+                        if(state==4){log.push("third");state=5;}
+                    } else if(state==2){log.push("dead-2");state=5;}
+                    else if(state==3){log.push("dead-3");state=5;}
+                    else if(state==4){log.push("dead-4");state=5;}
+                    else if(state==5)return log;
+                } catch(error) {throw error;}
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+        for label in ["dead-2", "dead-3", "dead-4"] {
+            assert!(!result.source.contains(label), "{}", result.source);
+        }
+        for label in ["first", "second", "third"] {
+            assert_eq!(
+                result
+                    .source
+                    .matches(&format!("log.push(\"{label}\")"))
+                    .count(),
+                1,
+                "{}",
+                result.source
+            );
+        }
+    }
+
+    #[test]
+    fn exception_dispatcher_multiple_guards_keep_throw_resume_root() {
+        let source = r#"
+            function f(boom, log) {
+                let state=1, caught=false;
+                while(true) try {
+                    if(state==1) {
+                        state=2;
+                        if(state==2){
+                            log.push("before");
+                            if(boom && !caught)throw Error("caught");
+                            state=3;
+                        }
+                        if(state==3){log.push("after");state=4;}
+                    } else if(state==2){log.push("resumed");state=3;}
+                    else if(state==3){log.push("later");state=4;}
+                    else if(state==4)return log;
+                } catch(error) {
+                    log.push(error.message);
+                    caught=true;
+                }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(result.source.contains("resumed"), "{}", result.source);
+        assert_eq!(result.source.matches("log.push(\"before\")").count(), 1);
+        assert_eq!(result.source.matches("log.push(\"after\")").count(), 1);
+    }
+
+    #[test]
+    fn exception_dispatcher_skips_unreachable_numeric_guard_before_live_guard() {
+        let source = r#"
+            function f(log) {
+                let state=1;
+                while(true) try {
+                    if(state==1) {
+                        state=2;
+                        if(state==99){log.push("unreachable guard");while(log.length>1)log.pop();}
+                        if(state==2){log.push("live guard");state=3;}
+                    } else if(state==2){log.push("dead dispatcher case");state=3;}
+                    else if(state==3)return log;
+                    else if(state==8){log.push("dead state");state=3;}
+                } catch(error) {throw error;}
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+        assert!(
+            !result.source.contains("dead dispatcher case"),
+            "{}",
+            result.source
+        );
+        assert_eq!(result.source.matches("log.push(\"live guard\")").count(), 1);
+    }
+
+    #[test]
     fn exception_dispatcher_prunes_with_trailing_nonthrowing_return() {
         let source = r#"
             function f(log) {

@@ -723,9 +723,12 @@ terminal. Its actual source remains at the original position after the
 normal state case; catch handlers and the one-iteration boundary are
 untouched. Effectful return expressions, duplicate case labels and
 unmodelled trailing statements block this extension. The normal-state CFG
-also composes a modeled state-selection statement followed by a pure
-numeric-state guard without an else: only predecessor arms that establish
-the guarded state receive the follow-up transition. Source statements,
+also composes a modeled state-selection statement followed by any
+number of ordered, pure numeric-state guards without else branches. Each
+guard sees the state produced by earlier guards, and only branches that
+establish its tested state receive its follow-up transition. A guard with no
+possible normal-state match is skipped in the CFG even if its body is opaque;
+the original guard remains in the source. Source statements,
 exceptional roots, and original try/catch evaluation stay in place; this
 allows later region recovery in the **complete** lexical program, not only
 isolated helper projections.
