@@ -847,8 +847,10 @@ frames. The normal `lexical-context/whole-program/readable.js`, original
 lexical source and protected capture stay unchanged. A separate
 `readable-guarded.js` contains executable optimized paths with original
 fallbacks. Only verified guards participate in compaction: a broader
-source-proven selector replaces redundant narrower guards, and identical
-optimized bodies share a disjunction of their pure selector checks. The
+source-proven selector replaces redundant narrower guards. The remaining
+pure selector checks form a shared decision tree, so common parameter
+comparisons execute once. Identical executable subtrees share OR-combined
+selector edges without changing the selected bodies. The
 manifest distinguishes the original `candidate_variants` from actually
 emitted `fast_paths`, so merging cannot be mistaken for lost coverage.
 The original and result SHA-256, helper names, and installed fast-path

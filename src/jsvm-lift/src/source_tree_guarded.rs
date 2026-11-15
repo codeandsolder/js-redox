@@ -6,7 +6,7 @@
 //! through the ordinary safe deobfuscator; this module rechecks the binding
 //! proof and lexical identity before installing any branch.
 use crate::source_tree_specialize::specialize_function;
-use anyhow::{ensure, Result};
+use anyhow::{anyhow, ensure, Result};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingPattern, Expression, Function, Statement, VariableDeclaration, VariableDeclarationKind,
@@ -221,6 +221,48 @@ fn optimized_body(source: &str) -> Option<String> {
     Some(source.get(start..end)?.to_string())
 }
 
+/// All edges are independently proven pure selector comparisons; ordering
+/// them by formal index shares tests without changing which input tuples
+/// select a verified optimized body.
+#[derive(Default)]
+struct SelectorDispatch {
+    body: Option<String>,
+    children: BTreeMap<(usize, String), SelectorDispatch>,
+}
+
+impl SelectorDispatch {
+    fn add(&mut self, constants: &[(usize, String)], body: &str) {
+        let mut current = self;
+        for literal in constants {
+            current = current.children.entry(literal.clone()).or_default();
+        }
+        current.body.get_or_insert_with(|| body.to_owned());
+    }
+
+    /// Return generated source and number of executable terminal fast paths,
+    /// not the number of internal selector tests used to reach them.
+    fn emit(&self, slot: &FunctionSlot) -> Result<(String, usize)> {
+        if let Some(body) = &self.body {
+            return Ok((format!("{body}\nreturn;\n"), 1));
+        }
+        let mut by_body = BTreeMap::<String, (usize, Vec<String>)>::new();
+        for (literal, child) in &self.children {
+            let test = condition(slot, std::slice::from_ref(literal))
+                .ok_or_else(|| anyhow!("validated selector became unrenderable"))?;
+            let (source, fast_paths) = child.emit(slot)?;
+            let group = by_body.entry(source).or_insert((fast_paths, Vec::new()));
+            group.1.push(format!("({test})"));
+        }
+        let mut output = String::new();
+        let mut paths = 0;
+        for (source, (count, tests)) in by_body {
+            output.push_str(&format!("if ({}) {{\n{source}}}\n", tests.join(" || ")));
+            paths += count;
+        }
+        Ok((output, paths))
+    }
+}
+
 pub fn install_guarded_specializations(
     original: &str,
     variants: &[GuardedVariant],
@@ -242,7 +284,6 @@ pub fn install_guarded_specializations(
     collector.visit_program(&parsed.program);
     struct ProvenFastPath {
         constants: Vec<(usize, String)>,
-        test: String,
         body: String,
     }
     let mut grouped = BTreeMap::<[u32; 2], Vec<ProvenFastPath>>::new();
@@ -269,15 +310,14 @@ pub fn install_guarded_specializations(
         {
             continue;
         }
-        let Some(test) = condition(slot, &variant.constants) else {
+        if condition(slot, &variant.constants).is_none() {
             continue;
-        };
+        }
         let Some(body) = optimized_body(&variant.optimized_wrapper) else {
             continue;
         };
         grouped.entry(slot.span).or_default().push(ProvenFastPath {
             constants: variant.constants.clone(),
-            test,
             body,
         });
     }
@@ -311,32 +351,21 @@ pub fn install_guarded_specializations(
             }
             retained.push(path);
         }
-        // Identical executable bodies can share a disjunction of pure
-        // selector checks. Source identity and every constant-substitution
-        // proof were validated above; only the branch test is combined.
-        let mut by_body = BTreeMap::<String, Vec<String>>::new();
-        for path in retained {
-            by_body.entry(path.body).or_default().push(path.test);
-        }
-        let mut branches = Vec::new();
-        for (body, mut tests) in by_body {
-            tests.sort();
-            tests.dedup();
-            let combined = tests
-                .into_iter()
-                .map(|test| format!("({test})"))
-                .collect::<Vec<_>>()
-                .join(" || ");
-            // The extra return handles fallthrough from the optimized
-            // function body without entering the original fallback.
-            branches.push(format!("\nif ({combined}) {{\n{body}\nreturn;\n}}\n"));
-        }
-        branches.sort();
-        fast_paths += branches.len();
         let Some(slot) = collector.slots.get(&key) else {
             continue;
         };
-        placements.push((slot.insertion, branches.concat()));
+        let mut dispatch = SelectorDispatch::default();
+        for path in retained {
+            let mut constants = path.constants;
+            constants.sort();
+            dispatch.add(&constants, &path.body);
+        }
+        // The selector trie shares pure prefix checks, and equal executable
+        // child subtrees automatically share OR-combined selector edges.
+        // Every terminal still executes inside the original call frame.
+        let (branches, emitted) = dispatch.emit(slot)?;
+        fast_paths += emitted;
+        placements.push((slot.insertion, format!("\n{branches}")));
     }
     let targeted_functions = placements.len();
     placements.sort_by_key(|item| std::cmp::Reverse(item.0));
@@ -455,6 +484,35 @@ mod tests {
         ensure!(result.source.contains("selector === (4)"), "{result:?}");
         ensure!(result.source.contains(" || "), "{result:?}");
         ensure!(result.source.contains("return 0;"), "{result:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn factors_common_selector_prefix_into_one_shared_check() -> Result<()> {
+        let raw = "function(mode,kind){if(mode===7){return kind===1?10:20;}return 30;}";
+        let source = format!("const f={raw};");
+        let first = variant(
+            &source,
+            raw,
+            "function(mode,kind){return 10;}",
+            &[(0, "7"), (1, "1")],
+        )?;
+        let second = variant(
+            &source,
+            raw,
+            "function(mode,kind){return 20;}",
+            &[(0, "7"), (1, "2")],
+        )?;
+        let result = install_guarded_specializations(&source, &[first, second])?
+            .ok_or_else(|| anyhow::anyhow!("missing common selector dispatch"))?;
+        ensure!(result.fast_paths == 2 && result.targeted_functions == 1);
+        ensure!(
+            result.source.matches("mode === (7)").count() == 1,
+            "{result:?}"
+        );
+        ensure!(result.source.contains("kind === (1)"), "{result:?}");
+        ensure!(result.source.contains("kind === (2)"), "{result:?}");
+        ensure!(result.source.contains("return 30;"), "{result:?}");
         Ok(())
     }
 
