@@ -79,19 +79,19 @@ pub(super) fn render_scalar_family(family: &str, args: &[String]) -> Option<Stri
         return None;
     };
     let expression = match family {
-        "i32add" if a == ZERO => b.clone(),
-        "i32add" if b == ZERO => a.clone(),
-        "i32sub" if b == ZERO => a.clone(),
-        "i32mul" if a == ZERO || b == ZERO => ZERO.to_owned(),
+        "i32add" | "i32or" | "i32xor" if a == ZERO => b.clone(),
+        "i32add" | "i32sub" | "i32or" | "i32xor" | "i32shl" | "i32shrs" | "i32shru" | "i32rotl"
+        | "i32rotr"
+            if b == ZERO =>
+        {
+            a.clone()
+        }
+        "i32mul" | "i32and" if a == ZERO || b == ZERO => ZERO.to_owned(),
         "i32mul" if a == ONE => b.clone(),
         "i32mul" if b == ONE => a.clone(),
-        "i32and" if a == ZERO || b == ZERO => ZERO.to_owned(),
         "i32and" if a == ALL_ONES => b.clone(),
         "i32and" if b == ALL_ONES => a.clone(),
-        "i32or" | "i32xor" if a == ZERO => b.clone(),
-        "i32or" | "i32xor" if b == ZERO => a.clone(),
         "i32shl" | "i32shrs" | "i32shru" | "i32rotl" | "i32rotr" if a == ZERO => ZERO.to_owned(),
-        "i32shl" | "i32shrs" | "i32shru" | "i32rotl" | "i32rotr" if b == ZERO => a.clone(),
         "i32add" => format!("wrapping_add({a}, {b})"),
         "i32sub" => format!("wrapping_sub({a}, {b})"),
         "i32mul" => format!("wrapping_mul({a}, {b})"),
@@ -403,7 +403,7 @@ fn identity_bit_permutation(base: Value) -> BitPermutation {
     }
 }
 
-fn zero_bit_permutation(base: Value) -> BitPermutation {
+const fn zero_bit_permutation(base: Value) -> BitPermutation {
     BitPermutation {
         base,
         bits: [None; 32],
@@ -440,9 +440,9 @@ fn bit_permutation(
                     };
                     let mut permutation =
                         bit_permutation(body, source, depth.saturating_sub(1), visiting)?;
-                    for bit in 0..32 {
+                    for (bit, source) in permutation.bits.iter_mut().enumerate() {
                         if mask & (1u32 << bit) == 0 {
-                            permutation.bits[bit] = None;
+                            *source = None;
                         }
                     }
                     Some(permutation)
@@ -450,9 +450,7 @@ fn bit_permutation(
                 ("i32or", [left, right]) => {
                     let left = bit_permutation(body, *left, depth.saturating_sub(1), visiting)?;
                     let right = bit_permutation(body, *right, depth.saturating_sub(1), visiting)?;
-                    if left.base != right.base {
-                        None
-                    } else {
+                    if left.base == right.base {
                         let mut bits = [None; 32];
                         for (bit, merged) in bits.iter_mut().enumerate() {
                             *merged = match (left.bits[bit], right.bits[bit]) {
@@ -469,12 +467,11 @@ fn bit_permutation(
                             base: left.base,
                             bits,
                         })
+                    } else {
+                        None
                     }
                 }
-                ("i32shl", [source, amount])
-                | ("i32shru", [source, amount])
-                | ("i32rotl", [source, amount])
-                | ("i32rotr", [source, amount]) => {
+                ("i32shl" | "i32shru" | "i32rotl" | "i32rotr", [source, amount]) => {
                     let amount = i32_const(body, *amount)? & 31;
                     let source = bit_permutation(body, *source, depth.saturating_sub(1), visiting)?;
                     let mut bits = [None; 32];

@@ -58,13 +58,11 @@ fn strip_wasm_bindgen_hash(name: &str) -> &str {
 
 pub(super) fn normalize_import_name(module: &str, name: &str) -> String {
     let name = strip_wasm_bindgen_hash(name);
-    if let Some(name) = name.strip_prefix("__wbg_") {
-        format!("{module}.{name}")
-    } else if let Some(name) = name.strip_prefix("__wbindgen_") {
-        format!("wbindgen.{name}")
-    } else {
-        format!("{module}.{name}")
-    }
+    let (module, name) = name.strip_prefix("__wbindgen_").map_or_else(
+        || (module, name.strip_prefix("__wbg_").unwrap_or(name)),
+        |stripped| ("wbindgen", stripped),
+    );
+    format!("{module}.{name}")
 }
 
 fn direct_called_functions(body: &FunctionBody) -> BTreeSet<Func> {
@@ -487,7 +485,7 @@ fn helper_is_heap_allocator(
     memory_grows > 0 && loads >= 4 && stores >= 8 && zero_return && nonzero_return
 }
 
-pub(super) fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> SemanticCallNames {
+fn imported_semantic_call_names(module: &Module<'_>) -> SemanticCallNames {
     let mut names = SemanticCallNames::default();
     for import in &module.imports {
         if let ImportKind::Func(function) = import.kind {
@@ -518,6 +516,11 @@ pub(super) fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> 
         }
     }
 
+    names
+}
+
+pub(super) fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> SemanticCallNames {
+    let mut names = imported_semantic_call_names(module);
     let imported_functions = module
         .imports
         .iter()
@@ -528,8 +531,7 @@ pub(super) fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> 
         .collect::<BTreeSet<_>>();
     let direct_callees = module.funcs[root]
         .body()
-        .map(direct_called_functions)
-        .unwrap_or_default();
+        .map_or_default(direct_called_functions);
     let mut candidates = direct_callees
         .iter()
         .copied()
@@ -545,8 +547,7 @@ pub(super) fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> 
         }
         let nested = module.funcs[callee]
             .body()
-            .map(direct_called_functions)
-            .unwrap_or_default();
+            .map_or_default(direct_called_functions);
         candidates.extend(
             nested
                 .into_iter()

@@ -95,7 +95,7 @@ pub struct ModuleReport {
     pub strings: Vec<String>,
 }
 
-fn import_kind(ty: TypeRef) -> &'static str {
+const fn import_kind(ty: TypeRef) -> &'static str {
     match ty {
         TypeRef::Func(_) | TypeRef::FuncExact(_) => "function",
         TypeRef::Table(_) => "table",
@@ -105,7 +105,7 @@ fn import_kind(ty: TypeRef) -> &'static str {
     }
 }
 
-fn export_kind(kind: ExternalKind) -> &'static str {
+const fn export_kind(kind: ExternalKind) -> &'static str {
     match kind {
         ExternalKind::Func | ExternalKind::FuncExact => "function",
         ExternalKind::Table => "table",
@@ -162,6 +162,90 @@ fn extract_ascii_strings(bytes: &[u8]) -> Vec<String> {
     result
 }
 
+fn summarize_function_body(
+    body: &wasmparser::FunctionBody<'_>,
+    index: u32,
+    export_names: Vec<String>,
+    budget: &WorkBudget,
+) -> Result<FunctionSummary> {
+    let range = body.range();
+    let body_bytes = usize::try_from(range.end.saturating_sub(range.start))
+        .context("function body length does not fit usize")?;
+    let mut direct_calls = BTreeSet::new();
+    let mut operators = body
+        .get_operators_reader()
+        .context("read function operators")?;
+    while !operators.eof() {
+        budget.checkpoint()?;
+        match operators.read().context("read function operator")? {
+            Operator::Call { function_index } | Operator::ReturnCall { function_index } => {
+                direct_calls.insert(function_index);
+            }
+            _ => {}
+        }
+    }
+    Ok(FunctionSummary {
+        index,
+        body_bytes,
+        role: classify_function(&export_names),
+        exports: export_names,
+        direct_calls: direct_calls.into_iter().collect(),
+        reachable_from_exports: Vec::new(),
+    })
+}
+
+fn summarize_call_graph(
+    functions: &mut [FunctionSummary],
+    exports: &[ExportSummary],
+    budget: &WorkBudget,
+) -> Result<CallGraphSummary> {
+    let adjacency = functions
+        .iter()
+        .map(|function| (function.index, function.direct_calls.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let direct_edges = adjacency.values().map(Vec::len).sum();
+    let function_exports = exports
+        .iter()
+        .filter(|export| export.kind == "function")
+        .map(|export| (export.name.clone(), export.index))
+        .collect::<Vec<_>>();
+    let mut export_reachability = Vec::new();
+    for (export_name, root) in function_exports {
+        budget.checkpoint()?;
+        let mut queue = VecDeque::from([root]);
+        let mut reachable = BTreeSet::new();
+        while let Some(function_index) = queue.pop_front() {
+            budget.checkpoint()?;
+            if !reachable.insert(function_index) {
+                continue;
+            }
+            if let Some(callees) = adjacency.get(&function_index) {
+                queue.extend(callees.iter().copied());
+            }
+        }
+        for function in functions.iter_mut() {
+            budget.checkpoint()?;
+            if reachable.contains(&function.index) {
+                function.reachable_from_exports.push(export_name.clone());
+            }
+        }
+        export_reachability.push(ExportReachability {
+            export: export_name,
+            function_index: root,
+            reachable_functions: reachable.into_iter().collect(),
+        });
+    }
+
+    Ok(CallGraphSummary {
+        direct_edges,
+        exports: export_reachability,
+    })
+}
+
+/// Validate and inventory a WebAssembly module without executing it.
+///
+/// # Errors
+/// Returns an error when WASM validation, decoding, or resource accounting fails.
 pub fn analyze(bytes: &[u8], budget: &WorkBudget) -> Result<ModuleReport> {
     budget.checkpoint()?;
     Validator::new_with_features(WasmFeatures::all())
@@ -185,7 +269,7 @@ pub fn analyze(bytes: &[u8], budget: &WorkBudget) -> Result<ModuleReport> {
             Payload::ImportSection(reader) => {
                 for group in reader {
                     budget.checkpoint()?;
-                    for import in group.context("parse import group")?.into_iter() {
+                    for import in group.context("parse import group")? {
                         budget.checkpoint()?;
                         let (_, import) = import.context("parse import")?;
                         let kind = import_kind(import.ty);
@@ -232,31 +316,7 @@ pub fn analyze(bytes: &[u8], budget: &WorkBudget) -> Result<ModuleReport> {
                 let index = next_defined_function
                     .context("code section encountered without function section")?;
                 let export_names = function_exports.remove(&index).unwrap_or_default();
-                let range = body.range();
-                let body_bytes = usize::try_from(range.end.saturating_sub(range.start))
-                    .context("function body length does not fit usize")?;
-                let mut direct_calls = BTreeSet::new();
-                let mut operators = body
-                    .get_operators_reader()
-                    .context("read function operators")?;
-                while !operators.eof() {
-                    budget.checkpoint()?;
-                    match operators.read().context("read function operator")? {
-                        Operator::Call { function_index }
-                        | Operator::ReturnCall { function_index } => {
-                            direct_calls.insert(function_index);
-                        }
-                        _ => {}
-                    }
-                }
-                functions.push(FunctionSummary {
-                    index,
-                    body_bytes,
-                    role: classify_function(&export_names),
-                    exports: export_names,
-                    direct_calls: direct_calls.into_iter().collect(),
-                    reachable_from_exports: Vec::new(),
-                });
+                functions.push(summarize_function_body(&body, index, export_names, budget)?);
                 next_defined_function = Some(index.saturating_add(1));
             }
             Payload::CustomSection(reader) => {
@@ -266,42 +326,7 @@ pub fn analyze(bytes: &[u8], budget: &WorkBudget) -> Result<ModuleReport> {
         }
     }
 
-    let adjacency = functions
-        .iter()
-        .map(|function| (function.index, function.direct_calls.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let direct_edges = adjacency.values().map(Vec::len).sum();
-    let function_exports = exports
-        .iter()
-        .filter(|export| export.kind == "function")
-        .map(|export| (export.name.clone(), export.index))
-        .collect::<Vec<_>>();
-    let mut export_reachability = Vec::new();
-    for (export_name, root) in function_exports {
-        budget.checkpoint()?;
-        let mut queue = VecDeque::from([root]);
-        let mut reachable = BTreeSet::new();
-        while let Some(function_index) = queue.pop_front() {
-            budget.checkpoint()?;
-            if !reachable.insert(function_index) {
-                continue;
-            }
-            if let Some(callees) = adjacency.get(&function_index) {
-                queue.extend(callees.iter().copied());
-            }
-        }
-        for function in &mut functions {
-            budget.checkpoint()?;
-            if reachable.contains(&function.index) {
-                function.reachable_from_exports.push(export_name.clone());
-            }
-        }
-        export_reachability.push(ExportReachability {
-            export: export_name,
-            function_index: root,
-            reachable_functions: reachable.into_iter().collect(),
-        });
-    }
+    let call_graph = summarize_call_graph(&mut functions, &exports, budget)?;
 
     Ok(ModuleReport {
         sha256: lowercase_hex(digest.as_ref()),
@@ -310,15 +335,17 @@ pub fn analyze(bytes: &[u8], budget: &WorkBudget) -> Result<ModuleReport> {
         imports,
         exports,
         functions,
-        call_graph: CallGraphSummary {
-            direct_edges,
-            exports: export_reachability,
-        },
+        call_graph,
         custom_sections,
         strings: extract_ascii_strings(bytes),
     })
 }
 
+/// Analyze exported function behavior from a previously validated module.
+///
+/// # Errors
+/// Returns an error when the work budget is exhausted. Per-export analysis
+/// errors are retained within the report rather than aborting other exports.
 pub fn deep_analyze(
     bytes: &[u8],
     report: &ModuleReport,
@@ -357,6 +384,10 @@ pub fn deep_analyze(
     })
 }
 
+/// Render validated WASM instructions as folded WAT.
+///
+/// # Errors
+/// Returns an error if printing fails or the work budget is exhausted.
 pub fn folded_wat(bytes: &[u8], budget: &WorkBudget) -> Result<String> {
     budget.checkpoint()?;
     let mut config = wasmprinter::Config::new();

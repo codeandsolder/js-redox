@@ -64,7 +64,7 @@ fn normalize(expression: &SemanticExpression, referenced: &BTreeSet<usize>) -> S
     }
 }
 
-fn constant_value(expression: &SemanticExpression) -> Option<u32> {
+const fn constant_value(expression: &SemanticExpression) -> Option<u32> {
     let SemanticExpression::I32Const { value } = expression else {
         return None;
     };
@@ -102,15 +102,17 @@ fn neutral_identity(
         return None;
     };
     let result = match operator {
-        "i32add" if is_const(left, 0) => right,
-        "i32add" | "i32sub" if is_const(right, 0) => left,
+        "i32add" | "i32or" | "i32xor" if is_const(left, 0) => right,
+        "i32add" | "i32sub" | "i32or" | "i32xor" | "i32shl" | "i32shrs" | "i32shru" | "i32rotl"
+        | "i32rotr"
+            if is_const(right, 0) =>
+        {
+            left
+        }
         "i32mul" if is_const(left, 1) => right,
         "i32mul" if is_const(right, 1) => left,
         "i32and" if is_const(left, u32::MAX) => right,
         "i32and" if is_const(right, u32::MAX) => left,
-        "i32or" | "i32xor" if is_const(left, 0) => right,
-        "i32or" | "i32xor" if is_const(right, 0) => left,
-        "i32shl" | "i32shrs" | "i32shru" | "i32rotl" | "i32rotr" if is_const(right, 0) => left,
         _ => return None,
     };
     Some(result.clone())
