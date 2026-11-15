@@ -756,6 +756,11 @@ lexical state binding, a catch that provably exits or replaces the state on
 all paths, and no read of the prior state in that catch. Catch-state reads,
 implicit retries, mapped arguments, closures and still-live branch guards
 keep the original writes. Original dynamic tests execute exactly once.
+The identical proof is also rerun on already-structured multi-entry SCCs,
+identified by an exact lexical state-comparison OR guarding the recovered
+inner `for (;;)` dispatcher. This handles later dead writes whose original
+compressed expressions were not yet separate statements, while leaving
+ordinary single-entry CFG reductions and their transition evidence intact.
 
 Within that same exception-preserving CFG, an independently proven
 single-entry successor on just one arm of a conditional state assignment can

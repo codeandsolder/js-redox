@@ -3681,6 +3681,147 @@ fn dead_exception_state_writes(
     }
 }
 
+/// Collect every numeric comparison that might dispatch the exact state
+/// binding, including nested tests in already-structured exception regions.
+/// Preserving assignments to these case values keeps explicit transition
+/// evidence available for subsequent normal/exceptional CFG recovery.
+struct NumericStateCaseLabels<'s> {
+    symbol: SymbolId,
+    scoping: &'s Scoping,
+    labels: BTreeSet<u64>,
+}
+
+impl<'a> Visit<'a> for NumericStateCaseLabels<'_> {
+    fn visit_binary_expression(&mut self, binary: &oxc_ast::ast::BinaryExpression<'a>) {
+        let strict = matches!(binary.operator.as_str(), "===" | "!==");
+        if matches!(binary.operator.as_str(), "==" | "===" | "!=" | "!==") {
+            for (candidate, other) in [(&binary.left, &binary.right), (&binary.right, &binary.left)]
+            {
+                if matches!(unparen(candidate), Expression::Identifier(id)
+                    if id.reference_id.get().is_some_and(|reference|
+                        self.scoping.get_reference(reference).symbol_id() == Some(self.symbol)))
+                {
+                    if let Some(value) = comparison_number(other, strict) {
+                        self.labels.insert(value);
+                    }
+                }
+            }
+        }
+        walk::walk_binary_expression(self, binary);
+    }
+}
+
+/// A multi-entry structured component uses an OR of exact numeric state
+/// comparisons as a single dispatcher guard. Require this concrete shape
+/// before running the follow-up pass: ordinary single-entry state machines
+/// keep their existing CFG rewrite and terminal-state factoring behavior.
+fn composite_state_dispatch_guard(
+    expr: &Expression<'_>,
+    symbol: SymbolId,
+    scoping: &Scoping,
+) -> bool {
+    match unparen(expr) {
+        Expression::LogicalExpression(logical) if logical.operator.as_str() == "||" => {
+            composite_state_dispatch_guard(&logical.left, symbol, scoping)
+                && composite_state_dispatch_guard(&logical.right, symbol, scoping)
+        }
+        Expression::BinaryExpression(binary)
+            if matches!(binary.operator.as_str(), "==" | "===") =>
+        {
+            let strict = binary.operator.as_str() == "===";
+            [(&binary.left, &binary.right), (&binary.right, &binary.left)]
+                .iter()
+                .any(|(candidate, other)| {
+                    matches!(unparen(candidate), Expression::Identifier(id)
+                        if id.reference_id.get().is_some_and(|reference|
+                            scoping.get_reference(reference).symbol_id() == Some(symbol)))
+                        && comparison_number(other, strict).is_some()
+                })
+        }
+        _ => false,
+    }
+}
+
+/// The source may already have been reconstructed into an outer if-ladder
+/// whose tests are no longer a simple one-state equality (e.g. a multi-entry
+/// SCC guard). Reuse the same exact lexical and exceptional liveness proof
+/// on this later AST rather than introducing a separate optimization rule.
+///
+/// Every selected write is a standalone, side-effect-free state assignment
+/// whose value is overwritten along *every* normal path before any read.
+/// A catch that can read or resume that value, or an aliased state binding,
+/// prohibits all removals. There is no output when structural CFG
+/// reconstruction already handled the case earlier in the same pass.
+pub(crate) fn dead_intermediate_writes_in_structured_try(
+    loop_stmt: &WhileStatement<'_>,
+    symbol: SymbolId,
+    scoping: &Scoping,
+    source: &str,
+    catch_scope: CatchScopeEvidence<'_>,
+) -> Vec<Span> {
+    if known_bool(&loop_stmt.test) != Some(true) || !exception_state_is_unaliased(symbol, scoping) {
+        return Vec::new();
+    }
+    let Statement::TryStatement(protected) = &loop_stmt.body else {
+        return Vec::new();
+    };
+    // Require the recovered multi-entry SCC *shape*, not merely an OR
+    // comparison: other CFG passes can introduce composite guards without
+    // moving a cycle into its own nested for(;;). Leave those alone.
+    if protected.finalizer.is_some()
+        || !matches!(protected.block.body.first(), Some(Statement::IfStatement(branch))
+            if composite_state_dispatch_guard(&branch.test, symbol, scoping)
+                && matches!(&branch.consequent, Statement::BlockStatement(block)
+                    if matches!(block.body.first(), Some(Statement::ForStatement(loop_stmt))
+                        if loop_stmt.init.is_none()
+                            && loop_stmt.test.is_none()
+                            && loop_stmt.update.is_none())))
+    {
+        return Vec::new();
+    }
+    let Some(handler) = protected.handler.as_ref() else {
+        return Vec::new();
+    };
+    let state = scoping.symbol_name(symbol);
+    let catch_exits_or_overwrites = catch_block_always_replaces_state_or_exits(
+        &handler.body.body,
+        state,
+        source,
+        scoping,
+        None,
+    ) || catch_finite_domain_always_replaces_state(
+        loop_stmt,
+        handler,
+        state,
+        source,
+        scoping,
+        catch_scope.reaching,
+        catch_scope.reference_spans,
+    );
+    if !catch_exits_or_overwrites
+        || state_binding_read(symbol, scoping, |reads| {
+            reads.visit_block_statement(&handler.body);
+        })
+    {
+        return Vec::new();
+    }
+    let mut labels = NumericStateCaseLabels {
+        symbol,
+        scoping,
+        labels: BTreeSet::new(),
+    };
+    for statement in &protected.block.body {
+        labels.visit_statement(statement);
+    }
+    let mut dead = Vec::new();
+    for statement in &protected.block.body {
+        dead_exception_state_writes(statement, true, symbol, scoping, &mut dead, &labels.labels);
+    }
+    dead.sort_by_key(|span| (span.start, span.end));
+    dead.dedup();
+    dead
+}
+
 /// Preserve exception-handling scope and the original one-state-per-iteration
 /// execution order. Only remove state comparisons proven unreachable from
 /// both the lexical initializer and every statically possible catch recovery.

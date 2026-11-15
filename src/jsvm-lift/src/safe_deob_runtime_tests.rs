@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 38] = [
+const MAIN_FIXTURES: [&str; 39] = [
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
@@ -40,6 +40,7 @@ const MAIN_FIXTURES: [&str; 38] = [
     "exception-state-multi-entry-cycle.js",
     "exception-state-multi-entry-branching.js",
     "exception-state-write-liveness.js",
+    "exception-state-structured-liveness.js",
     "boolean-switch.js",
     "inert-array-truthiness.js",
     "static-alias-installer-calls.js",
@@ -199,6 +200,38 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
         | "arithmetic-state-conditional.js" => {
             assert!(count(report, "arithmetic_state_unflatten") >= 1, "{file}");
             assert!(!report.arithmetic_state_proofs.is_empty(), "{file}");
+        }
+        "exception-state-structured-liveness.js" => {
+            assert!(
+                count(report, "dead_intermediate_state_write") >= 3,
+                "{file}: {:#?}",
+                report.transforms
+            );
+            assert!(
+                !outcome.source.contains("state = 73;"),
+                "{file}: {}",
+                outcome.source
+            );
+            assert!(
+                !outcome.source.contains("state = 94;"),
+                "{file}: {}",
+                outcome.source
+            );
+            assert!(
+                outcome.source.contains("state = 69;"),
+                "{file}: {}",
+                outcome.source
+            );
+            assert!(
+                outcome.source.contains("state = 25;"),
+                "{file}: {}",
+                outcome.source
+            );
+            assert!(
+                outcome.source.contains("for (;;) {"),
+                "{file}: {}",
+                outcome.source
+            );
         }
         "exception-state-write-liveness.js" => {
             assert!(

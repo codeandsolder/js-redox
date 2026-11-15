@@ -775,6 +775,7 @@ impl Collector<'_, '_> {
             // lexical initializer and write-provenance still prove its entry.
             if let Statement::WhileStatement(loop_stmt) = stmt {
                 if let Statement::TryStatement(protected) = &loop_stmt.body {
+                    let mut rewritten = false;
                     for (&symbol, &(initial, init_span)) in &reaching {
                         if !self.safe_numeric_state_binding(symbol)
                             || !self.reaching_state_is_stable(symbol, init_span, loop_stmt.span)
@@ -796,7 +797,36 @@ impl Collector<'_, '_> {
                         ) {
                             if let Some(dispatcher) = protected.block.body.first() {
                                 self.push(dispatcher.span(), code, "exception_state_pruned");
+                                rewritten = true;
                                 break;
+                            }
+                        }
+                    }
+                    // On subsequent fixed-point passes a recovered multi-entry
+                    // dispatcher may use an OR guard, so the original CFG
+                    // recognizer no longer matches its case shape. Reuse the
+                    // same exceptional liveness proof on that structured AST.
+                    // Never emit overlapping rewrites with a CFG reduction.
+                    if !rewritten {
+                        for (&symbol, &(_, init_span)) in &reaching {
+                            if !self.safe_numeric_state_binding(symbol)
+                                || !self.reaching_state_is_stable(symbol, init_span, loop_stmt.span)
+                            {
+                                continue;
+                            }
+                            for span in
+                                if_ladder_structure::dead_intermediate_writes_in_structured_try(
+                                    loop_stmt,
+                                    symbol,
+                                    self.scoping,
+                                    self.source,
+                                    if_ladder_structure::CatchScopeEvidence {
+                                        reaching: &reaching,
+                                        reference_spans: self.reference_spans,
+                                    },
+                                )
+                            {
+                                self.push(span, ";".to_owned(), "dead_intermediate_state_write");
                             }
                         }
                     }
@@ -6318,6 +6348,30 @@ mod tests {
             compact.contains("if(state==2)"),
             "true || must NOT be treated as executing the state assignment: {}",
             result.source
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_revisits_multi_entry_structured_state_liveness() {
+        let source = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/exception-state-structured-liveness.js"
+        );
+        let Some(result) = deobfuscate(source, 16) else {
+            unreachable!("valid source");
+        };
+        assert_eq!(source.matches("state = 73;").count(), 1);
+        assert_eq!(source.matches("state = 94;").count(), 1);
+        assert!(!result.source.contains("state = 73;"), "{}", result.source);
+        assert!(!result.source.contains("state = 94;"), "{}", result.source);
+        assert!(result.source.contains("state = 69;"), "{}", result.source);
+        assert!(result.source.contains("state = 25;"), "{}", result.source);
+        assert!(
+            result
+                .transforms
+                .get("dead_intermediate_state_write")
+                .is_some_and(|count| *count >= 3),
+            "{:#?}",
+            result.transforms
         );
     }
 
