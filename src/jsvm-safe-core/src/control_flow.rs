@@ -924,8 +924,8 @@ enum ArithmeticCaseOutcome {
     Flow(StateFlow),
     Conditional {
         test: String,
-        consequent: f64,
-        alternate: f64,
+        consequent: Value,
+        alternate: Value,
     },
 }
 
@@ -2415,7 +2415,7 @@ impl Collector<'_, '_> {
         &self,
         stmt: &Statement<'_>,
         state_var: &str,
-    ) -> Option<(String, f64, f64)> {
+    ) -> Option<(String, Value, Value)> {
         let Statement::ExpressionStatement(expression_stmt) = stmt else {
             return None;
         };
@@ -2430,15 +2430,13 @@ impl Collector<'_, '_> {
         let Expression::ConditionalExpression(conditional) = &assignment.right else {
             return None;
         };
-        let consequent = eval(&conditional.consequent)?.number()?;
-        let alternate = eval(&conditional.alternate)?.number()?;
-        if !consequent.is_finite()
-            || consequent.fract() != 0.0
-            || !alternate.is_finite()
-            || alternate.fract() != 0.0
-        {
-            return None;
-        }
+        // A state assignment keeps its primitive type: switch uses strict
+        // equality, so "3" must not be modeled as the Number 3. Retain the
+        // complete safely evaluated value for both branches.
+        let consequent = eval(&conditional.consequent)?;
+        let alternate = eval(&conditional.alternate)?;
+        consequent.render()?;
+        alternate.render()?;
         Some((
             fragment(self.source, conditional.test.span()).to_string(),
             consequent,
@@ -2513,16 +2511,16 @@ impl Collector<'_, '_> {
         &self,
         setup: &ArithmeticStateSetup<'_>,
         base_env: &HashMap<String, Value>,
-        target: f64,
+        target: Value,
     ) -> Option<ArithmeticBranchResult> {
-        let target_text = Value::Number(target).render()?;
+        let target_text = target.render()?;
         let mut env = base_env.clone();
         // Evaluating an arbitrary runtime branch condition may call user code or
         // mutate any previously known non-state value. The conditional assignment
         // itself overwrites the dispatcher state afterwards, so retain no other
         // abstract facts across that boundary.
         invalidate_opaque_state(&mut env, &setup.state_var);
-        env.insert(setup.state_var.clone(), Value::Number(target));
+        env.insert(setup.state_var.clone(), target);
         let mut chunks = vec![format!("{} = {target_text};", setup.state_var)];
         let mut state_path = Vec::new();
         let mut seen_states = HashSet::new();
@@ -2588,18 +2586,10 @@ impl Collector<'_, '_> {
                 return None;
             }
 
-            match env.get(&setup.state_var) {
-                Some(Value::Undefined) => {
-                    return Some(ArithmeticBranchResult {
-                        chunks,
-                        state_path,
-                        termination: "undefined".to_string(),
-                        register_reads_rewritten,
-                    });
-                }
-                Some(Value::Number(number)) if number.is_finite() && number.fract() == 0.0 => {}
-                _ => return None,
-            }
+            // All supported primitive states may have matching switch cases
+            // on the following iteration. Undefined is not an unconditional
+            // exit: only the actual for-loop condition can terminate the loop.
+            env.get(&setup.state_var)?.render()?;
         }
         None
     }
@@ -2712,20 +2702,10 @@ impl Collector<'_, '_> {
                 return None;
             }
 
-            match env.get(&setup.state_var) {
-                Some(Value::Undefined) => {
-                    return Some(arithmetic_state_result(
-                        it.span,
-                        &setup.state_var,
-                        state_path,
-                        &chunks,
-                        "undefined",
-                        register_reads_rewritten,
-                    ));
-                }
-                Some(Value::Number(number)) if number.is_finite() && number.fract() == 0.0 => {}
-                _ => return None,
-            }
+            // Repeat only with a precisely modeled, renderable JS state.
+            // The next evaluation of setup.test determines whether the loop
+            // exits; a typed or undefined value is not itself an exit.
+            env.get(&setup.state_var)?.render()?;
         }
         None
     }

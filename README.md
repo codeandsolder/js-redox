@@ -81,6 +81,12 @@ or lexical bindings are retained; dynamic tests are not guessed. The numeric
 state-graph reducer also handles `for (var state = initial; ...)`, state
 transitions inside `var` declaration initializers, and sequential terminating
 `return` cases, preserving function-scoped hoisted variables across branches.
+Arithmetic-switch dispatchers also retain the exact primitive types of
+conditional state assignments: string, boolean, null and undefined labels are
+matched using JavaScript's strict `switch` equality rather than numeric
+coercion. Even an `undefined` state is not assumed to terminate a loop: only
+the original loop condition may establish termination, and the next switch
+case (including `default`) is simulated when the loop continues.
 For a nonadjacent state initializer, a direct `eval` in an unrelated sibling
 callback does not block reconstruction of another callback's **own** numeric
 state. That exception is proven by the exact Oxc lexical state symbol and its

@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 33] = [
+const MAIN_FIXTURES: [&str; 34] = [
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
@@ -32,6 +32,7 @@ const MAIN_FIXTURES: [&str; 33] = [
     "arithmetic-state-registers.js",
     "arithmetic-state-try.js",
     "arithmetic-state-conditional.js",
+    "arithmetic-state-primitive-branches.js",
     "multi-exit-reducible-state.js",
     "early-abrupt-state-dispatch.js",
     "exception-resume-state.js",
@@ -193,6 +194,29 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
         | "arithmetic-state-conditional.js" => {
             assert!(count(report, "arithmetic_state_unflatten") >= 1, "{file}");
             assert!(!report.arithmetic_state_proofs.is_empty(), "{file}");
+        }
+        "arithmetic-state-primitive-branches.js" => {
+            assert_eq!(count(report, "arithmetic_state_unflatten"), 5);
+            assert_eq!(report.arithmetic_state_proofs.len(), 5);
+            assert!(
+                report.arithmetic_state_proofs.iter().any(|proof| {
+                    proof.branch_paths.is_empty()
+                        && proof.state_path.iter().any(|state| state == "void 0")
+                }),
+                "direct undefined state must dispatch through its next switch"
+            );
+            for value in ["\"3\"", "true", "null", "void 0"] {
+                assert!(
+                    report.arithmetic_state_proofs.iter().any(|proof| {
+                        proof
+                            .branch_paths
+                            .first()
+                            .and_then(|path| path.first())
+                            .is_some_and(|state| state == value)
+                    }),
+                    "missing typed state {value}"
+                );
+            }
         }
         "static-alias-installer-calls.js" => {
             assert_eq!(report.static_alias_installer_calls.len(), 2);
