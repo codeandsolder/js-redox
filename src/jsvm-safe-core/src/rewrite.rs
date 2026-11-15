@@ -286,16 +286,14 @@ mod tests {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1);
-            let start = match usize::try_from(state % 5_000) {
-                Ok(value) => value,
-                Err(_) => unreachable!(),
+            let Ok(start) = usize::try_from(state % 5_000) else {
+                unreachable!();
             };
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1);
-            let width = match usize::try_from(state % 80) {
-                Ok(value) => value,
-                Err(_) => unreachable!(),
+            let Ok(width) = usize::try_from(state % 80) else {
+                unreachable!();
             };
             replacements.push(replacement(start, start + width, &format!("r{index}")));
         }

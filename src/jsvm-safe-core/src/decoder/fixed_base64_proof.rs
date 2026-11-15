@@ -101,6 +101,22 @@ fn fixed_base64_direct_source(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
 ) -> Option<(SymbolId, u32)> {
+    fn load_alias(
+        expression: &Expression<'_>,
+        index_symbol: SymbolId,
+        scoping: &Scoping,
+    ) -> Option<SymbolId> {
+        let Expression::UnaryExpression(unary) = unparenthesized(expression) else {
+            return None;
+        };
+        if unary.operator.as_str() != "typeof" {
+            return None;
+        }
+        let (target, value) = assignment_identifier(&unary.argument)?;
+        indexed_table_symbol(value, index_symbol, scoping)?;
+        assignment_reference_symbol(target, scoping)
+    }
+
     let body = function.body.as_ref()?;
     let [Statement::IfStatement(guard), Statement::ForStatement(_), Statement::ReturnStatement(_)] =
         body.statements.as_slice()
@@ -124,22 +140,6 @@ fn fixed_base64_direct_source(
     };
     if !matches!(test.operator.as_str(), "!=" | "!==") {
         return None;
-    }
-
-    fn load_alias(
-        expression: &Expression<'_>,
-        index_symbol: SymbolId,
-        scoping: &Scoping,
-    ) -> Option<SymbolId> {
-        let Expression::UnaryExpression(unary) = unparenthesized(expression) else {
-            return None;
-        };
-        if unary.operator.as_str() != "typeof" {
-            return None;
-        }
-        let (target, value) = assignment_identifier(&unary.argument)?;
-        indexed_table_symbol(value, index_symbol, scoping)?;
-        assignment_reference_symbol(target, scoping)
     }
 
     let string_side = |expression: &Expression<'_>| matches!(eval(expression), Some(Value::String(value)) if value == "string");
@@ -193,12 +193,11 @@ struct FixedBase64Eval<'c> {
 
 impl FixedBase64Eval<'_> {
     fn consistent(slot: &mut Option<SymbolId>, symbol: SymbolId) -> bool {
-        match slot {
-            Some(existing) => *existing == symbol,
-            None => {
-                *slot = Some(symbol);
-                true
-            }
+        if let Some(existing) = slot {
+            *existing == symbol
+        } else {
+            *slot = Some(symbol);
+            true
         }
     }
 
@@ -519,7 +518,7 @@ impl<'a> GlobalContext<'a> for FixedBase64EffectContext<'_> {
     }
 }
 
-impl<'a> MayHaveSideEffectsContext<'a> for FixedBase64EffectContext<'_> {
+impl MayHaveSideEffectsContext<'_> for FixedBase64EffectContext<'_> {
     fn annotations(&self) -> bool {
         false
     }

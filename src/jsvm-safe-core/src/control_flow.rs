@@ -561,7 +561,7 @@ fn detect_sync_reference_identity_tables(
 }
 
 fn prove_reference_identity_shape(
-    shape: ReferenceIdentityShape,
+    shape: &ReferenceIdentityShape,
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> Option<(SymbolId, ReferenceIdentityTable)> {
@@ -618,7 +618,7 @@ pub fn detect_reference_identity_tables(
             .row
             .captures_iter(source)
             .filter_map(|row_caps| parse_reference_identity_shape(source, &patterns, &row_caps))
-            .filter_map(|shape| prove_reference_identity_shape(shape, scoping, reference_spans))
+            .filter_map(|shape| prove_reference_identity_shape(&shape, scoping, reference_spans))
             .collect::<HashMap<_, _>>()
     } else {
         HashMap::new()
@@ -887,12 +887,12 @@ fn eval_with_env(expr: &Expression<'_>, env: &HashMap<String, Value>) -> Option<
                 .cloned()
         }
         Expression::UnaryExpression(v) => {
-            eval_unary_value(v.operator.as_str(), eval_with_env(&v.argument, env)?)
+            eval_unary_value(v.operator.as_str(), &eval_with_env(&v.argument, env)?)
         }
         Expression::BinaryExpression(v) => eval_binary(
             v.operator.as_str(),
-            eval_with_env(&v.left, env)?,
-            eval_with_env(&v.right, env)?,
+            &eval_with_env(&v.left, env)?,
+            &eval_with_env(&v.right, env)?,
         ),
         Expression::LogicalExpression(v) => {
             match eval_logical_left(v.operator.as_str(), eval_with_env(&v.left, env)?)? {
@@ -1121,7 +1121,7 @@ fn apply_known_assignment(
     } else if let Some(binary_op) = operator.strip_suffix('=') {
         let left = env.get(name)?.clone();
         let right = eval_with_env(right, env)?;
-        eval_binary(binary_op, left, right)
+        eval_binary(binary_op, &left, &right)
     } else {
         None
     };
@@ -1755,12 +1755,12 @@ impl Collector<'_, '_> {
             }
             Expression::UnaryExpression(unary) => eval_unary_value(
                 unary.operator.as_str(),
-                self.reference_state_eval(&unary.argument, env)?,
+                &self.reference_state_eval(&unary.argument, env)?,
             ),
             Expression::BinaryExpression(value) => eval_binary(
                 value.operator.as_str(),
-                self.reference_state_eval(&value.left, env)?,
-                self.reference_state_eval(&value.right, env)?,
+                &self.reference_state_eval(&value.left, env)?,
+                &self.reference_state_eval(&value.right, env)?,
             ),
             Expression::LogicalExpression(value) => match eval_logical_left(
                 value.operator.as_str(),

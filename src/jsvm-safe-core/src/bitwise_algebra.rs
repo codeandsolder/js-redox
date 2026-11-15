@@ -268,15 +268,14 @@ fn cannot_be_negative_zero(
                     || cannot_be_negative_zero(&binary.right, primitive, scoping)
             }
             "-" => cannot_be_negative_zero(&binary.left, primitive, scoping),
-            "*" => {
-                if let Some(scalar) = integer_literal(&binary.left) {
-                    scalar > 0 && cannot_be_negative_zero(&binary.right, primitive, scoping)
-                } else if let Some(scalar) = integer_literal(&binary.right) {
-                    scalar > 0 && cannot_be_negative_zero(&binary.left, primitive, scoping)
-                } else {
-                    false
-                }
-            }
+            "*" => integer_literal(&binary.left).map_or_else(
+                || {
+                    integer_literal(&binary.right).is_some_and(|scalar| {
+                        scalar > 0 && cannot_be_negative_zero(&binary.left, primitive, scoping)
+                    })
+                },
+                |scalar| scalar > 0 && cannot_be_negative_zero(&binary.right, primitive, scoping),
+            ),
             _ => false,
         },
         _ => false,
@@ -339,7 +338,7 @@ fn simplify(
             for (op, inner) in [
                 ("|", Bits::Or(Box::new(a.clone()), Box::new(b.clone()))),
                 ("&", Bits::And(Box::new(a.clone()), Box::new(b.clone()))),
-                ("^", Bits::Xor(Box::new(a.clone()), Box::new(b.clone()))),
+                ("^", Bits::Xor(Box::new(a), Box::new(b))),
             ] {
                 alternatives.push((format!("~({na} {op} {nb})"), Bits::Not(Box::new(inner))));
             }

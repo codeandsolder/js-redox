@@ -162,8 +162,7 @@ fn parse_route(expr: &Expression<'_>, state: &str, source: &str) -> Option<Route
             result.effects.splice(
                 0..0,
                 rest.iter()
-                    .map(|expression| format!("({});", fragment(source, expression.span())))
-                    .collect::<Vec<_>>(),
+                    .map(|expression| format!("({});", fragment(source, expression.span()))),
             );
             Some(result)
         }
@@ -226,8 +225,8 @@ fn inert_after_state_write(expr: &Expression<'_>) -> bool {
             inert_after_state_write(&unary.argument)
         }
         Expression::ArrayExpression(array) => array.elements.iter().all(|item| match item {
-            ArrayExpressionElement::Elision(_) => true,
-            ArrayExpressionElement::Identifier(_)
+            ArrayExpressionElement::Elision(_)
+            | ArrayExpressionElement::Identifier(_)
             | ArrayExpressionElement::StringLiteral(_)
             | ArrayExpressionElement::NumericLiteral(_)
             | ArrayExpressionElement::NullLiteral(_)
@@ -1351,7 +1350,7 @@ impl<'a> GlobalContext<'a> for ExceptionLoopEffectContext<'_> {
     }
 }
 
-impl<'a> MayHaveSideEffectsContext<'a> for ExceptionLoopEffectContext<'_> {
+impl MayHaveSideEffectsContext<'_> for ExceptionLoopEffectContext<'_> {
     fn annotations(&self) -> bool {
         false
     }
@@ -2163,6 +2162,7 @@ fn splice_conditional_successor(route: &mut Route, target: u64, successor: &Rout
 /// A new wrapper block contains two *sibling* source statements. Neither the
 /// predecessor nor the wrapper creates lexical bindings, and the target's
 /// existing block (if any) retains its own lexical scope.
+#[derive(Clone, Copy)]
 struct ExceptionEntryProof<'a> {
     roots: &'a BTreeSet<u64>,
     reachable: &'a BTreeSet<u64>,
@@ -2248,7 +2248,7 @@ fn single_entry_exception_regions(
             // Both cases have modeled numeric transitions and exact lexical
             // source bodies; the successor must not have an independent
             // initializer/catch entry or competing source predecessor.
-            let Some(successor_route) = cases.get(&target)?.as_ref().cloned() else {
+            let Some(successor_route) = cases.get(&target)?.clone() else {
                 continue;
             };
             if !unconditional {
@@ -2468,7 +2468,7 @@ fn closed_exception_dag_region(
         ordered.push(current);
         let mut targets = Vec::new();
         cases.get(&current)?.as_ref()?.targets(&mut targets);
-        for successor in targets.into_iter().collect::<BTreeSet<_>>() {
+        for successor in targets {
             if let Some(degree) = indegrees.get_mut(&successor) {
                 *degree -= 1;
                 if *degree == 0 {
@@ -2549,10 +2549,10 @@ fn exception_branching_dag_regions(
 
     let original_text = |label: u64| -> Option<String> {
         let stmt = *statements.get(&label)?;
-        match edits.get(&label) {
-            Some(changes) => print_terminal_edits(stmt, source, changes),
-            None => Some(fragment(source, stmt.span()).to_owned()),
-        }
+        edits.get(&label).map_or_else(
+            || Some(fragment(source, stmt.span()).to_owned()),
+            |changes| print_terminal_edits(stmt, source, changes),
+        )
     };
 
     for &start in entry.reachable {
@@ -2575,17 +2575,8 @@ fn exception_branching_dag_regions(
         candidates.sort_unstable();
 
         for (_, join) in candidates {
-            let Some(ordered) = closed_exception_dag_region(
-                start,
-                join,
-                cases,
-                ExceptionEntryProof {
-                    roots: entry.roots,
-                    reachable: entry.reachable,
-                    excluded: entry.excluded,
-                },
-                &incoming,
-            ) else {
+            let Some(ordered) = closed_exception_dag_region(start, join, cases, entry, &incoming)
+            else {
                 continue;
             };
             // Keep the original two linear-arm emitter for cases it already
@@ -2682,10 +2673,10 @@ fn exception_scc_backedge_regions(
 
     let original_text = |label: u64| -> Option<String> {
         let statement = *statements.get(&label)?;
-        match edits.get(&label) {
-            Some(changes) => print_terminal_edits(statement, source, changes),
-            None => Some(fragment(source, statement.span()).to_owned()),
-        }
+        edits.get(&label).map_or_else(
+            || Some(fragment(source, statement.span()).to_owned()),
+            |changes| print_terminal_edits(statement, source, changes),
+        )
     };
 
     for region in strongly_connected_regions(&graph, entry.reachable) {
@@ -2795,7 +2786,7 @@ fn exception_scc_backedge_regions(
             ordered.push(member);
             let mut targets = Vec::new();
             graph.get(&member)?.targets(&mut targets);
-            for successor in targets.into_iter().collect::<BTreeSet<_>>() {
+            for successor in targets {
                 if let Some(degree) = indegrees.get_mut(&successor) {
                     *degree -= 1;
                     if *degree == 0 {
@@ -3043,10 +3034,10 @@ fn exception_diamond_regions(
 
     let text_of = |label: u64| -> Option<String> {
         let statement = *statements.get(&label)?;
-        match edits.get(&label) {
-            Some(changes) => print_terminal_edits(statement, source, changes),
-            None => Some(fragment(source, statement.span()).to_owned()),
-        }
+        edits.get(&label).map_or_else(
+            || Some(fragment(source, statement.span()).to_owned()),
+            |changes| print_terminal_edits(statement, source, changes),
+        )
     };
 
     for &predecessor in entry.reachable {
@@ -3251,20 +3242,16 @@ fn catch_expression_always_replaces_state(
                     catch_condition_for_numeric_value(&logical.left, symbol, value, scoping)
                 })
                 .or_else(|| known_bool(&logical.left));
-            if matches!(
+            matches!(
                 (logical.operator.as_str(), condition),
                 ("&&", Some(true)) | ("||", Some(false))
-            ) {
-                catch_expression_always_replaces_state(
-                    &logical.right,
-                    state,
-                    source,
-                    scoping,
-                    selector,
-                )
-            } else {
-                false
-            }
+            ) && catch_expression_always_replaces_state(
+                &logical.right,
+                state,
+                source,
+                scoping,
+                selector,
+            )
         }
         Expression::ConditionalExpression(conditional) => {
             let condition = selector
@@ -3471,6 +3458,7 @@ impl<'a> Visit<'a> for CatchSelectorFiniteWrites<'_> {
 /// Prove a finite lexical value domain, established before the loop. No
 /// unrecognized write is allowed in or outside the loop, and the catch must
 /// not modify the selector while its branches are being analyzed.
+#[derive(Clone, Copy)]
 struct FiniteSelectorSeed {
     symbol: SymbolId,
     initial: u64,
@@ -3652,7 +3640,7 @@ fn dead_exception_state_writes(
             live_yes |= live_no;
             live_yes
                 || state_binding_read(symbol, scoping, |reads| {
-                    reads.visit_expression(&branch.test)
+                    reads.visit_expression(&branch.test);
                 })
         }
         Statement::ExpressionStatement(expr) => {
@@ -3687,7 +3675,7 @@ fn dead_exception_state_writes(
             state_binding_read(symbol, scoping, |reads| reads.visit_expression(value))
         }),
         Statement::ThrowStatement(throw) => state_binding_read(symbol, scoping, |reads| {
-            reads.visit_expression(&throw.argument)
+            reads.visit_expression(&throw.argument);
         }),
         Statement::EmptyStatement(_) | Statement::DebuggerStatement(_) => live_after,
         _ => true,
@@ -3842,6 +3830,7 @@ pub fn dead_intermediate_writes_in_structured_try(
 /// This deliberately leaves the try/catch in place: combining states into a
 /// single iteration could alter catch-visible intermediate state or a loop
 /// condition's evaluation count.
+#[derive(Clone, Copy)]
 pub struct CatchScopeEvidence<'a> {
     pub reaching: &'a HashMap<SymbolId, (u64, Span)>,
     pub reference_spans: &'a HashMap<ReferenceId, Span>,
@@ -4335,8 +4324,7 @@ pub fn prune_exception_dispatcher(
             };
             let test = expanded_tests
                 .get(&label)
-                .map(String::as_str)
-                .unwrap_or_else(|| fragment(source, branch.test.span()));
+                .map_or_else(|| fragment(source, branch.test.span()), String::as_str);
             alternatives.push(format!("if ({test}) {consequent}"));
         } else {
             hoisted.visit_statement(&branch.consequent);
@@ -4540,10 +4528,7 @@ fn reconstruct_state_loop(
             hoisted.names.into_iter().collect::<Vec<_>>().join(", ")
         )
     };
-    Some(format!(
-        "{{\n{init_text}\n{declarations}{code}\n}}",
-        init_text = initial_text
-    ))
+    Some(format!("{{\n{initial_text}\n{declarations}{code}\n}}"))
 }
 
 #[cfg(test)]

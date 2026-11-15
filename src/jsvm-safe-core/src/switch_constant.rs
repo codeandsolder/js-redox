@@ -224,8 +224,8 @@ fn value_after_evaluation(expr: &Expression<'_>) -> Option<crate::value_eval::Va
         }
         Expression::BinaryExpression(binary) => eval_binary(
             binary.operator.as_str(),
-            value_after_evaluation(&binary.left)?,
-            value_after_evaluation(&binary.right)?,
+            &value_after_evaluation(&binary.left)?,
+            &value_after_evaluation(&binary.right)?,
         ),
         Expression::SequenceExpression(sequence) => {
             value_after_evaluation(sequence.expressions.last()?)
@@ -367,10 +367,10 @@ fn structure_boolean_switch_with_dynamic_suffix(
     }
     let mut other_body = boolean_switch_branch(node, default, source)?;
     for (condition, body) in choices.into_iter().rev() {
-        other_body = match condition {
-            Some(condition) => format!("if ({condition}) {{\n{body}\n}} else {{\n{other_body}\n}}"),
-            None => format!("{{\n{body}\n}}"),
-        };
+        other_body = condition.map_or_else(
+            || format!("{{\n{body}\n}}"),
+            |condition| format!("if ({condition}) {{\n{body}\n}} else {{\n{other_body}\n}}"),
+        );
     }
     let (true_body, false_body) = if first_value {
         (first_body, other_body)
@@ -400,15 +400,14 @@ pub fn structure_boolean_switch(node: &SwitchStatement<'_>, source: &str) -> Opt
     let mut labels = Vec::with_capacity(node.cases.len());
     let mut default_index = None;
     for (index, case) in node.cases.iter().enumerate() {
-        let value = match &case.test {
-            Some(expr) => match eval(expr)? {
+        let value = if let Some(expr) = &case.test {
+            match eval(expr)? {
                 crate::value_eval::Value::Bool(value) => Some(value),
                 _ => return None,
-            },
-            None => {
-                default_index = Some(index);
-                None
             }
+        } else {
+            default_index = Some(index);
+            None
         };
         labels.push(value);
         for statement in &case.consequent {

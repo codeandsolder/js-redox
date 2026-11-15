@@ -4,13 +4,13 @@
 /// zero compares equal to the other, and NaN never compares equal (even when
 /// its payload bits happen to match). This is *not* SameValue/Object.is.
 #[must_use]
-pub fn js_number_equal(left: f64, right: f64) -> bool {
+pub const fn js_number_equal(left: f64, right: f64) -> bool {
+    const ABS_MASK: u64 = 0x7fff_ffff_ffff_ffff;
     if left.is_nan() || right.is_nan() {
         return false;
     }
     let left_bits = left.to_bits();
     let right_bits = right.to_bits();
-    const ABS_MASK: u64 = 0x7fff_ffff_ffff_ffff;
     left_bits == right_bits || ((left_bits & ABS_MASK) == 0 && (right_bits & ABS_MASK) == 0)
 }
 
@@ -83,7 +83,7 @@ mod tests {
             f64::from_bits(0x7ff8_0000_0000_0001)
         ));
         assert!(js_number_equal(42.0, 42.0));
-        assert!(!js_number_equal(42.0, 42.00000000000001));
+        assert!(!js_number_equal(42.0, 42.000_000_000_000_01));
     }
 
     #[test]

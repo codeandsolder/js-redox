@@ -16,14 +16,6 @@ pub struct BrowserLegacyCallAssignmentRecovery {
 }
 
 fn expression_is_call(source: &str) -> bool {
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, SourceType::cjs()).parse();
-    if parsed.fatal_error || !parsed.diagnostics.is_empty() || parsed.program.body.len() != 1 {
-        return false;
-    }
-    let Statement::ExpressionStatement(statement) = &parsed.program.body[0] else {
-        return false;
-    };
     fn is_call(expression: &Expression<'_>) -> bool {
         match expression {
             Expression::CallExpression(_) => true,
@@ -33,6 +25,14 @@ fn expression_is_call(source: &str) -> bool {
             _ => false,
         }
     }
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, source, SourceType::cjs()).parse();
+    if parsed.fatal_error || !parsed.diagnostics.is_empty() || parsed.program.body.len() != 1 {
+        return false;
+    }
+    let Statement::ExpressionStatement(statement) = &parsed.program.body[0] else {
+        return false;
+    };
     is_call(&statement.expression)
 }
 

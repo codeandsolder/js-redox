@@ -120,10 +120,9 @@ pub fn decode_fixed_base64_latin1(input: &str, alphabet: &str) -> Option<String>
     let mut index = 0usize;
     while index < filtered.len() {
         let symbol = |offset: usize| -> Option<usize> {
-            match filtered.get(index + offset) {
-                Some(ch) => alphabet.iter().position(|candidate| candidate == ch),
-                None => Some(0),
-            }
+            filtered.get(index + offset).map_or(Some(0), |ch| {
+                alphabet.iter().position(|candidate| candidate == ch)
+            })
         };
         let a = symbol(0)?;
         let b = symbol(1)?;

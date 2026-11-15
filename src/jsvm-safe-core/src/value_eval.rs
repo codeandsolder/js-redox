@@ -40,10 +40,10 @@ pub fn string_literal_value(literal: &StringLiteral<'_>) -> Option<String> {
 /// proof domain, so the recovery fails closed.
 #[must_use]
 pub fn template_element_value(quasi: &TemplateElement<'_>) -> Option<String> {
-    match quasi.value.cooked.as_ref() {
-        Some(cooked) => (*cooked).as_str().map(str::to_owned),
-        None => Some(quasi.value.raw.as_str().to_owned()),
-    }
+    quasi.value.cooked.as_ref().map_or_else(
+        || Some(quasi.value.raw.as_str().to_owned()),
+        |cooked| (*cooked).as_str().map(str::to_owned),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -163,8 +163,8 @@ where
         Expression::UnaryExpression(v) => eval_unary_with_resolver(v, resolve),
         Expression::BinaryExpression(v) => eval_binary(
             v.operator.as_str(),
-            eval_with_resolver(&v.left, resolve)?,
-            eval_with_resolver(&v.right, resolve)?,
+            &eval_with_resolver(&v.left, resolve)?,
+            &eval_with_resolver(&v.right, resolve)?,
         ),
         Expression::LogicalExpression(v) => eval_logical_with_resolver(v, resolve),
         Expression::ConditionalExpression(v) => {
@@ -247,7 +247,7 @@ pub fn eval_unary(v: &UnaryExpression<'_>) -> Option<Value> {
     eval_unary_with_resolver(v, &|_| None)
 }
 
-pub fn eval_unary_value(op: &str, value: Value) -> Option<Value> {
+pub fn eval_unary_value(op: &str, value: &Value) -> Option<Value> {
     match op {
         "!" => Some(Value::Bool(!value.truthy())),
         "+" => value.number().map(Value::Number),
@@ -279,7 +279,7 @@ where
         return known_bool_with_resolver(&v.argument, resolve).map(|x| Value::Bool(!x));
     }
     let value = eval_with_resolver(&v.argument, resolve)?;
-    eval_unary_value(op, value)
+    eval_unary_value(op, &value)
 }
 
 #[inline]
@@ -313,7 +313,7 @@ fn abstract_primitive_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
-pub fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
+pub fn eval_binary(op: &str, left: &Value, right: &Value) -> Option<Value> {
     match op {
         "+" => {
             if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
@@ -358,14 +358,14 @@ pub fn eval_binary(op: &str, left: Value, right: Value) -> Option<Value> {
         "&" => Some(Value::Number(f64::from(
             js_to_int32(left.number()?) & js_to_int32(right.number()?),
         ))),
-        "===" => Some(Value::Bool(same_value(&left, &right))),
-        "!==" => Some(Value::Bool(!same_value(&left, &right))),
+        "===" => Some(Value::Bool(same_value(left, right))),
+        "!==" => Some(Value::Bool(!same_value(left, right))),
         "==" | "!=" => {
-            let equal = abstract_primitive_equal(&left, &right);
+            let equal = abstract_primitive_equal(left, right);
             Some(Value::Bool(if op == "==" { equal } else { !equal }))
         }
         "<" | "<=" | ">" | ">=" => {
-            let result = if let (Value::String(a), Value::String(b)) = (&left, &right) {
+            let result = if let (Value::String(a), Value::String(b)) = (left, right) {
                 match op {
                     "<" => a < b,
                     "<=" => a <= b,
@@ -401,12 +401,19 @@ pub enum LogicalStep {
 
 pub fn eval_logical_left(op: &str, left: Value) -> Option<LogicalStep> {
     match op {
-        "&&" if left.truthy() => Some(LogicalStep::EvaluateRight),
-        "&&" => Some(LogicalStep::Value(left)),
-        "||" if left.truthy() => Some(LogicalStep::Value(left)),
-        "||" => Some(LogicalStep::EvaluateRight),
-        "??" if matches!(left, Value::Null | Value::Undefined) => Some(LogicalStep::EvaluateRight),
-        "??" => Some(LogicalStep::Value(left)),
+        "&&" | "||" | "??" => {
+            let evaluate_right = match op {
+                "&&" => left.truthy(),
+                "||" => !left.truthy(),
+                "??" => matches!(left, Value::Null | Value::Undefined),
+                _ => unreachable!(),
+            };
+            Some(if evaluate_right {
+                LogicalStep::EvaluateRight
+            } else {
+                LogicalStep::Value(left)
+            })
+        }
         _ => None,
     }
 }

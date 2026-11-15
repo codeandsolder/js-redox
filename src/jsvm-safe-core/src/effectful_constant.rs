@@ -48,7 +48,7 @@ fn evaluate(expr: &Expression<'_>, source: &str) -> Option<KnownEffects> {
         Expression::BinaryExpression(binary) => {
             let mut left = evaluate(&binary.left, source)?;
             let right = evaluate(&binary.right, source)?;
-            let value = eval_binary(binary.operator.as_str(), left.value, right.value)?;
+            let value = eval_binary(binary.operator.as_str(), &left.value, &right.value)?;
             left.effects.extend(right.effects);
             Some(KnownEffects {
                 value,
@@ -86,7 +86,7 @@ fn evaluate(expr: &Expression<'_>, source: &str) -> Option<KnownEffects> {
         }
         Expression::UnaryExpression(unary) => {
             let argument = evaluate(&unary.argument, source)?;
-            let value = eval_unary_value(unary.operator.as_str(), argument.value)?;
+            let value = eval_unary_value(unary.operator.as_str(), &argument.value)?;
             Some(KnownEffects {
                 value,
                 effects: argument.effects,
@@ -145,7 +145,7 @@ mod tests {
         assert!(output.contains("log.push(1)"), "{output}");
         assert!(output.contains("log.push(2)"), "{output}");
         assert!(!output.contains("log.push(3)"), "{output}");
-        assert!(output.contains("6"), "{output}");
+        assert!(output.contains('6'), "{output}");
         Ok(())
     }
 
