@@ -9,6 +9,7 @@ mod decoder;
 mod decoder_encoding;
 mod effect_statements;
 mod effectful_constant;
+mod empty_iife;
 mod if_ladder_structure;
 mod numeric;
 mod proxy;
@@ -960,6 +961,15 @@ impl Collector<'_, '_> {
         !call.optional && !call.arguments.iter().any(Argument::is_spread)
     }
 
+    fn try_empty_iife_rewrite(
+        &mut self,
+        call: &CallExpression<'_>,
+    ) -> Option<CallRewriteTraversal> {
+        let text = empty_iife::simplify_empty_iife(call, self.source)?;
+        self.push(call.span, text, "empty_iife_eliminated");
+        Some(CallRewriteTraversal::Stop)
+    }
+
     fn try_selector_dispatch_rewrite(
         &mut self,
         call: &CallExpression<'_>,
@@ -1552,7 +1562,8 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
 
     fn visit_call_expression(&mut self, it: &CallExpression<'a>) {
         let rewrite = self
-            .try_selector_dispatch_rewrite(it)
+            .try_empty_iife_rewrite(it)
+            .or_else(|| self.try_selector_dispatch_rewrite(it))
             .or_else(|| self.try_proxy_call_rewrite(it))
             .or_else(|| self.try_from_char_code_alias_rewrite(it))
             .or_else(|| self.try_pure_function_rewrite(it))

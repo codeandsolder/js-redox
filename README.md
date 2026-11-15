@@ -611,6 +611,18 @@ write data or throw) before discarding the result. Coercing unary operators
 and reference-sensitive typeof/delete retain opaque behavior until their
 individual steps can be modeled. These remain plans for possible evaluation
 order and analyst navigation, not runtime traces or executable rewrites.
+
+The **executable safe deobfuscator**, independently of those analyst views,
+also removes directly invoked synchronous empty function/arrow literals.
+A call whose callee is such a literal, with no body effects or parameter
+initialization effects, is replaced by the original nonspread argument
+expressions evaluated once in order, followed by void 0. The no-argument
+case becomes void 0 directly. Spreads, destructuring/default parameters,
+async functions, generators and nonempty bodies remain calls: rewriting
+their invocation can change observable iteration, binding or return
+semantics. This AST-backed semantic transformation is reported as
+empty_iife_eliminated; it applies to actual recovered JavaScript, not
+merely to a formatted helper view.
 Each view records its source hash and generated artifact hash in the
 whole-program `helpers.json` v4 report, without modifying the polished
 helper or its source-backed extract. Every exact source-backed helper extract
