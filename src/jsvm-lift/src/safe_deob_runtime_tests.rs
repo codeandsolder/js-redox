@@ -358,6 +358,25 @@ function execute(mode) {
 for (const mode of [0,1,2,3,4,5,6]) {
     console.log(JSON.stringify([mode,execute(mode)]));
 }
+function controlPlacement(mode) {
+    const events = [];
+    const sink = new Proxy({p: 0}, {
+        set(target, key, value) {
+            events.push('set:' + key + ':' + value);
+            return Reflect.set(target, key, value);
+        }
+    });
+    function first() { events.push('first'); return null; }
+    if (mode === 0) ((first(), sink).p = 1);
+    if (mode === 1) ((first(), sink).p = 2);
+    if (mode === 2) { let n = 0; while (n++ < 2) ((first(), sink).p = n); }
+    if (mode === 3) { label: ((first(), sink).p = 4); }
+    if (mode === 4) { if (false) ((first(), sink).p = 5); }
+    return [events, sink.p];
+}
+for (const mode of [0,1,2,3,4]) {
+    console.log(JSON.stringify(['control', mode, controlPlacement(mode)]));
+}
 "#;
     let result = deobfuscate_source(
         source,

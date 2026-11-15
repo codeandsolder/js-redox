@@ -901,20 +901,30 @@ mod tests {
     }
 
     #[test]
-    fn refuses_ambiguous_comments_and_non_sibling_placements() -> Result<(), BudgetExceeded> {
-        let inputs = [
+    fn retains_ambiguous_comments_and_conditional_effect_order() -> Result<(), BudgetExceeded> {
+        // Source comments cannot be safely attached across the reassociation.
+        // Unlike lifting to sibling statements, expression-level reassociation
+        // *can* run inside branches, loops, labels, and script completion.
+        for input in [
             "function f(o){((first()/*between*/,o).p=1);}",
             "function f(o){((first(),o/*after*/).p=1);}",
+        ] {
+            let output = rewritten(input)?;
+            assert!(output.contains("/*"), "{output}");
+            assert!(output.contains("first()"), "{output}");
+            assert!(!output.contains("(first());"), "{output}");
+        }
+        for input in [
             "function f(o){if(ready)((first(),o).p=1);}",
             "function f(o){while(ready)((first(),o).p=1);}",
             "function f(o){label:((first(),o).p=1);}",
             "((first(),o).p=1);",
-        ];
-        for input in inputs {
+        ] {
             let output = rewritten(input)?;
+            assert_eq!(output.matches("first()").count(), 1, "{output}");
             assert!(
-                !output.contains("(first());"),
-                "unsupported placement/comment must not be split: {output}"
+                output.contains(".p=1") || output.contains(".p = 1"),
+                "{output}"
             );
         }
         Ok(())
