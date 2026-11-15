@@ -3274,11 +3274,30 @@ pub(crate) fn prune_exception_dispatcher(
     let Statement::TryStatement(protected) = &loop_stmt.body else {
         return None;
     };
-    if protected.finalizer.is_some() || protected.block.body.len() != 1 {
+    if protected.finalizer.is_some() {
         return None;
     }
+    let [dispatcher, tail @ ..] = protected.block.body.as_slice() else {
+        return None;
+    };
+    // A trailing, nonthrowing return guard is a separate terminal CFG
+    // case, not another dispatch iteration. Keep its source statement
+    // exactly where it was: it must still run after the current iteration's
+    // state assignment, inside the same try/catch.
+    let trailing_exit = match tail {
+        [] => None,
+        [Statement::IfStatement(branch)] if branch.alternate.is_none() => {
+            let target = state_test(&branch.test, state)?;
+            if branch.test.may_have_side_effects(&effects)
+                || nonthrowing_return(&branch.consequent, scoping, source).is_none()
+            {
+                return None;
+            }
+            Some((target, &branch.consequent))
+        }
+        _ => return None,
+    };
     let handler = protected.handler.as_ref()?;
-    let dispatcher = &protected.block.body[0];
 
     let mut writes = ExceptionStateWrites {
         symbol,
@@ -3310,6 +3329,18 @@ pub(crate) fn prune_exception_dispatcher(
     collect_dispatch_statement(dispatcher, state, exit, source, &mut cases)?;
     if cases.contains_key(&exit) {
         return None;
+    }
+    if let Some((target, _)) = trailing_exit {
+        if target == exit || cases.contains_key(&target) {
+            return None;
+        }
+        cases.insert(
+            target,
+            Some(Route {
+                effects: Vec::new(),
+                next: Next::State(exit),
+            }),
+        );
     }
 
     // Skipping an iteration is only valid if its loop predicate is pure and
@@ -3381,6 +3412,9 @@ pub(crate) fn prune_exception_dispatcher(
     );
     let confined_state = catch_retries_unchanged && confined_exception_state(symbol, scoping);
     let mut source_cases = BTreeMap::new();
+    if let Some((target, tail)) = trailing_exit {
+        source_cases.insert(target, tail);
+    }
     let mut cursor = dispatcher;
     loop {
         let Statement::IfStatement(branch) = cursor else {
@@ -3465,14 +3499,18 @@ pub(crate) fn prune_exception_dispatcher(
     // absorbed states so a second rewrite cannot discard its source body.
     // This preserves disjoint straight-line improvements in the same pass.
     let (combined_regions, absorbed_regions) = if known_bool(&loop_stmt.test) == Some(true) {
-        let empty = BTreeSet::new();
+        // The source of a trailing completion is *outside* the dispatcher.
+        // Its synthetic CFG exit must never be moved into an inlined region.
+        let excluded = trailing_exit
+            .map(|(target, _)| BTreeSet::from([target]))
+            .unwrap_or_default();
         let (mut combined, mut absorbed) = exception_diamond_regions(
             dispatcher,
             state,
             ExceptionEntryProof {
                 roots: &roots,
                 reachable: &reachable,
-                excluded: &empty,
+                excluded: &excluded,
             },
             &mut cases,
             &retargeted,
@@ -3486,7 +3524,7 @@ pub(crate) fn prune_exception_dispatcher(
                 ExceptionEntryProof {
                     roots: &roots,
                     reachable: &reachable,
-                    excluded: &empty,
+                    excluded: &excluded,
                 },
                 &mut cases,
                 &retargeted,
@@ -3503,7 +3541,7 @@ pub(crate) fn prune_exception_dispatcher(
                 ExceptionEntryProof {
                     roots: &roots,
                     reachable: &reachable,
-                    excluded: &empty,
+                    excluded: &excluded,
                 },
                 &mut cases,
                 &retargeted,
@@ -3527,7 +3565,8 @@ pub(crate) fn prune_exception_dispatcher(
                 work.extend(next);
             }
         }
-        let mut excluded = absorbed.clone();
+        let mut excluded = excluded;
+        excluded.extend(absorbed.iter().copied());
         excluded.extend(combined.keys().copied());
         let (linear, linear_absorbed) = single_entry_exception_regions(
             dispatcher,
@@ -3658,7 +3697,10 @@ pub(crate) fn prune_exception_dispatcher(
     if hoisted.unsupported || hoisted.function_declaration {
         return None;
     }
-    if (alternatives.len() == cases.len() && retargeted.is_empty() && completion_tail.is_empty())
+    let dispatch_case_count = cases.len() - usize::from(trailing_exit.is_some());
+    if (alternatives.len() == dispatch_case_count
+        && retargeted.is_empty()
+        && completion_tail.is_empty())
         || (alternatives.is_empty() && completion_tail.is_empty())
     {
         return None;

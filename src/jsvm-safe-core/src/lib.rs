@@ -2273,6 +2273,110 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_prunes_with_trailing_nonthrowing_return() {
+        let source = r#"
+            function f(log) {
+                let state=57;
+                while(true) try {
+                    if(state==99){log.push("dead");state=30;}
+                    else if(state==57)state=73;
+                    else if(state==73)state=30;
+                    if(state==30)return log;
+                } catch(error) { throw error; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+        assert!(!result.source.contains("dead"), "{}", result.source);
+        assert!(
+            result.source.contains("if(state==30)return log"),
+            "{}",
+            result.source
+        );
+        assert!(result.source.contains("catch"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_trailing_completion_keeps_catch_root() {
+        let source = r#"
+            function f(log) {
+                let state=1;
+                while(true) try {
+                    if(state==99){log.push("dead");state=30;}
+                    else if(state==1){log.push("try");state=2;}
+                    else if(state==2){log.push("resumed");state=30;}
+                    if(state==30)return log;
+                } catch(error) { log.push(error.message);state=2; }
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+        assert!(!result.source.contains("dead"), "{}", result.source);
+        assert!(
+            result.source.contains("if(state==30)return log"),
+            "{}",
+            result.source
+        );
+        assert!(result.source.contains("resumed"), "{}", result.source);
+        assert!(result.source.contains("catch"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_refuses_conflicting_trailing_return_label() {
+        let source = r#"
+            function f(log) {
+                let state=1;
+                while(true) try {
+                    if(state==99){log.push("dead");state=30;}
+                    else if(state==1)state=30;
+                    else if(state==30)log.push("before-return");
+                    if(state==30)return log;
+                } catch(error) {throw error;}
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            !result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+        assert!(result.source.contains("dead"), "{}", result.source);
+    }
+
+    #[test]
+    fn exception_dispatcher_refuses_effectful_trailing_completion() {
+        let source = r#"
+            function f(log) {
+                let state=1;
+                while(true) try {
+                    if(state==99){log.push("dead");state=30;}
+                    else if(state==1)state=30;
+                    if(state==30)return log.push("done");
+                } catch(error) {throw error;}
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(result.is_some(), "valid source");
+        let Some(result) = result else { unreachable!() };
+        assert!(
+            !result.transforms.contains_key("exception_state_pruned"),
+            "{result:?}"
+        );
+        assert!(result.source.contains("dead"), "{}", result.source);
+    }
+
+    #[test]
     fn exception_dispatcher_prunes_unreachable_state_but_keeps_catch_resume_root() {
         let source = r#"
             function f(flag, log) {

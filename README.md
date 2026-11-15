@@ -716,7 +716,13 @@ Exception-sensitive state dispatchers retain their original try/catch
 and one-state-per-iteration semantics. Exact lexical-state reachability
 includes catch-resume assignments as additional roots, so unreachable
 case comparisons can be removed without erasing recovery paths or moving
-potentially throwing operations across the handler.
+potentially throwing operations across the handler. The reachability
+proof also recognizes a single nonthrowing numeric-state return guard
+*after* the dispatcher in the same try block as an exceptional-graph
+terminal. Its actual source remains at the original position after the
+normal state case; catch handlers and the one-iteration boundary are
+untouched. Effectful return expressions, duplicate case labels and
+unmodelled trailing statements block this extension.
 
 Numeric-state control-flow recovery also structures single-entry reducible
 cycles with early exits from the middle of their bodies. The original
