@@ -22,7 +22,7 @@ pub struct StructuralInputCopyLoadReport {
     /// wasm-bindgen helper on paths from the proven set-like call to this load.
     /// Cross-language correlation may discharge these only with an exact pure
     /// `length` handler proof for the same module/import object and a proven
-    /// Uint32Array source.
+    /// `Uint32Array` source.
     pub source_length_import_barriers: Vec<usize>,
     /// Other imported calls reachable before this load. These remain opaque
     /// memory barriers and prevent byte-integrity claims.
@@ -474,10 +474,10 @@ fn provider_chain(
     };
     let memory_import = nested
         .and_then(|function| names.memory_slot_import(function))
-        .map(|function| function.index());
+        .map(waffle::entity::EntityRef::index);
     (
         Some(provider.index()),
-        nested.map(|function| function.index()),
+        nested.map(waffle::entity::EntityRef::index),
         memory_import,
     )
 }
@@ -962,12 +962,11 @@ fn barriers_before_load(
             let barriers = analyzer.instruction(block_definition.insts[position]);
             next.merge(&barriers);
             let next_key = (block.index(), position + 1);
-            let changed = match states.get_mut(&next_key) {
-                Some(existing) => existing.merge(&next),
-                None => {
-                    states.insert(next_key, next);
-                    true
-                }
+            let changed = if let Some(existing) = states.get_mut(&next_key) {
+                existing.merge(&next)
+            } else {
+                states.insert(next_key, next);
+                true
             };
             if changed {
                 queue.push_back((block, position + 1));
@@ -976,12 +975,11 @@ fn barriers_before_load(
         }
         block_definition.terminator.visit_targets(|target| {
             let next_key = (target.block.index(), 0);
-            let changed = match states.get_mut(&next_key) {
-                Some(existing) => existing.merge(&state),
-                None => {
-                    states.insert(next_key, state.clone());
-                    true
-                }
+            let changed = if let Some(existing) = states.get_mut(&next_key) {
+                existing.merge(&state)
+            } else {
+                states.insert(next_key, state.clone());
+                true
             };
             if changed {
                 queue.push_back((target.block, 0));

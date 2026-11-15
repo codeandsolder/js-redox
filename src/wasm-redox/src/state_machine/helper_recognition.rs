@@ -528,8 +528,7 @@ pub(super) fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> 
         .collect::<BTreeSet<_>>();
     let direct_callees = module.funcs[root]
         .body()
-        .map(direct_called_functions)
-        .unwrap_or_default();
+        .map_or_default(direct_called_functions);
     let mut candidates = direct_callees
         .iter()
         .copied()
@@ -545,8 +544,7 @@ pub(super) fn build_semantic_call_names(module: &mut Module<'_>, root: Func) -> 
         }
         let nested = module.funcs[callee]
             .body()
-            .map(direct_called_functions)
-            .unwrap_or_default();
+            .map_or_default(direct_called_functions);
         candidates.extend(
             nested
                 .into_iter()

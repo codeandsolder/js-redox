@@ -64,7 +64,7 @@ fn normalize(expression: &SemanticExpression, referenced: &BTreeSet<usize>) -> S
     }
 }
 
-fn constant_value(expression: &SemanticExpression) -> Option<u32> {
+const fn constant_value(expression: &SemanticExpression) -> Option<u32> {
     let SemanticExpression::I32Const { value } = expression else {
         return None;
     };

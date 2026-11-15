@@ -42,6 +42,7 @@ pub struct FreshI32CallReport {
 }
 
 impl FreshI32CallReport {
+    #[must_use]
     pub fn proven_result(&self) -> Option<u32> {
         (self.outcome == FreshEvalOutcome::Returned)
             .then_some(self.i32_result)
@@ -106,6 +107,7 @@ pub struct FreshI32SequenceReport {
 }
 
 impl FreshI32SequenceReport {
+    #[must_use]
     pub fn proven_result(&self, step: usize) -> Option<u32> {
         (self.outcome == FreshEvalOutcome::Returned)
             .then(|| self.steps.get(step)?.i32_result)
@@ -289,7 +291,7 @@ pub fn evaluate_fresh_i32_sequence(
     if calls.is_empty() || fuel_limit_per_call == 0 {
         return Ok(failed(FreshEvalOutcome::InvalidRequest));
     }
-    match catch_unwind(AssertUnwindSafe(|| {
+    if let Ok(report) = catch_unwind(AssertUnwindSafe(|| {
         evaluate_sequence_inner(
             bytes,
             initial_table_grows,
@@ -298,11 +300,10 @@ pub fn evaluate_fresh_i32_sequence(
             budget,
         )
     })) {
-        Ok(report) => report,
-        Err(_) => {
-            budget.checkpoint()?;
-            Ok(failed(FreshEvalOutcome::UnsupportedOrPanicked))
-        }
+        report
+    } else {
+        budget.checkpoint()?;
+        Ok(failed(FreshEvalOutcome::UnsupportedOrPanicked))
     }
 }
 

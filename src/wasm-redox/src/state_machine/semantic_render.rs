@@ -34,7 +34,7 @@ pub enum SemanticExpression {
     Operation {
         value: usize,
         operator: String,
-        arguments: Vec<SemanticExpression>,
+        arguments: Vec<Self>,
     },
 }
 
@@ -210,7 +210,9 @@ fn build_semantic_expression(
                 };
             }
             let expression = if let Some(source) = reverse_bits_source(body, value) {
-                if source != value {
+                if source == value {
+                    semantic_operator_expression(body, value, op, *arg_ref, depth, context)
+                } else {
                     SemanticExpression::Operation {
                         value: value.index(),
                         operator: "reverse_bits32".to_owned(),
@@ -221,8 +223,6 @@ fn build_semantic_expression(
                             context,
                         )],
                     }
-                } else {
-                    semantic_operator_expression(body, value, op, *arg_ref, depth, context)
                 }
             } else {
                 semantic_operator_expression(body, value, op, *arg_ref, depth, context)

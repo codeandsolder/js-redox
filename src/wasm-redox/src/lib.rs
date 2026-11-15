@@ -95,7 +95,7 @@ pub struct ModuleReport {
     pub strings: Vec<String>,
 }
 
-fn import_kind(ty: TypeRef) -> &'static str {
+const fn import_kind(ty: TypeRef) -> &'static str {
     match ty {
         TypeRef::Func(_) | TypeRef::FuncExact(_) => "function",
         TypeRef::Table(_) => "table",
@@ -105,7 +105,7 @@ fn import_kind(ty: TypeRef) -> &'static str {
     }
 }
 
-fn export_kind(kind: ExternalKind) -> &'static str {
+const fn export_kind(kind: ExternalKind) -> &'static str {
     match kind {
         ExternalKind::Func | ExternalKind::FuncExact => "function",
         ExternalKind::Table => "table",
@@ -185,7 +185,7 @@ pub fn analyze(bytes: &[u8], budget: &WorkBudget) -> Result<ModuleReport> {
             Payload::ImportSection(reader) => {
                 for group in reader {
                     budget.checkpoint()?;
-                    for import in group.context("parse import group")?.into_iter() {
+                    for import in group.context("parse import group")? {
                         budget.checkpoint()?;
                         let (_, import) = import.context("parse import")?;
                         let kind = import_kind(import.ty);

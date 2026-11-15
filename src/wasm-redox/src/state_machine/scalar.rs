@@ -403,7 +403,7 @@ fn identity_bit_permutation(base: Value) -> BitPermutation {
     }
 }
 
-fn zero_bit_permutation(base: Value) -> BitPermutation {
+const fn zero_bit_permutation(base: Value) -> BitPermutation {
     BitPermutation {
         base,
         bits: [None; 32],
@@ -450,9 +450,7 @@ fn bit_permutation(
                 ("i32or", [left, right]) => {
                     let left = bit_permutation(body, *left, depth.saturating_sub(1), visiting)?;
                     let right = bit_permutation(body, *right, depth.saturating_sub(1), visiting)?;
-                    if left.base != right.base {
-                        None
-                    } else {
+                    if left.base == right.base {
                         let mut bits = [None; 32];
                         for (bit, merged) in bits.iter_mut().enumerate() {
                             *merged = match (left.bits[bit], right.bits[bit]) {
@@ -469,12 +467,11 @@ fn bit_permutation(
                             base: left.base,
                             bits,
                         })
+                    } else {
+                        None
                     }
                 }
-                ("i32shl", [source, amount])
-                | ("i32shru", [source, amount])
-                | ("i32rotl", [source, amount])
-                | ("i32rotr", [source, amount]) => {
+                ("i32shl" | "i32shru" | "i32rotl" | "i32rotr", [source, amount]) => {
                     let amount = i32_const(body, *amount)? & 31;
                     let source = bit_permutation(body, *source, depth.saturating_sub(1), visiting)?;
                     let mut bits = [None; 32];
