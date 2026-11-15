@@ -13,6 +13,17 @@ use oxc_ast::ast::{
 use oxc_ecmascript::{StringToNumber, ToInt32, ToUint32};
 use oxc_syntax::number::ToJsString;
 
+/// A JavaScript array index is a canonical decimal property key in
+/// [0, 2^32 - 2]. Computed members use ToPropertyKey, *not* ToNumber:
+/// arr[true] reads "true", not index 1, and arr["01"] is not arr[1].
+/// Signed numeric zero becomes "0"; the string "-0" remains distinct.
+#[must_use]
+pub(crate) fn canonical_array_index(value: &Value) -> Option<u32> {
+    let key = value.js_string()?;
+    let index = key.parse::<u32>().ok()?;
+    (index != u32::MAX && index.to_string() == key).then_some(index)
+}
+
 /// Convert an Oxc JavaScript string literal into Rust UTF-8.
 ///
 /// Oxc preserves lone UTF-16 surrogates in `JSStr`; js-redox's proof domain

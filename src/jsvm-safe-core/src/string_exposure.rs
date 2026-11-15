@@ -1,5 +1,5 @@
 use crate::rewrite::{apply, Counts, Replacement};
-use crate::value_eval::{eval, eval_binary, Value};
+use crate::value_eval::{canonical_array_index, eval, eval_binary, Value};
 use crate::{
     array_element, parse_as, reference_is_statically_resolved_read, semantically_valid_source_type,
     symbol_of, SafeSourceMode,
@@ -49,15 +49,8 @@ impl<'a> Visit<'a> for StaticArrayCandidateCollector {
     }
 }
 
-/// Array element lookup is a property-key operation, not ToNumber.
-///
-/// `arr[true]` reads the property "true", not index 1, while `arr["01"]`
-/// reads "01", not index 1. Only canonical nonnegative decimal keys refer
-/// to the array's own indexed elements. Number(-0) stringifies to "0".
-fn canonical_array_index(expr: &Expression<'_>) -> Option<usize> {
-    let key = eval(expr)?.js_string()?;
-    let index = key.parse::<usize>().ok()?;
-    (index.to_string() == key).then_some(index)
+fn static_array_index(expr: &Expression<'_>) -> Option<usize> {
+    usize::try_from(canonical_array_index(&eval(expr)?)?).ok()
 }
 
 #[derive(Default)]
@@ -67,7 +60,7 @@ struct StaticArrayReadCollector {
 
 impl<'a> Visit<'a> for StaticArrayReadCollector {
     fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
-        if !member.optional && canonical_array_index(&member.expression).is_some() {
+        if !member.optional && static_array_index(&member.expression).is_some() {
             if let Expression::Identifier(identifier) = &member.object {
                 if let Some(reference_id) = identifier.reference_id.get() {
                     self.references.insert(reference_id);
@@ -109,7 +102,7 @@ pub(crate) fn static_array_lookup_text(
     }
     let symbol = symbol_of(scoping, &member.object)?;
     let values = arrays.get(&symbol)?;
-    let index = canonical_array_index(&member.expression)?;
+    let index = static_array_index(&member.expression)?;
     values.get(index)?.render()
 }
 

@@ -7273,7 +7273,15 @@ mod tests {
 
         // ToPropertyKey never coerces these values into numeric array indices.
         for index in [
-            "true", "false", "null", "void 0", "\"01\"", "\"1.0\"", "\" 1 \"", "\"-0\"",
+            "true",
+            "false",
+            "null",
+            "void 0",
+            "\"01\"",
+            "\"1.0\"",
+            "\" 1 \"",
+            "\"-0\"",
+            "\"4294967295\"",
         ] {
             let source = format!("const table = [\"ZERO\", \"ONE\"]; sink(table[{index}]);");
             let result = deobfuscate(&source, 4);

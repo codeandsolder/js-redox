@@ -87,8 +87,9 @@ matched using JavaScript's strict `switch` equality rather than numeric
 coercion. Even an `undefined` state is not assumed to terminate a loop: only
 the original loop condition may establish termination, and the next switch
 case (including `default`) is simulated when the loop continues.
-Static array lookup uses JavaScript `ToPropertyKey`, not `ToNumber`:
-canonical keys such as `"1"` may resolve an indexed element, but
+Static and recovered register-array lookups use JavaScript `ToPropertyKey`,
+not `ToNumber`: canonical keys such as `"1"` may resolve an indexed
+array element, but
 `true`, `null`, `"01"` and other non-index property keys are not
 mistaken for numeric array elements.
 For a nonadjacent state initializer, a direct `eval` in an unrelated sibling

@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 34] = [
+const MAIN_FIXTURES: [&str; 35] = [
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
@@ -30,6 +30,7 @@ const MAIN_FIXTURES: [&str; 34] = [
     "arithmetic-state.js",
     "arithmetic-state-external.js",
     "arithmetic-state-registers.js",
+    "arithmetic-state-register-key-safety.js",
     "arithmetic-state-try.js",
     "arithmetic-state-conditional.js",
     "arithmetic-state-primitive-branches.js",
@@ -191,6 +192,7 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
         "arithmetic-state.js"
         | "arithmetic-state-external.js"
         | "arithmetic-state-registers.js"
+        | "arithmetic-state-register-key-safety.js"
         | "arithmetic-state-conditional.js" => {
             assert!(count(report, "arithmetic_state_unflatten") >= 1, "{file}");
             assert!(!report.arithmetic_state_proofs.is_empty(), "{file}");

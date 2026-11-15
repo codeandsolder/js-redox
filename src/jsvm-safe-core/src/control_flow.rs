@@ -8,8 +8,8 @@
 
 use crate::numeric::exact_u32;
 use crate::value_eval::{
-    eval, eval_binary, eval_logical_left, eval_unary_value, js_to_uint32, known_bool, same_value,
-    string_literal_value, template_element_value, LogicalStep, Value,
+    canonical_array_index, eval, eval_binary, eval_logical_left, eval_unary_value, js_to_uint32,
+    known_bool, same_value, string_literal_value, template_element_value, LogicalStep, Value,
 };
 use crate::{
     array_element, direct_identifier_name, fragment, js_parse_int, symbol_has_only_read_references,
@@ -882,9 +882,7 @@ fn eval_with_env(expr: &Expression<'_>, env: &HashMap<String, Value>) -> Option<
             if !register_active(env, object.name.as_str()) {
                 return None;
             }
-            let index = eval_with_env(&member.expression, env)
-                .and_then(|value| value.number())
-                .and_then(exact_u32)?;
+            let index = canonical_array_index(&eval_with_env(&member.expression, env)?)?;
             env.get(&register_slot(object.name.as_str(), index))
                 .cloned()
         }
@@ -1052,9 +1050,7 @@ fn computed_register_slot(
     if !register_active(env, object.name.as_str()) {
         return None;
     }
-    let index = eval_with_env(&member.expression, env)
-        .and_then(|value| value.number())
-        .and_then(exact_u32)?;
+    let index = canonical_array_index(&eval_with_env(&member.expression, env)?)?;
     Some((object.name.to_string(), index))
 }
 
@@ -1484,8 +1480,8 @@ impl RegisterArrayShapeCollector {
     fn record_numeric_member(&mut self, it: &oxc_ast::ast::ComputedMemberExpression<'_>) {
         if it.optional
             || eval(&it.expression)
-                .and_then(|value| value.number())
-                .and_then(exact_u32)
+                .as_ref()
+                .and_then(canonical_array_index)
                 .is_none()
         {
             return;
@@ -1575,8 +1571,8 @@ impl<'a> Visit<'a> for KnownRegisterReadCollector<'_, '_> {
                         && register_active(self.env, object.name.as_str())
                     {
                         if let Some(index) = eval_with_env(&it.expression, self.env)
-                            .and_then(|value| value.number())
-                            .and_then(exact_u32)
+                            .as_ref()
+                            .and_then(canonical_array_index)
                         {
                             if let Some(text) = self
                                 .env
