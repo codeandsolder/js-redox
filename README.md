@@ -759,7 +759,20 @@ by source span, and spread arguments never shift inferred parameter indices.
 The output contains `specializations/*.js` with deobfuscated, formatted
 original helper bodies, `specializations/original/` for comparison, and
 per-variant callsite, source-span, constant-argument, and transform metadata
-in `caller-views.json`. The generated specialization index lists the
+in `caller-views.json`. With caller-views specialization enabled, --guarded-executable also writes
+an executable-guarded.js variant. Each proven constant-selector route gets a
+runtime guard inside its original function; the optimized body executes in
+that same call frame, and the entire original function body remains as the
+fallback. This retains Function.call lookup, receiver identity and external
+call sites, rather than replacing the original callable with a separate
+specialized function. Pure primitive guards distinguish signed zero and
+reject unproven/dynamic literals; unsafe inherited strictness, parameter
+initialization, var hoisting and function declarations are not transplanted.
+The manifest records the output hash and installed fast-path count.
+As with all executable deobfuscation, reflected Function#toString text
+changes; the exact captured original stays separately preserved.
+
+The generated specialization index lists the
 **20 largest source reductions first**, then all variants grouped by resolved
 helper, with direct links to readable and original bodies, call depth,
 rewrite count, callsite count and byte-size change. These are also included

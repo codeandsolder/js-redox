@@ -13,6 +13,7 @@ use jsvm_lift::{
         annotate_handler_helper_calls_with_specializations, reconstruct_context,
         SpecializedHelperCall,
     },
+    source_tree_guarded::{install_guarded_specializations, GuardedVariant},
     source_tree_inline::expand_helper_returns,
     source_tree_navigation::helper_navigation,
     source_tree_reflow::reflow_single_trip_loops,
@@ -81,6 +82,10 @@ struct CallerViewsArgs {
     /// lexical call edges (opt-in because it can produce many variants).
     #[arg(long)]
     specialize: bool,
+    /// Emit an executable program with source-proven, runtime-guarded
+    /// optimized function bodies and the original fallback intact.
+    #[arg(long, requires = "specialize")]
+    guarded_executable: bool,
     /// Restrict call graph entries and generated specializations to helpers
     /// with these resolved lexical names. Repeat for several helpers.
     #[arg(long, requires = "specialize")]
@@ -1886,11 +1891,53 @@ fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
     } else {
         Vec::new()
     };
+    let guarded = if args.guarded_executable {
+        let mut proven = Vec::new();
+        for candidate in specialize_resolved_call_graph(&original, &views)? {
+            if !args.only_helper.is_empty() && !args.only_helper.contains(&candidate.helper) {
+                continue;
+            }
+            let row = specialization_rows.iter().find(|row| {
+                row["function_span"] == json!(candidate.function_span)
+                    && row["arguments"] == json!(candidate.constants)
+                    && row["deobfuscation_error"].is_null()
+            });
+            let Some(path) = row.and_then(|row| row["path"].as_str()) else {
+                continue;
+            };
+            proven.push(GuardedVariant {
+                function_span: candidate.function_span,
+                constants: candidate.constants,
+                original_wrapper: candidate.original,
+                specialized_wrapper: candidate.specialized,
+                optimized_wrapper: fs::read_to_string(args.output.join(path))?,
+            });
+        }
+        if let Some(guarded) = install_guarded_specializations(&original, &proven)? {
+            let name = "executable-guarded.js";
+            fs::write(args.output.join(name), &guarded.source)?;
+            index.push_str(&format!(
+                "\n[Executable guarded specialization]({name}): {} fast paths across {} functions, original bodies retained as fallbacks.\n",
+                guarded.fast_paths, guarded.targeted_functions
+            ));
+            Some(json!({
+                "path": name,
+                "fast_paths": guarded.fast_paths,
+                "targeted_functions": guarded.targeted_functions,
+                "sha256": sha256_hex(guarded.source.as_bytes()),
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut data = serde_json::to_string_pretty(&json!({
         "schema": "jsvm-caller-views/v2",
         "entries": manifest,
         "specializations": specialization_rows,
         "specialization_count": specialization_rows.len(),
+        "guarded_executable": guarded,
         "source_sha256": sha256_hex(original.as_bytes()),
     }))?;
     data.push('\n');
@@ -1930,6 +1977,7 @@ mod tests {
             output: output.clone(),
             entry_member: Some("run".into()),
             specialize: false,
+            guarded_executable: false,
             only_helper: vec![],
             max_iterations: 12,
         })?;
@@ -1982,6 +2030,7 @@ mod tests {
             output: output.clone(),
             entry_member: Some("run".into()),
             specialize: true,
+            guarded_executable: false,
             only_helper: vec![],
             max_iterations: 12,
         })?;
@@ -2038,6 +2087,7 @@ mod tests {
             output: output.clone(),
             entry_member: None,
             specialize: true,
+            guarded_executable: false,
             only_helper: vec!["chosen".into()],
             max_iterations: 12,
         })?;
@@ -2076,6 +2126,7 @@ mod tests {
             output: output.clone(),
             entry_member: Some("run".into()),
             specialize: true,
+            guarded_executable: false,
             only_helper: vec![],
             max_iterations: 12,
         })?;
