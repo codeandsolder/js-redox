@@ -2765,6 +2765,83 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_rejects_strict_string_numeric_case_alias() {
+        // A numeric state can never strictly equal a string. Historically
+        // the proof coerced the string label to 2 and turned this loop
+        // into an incorrect successful return.
+        let source = r#"
+            function f(log) {
+                let state=1;
+                while(true) try {
+                    if(state===1)state=2;
+                    else if(state==="2"){log.push("WRONG_STRING");state=3;}
+                    else if(state===3)return log;
+                } catch(error) {throw error;}
+            }
+        "#;
+        let result = deobfuscate(source, 12);
+        assert!(
+            !result
+                .as_ref()
+                .is_some_and(|output| output.transforms.contains_key("exception_state_pruned")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn exception_dispatcher_rejects_string_and_boolean_state_assignments() {
+        // Assignments preserve their JavaScript value types. Treating
+        // "2" as number 2 or true as number 1 is unsound under ===.
+        for (value, initial, numeric_alias) in [
+            ("\"2\"", 1, 2),
+            ("true", 0, 1),
+            ("false", 1, 0),
+            ("null", 1, 0),
+        ] {
+            let source = format!(
+                "function f(log) {{ let state={initial}; while(true) try {{ \
+                 if(state==={initial})state={value}; \
+                 else if(state==={numeric_alias}){{log.push('WRONG');state=3;}} \
+                 else if(state===3)return log; \
+                 }} catch(error) {{throw error;}} }}"
+            );
+            let result = deobfuscate(&source, 12);
+            assert!(
+                !result
+                    .as_ref()
+                    .is_some_and(|output| output.transforms.contains_key("exception_state_pruned")),
+                "value={value}; {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exception_dispatcher_accepts_valid_loose_primitive_comparisons() {
+        for literal in ["\"2\"", "2", "true"] {
+            let test = if literal == "true" {
+                "state==true".to_owned()
+            } else {
+                format!("state=={literal}")
+            };
+            let initial = if literal == "true" { 1 } else { 2 };
+            let destination = if literal == "true" { 2 } else { 3 };
+            let source = format!(
+                "function f(log) {{ let state={initial}; while(true) try {{ \
+                 if({test}) state={destination}; \
+                 else if(state=={destination})return log; \
+                 }} catch(error) {{throw error;}} }}"
+            );
+            let result = deobfuscate(&source, 12);
+            assert!(
+                result
+                    .as_ref()
+                    .is_some_and(|output| output.transforms.contains_key("exception_state_pruned")),
+                "literal={literal}; {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn exception_dispatcher_retargets_effectful_terminal_assignment() {
         let source = r#"
             function f(log) {

@@ -716,7 +716,13 @@ Exception-sensitive state dispatchers retain their original try/catch
 and one-state-per-iteration semantics. Exact lexical-state reachability
 includes catch-resume assignments as additional roots, so unreachable
 case comparisons can be removed without erasing recovery paths or moving
-potentially throwing operations across the handler. The reachability
+potentially throwing operations across the handler. Numeric-state proofs
+require actual JavaScript Number assignments, not implicit ToNumber
+coercion of string, boolean, or null values. Equality-label and
+catch-selector proofs distinguish `===` from `==`: loose comparisons
+may coerce strings and booleans, but strict comparisons must not.
+Unsupported nonnumeric states leave the original dispatcher intact.
+The reachability
 proof also recognizes a single nonthrowing numeric-state return guard
 *after* the dispatcher in the same try block as an exceptional-graph
 terminal. Its actual source remains at the original position after the

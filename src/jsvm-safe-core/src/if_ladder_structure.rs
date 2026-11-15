@@ -8,7 +8,7 @@ use crate::{
     control_flow::direct_assignment_name,
     direct_identifier_name, fragment,
     numeric::exact_u64,
-    value_eval::{eval, inert_literal_value, known_bool},
+    value_eval::{eval, inert_literal_value, known_bool, Value},
 };
 use oxc_ast::ast::{
     ArrayExpressionElement, AssignmentExpression, AssignmentTarget, BindingPattern, CallExpression,
@@ -72,8 +72,27 @@ impl Route {
     }
 }
 
+/// Numeric *state values* must actually be JavaScript Numbers. Abstract
+/// ToNumber is only valid for the other operand of a loose comparison, not
+/// for a state assignment or an initializer ("2" and 2 are different states).
 fn number(expr: &Expression<'_>) -> Option<u64> {
-    eval(expr)?.number().and_then(exact_u64)
+    match eval(expr)? {
+        Value::Number(value) => exact_u64(value),
+        _ => None,
+    }
+}
+
+/// Compare a proven numeric state with a primitive constant. Strict equality
+/// requires another Number; loose equality coerces strings and booleans but
+/// never treats null/undefined as zero. Unsupported or always-false constants
+/// return None, preventing the CFG proof from inventing a matching label.
+fn comparison_number(expr: &Expression<'_>, strict: bool) -> Option<u64> {
+    let value = eval(expr)?;
+    match &value {
+        Value::Number(number) => exact_u64(*number),
+        Value::String(_) | Value::Bool(_) if !strict => value.number().and_then(exact_u64),
+        _ => None,
+    }
 }
 
 fn unparen<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
@@ -87,15 +106,17 @@ fn state_test(expr: &Expression<'_>, state: &str) -> Option<u64> {
     let Expression::BinaryExpression(test) = unparen(expr) else {
         return None;
     };
-    if !matches!(test.operator.as_str(), "==" | "===") {
-        return None;
-    }
+    let strict = match test.operator.as_str() {
+        "==" => false,
+        "===" => true,
+        _ => return None,
+    };
     match (
         direct_identifier_name(unparen(&test.left)),
         direct_identifier_name(unparen(&test.right)),
     ) {
-        (Some(id), _) if id == state => number(&test.right),
-        (_, Some(id)) if id == state => number(&test.left),
+        (Some(id), _) if id == state => comparison_number(&test.right, strict),
+        (_, Some(id)) if id == state => comparison_number(&test.left, strict),
         _ => None,
     }
 }
@@ -442,13 +463,15 @@ fn exit_state(expr: &Expression<'_>, state: &str) -> Option<u64> {
     let Expression::BinaryExpression(binary) = unparen(expr) else {
         return None;
     };
-    if !matches!(binary.operator.as_str(), "!=" | "!==") {
-        return None;
-    }
+    let strict = match binary.operator.as_str() {
+        "!=" => false,
+        "!==" => true,
+        _ => return None,
+    };
     if direct_identifier_name(unparen(&binary.left)) == Some(state) {
-        number(&binary.right)
+        comparison_number(&binary.right, strict)
     } else if direct_identifier_name(unparen(&binary.right)) == Some(state) {
-        number(&binary.left)
+        comparison_number(&binary.left, strict)
     } else {
         None
     }
@@ -1178,9 +1201,10 @@ pub(crate) fn while_state_binding<'a>(
     if !matches!(binary.operator.as_str(), "!=" | "!==") {
         return None;
     }
+    let strict = binary.operator.as_str() == "!==";
     let id = match (unparen(&binary.left), unparen(&binary.right)) {
-        (Expression::Identifier(id), other) if number(other).is_some() => id,
-        (other, Expression::Identifier(id)) if number(other).is_some() => id,
+        (Expression::Identifier(id), other) if comparison_number(other, strict).is_some() => id,
+        (other, Expression::Identifier(id)) if comparison_number(other, strict).is_some() => id,
         _ => return None,
     };
     Some((
@@ -3010,10 +3034,11 @@ fn catch_condition_for_numeric_value(
             .and_then(|reference| scoping.get_reference(reference).symbol_id())
             == Some(selector)
     };
+    let strict = matches!(binary.operator.as_str(), "===" | "!==");
     let literal = if candidate(&binary.left) && inert_literal_value(&binary.right) {
-        number(&binary.right)?
+        comparison_number(&binary.right, strict)?
     } else if candidate(&binary.right) && inert_literal_value(&binary.left) {
-        number(&binary.left)?
+        comparison_number(&binary.left, strict)?
     } else {
         return None;
     };
