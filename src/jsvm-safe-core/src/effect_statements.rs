@@ -1,0 +1,1110 @@
+//! Reconstruct statement-level control flow when the value of a JavaScript
+//! expression is discarded. No temporary identifiers and no special helper
+//! names: only move operations between expression, block and if statements.
+//!
+//! The returned source is a block to avoid accidentally introducing a string
+//! directive prologue (and to preserve dangling-else grammar). Atomically
+//! retained expressions remain wrapped so object/function literals are valid
+//! statement syntax. Dynamic branches are evaluated exactly once.
+use crate::{fragment, statically_resolved_symbol, value_eval::eval};
+use oxc_ast::ast::{
+    AssignmentExpression, AssignmentTarget, Expression, ExpressionStatement, IfStatement,
+    SequenceExpression,
+};
+use oxc_semantic::Scoping;
+use oxc_span::GetSpan;
+
+/// Parentheses are value-neutral here, but the original call syntax is
+/// preserved in all emitted fragments so they cannot change direct eval.
+fn sequence_rhs<'a, 'e>(expr: &'e Expression<'a>) -> Option<&'e SequenceExpression<'a>> {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => sequence_rhs(&paren.expression),
+        Expression::SequenceExpression(sequence) => Some(sequence),
+        _ => None,
+    }
+}
+
+/// Anonymous function and class expressions can acquire a visible name from
+/// an assignment target. A comma expression suppresses that name inference;
+/// don't erase this context when splitting assignment RHS expressions.
+fn name_inference_hazard(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => name_inference_hazard(&paren.expression),
+        Expression::FunctionExpression(function) => function.id.is_none(),
+        Expression::ClassExpression(class) => class.id.is_none(),
+        Expression::ArrowFunctionExpression(_) => true,
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct Lowered {
+    statements: Vec<String>,
+    structured: bool,
+}
+
+impl Lowered {
+    fn push_expression(&mut self, expression: &Expression<'_>, source: &str) {
+        if eval(expression).is_none() {
+            self.statements
+                .push(format!("({});", fragment(source, expression.span())));
+        }
+    }
+
+    fn emit(
+        &mut self,
+        expr: &Expression<'_>,
+        source: &str,
+        scoping: &Scoping,
+        depth: usize,
+    ) -> Option<()> {
+        if depth > 96 {
+            return None;
+        }
+        match expr {
+            Expression::ParenthesizedExpression(paren) => {
+                self.emit(&paren.expression, source, scoping, depth + 1)
+            }
+            Expression::SequenceExpression(sequence) => {
+                self.structured = true;
+                for item in &sequence.expressions {
+                    self.emit(item, source, scoping, depth + 1)?;
+                }
+                Some(())
+            }
+            Expression::LogicalExpression(logical)
+                if matches!(logical.operator.as_str(), "&&" | "||") =>
+            {
+                self.structured = true;
+                let and = logical.operator.as_str() == "&&";
+                if let Some(value) = eval(&logical.left) {
+                    if value.truthy() == and {
+                        self.emit(&logical.right, source, scoping, depth + 1)?;
+                    }
+                    return Some(());
+                }
+                if eval(&logical.right).is_some() {
+                    // The result is discarded; this RHS is pure, so only
+                    // the LHS's evaluation may have effects or throw.
+                    return self.emit(&logical.left, source, scoping, depth + 1);
+                }
+                let mut branch = Self::default();
+                branch.emit(&logical.right, source, scoping, depth + 1)?;
+                if branch.statements.is_empty() {
+                    return self.emit(&logical.left, source, scoping, depth + 1);
+                }
+                let test = fragment(source, logical.left.span());
+                let test = if and {
+                    format!("({test})")
+                } else {
+                    format!("!({test})")
+                };
+                self.statements.push(format!(
+                    "if ({test}) {{\n{}\n}}",
+                    branch.statements.join("\n")
+                ));
+                Some(())
+            }
+            Expression::ConditionalExpression(conditional) => {
+                self.structured = true;
+                if let Some(value) = eval(&conditional.test) {
+                    return self.emit(
+                        if value.truthy() {
+                            &conditional.consequent
+                        } else {
+                            &conditional.alternate
+                        },
+                        source,
+                        scoping,
+                        depth + 1,
+                    );
+                }
+                let mut yes = Self::default();
+                let mut no = Self::default();
+                yes.emit(&conditional.consequent, source, scoping, depth + 1)?;
+                no.emit(&conditional.alternate, source, scoping, depth + 1)?;
+                if yes.statements.is_empty() && no.statements.is_empty() {
+                    return self.emit(&conditional.test, source, scoping, depth + 1);
+                }
+                let test = fragment(source, conditional.test.span());
+                let body = match (yes.statements.is_empty(), no.statements.is_empty()) {
+                    (false, false) => format!(
+                        "if ({test}) {{\n{}\n}} else {{\n{}\n}}",
+                        yes.statements.join("\n"),
+                        no.statements.join("\n")
+                    ),
+                    (false, true) => format!("if ({test}) {{\n{}\n}}", yes.statements.join("\n")),
+                    (true, false) => format!("if (!({test})) {{\n{}\n}}", no.statements.join("\n")),
+                    (true, true) => unreachable!(),
+                };
+                self.statements.push(body);
+                Some(())
+            }
+            Expression::AssignmentExpression(assign) if assign.operator.as_str() == "=" => {
+                // LHS reference evaluation may be moved past RHS prefixes
+                // only for a stable lexical identifier: a member's getter,
+                // computed key, or a dynamic `with` lookup can have effects.
+                let AssignmentTarget::AssignmentTargetIdentifier(id) = &assign.left else {
+                    self.push_expression(expr, source);
+                    return Some(());
+                };
+                let Some(reference_id) = id.reference_id.get() else {
+                    self.push_expression(expr, source);
+                    return Some(());
+                };
+                if statically_resolved_symbol(scoping, reference_id).is_none() {
+                    self.push_expression(expr, source);
+                    return Some(());
+                }
+                let Some(sequence) = sequence_rhs(&assign.right) else {
+                    self.push_expression(expr, source);
+                    return Some(());
+                };
+                let Some((last, prefixes)) = sequence.expressions.split_last() else {
+                    self.push_expression(expr, source);
+                    return Some(());
+                };
+                if prefixes.is_empty() || name_inference_hazard(last) {
+                    self.push_expression(expr, source);
+                    return Some(());
+                }
+                self.structured = true;
+                for prefix in prefixes {
+                    self.emit(prefix, source, scoping, depth + 1)?;
+                }
+                // With a proved lexical identifier and no anonymous
+                // name-inference hazard, an assignment is valid statement
+                // syntax as-is. Avoid redundant wrapping around the target
+                // and the selected value.
+                self.statements.push(format!(
+                    "{} = {};",
+                    fragment(source, assign.left.span()),
+                    fragment(source, last.span())
+                ));
+                Some(())
+            }
+            _ => {
+                self.push_expression(expr, source);
+                Some(())
+            }
+        }
+    }
+}
+
+/// Unwrap only transparent parentheses, without changing eval or receivers.
+fn assignment_rhs<'a, 'e>(expr: &'e Expression<'a>) -> Option<&'e AssignmentExpression<'a>> {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => assignment_rhs(&paren.expression),
+        Expression::AssignmentExpression(assignment) => Some(assignment),
+        _ => None,
+    }
+}
+
+fn conditional_rhs<'a, 'e>(
+    expr: &'e Expression<'a>,
+) -> Option<&'e oxc_ast::ast::ConditionalExpression<'a>> {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => conditional_rhs(&paren.expression),
+        Expression::ConditionalExpression(conditional) => Some(conditional),
+        _ => None,
+    }
+}
+
+/// A conditional expression is not an anonymous function definition, whereas
+/// a new assignment at a leaf could infer a name for an anonymous function,
+/// class or arrow. Reject any tree containing such a leaf.
+pub(crate) fn conditional_has_name_hazard(expr: &Expression<'_>, depth: usize) -> bool {
+    if depth > 96 {
+        return true;
+    }
+    if let Some(conditional) = conditional_rhs(expr) {
+        return conditional_has_name_hazard(&conditional.consequent, depth + 1)
+            || conditional_has_name_hazard(&conditional.alternate, depth + 1);
+    }
+    name_inference_hazard(expr)
+}
+
+/// Each arm assigns exactly its own selected value. Preserve all exception
+/// paths, including an intentionally invalid numeric call in a fallback arm.
+/// The braces contain no declarations and the original function variable
+/// environment (including direct eval) is retained.
+fn conditional_assignment_branch(
+    expr: &Expression<'_>,
+    target: &str,
+    source: &str,
+    depth: usize,
+) -> Option<String> {
+    if depth > 96 {
+        return None;
+    }
+    let Some(conditional) = conditional_rhs(expr) else {
+        // The target is proven to be a plain lexical identifier, so this
+        // is already a valid statement expression. Extra parentheses around
+        // both sides make the recovered code harder to read and turn
+        // downstream structural assertions into formatting checks.
+        return Some(format!("{target} = {};", fragment(source, expr.span())));
+    };
+    let test = fragment(source, conditional.test.span());
+    let yes = conditional_assignment_branch(&conditional.consequent, target, source, depth + 1)?;
+    let no = conditional_assignment_branch(&conditional.alternate, target, source, depth + 1)?;
+    if conditional_rhs(&conditional.alternate).is_some() {
+        // A nested alternate is already an if statement. Emit it as an
+        // else-if chain instead of inventing redundant block nesting.
+        Some(format!("if ({test}) {{\n{yes}\n}} else {no}"))
+    } else {
+        Some(format!("if ({test}) {{\n{yes}\n}} else {{\n{no}\n}}"))
+    }
+}
+
+/// Recover nested conditional assignments as ordinary if/else control flow.
+/// Only a function/block sibling statement with a statically resolved
+/// identifier target can be rewritten: no member/computed/dynamic reference,
+/// script/eval completion or unbraced statement body may change.
+///
+/// Comments inside test/arm expressions remain in original source fragments.
+/// Refuse comments at changed operator/parentheses boundaries, since their
+/// attachment could otherwise change in the newly structured source.
+pub(crate) fn lower_conditional_assignment(
+    statement: &ExpressionStatement<'_>,
+    source: &str,
+    scoping: &Scoping,
+) -> Option<String> {
+    let assignment = assignment_rhs(&statement.expression)?;
+    if assignment.operator.as_str() != "=" {
+        return None;
+    }
+    let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left else {
+        return None;
+    };
+    let symbol = statically_resolved_symbol(scoping, identifier.reference_id.get()?)?;
+    // A script-global var/function can be backed by a global-object property:
+    // resolving it may run proxy-like HasProperty hooks. Only an actual
+    // lexical/import binding has the same fixed reference at root scope.
+    if scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
+        && !scoping
+            .symbol_flags(symbol)
+            .intersects(oxc_semantic::SymbolFlags::BlockScoped | oxc_semantic::SymbolFlags::Import)
+    {
+        return None;
+    }
+    conditional_rhs(&assignment.right)?;
+    if conditional_has_name_hazard(&assignment.right, 0) {
+        return None;
+    }
+    let comments = |start: usize, end: usize| -> Option<bool> {
+        let gap = source.get(start..end)?;
+        Some(gap.contains("/*") || gap.contains("//"))
+    };
+    if comments(
+        statement.span.start as usize,
+        assignment.span.start as usize,
+    )? || comments(
+        assignment.left.span().end as usize,
+        assignment.right.span().start as usize,
+    )? || comments(assignment.span.end as usize, statement.span.end as usize)?
+    {
+        return None;
+    }
+    fn clean_boundaries(expr: &Expression<'_>, source: &str, depth: usize) -> Option<()> {
+        if depth > 96 {
+            return None;
+        }
+        let Some(conditional) = conditional_rhs(expr) else {
+            return Some(());
+        };
+        let comments = |start: usize, end: usize| -> Option<bool> {
+            let gap = source.get(start..end)?;
+            Some(gap.contains("/*") || gap.contains("//"))
+        };
+        if comments(expr.span().start as usize, conditional.span.start as usize)?
+            || comments(conditional.span.end as usize, expr.span().end as usize)?
+            || comments(
+                conditional.span.start as usize,
+                conditional.test.span().start as usize,
+            )?
+            || comments(
+                conditional.test.span().end as usize,
+                conditional.consequent.span().start as usize,
+            )?
+            || comments(
+                conditional.consequent.span().end as usize,
+                conditional.alternate.span().start as usize,
+            )?
+            || comments(
+                conditional.alternate.span().end as usize,
+                conditional.span.end as usize,
+            )?
+        {
+            return None;
+        }
+        clean_boundaries(&conditional.consequent, source, depth + 1)?;
+        clean_boundaries(&conditional.alternate, source, depth + 1)
+    }
+    clean_boundaries(&assignment.right, source, 0)?;
+    let target = fragment(source, assignment.left.span());
+    conditional_assignment_branch(&assignment.right, target, source, 0)
+}
+
+/// Peel a comma sequence off the object *of an assignment target* only
+/// when the entire assignment is a discarded sibling expression statement.
+///
+/// `((first(), second(), object).field = rhs)` evaluates each prefix and
+/// performs GetValue before it obtains the object used for the property
+/// reference. Emitting those prefixes as preceding sibling statements keeps
+/// exactly that ordering, without moving a member/element lookup past the
+/// RHS or changing the assignment's `this`/name-inference context.
+///
+/// This is deliberately **not** generic RHS-assignment decomposition: the
+/// target reference must be evaluated before the RHS, and its object/key can
+/// run arbitrary user code (including proxy traps, getters and direct eval).
+/// Call only for an expression already occupying a function/block statement
+/// list, never an unbraced if/loop/label or script/eval top level.
+pub(crate) fn lower_member_object_sequence(
+    statement: &ExpressionStatement<'_>,
+    source: &str,
+) -> Option<String> {
+    let assign = assignment_rhs(&statement.expression)?;
+    let object = match &assign.left {
+        AssignmentTarget::StaticMemberExpression(member) => &member.object,
+        AssignmentTarget::ComputedMemberExpression(member) => &member.object,
+        AssignmentTarget::PrivateFieldExpression(member) => &member.object,
+        _ => return None,
+    };
+    let sequence = sequence_rhs(object)?;
+    let (last, prefixes) = sequence.expressions.split_last()?;
+    if prefixes.is_empty() {
+        return None;
+    }
+    let object_span = object.span();
+    let mut previous_end = object_span.start as usize;
+    for operand in &sequence.expressions {
+        let start = operand.span().start as usize;
+        let gap = source.get(previous_end..start)?;
+        if gap.contains("/*") || gap.contains("//") {
+            return None;
+        }
+        previous_end = operand.span().end as usize;
+    }
+    let tail = source.get(previous_end..object_span.end as usize)?;
+    if tail.contains("/*") || tail.contains("//") {
+        return None;
+    }
+
+    let mut text = String::new();
+    for prefix in prefixes {
+        // Parentheses retain expression syntax (including anonymous function,
+        // object literal and strings that must not become directives).
+        // Each operand still performs GetValue, including direct eval/getters.
+        text.push_str(&format!("({});\n", fragment(source, prefix.span())));
+    }
+    let statement_span = statement.span;
+    text.push_str(source.get(statement_span.start as usize..object_span.start as usize)?);
+    // The final comma operand produced a value, not an assignable reference.
+    // It remains in the same object-position context after the prefix.
+    text.push('(');
+    text.push_str(fragment(source, last.span()));
+    text.push(')');
+    text.push_str(source.get(object_span.end as usize..statement_span.end as usize)?);
+    Some(text)
+}
+
+/// Only descend through operands evaluated *first*, with no other
+/// possibly-effectful expression or reference creation before them.
+///
+/// In particular, walking a right operand, a computed key, a call callee,
+/// or an optional chain could move effects across user code or even change
+/// direct/indirect eval and receiver identity. An ordinary property object's
+/// comma sequence is a value computation, so the prefix can be evaluated as
+/// preceding sibling statements without changing a property reference.
+fn first_member_object_sequence<'a, 'e>(
+    expr: &'e Expression<'a>,
+) -> Option<&'e SequenceExpression<'a>> {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => {
+            first_member_object_sequence(&paren.expression)
+        }
+        Expression::BinaryExpression(binary) => first_member_object_sequence(&binary.left),
+        Expression::LogicalExpression(logical) => first_member_object_sequence(&logical.left),
+        Expression::ConditionalExpression(conditional) => {
+            first_member_object_sequence(&conditional.test)
+        }
+        Expression::UnaryExpression(unary) => first_member_object_sequence(&unary.argument),
+        Expression::StaticMemberExpression(member) if !member.optional => {
+            sequence_rhs(&member.object).or_else(|| first_member_object_sequence(&member.object))
+        }
+        Expression::ComputedMemberExpression(member) if !member.optional => {
+            sequence_rhs(&member.object).or_else(|| first_member_object_sequence(&member.object))
+        }
+        Expression::PrivateFieldExpression(member) if !member.optional => {
+            sequence_rhs(&member.object).or_else(|| first_member_object_sequence(&member.object))
+        }
+        _ => None,
+    }
+}
+
+/// Split a comma prefix that is the complete first operand of any binary
+/// expression. The left operand is evaluated before the right operand,
+/// so extraction cannot move effects across getters or binary evaluation.
+/// Never descend into second operands, call callees, or guarded branches.
+pub(crate) fn lower_if_test_first_binary_left_sequence(
+    statement: &IfStatement<'_>,
+    source: &str,
+) -> Option<String> {
+    fn binary_left_sequence<'a, 'e>(
+        expression: &'e Expression<'a>,
+    ) -> Option<&'e SequenceExpression<'a>> {
+        match expression {
+            Expression::ParenthesizedExpression(paren) => binary_left_sequence(&paren.expression),
+            Expression::BinaryExpression(binary) => sequence_rhs(&binary.left),
+            _ => None,
+        }
+    }
+    let sequence = binary_left_sequence(&statement.test)?;
+    lower_if_test_first_sequence(statement, sequence, source)
+}
+
+/// Extract a comma prefix from an unconditionally first-evaluated property
+/// object in a sibling if-statement test.
+///
+/// E.g. if (((initialize(), object).length < bound)) body;
+/// becomes (initialize()); if ((((object)).length < bound)) body;
+///
+/// Nothing from the original test runs before the selected prefix; this is
+/// why we only follow the leftmost guaranteed-evaluation path. The original
+/// branch source is kept verbatim, with one expression replacement. A
+/// function/block statement-list parent is required (verified by the caller).
+pub(crate) fn lower_if_test_first_member_object(
+    statement: &IfStatement<'_>,
+    source: &str,
+) -> Option<String> {
+    let sequence = first_member_object_sequence(&statement.test)?;
+    lower_if_test_first_sequence(statement, sequence, source)
+}
+
+/// The caller must prove the comma is unconditionally first in a sibling if.
+fn lower_if_test_first_sequence(
+    statement: &IfStatement<'_>,
+    sequence: &SequenceExpression<'_>,
+    source: &str,
+) -> Option<String> {
+    let (last, prefixes) = sequence.expressions.split_last()?;
+    if prefixes.is_empty() {
+        return None;
+    }
+    let sequence_start = sequence.span.start as usize;
+    let sequence_end = sequence.span.end as usize;
+    let mut previous_end = sequence_start;
+    for operand in &sequence.expressions {
+        let start = operand.span().start as usize;
+        let gap = source.get(previous_end..start)?;
+        if gap.contains("/*") || gap.contains("//") {
+            return None;
+        }
+        previous_end = operand.span().end as usize;
+    }
+    let tail = source.get(previous_end..sequence_end)?;
+    if tail.contains("/*") || tail.contains("//") {
+        return None;
+    }
+    let mut result = String::new();
+    for prefix in prefixes {
+        result.push_str(&format!("({});\n", fragment(source, prefix.span())));
+    }
+    result.push_str(source.get(statement.span.start as usize..sequence_start)?);
+    result.push('(');
+    result.push_str(fragment(source, last.span()));
+    result.push(')');
+    result.push_str(source.get(sequence_end..statement.span.end as usize)?);
+    Some(result)
+}
+
+/// Split the side-effecting comma prefix of an if test from its final
+/// condition. The caller must prove this is a sibling statement in an
+/// existing function/block statement list: emitting several statements
+/// in-place under an unbraced if/loop/label would change control flow, and
+/// inserting a new block could change direct-eval/Annex-B binding behavior.
+///
+/// Every prefix still performs GetValue and can throw. Keep the exact source
+/// of each operand and of the original branches, without changing reference
+/// identity, short-circuit behavior, or lexical scope.
+pub(crate) fn lower_if_test(statement: &IfStatement<'_>, source: &str) -> Option<String> {
+    let sequence = sequence_rhs(&statement.test)?;
+    let (condition, prefixes) = sequence.expressions.split_last()?;
+    if prefixes.is_empty() {
+        return None;
+    }
+    let test_start = statement.test.span().start as usize;
+    let test_end = statement.test.span().end as usize;
+    let mut previous_end = test_start;
+    for operand in &sequence.expressions {
+        // Comments between comma operands belong to the original source
+        // narration. Until we can relocate them exactly, leave such tests
+        // unchanged rather than losing the comments in an analyst view.
+        let gap = source.get(previous_end..operand.span().start as usize)?;
+        if gap.contains("/*") || gap.contains("//") {
+            return None;
+        }
+        previous_end = operand.span().end as usize;
+    }
+    let tail = source.get(previous_end..test_end)?;
+    if tail.contains("/*") || tail.contains("//") {
+        return None;
+    }
+
+    let mut text = String::new();
+    for expression in prefixes {
+        let original = fragment(source, expression.span());
+        // An inert known primitive cannot have observable effects. Keep
+        // comments within such an operand rather than deleting annotations.
+        if eval(expression).is_none() || original.contains("/*") || original.contains("//") {
+            text.push_str(&format!("({original});\n"));
+        }
+    }
+    // Preserve every original byte outside the test itself, including
+    // comments between the test and the consequent/alternate statements.
+    text.push_str(source.get(statement.span.start as usize..test_start)?);
+    text.push_str(fragment(source, condition.span()));
+    text.push_str(source.get(test_end..statement.span.end as usize)?);
+    Some(text)
+}
+
+/// Direct `guard && call()` / `guard || call()` already has readable
+/// short-circuit semantics. Retain that idiomatic source shape at statement
+/// root rather than expanding it into an `if`; downstream semantic analyzers
+/// can then recognize the same source-level guard/call relationship. Nested
+/// comma expressions and assignment-heavy dispatch still get restructured.
+fn simple_guarded_call(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::ParenthesizedExpression(paren) => simple_guarded_call(&paren.expression),
+        Expression::LogicalExpression(logical)
+            if matches!(logical.operator.as_str(), "&&" | "||") =>
+        {
+            matches!(&logical.right, Expression::CallExpression(_))
+        }
+        _ => false,
+    }
+}
+
+/// Lower an expression statement only when it actually contains conditional
+/// or sequencing structure. Plain assignments, calls, property accesses and
+/// existing idiomatic JavaScript expressions remain in their original form.
+pub(crate) fn lower(
+    statement: &ExpressionStatement<'_>,
+    source: &str,
+    scoping: &Scoping,
+) -> Option<String> {
+    if simple_guarded_call(&statement.expression) {
+        return None;
+    }
+    let mut lowered = Lowered::default();
+    lowered.emit(&statement.expression, source, scoping, 0)?;
+    if !lowered.structured {
+        return None;
+    }
+    Some(format!("{{\n{}\n}}", lowered.statements.join("\n")))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::deobfuscate;
+    use work_budget::{BudgetExceeded, WorkBudget};
+
+    fn rewritten(input: &str) -> Result<String, BudgetExceeded> {
+        Ok(
+            deobfuscate(input, 12, &WorkBudget::unlimited("statement-lowering"))?
+                .map_or_else(|| input.to_owned(), |result| result.source),
+        )
+    }
+
+    #[test]
+    fn lowers_effectful_comma_and_short_circuit_without_repeating_test(
+    ) -> Result<(), BudgetExceeded> {
+        let input = "function f(Y){true && (U=AM(Y), 129 + (U&-129) + (~U^128) && (U=(L=U&127,v=AM(Y)<<7,~L-2*~(L|v)+(L|~v))),u=U), false;return u;}";
+        let output = rewritten(input)?;
+        assert!(!output.contains("true &&"), "{output}");
+        assert!(output.contains("U=AM(Y)"), "{output}");
+        assert!(output.contains("if ("), "{output}");
+        assert!(output.contains("u=U"), "{output}");
+        assert!(!output.contains("false;"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn splits_lexically_stable_assignment_sequences() -> Result<(), BudgetExceeded> {
+        let source = "function f(U,L,v,Y){U=(L=U&127,v=AM(Y)<<7,~L-2*~(L|v)+(L|~v));return U;}";
+        let output = rewritten(source)?;
+        assert!(output.contains("L=U&127"), "{output}");
+        assert!(output.contains("v=AM(Y)<<7"), "{output}");
+        // A later generic bitwise pass may further simplify the now-separated
+        // RHS; the essential invariant is that the assignment is separate.
+        assert!(output.contains("U = "), "{output}");
+        assert!(!output.contains("U=(L=U&127,v="), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_sequence_recovery_emits_plain_lexical_assignment() -> Result<(), BudgetExceeded> {
+        let input = "function f(log,flag){let state;state=flag?(log.push('true'),3):(log.push('false'),5);return state;}";
+        let output = rewritten(input)?;
+        assert!(output.contains("if (flag)"), "{output}");
+        assert!(output.contains("state = 3;"), "{output}");
+        assert!(output.contains("state = 5;"), "{output}");
+        assert!(!output.contains("(state = (3))"), "{output}");
+        assert!(!output.contains("(state = (5))"), "{output}");
+        assert!(output.contains("log.push('true')"), "{output}");
+        assert!(output.contains("log.push('false')"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn retains_anonymous_function_name_inference_and_effectful_member_lhs(
+    ) -> Result<(), BudgetExceeded> {
+        let source =
+            "function f(){let assigned;assigned=(sideEffect(),function(){});return assigned.name;}";
+        let output = rewritten(source)?;
+        assert!(
+            output.contains("assigned=(sideEffect(),function(){});"),
+            "{output}"
+        );
+        let source = "function f(o){o.prop=(sideEffect(),value());}";
+        let output = rewritten(source)?;
+        assert!(output.contains("o.prop=(sideEffect(),value())"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn pure_branches_and_directives_do_not_become_directive_prologue() -> Result<(), BudgetExceeded>
+    {
+        let input = "function f(x){('use strict', x && call(), false);return this;}";
+        let output = rewritten(input)?;
+        assert!(!output.contains("'use strict';"), "{output}");
+        assert!(output.contains("call()"), "{output}");
+        let input = "function f(){'use strict'; eval('x');}";
+        let output = rewritten(input)?;
+        assert!(output.contains("'use strict'"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn drops_pure_branches_but_preserves_computed_access_and_direct_eval(
+    ) -> Result<(), BudgetExceeded> {
+        let input = "function f(o){(o.value ? 1 : 2, o.value && (0,eval)('foo'));}";
+        let output = rewritten(input)?;
+        assert!(output.contains("o.value"), "{output}");
+        assert!(output.contains("(0,eval)('foo')"), "{output}");
+        assert!(!output.contains("? 1 : 2"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn constant_effectful_result_eliminates_dead_closure_before_statement_lowering(
+    ) -> Result<(), BudgetExceeded> {
+        let source = "function f(Y){let U; (62 ^ (U=AM(Y),7)) >= 68 && (U=function(){deadCall()});return U;}";
+        let output = rewritten(source)?;
+        assert!(!output.contains("deadCall"), "{output}");
+        assert!(output.contains("AM(Y)"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn retains_idiomatic_guarded_calls_for_semantic_consumers() -> Result<(), BudgetExceeded> {
+        let source =
+            "function f(offset,view,address){offset === 56708 || view.setUint32(address,1,false);}";
+        let output = rewritten(source)?;
+        assert!(
+            output.contains("offset === 56708 || view.setUint32(address,1,false)"),
+            "{output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn separates_effectful_object_prefix_before_member_assignment() -> Result<(), BudgetExceeded> {
+        let input = "function f(o,key,value){((first(),second(),o)[key()] = value);return o;}";
+        let output = rewritten(input)?;
+        assert!(output.contains("(first());"), "{output}");
+        assert!(output.contains("(second());"), "{output}");
+        assert!(output.contains("(o)[key()] = value"), "{output}");
+        assert!(
+            matches!(
+                (
+                    output.find("(first());"),
+                    output.find("(second());"),
+                    output.find("(o)[key()]")
+                ),
+                (Some(first), Some(second), Some(target)) if first < second && second < target
+            ),
+            "{output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retains_member_assignment_rhs_name_and_direct_eval_scope() -> Result<(), BudgetExceeded> {
+        let input = "function f(o){((eval('var marker = 19'),read(),o).fn = function() { return marker; });return [marker,o.fn.name];}";
+        let output = rewritten(input)?;
+        assert!(output.contains("(eval('var marker = 19'));"), "{output}");
+        assert!(output.contains("(read());"), "{output}");
+        assert!(output.contains("(o).fn = function()"), "{output}");
+        assert!(!output.contains("{{"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_ambiguous_comments_and_non_sibling_placements() -> Result<(), BudgetExceeded> {
+        let inputs = [
+            "function f(o){((first()/*between*/,o).p=1);}",
+            "function f(o){((first(),o/*after*/).p=1);}",
+            "function f(o){if(ready)((first(),o).p=1);}",
+            "function f(o){while(ready)((first(),o).p=1);}",
+            "function f(o){label:((first(),o).p=1);}",
+            "((first(),o).p=1);",
+        ];
+        for input in inputs {
+            let output = rewritten(input)?;
+            assert!(
+                !output.contains("(first());"),
+                "unsupported placement/comment must not be split: {output}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unfolds_unconditionally_first_member_object_in_if_test() -> Result<(), BudgetExceeded> {
+        let input = "function f(o,bound){if(((record('prefix'),o).length<bound)){record('yes');}else{record('no');}}";
+        let output = rewritten(input)?;
+        assert!(output.contains("(record('prefix'));"), "{output}");
+        assert!(!output.contains("record('prefix'),o"), "{output}");
+        assert!(output.contains(".length<bound"), "{output}");
+        assert!(
+            matches!(
+                (
+                    output.find("(record('prefix'));"),
+                    output.find("if("),
+                    output.find("record('yes')")
+                ),
+                (Some(prefix), Some(guard), Some(yes)) if prefix < guard && guard < yes
+            ),
+            "{output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn separates_first_binary_left_sequence_preserving_right_operand_order(
+    ) -> Result<(), BudgetExceeded> {
+        let input = "function f(o,limit,trace){let p;if(((p=(trace.push('left'),o),o.value)<(trace.push('right'),limit))){trace.push('yes');}return p;}";
+        let output = rewritten(input)?;
+        assert!(!output.contains("),o.value)<"), "{output}");
+        assert!(output.contains("trace.push('left')"), "{output}");
+        assert!(output.contains("trace.push('right')"), "{output}");
+        assert!(
+            matches!(
+                (
+                    output.find("(trace.push('left'))"),
+                    output.find("p = o;"),
+                    output.find("if("),
+                    output.find("trace.push('right')")
+                ),
+                (Some(first), Some(assign), Some(test), Some(right))
+                    if first < assign && assign < right && right < test
+            ),
+            "initial comma must stay before the right operand: {output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn never_splits_guarded_or_noninitial_comma_effects() -> Result<(), BudgetExceeded> {
+        for input in [
+            "function f(a,b){if(a&&((log('guarded'),b)<3))ok();}",
+            "function f(a,b){if((read()+((log('late'),b)))<3)ok();}",
+            "function f(a,b){if(((log('callee'),eval)('a'))<3)ok();}",
+            "function f(a,b){if(((log('part')/*comment*/,b))<3)ok();}",
+        ] {
+            let output = rewritten(input)?;
+            assert!(
+                !output.contains("(log('guarded'));")
+                    && !output.contains("(log('late'));")
+                    && !output.contains("(log('callee'));")
+                    && !output.contains("(log('part'));"),
+                "unsafe hoist: {output}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn never_hoists_noninitial_guard_effects_or_call_callee() -> Result<(), BudgetExceeded> {
+        let inputs = [
+            "function f(o,flag){if(flag&&((record('late'),o).length<3))act();}",
+            "function f(o,flag){if(flag?((record('late'),o).length<3):false)act();}",
+            "function f(o){if(read()+((record('late'),o).length<3))act();}",
+            "function f(o){if((record('callee'),eval)('o'))act();}",
+            "function f(o){if(obj[(record('key'),name)]<3)act();}",
+            "function f(o){if(((record('prefix')/*note*/,o).length<3))act();}",
+            "function f(o){if(((record('prefix'),o).length<3))/*branch*/act();}",
+        ];
+        for (index, input) in inputs.into_iter().enumerate() {
+            let output = rewritten(input)?;
+            if index == 6 {
+                // The branch annotation survives a correct rewrite.
+                assert!(output.contains("/*branch*/"), "{output}");
+                continue;
+            }
+            assert!(
+                !output.contains("(record('late'));")
+                    && !output.contains("(record('key'));")
+                    && !output.contains("(record('callee'));")
+                    && !output.contains("(record('prefix'));"),
+                "must not move guarded or ordered effects: {output}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn first_member_test_preserves_direct_eval_binding() -> Result<(), BudgetExceeded> {
+        let input = "function f(o){if(((eval('var flag = 7'),o).value<3)){return flag;}return 0;}";
+        let output = rewritten(input)?;
+        assert!(output.contains("(eval('var flag = 7'));"), "{output}");
+        assert!(output.contains("return flag"), "{output}");
+        assert!(!output.contains("eval('var flag = 7'),o"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn unfolds_nested_conditional_assignment_to_stable_binding() -> Result<(), BudgetExceeded> {
+        let input = "function f(a,b,c,d){let h;h=a==0?new c[d]():a==1?new c[d](b):a==2?side():2();return h;}";
+        let output = rewritten(input)?;
+        assert!(!output.contains("?new c[d]"), "{output}");
+        assert!(output.contains("if (a==0)"), "{output}");
+        assert!(output.contains("if (a==1)"), "{output}");
+        assert!(output.contains("else if (a==1)"), "{output}");
+        assert!(output.contains("if (a==2)"), "{output}");
+        assert!(output.contains("new c[d](b)"), "{output}");
+        assert!(
+            output.contains("2()"),
+            "throwing fallback must survive: {output}"
+        );
+        assert!(
+            output.matches("h =").count() >= 4,
+            "each selected leaf must write h: {output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_assignment_retains_names_and_reference_semantics() -> Result<(), BudgetExceeded>
+    {
+        let sources = [
+            "function f(flag){let named;named=flag?function(){}:function(){};return named.name;}",
+            "function f(flag){let named;named=flag?()=>1:()=>2;return named.name;}",
+            "function f(flag){let named;named=flag?class{}:class{};return named.name;}",
+            "function f(flag){named=flag?yes():no();return named;}",
+            "function f(o,flag){o.slot=flag?yes():no();}",
+            "function f(o,flag){o[key()]=flag?yes():no();}",
+            "function f(o,flag){let result;with(o){result=flag?yes():no();}}",
+            "function f(flag){let result;if(flag)result=other?yes():no();}",
+            "result=flag?yes():no();",
+            "function f(flag){let result;result=flag/*boundary*/?yes():no();}",
+            "function f(flag){let result;result=flag?yes()/*boundary*/:no();}",
+        ];
+        for source in sources {
+            let output = rewritten(source)?;
+            assert!(
+                !output.contains("assignment_conditional_lowering")
+                    && !output.contains("if (other)")
+                    && !output.contains("if (flag) {\n(result ="),
+                "unsafe or non-sibling assignment was split: {output}"
+            );
+            if source.contains("named=flag?") {
+                assert!(
+                    output.contains("named=flag?"),
+                    "name inference changed: {output}"
+                );
+            }
+            if source.contains("result=flag?") {
+                assert!(
+                    output.contains("result=flag?"),
+                    "source must remain unsplit: {output}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_assignment_preserves_comments_inside_selected_arms() -> Result<(), BudgetExceeded>
+    {
+        let source =
+            "function f(flag){let output;output=flag?note(/*inside*/1):note(2);return output;}";
+        let result = rewritten(source)?;
+        assert!(result.contains("/*inside*/"), "{result}");
+        assert!(result.contains("if (flag)"), "{result}");
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_assignment_skips_global_property_backed_bindings() -> Result<(), BudgetExceeded>
+    {
+        let global_var = "var result;function f(flag){result=flag?yes():no();return result;}";
+        let output = rewritten(global_var)?;
+        assert!(
+            output.contains("result=flag?"),
+            "script global var is not a safe static lexical target: {output}"
+        );
+        let global_lexical = "let result;function f(flag){result=flag?yes():no();return result;}";
+        let output = rewritten(global_lexical)?;
+        assert!(
+            output.contains("if (flag)"),
+            "root lexical let is a stable target: {output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_assignment_named_function_and_class_leaves_remain_named(
+    ) -> Result<(), BudgetExceeded> {
+        let source = "function f(flag){let chosen;chosen=flag?function Exact(){}:class Visible{};return chosen.name;}";
+        let output = rewritten(source)?;
+        assert!(output.contains("if (flag)"), "{output}");
+        assert!(output.contains("function Exact()"), "{output}");
+        assert!(output.contains("class Visible"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_assignment_preserves_comments_in_parenthesis_wrappers(
+    ) -> Result<(), BudgetExceeded> {
+        for source in [
+            "function f(flag){let chosen;chosen=(/*wrapper*/flag?yes():no());return chosen;}",
+            "function f(flag){let chosen;chosen=(flag?yes():no()/*tail*/);return chosen;}",
+        ] {
+            let output = rewritten(source)?;
+            assert!(
+                output.contains("chosen=("),
+                "parenthesized comment must not be discarded: {output}"
+            );
+            assert!(
+                output.contains("/*wrapper*/") || output.contains("/*tail*/"),
+                "{output}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_assignment_handles_nested_consequents() -> Result<(), BudgetExceeded> {
+        let source = "function f(a,b,c){let x;x=a?(b?one():two()):(c?three():2());return x;}";
+        let result = rewritten(source)?;
+        assert!(result.contains("if (a)"), "{result}");
+        assert!(result.contains("if (b)"), "{result}");
+        assert!(result.contains("if (c)"), "{result}");
+        assert!(result.contains("2()"), "{result}");
+        Ok(())
+    }
+
+    #[test]
+    fn lowers_if_test_comma_effects_without_changing_branch_scope() -> Result<(), BudgetExceeded> {
+        let input = r#"function initialize(log, condition) {
+            if ((log("one"), log("two"), condition)) {
+                log("yes");
+            } else {
+                log("no");
+            }
+        }"#;
+        let output = rewritten(input)?;
+        assert!(output.contains("if (condition)"), "{output}");
+        assert!(!output.contains("if ((log("), "{output}");
+        for word in ["one", "two", "yes", "no"] {
+            assert!(output.contains(word), "{output}");
+        }
+        assert!(
+            matches!(
+                (
+                    output.find("log(\"one\")"),
+                    output.find("log(\"two\")"),
+                    output.find("if (condition)")
+                ),
+                (Some(one), Some(two), Some(test)) if one < two && two < test
+            ),
+            "{output}"
+        );
+        assert!(output.contains("} else {"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn if_test_split_preserves_direct_eval_and_property_reads() -> Result<(), BudgetExceeded> {
+        let input =
+            "function f(o,flag){if((eval('var marker=5'),o.value,flag)){return marker;}return 0;}";
+        let output = rewritten(input)?;
+        assert!(output.contains("eval('var marker=5')"), "{output}");
+        assert!(output.contains("(o.value);"), "{output}");
+        assert!(output.contains("if(flag)"), "{output}");
+        assert!(output.contains("return marker"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_unbraced_nested_if_and_script_level_test_splitting() -> Result<(), BudgetExceeded> {
+        let inputs = [
+            "if((effect(),ready))run();",
+            "function f(ready){if(ready)if((effect(),ready))run();}",
+            "function f(ready){while(ready)if((effect(),ready))run();}",
+            "function f(ready){label:if((effect(),ready))run();}",
+        ];
+        for input in inputs {
+            let output = rewritten(input)?;
+            assert!(
+                output.contains("if((effect(),ready))"),
+                "must not split unsupported statement placement: {output}"
+            );
+            assert!(
+                !output.contains("if (ready)"),
+                "should not split comma test in unsupported placement: {output}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn if_test_split_retains_comments_and_refuses_ambiguous_operand_comments(
+    ) -> Result<(), BudgetExceeded> {
+        let input = "function f(flag){if((ping(),flag))/*branch note*/act();if((ping()/*operand note*/,flag))other();}";
+        let output = rewritten(input)?;
+        assert!(output.contains("/*branch note*/"), "{output}");
+        assert!(output.contains("if(flag)/*branch note*/act()"), "{output}");
+        assert!(
+            output.contains("if((ping()/*operand note*/,flag))"),
+            "{output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn top_level_expression_completion_remains_observable() -> Result<(), BudgetExceeded> {
+        let source = "(sideEffect(), 42);";
+        let output = rewritten(source)?;
+        assert_eq!(output, source);
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_branches_retain_effectful_arm_order() -> Result<(), BudgetExceeded> {
+        let input = "function f(n){n ? (push(1),push(2)) : (push(3),push(4));}";
+        let output = rewritten(input)?;
+        assert!(output.contains("if (n)"), "{output}");
+        assert!(output.contains("else"), "{output}");
+        assert!(
+            matches!(
+                (output.find("push(1)"), output.find("push(2)")),
+                (Some(first), Some(second)) if first < second
+            ),
+            "{output}"
+        );
+        Ok(())
+    }
+}

@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 28] = [
+const MAIN_FIXTURES: [&str; 40] = [
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
@@ -30,8 +30,20 @@ const MAIN_FIXTURES: [&str; 28] = [
     "arithmetic-state.js",
     "arithmetic-state-external.js",
     "arithmetic-state-registers.js",
+    "arithmetic-state-register-key-safety.js",
     "arithmetic-state-try.js",
     "arithmetic-state-conditional.js",
+    "arithmetic-state-primitive-branches.js",
+    "multi-exit-reducible-state.js",
+    "early-abrupt-state-dispatch.js",
+    "exception-resume-state.js",
+    "exception-state-multi-entry-cycle.js",
+    "exception-state-multi-entry-branching.js",
+    "exception-state-write-liveness.js",
+    "exception-state-structured-liveness.js",
+    "numeric-state-sibling-guard-fold.js",
+    "boolean-switch.js",
+    "inert-array-truthiness.js",
     "static-alias-installer-calls.js",
     "static-alias-live-forwarding.js",
 ];
@@ -80,9 +92,11 @@ fn runtime_equivalent(scratch: &Path, label: &str, before: &str, after: &str) ->
     let after_path = scratch.join(format!("{label}.after.js"));
     fs::write(&before_path, before)?;
     fs::write(&after_path, after)?;
+    let before_output = node(&before_path, false)?;
+    let after_output = node(&after_path, false)?;
     assert_eq!(
-        node(&before_path, false)?,
-        node(&after_path, false)?,
+        String::from_utf8_lossy(&before_output),
+        String::from_utf8_lossy(&after_output),
         "{label}"
     );
     Ok(())
@@ -140,6 +154,22 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
             assert!(count(report, "proxy_computed_member") >= 2);
         }
         "proxy-calls.js" => assert!(count(report, "proxy_call") >= 3),
+        "multi-exit-reducible-state.js" => {
+            assert!(count(report, "if_ladder_structured") >= 2);
+        }
+        "early-abrupt-state-dispatch.js" => {
+            assert!(count(report, "if_ladder_structured") >= 2);
+        }
+        "exception-resume-state.js" => {
+            assert!(count(report, "exception_state_pruned") >= 1);
+        }
+        "boolean-switch.js" => {
+            assert!(count(report, "boolean_switch_structured") >= 2);
+        }
+        "inert-array-truthiness.js" => {
+            // One actual constant fold; runtime equivalence checks the guarded effects.
+            assert!(count(report, "constant_fold") >= 1);
+        }
         "proven-helper-prune.js" => {
             assert!(!outcome.source.contains("function pruneMe"));
             assert!(outcome.source.contains("function keepMe"));
@@ -167,9 +197,121 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
         "arithmetic-state.js"
         | "arithmetic-state-external.js"
         | "arithmetic-state-registers.js"
+        | "arithmetic-state-register-key-safety.js"
         | "arithmetic-state-conditional.js" => {
             assert!(count(report, "arithmetic_state_unflatten") >= 1, "{file}");
             assert!(!report.arithmetic_state_proofs.is_empty(), "{file}");
+        }
+        "numeric-state-sibling-guard-fold.js" => {
+            assert!(
+                count(report, "numeric_state_guard_fold") >= 4,
+                "{file}: {:#?}",
+                report.transforms
+            );
+            assert_eq!(outcome.source.matches("log.push('guard')").count(), 1);
+            assert_eq!(outcome.source.matches("get value()").count(), 1);
+        }
+        "exception-state-structured-liveness.js" => {
+            assert!(
+                count(report, "dead_intermediate_state_write") >= 3,
+                "{file}: {:#?}",
+                report.transforms
+            );
+            assert!(
+                !outcome.source.contains("state = 73;"),
+                "{file}: {}",
+                outcome.source
+            );
+            assert!(
+                !outcome.source.contains("state = 94;"),
+                "{file}: {}",
+                outcome.source
+            );
+            // The immediate state-69 guard has been moved into the arm
+            // that sets it. Later liveness removes the now-unused value,
+            // but the effect must still execute exactly once.
+            assert!(count(report, "numeric_state_guard_fold") >= 1, "{file}");
+            assert_eq!(outcome.source.matches("trace.push('left')").count(), 1);
+            assert!(
+                outcome.source.contains("state = 25;"),
+                "{file}: {}",
+                outcome.source
+            );
+            assert!(
+                outcome.source.contains("for (;;) {"),
+                "{file}: {}",
+                outcome.source
+            );
+        }
+        "exception-state-write-liveness.js" => {
+            assert!(
+                count(report, "exception_state_pruned") >= 2,
+                "{file}: {:#?}",
+                report.transforms
+            );
+            // Two assignments are proven dead; five observable writes
+            // survive catch reads, implicit retry, closure capture,
+            // the normal state guard and mapped-arguments alias.
+            assert_eq!(outcome.source.matches("state = 73;").count(), 5);
+        }
+        "exception-state-multi-entry-cycle.js" | "exception-state-multi-entry-branching.js" => {
+            assert_eq!(count(report, "exception_state_pruned"), 1, "{file}");
+            assert!(
+                outcome.source.contains("for (;;) {"),
+                "{file}: {}",
+                outcome.source
+            );
+            assert!(
+                outcome.source.contains("else break;"),
+                "{file}: {}",
+                outcome.source
+            );
+            if file == "exception-state-multi-entry-cycle.js" {
+                assert_eq!(
+                    outcome
+                        .source
+                        .matches("log.push(\"body:\" + count)")
+                        .count(),
+                    1
+                );
+            } else {
+                // A shared join executes only once even if both branches
+                // and the independent catch retry can enter the same SCC.
+                assert_eq!(
+                    outcome.source.matches("log.push('join:' + count)").count(),
+                    1
+                );
+                for label in [1, 2, 3, 4] {
+                    assert!(
+                        outcome.source.contains(&format!("state === {label}")),
+                        "{file}: {}",
+                        outcome.source
+                    );
+                }
+            }
+        }
+        "arithmetic-state-primitive-branches.js" => {
+            assert_eq!(count(report, "arithmetic_state_unflatten"), 5);
+            assert_eq!(report.arithmetic_state_proofs.len(), 5);
+            assert!(
+                report.arithmetic_state_proofs.iter().any(|proof| {
+                    proof.branch_paths.is_empty()
+                        && proof.state_path.iter().any(|state| state == "void 0")
+                }),
+                "direct undefined state must dispatch through its next switch"
+            );
+            for value in ["\"3\"", "true", "null", "void 0"] {
+                assert!(
+                    report.arithmetic_state_proofs.iter().any(|proof| {
+                        proof
+                            .branch_paths
+                            .first()
+                            .and_then(|path| path.first())
+                            .is_some_and(|state| state == value)
+                    }),
+                    "missing typed state {value}"
+                );
+            }
         }
         "static-alias-installer-calls.js" => {
             assert_eq!(report.static_alias_installer_calls.len(), 2);
@@ -181,6 +323,221 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
         }
         _ => {}
     }
+}
+
+#[test]
+#[ignore = "requires Node; run the focused test explicitly"]
+fn nested_conditional_assignment_runtime_equivalence() -> Result<()> {
+    let source = r#"
+function run(selector) {
+    const events = [];
+    function Constructor(...args) { events.push('new:' + args.join(',')); this.args = args; }
+    const obj = {Ctor: Constructor};
+    let chosen;
+    const note = (value) => { events.push('eval:' + value); return value; };
+    function choose() {
+        let target;
+        target = selector === 0 ? new obj.Ctor() :
+                 selector === 1 ? new obj.Ctor(note('a')) :
+                 selector === 2 ? (note('outer'), selector > 1 ? note('inner') : note('no')) :
+                 selector === 3 ? (eval('var introduced=31'), introduced) :
+                 selector === 4 ? (() => { throw Error('branch error'); })() :
+                 2();
+        return target;
+    }
+    try {
+        chosen = choose();
+        events.push('value:' + (chosen && chosen.args ? chosen.args.join('|') : chosen));
+    } catch (error) {
+        events.push('throw:' + error.name + ':' + error.message);
+    }
+    let named;
+    named = selector === 0 ? function ExactlyNamed() {} : class AlsoNamed {};
+    events.push('named:' + named.name);
+    function withVariableEnvironment() {
+        let assigned;
+        assigned = selector === 2 ?
+            (eval('var dynamicLocal=23; function runtimeFunction() { return dynamicLocal }'),
+             runtimeFunction() ) : 0;
+        events.push('direct-eval:' + assigned);
+    }
+    try { withVariableEnvironment(); }
+    catch (error) { events.push('eval-throw:' + error.name); }
+    return events;
+}
+for (const selector of [0,1,2,3,4,5,-1]) {
+    console.log(JSON.stringify([selector, run(selector)]));
+}
+"#;
+    let result = deobfuscate_source(
+        source,
+        "nested-conditional-assignment-runtime",
+        SourceMode::Auto,
+        16,
+        false,
+        &budget("nested-conditional-assignment-runtime"),
+    )?;
+    assert!(
+        count(&result.report, "assignment_conditional_lowering") >= 2,
+        "{:?}",
+        result.report.transforms
+    );
+    let scratch = TempDir::new()?;
+    runtime_equivalent(
+        scratch.path(),
+        "nested-conditional-assignment",
+        source,
+        &result.source,
+    )
+}
+
+#[test]
+#[ignore = "requires Node; run the focused test explicitly"]
+fn if_guard_binary_left_sequence_runtime_equivalence() -> Result<()> {
+    let source = r#"
+function run(flag) {
+    const events = [];
+    const obj = new Proxy({value: 3}, {
+        get(target,key) { events.push('get:' + String(key)); return target[key]; }
+    });
+    const right = { valueOf() { events.push('right-value'); return 5; } };
+    let assigned = 0;
+    if (((assigned = (events.push('prepare'), obj), obj.value) < right))
+        events.push('matched');
+    events.push('same:' + (assigned === obj));
+    if (((eval('var lexical = 17'),obj.value) < right))
+        events.push('direct-eval:' + lexical);
+    if (flag && ((events.push('guarded'),obj.value) < right))
+        events.push('guarded-yes');
+    try {
+        if (((events.push('throw'),(() => { throw Error('stop'); })(),obj.value) < right))
+            events.push('unreachable');
+    } catch (error) { events.push('caught:' + error.message); }
+    return events;
+}
+console.log(JSON.stringify([run(false), run(true)]));
+"#;
+    let result = deobfuscate_source(
+        source,
+        "if-guard-binary-left-sequence-runtime",
+        SourceMode::Auto,
+        16,
+        false,
+        &budget("if-guard-binary-left-sequence-runtime"),
+    )?;
+    assert!(
+        count(&result.report, "if_guard_binary_left_sequence_lowering") >= 1,
+        "{:?}",
+        result.report.transforms
+    );
+    let scratch = TempDir::new()?;
+    runtime_equivalent(
+        scratch.path(),
+        "if-guard-binary-left-sequence",
+        source,
+        &result.source,
+    )
+}
+
+#[test]
+#[ignore = "requires Node; run the focused test explicitly"]
+fn if_guard_first_member_object_runtime_equivalence() -> Result<()> {
+    let source = r#"
+function execute(gate) {
+    const trace = [];
+    const note = name => { trace.push(name); return name; };
+    const obj = new Proxy({value: 3}, {
+        get(target, key) { trace.push('get:' + String(key)); return target[key]; }
+    });
+    if (((note('start'),obj).value < 5)) trace.push('first-yes');
+    if (gate && ((note('guarded'),obj).value < 5)) trace.push('second-yes');
+    if (note('left').length + ((note('right'),obj).value) > 0) trace.push('sum-yes');
+    if (((eval('var lexical = 17'),obj).value < 5)) trace.push('eval:' + lexical);
+    try {
+        if (((note('throw'),(() => { throw Error('abort'); })(),obj).value < 5))
+            trace.push('unreachable');
+    } catch (error) { trace.push('caught:' + error.message); }
+    return trace;
+}
+console.log(JSON.stringify([execute(false), execute(true)]));
+"#;
+    let result = deobfuscate_source(
+        source,
+        "if-guard-member-prefix-runtime",
+        SourceMode::Auto,
+        12,
+        false,
+        &budget("if-guard-member-prefix-runtime"),
+    )?;
+    assert!(
+        count(&result.report, "if_guard_member_prefix_lowering") >= 1,
+        "{:?}",
+        result.report.transforms
+    );
+    let scratch = TempDir::new()?;
+    runtime_equivalent(
+        scratch.path(),
+        "if-guard-member-prefix",
+        source,
+        &result.source,
+    )
+}
+
+#[test]
+#[ignore = "requires Node; run the focused test explicitly"]
+fn member_object_sequence_runtime_equivalence() -> Result<()> {
+    let source = r#"
+function run(strict) {
+    const trace = [];
+    const write = (kind) => { trace.push(kind); return kind; };
+    const proxy = new Proxy({}, {
+        set(target,key,value) { trace.push('set:' + key); target[key] = value; return true; },
+        get(target,key) { trace.push('get:' + key); return target[key]; }
+    });
+    function outer() {
+        // The direct eval must still see the function lexical environment.
+        ((eval('var marker = 19'),write('prefix'),proxy).fn =
+            function(){ return marker; });
+        ((write('before'),proxy)[write('key')] = write('rhs'));
+        ((write('compound'),proxy)[write('key-compound')] += write('tail'));
+        ((write('logical'),proxy)[write('key')] ||= write('skipped'));
+        ((write('nullish'),proxy)[write('key')] ??= write('skipped-nullish'));
+        class C {
+            #value = 1;
+            add() { ((write('private'),this).#value += 2); return this.#value; }
+        }
+        trace.push('private-value:' + new C().add());
+        try {
+            ((write('throw'),(() => { throw Error('stop'); })(), proxy).bad = 1);
+        } catch (error) { trace.push('catch:' + error.message); }
+        const fn = proxy.fn;
+        trace.push(fn.name + ':' + fn());
+        return trace;
+    }
+    return outer();
+}
+console.log(JSON.stringify(run(false)));
+"#;
+    let result = deobfuscate_source(
+        source,
+        "member-object-sequence-runtime",
+        SourceMode::Auto,
+        12,
+        false,
+        &budget("member-object-sequence-runtime"),
+    )?;
+    assert!(
+        count(&result.report, "member_object_sequence_lowering") >= 2,
+        "{:?}",
+        result.report.transforms
+    );
+    let scratch = TempDir::new()?;
+    runtime_equivalent(
+        scratch.path(),
+        "member-object-sequence",
+        source,
+        &result.source,
+    )
 }
 
 #[test]
@@ -336,7 +693,7 @@ fn depythonify_safe_deob_safety_runtime_equivalence() -> Result<()> {
             &["arithmetic_state_unflatten"][..],
         ),
         (
-            "arithmetic-state-iife-safety.js",
+            "arithmetic-state-iife-shadow-safety.js",
             &["arithmetic_state_unflatten"][..],
         ),
     ] {
@@ -352,6 +709,14 @@ fn depythonify_safe_deob_safety_runtime_equivalence() -> Result<()> {
         &["remove_unused_proven_helper"],
     )?;
     assert!(eval.source.contains("function hiddenHelper"));
+
+    let iife = deob_fixture(scratch.path(), "arithmetic-state-iife-recovery.js")?;
+    assert_eq!(count(&iife.report, "arithmetic_state_unflatten"), 1);
+    assert_eq!(iife.report.arithmetic_state_proofs.len(), 1);
+    let proof = &iife.report.arithmetic_state_proofs[0];
+    assert_eq!(proof.termination, "conditional");
+    assert_eq!(proof.state_path, ["2", "0", "1"]);
+    assert_eq!(proof.branch_paths, [vec!["3".to_owned()], vec![]]);
 
     let arithmetic = deob_fixture(scratch.path(), "arithmetic-state-safety.js")?;
     assert_eq!(count(&arithmetic.report, "arithmetic_state_unflatten"), 1);
@@ -413,4 +778,83 @@ fn depythonify_safe_deob_real_et_external_corpus() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[test]
+#[ignore = "requires Node; run the focused test explicitly"]
+fn if_binary_rhs_effect_lifting_runtime_equivalence() -> Result<()> {
+    let source = r#"
+function run(mode) {
+  const events = [];
+  let reads = 0;
+  const U = {};
+  const H = new Proxy({}, {
+    get(_, key) {
+      if (key !== 'length') return undefined;
+      const n = ++reads;
+      events.push('getter:' + n);
+      if (mode === 4 && n === 2) throw new Error('getter-failed');
+      return {
+        [Symbol.toPrimitive](hint) {
+          events.push('primitive:' + n + ':' + hint);
+          if (mode === 3) throw new Error('coercion-failed');
+          return mode === 1 ? 1 - n : n;
+        }
+      };
+    }
+  });
+  function effect(name) { events.push('effect:' + name); return 2; }
+  try {
+    if (H.length < (H.length < (U.fO = void 0, (U.Bn = [], (effect('third'), 2)))))
+        events.push('then');
+    else events.push('else');
+  } catch (e) { events.push('catch:' + e.message); }
+  events.push('fields:' + Object.keys(U).join(','));
+
+  const prior = Function.prototype[Symbol.toPrimitive];
+  Function.prototype[Symbol.toPrimitive] = function() {
+    events.push('function-name:' + this.name);
+    return 1;
+  };
+  try {
+    if (function(){} < (effect('anonymous'), 3))
+      events.push('fn-matched');
+    if ((()=>1) < (effect('arrow'),3)) events.push('arrow-matched');
+    if ((class {}) < (effect('class'),3)) events.push('class-matched');
+    if ((mode ? function(){} : class {}) < (effect('conditional-name'),3))
+      events.push('conditional-matched');
+  } finally {
+    if (prior === undefined) delete Function.prototype[Symbol.toPrimitive];
+    else Function.prototype[Symbol.toPrimitive] = prior;
+  }
+
+  try {
+    if (mode < (effect('first'), (mode < (effect('second'), 2))))
+      events.push('numbers-then');
+    else events.push('numbers-else');
+  } catch (e) { events.push('numbers-throw:' + e.message); }
+  return events;
+}
+console.log(JSON.stringify(Array.from({length:5},(_, mode) => run(mode))));
+"#;
+    let result = deobfuscate_source(
+        source,
+        "if-binary-rhs-effect-lifting-runtime",
+        SourceMode::Auto,
+        32,
+        false,
+        &budget("if-binary-rhs-effect-lifting-runtime"),
+    )?;
+    assert!(
+        count(&result.report, "if_binary_rhs_effect_lifting") >= 2,
+        "{:?}",
+        result.report.transforms
+    );
+    let scratch = TempDir::new()?;
+    runtime_equivalent(
+        scratch.path(),
+        "if-binary-rhs-effect-lifting",
+        source,
+        &result.source,
+    )
 }

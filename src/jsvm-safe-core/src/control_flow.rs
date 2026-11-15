@@ -8,8 +8,8 @@
 
 use crate::numeric::exact_u32;
 use crate::value_eval::{
-    eval, eval_binary, eval_logical_left, eval_unary_value, js_to_uint32, known_bool, same_value,
-    string_literal_value, template_element_value, LogicalStep, Value,
+    canonical_array_index, eval, eval_binary, eval_logical_left, eval_unary_value, js_to_uint32,
+    known_bool, same_value, string_literal_value, template_element_value, LogicalStep, Value,
 };
 use crate::{
     array_element, direct_identifier_name, fragment, js_parse_int, symbol_has_only_read_references,
@@ -882,9 +882,7 @@ fn eval_with_env(expr: &Expression<'_>, env: &HashMap<String, Value>) -> Option<
             if !register_active(env, object.name.as_str()) {
                 return None;
             }
-            let index = eval_with_env(&member.expression, env)
-                .and_then(|value| value.number())
-                .and_then(exact_u32)?;
+            let index = canonical_array_index(&eval_with_env(&member.expression, env)?)?;
             env.get(&register_slot(object.name.as_str(), index))
                 .cloned()
         }
@@ -924,8 +922,8 @@ enum ArithmeticCaseOutcome {
     Flow(StateFlow),
     Conditional {
         test: String,
-        consequent: f64,
-        alternate: f64,
+        consequent: Value,
+        alternate: Value,
     },
 }
 
@@ -1030,7 +1028,9 @@ fn statement_has_loop_control(stmt: &Statement<'_>) -> bool {
     detector.found
 }
 
-fn direct_assignment_name<'a>(target: &'a oxc_ast::ast::AssignmentTarget<'a>) -> Option<&'a str> {
+pub(super) fn direct_assignment_name<'a>(
+    target: &'a oxc_ast::ast::AssignmentTarget<'a>,
+) -> Option<&'a str> {
     match target {
         oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.as_str()),
         _ => None,
@@ -1050,9 +1050,7 @@ fn computed_register_slot(
     if !register_active(env, object.name.as_str()) {
         return None;
     }
-    let index = eval_with_env(&member.expression, env)
-        .and_then(|value| value.number())
-        .and_then(exact_u32)?;
+    let index = canonical_array_index(&eval_with_env(&member.expression, env)?)?;
     Some((object.name.to_string(), index))
 }
 
@@ -1482,8 +1480,8 @@ impl RegisterArrayShapeCollector {
     fn record_numeric_member(&mut self, it: &oxc_ast::ast::ComputedMemberExpression<'_>) {
         if it.optional
             || eval(&it.expression)
-                .and_then(|value| value.number())
-                .and_then(exact_u32)
+                .as_ref()
+                .and_then(canonical_array_index)
                 .is_none()
         {
             return;
@@ -1573,8 +1571,8 @@ impl<'a> Visit<'a> for KnownRegisterReadCollector<'_, '_> {
                         && register_active(self.env, object.name.as_str())
                     {
                         if let Some(index) = eval_with_env(&it.expression, self.env)
-                            .and_then(|value| value.number())
-                            .and_then(exact_u32)
+                            .as_ref()
+                            .and_then(canonical_array_index)
                         {
                             if let Some(text) = self
                                 .env
@@ -2413,7 +2411,7 @@ impl Collector<'_, '_> {
         &self,
         stmt: &Statement<'_>,
         state_var: &str,
-    ) -> Option<(String, f64, f64)> {
+    ) -> Option<(String, Value, Value)> {
         let Statement::ExpressionStatement(expression_stmt) = stmt else {
             return None;
         };
@@ -2428,15 +2426,13 @@ impl Collector<'_, '_> {
         let Expression::ConditionalExpression(conditional) = &assignment.right else {
             return None;
         };
-        let consequent = eval(&conditional.consequent)?.number()?;
-        let alternate = eval(&conditional.alternate)?.number()?;
-        if !consequent.is_finite()
-            || consequent.fract() != 0.0
-            || !alternate.is_finite()
-            || alternate.fract() != 0.0
-        {
-            return None;
-        }
+        // A state assignment keeps its primitive type: switch uses strict
+        // equality, so "3" must not be modeled as the Number 3. Retain the
+        // complete safely evaluated value for both branches.
+        let consequent = eval(&conditional.consequent)?;
+        let alternate = eval(&conditional.alternate)?;
+        consequent.render()?;
+        alternate.render()?;
         Some((
             fragment(self.source, conditional.test.span()).to_string(),
             consequent,
@@ -2511,16 +2507,16 @@ impl Collector<'_, '_> {
         &self,
         setup: &ArithmeticStateSetup<'_>,
         base_env: &HashMap<String, Value>,
-        target: f64,
+        target: Value,
     ) -> Option<ArithmeticBranchResult> {
-        let target_text = Value::Number(target).render()?;
+        let target_text = target.render()?;
         let mut env = base_env.clone();
         // Evaluating an arbitrary runtime branch condition may call user code or
         // mutate any previously known non-state value. The conditional assignment
         // itself overwrites the dispatcher state afterwards, so retain no other
         // abstract facts across that boundary.
         invalidate_opaque_state(&mut env, &setup.state_var);
-        env.insert(setup.state_var.clone(), Value::Number(target));
+        env.insert(setup.state_var.clone(), target);
         let mut chunks = vec![format!("{} = {target_text};", setup.state_var)];
         let mut state_path = Vec::new();
         let mut seen_states = HashSet::new();
@@ -2586,18 +2582,10 @@ impl Collector<'_, '_> {
                 return None;
             }
 
-            match env.get(&setup.state_var) {
-                Some(Value::Undefined) => {
-                    return Some(ArithmeticBranchResult {
-                        chunks,
-                        state_path,
-                        termination: "undefined".to_string(),
-                        register_reads_rewritten,
-                    });
-                }
-                Some(Value::Number(number)) if number.is_finite() && number.fract() == 0.0 => {}
-                _ => return None,
-            }
+            // All supported primitive states may have matching switch cases
+            // on the following iteration. Undefined is not an unconditional
+            // exit: only the actual for-loop condition can terminate the loop.
+            env.get(&setup.state_var)?.render()?;
         }
         None
     }
@@ -2710,20 +2698,10 @@ impl Collector<'_, '_> {
                 return None;
             }
 
-            match env.get(&setup.state_var) {
-                Some(Value::Undefined) => {
-                    return Some(arithmetic_state_result(
-                        it.span,
-                        &setup.state_var,
-                        state_path,
-                        &chunks,
-                        "undefined",
-                        register_reads_rewritten,
-                    ));
-                }
-                Some(Value::Number(number)) if number.is_finite() && number.fract() == 0.0 => {}
-                _ => return None,
-            }
+            // Repeat only with a precisely modeled, renderable JS state.
+            // The next evaluation of setup.test determines whether the loop
+            // exits; a typed or undefined value is not itself an exit.
+            env.get(&setup.state_var)?.render()?;
         }
         None
     }

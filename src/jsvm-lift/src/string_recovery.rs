@@ -29,13 +29,33 @@ pub fn recover_static_strings(
         decoder_candidates,
         classic_transforms,
         classic_status,
+        classic_cycle,
     ) = match classic {
+        Some(result) if result.iteration_cycle.is_some() => {
+            let Some(cycle) = result.iteration_cycle.as_ref() else {
+                unreachable!("guarded by cycle presence");
+            };
+            (
+                original.to_string(),
+                result.iterations,
+                result.decoder_candidates,
+                Default::default(),
+                "iteration_cycle",
+                Some(json!({
+                    "first_seen_iteration": cycle.first_seen_iteration,
+                    "repeated_at_iteration": cycle.repeated_at_iteration,
+                    "period": cycle.period,
+                    "source_sha256": cycle.source_sha256,
+                })),
+            )
+        }
         Some(result) => (
             result.source,
             result.iterations,
             result.decoder_candidates,
             result.transforms,
             "proven",
+            None,
         ),
         None => (
             original.to_string(),
@@ -43,10 +63,11 @@ pub fn recover_static_strings(
             0,
             Default::default(),
             "parse_or_semantic_rejected",
+            None,
         ),
     };
     let classic_replacements = classic_transforms.values().copied().sum::<usize>();
-    let classic_report = json!({
+    let mut classic_report = json!({
         "schema": "js-static-decoder-recovery/v1",
         "source_mode": source_mode.as_str(),
         "input": input_label,
@@ -60,6 +81,9 @@ pub fn recover_static_strings(
         "safe_static_only": true,
         "status": classic_status,
     });
+    if let Some(cycle) = classic_cycle {
+        classic_report["iteration_cycle"] = cycle;
+    }
 
     let base91 = jsvm_safe_core::recover_base91_strings_with_source_mode(
         &classic_source,
