@@ -106,7 +106,29 @@ pub struct SafeDeobReport {
     pub presentation_formatted: bool,
     pub runtime_semantics_preserved_by_design: bool,
     pub analysis_complete: bool,
+    /// Nontrivial multi-pass cycle (the ordinary no-op fixed point is separate).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iteration_cycle: Option<IterationCycleReport>,
     pub source_recovery: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct IterationCycleReport {
+    pub first_seen_iteration: usize,
+    pub repeated_at_iteration: usize,
+    pub period: usize,
+    pub source_sha256: String,
+}
+
+impl From<&jsvm_safe_core::IterationCycle> for IterationCycleReport {
+    fn from(cycle: &jsvm_safe_core::IterationCycle) -> Self {
+        Self {
+            first_seen_iteration: cycle.first_seen_iteration,
+            repeated_at_iteration: cycle.repeated_at_iteration,
+            period: cycle.period,
+            source_sha256: cycle.source_sha256.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +172,10 @@ pub fn deobfuscate_source(
         .collect::<Vec<_>>();
     let iterations = result.iterations;
     let analysis_complete = result.analysis_complete;
+    let iteration_cycle = result
+        .iteration_cycle
+        .as_ref()
+        .map(IterationCycleReport::from);
     let source_recovery = result.source_recovery.map(SafeSourceRecovery::as_str);
     let analysis_source_sha256 = sha256_hex(result.source.as_bytes());
     let static_alias_installer_calls =
@@ -204,6 +230,7 @@ pub fn deobfuscate_source(
         presentation_formatted: format_output,
         runtime_semantics_preserved_by_design: !format_output,
         analysis_complete,
+        iteration_cycle,
         source_recovery,
     };
 

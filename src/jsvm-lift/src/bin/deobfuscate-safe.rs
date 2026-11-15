@@ -316,6 +316,15 @@ fn materialize_full_lexical_context(
         true,
         &budget,
     )?;
+    if let Some(cycle) = &outcome.report.iteration_cycle {
+        anyhow::bail!(
+            "full lexical context entered a rewrite cycle: first seen at iteration {}, repeated at {}, period {}, SHA-256 {}",
+            cycle.first_seen_iteration,
+            cycle.repeated_at_iteration,
+            cycle.period,
+            cycle.source_sha256
+        );
+    }
     anyhow::ensure!(
         outcome.report.analysis_complete && outcome.report.iterations < iterations,
         "full lexical context did not reach a validated fixed point within {iterations} iterations",
@@ -1681,6 +1690,15 @@ fn run_source(args: SourceArgs) -> Result<()> {
         args.format_output,
         &budget,
     )?;
+    if let Some(cycle) = &outcome.report.iteration_cycle {
+        anyhow::bail!(
+            "source rewrite entered a cycle: first seen at iteration {}, repeated at {}, period {}, SHA-256 {}",
+            cycle.first_seen_iteration,
+            cycle.repeated_at_iteration,
+            cycle.period,
+            cycle.source_sha256
+        );
+    }
 
     if let Some(parent) = args.output.parent() {
         fs::create_dir_all(parent)?;

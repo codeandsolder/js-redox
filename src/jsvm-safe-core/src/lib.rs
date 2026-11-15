@@ -11,6 +11,7 @@ mod effect_statements;
 mod effectful_constant;
 mod empty_iife;
 mod if_ladder_structure;
+mod iteration_history;
 mod numeric;
 mod proxy;
 mod pure_function;
@@ -31,6 +32,8 @@ use control_flow::{
     reference_identity, ReferenceIdentityTable,
 };
 use decoder::{analyze_decoders, decoder_call_rewrite, js_parse_int, static_decoder_pass, Decoder};
+pub use iteration_history::IterationCycle;
+use iteration_history::IterationHistory;
 pub use numeric::{exact_i64, exact_u32, exact_u64, exact_usize};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -2019,6 +2022,8 @@ pub struct StaticDecoderRecoveryResult {
     pub iterations: usize,
     pub transforms: BTreeMap<String, usize>,
     pub decoder_candidates: usize,
+    /// Repeated source detected before exhausting the iteration limit.
+    pub iteration_cycle: Option<IterationCycle>,
 }
 
 fn recover_static_decoders_with_mode(
@@ -2036,6 +2041,8 @@ fn recover_static_decoders_with_mode(
     let mut counts = Counts::default();
     let mut iterations = 0usize;
     let mut decoder_candidates = 0usize;
+    let mut history = IterationHistory::new(&current);
+    let mut iteration_cycle = None;
 
     for iteration in 1..=max_iterations {
         budget.consume(1)?;
@@ -2072,7 +2079,11 @@ fn recover_static_decoders_with_mode(
             break;
         }
         iterations += 1;
+        iteration_cycle = history.observe(iterations, &next);
         current = next;
+        if iteration_cycle.is_some() {
+            break;
+        }
     }
 
     Ok(Some(StaticDecoderRecoveryResult {
@@ -2080,6 +2091,7 @@ fn recover_static_decoders_with_mode(
         iterations,
         transforms: counts.into_inner(),
         decoder_candidates,
+        iteration_cycle,
     }))
 }
 
@@ -2107,6 +2119,8 @@ pub struct SafeTransformResult {
     pub transforms: BTreeMap<String, usize>,
     pub arithmetic_state_proofs: Vec<ArithmeticStateProof>,
     pub analysis_complete: bool,
+    /// Exact repeat of a prior pass. Never claim a fixed point for a cycle.
+    pub iteration_cycle: Option<IterationCycle>,
     pub source_recovery: Option<SafeSourceRecovery>,
 }
 
@@ -2137,6 +2151,7 @@ fn deobfuscate_with_mode(
                 transforms: BTreeMap::new(),
                 arithmetic_state_proofs: Vec::new(),
                 analysis_complete: false,
+                iteration_cycle: None,
                 source_recovery: Some(SafeSourceRecovery::BrowserLegacyCallAssignment),
             }));
         }
@@ -2148,6 +2163,8 @@ fn deobfuscate_with_mode(
     let mut counts = Counts::default();
     let mut iterations = 0usize;
     let mut arithmetic_state_proofs = Vec::new();
+    let mut history = IterationHistory::new(&current);
+    let mut iteration_cycle = None;
 
     for iteration in 1..=max_iterations {
         budget.consume(1)?;
@@ -2194,7 +2211,11 @@ fn deobfuscate_with_mode(
             break;
         }
         iterations += 1;
+        iteration_cycle = history.observe(iterations, &next);
         current = next;
+        if iteration_cycle.is_some() {
+            break;
+        }
     }
 
     // Every ordinary fixed-point exit has already validated `current` at the
@@ -2202,7 +2223,7 @@ fn deobfuscate_with_mode(
     // the source, however, there is no next iteration to validate the final
     // rewrite. Revalidate only that iteration-budget-exhaustion case so callers
     // can never receive syntactically or semantically invalid transformed source.
-    if max_iterations > 0 && iterations == max_iterations {
+    if iteration_cycle.is_none() && max_iterations > 0 && iterations == max_iterations {
         budget.checkpoint()?;
         let allocator = Allocator::default();
         let Some(program) = parse_as(&allocator, &current, source_type) else {
@@ -2222,7 +2243,8 @@ fn deobfuscate_with_mode(
         iterations,
         transforms: counts.into_inner(),
         arithmetic_state_proofs,
-        analysis_complete: true,
+        analysis_complete: iteration_cycle.is_none(),
+        iteration_cycle,
         source_recovery: None,
     }))
 }

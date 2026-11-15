@@ -1183,6 +1183,7 @@ dependencies = [
  "regex",
  "rolldown_redox",
  "serde_json",
+ "sha2",
  "string_wizard",
  "work-budget",
 ]

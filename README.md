@@ -119,6 +119,12 @@ or class name-inference hazards remain intact. Semantic recovery always
 runs first to a fixed point, with presentation-level expression lowering only
 on subsequent no-op semantic passes; this prevents cosmetic AST rewrites from
 hiding decoder calls or other semantic patterns before they are recovered.
+The fixed-point engine also hashes each complete intermediate source using
+SHA-256, verifies an exact byte match before declaring a repeated state, and
+stops immediately on a multi-pass rewrite cycle (A → B → A or longer), rather
+than silently burning the iteration limit. Cycle reports include the first
+and repeated iteration, period and source digest; they are distinct from an
+ordinary unchanged fixed point. Static decoder recovery uses the same guard.
 A bounded bitwise algebra pass recovers simpler 32-bit formulas from
 symbol-resolved, locally established primitive Int32 assignments. It compares
 linear combinations of bitwise Boolean expressions against shorter formulas
