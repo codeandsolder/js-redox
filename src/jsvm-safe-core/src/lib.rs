@@ -6322,6 +6322,26 @@ mod tests {
     }
 
     #[test]
+    fn exception_dispatcher_prunes_dead_intermediate_state_writes_only_when_unobservable() {
+        let source = include_str!(
+            "../../../corpus/generated/reversible-obfuscation/exception-state-write-liveness.js"
+        );
+        let Some(result) = deobfuscate(source, 16) else {
+            unreachable!("valid source");
+        };
+        assert_eq!(source.matches("state = 73;").count(), 7);
+        assert_eq!(
+            result.source.matches("state = 73;").count(),
+            5,
+            "only the two exception-safe writes may be removed: {}",
+            result.source
+        );
+        assert!(result.transforms.contains_key("exception_state_pruned"));
+        assert!(result.source.contains("catch-read:"));
+        assert!(result.source.contains("arguments[0]"));
+    }
+
+    #[test]
     fn exception_dispatcher_scc_groups_multi_entry_catch_retry_without_duplication() {
         let source = include_str!(
             "../../../corpus/generated/reversible-obfuscation/exception-state-multi-entry-cycle.js"

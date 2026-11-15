@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use work_budget::{run_command, BudgetLimits, WorkBudget};
 
 const FIXTURE_DIR: &str = "corpus/generated/reversible-obfuscation";
-const MAIN_FIXTURES: [&str; 37] = [
+const MAIN_FIXTURES: [&str; 38] = [
     "obscura-split-strings.js",
     "obscura-number-expressions.js",
     "obscura-unicode-escape.js",
@@ -39,6 +39,7 @@ const MAIN_FIXTURES: [&str; 37] = [
     "exception-resume-state.js",
     "exception-state-multi-entry-cycle.js",
     "exception-state-multi-entry-branching.js",
+    "exception-state-write-liveness.js",
     "boolean-switch.js",
     "inert-array-truthiness.js",
     "static-alias-installer-calls.js",
@@ -198,6 +199,17 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
         | "arithmetic-state-conditional.js" => {
             assert!(count(report, "arithmetic_state_unflatten") >= 1, "{file}");
             assert!(!report.arithmetic_state_proofs.is_empty(), "{file}");
+        }
+        "exception-state-write-liveness.js" => {
+            assert!(
+                count(report, "exception_state_pruned") >= 2,
+                "{file}: {:#?}",
+                report.transforms
+            );
+            // Two assignments are proven dead; five observable writes
+            // survive catch reads, implicit retry, closure capture,
+            // the normal state guard and mapped-arguments alias.
+            assert_eq!(outcome.source.matches("state = 73;").count(), 5);
         }
         "exception-state-multi-entry-cycle.js" | "exception-state-multi-entry-branching.js" => {
             assert_eq!(count(report, "exception_state_pruned"), 1, "{file}");

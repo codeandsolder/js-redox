@@ -749,7 +749,13 @@ possible normal-state match is skipped in the CFG even if its body is opaque;
 the original guard remains in the source. Source statements,
 exceptional roots, and original try/catch evaluation stay in place; this
 allows later region recovery in the **complete** lexical program, not only
-isolated helper projections.
+isolated helper projections. A backward per-case liveness proof can also
+discard intermediate literal numeric-state writes that are overwritten on
+every normal path before any read. This requires an unaliased, uncaptured
+lexical state binding, a catch that provably exits or replaces the state on
+all paths, and no read of the prior state in that catch. Catch-state reads,
+implicit retries, mapped arguments, closures and still-live branch guards
+keep the original writes. Original dynamic tests execute exactly once.
 
 Within that same exception-preserving CFG, an independently proven
 single-entry successor on just one arm of a conditional state assignment can

@@ -3542,6 +3542,145 @@ fn catch_finite_domain_always_replaces_state(
     })
 }
 
+/// An exact binding read, not a matching identifier spelling. Assignments
+/// can be discarded only when every reachable normal path overwrites the
+/// value before reading it, and the exceptional path cannot observe it.
+struct StateBindingReads<'s> {
+    symbol: SymbolId,
+    scoping: &'s Scoping,
+    found: bool,
+}
+
+impl<'a> Visit<'a> for StateBindingReads<'_> {
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        if let Some(reference) = id.reference_id.get() {
+            let item = self.scoping.get_reference(reference);
+            self.found |= item.symbol_id() == Some(self.symbol) && item.is_read();
+        }
+    }
+}
+
+fn state_binding_read(
+    symbol: SymbolId,
+    scoping: &Scoping,
+    visit: impl FnOnce(&mut StateBindingReads<'_>),
+) -> bool {
+    let mut reads = StateBindingReads {
+        symbol,
+        scoping,
+        found: false,
+    };
+    visit(&mut reads);
+    reads.found
+}
+
+/// A local/parameter binding must not be captured by nested functions, or
+/// visible through direct eval/with. The caller has already excluded mapped
+/// arguments and function-local dynamic-eval aliases before CFG recovery.
+fn exception_state_is_unaliased(symbol: SymbolId, scoping: &Scoping) -> bool {
+    let owner = scoping.symbol_scope_id(symbol);
+    if owner == scoping.root_scope_id() {
+        return false;
+    }
+    if scoping.scope_descendants_from_root().any(|scope| {
+        (scope == owner || scoping.scope_is_descendant_of(scope, owner))
+            && (scoping.scope_flags(scope).contains_direct_eval()
+                || scoping.scope_flags(scope).is_with())
+    }) {
+        return false;
+    }
+    scoping.get_resolved_references(symbol).all(|reference| {
+        for scope in scoping.scope_ancestors(reference.scope_id()) {
+            if scope == owner {
+                return true;
+            }
+            let flags = scoping.scope_flags(scope);
+            if flags.is_function() || flags.is_arrow() || flags.is_class_static_block() {
+                return false;
+            }
+        }
+        false
+    })
+}
+
+/// Backwards may-liveness over original structured statements. Unsupported
+/// control-flow shapes are conservatively live. A direct primitive assignment
+/// kills the earlier value only after the proof establishes its new value is
+/// inert; any read (including a test or return expression) makes it live.
+/// Normal dispatch after the case always reads the selected state.
+fn dead_exception_state_writes(
+    statement: &Statement<'_>,
+    live_after: bool,
+    symbol: SymbolId,
+    scoping: &Scoping,
+    dead: &mut Vec<Span>,
+    case_labels: &BTreeSet<u64>,
+) -> bool {
+    match statement {
+        Statement::BlockStatement(block) => {
+            let mut live = live_after;
+            for item in block.body.iter().rev() {
+                live = dead_exception_state_writes(item, live, symbol, scoping, dead, case_labels);
+            }
+            live
+        }
+        Statement::IfStatement(branch) => {
+            let mut live_yes = dead_exception_state_writes(
+                &branch.consequent,
+                live_after,
+                symbol,
+                scoping,
+                dead,
+                case_labels,
+            );
+            let live_no = branch.alternate.as_ref().map_or(live_after, |other| {
+                dead_exception_state_writes(other, live_after, symbol, scoping, dead, case_labels)
+            });
+            live_yes |= live_no;
+            live_yes
+                || state_binding_read(symbol, scoping, |reads| {
+                    reads.visit_expression(&branch.test)
+                })
+        }
+        Statement::ExpressionStatement(expr) => {
+            if let Expression::AssignmentExpression(assignment) = unparen(&expr.expression) {
+                if assignment.operator.as_str() == "="
+                    && matches!(
+                        &assignment.left,
+                        AssignmentTarget::AssignmentTargetIdentifier(id)
+                            if id.reference_id.get().is_some_and(|reference|
+                                scoping.get_reference(reference).symbol_id() == Some(symbol))
+                    )
+                    && inert_literal_value(&assignment.right)
+                    && number(&assignment.right).is_some()
+                {
+                    // An assignment expression statement has no observable
+                    // completion value in its surrounding function body.
+                    if !live_after
+                        && number(&assignment.right)
+                            .is_some_and(|value| !case_labels.contains(&value))
+                    {
+                        dead.push(expr.span);
+                    }
+                    return false;
+                }
+            }
+            live_after
+                || state_binding_read(symbol, scoping, |reads| {
+                    reads.visit_expression(&expr.expression);
+                })
+        }
+        Statement::ReturnStatement(ret) => ret.argument.as_ref().is_some_and(|value| {
+            state_binding_read(symbol, scoping, |reads| reads.visit_expression(value))
+        }),
+        Statement::ThrowStatement(throw) => state_binding_read(symbol, scoping, |reads| {
+            reads.visit_expression(&throw.argument)
+        }),
+        Statement::EmptyStatement(_) | Statement::DebuggerStatement(_) => live_after,
+        _ => true,
+    }
+}
+
 /// Preserve exception-handling scope and the original one-state-per-iteration
 /// execution order. Only remove state comparisons proven unreachable from
 /// both the lexical initializer and every statically possible catch recovery.
@@ -3797,6 +3936,46 @@ pub(crate) fn prune_exception_dispatcher(
             }
         }
     }
+
+    // Once every normal and exceptional state edge is established, prove
+    // which intermediate *standalone* state writes are dead. A catch that
+    // implicitly resumes the interrupted state, reads that state, or an
+    // escaping/aliased binding forbids this reduction. Keep source spans
+    // byte-identical by substituting an empty statement and padding, so
+    // precomputed semantic spans and CFG transitions remain valid.
+    let mut rewritten_source = None;
+    if !catch_retries_unchanged
+        && exception_state_is_unaliased(symbol, scoping)
+        && !state_binding_read(symbol, scoping, |reads| {
+            reads.visit_block_statement(&handler.body);
+        })
+    {
+        let mut dead = Vec::new();
+        let case_labels = cases.keys().copied().collect::<BTreeSet<_>>();
+        for &label in &reachable {
+            if let Some(&body) = source_cases.get(&label) {
+                dead_exception_state_writes(body, true, symbol, scoping, &mut dead, &case_labels);
+            }
+        }
+        if !dead.is_empty() {
+            let mut replacement = source.to_owned();
+            dead.sort_by_key(|span| std::cmp::Reverse(span.start));
+            for span in dead {
+                let start = usize::try_from(span.start).ok()?;
+                let end = usize::try_from(span.end).ok()?;
+                let width = end.checked_sub(start)?;
+                if width == 0
+                    || !replacement.is_char_boundary(start)
+                    || !replacement.is_char_boundary(end)
+                {
+                    return None;
+                }
+                replacement.replace_range(start..end, &format!(";{}", " ".repeat(width - 1)));
+            }
+            rewritten_source = Some(replacement);
+        }
+    }
+    let source = rewritten_source.as_deref().unwrap_or(source);
 
     // Recover one closed conditional region (compact two-arm or general DAG),
     // then recover independent linear
