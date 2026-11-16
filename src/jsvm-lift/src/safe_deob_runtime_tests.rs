@@ -328,7 +328,7 @@ fn assert_main_contract(file: &str, outcome: &SafeDeobOutcome) {
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
 fn nested_member_target_reassociation_runtime_equivalence() -> Result<()> {
-    let source = r#"
+    let source = r"
 function execute(mode) {
     const events = [];
     const note = name => { events.push('note:' + name); return name; };
@@ -377,7 +377,7 @@ function controlPlacement(mode) {
 for (const mode of [0,1,2,3,4]) {
     console.log(JSON.stringify(['control', mode, controlPlacement(mode)]));
 }
-"#;
+";
     let result = deobfuscate_source(
         source,
         "member-target-comma-reassociation",
@@ -403,7 +403,7 @@ for (const mode of [0,1,2,3,4]) {
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
 fn nested_conditional_assignment_runtime_equivalence() -> Result<()> {
-    let source = r#"
+    let source = r"
 function run(selector) {
     const events = [];
     function Constructor(...args) { events.push('new:' + args.join(',')); this.args = args; }
@@ -443,7 +443,7 @@ function run(selector) {
 for (const selector of [0,1,2,3,4,5,-1]) {
     console.log(JSON.stringify([selector, run(selector)]));
 }
-"#;
+";
     let result = deobfuscate_source(
         source,
         "nested-conditional-assignment-runtime",
@@ -469,7 +469,7 @@ for (const selector of [0,1,2,3,4,5,-1]) {
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
 fn if_guard_binary_left_sequence_runtime_equivalence() -> Result<()> {
-    let source = r#"
+    let source = r"
 function run(flag) {
     const events = [];
     const obj = new Proxy({value: 3}, {
@@ -491,7 +491,7 @@ function run(flag) {
     return events;
 }
 console.log(JSON.stringify([run(false), run(true)]));
-"#;
+";
     let result = deobfuscate_source(
         source,
         "if-guard-binary-left-sequence-runtime",
@@ -517,7 +517,7 @@ console.log(JSON.stringify([run(false), run(true)]));
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
 fn if_guard_first_member_object_runtime_equivalence() -> Result<()> {
-    let source = r#"
+    let source = r"
 function execute(gate) {
     const trace = [];
     const note = name => { trace.push(name); return name; };
@@ -535,7 +535,7 @@ function execute(gate) {
     return trace;
 }
 console.log(JSON.stringify([execute(false), execute(true)]));
-"#;
+";
     let result = deobfuscate_source(
         source,
         "if-guard-member-prefix-runtime",
@@ -561,7 +561,7 @@ console.log(JSON.stringify([execute(false), execute(true)]));
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
 fn member_object_sequence_runtime_equivalence() -> Result<()> {
-    let source = r#"
+    let source = r"
 function run(strict) {
     const trace = [];
     const write = (kind) => { trace.push(kind); return kind; };
@@ -592,7 +592,7 @@ function run(strict) {
     return outer();
 }
 console.log(JSON.stringify(run(false)));
-"#;
+";
     let result = deobfuscate_source(
         source,
         "member-object-sequence-runtime",
@@ -858,7 +858,7 @@ fn depythonify_safe_deob_real_et_external_corpus() -> Result<()> {
 #[test]
 #[ignore = "requires Node; run the focused test explicitly"]
 fn if_binary_rhs_effect_lifting_runtime_equivalence() -> Result<()> {
-    let source = r#"
+    let source = r"
 function run(mode) {
   const events = [];
   let reads = 0;
@@ -911,7 +911,7 @@ function run(mode) {
   return events;
 }
 console.log(JSON.stringify(Array.from({length:5},(_, mode) => run(mode))));
-"#;
+";
     let result = deobfuscate_source(
         source,
         "if-binary-rhs-effect-lifting-runtime",

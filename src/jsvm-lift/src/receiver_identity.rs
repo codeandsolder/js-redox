@@ -5963,7 +5963,7 @@ mod tests {
 
     #[test]
     fn proves_seeded_nested_method_call_runtime_target() -> TestResult {
-        let source = r#"
+        let source = r"
             (function() {
                 const C = function() { use(this); };
                 function helper() { this.read(); }
@@ -5972,7 +5972,7 @@ mod tests {
                 function use(state) { state.outer(); }
                 api.make = function() { return new C(); };
             })();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6010,14 +6010,14 @@ mod tests {
 
     #[test]
     fn proves_runtime_method_install_before_direct_allocation() {
-        let source = r#"
+        let source = r"
             (function() {
                 const C = function() { launch(this); };
                 function launch(state) { state.run(); }
                 C.prototype.run = function() { return 1; };
                 new C();
             })();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6036,14 +6036,14 @@ mod tests {
 
     #[test]
     fn proves_runtime_method_install_before_nested_allocation_factory() {
-        let source = r#"
+        let source = r"
             (function() {
                 const C = function() { launch(this); };
                 function launch(state) { state.run(); }
                 C.prototype.run = function() { return 1; };
                 api.make = function() { return new C(); };
             })();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6062,14 +6062,14 @@ mod tests {
 
     #[test]
     fn runtime_method_install_rejects_factory_created_before_assignment() {
-        let source = r#"
+        let source = r"
             (function() {
                 const C = function() { launch(this); };
                 function launch(state) { state.run(); }
                 api.make = function() { return new C(); };
                 C.prototype.run = function() { return 1; };
             })();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6089,7 +6089,7 @@ mod tests {
 
     #[test]
     fn runtime_method_install_rejects_function_declaration_factory() {
-        let source = r#"
+        let source = r"
             (function() {
                 const C = function() { launch(this); };
                 function launch(state) { state.run(); }
@@ -6097,7 +6097,7 @@ mod tests {
                 function make() { return new C(); }
                 api.make = make;
             })();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6181,13 +6181,13 @@ mod tests {
 
     #[test]
     fn propagates_matched_method_this_through_function_call() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() { use(this); };
             C.prototype.run = function() { bridge.call(this, 7); };
             function bridge(selector) { this.finish(); }
             function use(state) { state.run(); }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -6223,7 +6223,7 @@ mod tests {
 
     #[test]
     fn proves_own_field_across_unique_direct_path_and_preserving_method() -> TestResult {
-        let source = r#"
+        let source = r"
             (function() {
                 const C = function() {
                     this.value = 1;
@@ -6238,7 +6238,7 @@ mod tests {
                 C.prototype.target = function() { return this.value; };
                 api.make = function() { return new C(); };
             })();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6269,7 +6269,7 @@ mod tests {
 
     #[test]
     fn own_field_runtime_call_rejects_ambiguous_direct_path() {
-        let source = r#"
+        let source = r"
             (function() {
                 const C = function(flag) {
                     this.value = 1;
@@ -6281,7 +6281,7 @@ mod tests {
                 C.prototype.target = function() { return this.value; };
                 api.make = function(flag) { return new C(flag); };
             })();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6305,7 +6305,7 @@ mod tests {
 
     #[test]
     fn own_field_runtime_call_rejects_unresolved_receiver_barrier() {
-        let source = r#"
+        let source = r"
             (function() {
                 const C = function() {
                     this.value = 1;
@@ -6319,7 +6319,7 @@ mod tests {
                 C.prototype.target = function() { return this.value; };
                 api.make = function() { return new C(); };
             })();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6343,7 +6343,7 @@ mod tests {
 
     #[test]
     fn summarizes_transitive_receiver_preservation_requirements() -> TestResult {
-        let source = r#"
+        let source = r"
             (function() {
                 const C = function() { this.value = 1; use(this); };
                 function helper(selector) {
@@ -6361,7 +6361,7 @@ mod tests {
                 function use(state) { state.outer(); }
                 api.make = function() { return new C(); };
             })();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6388,7 +6388,7 @@ mod tests {
 
     #[test]
     fn transitive_receiver_preservation_rejects_reachable_mutation() {
-        let source = r#"
+        let source = r"
             (function() {
                 const C = function() { use(this); };
                 function helper(selector) {
@@ -6404,7 +6404,7 @@ mod tests {
                 function use(state) { state.outer(); }
                 api.make = function() { return new C(); };
             })();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6425,14 +6425,14 @@ mod tests {
 
     #[test]
     fn transitive_receiver_preservation_rejects_method_cycle() {
-        let source = r#"
+        let source = r"
             (function() {
                 const C = function() { use(this); };
                 C.prototype.loop = function() { this.loop(); };
                 function use(state) { state.loop(); }
                 api.make = function() { return new C(); };
             })();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6453,12 +6453,12 @@ mod tests {
 
     #[test]
     fn proves_receiver_preserving_method_when_own_data_reads_are_live() {
-        let source = r#"
+        let source = r"
             const C = function() { this.value = 1; use(this); };
             C.prototype.read = function() { return this.value; };
             function use(state) { state.read(); }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6484,12 +6484,12 @@ mod tests {
 
     #[test]
     fn receiver_preserving_method_rejects_receiver_mutation() {
-        let source = r#"
+        let source = r"
             const C = function() { this.value = 1; use(this); };
             C.prototype.read = function() { this.value = 2; return this.value; };
             function use(state) { state.read(); }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6510,12 +6510,12 @@ mod tests {
 
     #[test]
     fn matches_exact_origin_member_call_to_stable_prototype_method() {
-        let source = r#"
+        let source = r"
             const C = function() { launch(this); };
             function launch(state) { state.run(); }
             C.prototype.run = function() { return this.value; };
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -6536,13 +6536,13 @@ mod tests {
 
     #[test]
     fn does_not_match_method_from_different_constructor() {
-        let source = r#"
+        let source = r"
             const A = function() { launch(this); };
             const B = function() {};
             function launch(state) { state.run(); }
             B.prototype.run = function() {};
             new A();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -6560,12 +6560,12 @@ mod tests {
 
     #[test]
     fn propagates_already_proven_method_this_through_direct_calls() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() { this.marker = 1; };
             C.prototype.run = function() { bridge(this); };
             function bridge(state) { state.finish(); }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -6622,11 +6622,11 @@ mod tests {
 
     #[test]
     fn tracks_stable_local_origin_aliases_without_exposing_them() {
-        let source = r#"
+        let source = r"
             const C = function() { const alias = this; bridge(alias); };
             function bridge(state) { state.run(); }
             new C();
-        "#;
+        ";
         let proven = calls(source);
         assert_eq!(proven.len(), 1);
         assert_eq!(proven[0].property, "run");
@@ -6692,12 +6692,12 @@ mod tests {
 
     #[test]
     fn resolves_stable_empty_array_computed_read_key() {
-        let source = r#"
+        let source = r"
             const KEY = [];
             const C = function() { use(this); };
             function use(state) { void state[KEY]; }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -6713,7 +6713,7 @@ mod tests {
 
     #[test]
     fn proves_early_own_data_field_through_fresh_direct_parameter() {
-        let source = r#"
+        let source = r"
             const C = function() { init(this); };
             function init(state) {
                 state.other = 1;
@@ -6723,7 +6723,7 @@ mod tests {
             }
             function later(state) { state.done = 3; }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -6744,7 +6744,7 @@ mod tests {
 
     #[test]
     fn proves_own_data_field_survives_known_call_prefix_to_member_call() {
-        let source = r#"
+        let source = r"
             const C = function() { init(this); };
             function init(state) {
                 state.field = 1;
@@ -6754,7 +6754,7 @@ mod tests {
             function helper(state) { state.other = 2; }
             function use(state) { state.read(); }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6774,7 +6774,7 @@ mod tests {
 
     #[test]
     fn proves_exact_own_data_field_value_at_nested_direct_call() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() { init(this); };
             function init(state) {
                 state.cell = {};
@@ -6785,7 +6785,7 @@ mod tests {
             }
             function helper(state) {}
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6831,14 +6831,14 @@ mod tests {
 
     #[test]
     fn exact_own_data_field_value_proves_direct_root_call() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() {
                 this.cell = {};
                 helper(this);
             };
             function helper(state) { void state.cell; }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6878,7 +6878,7 @@ mod tests {
 
     #[test]
     fn exact_own_data_field_value_rejects_nested_prior_write() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() { init(this); };
             function init(state) {
                 state.cell = {};
@@ -6890,7 +6890,7 @@ mod tests {
             }
             function helper(state) {}
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6936,7 +6936,7 @@ mod tests {
 
     #[test]
     fn own_data_field_survival_requires_initialization_to_dominate_entry_call() {
-        let source = r#"
+        let source = r"
             const C = function(flag) { init(this, flag); };
             function init(state, flag) {
                 if (flag) state.field = 1;
@@ -6944,7 +6944,7 @@ mod tests {
             }
             function use(state) { state.read(); }
             new C(false);
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6964,7 +6964,7 @@ mod tests {
 
     #[test]
     fn own_data_field_survival_allows_static_getter_free_helper_read() {
-        let source = r#"
+        let source = r"
             const C = function() { init(this); };
             function init(state) {
                 state.field = 1;
@@ -6974,7 +6974,7 @@ mod tests {
             function helper(state) { void state.missing; }
             function use(state) { state.read(); }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -6994,7 +6994,7 @@ mod tests {
 
     #[test]
     fn own_data_field_survival_rejects_dynamic_helper_read() {
-        let source = r#"
+        let source = r"
             const C = function(key) { init(this, key); };
             function init(state, key) {
                 state.field = 1;
@@ -7004,7 +7004,7 @@ mod tests {
             function helper(state, key) { void state[key]; }
             function use(state) { state.read(); }
             new C(window.key);
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -7024,7 +7024,7 @@ mod tests {
 
     #[test]
     fn own_data_field_survival_rejects_nested_direct_call_exposure() {
-        let source = r#"
+        let source = r"
             const C = function() { init(this); };
             function init(state) {
                 state.field = 1;
@@ -7034,7 +7034,7 @@ mod tests {
             function helper(state) { unknown(state); }
             function use(state) { state.read(); }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -7054,14 +7054,14 @@ mod tests {
 
     #[test]
     fn own_data_field_proof_rejects_prior_external_exposure() {
-        let source = r#"
+        let source = r"
             const C = function() { init(this); };
             function init(state) {
                 unknown(state);
                 state.field = 2;
             }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -7078,10 +7078,10 @@ mod tests {
 
     #[test]
     fn same_origin_self_store_is_not_an_exposure() {
-        let source = r#"
+        let source = r"
             const C = function() { this.self = this; };
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -7102,10 +7102,10 @@ mod tests {
 
     #[test]
     fn records_origin_passed_to_unresolved_call_as_exposure() {
-        let source = r#"
+        let source = r"
             const C = function() { unknown(this); };
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -7120,10 +7120,10 @@ mod tests {
 
     #[test]
     fn records_returned_origin_as_exposure() {
-        let source = r#"
+        let source = r"
             const C = function() { return this; };
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -7138,11 +7138,11 @@ mod tests {
 
     #[test]
     fn propagates_exact_origin_through_function_prototype_call() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() { bridge.call(this, 7); };
             function bridge(selector) { this.finish(); }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -7170,11 +7170,11 @@ mod tests {
 
     #[test]
     fn exact_origin_direct_call_rejects_arguments_object_aliasing() {
-        let source = r#"
+        let source = r"
             const C = function() { helper(this); };
             function helper(state) { unknown(arguments[0]); state.done(); }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -7188,11 +7188,11 @@ mod tests {
 
     #[test]
     fn direct_call_records_static_final_sequence_argument_value() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() { helper(this, (unknown(), 47), null, true); };
             function helper(state, selector, nullable, flag) { state.done(); }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -7215,12 +7215,12 @@ mod tests {
 
     #[test]
     fn propagates_constructor_this_through_direct_calls() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() { start(this); };
             function start(state) { bridge(state); }
             function bridge(state) { state.run(); }
             new C();
-        "#;
+        ";
         let proven = calls(source);
         assert_eq!(proven.len(), 1);
         assert_eq!(proven[0].property, "run");
@@ -7239,14 +7239,14 @@ mod tests {
 
     #[test]
     fn propagates_origin_across_multipurpose_helper_depth() {
-        let source = r#"
+        let source = r"
             const C = function() { setup(this); };
             function setup(state) { schedule(state); }
             function schedule(state) { dispatch(state); }
             function dispatch(state) { route(state); }
             function route(state) { state.run(); state.run(); }
             new C();
-        "#;
+        ";
         let proven = calls(source);
         assert_eq!(proven.len(), 2);
         assert!(proven.iter().all(|call| call.property == "run"));
@@ -7257,12 +7257,12 @@ mod tests {
 
     #[test]
     fn keeps_allocations_context_sensitive() {
-        let source = r#"
+        let source = r"
             const C = function() { start(this); };
             function start(state) { state.run(); }
             new C();
             new C();
-        "#;
+        ";
         let proven = calls(source);
         assert_eq!(proven.len(), 2);
         assert_ne!(proven[0].allocation_start, proven[1].allocation_start);
@@ -7270,11 +7270,11 @@ mod tests {
 
     #[test]
     fn rejects_reassigned_origin_parameter() {
-        let source = r#"
+        let source = r"
             const C = function() { start(this); };
             function start(state) { state = other; state.run(); }
             new C();
-        "#;
+        ";
         assert!(calls(source).is_empty());
     }
 
@@ -7392,11 +7392,11 @@ mod tests {
 
     #[test]
     fn exact_property_preservation_allows_other_static_writes() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() { helper(this); };
             function helper(state) { state.other = 2; }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -7464,12 +7464,12 @@ mod tests {
 
     #[test]
     fn records_context_sensitive_origin_direct_call_chain() {
-        let source = r#"
+        let source = r"
             const C = function() { setup(this); };
             function setup(state) { schedule(state); }
             function schedule(state) { state.run(); }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -7495,7 +7495,7 @@ mod tests {
 
     #[test]
     fn keeps_multipurpose_helper_origin_positions_distinct() {
-        let source = r#"
+        let source = r"
             const C = function() { setup(this); };
             function setup(state) {
                 helper(state, other);
@@ -7506,7 +7506,7 @@ mod tests {
                 right.run();
             }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -7529,11 +7529,11 @@ mod tests {
 
     #[test]
     fn prototype_property_value_argument_does_not_escape_prototype_object() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             sink(C.prototype.token);
-        "#;
+        ";
         let targets = lookup_targets(source);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].property, "run");
@@ -7541,21 +7541,21 @@ mod tests {
 
     #[test]
     fn direct_prototype_value_argument_invalidates_lookup() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             sink(C.prototype);
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn conditional_prototype_value_argument_invalidates_lookup() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             sink(flag ? C.prototype : {});
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
@@ -7567,7 +7567,7 @@ mod tests {
         // The other IIFE has a same-name binding but cannot mutate ours.
         // A nested eval in our IIFE *can*, even though Oxc sees only the
         // original phase assignment as an explicit lexical write.
-        let template = r#"
+        let template = r"
             const C = function() {};
             (function() {
                 let phase;
@@ -7581,7 +7581,7 @@ mod tests {
                 let phase;
                 function other(source) { return eval(source); }
             })();
-        "#;
+        ";
 
         let cases = [
             ("", true, 0, true),
@@ -7653,7 +7653,7 @@ mod tests {
             structurally_proven_prototype_method_phase_closures,
         };
 
-        let template = r#"
+        let template = r"
             (function() {
                 const C = function() {};
                 let phase;
@@ -7675,7 +7675,7 @@ mod tests {
                 let phase;
                 function unrelated(code) { return eval(code); }
             })();
-        "#;
+        ";
         let cases = [
             ("", true),
             ("function hazard(code) { return eval(code); }", false),
@@ -7738,7 +7738,7 @@ mod tests {
 
     #[test]
     fn proves_iife_method_phase_closure_and_event_value() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() {};
             let phase;
             C.prototype.run = function(left, right) {
@@ -7753,7 +7753,7 @@ mod tests {
                     }
                 };
             }();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new()
@@ -7785,14 +7785,14 @@ mod tests {
 
     #[test]
     fn rejects_conditional_phase_assignment_in_iife_prefix() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             let phase;
             C.prototype.run = function(left, right) {
                 return (flag && (phase = function() { return left == right ? 1 : 2; }),
                     function() {});
             }();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -7808,7 +7808,7 @@ mod tests {
 
     #[test]
     fn rejects_phase_closure_overwritten_later_in_iife_prefix() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             let phase;
             C.prototype.run = function(left, right) {
@@ -7816,7 +7816,7 @@ mod tests {
                     phase = function() { return left == right ? 3 : 4; },
                     function() {});
             }();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -7832,14 +7832,14 @@ mod tests {
 
     #[test]
     fn rejects_effectful_phase_function() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             let phase;
             C.prototype.run = function(left, right) {
                 return (phase = function() { sideEffect(); return left == right ? 1 : 2; },
                     function() {});
             }();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -7855,14 +7855,14 @@ mod tests {
 
     #[test]
     fn proves_straight_line_prototype_alias_iife_method() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() {};
             var p;
             p = C.prototype;
             p.run = function(seed) {
                 return (seed = 1, function(value) { return value + seed; });
             }();
-        "#;
+        ";
         let proven = method_assignments(source);
         assert_eq!(proven.len(), 1);
         assert_eq!(proven[0].property, "run");
@@ -7880,25 +7880,25 @@ mod tests {
 
     #[test]
     fn rejects_prototype_alias_across_unknown_call() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             var p;
             p = C.prototype;
             unknown();
             p.run = function() {};
-        "#;
+        ";
         assert!(method_assignments(source).is_empty());
     }
 
     #[test]
     fn dynamic_property_write_does_not_destroy_prototype_alias_identity() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             var p;
             p = C.prototype;
             p[key] = 1;
             p.run = function() {};
-        "#;
+        ";
         let proven = method_assignments(source);
         assert_eq!(proven.len(), 1);
         assert_eq!(proven[0].property, "run");
@@ -7906,12 +7906,12 @@ mod tests {
 
     #[test]
     fn lookup_target_accepts_resolved_nonconflicting_empty_array_key() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             const empty = [];
             C.prototype.run = function() {};
             C.prototype[empty] = 1;
-        "#;
+        ";
         let targets = lookup_targets(source);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].property, "run");
@@ -7919,51 +7919,51 @@ mod tests {
 
     #[test]
     fn lookup_target_rejects_constructor_escape_to_unknown_call() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             unknown(C);
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn lookup_target_rejects_constructor_alias_creation() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             const Alias = C;
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn lookup_target_rejects_dynamic_constructor_property_write() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             C[key] = value;
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn lookup_target_rejects_dynamic_constructor_property_escape() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             unknown(C[key]);
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn lookup_target_keeps_static_constructor_property_value_escape_distinct() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             unknown(C.other);
-        "#;
+        ";
         let targets = lookup_targets(source);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].property, "run");
@@ -7971,21 +7971,21 @@ mod tests {
 
     #[test]
     fn lookup_target_rejects_conditional_constructor_escape() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             if (flag) unknown(C);
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn lookup_target_keeps_constructor_new_expression_distinct_from_escape() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             function make() { return new C(); }
-        "#;
+        ";
         let targets = lookup_targets(source);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].property, "run");
@@ -7993,62 +7993,62 @@ mod tests {
 
     #[test]
     fn lookup_target_rejects_conditional_prototype_mutation() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             if (flag) C.prototype.run = function() {};
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn lookup_target_rejects_conditional_alias_prototype_mutation() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             let p = C.prototype;
             p.run = function() {};
             if (flag) p.run = function() {};
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn lookup_target_rejects_compound_prototype_method_write() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             C.prototype.run += 1;
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn lookup_target_rejects_prototype_method_update() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             C.prototype.run++;
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn lookup_target_rejects_prototype_method_delete() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             delete C.prototype.run;
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn stable_constructor_prototype_rejects_proto_chain_mutation() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             C.prototype.__proto__ = {};
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -8062,11 +8062,11 @@ mod tests {
 
     #[test]
     fn lookup_target_rejects_static_proto_chain_mutation() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             C.prototype.__proto__ = {};
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
@@ -8082,77 +8082,77 @@ mod tests {
 
     #[test]
     fn lookup_target_rejects_unresolved_computed_prototype_write() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             C.prototype[key] = 1;
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
         assert_eq!(method_assignments(source).len(), 1);
     }
 
     #[test]
     fn lookup_target_rejects_prototype_escape_to_unknown_call() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             unknown(C.prototype);
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
         assert_eq!(method_assignments(source).len(), 1);
     }
 
     #[test]
     fn lookup_target_rejects_unknown_method_call_on_prototype_alias() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             let p = C.prototype;
             p.run = function() {};
             p.touch();
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn lookup_target_rejects_unknown_computed_method_call_on_prototype_alias() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             let p = C.prototype;
             p.run = function() {};
             p[key]();
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn lookup_target_rejects_nested_prototype_escape_to_unknown_call() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             unknown([C.prototype]);
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn lookup_target_rejects_prototype_nested_in_object_value() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function() {};
             unknown({ value: C.prototype });
-        "#;
+        ";
         assert!(lookup_targets(source).is_empty());
     }
 
     #[test]
     fn records_exact_origin_effects_in_evaluation_order() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() {
                 this.n0 = (this.T = [], 1);
                 unknown(this);
             };
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -8184,7 +8184,7 @@ mod tests {
 
     #[test]
     fn proves_exact_origin_member_writes_through_direct_calls() {
-        let source = r#"
+        let source = r"
             const C = function() { setup(this); };
             function setup(state) {
                 state.ready = 1;
@@ -8193,7 +8193,7 @@ mod tests {
                 delete state.old;
             }
             new C();
-        "#;
+        ";
         let proven = writes(source);
         assert_eq!(proven.len(), 4);
         assert_eq!(proven[0].property.as_deref(), Some("ready"));
@@ -8209,24 +8209,24 @@ mod tests {
 
     #[test]
     fn member_write_origin_does_not_enter_uninvoked_closure() {
-        let source = r#"
+        let source = r"
             const C = function() { setup(this); };
             function setup(state) {
                 function later() { state.shadow = 1; }
             }
             new C();
-        "#;
+        ";
         assert!(writes(source).is_empty());
     }
 
     #[test]
     fn proves_finite_conditional_prototype_function_values() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.clock = flag
                 ? function() { return this.base + host.now(); }
                 : function() { return 0; };
-        "#;
+        ";
         let proven = method_assignments(source);
         assert_eq!(proven.len(), 1);
         assert_eq!(proven[0].property, "clock");
@@ -8235,12 +8235,12 @@ mod tests {
 
     #[test]
     fn summarizes_receiver_requirements_across_all_possible_method_bodies() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.clock = flag
                 ? function() { return this.base + host.now(); }
                 : function() { return 0; };
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -8262,7 +8262,7 @@ mod tests {
 
     #[test]
     fn summarizes_receiver_mutation_call_and_exposure_obligations() {
-        let source = r#"
+        let source = r"
             const C = function() {};
             C.prototype.run = function(arg) {
                 this.count++;
@@ -8270,7 +8270,7 @@ mod tests {
                 unknown(this);
                 return this[key];
             };
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -8291,13 +8291,13 @@ mod tests {
 
     #[test]
     fn does_not_descend_into_uninvoked_nested_functions() {
-        let source = r#"
+        let source = r"
             const C = function() { start(this); };
             function start(state) {
                 function later() { state.run(); }
             }
             new C();
-        "#;
+        ";
         assert!(calls(source).is_empty());
     }
 }

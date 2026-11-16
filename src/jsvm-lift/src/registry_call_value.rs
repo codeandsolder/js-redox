@@ -601,7 +601,7 @@ mod tests {
     fn joins_lazy_shape_without_inventing_handler_identity() -> TestResult {
         use super::join_lazy_accessor_results;
         use crate::forwarding_semantics::structurally_proven_lazy_registry_read_calls;
-        let source = r#"
+        let source = r"
             function get(state, index, cell) {
                 if (cell = state.T[index], cell === undefined) throw Error();
                 if (cell.value) return cell.create();
@@ -612,7 +612,7 @@ mod tests {
                 if (flag) h = fallback;
                 h();
             }
-        "#;
+        ";
         let alloc = Allocator::default();
         let parsed = parse_program(&alloc, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -650,7 +650,7 @@ mod tests {
     fn unrelated_accessor_does_not_inherit_lazy_shape() -> TestResult {
         use super::join_lazy_accessor_results;
         use crate::forwarding_semantics::structurally_proven_lazy_registry_read_calls;
-        let source = r#"
+        let source = r"
             function get(state, index, cell) {
                 if (cell = state.T[index], cell === undefined) throw Error();
                 if (cell.value) return cell.create();
@@ -658,7 +658,7 @@ mod tests {
             }
             function plain(state, index) { return state.T[index]; }
             function run(s, n) { let a = get(s, n); let b = plain(s, n); a(); b(); }
-        "#;
+        ";
         let alloc = Allocator::default();
         let parsed = parse_program(&alloc, source, SourceType::cjs());
         assert!(parsed.is_clean());

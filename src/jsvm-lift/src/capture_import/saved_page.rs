@@ -199,7 +199,7 @@ fn html_references(html: &str, base: &str) -> Result<Vec<Value>> {
 
 fn css_source_references(source: &str, base: &str) -> Result<Vec<Value>> {
     let pattern =
-        Regex::new(r#"(?m)(?://[#@]|/\*[#@])\s*(sourceMappingURL|sourceURL)\s*=\s*([^\s*]+)"#)?;
+        Regex::new(r"(?m)(?://[#@]|/\*[#@])\s*(sourceMappingURL|sourceURL)\s*=\s*([^\s*]+)")?;
     let mut references = Vec::new();
     for capture in pattern.captures_iter(source) {
         let Some(kind) = capture.get(1).map(|value| value.as_str()) else {

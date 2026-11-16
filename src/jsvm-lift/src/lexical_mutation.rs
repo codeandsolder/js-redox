@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn tracks_hazard_lexical_context_and_enclosing_function() -> TestResult {
-        let source = r#"
+        let source = r"
             (function() {
                 let target;
                 target = function() { return 1; };
@@ -171,7 +171,7 @@ mod tests {
                 let target;
                 function unrelated(s) { return eval(s); }
             })();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());

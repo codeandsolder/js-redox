@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn maps_direct_iifes_and_lexical_calls_but_not_callbacks_as_execution() -> anyhow::Result<()> {
-        let code = r#"
+        let code = r"
             const handler = function() { return 1; };
             function init() {
               if (maybe) handler();
@@ -253,7 +253,7 @@ mod tests {
             }
             init();
             function unused() { handler(); }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, code, SourceType::cjs());
         assert!(parsed.is_clean());

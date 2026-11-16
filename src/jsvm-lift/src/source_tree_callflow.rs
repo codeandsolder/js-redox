@@ -1094,10 +1094,10 @@ mod tests {
     #[test]
     fn unrelated_dynamic_eval_does_not_suppress_other_lexical_call_wrappers() -> anyhow::Result<()>
     {
-        let source = r#"const unrelated=x=>eval(x);
+        let source = r"const unrelated=x=>eval(x);
             const leaf=x=>x===88?true:false;
             const wrapper=()=>leaf.call(this,88);
-            const api={};api.run=()=>wrapper();"#;
+            const api={};api.run=()=>wrapper();";
         let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
         assert!(
             view.reachable_edges
@@ -1155,9 +1155,9 @@ mod tests {
     #[test]
     fn shadowed_or_dynamic_function_call_target_is_not_original_lexical_function(
     ) -> anyhow::Result<()> {
-        let source = r#"const leaf=x=>x;
+        let source = r"const leaf=x=>x;
             const wrapper=(leaf,value)=>leaf.call(null,value);
-            const api={};api.run=()=>wrapper(x=>x*2,7);"#;
+            const api={};api.run=()=>wrapper(x=>x*2,7);";
         let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
         assert!(
             view.reachable_edges
@@ -1191,9 +1191,9 @@ mod tests {
     #[test]
     fn spread_after_function_call_receiver_does_not_shift_original_parameter_indexes(
     ) -> anyhow::Result<()> {
-        let source = r#"const leaf=(a,b,c)=>c;
+        let source = r"const leaf=(a,b,c)=>c;
             const wrapper=(x,y,z)=>leaf.call(null,x,...y,z);
-            const api={};api.run=()=>wrapper(1,[],3);"#;
+            const api={};api.run=()=>wrapper(1,[],3);";
         let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
         let edge = view
             .reachable_edges
@@ -1209,12 +1209,12 @@ mod tests {
 
     #[test]
     fn complete_graph_reaches_beyond_display_depth_and_preserves_cycles() -> anyhow::Result<()> {
-        let source = r#"const f5=(x)=>x ? f1(x-1) : x;
+        let source = r"const f5=(x)=>x ? f1(x-1) : x;
           const f4=(x)=>f5(x);
           const f3=(x)=>f4(x);
           const f2=(x)=>f3(x);
           const f1=(x)=>f2(x);
-          const api={}; api.run=(x)=>f1(x);"#;
+          const api={}; api.run=(x)=>f1(x);";
         let views = reconstruct_caller_views(source, Some("run"))?;
         assert_eq!(views.len(), 1);
         let view = &views[0];
@@ -1235,12 +1235,12 @@ mod tests {
 
     #[test]
     fn propagates_parameter_origins_beyond_display_cap_and_through_cycles() -> anyhow::Result<()> {
-        let source = r#"const leaf=(p)=>p;
+        let source = r"const leaf=(p)=>p;
           const f4=(p)=>leaf(p);
           const f3=(p)=>f4(p);
           const f2=(p)=>f3(p);
           const f1=(p)=>f2(p);
-          const api={};api.run=(input)=>f1(input);"#;
+          const api={};api.run=(input)=>f1(input);";
         let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
         assert!(view
             .paths
@@ -1259,14 +1259,14 @@ mod tests {
 
     #[test]
     fn multiple_callers_preserve_ambiguous_and_nonentry_sources() -> anyhow::Result<()> {
-        let source = r#"const leaf=(p)=>p;
+        let source = r"const leaf=(p)=>p;
           const fromA=(x)=>leaf(x);
           const fromB=(y)=>leaf(y);
           const api={};api.run=(first,second)=>{
               fromA(first);
               fromB(second);
               leaf(5);
-          };"#;
+          };";
         let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
         let leaf = view
             .reachable_functions
@@ -1280,9 +1280,9 @@ mod tests {
 
     #[test]
     fn recursive_parameter_swaps_converge_to_all_possible_sources() -> anyhow::Result<()> {
-        let source = r#"const one=(a,b)=>two(a,b);
+        let source = r"const one=(a,b)=>two(a,b);
           const two=(a,b)=>one(b,a);
-          const api={};api.run=(first,second)=>one(first,second);"#;
+          const api={};api.run=(first,second)=>one(first,second);";
         let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
         let one = view
             .reachable_functions
@@ -1335,14 +1335,14 @@ mod tests {
 
     #[test]
     fn spread_and_default_arguments_do_not_claim_direct_forwarding() -> anyhow::Result<()> {
-        let source = r#"const leaf=(a,b)=>[a,b];
+        let source = r"const leaf=(a,b)=>[a,b];
           const withDefault=(a=10)=>leaf(a,a);
           const middle=(x,y,arr)=>{
               leaf(...arr,x);
               leaf(x,...arr);
               withDefault(y);
           };
-          const api={};api.run=(one,two,arr)=>middle(one,two,arr);"#;
+          const api={};api.run=(one,two,arr)=>middle(one,two,arr);";
         let view = reconstruct_caller_views(source, Some("run"))?.remove(0);
         let leaf = view
             .reachable_functions
@@ -1369,11 +1369,11 @@ mod tests {
     #[test]
     fn forwards_an_entry_parameter_through_new_and_call_by_resolved_symbols() -> anyhow::Result<()>
     {
-        let source = r#"function app(){
+        let source = r"function app(){
             const deep=function(a,b){return b;};
             const Wd=function(x,y){return deep(y,x);};
             const AV={}; AV.aoF_=function(J,Q){return new Wd(Q,J);};
-        }"#;
+        }";
         let views = reconstruct_caller_views(source, Some("aoF_"))?;
         assert_eq!(views.len(), 1, "{views:?}");
         let path = views[0]
@@ -1392,12 +1392,12 @@ mod tests {
 
     #[test]
     fn construction_receiver_propagates_through_exact_forwarding() -> anyhow::Result<()> {
-        let source = r#"function outer() {
+        let source = r"function outer() {
           const leaf = state => state;
           const middle = value => leaf(value);
           const Wd = function(input) { middle((this)); };
           const AV = {}; AV.aoF_ = function(arg) { return new Wd(arg); };
-        }"#;
+        }";
         let view = reconstruct_caller_views(source, Some("aoF_"))?.remove(0);
         let path = view
             .paths
@@ -1432,8 +1432,8 @@ mod tests {
 
     #[test]
     fn arrow_functions_and_initialized_lexical_assignments_work() -> anyhow::Result<()> {
-        let source = r#"let middle;middle=(x)=>last(x);
-          const last=(y)=>y; const service={};service.run=(arg)=>middle(arg);"#;
+        let source = r"let middle;middle=(x)=>last(x);
+          const last=(y)=>y; const service={};service.run=(arg)=>middle(arg);";
         let views = reconstruct_caller_views(source, Some("run"))?;
         assert_eq!(views.len(), 1);
         let path = views[0]
@@ -1447,7 +1447,7 @@ mod tests {
 
     #[test]
     fn follows_immutable_function_and_parameter_alias_chains() -> anyhow::Result<()> {
-        let source = r#"function app(){
+        let source = r"function app(){
             const deep=(leaf)=>leaf;
             var deepAlias=deep;
             const deepAlias2=deepAlias;
@@ -1458,7 +1458,7 @@ mod tests {
             };
             let middleAlias=middle;
             const entry={}; entry.run=(request)=>middleAlias(request);
-        }"#;
+        }";
         let views = reconstruct_caller_views(source, Some("run"))?;
         assert_eq!(views.len(), 1, "{views:?}");
         let path = views[0]
@@ -1505,13 +1505,13 @@ mod tests {
 
     #[test]
     fn alias_of_mutated_function_does_not_create_certain_call_edge() -> anyhow::Result<()> {
-        let source = r#"function app(){
+        let source = r"function app(){
             let deep=(value)=>value;
             const alias=deep;
             deep=(value)=>value+1;
             const middle=(arg)=>alias(arg);
             const entry={};entry.run=(request)=>middle(request);
-        }"#;
+        }";
         let views = reconstruct_caller_views(source, Some("run"))?;
         assert!(views.iter().all(|view| view
             .paths
@@ -1522,9 +1522,9 @@ mod tests {
 
     #[test]
     fn aliased_parameter_with_direct_write_is_not_invariant() -> anyhow::Result<()> {
-        let source = r#"const deep=(p)=>p;
+        let source = r"const deep=(p)=>p;
             const middle=(arg)=>{const copy=arg; arg=0;return deep(copy);};
-            const entry={};entry.run=(request)=>middle(request);"#;
+            const entry={};entry.run=(request)=>middle(request);";
         let views = reconstruct_caller_views(source, Some("run"))?;
         assert_eq!(views.len(), 1);
         let path = views[0]
@@ -1538,7 +1538,7 @@ mod tests {
 
     #[test]
     fn rejects_mutated_parameter_as_certain_forwarding() -> anyhow::Result<()> {
-        let source = r#"const deep=function(p){return p;};const Wd=function(x){x=3;return deep(x);};const api={};api.m=function(arg){return new Wd(arg);};"#;
+        let source = r"const deep=function(p){return p;};const Wd=function(x){x=3;return deep(x);};const api={};api.m=function(arg){return new Wd(arg);};";
         let views = reconstruct_caller_views(source, Some("m"))?;
         assert_eq!(views.len(), 1);
         let path = &views[0].paths[0];

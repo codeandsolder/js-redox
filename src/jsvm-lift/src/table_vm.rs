@@ -1605,7 +1605,7 @@ mod tests {
         use crate::receiver_identity::structurally_proven_origin_flow;
         use oxc_semantic::SemanticBuilder;
 
-        let source = r#"
+        let source = r"
             const C = function(key) {
                 install(this, 1, function a() {});
                 install(this, 2, function b() {});
@@ -1617,7 +1617,7 @@ mod tests {
             function read(state, key) { let value; value = state.T[key]; return value; }
             function run(state, key) { return read(state, key); }
             new C(window.dynamicKey);
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -1645,7 +1645,7 @@ mod tests {
 
     #[test]
     fn production_origin_flow_joins_prototype_method_registry_read() -> TestResult {
-        let source = r#"
+        let source = r"
             function install(state, key, value) { state.T[key] = value; }
             function read(state, key) { return state.T[key]; }
             function C(key) {
@@ -1657,7 +1657,7 @@ mod tests {
             }
             C.prototype.run = function(key) { return read(this, key); };
             new C(window.dynamicKey);
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -1677,7 +1677,7 @@ mod tests {
 
     #[test]
     fn lazy_accessor_indirect_call_requires_same_origin_and_write_free_path() -> TestResult {
-        let setup = r#"
+        let setup = r"
             function install(receiver, key, value) { receiver.T[key] = value; }
             function read(receiver, key, cell) {
                 if (cell = receiver.T[key], cell === undefined) throw Error();
@@ -1696,7 +1696,7 @@ mod tests {
                 if (key > 0) handler();
             };
             new C(window.dynamicKey);
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, setup, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -1726,7 +1726,7 @@ mod tests {
 
     #[test]
     fn materializes_proven_forwarded_registry_calls() -> TestResult {
-        let source = r#"
+        let source = r"
             function install(receiver, key, value) {
                 receiver.handlers[key] = wrap(receiver, key, value);
             }
@@ -1736,7 +1736,7 @@ mod tests {
                 install(state, 3, function() { return 3; });
                 install(state, 4, function(a) { return a * 4; });
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -1753,7 +1753,7 @@ mod tests {
 
     #[test]
     fn groups_proven_sequence_receivers_by_stable_final_binding() -> TestResult {
-        let source = r#"
+        let source = r"
             function install(receiver, key, value) {
                 receiver.handlers[key] = wrap(receiver, key, value);
             }
@@ -1764,7 +1764,7 @@ mod tests {
                 install((touch(3), state), 3, (noise(), function() { return 3; }));
                 (noise(), install)((touch(4), state), 4, function(a) { return a * 4; });
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());

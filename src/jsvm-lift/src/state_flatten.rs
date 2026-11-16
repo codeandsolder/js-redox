@@ -5649,7 +5649,7 @@ mod tests {
     #[test]
     fn detects_unconditional_for_if_ladder_with_guarded_break_exit() {
         let detected = detect(
-            r#"
+            r"
             function flattened() {
                 let outer, noise, state;
                 for (outer = (state = 17, noise = side(), 0);;) {
@@ -5660,7 +5660,7 @@ mod tests {
                     else if (state == 44) state = 33;
                 }
             }
-            "#,
+            ",
         );
         assert_eq!(detected.if_ladder_machines.len(), 1);
         let machine = &detected.if_ladder_machines[0];
@@ -5674,7 +5674,7 @@ mod tests {
 
     #[test]
     fn proves_identifier_equality_live_at_event() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened(left, right, flag) {
                 let state;
                 for (state = 0; state !== 99;) {
@@ -5684,7 +5684,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         let target_start = source_offset(source, "target()", "target() offset")?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -5708,7 +5708,7 @@ mod tests {
 
     #[test]
     fn proves_identifier_equality_inside_nested_alternate_dispatch_chunk() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened(left, right, other) {
                 let state;
                 for (state = 0; state !== 99;) {
@@ -5721,7 +5721,7 @@ mod tests {
                     }
                 }
             }
-        "#;
+        ";
         let target_start = source_offset(source, "target()", "target() offset")?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -5745,7 +5745,7 @@ mod tests {
 
     #[test]
     fn rejects_identifier_equality_invalidated_before_event() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened(left, right, flag) {
                 let state;
                 for (state = 0; state !== 99;) {
@@ -5755,7 +5755,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         let target_start = source_offset(source, "target()", "target() offset")?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -5780,7 +5780,7 @@ mod tests {
     #[test]
     fn proves_protected_identifier_equality_when_barrier_suffix_cannot_return_to_event(
     ) -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened(left, right, other) {
                 let outer, state, phase;
                 for (outer = (state = 0, phase = undefined, 0);;) try {
@@ -5794,7 +5794,7 @@ mod tests {
                     throw error;
                 }
             }
-        "#;
+        ";
         let target_start = source_offset(source, "target()", "target() offset")?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -5818,7 +5818,7 @@ mod tests {
 
     #[test]
     fn rejects_protected_identifier_equality_when_barrier_suffix_returns_to_event() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened(left, right, other) {
                 let state;
                 for (state = 0;;) try {
@@ -5831,7 +5831,7 @@ mod tests {
                     throw error;
                 }
             }
-        "#;
+        ";
         let target_start = source_offset(source, "target()", "target() offset")?;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -5855,7 +5855,7 @@ mod tests {
 
     #[test]
     fn proves_required_state_before_event() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened() {
                 let state;
                 for (state = 0; state !== 99;) {
@@ -5865,7 +5865,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         let target_start = source_offset(source, "target()", "target() offset")?;
         let target = Span::new(target_start, target_start + 8);
         let allocator = Allocator::default();
@@ -5889,7 +5889,7 @@ mod tests {
 
     #[test]
     fn allows_unresolved_transition_after_required_state() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened(flag, unknown) {
                 let state;
                 for (state = 0; state !== 99;) {
@@ -5900,7 +5900,7 @@ mod tests {
                     else if (state === 4) { state = unknown; }
                 }
             }
-        "#;
+        ";
         let target_start = source_offset(source, "target()", "target() offset")?;
         let target = Span::new(target_start, target_start + 8);
         let allocator = Allocator::default();
@@ -5924,7 +5924,7 @@ mod tests {
 
     #[test]
     fn rejects_unresolved_transition_before_required_state() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened(flag, unknown) {
                 let state;
                 for (state = 0; state !== 99;) {
@@ -5934,7 +5934,7 @@ mod tests {
                     else if (state === 4) { state = unknown; }
                 }
             }
-        "#;
+        ";
         let target_start = source_offset(source, "target()", "target() offset")?;
         let target = Span::new(target_start, target_start + 8);
         let allocator = Allocator::default();
@@ -5958,7 +5958,7 @@ mod tests {
 
     #[test]
     fn rejects_required_state_bypassed_on_path_to_event() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened(flag) {
                 let state;
                 for (state = 0; state !== 99;) {
@@ -5968,7 +5968,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         let target_start = source_offset(source, "target()", "target() offset")?;
         let target = Span::new(target_start, target_start + 8);
         let allocator = Allocator::default();
@@ -5992,7 +5992,7 @@ mod tests {
 
     #[test]
     fn proves_if_ladder_event_before_later_barrier_state() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened() {
                 for (let state = 0; state !== 99;) {
                     if (state === 0) { state = 1; }
@@ -6001,7 +6001,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         assert!(prove_order(source, "target()", &["barrier()"])?);
 
         Ok(())
@@ -6009,7 +6009,7 @@ mod tests {
 
     #[test]
     fn rejects_if_ladder_barrier_on_path_before_event() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened() {
                 for (let state = 0; state !== 99;) {
                     if (state === 0) { barrier(); state = 1; }
@@ -6018,7 +6018,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         assert!(!prove_order(source, "target()", &["barrier()"])?);
 
         Ok(())
@@ -6026,7 +6026,7 @@ mod tests {
 
     #[test]
     fn orders_barriers_within_target_state() -> TestResult {
-        let before = r#"
+        let before = r"
             function flattened() {
                 for (let state = 0; state !== 99;) {
                     if (state === 0) { barrier(); target(); state = 99; }
@@ -6035,7 +6035,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         assert!(!prove_order(before, "target()", &["barrier()"])?);
 
         let after = before.replace("barrier(); target();", "target(); barrier();");
@@ -6046,7 +6046,7 @@ mod tests {
 
     #[test]
     fn allows_known_alternate_path_that_exits_without_event() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened(flag) {
                 for (let state = 0; state !== 99;) {
                     if (state === 0) { state = flag ? 1 : 3; }
@@ -6055,7 +6055,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         assert!(prove_order(source, "target()", &["barrier()"])?);
 
         Ok(())
@@ -6063,7 +6063,7 @@ mod tests {
 
     #[test]
     fn rejects_reachable_unresolved_transition_before_event() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened(next) {
                 for (let state = 0; state !== 99;) {
                     if (state === 0) { state = next; }
@@ -6072,7 +6072,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         assert!(!prove_order(source, "target()", &[])?);
 
         Ok(())
@@ -6145,7 +6145,7 @@ mod tests {
 
     #[test]
     fn proves_while_if_ladder_event_before_later_same_state_barrier() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened() {
                 let state;
                 state = 0;
@@ -6156,7 +6156,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         assert!(prove_while_order(source, "target()", &["barrier()"])?);
 
         Ok(())
@@ -6164,7 +6164,7 @@ mod tests {
 
     #[test]
     fn proves_order_from_pre_detected_while_machine() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened() {
                 let state = 0;
                 while (state !== 99) {
@@ -6174,7 +6174,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         struct Finder<'m> {
@@ -6217,7 +6217,7 @@ mod tests {
 
     #[test]
     fn proves_selector_specialized_branch_unreachable() -> TestResult {
-        let source = r#"function f(Q) {
+        let source = r"function f(Q) {
             for (H = 28; H != 74;) {
                 if (H == 55) { sink(); H = 62; }
                 else if (H == 56) H = (Q & 62) == Q ? 55 : 62;
@@ -6227,7 +6227,7 @@ mod tests {
                 else if (H == 89) return;
                 else if (H == 28) H = 56;
             }
-        }"#;
+        }";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let mut harness = DetectorHarness {
@@ -6266,7 +6266,7 @@ mod tests {
 
     #[test]
     fn proves_switch_event_unreachable_by_parameter_index() -> TestResult {
-        let source = r#"const x = function(J, Q, Y) {
+        let source = r"const x = function(J, Q, Y) {
             switch (!(Q == 410 || Q == 387)) {
                 case true:
                     J.T[Q] = Y;
@@ -6275,7 +6275,7 @@ mod tests {
                     sink(Y);
                     break;
             }
-        };"#;
+        };";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
@@ -6318,7 +6318,7 @@ mod tests {
 
     #[test]
     fn proves_switch_target_mismatch_past_opaque_terminating_case() -> TestResult {
-        let source = r#"const x = function(Q, Y) {
+        let source = r"const x = function(Q, Y) {
             switch (!(Q == 410 || Q == 387)) {
                 case opaque():
                     first(Y);
@@ -6327,7 +6327,7 @@ mod tests {
                     sink(Y);
                     break;
             }
-        };"#;
+        };";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
@@ -6360,7 +6360,7 @@ mod tests {
 
     #[test]
     fn switch_target_mismatch_rejects_possible_prior_fallthrough() -> TestResult {
-        let source = r#"const x = function(Q, Y) {
+        let source = r"const x = function(Q, Y) {
             switch (!(Q == 410 || Q == 387)) {
                 case opaque():
                     first(Y);
@@ -6368,7 +6368,7 @@ mod tests {
                     sink(Y);
                     break;
             }
-        };"#;
+        };";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
@@ -6401,7 +6401,7 @@ mod tests {
 
     #[test]
     fn function_ordering_falls_back_to_detected_while_machine() -> TestResult {
-        let source = r#"
+        let source = r"
             function target() {
                 let state = 5;
                 while (state != 27) {
@@ -6411,7 +6411,7 @@ mod tests {
                     else if (state == 85) state = 27;
                 }
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -6447,7 +6447,7 @@ mod tests {
 
     #[test]
     fn function_specializer_maps_logical_and_state_guard() -> TestResult {
-        let source = r#"
+        let source = r"
             function target(selector) {
                 let state = 5;
                 while (state != 27) {
@@ -6458,7 +6458,7 @@ mod tests {
                     else state == 92 && (sideEffect(), state = 27);
                 }
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -6513,7 +6513,7 @@ mod tests {
 
     #[test]
     fn exact_parameter_specializer_proves_required_state_before_event() -> TestResult {
-        let source = r#"
+        let source = r"
             function helper(j, q) {
                 let out;
                 let state = 88;
@@ -6526,7 +6526,7 @@ mod tests {
                     else if (state == 48) { out = build(); state = 63; }
                 }
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
@@ -6577,7 +6577,7 @@ mod tests {
 
     #[test]
     fn function_specializer_handles_preceding_init_while_machine() -> TestResult {
-        let source = r#"
+        let source = r"
             const f = function(selector) {
                 state = 5;
                 while (state != 27) {
@@ -6588,7 +6588,7 @@ mod tests {
                     else if (state == 44) state = 27;
                 }
             };
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
@@ -6633,12 +6633,12 @@ mod tests {
 
     #[test]
     fn structured_branch_keeps_unrelated_stable_exact_parameter() -> TestResult {
-        let source = r#"
+        let source = r"
             function f(selector, scratch) {
                 if (selector === 99) target();
                 scratch = 1;
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
@@ -6668,13 +6668,13 @@ mod tests {
 
     #[test]
     fn proves_false_while_body_unreachable_with_integer_parameters() -> TestResult {
-        let source = r#"
+        let source = r"
             function f(mode, cell) {
                 while ((mode ^ 48) < 10 && mode << 2 >= 2) {
                     observe(cell);
                 }
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
@@ -6724,7 +6724,7 @@ mod tests {
 
     #[test]
     fn branch_truthiness_proves_real_m_style_guard_false() -> TestResult {
-        let source = r#"
+        let source = r"
             J - 6 << 1 < J
                 && J + 9 >> 1 >= J
                 && (
@@ -6739,7 +6739,7 @@ mod tests {
                     ) | Y[(L | Q) + 3],
                     J & 100
                 ) == J;
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -6763,7 +6763,7 @@ mod tests {
 
     #[test]
     fn branch_truthiness_proves_false_left_associated_guard() -> TestResult {
-        let source = r#"J - 6 << 1 < J && J + 9 >> 1 >= J && (u = 3, J & 100) == J;"#;
+        let source = r"J - 6 << 1 < J && J + 9 >> 1 >= J && (u = 3, J & 100) == J;";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let statement = parsed
@@ -6783,7 +6783,7 @@ mod tests {
 
     #[test]
     fn proves_nested_sequence_short_circuit_event_unreachable() -> TestResult {
-        let source = r#"
+        let source = r"
             function f(J, Q, L, U, v) {
                 ((J & 100) == J && (
                     U = 7,
@@ -6791,7 +6791,7 @@ mod tests {
                     U
                 ), 11);
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
@@ -6821,11 +6821,11 @@ mod tests {
 
     #[test]
     fn proves_left_associated_short_circuit_with_opaque_prefix() -> TestResult {
-        let source = r#"
+        let source = r"
             function f(selector, state) {
                 (opaque() && (selector & 100) == selector) && (state = 1);
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
@@ -6855,11 +6855,11 @@ mod tests {
 
     #[test]
     fn proves_structured_short_circuit_event_unreachable() -> TestResult {
-        let source = r#"
+        let source = r"
             const f = function(selector) {
                 selector == 449 && target();
             };
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
@@ -6900,7 +6900,7 @@ mod tests {
 
     #[test]
     fn proves_selector_specialization_by_parameter_index() -> TestResult {
-        let source = r#"const g = function(J, Q) {
+        let source = r"const g = function(J, Q) {
             for (H = 28; H != 74;) {
                 if (H == 55) { sink(J); H = 62; }
                 else if (H == 56) H = (Q & 62) == Q ? 55 : 62;
@@ -6910,7 +6910,7 @@ mod tests {
                 else if (H == 89) return;
                 else if (H == 28) H = 56;
             }
-        };"#;
+        };";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
@@ -7013,7 +7013,7 @@ mod tests {
 
     #[test]
     fn protected_ladder_fails_closed_for_supplied_unknown_parameter() -> TestResult {
-        let source = r#"
+        let source = r"
             const y = function(J, Q, Y, L, v, U, H, S, q, R, l, u, r, n) {
                 r = 57;
                 {
@@ -7030,7 +7030,7 @@ mod tests {
                     }
                 }
             };
-        "#;
+        ";
         assert!(!protected_call_proof(source, 7)?);
 
         Ok(())
@@ -7038,7 +7038,7 @@ mod tests {
 
     #[test]
     fn protected_ladder_rejects_nested_state_capture() -> TestResult {
-        let source = r#"
+        let source = r"
             const y = function(J, Q, Y, L, v, U, H, S, q, R, l, u, r, n) {
                 r = 57;
                 while (true) try {
@@ -7049,7 +7049,7 @@ mod tests {
                     else if (r == 30) return;
                 } catch (m) { throw m; }
             };
-        "#;
+        ";
         assert!(!protected_call_proof(source, 4)?);
 
         Ok(())
@@ -7057,7 +7057,7 @@ mod tests {
 
     #[test]
     fn protected_ladder_rejects_recoverable_exception_path_to_event() -> TestResult {
-        let source = r#"
+        let source = r"
             const y = function(J, Q, Y, L, v, U, H, S, q, R, l, u, r, n) {
                 r = 57;
                 {
@@ -7073,7 +7073,7 @@ mod tests {
                     }
                 }
             };
-        "#;
+        ";
         assert!(!protected_call_proof(source, 4)?);
 
         Ok(())
@@ -7081,7 +7081,7 @@ mod tests {
 
     #[test]
     fn while_detector_matches_condition_state_in_mixed_sequence_init() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened() {
                 let state, noise;
                 noise = 7, state = 0, noise = 9;
@@ -7092,7 +7092,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         assert!(prove_while_order(source, "target()", &[])?);
 
         Ok(())
@@ -7100,7 +7100,7 @@ mod tests {
 
     #[test]
     fn while_detector_matches_condition_state_in_multi_declarator_init() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened() {
                 let noise = 7, state = 0, tail = 9;
                 while (state !== 99) {
@@ -7110,7 +7110,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         assert!(prove_while_order(source, "target()", &[])?);
 
         Ok(())
@@ -7118,7 +7118,7 @@ mod tests {
 
     #[test]
     fn rejects_while_if_ladder_barrier_before_event() -> TestResult {
-        let source = r#"
+        let source = r"
             function flattened() {
                 let state;
                 state = 0;
@@ -7129,7 +7129,7 @@ mod tests {
                     else if (state === 3) { state = 99; }
                 }
             }
-        "#;
+        ";
         assert!(!prove_while_order(source, "target()", &["barrier()"])?);
 
         Ok(())

@@ -3438,10 +3438,10 @@ mod tests {
         let original = temp.path().join("original.js");
         fs::write(
             &original,
-            r#"function original(){const helper=function(H,key){
+            r"function original(){const helper=function(H,key){
                key='push';H.length<2&&(key=H);
                return function(value){const list=[];list[key](value);return list.length};
-            };}"#,
+            };}",
         )?;
         fs::write(
             input.join("handler.js"),
