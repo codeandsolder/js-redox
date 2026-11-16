@@ -1726,7 +1726,7 @@ impl SequentialExceptionScan<'_> {
         }
     }
 
-    /// Tagged substitutions are evaluated without the ToString coercion
+    /// Tagged substitutions are evaluated without the `ToString` coercion
     /// applied to ordinary templates; preserve the later tag call throw root.
     fn tagged_template(
         &mut self,
@@ -2212,17 +2212,22 @@ struct ExceptionEntryProof<'a> {
     excluded: &'a BTreeSet<u64>,
 }
 
-fn single_entry_exception_regions(
-    dispatcher: &Statement<'_>,
+/// Every region proof needs exactly the same source-case index: numeric
+/// labels with side-effect-free tests and the original ordered branch bodies.
+/// Reject malformed fallthroughs before any CFG transformation mutates cases.
+struct ExceptionSourceCaseIndex<'node, 'ast> {
+    statements: BTreeMap<u64, &'node Statement<'ast>>,
+    tests: BTreeMap<u64, String>,
+}
+
+fn indexed_exception_source_cases<'node, 'ast>(
+    dispatcher: &'node Statement<'ast>,
     state: &str,
-    entry: ExceptionEntryProof<'_>,
-    cases: &mut BTreeMap<u64, Option<Route>>,
-    edits: &BTreeMap<u64, Vec<TerminalStateEdit>>,
     effects: &ExceptionLoopEffectContext<'_>,
     source: &str,
-) -> Option<(BTreeMap<u64, String>, BTreeSet<u64>)> {
+) -> Option<ExceptionSourceCaseIndex<'node, 'ast>> {
     let mut statements = BTreeMap::new();
-    let mut source_tests = BTreeMap::new();
+    let mut tests = BTreeMap::new();
     let mut cursor = dispatcher;
     loop {
         let Statement::IfStatement(branch) = cursor else {
@@ -2233,13 +2238,29 @@ fn single_entry_exception_regions(
         }
         let label = state_test(&branch.test, state)?;
         statements.insert(label, &branch.consequent);
-        source_tests.insert(label, fragment(source, branch.test.span()));
+        tests.insert(label, fragment(source, branch.test.span()).to_owned());
         match branch.alternate.as_ref() {
             Some(other @ Statement::IfStatement(_)) => cursor = other,
             None => break,
             Some(_) => return None,
         }
     }
+    Some(ExceptionSourceCaseIndex { statements, tests })
+}
+
+fn single_entry_exception_regions(
+    dispatcher: &Statement<'_>,
+    state: &str,
+    entry: ExceptionEntryProof<'_>,
+    cases: &mut BTreeMap<u64, Option<Route>>,
+    edits: &BTreeMap<u64, Vec<TerminalStateEdit>>,
+    effects: &ExceptionLoopEffectContext<'_>,
+    source: &str,
+) -> Option<(BTreeMap<u64, String>, BTreeSet<u64>)> {
+    let ExceptionSourceCaseIndex {
+        statements,
+        tests: source_tests,
+    } = indexed_exception_source_cases(dispatcher, state, effects, source)?;
 
     // Count distinct source cases, not duplicate conditional arms from
     // the same case. Multiple arms may safely converge to one successor.
@@ -2666,6 +2687,101 @@ fn exception_branching_dag_regions(
     Some((BTreeMap::new(), BTreeSet::new()))
 }
 
+/// Produce a topological order of the natural loop's side graph while
+/// preserving the original state write on the genuine header backedge.
+fn ordered_natural_loop_side(
+    graph: &BTreeMap<u64, Route>,
+    incoming: &BTreeMap<u64, BTreeSet<u64>>,
+    entry: ExceptionEntryProof<'_>,
+    region: &BTreeSet<u64>,
+    header: u64,
+    side: u64,
+) -> Option<(BTreeSet<u64>, Vec<u64>)> {
+    // The internal side of a natural loop may branch and reconverge.
+    // Only absorb it when every normal path stays in an acyclic side
+    // graph and eventually returns to the header. This lets us emit
+    // each source case once, instead of cloning effects at joins.
+    let members = region
+        .iter()
+        .copied()
+        .filter(|&member| member != header)
+        .collect::<BTreeSet<_>>();
+    if !members.contains(&side) {
+        return None;
+    }
+    let mut indegrees = BTreeMap::new();
+    let mut valid = true;
+    let mut has_backedge = false;
+    for &member in &members {
+        if entry.roots.contains(&member) || entry.excluded.contains(&member) {
+            valid = false;
+            break;
+        }
+        let Some(parents) = incoming.get(&member) else {
+            valid = false;
+            break;
+        };
+        if !parents.is_subset(region) {
+            valid = false;
+            break;
+        }
+        indegrees.insert(
+            member,
+            parents
+                .iter()
+                .filter(|parent| members.contains(parent))
+                .count(),
+        );
+        let mut targets = Vec::new();
+        graph.get(&member)?.targets(&mut targets);
+        for target in targets {
+            if target == header {
+                has_backedge = true;
+            } else if !members.contains(&target) {
+                // No side exits may bypass the header's sole exit arm.
+                valid = false;
+                break;
+            }
+        }
+        if !valid {
+            break;
+        }
+    }
+    if !valid || !has_backedge {
+        return None;
+    }
+    let mut ready = indegrees
+        .iter()
+        .filter_map(|(&member, &degree)| (degree == 0).then_some(member))
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(members.len());
+    while let Some(&member) = ready.first() {
+        ready.remove(&member);
+        ordered.push(member);
+        let mut targets = Vec::new();
+        graph.get(&member)?.targets(&mut targets);
+        // Incoming counts are per distinct source edge. A conditional
+        // with two arms reaching one successor must decrement once.
+        targets.sort_unstable();
+        targets.dedup();
+        for successor in targets {
+            if let Some(degree) = indegrees.get_mut(&successor) {
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.insert(successor);
+                }
+            }
+        }
+    }
+    if ordered.len() != members.len() {
+        // A cycle not passing through the header would allow a side
+        // case to execute twice and cannot be flattened this way.
+        return None;
+    }
+
+    Some((members, ordered))
+}
+
 /// Absorb one uniquely entered backedge arm of a natural loop without
 /// changing the enclosing `while`/`try` iteration boundary.
 ///
@@ -2678,6 +2794,39 @@ fn exception_branching_dag_regions(
 /// catch-visible values in the original protected try. The true backedge
 /// remains a state write; only the original outer while iteration reenters
 /// the header.
+/// A cyclic region has an independent entry at every catch root or
+/// target of an incoming edge from outside the strongly connected region.
+fn exception_scc_entrances(
+    region: &BTreeSet<u64>,
+    graph: &BTreeMap<u64, Route>,
+    roots: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    let mut entrances = roots.intersection(region).copied().collect::<BTreeSet<_>>();
+    for (&outside, route) in graph {
+        if region.contains(&outside) {
+            continue;
+        }
+        let mut targets = Vec::new();
+        route.targets(&mut targets);
+        entrances.extend(targets.into_iter().filter(|target| region.contains(target)));
+    }
+    entrances
+}
+
+/// Print one original case, applying any proven source-terminal replacement.
+fn exception_case_text(
+    label: u64,
+    statements: &BTreeMap<u64, &Statement<'_>>,
+    edits: &BTreeMap<u64, Vec<TerminalStateEdit>>,
+    source: &str,
+) -> Option<String> {
+    let statement = *statements.get(&label)?;
+    edits.get(&label).map_or_else(
+        || Some(fragment(source, statement.span()).to_owned()),
+        |changes| print_terminal_edits(statement, source, changes),
+    )
+}
+
 fn exception_scc_backedge_regions(
     dispatcher: &Statement<'_>,
     state: &str,
@@ -2687,22 +2836,8 @@ fn exception_scc_backedge_regions(
     effects: &ExceptionLoopEffectContext<'_>,
     source: &str,
 ) -> Option<(BTreeMap<u64, String>, BTreeSet<u64>)> {
-    let mut statements = BTreeMap::new();
-    let mut cursor = dispatcher;
-    loop {
-        let Statement::IfStatement(branch) = cursor else {
-            return None;
-        };
-        if branch.test.may_have_side_effects(effects) {
-            return None;
-        }
-        statements.insert(state_test(&branch.test, state)?, &branch.consequent);
-        match branch.alternate.as_ref() {
-            Some(other @ Statement::IfStatement(_)) => cursor = other,
-            None => break,
-            Some(_) => return None,
-        }
-    }
+    let ExceptionSourceCaseIndex { statements, .. } =
+        indexed_exception_source_cases(dispatcher, state, effects, source)?;
 
     let graph = entry
         .reachable
@@ -2718,31 +2853,13 @@ fn exception_scc_backedge_regions(
         }
     }
 
-    let original_text = |label: u64| -> Option<String> {
-        let statement = *statements.get(&label)?;
-        edits.get(&label).map_or_else(
-            || Some(fragment(source, statement.span()).to_owned()),
-            |changes| print_terminal_edits(statement, source, changes),
-        )
-    };
+    let original_text = |label| exception_case_text(label, &statements, edits, source);
 
     for region in strongly_connected_regions(&graph, entry.reachable) {
         if region.len() < 2 {
             continue;
         }
-        let mut entrances = entry
-            .roots
-            .intersection(&region)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        for (&outside, route) in &graph {
-            if region.contains(&outside) {
-                continue;
-            }
-            let mut targets = Vec::new();
-            route.targets(&mut targets);
-            entrances.extend(targets.into_iter().filter(|target| region.contains(target)));
-        }
+        let entrances = exception_scc_entrances(&region, &graph, entry.roots);
         if entrances.len() != 1 {
             // An SCC entered at two labels is irreducible for this source
             // transformation, even when normal graph edges appear linear.
@@ -2770,83 +2887,11 @@ fn exception_scc_backedge_regions(
             continue;
         }
 
-        // The internal side of a natural loop may branch and reconverge.
-        // Only absorb it when every normal path stays in an acyclic side
-        // graph and eventually returns to the header. This lets us emit
-        // each source case once, instead of cloning effects at joins.
-        let members = region
-            .iter()
-            .copied()
-            .filter(|&member| member != header)
-            .collect::<BTreeSet<_>>();
-        if !members.contains(&side) {
+        let Some((members, ordered)) =
+            ordered_natural_loop_side(&graph, &incoming, entry, &region, header, side)
+        else {
             continue;
-        }
-        let mut indegrees = BTreeMap::new();
-        let mut valid = true;
-        let mut has_backedge = false;
-        for &member in &members {
-            if entry.roots.contains(&member) || entry.excluded.contains(&member) {
-                valid = false;
-                break;
-            }
-            let Some(parents) = incoming.get(&member) else {
-                valid = false;
-                break;
-            };
-            if !parents.is_subset(&region) {
-                valid = false;
-                break;
-            }
-            indegrees.insert(
-                member,
-                parents
-                    .iter()
-                    .filter(|parent| members.contains(parent))
-                    .count(),
-            );
-            let mut targets = Vec::new();
-            graph.get(&member)?.targets(&mut targets);
-            for target in targets {
-                if target == header {
-                    has_backedge = true;
-                } else if !members.contains(&target) {
-                    // No side exits may bypass the header's sole exit arm.
-                    valid = false;
-                    break;
-                }
-            }
-            if !valid {
-                break;
-            }
-        }
-        if !valid || !has_backedge {
-            continue;
-        }
-        let mut ready = indegrees
-            .iter()
-            .filter_map(|(&member, &degree)| (degree == 0).then_some(member))
-            .collect::<BTreeSet<_>>();
-        let mut ordered = Vec::with_capacity(members.len());
-        while let Some(&member) = ready.first() {
-            ready.remove(&member);
-            ordered.push(member);
-            let mut targets = Vec::new();
-            graph.get(&member)?.targets(&mut targets);
-            for successor in targets {
-                if let Some(degree) = indegrees.get_mut(&successor) {
-                    *degree -= 1;
-                    if *degree == 0 {
-                        ready.insert(successor);
-                    }
-                }
-            }
-        }
-        if ordered.len() != members.len() {
-            // A cycle not passing through the header would allow a side
-            // case to execute twice and cannot be flattened this way.
-            continue;
-        }
+        };
 
         let mut composed = route.clone();
         let Next::Choose { yes, no, .. } = &mut composed.next else {
@@ -2917,25 +2962,8 @@ fn exception_multi_entry_cycle_regions(
     effects: &ExceptionLoopEffectContext<'_>,
     source: &str,
 ) -> Option<ExceptionCycleRewrite> {
-    let mut statements = BTreeMap::new();
-    let mut tests = BTreeMap::new();
-    let mut cursor = dispatcher;
-    loop {
-        let Statement::IfStatement(branch) = cursor else {
-            return None;
-        };
-        if branch.test.may_have_side_effects(effects) {
-            return None;
-        }
-        let label = state_test(&branch.test, state)?;
-        statements.insert(label, &branch.consequent);
-        tests.insert(label, fragment(source, branch.test.span()).to_owned());
-        match branch.alternate.as_ref() {
-            Some(other @ Statement::IfStatement(_)) => cursor = other,
-            None => break,
-            Some(_) => return None,
-        }
-    }
+    let ExceptionSourceCaseIndex { statements, tests } =
+        indexed_exception_source_cases(dispatcher, state, effects, source)?;
 
     let graph = entry
         .reachable
@@ -2946,19 +2974,7 @@ fn exception_multi_entry_cycle_regions(
         if region.len() < 2 || !region.is_disjoint(entry.excluded) {
             continue;
         }
-        let mut entrances = entry
-            .roots
-            .intersection(&region)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        for (&outside, route) in &graph {
-            if region.contains(&outside) {
-                continue;
-            }
-            let mut targets = Vec::new();
-            route.targets(&mut targets);
-            entrances.extend(targets.into_iter().filter(|target| region.contains(target)));
-        }
+        let entrances = exception_scc_entrances(&region, &graph, entry.roots);
         if entrances.len() < 2 {
             continue;
         }
@@ -3047,25 +3063,8 @@ fn exception_diamond_regions(
     effects: &ExceptionLoopEffectContext<'_>,
     source: &str,
 ) -> Option<(BTreeMap<u64, String>, BTreeSet<u64>)> {
-    let mut statements = BTreeMap::new();
-    let mut tests = BTreeMap::new();
-    let mut cursor = dispatcher;
-    loop {
-        let Statement::IfStatement(branch) = cursor else {
-            return None;
-        };
-        if branch.test.may_have_side_effects(effects) {
-            return None;
-        }
-        let label = state_test(&branch.test, state)?;
-        statements.insert(label, &branch.consequent);
-        tests.insert(label, fragment(source, branch.test.span()));
-        match branch.alternate.as_ref() {
-            Some(other @ Statement::IfStatement(_)) => cursor = other,
-            None => break,
-            Some(_) => return None,
-        }
-    }
+    let ExceptionSourceCaseIndex { statements, tests } =
+        indexed_exception_source_cases(dispatcher, state, effects, source)?;
 
     let mut incoming = BTreeMap::<u64, BTreeSet<u64>>::new();
     for &label in entry.reachable {
@@ -3079,13 +3078,7 @@ fn exception_diamond_regions(
         }
     }
 
-    let text_of = |label: u64| -> Option<String> {
-        let statement = *statements.get(&label)?;
-        edits.get(&label).map_or_else(
-            || Some(fragment(source, statement.span()).to_owned()),
-            |changes| print_terminal_edits(statement, source, changes),
-        )
-    };
+    let text_of = |label| exception_case_text(label, &statements, edits, source);
 
     for &predecessor in entry.reachable {
         if entry.excluded.contains(&predecessor) {
@@ -3980,6 +3973,7 @@ fn exception_source_case_bodies<'node, 'ast>(
 }
 
 /// Exact proof context for exceptional retry roots of a numeric state.
+#[derive(Clone, Copy)]
 struct ExceptionCatchReachability<'a> {
     state: &'a str,
     symbol: SymbolId,
@@ -4073,6 +4067,7 @@ fn reachable_exception_states(
     Some(reachable)
 }
 
+#[derive(Clone, Copy)]
 struct ExceptionReachableCases<'a, 'ast> {
     cases: &'a BTreeMap<u64, Option<Route>>,
     source_cases: &'a BTreeMap<u64, &'a Statement<'ast>>,
@@ -4081,6 +4076,12 @@ struct ExceptionReachableCases<'a, 'ast> {
 
 /// Elide only catch-invisible, unaliased intermediate writes. Preserve
 /// exact byte offsets for subsequent AST spans and dispatcher comparisons.
+/// Distinguish a failed proof (None) from a valid no-op and a byte-padded rewrite.
+enum ExceptionSourceRewrite {
+    Unchanged,
+    Rewritten(String),
+}
+
 fn rewritten_exception_source(
     handler: &oxc_ast::ast::CatchClause<'_>,
     symbol: SymbolId,
@@ -4088,7 +4089,7 @@ fn rewritten_exception_source(
     source: &str,
     catch_retries_unchanged: bool,
     proof: ExceptionReachableCases<'_, '_>,
-) -> Option<Option<String>> {
+) -> Option<ExceptionSourceRewrite> {
     // Once every normal and exceptional state edge is established, prove
     // which intermediate *standalone* state writes are dead. A catch that
     // implicitly resumes the interrupted state, reads that state, or an
@@ -4100,7 +4101,7 @@ fn rewritten_exception_source(
         source_cases,
         reachable,
     } = proof;
-    let mut rewritten_source = None;
+    let mut rewritten_source = ExceptionSourceRewrite::Unchanged;
     if !catch_retries_unchanged
         && exception_state_is_unaliased(symbol, scoping)
         && !state_binding_read(symbol, scoping, |reads| {
@@ -4129,7 +4130,7 @@ fn rewritten_exception_source(
                 }
                 replacement.replace_range(start..end, &format!(";{}", " ".repeat(width - 1)));
             }
-            rewritten_source = Some(replacement);
+            rewritten_source = ExceptionSourceRewrite::Rewritten(replacement);
         }
     }
     Some(rewritten_source)
@@ -4199,6 +4200,25 @@ fn discover_exception_branch_regions(
     })
 }
 
+/// Recompute only normal state edges after source/CFG region absorption.
+fn exception_normal_reachability(
+    roots: &BTreeSet<u64>,
+    cases: &BTreeMap<u64, Option<Route>>,
+) -> Option<BTreeSet<u64>> {
+    let mut reachable = BTreeSet::new();
+    let mut work = VecDeque::from_iter(roots.iter().copied());
+    while let Some(current) = work.pop_front() {
+        if current == u64::MAX || !reachable.insert(current) {
+            continue;
+        }
+        let route = cases.get(&current)?.as_ref()?;
+        let mut next = Vec::new();
+        route.targets(&mut next);
+        work.extend(next);
+    }
+    Some(reachable)
+}
+
 fn recover_exception_regions(
     context: ExceptionRegionProof<'_, '_>,
     cases: &mut BTreeMap<u64, Option<Route>>,
@@ -4215,7 +4235,6 @@ fn recover_exception_regions(
         constant_true_loop,
     } = context;
     let effects = ExceptionLoopEffectContext { scoping };
-    let exit = u64::MAX;
     // Recover one closed conditional region (compact two-arm or general DAG),
     // then recover independent linear
     // regions against the UPDATED CFG. Protect the diamond's entry and
@@ -4241,20 +4260,11 @@ fn recover_exception_regions(
             &effects,
             source,
         )?;
-        let mut after_diamond = reachable.clone();
-        if !absorbed.is_empty() {
-            after_diamond.clear();
-            let mut work = VecDeque::from_iter(roots.iter().copied());
-            while let Some(current) = work.pop_front() {
-                if current == exit || !after_diamond.insert(current) {
-                    continue;
-                }
-                let route = cases.get(&current)?.as_ref()?;
-                let mut next = Vec::new();
-                route.targets(&mut next);
-                work.extend(next);
-            }
-        }
+        let after_diamond = if absorbed.is_empty() {
+            reachable.clone()
+        } else {
+            exception_normal_reachability(roots, cases)?
+        };
         let mut excluded = excluded;
         excluded.extend(absorbed.iter().copied());
         excluded.extend(combined.keys().copied());
@@ -4452,15 +4462,24 @@ fn render_exception_pruned(context: ExceptionRenderContext<'_, '_>) -> Option<St
     Some(text)
 }
 
-pub fn prune_exception_dispatcher(
-    loop_stmt: &WhileStatement<'_>,
+/// The lexical try/catch, trailing terminal guard and every possible
+/// catch-root transition must be validated before pruning source cases.
+struct ExceptionDispatchSetup<'a, 'ast> {
+    dispatcher: &'a Statement<'ast>,
+    handler: &'a oxc_ast::ast::CatchClause<'ast>,
+    trailing_exit: Option<(u64, &'a Statement<'ast>)>,
+    catch_roots: BTreeSet<u64>,
+    cases: BTreeMap<u64, Option<Route>>,
+}
+
+fn exception_dispatch_setup<'a, 'ast>(
+    loop_stmt: &'a WhileStatement<'ast>,
     state: &str,
-    initial: u64,
     symbol: SymbolId,
     scoping: &Scoping,
     source: &str,
     catch_scope: CatchScopeEvidence<'_>,
-) -> Option<String> {
+) -> Option<ExceptionDispatchSetup<'a, 'ast>> {
     // Assigning to a const dispatcher binding throws instead of advancing
     // its numeric value. A normal-state CFG must never model that write as
     // a successful edge, even if constant propagation later simplifies it.
@@ -4546,34 +4565,75 @@ pub fn prune_exception_dispatcher(
         );
     }
 
+    Some(ExceptionDispatchSetup {
+        dispatcher,
+        handler,
+        trailing_exit,
+        catch_roots: writes.targets,
+        cases,
+    })
+}
+
+/// A catch may resume the interrupted state unless it provably replaces
+/// the binding or exits for every normal completion and selector value.
+fn catch_retries_current_exception_state(
+    loop_stmt: &WhileStatement<'_>,
+    handler: &oxc_ast::ast::CatchClause<'_>,
+    state: &str,
+    scoping: &Scoping,
+    source: &str,
+    catch_scope: CatchScopeEvidence<'_>,
+) -> bool {
+    // The catch can change the numeric state explicitly, or complete normally
+    // and retry at any state value held when a source case throws. Those values
+    // include *intermediate writes* within the case, not just its modeled
+    // normal successor. Track their exceptional edges to a fixed point.
+    !catch_block_always_replaces_state_or_exits(&handler.body.body, state, source, scoping, None)
+        && !catch_finite_domain_always_replaces_state(
+            loop_stmt,
+            handler,
+            state,
+            source,
+            scoping,
+            catch_scope.reaching,
+            catch_scope.reference_spans,
+        )
+}
+
+pub fn prune_exception_dispatcher(
+    loop_stmt: &WhileStatement<'_>,
+    state: &str,
+    initial: u64,
+    symbol: SymbolId,
+    scoping: &Scoping,
+    source: &str,
+    catch_scope: CatchScopeEvidence<'_>,
+) -> Option<String> {
+    let ExceptionDispatchSetup {
+        dispatcher,
+        handler,
+        trailing_exit,
+        catch_roots,
+        mut cases,
+    } = exception_dispatch_setup(loop_stmt, state, symbol, scoping, source, catch_scope)?;
+
     let ExceptionTerminalProofs {
         retargeted,
         terminal_returns,
     } = exception_terminal_proofs(loop_stmt, dispatcher, state, scoping, source, &mut cases)?;
 
-    // The catch can change the numeric state explicitly, or complete normally
-    // and retry at any state value held when a source case throws. Those values
-    // include *intermediate writes* within the case, not just its modeled
-    // normal successor. Track their exceptional edges to a fixed point.
-    let catch_retries_unchanged = !catch_block_always_replaces_state_or_exits(
-        &handler.body.body,
-        state,
-        source,
-        scoping,
-        None,
-    ) && !catch_finite_domain_always_replaces_state(
+    let catch_retries_unchanged = catch_retries_current_exception_state(
         loop_stmt,
         handler,
         state,
-        source,
         scoping,
-        catch_scope.reaching,
-        catch_scope.reference_spans,
+        source,
+        catch_scope,
     );
     let confined_state = catch_retries_unchanged && confined_exception_state(symbol, scoping);
     let source_cases = exception_source_case_bodies(dispatcher, state, trailing_exit)?;
 
-    let mut roots = writes.targets;
+    let mut roots = catch_roots;
     roots.insert(initial);
     let mut reachable = reachable_exception_states(
         ExceptionCatchReachability {
@@ -4602,7 +4662,10 @@ pub fn prune_exception_dispatcher(
             reachable: &reachable,
         },
     )?;
-    let source = rewritten_source.as_deref().unwrap_or(source);
+    let source = match &rewritten_source {
+        ExceptionSourceRewrite::Unchanged => source,
+        ExceptionSourceRewrite::Rewritten(replacement) => replacement.as_str(),
+    };
 
     let ExceptionRegions {
         combined: combined_regions,
@@ -4624,17 +4687,7 @@ pub fn prune_exception_dispatcher(
     )?;
 
     if !absorbed_regions.is_empty() {
-        reachable.clear();
-        let mut work = VecDeque::from_iter(roots.iter().copied());
-        while let Some(current) = work.pop_front() {
-            if current == exit || !reachable.insert(current) {
-                continue;
-            }
-            let route = cases.get(&current)?.as_ref()?;
-            let mut next = Vec::new();
-            route.targets(&mut next);
-            work.extend(next);
-        }
+        reachable = exception_normal_reachability(&roots, &cases)?;
     }
 
     let completion_tail = exception_terminal_completion_tail(
@@ -4823,7 +4876,10 @@ fn reconstruct_state_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{closed_exception_dag_region, reconstruct_for, ExceptionEntryProof, Next, Route};
+    use super::{
+        closed_exception_dag_region, ordered_natural_loop_side, reconstruct_for,
+        ExceptionEntryProof, Next, Route,
+    };
     use crate::deobfuscate;
     use oxc_allocator::Allocator;
     use oxc_ast::ast::Statement;
@@ -4871,6 +4927,44 @@ mod tests {
             &incoming,
         );
         assert_eq!(ordered, Some(vec![2, 3, 4]));
+    }
+
+    #[test]
+    fn natural_loop_deduplicates_conditional_successor_indegrees() {
+        let choose = |yes, no| Route {
+            effects: Vec::new(),
+            next: Next::Choose {
+                condition: "pick()".to_owned(),
+                yes: Box::new(Route::jump("state", yes)),
+                no: Box::new(Route::jump("state", no)),
+            },
+        };
+        let graph = BTreeMap::from([
+            (1, choose(2, 99)),
+            (2, choose(3, 3)),
+            (3, Route::jump("state", 1)),
+        ]);
+        let incoming = BTreeMap::from([
+            (1, BTreeSet::from([3])),
+            (2, BTreeSet::from([1])),
+            (3, BTreeSet::from([2])),
+        ]);
+        let roots = BTreeSet::from([1]);
+        let reachable = BTreeSet::from([1, 2, 3]);
+        let excluded = BTreeSet::new();
+        let ordered = ordered_natural_loop_side(
+            &graph,
+            &incoming,
+            ExceptionEntryProof {
+                roots: &roots,
+                reachable: &reachable,
+                excluded: &excluded,
+            },
+            &reachable,
+            1,
+            2,
+        );
+        assert_eq!(ordered, Some((BTreeSet::from([2, 3]), vec![2, 3])));
     }
 
     #[derive(Default)]
