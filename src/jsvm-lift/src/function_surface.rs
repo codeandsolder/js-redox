@@ -286,6 +286,10 @@ impl SurfaceAccumulator {
 /// spans are resolved to unique function nodes before collecting evidence;
 /// missing/ambiguous spans produce None, not a speculative match. Results
 /// preserve the requested order, including duplicates.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn analyze_function_source_surfaces(
     source: &str,
     semantic: &Semantic<'_>,
@@ -365,6 +369,10 @@ pub fn analyze_function_source_surfaces(
 }
 
 /// Inspect one exact function, using the same implementation as batch mode.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn analyze_function_source_surface(
     source: &str,
     semantic: &Semantic<'_>,

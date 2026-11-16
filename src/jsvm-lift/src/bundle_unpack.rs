@@ -1555,6 +1555,10 @@ fn parse<'a>(
 }
 
 /// Analyze one JavaScript source body for statically explicit bundle/module tables.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn analyze_bundle_source(
     source: &str,
     input: impl Into<String>,

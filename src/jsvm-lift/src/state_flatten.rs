@@ -5304,6 +5304,11 @@ fn direct_binding_score(
     Ok(score)
 }
 
+/// Analyze a function's supported flattened-state transitions.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn analyze_function(
     source: &str,
     function: &Function<'_>,

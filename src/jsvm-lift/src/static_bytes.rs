@@ -1485,6 +1485,11 @@ fn statements_to_sink(
     Ok(None)
 }
 
+/// Recover statically supported WebAssembly byte artifacts from a program.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn recover_webassembly_byte_artifacts_from_program(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,

@@ -1412,6 +1412,11 @@ impl<'a> Visit<'a> for Analyzer<'_> {
     }
 }
 
+/// Analyze structurally supported handler-table dispatches.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn analyze(
     source: &str,
     program: &oxc_ast::ast::Program<'_>,
@@ -1505,6 +1510,10 @@ pub fn analyze(
 /// Install and read flows may differ: constructor initialization typically proves
 /// installs, while a seeded runtime method flow proves later reads through helper
 /// parameters.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn analyze_with_registry_origins(
     source: &str,
     program: &oxc_ast::ast::Program<'_>,

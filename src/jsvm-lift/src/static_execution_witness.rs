@@ -101,6 +101,10 @@ fn positive_instance(
 ///
 /// Identical bytes in separate tags/frames or injected scripts mean that an exact
 /// digest match is NOT proof a specific tag executed.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn join_initial_source_coverage(
     documents: &[DocumentEntrypoints],
     runtime_scripts: &Value,

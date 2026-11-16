@@ -510,6 +510,10 @@ fn prove_required_before_node_budgeted(
 /// list of possible JavaScript paths.
 ///
 /// Every span lookup and graph traversal is charged to the caller's budget.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn cfg_has_write_free_path(
     semantic: &Semantic<'_>,
     source: Span,
@@ -600,6 +604,10 @@ pub fn cfg_has_write_free_path(
 ///
 /// All AST/ancestor/CFG traversal on this production-facing path is charged to
 /// the caller's shared work budget.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn prove_event_completion_before_nested_event(
     semantic: &Semantic<'_>,
     required: Span,

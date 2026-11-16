@@ -8,6 +8,11 @@ pub struct StaticStringRecoveryOutcome {
     pub report: Value,
 }
 
+/// Recover statically provable string values from the program.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn recover_static_strings(
     original: &str,
     input_label: impl Into<String>,

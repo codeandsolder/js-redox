@@ -55,6 +55,10 @@ pub struct LazyRegistryAccessorResultUse {
 
 /// Join independent, span-exact proofs. No structural candidate is promoted
 /// to a definite result merely because its accessor has a lazy-cell shape.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn join_lazy_accessor_results(
     uses: &[RegistryAccessorResultUse],
     lazy_reads: &[ProvenLazyRegistryReadCall],
@@ -106,6 +110,10 @@ pub struct ExactOriginLazyAccessorResultUse {
 
 /// Require unique, nonconflicting exact-origin facts for a specific call, and
 /// preserve the registry path established by the independent lazy analysis.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn join_exact_origin_lazy_accessor_results(
     lazy_uses: &[LazyRegistryAccessorResultUse],
     origin_reads: &[ProvenOriginRegistryReadCall],
@@ -292,6 +300,10 @@ fn is_definite(s: &Semantic<'_>, d: &Source, call: Span, writes: &[Span]) -> boo
 ///
 /// Definite edges prove a local call-result reaching definition, but do not
 /// assign any semantics to the registry accessor's returned object.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn analyze(
     s: &Semantic<'_>,
     reads: &[ProvenRegistryReadCall],
