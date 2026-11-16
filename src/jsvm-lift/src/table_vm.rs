@@ -26,6 +26,7 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, Span};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use work_budget::{BudgetExceeded, BudgetPoller, WorkBudget};
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,7 +222,7 @@ fn append_registry_path(mut binding: String, registry_path: &[String]) -> String
             binding.push_str(property);
         } else {
             binding.push('[');
-            binding.push_str(&format!("{property:?}"));
+            let _ = write!(binding, "{property:?}");
             binding.push(']');
         }
     }

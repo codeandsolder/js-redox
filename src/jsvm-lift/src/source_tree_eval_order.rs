@@ -9,6 +9,7 @@ use oxc_ast_visit::{walk, Visit};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::operator::AssignmentOperator;
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 use crate::source_tree_navigation::long_assignment_roots;
 
@@ -591,10 +592,11 @@ pub(super) fn ordered_assignment_phases(source: &str, program: &Program<'_>) -> 
     collector.sections.sort_by_key(|(span, _)| span.start);
     for (root, phases) in &collector.sections {
         let (line, col) = line_col(source, root.start as usize);
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "## Assignment at {line}:{col} (source bytes {}–{})\n\n",
             root.start, root.end
-        ));
+        );
         out.push_str(
             "| Phase | Path guard | Step | Details | Source bytes |\n|---:|---|---|---|---|\n",
         );
@@ -604,7 +606,8 @@ pub(super) fn ordered_assignment_phases(source: &str, program: &Program<'_>) -> 
             } else {
                 phase.guards.join(" and ")
             };
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "| {} | {} | {} | {} | {}–{} |\n",
                 i + 1,
                 cell(&guard),
@@ -612,7 +615,7 @@ pub(super) fn ordered_assignment_phases(source: &str, program: &Program<'_>) -> 
                 cell(&phase.detail),
                 phase.span.start,
                 phase.span.end
-            ));
+            );
         }
         out.push('\n');
     }

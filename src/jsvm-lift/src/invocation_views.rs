@@ -9,6 +9,7 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
@@ -63,11 +64,12 @@ fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
         } else {
             ""
         };
-        excerpt.push_str(&format!(
+        let _ = write!(
+            excerpt,
             "{} {:>6} | {shown}{cropped}\n",
             if index == local_line { ">" } else { " " },
             index + 1 + usize::try_from(start).unwrap_or(0),
-        ));
+        );
     }
     fence(excerpt.trim_end(), "js")
 }
@@ -225,17 +227,18 @@ fn append_observed_callable_definitions(
         }
         let source = String::from_utf8(bytes)
             .with_context(|| format!("non-UTF8 callable definition source: {sha}"))?;
-        page.push_str(&format!(
+        let _ = write!(
+            page,
             "### V8 script {script}, original line {}, column {} (1-based)\n\n",
             line.saturating_add(1),
             column.saturating_add(1),
-        ));
-        page.push_str(&format!(
+        );
+        let _ = write!(page,
             "Source SHA-256: **{sha}**. [Original code](../../../resources/runtime-scripts/{sha}.js).\n\n"
-        ));
+        );
         let readable = format!("src/_readable/runtime-scripts/{sha}.js");
         if project.join(&readable).is_file() {
-            page.push_str(&format!("[Shared readable code](../../../{readable}) — original V8 coordinates do not apply to transformed code.\n\n"));
+            let _ = write!(page, "[Shared readable code](../../../{readable}) — original V8 coordinates do not apply to transformed code.\n\n");
         }
         page.push_str("Observed references to this **definition site**:\n\n");
         page.push_str(&display_json(&json!(seen_as))?);
@@ -263,7 +266,8 @@ fn build_observed_path_view(
         "# Observed execution path {ordinal:04}\n\n         This is an **ordered sequence of {} debugger step pauses** in CDP session {session}.          It is not a complete or universally feasible program path, and debugger instrumentation          may perturb timing. Source excerpts refer to original captured code only.\n\n",
         steps.len()
     );
-    page.push_str(&format!(
+    let _ = write!(
+        page,
         "Requested mode: {}. Capture status: {}.\n\n",
         hit.get("pathWitnessMode")
             .and_then(Value::as_str)
@@ -271,7 +275,7 @@ fn build_observed_path_view(
         hit.get("pathWitnessStatus")
             .and_then(Value::as_str)
             .unwrap_or("unknown"),
-    ));
+    );
     let guard_witnesses = hit
         .get("observed_guard_witnesses")
         .and_then(Value::as_array);
@@ -279,7 +283,8 @@ fn build_observed_path_view(
         page.push_str("## Guard observations matched to original AST\n\n");
         page.push_str("Only side-effect-checked booleans at an exact captured guard site appear here. A selected-arm label requires the next debugger pause in the same verified stack and original AST arm. Missing steps are not inferred.\n\n");
         for witness in witnesses {
-            page.push_str(&format!(
+            let _ =
+                write!(page,
                 "- **Step {}** — {} guard observed **{}**; next pause in selected arm: **{}**.\n",
                 witness["step_index"].as_u64().unwrap_or(0),
                 witness["kind"].as_str().unwrap_or("?"),
@@ -287,7 +292,7 @@ fn build_observed_path_view(
                 witness["next_pause_in_selected_arm"]
                     .as_str()
                     .unwrap_or("not witnessed")
-            ));
+            );
             page.push_str(&fence(
                 &serde_json::to_string(&witness["expression"])?,
                 "json",
@@ -302,7 +307,7 @@ fn build_observed_path_view(
             .and_then(Value::as_array)
             .and_then(|frames| frames.first());
         let Some(top) = top else {
-            page.push_str(&format!("## Step {index}: no executing frame captured\n\n"));
+            let _ = write!(page, "## Step {index}: no executing frame captured\n\n");
             continue;
         };
         let function = top
@@ -317,12 +322,12 @@ fn build_observed_path_view(
             .unwrap_or("?");
         let line = location.get("lineNumber").and_then(Value::as_u64);
         let column = location.get("columnNumber").and_then(Value::as_u64);
-        page.push_str(&format!(
+        let _ = write!(page,
             "## Step {index}: {}\n\nV8 script **{script}**, original line {}, column {} (zero-based).\n\n",
             function.replace('\n', " "),
             line.map_or_else(|| "?".to_owned(), |v| v.to_string()),
             column.map_or_else(|| "?".to_owned(), |v| v.to_string()),
-        ));
+        );
         let sha = top.get("sourceSha256").and_then(verified_sha);
         let identity = identities
             .get(&(session.to_owned(), script.to_owned()))
@@ -336,9 +341,9 @@ fn build_observed_path_view(
             if identity.is_some_and(|source| source.capture_instrumentation)
                 && !project.join(&raw_path).is_file()
             {
-                page.push_str(&format!(
+                let _ = write!(page,
                     "Exact captured script SHA-256 **{sha}**; this is **recorder instrumentation**,                      intentionally excluded from the recovered application source tree.                      No original-source excerpt or application link is claimed.\n\n"
-                ));
+                );
             } else {
                 let bytes = fs::read(project.join(&raw_path)).with_context(|| {
                     format!("missing original application execution step source {sha}")
@@ -348,14 +353,15 @@ fn build_observed_path_view(
                 }
                 let raw = String::from_utf8(bytes)
                     .with_context(|| format!("execution step code is not UTF-8: {sha}"))?;
-                page.push_str(&format!(
+                let _ = write!(
+                    page,
                     "Verified [original source](../../../{raw_path}), SHA-256 **{sha}**.\n\n"
-                ));
+                );
                 let readable = format!("src/_readable/runtime-scripts/{sha}.js");
                 if project.join(&readable).is_file() {
-                    page.push_str(&format!(
+                    let _ = write!(page,
                         "[General safe-readable view](../../../{readable}) (different source offsets).\n\n"
-                    ));
+                    );
                 }
                 if let Some(line) = line {
                     page.push_str(&source_excerpt(
@@ -452,12 +458,12 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                 .unwrap_or("?");
             let line = location.get("lineNumber").and_then(Value::as_u64);
             let column = location.get("columnNumber").and_then(Value::as_u64);
-            view.push_str(&format!(
+            let _ = write!(view,
                 "### Frame {depth}: {}\n\nCDP script ID: **{script}**, line: **{}**, column: **{}** (zero-based).\n\n",
                 function.replace('\n', " "),
                 line.map_or_else(|| "?".into(), |n| n.to_string()),
                 column.map_or_else(|| "?".into(), |n| n.to_string())
-            ));
+            );
             let expected = frame.get("sourceSha256").and_then(verified_sha);
             let actual = identities
                 .get(&(session.clone(), script.to_owned()))
@@ -479,9 +485,9 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             }
             let raw = String::from_utf8(raw_bytes)
                 .with_context(|| format!("runtime source is not UTF-8: {sha}"))?;
-            view.push_str(&format!(
+            let _ = write!(view,
                 "Exact captured source SHA-256: **{sha}**. [Raw recorded code](../../../resources/runtime-scripts/{sha}.js).\n\n"
-            ));
+            );
             // The per-instance CDP origin is stronger context than a URL
             // pooled across unrelated identical source bodies.
             let matched_instance = runtime
@@ -506,11 +512,11 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                     if let Ok(mut parsed) = url::Url::parse(url) {
                         parsed.set_query(None);
                         parsed.set_fragment(None);
-                        view.push_str(&format!("Script origin (query omitted): {}\n\n", parsed));
+                        let _ = write!(view, "Script origin (query omitted): {}\n\n", parsed);
                     }
                 }
                 if let Some(context) = instance.get("execution_context_id") {
-                    view.push_str(&format!("V8 execution context ID: {}\n\n", context));
+                    let _ = write!(view, "V8 execution context ID: {}\n\n", context);
                 }
             }
 
@@ -523,7 +529,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                 (format!("src/_observed/{sha}.js"), "Observed source view"),
             ] {
                 if project.join(&target).is_file() {
-                    view.push_str(&format!("- [{label}](../../../{target})\n"));
+                    let _ = write!(view, "- [{label}](../../../{target})\n");
                 }
             }
             view.push('\n');
@@ -557,10 +563,10 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             let path_view = build_observed_path_view(project, &identities, &session, hit, ordinal)?;
             fs::write(output.join(&path_name), path_view)?;
             hit["path_view_path"] = json!(path_destination);
-            view.push_str(&format!(
+            let _ = write!(view,
                 "## Ordered execution witness\n\n[Browse {} observed debugger steps](./{path_name}). This is a bounded sequence, not universal path specialization.\n\n",
                 hit.get("steps").and_then(Value::as_array).map_or(0, Vec::len),
-            ));
+            );
         }
         view.push_str("## Observed bindings and expression results\n\n");
         view.push_str("Only values captured at this pause. Expressions were requested with side-effect checks; rejected or unavailable evaluations are not facts.\n\n");
@@ -575,8 +581,8 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             .get("pointId")
             .and_then(Value::as_str)
             .unwrap_or("unnamed");
-        index.push_str(&format!("- [Invocation {ordinal:04}](./{name}) — breakpoint point {} in CDP session {session}\n",
-            point.replace('\n', " ")));
+        let _ = write!(index, "- [Invocation {ordinal:04}](./{name}) — breakpoint point {} in CDP session {session}\n",
+            point.replace('\n', " "));
     }
 
     // Remove only our own obsolete numbered outputs, never user files.

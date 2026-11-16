@@ -9,6 +9,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use rayon::{prelude::*, ThreadPoolBuilder};
 use serde_json::{json, Map, Value};
+use std::fmt::Write as _;
 use std::{
     collections::BTreeMap,
     fs,
@@ -148,9 +149,9 @@ fn build_module_source(
             .collect::<Vec<_>>()
             .join(", ");
         if module.export_names.len() > 12 {
-            preview.push_str(&format!(", … (+{} more)", module.export_names.len() - 12));
+            let _ = write!(preview, ", … (+{} more)", module.export_names.len() - 12);
         }
-        metadata.push_str(&format!(" * Static export names: {preview}\n"));
+        let _ = write!(metadata, " * Static export names: {preview}\n");
     }
     if module.commonjs_export {
         metadata.push_str(" * Static CommonJS module.exports write observed.\n");
@@ -164,12 +165,17 @@ fn build_module_source(
             .collect::<Vec<_>>()
             .join(", ");
         if module.dependency_map.len() > 12 {
-            dependencies.push_str(&format!(", … (+{} more)", module.dependency_map.len() - 12));
+            let _ = write!(
+                dependencies,
+                ", … (+{} more)",
+                module.dependency_map.len() - 12
+            );
         }
         if !dependencies.is_empty() {
-            metadata.push_str(&format!(
+            let _ = write!(
+                metadata,
                 " * Static Browserify dependency map: {dependencies}\n"
-            ));
+            );
         }
         return Ok(format!(
             "/* Statically extracted Browserify module factory.\n * {provenance}\n{metadata} * The factory body is preserved from the parent analyst view.\n */\nconst __browserify_module_factory__ = {value};\n"
@@ -184,7 +190,11 @@ fn build_module_source(
             .collect::<Vec<_>>()
             .join(", ");
         if module.dependencies.len() > 12 {
-            dependencies.push_str(&format!(", … (+{} more)", module.dependencies.len() - 12));
+            let _ = write!(
+                dependencies,
+                ", … (+{} more)",
+                module.dependencies.len() - 12
+            );
         }
         if !dependencies.is_empty() {
             let label = if bundle_kind == "amd_named_modules" {
@@ -192,7 +202,7 @@ fn build_module_source(
             } else {
                 "named-loader"
             };
-            metadata.push_str(&format!(" * Static {label} dependencies: {dependencies}\n"));
+            let _ = write!(metadata, " * Static {label} dependencies: {dependencies}\n");
         }
         let family = if bundle_kind == "amd_named_modules" {
             "named AMD"

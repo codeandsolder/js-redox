@@ -23,6 +23,7 @@ use oxc_span::Span;
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use serde_json::json;
+use std::fmt::Write as _;
 use std::{fs, path::PathBuf, time::Duration};
 use work_budget::{BudgetLimits, WorkBudget};
 
@@ -361,7 +362,8 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
             );
             fs::write(handlers_dir.join(&name), format!("{header}{readable}"))?;
         }
-        index.push_str(&format!(
+        let _ =
+            write!(index,
             "| {} | [view](handlers/{}) | [evidence](handlers/{}) | {} | {} | {}..{} | {}..{} |\n",
             capture.exact_key,
             name,
@@ -372,7 +374,7 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
             end,
             capture.factory_call[0],
             capture.factory_call[1]
-        ));
+        );
     }
     index.push_str(
         "\n## Dynamic-source lexical mutation hazards\n\n\
@@ -432,9 +434,10 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
                 } else {
                     matching_handlers.join(", ")
                 };
-                index.push_str(&format!(
+                let _ = write!(
+                    index,
                     "| {phase_label} | {label} | {start}..{end} | {enclosing} | {related} |\n"
-                ));
+                );
             }
         }
     }
