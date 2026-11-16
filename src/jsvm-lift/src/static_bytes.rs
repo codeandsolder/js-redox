@@ -1572,7 +1572,7 @@ pub fn recover_webassembly_byte_artifacts_from_program(
 ///
 /// # Errors
 ///
-/// Fails on work-budget exhaustion during parsing or source-backed recovery, or when neither unambiguous nor CommonJS parsing passes syntax and semantic validation. Unprovable byte paths are reported in diagnostics rather than treated as parsing failures.
+/// Fails on work-budget exhaustion during parsing or source-backed recovery, or when neither unambiguous nor `CommonJS` parsing passes syntax and semantic validation. Unprovable byte paths are reported in diagnostics rather than treated as parsing failures.
 pub fn analyze_webassembly_byte_artifacts(
     source: &str,
     budget: &WorkBudget,
