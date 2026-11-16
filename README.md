@@ -19,7 +19,7 @@ Provenance-preserving static recovery for hostile browser JavaScript and embedde
 
 ## Build
 
-The Rust side is one Cargo workspace with four crates: `jsvm-safe-core`, `jsvm-lift`, `sourcemap-compose`, and `wasm-redox`. It uses a single root `Cargo.lock`, shared dependency-version pins, and `rust-version = "1.99"`. Whole-workspace correctness gates are therefore ordinary Cargo commands:
+The Rust side is one Cargo workspace with five crates: `jsvm-safe-core`, `jsvm-lift`, `sourcemap-compose`, `wasm-redox`, and `work-budget`. It uses a single root `Cargo.lock`, shared dependency-version pins, and `rust-version = "1.100"`. Whole-workspace correctness gates are therefore ordinary Cargo commands:
 
 ```sh
 cargo fmt --all -- --check
@@ -35,7 +35,7 @@ For normal executable builds, use the project helper rather than raw `cargo`:
 scripts/build-jsvm-lift.sh
 ```
 
-It uses the machine-pinned Rust 1.99 toolchain, requires the distributed sccache build path, derives build parallelism from live farm capacity, and publishes durable executables under `.cargo-target-nodebug/`. The helper builds the scanner/tooling plus `sourcemaps`, `wasm-redox`, and the `fresh-eval` proof helper, and asks Cargo for the workspace target directory rather than assuming a member-local `target/` layout.
+It uses the machine-pinned Rust 1.100 toolchain, requires the distributed sccache build path, derives build parallelism from live farm capacity, and publishes durable executables under `.cargo-target-nodebug/`. The helper builds the scanner/tooling plus `sourcemaps`, `wasm-redox`, and the `fresh-eval` proof helper, and asks Cargo for the workspace target directory rather than assuming a member-local `target/` layout.
 
 ### Deep lazy-cell handler provenance (on demand)
 
@@ -46,9 +46,9 @@ For source files whose structural scan reports a lazy-registry indirect-call can
   --output work/lazy-cell-explained
 ```
 
-The static-entrypoints command accepts an imported browser capture project and constructs the *initial* HTML script-root graph from captured document markup, including script ordinals, parser-blocking/deferred/async/module classification, first base href and exact candidate captured source bodies matched by URL and SHA-256. For each captured executable script it also builds a reusable source-local direct-call graph from AST-resolved lexical function bindings and immediately invoked function literals, retaining unresolved dynamic calls and possible rather than actual top-level reachability. It never assumes script completion order from HTML ordinals or turns callback arguments into executed calls. Usage: cargo +1.99.1 run --locked -p jsvm-lift --bin static-entrypoints -- path/to/capture-project --output path/to/report.json. The same command composes existing source-index and contextual JS-reference/import-map artifacts to traverse static ESM imports and re-exports across captured modules, retaining all same-URL response versions as candidates and dynamic imports as untraversed candidate edges. JS reference spans are bound to the *formatted* source SHA rather than incorrectly used as original raw script positions. Both SHA identities are reverified, and every traversed imported source is independently checked against its original capture-manifest body SHA and URL. When V8 precise coverage artifacts exist, the same report also joins exact captured HTML script bytes to counter-positive runtime script IDs, CDP sessions, execution contexts and correlated URLs. Positive source bytes do not establish which HTML tag ran or which function/call executed; V8 coverage offsets are UTF-16 and are never silently applied to original/analyzed UTF-8 source-byte spans. The output schema is intentionally v3. It does not prove import-map timing, selected response versions, or runtime dispatch; source-condition-dependent execution is a separate proof stage.
+The static-entrypoints command accepts an imported browser capture project and constructs the *initial* HTML script-root graph from captured document markup, including script ordinals, parser-blocking/deferred/async/module classification, first base href and exact candidate captured source bodies matched by URL and SHA-256. For each captured executable script it also builds a reusable source-local direct-call graph from AST-resolved lexical function bindings and immediately invoked function literals, retaining unresolved dynamic calls and possible rather than actual top-level reachability. It never assumes script completion order from HTML ordinals or turns callback arguments into executed calls. Usage: cargo +1.100.0 run --locked -p jsvm-lift --bin static-entrypoints -- path/to/capture-project --output path/to/report.json. The same command composes existing source-index and contextual JS-reference/import-map artifacts to traverse static ESM imports and re-exports across captured modules, retaining all same-URL response versions as candidates and dynamic imports as untraversed candidate edges. JS reference spans are bound to the *formatted* source SHA rather than incorrectly used as original raw script positions. Both SHA identities are reverified, and every traversed imported source is independently checked against its original capture-manifest body SHA and URL. When V8 precise coverage artifacts exist, the same report also joins exact captured HTML script bytes to counter-positive runtime script IDs, CDP sessions, execution contexts and correlated URLs. Positive source bytes do not establish which HTML tag ran or which function/call executed; V8 coverage offsets are UTF-16 and are never silently applied to original/analyzed UTF-8 source-byte spans. The output schema is intentionally v3. It does not prove import-map timing, selected response versions, or runtime dispatch; source-condition-dependent execution is a separate proof stage.
 
-For any JavaScript file, the standalone source-surface command lists exact original-function byte spans when called with only a path. Add one or more --function START:END arguments to inspect calls, external references, member writes, direct eval candidates, dynamic imports, and nested lexical depth for those functions. This is an opt-in and source-independent syntactic inventory, not a runtime-effects analysis; all event offsets are SHA-256-bound to the input. Usage: cargo +1.99.1 run --locked -p jsvm-lift --bin source-surface -- path/to/code.js [--function START:END].
+For any JavaScript file, the standalone source-surface command lists exact original-function byte spans when called with only a path. Add one or more --function START:END arguments to inspect calls, external references, member writes, direct eval candidates, dynamic imports, and nested lexical depth for those functions. This is an opt-in and source-independent syntactic inventory, not a runtime-effects analysis; all event offsets are SHA-256-bound to the input. Usage: cargo +1.100.0 run --locked -p jsvm-lift --bin source-surface -- path/to/code.js [--function START:END].
 
 The reusable function-surface API accepts multiple selected function spans and collects evidence in a single AST traversal (scaling with AST size and lexical nesting, rather than rescanning the source once per recovered handler). The singleton API delegates to the same code, with no separate semantics.
 
@@ -57,7 +57,7 @@ The analyst-facing handler project also emits a generic, source-mapped behavior 
 The separate research-grade `lazy-resolver-probe` example can derive *possible* phase values from proven prototype-method phase closures and check each exact handler capture against independently proven state-field, prototype-carrier, and resolver-index semantics. It is intentionally opt-in and keeps its output distinct from the source project:
 
 ```sh
-cargo +1.99.1 run --locked -p jsvm-lift --example lazy-resolver-probe -- \
+cargo +1.100.0 run --locked -p jsvm-lift --example lazy-resolver-probe -- \
   path/to/embedded-child.js
 ```
 
@@ -148,7 +148,7 @@ These passes apply to ordinary JS, not a framework or specific obfuscator.
 The original source directory is not modified.
 
 ```sh
-cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- source-tree   path/to/original-js-tree work/readable-js-tree --max-iterations 12 --format-output
+cargo +1.100.0 run --locked -p jsvm-lift --bin deobfuscate-safe -- source-tree   path/to/original-js-tree work/readable-js-tree --max-iterations 12 --format-output
 ```
 
 The output preserves relative source paths and contains linked README.md
@@ -167,7 +167,7 @@ reconstruction does not prove a particular browser execution.
 `corpus-eval` is the single engine-facing evaluator for pinned private/real-world JavaScript corpora. The manifest owns capture hashes and acceptance policy; the evaluator formats, safe-deobfuscates, and structurally scans each raw sample through the Rust library APIs in-process. Node is used only as an independent syntax check for generated analyst/deobfuscated source. Reference samples are hash-verified but never executed.
 
 ```sh
-cargo +1.99.1 run -p jsvm-lift --bin corpus-eval -- \
+cargo +1.100.0 run -p jsvm-lift --bin corpus-eval -- \
   path/to/manifest.json --corpus-root /path/to/private/corpus \
   --report /path/to/report.json
 ```
@@ -388,7 +388,7 @@ The generated source tree can also include real lexical helper implementations f
 the full original JavaScript, without Chromium:
 
 ~~~sh
-cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- source-tree \
+cargo +1.100.0 run --locked -p jsvm-lift --bin deobfuscate-safe -- source-tree \
   path/to/extracted-handlers work/readable-handlers \
   --context-source path/to/original.pretty.js \
   --max-iterations 12 --format-output
@@ -695,7 +695,7 @@ To inspect a standalone source file without reconstructing the full handler
 tree, use the focused caller-view command:
 
 ~~~sh
-cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views   path/to/already-formatted-original.js work/caller-views --entry-member someMethod
+cargo +1.100.0 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views   path/to/already-formatted-original.js work/caller-views --entry-member someMethod
 ~~~
 
 The output includes linked Markdown source excerpts and a machine-readable
@@ -731,7 +731,7 @@ To turn resolved constant selectors into **actual simplified helper bodies**,
 use the same standalone command with `--specialize`:
 
 ~~~sh
-cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
+cargo +1.100.0 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
   path/to/original.js work/caller-views --entry-member someMethod --specialize
 ~~~
 
@@ -743,7 +743,7 @@ callsite and exact-argument proofs still determine every variant. An example
 using more than one helper:
 
 ~~~sh
-cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
+cargo +1.100.0 run --locked -p jsvm-lift --bin deobfuscate-safe -- caller-views \
   path/to/original.js work/focused-helpers --specialize \
   --only-helper da --only-helper eU
 ~~~
@@ -961,7 +961,7 @@ counts are in `lexical-context/context.json` under
 For example:
 
 ```
-cargo +1.99.1 run --locked -p jsvm-lift --bin deobfuscate-safe -- source-tree \
+cargo +1.100.0 run --locked -p jsvm-lift --bin deobfuscate-safe -- source-tree \
   path/to/handlers output/tree --context-source path/to/original.js \
   --context-full-iterations 48 --context-guarded-helper mQ \
   --max-iterations 12 --format-output
