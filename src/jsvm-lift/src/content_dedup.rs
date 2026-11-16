@@ -14,6 +14,7 @@ pub enum Materialization {
 ///
 /// Fails when the source file cannot be opened or read.
 pub fn sha256_path(path: &Path) -> Result<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
@@ -26,7 +27,6 @@ pub fn sha256_path(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..count]);
     }
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = hasher.finalize();
     let mut output = String::with_capacity(digest.len() * 2);
     for byte in digest {
