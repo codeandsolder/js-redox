@@ -504,7 +504,7 @@ impl Collector<'_> {
         }
 
         if lower == "atob"
-            || has_dotted_member_suffix(&lower, "atob")
+            || has_dotted_member_suffix(lower, "atob")
             || (callee == "Buffer.from"
                 && it
                     .arguments
@@ -523,7 +523,7 @@ impl Collector<'_> {
 
         if matches!(callee, "eval" | "Function")
             || has_dotted_member_suffix(callee, "eval")
-            || has_dotted_member_suffix(&lower, "constructor")
+            || has_dotted_member_suffix(lower, "constructor")
         {
             let static_source = if callee == "eval" || has_dotted_member_suffix(callee, "eval") {
                 it.arguments
