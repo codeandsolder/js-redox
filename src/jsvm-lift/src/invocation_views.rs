@@ -64,9 +64,9 @@ fn source_excerpt(raw: &str, line: u64, first_line: Option<u64>) -> String {
         } else {
             ""
         };
-        let _ = write!(
+        let _ = writeln!(
             excerpt,
-            "{} {:>6} | {shown}{cropped}\n",
+            "{} {:>6} | {shown}{cropped}",
             if index == local_line { ">" } else { " " },
             index + 1 + usize::try_from(start).unwrap_or(0),
         );
@@ -283,9 +283,9 @@ fn build_observed_path_view(
         page.push_str("## Guard observations matched to original AST\n\n");
         page.push_str("Only side-effect-checked booleans at an exact captured guard site appear here. A selected-arm label requires the next debugger pause in the same verified stack and original AST arm. Missing steps are not inferred.\n\n");
         for witness in witnesses {
-            let _ =
-                write!(page,
-                "- **Step {}** — {} guard observed **{}**; next pause in selected arm: **{}**.\n",
+            let _ = writeln!(
+                page,
+                "- **Step {}** — {} guard observed **{}**; next pause in selected arm: **{}**.",
                 witness["step_index"].as_u64().unwrap_or(0),
                 witness["kind"].as_str().unwrap_or("?"),
                 witness["observed_value"].as_bool().unwrap_or(false),
@@ -529,7 +529,7 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
                 (format!("src/_observed/{sha}.js"), "Observed source view"),
             ] {
                 if project.join(&target).is_file() {
-                    let _ = write!(view, "- [{label}](../../../{target})\n");
+                    let _ = writeln!(view, "- [{label}](../../../{target})");
                 }
             }
             view.push('\n');
@@ -581,8 +581,11 @@ pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -
             .get("pointId")
             .and_then(Value::as_str)
             .unwrap_or("unnamed");
-        let _ = write!(index, "- [Invocation {ordinal:04}](./{name}) — breakpoint point {} in CDP session {session}\n",
-            point.replace('\n', " "));
+        let _ = writeln!(
+            index,
+            "- [Invocation {ordinal:04}](./{name}) — breakpoint point {} in CDP session {session}",
+            point.replace('\n', " ")
+        );
     }
 
     // Remove only our own obsolete numbered outputs, never user files.

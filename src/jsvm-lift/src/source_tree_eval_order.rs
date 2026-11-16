@@ -606,9 +606,9 @@ pub(super) fn ordered_assignment_phases(source: &str, program: &Program<'_>) -> 
             } else {
                 phase.guards.join(" and ")
             };
-            let _ = write!(
+            let _ = writeln!(
                 out,
-                "| {} | {} | {} | {} | {}–{} |\n",
+                "| {} | {} | {} | {} | {}–{} |",
                 i + 1,
                 cell(&guard),
                 phase.kind,

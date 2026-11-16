@@ -1163,9 +1163,9 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
         }
         origin_text.push_str("\n## AST lexical matches\n\n");
         for found in &capture.matches {
-            let _ = write!(
+            let _ = writeln!(
                 origin_text,
-                "- [{}]({}) (line {}, AST lexical structure)\n",
+                "- [{}]({}) (line {}, AST lexical structure)",
                 found.path,
                 relative_link(&origin, &found.path),
                 found.line
@@ -1215,31 +1215,31 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
                 serde_json::to_string(&e.thrown_types)?
             );
             if let Some(indices) = &e.global_event_indices {
-                let _ = write!(
+                let _ = writeln!(
                     details,
-                    "- Global execution event indices: {}\n",
+                    "- Global execution event indices: {}",
                     serde_json::to_string(indices)?
                 );
             }
             if let Some(bytes) = &entry.readable {
                 let fmt = format!("{}/readable/{}.js", capture.relative, e.sha256);
                 write_file(staging.path(), &fmt, bytes)?;
-                let _ = write!(
+                let _ = writeln!(
                     details,
-                    "- [Readable analyst view]({})\n",
+                    "- [Readable analyst view]({})",
                     relative_link(&page, &fmt)
                 );
             } else {
-                let _ = write!(
+                let _ = writeln!(
                     details,
-                    "- Standalone formatter status: {}\n",
+                    "- Standalone formatter status: {}",
                     e.readable_status
                 );
             }
             write_file(staging.path(), &page, details.as_bytes())?;
-            let _ = write!(
+            let _ = writeln!(
                 listing,
-                "- [{}]({}) - {} source units, {} event(s)\n",
+                "- [{}]({}) - {} source units, {} event(s)",
                 &e.sha256[..16],
                 relative_link(&readme, &page),
                 e.utf16_length,
@@ -1264,9 +1264,9 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
         } else {
             format!("Direct executable {}", &executable_sha[..12])
         };
-        let _ = write!(
+        let _ = writeln!(
             index,
-            "- [{label} / eval {}..{} / capture {}]({}) - {} calls, {} strings\n",
+            "- [{label} / eval {}..{} / capture {}]({}) - {} calls, {} strings",
             site.start,
             site.end,
             &capture.capture_id[..12],
@@ -1321,9 +1321,9 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
              Lexical structural matches, not whole-function equivalence.\n\n"
         );
         for (origin, line) in refs {
-            let _ = write!(
+            let _ = writeln!(
                 text,
-                "- Line {}: [verified observed eval origin]({})\n",
+                "- Line {}: [verified observed eval origin]({})",
                 line,
                 relative_link(&sidecar, &origin)
             );

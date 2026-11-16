@@ -151,7 +151,7 @@ fn build_module_source(
         if module.export_names.len() > 12 {
             let _ = write!(preview, ", … (+{} more)", module.export_names.len() - 12);
         }
-        let _ = write!(metadata, " * Static export names: {preview}\n");
+        let _ = writeln!(metadata, " * Static export names: {preview}");
     }
     if module.commonjs_export {
         metadata.push_str(" * Static CommonJS module.exports write observed.\n");
@@ -172,9 +172,9 @@ fn build_module_source(
             );
         }
         if !dependencies.is_empty() {
-            let _ = write!(
+            let _ = writeln!(
                 metadata,
-                " * Static Browserify dependency map: {dependencies}\n"
+                " * Static Browserify dependency map: {dependencies}"
             );
         }
         return Ok(format!(
@@ -202,7 +202,7 @@ fn build_module_source(
             } else {
                 "named-loader"
             };
-            let _ = write!(metadata, " * Static {label} dependencies: {dependencies}\n");
+            let _ = writeln!(metadata, " * Static {label} dependencies: {dependencies}");
         }
         let family = if bundle_kind == "amd_named_modules" {
             "named AMD"
