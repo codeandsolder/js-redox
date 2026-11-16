@@ -1569,6 +1569,10 @@ pub fn recover_webassembly_byte_artifacts_from_program(
 /// This evaluates only a bounded set of deterministic local byte-building operations.
 /// It does not execute JavaScript and fails closed when buffers escape, writes are
 /// ambiguous, or dynamic scope prevents static name resolution.
+///
+/// # Errors
+///
+/// Fails on work-budget exhaustion during parsing or source-backed recovery, or when neither unambiguous nor CommonJS parsing passes syntax and semantic validation. Unprovable byte paths are reported in diagnostics rather than treated as parsing failures.
 pub fn analyze_webassembly_byte_artifacts(
     source: &str,
     budget: &WorkBudget,
@@ -1596,6 +1600,11 @@ pub fn analyze_webassembly_byte_artifacts(
     anyhow::bail!("JavaScript did not parse as unambiguous or CommonJS source")
 }
 
+/// Return only proven WebAssembly byte artifacts from a bounded analysis.
+///
+/// # Errors
+///
+/// Propagates budget exhaustion and JavaScript parse or semantic validation failures from `analyze_webassembly_byte_artifacts`.
 pub fn recover_webassembly_byte_artifacts(
     source: &str,
     budget: &WorkBudget,

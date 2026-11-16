@@ -50,6 +50,11 @@ impl Default for SusScanOptions {
 }
 
 impl SusScanOptions {
+    /// Validate scanner options before attempting source analysis.
+    ///
+    /// # Errors
+    ///
+    /// Rejects `window_bytes` below 64. Other options are accepted by this validator.
     pub fn validate(&self) -> Result<()> {
         ensure!(self.window_bytes >= 64, "window_bytes must be at least 64");
         Ok(())
@@ -1411,6 +1416,11 @@ fn analyze_program(
     })
 }
 
+/// Analyze decoded JavaScript source using the supplied scan options.
+///
+/// # Errors
+///
+/// Returns an error when `SusScanOptions::validate` rejects the scan window. Fatal JavaScript parse failures are recorded in `SusFileReport` rather than raised.
 pub fn analyze_source(
     source: &str,
     input: &Path,
@@ -1541,6 +1551,10 @@ fn path_allows_classic_fallback(path: &Path) -> bool {
 ///
 /// Detached classic scripts cannot recover their embedding document encoding, so
 /// replacement decoding remains explicitly uncertain rather than failing the scan.
+///
+/// # Errors
+///
+/// Propagates invalid scan-window options from `analyze_source`. Non-UTF-8 input is decoded with explicit uncertainty flags rather than treated as an error.
 pub fn analyze_bytes(
     bytes: &[u8],
     input: &Path,
@@ -1561,6 +1575,10 @@ pub fn analyze_bytes(
 }
 
 /// Read and analyze one explicitly selected source file.
+///
+/// # Errors
+///
+/// Fails if the selected file cannot be read, or if the scanner rejects the configured window size. Parser failures and uncertain decoding are represented in the report.
 pub fn scan_file(path: &Path, options: &SusScanOptions) -> Result<SusFileReport> {
     let bytes = fs::read(path).with_context(|| format!("reading JavaScript {}", path.display()))?;
     analyze_bytes(&bytes, path, options)
@@ -1610,6 +1628,10 @@ fn collect_path(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 ///
 /// Explicit files are accepted regardless of extension; recursive walks select
 /// JavaScript-like extensions and never follow symlinks.
+///
+/// # Errors
+///
+/// Fails if a selected input cannot be inspected or an encountered directory cannot be enumerated, including metadata errors during recursive walks.
 pub fn collect_input_paths(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for input in inputs {
@@ -1620,6 +1642,11 @@ pub fn collect_input_paths(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Combine per-file scan results into a deterministically ordered summary.
+///
+/// # Errors
+///
+/// Rejects `window_bytes` below 64 through `SusScanOptions::validate`; per-file parse failures are not raised again here.
 pub fn build_report(
     mut files: Vec<SusFileReport>,
     options: &SusScanOptions,

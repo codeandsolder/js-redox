@@ -102,6 +102,10 @@ fn scheduling_class(
 
 /// Enumerate parser-visible initial script roots and *candidate* scheduling
 /// classes. The ordinal is source markup order, not an actual runtime sequence.
+///
+/// # Errors
+///
+/// Fails if `document_url` is not a valid absolute URL, or if the work budget is exhausted while enumerating script tags. Unresolvable individual `src` and `base` values remain candidates rather than errors.
 pub fn static_document_scripts(
     html: &str,
     document_url: &str,
@@ -151,6 +155,10 @@ pub fn static_document_scripts(
 
 /// Resolve source-linked HTML roots in an already validated capture project.
 /// Ambiguous repeated network responses remain separate candidate sources.
+///
+/// # Errors
+///
+/// Fails on work-budget exhaustion, inaccessible captured script or HTML files, invalid UTF-8 HTML, or invalid document base URLs propagated from `static_document_scripts`. Manifest hash mismatches are recorded, not raised.
 pub fn captured_document_entrypoints(
     project: &Path,
     manifest: &CaptureManifest,
