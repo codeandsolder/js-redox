@@ -1528,9 +1528,10 @@ fn path_allows_classic_fallback(path: &Path) -> bool {
 }
 
 /// Analyze a JavaScript file from raw bytes using the same browser-oriented
-/// decoding fallback as capture ingestion. Detached classic scripts cannot
-/// recover their embedding document encoding, so replacement decoding remains
-/// explicitly uncertain rather than failing the scan.
+/// decoding fallback as capture ingestion.
+///
+/// Detached classic scripts cannot recover their embedding document encoding, so
+/// replacement decoding remains explicitly uncertain rather than failing the scan.
 pub fn analyze_bytes(
     bytes: &[u8],
     input: &Path,
@@ -1596,8 +1597,10 @@ fn collect_path(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 /// Expand explicit files and recursive directories into a deterministic source
-/// list. Explicit files are accepted regardless of extension; recursive walks
-/// select JavaScript-like extensions and never follow symlinks.
+/// list.
+///
+/// Explicit files are accepted regardless of extension; recursive walks select
+/// JavaScript-like extensions and never follow symlinks.
 pub fn collect_input_paths(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for input in inputs {

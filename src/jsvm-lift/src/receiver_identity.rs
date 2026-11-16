@@ -2805,9 +2805,11 @@ pub fn structurally_proven_origin_direct_calls(
 }
 
 /// Prove that one event in the callee of an exact-origin direct call cannot
-/// execute for the call site's exact scalar facts. This composes the supported
-/// structured switch, ordinary flattened-ladder, and protected try/catch
-/// ladder theorems; unsupported control remains reachable/unknown.
+/// execute for the call site's exact scalar facts.
+///
+/// This composes the supported structured switch, ordinary flattened-ladder, and
+/// protected try/catch ladder theorems; unsupported control remains
+/// reachable/unknown.
 #[must_use]
 pub fn proven_origin_direct_call_event_unreachable(
     source: &str,
@@ -2958,9 +2960,11 @@ pub struct PhaseBindingMutationAudit {
     pub source_mutation_isolated: bool,
 }
 
-/// Audit mutation hazards which may invalidate a captured phase function after
-/// its structurally proven installation. A pure IIFE assignment plus a single
-/// explicit write is not enough if nested handlers can execute direct eval.
+/// Audit mutation hazards which may invalidate a captured phase function after its
+/// structurally proven installation.
+///
+/// A pure IIFE assignment plus a single explicit write is not enough if nested
+/// handlers can execute direct eval.
 ///
 /// A local callable named eval may contain the native eval, so syntactic direct
 /// eval calls are retained as hazards even when the identifier is bound.
@@ -3037,8 +3041,9 @@ pub struct ProvenStablePrototypePhaseFunction {
     pub mutation: PhaseBindingMutationAudit,
 }
 
-/// The result the stable original phase function would return *if called at
-/// the exact event*, where the captured lexical equality has been proved.
+/// The result the stable original phase function would return *if called at the
+/// exact event*, where the captured lexical equality has been proved.
+///
 /// Neither a call nor the value of that equality at later events is implied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenOriginalPhaseReturnAtEvent {
@@ -3046,10 +3051,11 @@ pub struct ProvenOriginalPhaseReturnAtEvent {
     pub stable_function: ProvenStablePrototypePhaseFunction,
 }
 
-/// A source-wide theorem, independent of any particular VM or runtime trace:
-/// after its guaranteed IIFE initialization this exact lexical binding cannot
-/// be overwritten via resolved writes, direct eval, or with scope injection.
-/// Root/global bindings are excluded because they can be mutated externally.
+/// Prove source-wide stability of a lexical phase-function binding.
+///
+/// After guaranteed IIFE initialization, resolved writes, direct eval and
+/// `with` injection cannot overwrite it. Root/global bindings are excluded
+/// because external code can mutate them.
 pub fn proven_stable_prototype_phase_function(
     semantic: &Semantic<'_>,
     closure: &ProvenPrototypeMethodPhaseClosure,
@@ -5253,8 +5259,10 @@ pub fn structurally_matched_prototype_method_calls(
 }
 
 /// Match prototype method calls found in an independently seeded exact-origin
-/// flow. This reuses the same constructor/property identity and ambiguity rules
-/// as the global origin flow; the caller is responsible only for the seed proof.
+/// flow.
+///
+/// This reuses the same constructor/property identity and ambiguity rules as the
+/// global origin flow; the caller is responsible only for the seed proof.
 pub fn structurally_matched_prototype_method_calls_in_flow(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -5687,9 +5695,11 @@ pub fn proven_prototype_method_receiver_preservation_summary(
 
 /// Prove runtime-targeted prototype methods that preserve receiver identity and
 /// member shape, conditional only on a finite set of ordinary own-data fields
-/// already existing at method entry. Exact direct-call scalar facts discharge
-/// unreachable effects; nested runtime-proven prototype calls are summarized
-/// recursively. Cycles and unresolved receiver effects fail closed.
+/// already existing at method entry.
+///
+/// Exact direct-call scalar facts discharge unreachable effects; nested
+/// runtime-proven prototype calls are summarized recursively. Cycles and
+/// unresolved receiver effects fail closed.
 pub fn structurally_proven_prototype_method_receiver_preservation_summaries(
     source: &str,
     program: &Program<'_>,

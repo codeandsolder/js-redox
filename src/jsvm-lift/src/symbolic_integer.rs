@@ -228,10 +228,12 @@ impl Normalizer<'_, '_, '_, '_> {
 }
 
 /// Normalize a supported integer expression into a canonical polynomial over
-/// symbol-resolved variables. `opaque_constants` can discharge independently
-/// proven calls/member reads by exact source span. Assignments whose RHS is
-/// intentionally unconstrained may be listed in `arbitrary_assignments`; their
-/// post-assignment value becomes a fresh symbolic value of that variable.
+/// symbol-resolved variables.
+///
+/// `opaque_constants` can discharge independently proven calls/member reads by
+/// exact source span. Assignments whose RHS is intentionally unconstrained may be
+/// listed in `arbitrary_assignments`; their post-assignment value becomes a fresh
+/// symbolic value of that variable.
 #[must_use]
 pub fn normalize_integer_polynomial(
     expression: &Expression<'_>,

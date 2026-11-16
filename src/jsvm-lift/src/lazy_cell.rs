@@ -2637,10 +2637,12 @@ fn proven_slow_lazy_cell_captured_value_path(
     Some((root_value_parameter_index, current_symbol))
 }
 
-/// Join one exact slow-cell registry assignment to any logical forwarding
-/// install whose original value feeds the wrapper. The same exact object-origin,
-/// key-provenance, binding-preservation, and no-use-before-forwarding barriers
-/// used for logical function handlers are required for arbitrary values.
+/// Join one exact slow-cell registry assignment to any logical forwarding install
+/// whose original value feeds the wrapper.
+///
+/// The same exact object-origin, key-provenance, binding-preservation, and
+/// no-use-before-forwarding barriers used for logical function handlers are
+/// required for arbitrary values.
 #[must_use]
 pub fn proven_slow_lazy_cell_captured_value_install(
     source: &str,
@@ -2763,9 +2765,10 @@ pub fn proven_slow_lazy_cell_resolved_handler(
     })
 }
 
-/// Join independent slow-cell structure proofs. This is not a read-site
-/// identity theorem: receiver/key origin and registry-slot preservation
-/// must be supplied by distinct proofs before a handler can be named.
+/// Join independent slow-cell structure proofs.
+///
+/// This is not a read-site identity theorem: receiver/key origin and registry-slot
+/// preservation must be supplied by distinct proofs before a handler can be named.
 #[must_use]
 pub fn structurally_compatible_slow_lazy_cell_read(
     resolved_handler: &ProvenSlowLazyCellResolvedHandler,
@@ -3378,9 +3381,10 @@ pub fn proven_slow_lazy_cell_resolver_index(
     harness.result.flatten()
 }
 
-/// Prove the two state-object facts consumed by slow-cell construction:
-/// the exact prototype-carrier own field is unchanged at this factory call,
-/// and the computed method-key field still has its exact inherited string value.
+/// Prove both state-object facts required for slow-cell construction.
+///
+/// The prototype-carrier own field must be unchanged at this factory call,
+/// and the computed method-key field must retain its inherited string value.
 ///
 /// This theorem deliberately does not interpret the carrier object itself. A
 /// separate object-model proof must establish what the exact carrier value does

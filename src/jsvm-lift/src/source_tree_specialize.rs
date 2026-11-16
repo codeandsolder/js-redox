@@ -504,9 +504,11 @@ struct CallContext {
 }
 
 /// Recover function-level variants by tracing *exact* primitive arguments and
-/// immutable forwarded formal parameters through arbitrarily deep lexical
-/// call chains. Every root entry starts with unknown parameters. Each emitted
-/// variant is attached to at least one real resolved incoming callsite.
+/// immutable forwarded formal parameters through arbitrarily deep lexical call
+/// chains.
+///
+/// Every root entry starts with unknown parameters. Each emitted variant is
+/// attached to at least one real resolved incoming callsite.
 ///
 /// This is a path-specific source-reading view, not an executable replacement.
 pub fn specialize_resolved_call_graph(
@@ -806,9 +808,11 @@ impl<'a> Visit<'a> for ParameterReferences<'_> {
 }
 
 /// Replace references to stable simple parameters with exact primitive literal
-/// arguments. Leaves the parameter list, function name, and external closures
-/// unchanged. Rejects dynamic scope and any write or arguments alias to
-/// the substituted parameters.
+/// arguments.
+///
+/// Leaves the parameter list, function name, and external closures unchanged.
+/// Rejects dynamic scope and any write or arguments alias to the substituted
+/// parameters.
 pub fn specialize_function(source: &str, constants: &[(usize, String)]) -> Result<Option<String>> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::unambiguous());

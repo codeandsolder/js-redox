@@ -1,6 +1,8 @@
 //! Expose short, source-backed helper returns directly inside analyst-only
-//! handlers, with exact semantic binding checks. Never modify the executable
-//! reconstruction or mistake source identity for observed runtime execution.
+//! handlers, with exact semantic binding checks.
+//!
+//! Never modify the executable reconstruction or mistake source identity for
+//! observed runtime execution.
 use crate::source_tree_context::{ContextHelper, ContextSourceTree, HandlerContext};
 use anyhow::{ensure, Result};
 use jsvm_safe_core::eval_static_primitive;
@@ -317,8 +319,10 @@ impl CallExpander<'_> {
 }
 
 /// Expand exact original single-return function expressions with binding-safe
-/// primitive or immutable formal arguments. This file is an analyst projection
-/// only: function-stack traces and source reflection can still differ.
+/// primitive or immutable formal arguments.
+///
+/// This file is an analyst projection only: function-stack traces and source
+/// reflection can still differ.
 pub fn expand_helper_returns(
     source: &str,
     context: &ContextSourceTree,

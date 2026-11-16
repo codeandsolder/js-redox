@@ -1650,9 +1650,10 @@ pub fn proven_function_boolean_expression_with_integer_parameters(
     harness.result.flatten()
 }
 
-/// Prove that an event is excluded by an enclosing exact structured branch
-/// (`if`, conditional expression, the RHS of `&&`/`||`, or a `while` body
-/// whose entry test is false) for exact integer formal-parameter values.
+/// Prove event exclusion by a structured branch for exact integer formals.
+///
+/// Supported branches are `if`, conditional expressions, the RHS of
+/// `&&`/`||`, and `while` bodies whose entry test is false.
 ///
 /// Only the scalar evaluator's side-effect-free subset participates. Unknown
 /// tests, targets not contained by a recognized branch, and dynamic scalar
@@ -1814,9 +1815,11 @@ pub fn prove_function_structured_branch_event_unreachable_with_integer_parameter
 }
 
 /// Prove that an event inside a structured `switch` cannot execute for exact
-/// integer formal-parameter values. The proof accepts only scalar-pure case
-/// selection and a selected case that either lies after the target or ends in
-/// an unconditional top-level break/return/throw before any later target case.
+/// integer formal-parameter values.
+///
+/// The proof accepts only scalar-pure case selection and a selected case that
+/// either lies after the target or ends in an unconditional top-level
+/// break/return/throw before any later target case.
 #[must_use]
 pub fn prove_function_switch_event_unreachable_with_integer_parameters(
     program: &Program<'_>,

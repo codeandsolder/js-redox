@@ -1,6 +1,8 @@
-//! Intrinsic alias elimination for analyst-only JS. This assumes standard
-//! builtins retain their native data properties throughout the program.
-//! Never use this presentation transform for proof-gated executable output.
+//! Intrinsic alias elimination for analyst-only JS.
+//!
+//! This assumes standard builtins retain their native data properties throughout
+//! the program. Never use this presentation transform for proof-gated executable
+//! output.
 use jsvm_safe_core::statically_unresolved_global_reference;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -244,9 +246,10 @@ impl<'a> Visit<'a> for References<'_> {
     }
 }
 
-/// Returns a different human-readable view, never an executable equivalence
-/// certificate: aliases capture a value once, while substituted members are
-/// looked up at their later use under the pristine-builtins assumption.
+/// Produce a human-readable alias view, not executable-equivalence evidence.
+///
+/// Aliases capture values once; substituted member lookups occur later
+/// and depend on the pristine-builtins assumption.
 pub fn inline_readable_intrinsic_aliases(source: &str) -> Option<(String, usize)> {
     for source_type in [SourceType::mjs(), SourceType::cjs()] {
         let allocator = Allocator::default();

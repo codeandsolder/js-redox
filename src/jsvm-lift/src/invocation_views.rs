@@ -388,8 +388,9 @@ fn build_observed_path_view(
     Ok(page)
 }
 
-/// Render every recorded invocation, including unresolved frames, without
-/// treating source offsets from transformed code as original CDP locations.
+/// Render every recorded invocation, including unresolved frames, without treating
+/// source offsets from transformed code as original CDP locations.
+///
 /// Re-runnable on an already reconstructed project; no deobfuscation rescan.
 pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -> Result<usize> {
     let Some(mut trace) = load_artifact(project, SELECTIVE_TRACE, true)? else {

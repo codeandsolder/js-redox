@@ -116,9 +116,10 @@ fn enclosing_context_and_guard(
     (None, guarded)
 }
 
-/// Build source-local direct-call candidates with exact semantic symbol
-/// identity. The graph deliberately does not assert value immutability,
-/// cross-script resolution, callback execution, or runtime reachability.
+/// Build source-local direct-call candidates with exact semantic symbol identity.
+///
+/// The graph deliberately does not assert value immutability, cross-script
+/// resolution, callback execution, or runtime reachability.
 ///
 /// A symbol gets a candidate only when exactly one function definition is
 /// visible in this source's declarations/variable initializers. Any distinct

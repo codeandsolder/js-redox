@@ -262,9 +262,11 @@ impl<'a> Visit<'a> for LoopCandidate<'_> {
     }
 }
 
-/// Structurally recover single-trip loops without guessing the values of
-/// arbitrary JavaScript expressions. Reparse each pass so nested candidates
-/// become eligible after the containing loop has been rewritten.
+/// Structurally recover single-trip loops without guessing the values of arbitrary
+/// JavaScript expressions.
+///
+/// Reparse each pass so nested candidates become eligible after the containing
+/// loop has been rewritten.
 pub fn reflow_single_trip_loops(source: &str) -> Result<ReflowedLoops> {
     let mut output = source.to_owned();
     let mut rewritten_loops = 0;
