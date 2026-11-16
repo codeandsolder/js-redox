@@ -139,6 +139,10 @@ impl AnalysisBudgets {
 /// Local operation exhaustion is returned to the caller for recording as that
 /// unit's failure; inherited exhaustion aborts the enclosing workflow. Non-budget
 /// errors are unchanged.
+///
+/// # Errors
+///
+/// Returns an error when the supplied failure represents an inherited work-budget exhaustion; local unit failures are returned as values.
 pub fn recoverable_unit_error(error: AnyError) -> Result<AnyError> {
     if find_budget_exceeded(error.as_ref()).is_some_and(|budget| budget.is_inherited()) {
         return Err(error);

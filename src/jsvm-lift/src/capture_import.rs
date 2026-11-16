@@ -48,6 +48,11 @@ pub struct CaptureImportSummary {
     pub script_records: usize,
 }
 
+/// Classify the supported capture input formats from their paths.
+///
+/// # Errors
+///
+/// Rejects unsupported file extensions and directories without the expected recorder manifest and HAR.
 pub fn detect_capture_input(path: &Path) -> Result<CaptureInputKind> {
     if path.is_dir() {
         if path.join("recorder-manifest.json").is_file() && path.join("capture.har").is_file() {
@@ -111,6 +116,11 @@ fn add_recorder_navigation(manifest: &mut CaptureManifest, recorder_manifest: &V
     }
 }
 
+/// Import a supported capture into a project under a bounded work budget.
+///
+/// # Errors
+///
+/// Propagates work-budget exhaustion, inaccessible inputs, unsupported formats, capture parsing/validation errors and output filesystem failures.
 pub fn import_capture_project(
     options: &CaptureImportOptions,
     budgets: &AnalysisBudgets,

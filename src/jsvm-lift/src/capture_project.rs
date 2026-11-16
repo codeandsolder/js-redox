@@ -72,6 +72,11 @@ fn validate_output_path(value: Option<&Value>, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate the capture manifest schema and internal reference integrity.
+///
+/// # Errors
+///
+/// Fails on an incorrect schema, empty source metadata, duplicate or malformed resource IDs, unsafe output paths or inline scripts referencing unknown resources.
 pub fn validate_manifest(manifest: &CaptureManifest, label: &str) -> Result<()> {
     if manifest.schema != SCHEMA {
         bail!("{label}: expected schema {SCHEMA:?}");
@@ -116,6 +121,11 @@ pub fn validate_manifest(manifest: &CaptureManifest, label: &str) -> Result<()> 
     Ok(())
 }
 
+/// Deserialize and validate a capture manifest from a JSON value.
+///
+/// # Errors
+///
+/// Fails when the JSON has the wrong manifest shape or violates `validate_manifest` invariants.
 pub fn validate_manifest_value(document: &Value, label: &str) -> Result<CaptureManifest> {
     let manifest: CaptureManifest = serde_json::from_value(document.clone())
         .with_context(|| format!("{label}: invalid capture manifest shape"))?;
@@ -123,6 +133,11 @@ pub fn validate_manifest_value(document: &Value, label: &str) -> Result<CaptureM
     Ok(manifest)
 }
 
+/// Read, decode and validate the capture project's manifest.
+///
+/// # Errors
+///
+/// Fails on filesystem reads, malformed JSON or invalid capture-manifest invariants.
 pub fn read_manifest(path: &Path) -> Result<CaptureManifest> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read capture manifest {}", path.display()))?;
@@ -132,6 +147,11 @@ pub fn read_manifest(path: &Path) -> Result<CaptureManifest> {
     Ok(manifest)
 }
 
+/// Prepare an output directory without overwriting unrelated data.
+///
+/// # Errors
+///
+/// Rejects symlink output paths, existing paths without overwrite permission, non-directories and nonempty directories lacking a capture manifest; also propagates filesystem errors.
 pub(crate) fn prepare_project_output(output: &Path, overwrite: bool) -> Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(output) {
         if metadata.file_type().is_symlink() {
@@ -161,6 +181,11 @@ pub(crate) fn prepare_project_output(output: &Path, overwrite: bool) -> Result<(
     Ok(())
 }
 
+/// Validate and serialize the capture manifest to its destination.
+///
+/// # Errors
+///
+/// Fails on invalid manifest contents, directory creation or serialization errors, or writing the manifest.
 pub fn write_manifest(path: &Path, manifest: &CaptureManifest) -> Result<()> {
     validate_manifest(manifest, &path.display().to_string())?;
     if let Some(parent) = path.parent() {
@@ -176,6 +201,11 @@ pub fn manifest_path(project: &Path) -> PathBuf {
     project.join(MANIFEST_NAME)
 }
 
+/// Load the capture manifest from its standard project location.
+///
+/// # Errors
+///
+/// Propagates read, parse and validation errors from `read_manifest`.
 pub fn load_manifest(project: &Path) -> Result<CaptureManifest> {
     read_manifest(&manifest_path(project))
 }
