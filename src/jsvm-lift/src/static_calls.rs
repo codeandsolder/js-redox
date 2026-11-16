@@ -21,7 +21,7 @@ pub struct StaticCallEdge {
     pub caller: Option<[u32; 2]>,
     pub callee: [u32; 2],
     pub call: [u32; 2],
-    /// direct_inline_function or lexical_binding_candidate
+    /// `direct_inline_function` or `lexical_binding_candidate`
     pub resolution: &'static str,
     pub constructor: bool,
     pub optional: bool,

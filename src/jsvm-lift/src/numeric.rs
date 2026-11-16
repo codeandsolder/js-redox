@@ -1,13 +1,13 @@
 pub use jsvm_safe_core::{exact_i64, exact_u64};
 
-/// JavaScript ToInt32 for values that are already proven exact signed integers.
+/// JavaScript `ToInt32` for values that are already proven exact signed integers.
 #[must_use]
 pub const fn js_int32_from_i64(value: i64) -> i32 {
     let bytes = value.to_le_bytes();
     i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
-/// JavaScript ToUint32 for values that are already proven exact signed integers.
+/// JavaScript `ToUint32` for values that are already proven exact signed integers.
 #[must_use]
 pub const fn js_uint32_from_i64(value: i64) -> u32 {
     let bytes = value.to_le_bytes();

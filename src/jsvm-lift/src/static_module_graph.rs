@@ -229,7 +229,7 @@ fn match_root(
 /// Traverse only imports/re-exports that are statically named by a module.
 ///
 /// The caller supplies the EXISTING project-js-refs stage's contextual
-/// resolution_candidates, which already incorporates captured import maps.
+/// `resolution_candidates`, which already incorporates captured import maps.
 /// Dynamic imports are retained as candidate edges but not followed.
 /// Missing modules are explicit, and same-URL different capture responses
 /// remain distinct alternatives. All source bytes are rehashed on use.
