@@ -50,6 +50,11 @@ pub struct NormalizedVm {
     pub opcodes: Vec<NormalizedOpcode>,
 }
 
+/// Read nonempty JSON Lines records as the requested deserializable type.
+///
+/// # Errors
+///
+/// Fails if the input cannot be read as UTF-8, or if a nonempty line cannot be decoded into `T`; the parse error includes the file and one-based line number.
 pub fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     text.lines()

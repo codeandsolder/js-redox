@@ -475,6 +475,11 @@ fn validate_sample_policy(
     Ok(())
 }
 
+/// Evaluate corpus manifest samples against authenticated source bytes and analysis invariants.
+///
+/// # Errors
+///
+/// Fails on manifest I/O, JSON or schema validation, corpus-root and path resolution, missing files or hash mismatches, scratch-directory errors, work-budget exhaustion, unsupported source encoding, or violated formatting, rewriting, syntax and scanner expectations.
 pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<CorpusEvalReport> {
     let manifest_text = fs::read_to_string(manifest_path)
         .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
@@ -675,6 +680,11 @@ pub fn evaluate_manifest(manifest_path: &Path, corpus_root: &Path) -> Result<Cor
     })
 }
 
+/// Write a newline-terminated JSON corpus evaluation report.
+///
+/// # Errors
+///
+/// Fails if the destination directory cannot be created, JSON serialization fails, or the report file cannot be written.
 pub fn write_report(report: &CorpusEvalReport, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;

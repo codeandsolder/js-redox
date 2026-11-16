@@ -18,6 +18,11 @@ fn generate(source: &str, source_type: SourceType, budget: &WorkBudget) -> Resul
     Ok(Some(output))
 }
 
+/// Format JavaScript source using Oxc with a module-first, CommonJS fallback.
+///
+/// # Errors
+///
+/// Fails on work-budget exhaustion, when both parse modes reject the input, or if code generation unexpectedly emits only whitespace for nonempty input.
 pub fn format_source(source: &str, budget: &WorkBudget) -> Result<String> {
     let output = if let Some(output) = generate(source, SourceType::mjs(), budget)? {
         output

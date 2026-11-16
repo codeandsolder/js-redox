@@ -765,6 +765,11 @@ fn contains_with_statement(program: &Program<'_>) -> bool {
     detector.found
 }
 
+/// Recover source-proven browser API call sites under a bounded analysis.
+///
+/// # Errors
+///
+/// Fails on work-budget exhaustion, a `with` statement that makes identifier resolution environment-dependent, or failure to parse and semantically validate the source in supported JavaScript modes.
 pub fn analyze_api_surface(source: &str, budget: &WorkBudget) -> Result<Vec<ApiCallsite>> {
     budget.checkpoint()?;
     for source_type in [SourceType::unambiguous(), SourceType::cjs()] {

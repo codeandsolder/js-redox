@@ -120,6 +120,11 @@ fn scan_embedded_candidate(
     })
 }
 
+/// Scan a source and its bounded, recursively discovered embedded code.
+///
+/// # Errors
+///
+/// Propagates work-budget exhaustion from the core scanner or embedded scans. Optional embedded-source dump I/O failures are ignored and reflected by absent dump paths.
 pub fn scan_source(
     source: &str,
     input_label: impl Into<String>,
@@ -156,6 +161,11 @@ pub fn scan_source(
     })
 }
 
+/// Load a UTF-8 JavaScript file and generate a bounded scanner report.
+///
+/// # Errors
+///
+/// Fails if the file cannot be read as UTF-8, or propagates budget exhaustion from the core scanner or recursive embedded analyses.
 pub fn scan_file(path: &Path, dump_dir: Option<&Path>, budget: &WorkBudget) -> Result<ScanReport> {
     let source = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     scan_source(
