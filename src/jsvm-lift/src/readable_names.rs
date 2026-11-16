@@ -671,11 +671,11 @@ mod tests {
 
     #[test]
     fn recovers_descriptive_object_destructuring_aliases() {
-        let source = r#"
+        let source = r"
 let {footerBg: v, buttonLink: b = '/guide', internal: {deepValue: x}} = load();
 function render({pageTitle: t}) { return [v, b, x, t]; }
 export {v as oldFooterBg};
-"#;
+";
         let out = named(source);
         assert!(out.contains("footerBg: footerBg"), "{out}");
         assert!(out.contains("buttonLink: buttonLink = '/guide'"), "{out}");
@@ -705,12 +705,12 @@ export {v as oldFooterBg};
 
     #[test]
     fn recovers_explicit_member_alias_identifiers() {
-        let source = r#"
+        let source = r"
 var R = Object.create, z = Object.defineProperty;
 const a = Object.prototype.hasOwnProperty, b = Math.min, c = JSON.parse;
 export {R as create, z as define, a as hasOwn};
 console.log(R, z, a, b, c);
-"#;
+";
         let out = named(source);
         for part in [
             "objectCreate = Object.create",
@@ -815,13 +815,13 @@ export {r as a, x as b};
 
     #[test]
     fn recovers_named_identity_decorator_from_real_vue_bundle_shape() {
-        let source = r#"
+        let source = r"
 const Zo = {}, Qo = ((e) => (e.displayName = `Transition`, e.props = Zo, e))(
     (e, {slots: t}) => [e, t]
 );
 export {Qo as q};
 console.log(Qo.displayName, Qo.props);
-"#;
+";
         let output = named(source);
         assert!(output.contains("Transition = (("), "{output}");
         assert!(output.contains("export {Transition as q}"), "{output}");
@@ -836,7 +836,7 @@ console.log(Qo.displayName, Qo.props);
         for source in [
             r#"var a = (e => (e.displayName = "WrongObject", {}))(function(){});"#,
             r#"var a = (e => (e.displayName = "NotFunction", e))({});"#,
-            r#"var a = (e => (e.displayName = make(), e))(function(){});"#,
+            r"var a = (e => (e.displayName = make(), e))(function(){});",
             r#"var a = (e => (e["displayName"] = "DynamicKey", e))(function(){});"#,
             r#"var a = (e => (e.displayName = "WrongValue", e.displayName = "RightValue", e))(function(){});"#,
             r#"var a = (e => (e.displayName = "NoReturn", e.other))(function(){});"#,
@@ -869,14 +869,14 @@ export {q, r};
         for source in [
             r#"var a = __name({}, "NotFunction");"#,
             r#"var a = Object.defineProperty({}, "name", {value: "NotFunction"});"#,
-            r#"var a = __name(function () {}, getName());"#,
+            r"var a = __name(function () {}, getName());",
             r#"var a = __name(function () {}, "not a legal name");"#,
             r#"var a = __name(function () {}, "if");"#,
             r#"var a = __name(function () {}, "x");"#,
             r#"var a = Object.defineProperty(function(){}, "name", { get value() { return "No"; }});"#,
             r#"var a = Object.defineProperty(function(){}, "other", {value: "NotTheName"});"#,
             r#"var a = Object.assign({}, {displayName: "NotFunction"});"#,
-            r#"var a = Object.assign(function(){}, {displayName: getName()});"#,
+            r"var a = Object.assign(function(){}, {displayName: getName()});",
             r#"var a = Object.assign(function(){}, {displayName: "One", displayName: "Two"});"#,
             r#"var a = Object.assign(function(){}, {[key]: 1, displayName: "Uncertain"});"#,
             r#"var a = Object.assign(function(){}, {displayName: "Uncertain"}, more);"#,
@@ -969,14 +969,14 @@ export {v as t};
             ),
             ("./other.js".into(), [("x".into(), "Other".into())].into()),
         ]);
-        let source = r#"
+        let source = r"
 import Page, {t as b} from './Footer.js';
 import {x} from './other.js';
 function f(b) { return b; }
 const obj = {b, x};
 export {b, x as yy};
 console.log(Page, b, x);
-"#;
+";
         let (out, count) = recover_readable_names_with_imports(source, Some(&imported))
             .ok_or_else(|| anyhow::anyhow!("expected imported name recovery"))?;
         assert_eq!(count, 3, "{out}");

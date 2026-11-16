@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn joins_registry_reads_and_installs_by_exact_origin_and_key() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() {
                 install(this, 7, function handler() {});
                 run(this);
@@ -232,7 +232,7 @@ mod tests {
             function read(state, key) { let value; value = state.T[key]; return value; }
             function run(state) { return read(state, 7); }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn keeps_origin_for_dynamic_registry_read_key() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function(key) {
                 install(this, 7, function handler() {});
                 run(this, key);
@@ -317,7 +317,7 @@ mod tests {
             function read(state, key) { let value; value = state.T[key]; return value; }
             function run(state, key) { return read(state, key); }
             new C(window.dynamicKey);
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn does_not_join_same_registry_shape_on_different_object() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function(other) {
                 install(this, 7, function handler() {});
                 run(other);
@@ -346,7 +346,7 @@ mod tests {
             function read(state, key) { let value; value = state.T[key]; return value; }
             function run(state) { return read(state, 7); }
             new C({T: []});
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());

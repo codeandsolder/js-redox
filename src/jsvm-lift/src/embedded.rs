@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn recovers_classic_packer_eval_without_executing_it() {
-        let source = r#"
+        let source = r"
             eval(function(p,a,c,k,e,d){
                 e=function(c){return(c<a?'':e(parseInt(c/a)))+
                     ((c=c%a)>35?String.fromCharCode(c+29):c.toString(36))};
@@ -507,7 +507,7 @@ mod tests {
                 while(c--){if(k[c]){p=p.replace(new RegExp('\b'+e(c)+'\b','g'),k[c])}}
                 return p
             }('0 1=2;',3,3,'var|answer|fortytwo'.split('|'),0,{}));
-        "#;
+        ";
         let candidates = detect(source);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].kind, "Dean Edwards P.A.C.K.E.R.");
@@ -516,14 +516,14 @@ mod tests {
 
     #[test]
     fn recovers_classic_four_argument_packer_eval() {
-        let source = r#"
+        let source = r"
             eval(function(p,a,c,k,e,d){
                 e=function(c){return(c<a?'':e(parseInt(c/a)))+
                     ((c=c%a)>35?String.fromCharCode(c+29):c.toString(36))};
                 while(c--){if(k[c]){p=p.replace(new RegExp('\\b'+e(c)+'\\b','g'),k[c])}}
                 return p
             }('0 1=2;',3,3,'var|answer|fortytwo'.split('|')));
-        "#;
+        ";
         let candidates = detect(source);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].kind, "Dean Edwards P.A.C.K.E.R.");
@@ -532,10 +532,10 @@ mod tests {
 
     #[test]
     fn rejects_packer_like_call_with_different_decoder_parameters() {
-        let source = r#"
+        let source = r"
             eval(function(payload,a,c,k,e,d){return payload}(
                 '0 1=2;',3,3,'var|answer|fortytwo'.split('|'),0,{}));
-        "#;
+        ";
         assert!(detect(source).is_empty());
     }
 }

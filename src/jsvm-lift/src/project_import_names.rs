@@ -456,13 +456,13 @@ fn write_esm_symbol_index(
     let total_symbols: usize = known.values().map(BTreeMap::len).sum();
     let total_modules = known.values().filter(|exports| !exports.is_empty()).count();
     let mut output = format!(
-        r#"# Captured ESM symbols
+        r"# Captured ESM symbols
 
 Names come from readable source and statically resolved captured ESM exports. This is a navigation index, **not** an execution trace or a claim that minified names are known without evidence. Public ESM keys are preserved.
 
 {total_modules} modules with named exports; {total_symbols} exported names. See [JavaScript entrypoints](ENTRYPOINTS.md) for captured module traversal.
 
-"#
+"
     );
 
     for (url, exports) in known {

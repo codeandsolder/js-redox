@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn inline_call_context_uses_only_unique_unresolved_lexical_helpers() -> Result<()> {
-        let original = r#"
+        let original = r"
             function parent() {
                 const AM = function(J) { return J.Y ? fast(J) : slow(J); };
                 const O = function(J, Q) { const v=read(J); return choose(v,Q); };
@@ -598,15 +598,15 @@ mod tests {
                 function one() { const duplicate = function(J) {return J;}; }
                 function two() { const duplicate = function(J) {return J+1;}; }
             }
-        "#;
-        let source = r#"const capturedHandler = function(input) {
+        ";
+        let source = r"const capturedHandler = function(input) {
             AM(input);
             O(input, 24);
             mutable(input);
             duplicate(input);
             function shadow(AM) { return AM(input); }
             return AM(input);
-        };"#;
+        };";
         let context =
             reconstruct_context(original, &[("nested/handler.js".into(), source.into())])?;
         let handler = context.handlers.first().context("missing handler")?;
@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     fn traverses_exact_lexical_helpers_not_shadowed_parameters() {
-        let original = r#"
+        let original = r"
             function originalProgram() {
                 const varint = function(input) { return byte(input) + 1; };
                 const byte = function(input) { return input.value; };
@@ -742,7 +742,7 @@ mod tests {
                 const mutable = function() { return 4; };
                 mutable = function() { return 8; };
             }
-        "#;
+        ";
         let handlers = vec![
             (
                 "alpha.js".into(),
@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn mutation_sites_follow_exact_symbols_and_separate_deferred_functions() -> Result<()> {
-        let original = r#"function program() {
+        let original = r"function program() {
             let Hm = 97;
             const oU = function() {
                 Hm = 88 >> 2;
@@ -794,7 +794,7 @@ mod tests {
                 { let Hm = 3; Hm = 4; }
                 return Hm;
             };
-        }"#;
+        }";
         let handlers = vec![(
             "captured.js".to_owned(),
             "const captured = () => oU();".to_owned(),
@@ -836,10 +836,10 @@ mod tests {
 
     #[test]
     fn ambiguous_names_cannot_be_guessed_from_extracted_handler() {
-        let original = r#"
+        let original = r"
             function a() { let helper = function() { return 1; }; }
             function b() { let helper = function() { return 2; }; }
-        "#;
+        ";
         let handler = vec![(
             "handler.js".into(),
             "const capturedHandler=()=>helper();".into(),

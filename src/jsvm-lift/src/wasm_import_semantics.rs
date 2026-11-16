@@ -1044,7 +1044,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_or_different_write_semantics() {
-        let source = r#"
+        let source = r"
             var host = window; var imports = {};
             imports.missing = function(memory, base, offset) {
                 var view = new host.DataView(memory.buffer); var address = base + offset;
@@ -1066,13 +1066,13 @@ mod tests {
                 var view = new host.DataView(memory.buffer); var address = base + offset;
                 if (flag) sideEffect(); view.setUint32(address, 1, false);
             };
-        "#;
+        ";
         assert!(proven_wasm_import_data_view_set_u32_shapes(source).is_empty());
     }
 
     #[test]
     fn specializes_conditional_write_on_proven_offset() {
-        let source = r#"
+        let source = r"
             var host = window; var imports = { wbg: {} };
             imports.wbg.conditional = function(memory, base, offset) {
                 var view = new host.DataView(memory.buffer); var address = base + offset;
@@ -1080,7 +1080,7 @@ mod tests {
                     ? (offset !== 5 || view.setUint32(address, 1, false))
                     : view.setUint32(address, 2, false);
             };
-        "#;
+        ";
         assert!(proven_wasm_import_data_view_set_u32_shapes(source).is_empty());
         assert_eq!(
             proven_wasm_import_data_view_set_u32_shape_at_offset(source, "wbg", "conditional", 5)
@@ -1098,7 +1098,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_namespace_and_reassigned_parameters() {
-        let source = r#"
+        let source = r"
             var host = window;
             var imports = { wbg: {}, other: {} };
             imports.other.target = function(memory, base, offset) {
@@ -1110,7 +1110,7 @@ mod tests {
                 var view = new host.DataView(memory.buffer), address = base + offset;
                 view.setUint32(address, 1, false);
             };
-        "#;
+        ";
         assert!(
             proven_wasm_import_data_view_set_u32_shape_at_offset(source, "wbg", "target", 5,)
                 .is_none()
@@ -1119,30 +1119,30 @@ mod tests {
 
     #[test]
     fn rejects_direct_eval_and_with_dynamic_scope() {
-        let direct_eval = r#"
+        let direct_eval = r"
             var host = window; var imports = { wbg: {} };
             eval(source);
             imports.wbg.target = function(memory, base, offset) {
                 var view = new host.DataView(memory.buffer), address = base + offset;
                 view.setUint32(address, 1, false);
             };
-        "#;
+        ";
         assert!(proven_wasm_import_data_view_set_u32_shapes(direct_eval).is_empty());
 
-        let with_scope = r#"
+        let with_scope = r"
             var host = window; var imports = { wbg: {} };
             with (object) { sideEffect(); }
             imports.wbg.target = function(memory, base, offset) {
                 var view = new host.DataView(memory.buffer), address = base + offset;
                 view.setUint32(address, 1, false);
             };
-        "#;
+        ";
         assert!(proven_wasm_import_data_view_set_u32_shapes(with_scope).is_empty());
     }
 
     #[test]
     fn proves_stable_import_object_at_webassembly_instantiation_sites() {
-        let source = r#"
+        let source = r"
             var host = window;
             var imports = { wbg: {} };
             imports.wbg.target = function(memory, base, offset) {
@@ -1151,7 +1151,7 @@ mod tests {
             };
             WebAssembly.instantiate(bytes(), imports);
             new WebAssembly.Instance(module(), imports);
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics_for(source, "wbg", "target", 5);
         assert_eq!(analysis.shapes.len(), 1);
         assert_eq!(analysis.import_object_usages.len(), 1);
@@ -1180,7 +1180,7 @@ mod tests {
 
     #[test]
     fn requires_instantiation_site_after_import_assignment_in_source() {
-        let source = r#"
+        let source = r"
             var host = window;
             var imports = { wbg: {} };
             WebAssembly.instantiate(bytes(), imports);
@@ -1188,7 +1188,7 @@ mod tests {
                 var view = new host.DataView(memory.buffer), address = base + offset;
                 view.setUint32(address, 1, false);
             };
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics_for(source, "wbg", "target", 5);
         assert_eq!(analysis.shapes.len(), 1);
         assert!(analysis.import_object_usages.is_empty());
@@ -1196,7 +1196,7 @@ mod tests {
 
     #[test]
     fn proves_return_sequence_factory_for_nested_later_instantiation() {
-        let source = r#"
+        let source = r"
             function tQ() {
                 var imports = {};
                 imports.wbg = {};
@@ -1210,7 +1210,7 @@ mod tests {
                     }
                     break;
             }
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics_for(source, "wbg", "target", 5);
         let usage = analysis
             .import_object_usages
@@ -1231,28 +1231,28 @@ mod tests {
 
     #[test]
     fn rejects_conditional_or_nested_import_object_assignment_reachability() {
-        let conditional = r#"
+        let conditional = r"
             var imports = { wbg: {} };
             if (enabled) {
                 imports.wbg.target = function() {};
             }
             WebAssembly.instantiate(bytes(), imports);
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics_for(conditional, "wbg", "target", 5);
         assert!(analysis.import_object_usages.is_empty());
 
-        let nested_installer = r#"
+        let nested_installer = r"
             var imports = { wbg: {} };
             function install() {
                 imports.wbg.target = function() {};
             }
             install();
             WebAssembly.instantiate(bytes(), imports);
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics_for(nested_installer, "wbg", "target", 5);
         assert!(analysis.import_object_usages.is_empty());
 
-        let conditional_factory = r#"
+        let conditional_factory = r"
             function tQ() {
                 var imports = {};
                 imports.wbg = {};
@@ -1263,11 +1263,11 @@ mod tests {
             }
             var imports = tQ();
             WebAssembly.instantiate(bytes(), imports);
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics_for(conditional_factory, "wbg", "target", 5);
         assert!(analysis.import_object_usages.is_empty());
 
-        let conditional_alias = r#"
+        let conditional_alias = r"
             function tQ() {
                 var imports = {};
                 imports.wbg = {};
@@ -1278,11 +1278,11 @@ mod tests {
                 var imports = tQ();
             }
             WebAssembly.instantiate(bytes(), imports);
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics_for(conditional_alias, "wbg", "target", 5);
         assert!(analysis.import_object_usages.is_empty());
 
-        let early_return_factory = r#"
+        let early_return_factory = r"
             function tQ() {
                 var imports = {};
                 imports.wbg = {};
@@ -1292,26 +1292,26 @@ mod tests {
             }
             var imports = tQ();
             WebAssembly.instantiate(bytes(), imports);
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics_for(early_return_factory, "wbg", "target", 5);
         assert!(analysis.import_object_usages.is_empty());
     }
 
     #[test]
     fn rejects_overwritten_import_member_before_instantiation() {
-        let source = r#"
+        let source = r"
             var imports = { wbg: {} };
             imports.wbg.target = function() {};
             imports.wbg.target = replacement;
             WebAssembly.instantiate(bytes(), imports);
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics_for(source, "wbg", "target", 5);
         assert!(analysis.import_object_usages.is_empty());
     }
 
     #[test]
     fn rejects_shadowed_webassembly_and_reassigned_import_objects() {
-        let shadowed = r#"
+        let shadowed = r"
             var host = window;
             var imports = { wbg: {} };
             imports.wbg.target = function(memory, base, offset) {
@@ -1321,12 +1321,12 @@ mod tests {
             function start(WebAssembly) {
                 WebAssembly.instantiate(bytes(), imports);
             }
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics_for(shadowed, "wbg", "target", 5);
         assert_eq!(analysis.shapes.len(), 1);
         assert!(analysis.import_object_usages.is_empty());
 
-        let reassigned = r#"
+        let reassigned = r"
             var host = window;
             var imports = { wbg: {} };
             imports.wbg.target = function(memory, base, offset) {
@@ -1335,7 +1335,7 @@ mod tests {
             };
             imports = replacement;
             WebAssembly.instantiate(bytes(), imports);
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics_for(reassigned, "wbg", "target", 5);
         assert_eq!(analysis.shapes.len(), 1);
         assert!(analysis.import_object_usages.is_empty());
@@ -1537,7 +1537,7 @@ mod tests {
 
     #[test]
     fn proves_bulk_import_handler_semantics() {
-        let source = r#"
+        let source = r"
             var host = window;
             var imports = { wbg: {} };
             imports.wbg.buffer = function(value) { return value.buffer };
@@ -1547,7 +1547,7 @@ mod tests {
                 receiver.set(source, offset >>> 0)
             };
             WebAssembly.instantiate(bytes, imports);
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics(source);
         assert_eq!(analysis.handler_semantics.len(), 4);
         assert!(analysis
@@ -1599,7 +1599,7 @@ mod tests {
 
     #[test]
     fn rejects_ambiguous_bulk_import_handler_semantics() {
-        let source = r#"
+        let source = r"
             var host = window;
             var imports = { wbg: {} };
             imports.wbg.shadowed_ctor = function(value) {
@@ -1617,7 +1617,7 @@ mod tests {
                 sideEffect();
                 receiver.set(source, offset >>> 0);
             };
-        "#;
+        ";
         assert!(proven_wasm_import_semantics(source)
             .handler_semantics
             .is_empty());
@@ -1843,7 +1843,7 @@ mod tests {
 
     #[test]
     fn proof_normalized_table_initializer_is_strict_and_shadow_safe() {
-        let good = r#"
+        let good = r"
             var host = window;
             var exports_binding;
             var imports = { wbg: {} };
@@ -1857,7 +1857,7 @@ mod tests {
                 table.set(base + 2, true);
                 table.set(base + 3, false);
             };
-        "#;
+        ";
         let analysis = proven_wasm_import_semantics(good);
         assert_eq!(analysis.proof_normalized_handler_semantics.len(), 1);
         assert_eq!(
@@ -1877,7 +1877,7 @@ mod tests {
             } if exports_binding == "exports_binding" && exact_grow_deltas == &[4]
         ));
 
-        let shadowed = r#"
+        let shadowed = r"
             var exports_binding;
             var imports = { wbg: {} };
             imports.wbg.__wbindgen_init_externref_table = function() {
@@ -1887,12 +1887,12 @@ mod tests {
                 base = table.grow(4);
                 table.set(base, void 0);
             };
-        "#;
+        ";
         assert!(proven_wasm_import_semantics(shadowed)
             .proof_normalized_handler_semantics
             .is_empty());
 
-        let side_effect = r#"
+        let side_effect = r"
             var exports_binding;
             var imports = { wbg: {} };
             imports.wbg.__wbindgen_init_externref_table = function() {
@@ -1902,12 +1902,12 @@ mod tests {
                 base = table.grow(4);
                 table.set(base, void 0);
             };
-        "#;
+        ";
         assert!(proven_wasm_import_semantics(side_effect)
             .proof_normalized_handler_semantics
             .is_empty());
 
-        let hidden_getter = r#"
+        let hidden_getter = r"
             var exports_binding;
             var attacker;
             var imports = { wbg: {} };
@@ -1917,12 +1917,12 @@ mod tests {
                 base = table.grow(attacker.value);
                 table.set(base, void 0);
             };
-        "#;
+        ";
         assert!(proven_wasm_import_semantics(hidden_getter)
             .proof_normalized_handler_semantics
             .is_empty());
 
-        let outer_write = r#"
+        let outer_write = r"
             var exports_binding, escaped;
             var imports = { wbg: {} };
             imports.wbg.__wbindgen_init_externref_table = function() {
@@ -1932,12 +1932,12 @@ mod tests {
                 base = table.grow(4);
                 table.set(base, void 0);
             };
-        "#;
+        ";
         assert!(proven_wasm_import_semantics(outer_write)
             .proof_normalized_handler_semantics
             .is_empty());
 
-        let duplicate = r#"
+        let duplicate = r"
             var exports_binding;
             var imports = { wbg: {} };
             imports.wbg.__wbindgen_init_externref_table = function() {
@@ -1947,7 +1947,7 @@ mod tests {
                 table.set(base, void 0);
             };
             imports.wbg.__wbindgen_init_externref_table = function() {};
-        "#;
+        ";
         assert!(proven_wasm_import_semantics(duplicate)
             .proof_normalized_handler_semantics
             .is_empty());
@@ -1955,13 +1955,13 @@ mod tests {
 
     #[test]
     fn requires_stable_global_alias() {
-        let source = r#"
+        let source = r"
             var host = window; host = fake; var imports = {};
             imports.bad = function(memory, base, offset) {
                 var view = new host.DataView(memory.buffer); var address = base + offset;
                 view.setUint32(address, 1, false);
             };
-        "#;
+        ";
         assert!(proven_wasm_import_data_view_set_u32_shapes(source).is_empty());
     }
 }

@@ -4530,7 +4530,7 @@ mod tests {
 
     #[test]
     fn proves_structural_slow_cell_factory_shape() -> TestResult {
-        let source = r#"
+        let source = r"
             let phase;
             function make(mode, state, handler, s, q, cell, out) {
                 return (mode | 48) == mode && (
@@ -4543,7 +4543,7 @@ mod tests {
                     out = cell
                 ), out;
             }
-        "#;
+        ";
         let proven = shapes(source);
         assert_eq!(proven.len(), 1);
         let shape = &proven[0];
@@ -4560,7 +4560,7 @@ mod tests {
     #[test]
     fn rejects_factory_when_handler_is_not_captured_directly() -> TestResult {
         assert!(shapes(
-            r#"
+            r"
             let phase;
             function make(mode, state, handler, q, cell, out) {
                 return (mode | 48) == mode && (
@@ -4572,7 +4572,7 @@ mod tests {
                     out = cell
                 ), out;
             }
-            "#,
+            ",
         )
         .is_empty());
 
@@ -4610,7 +4610,7 @@ mod tests {
 
     #[test]
     fn specializes_slow_cell_call_with_unreachable_handler_write() -> TestResult {
-        let source = r#"
+        let source = r"
             let phase;
             const C = function() { enter(this); };
             function enter(state) {
@@ -4629,7 +4629,7 @@ mod tests {
                 ), out;
             }
             new C();
-        "#;
+        ";
         assert!(specialized_call(source, "make(48")?);
 
         Ok(())
@@ -4893,7 +4893,7 @@ mod tests {
 
     #[test]
     fn rejects_fast_lazy_cell_updater_that_transforms_capture() -> TestResult {
-        let source = r#"
+        let source = r"
             const Maker = Object;
             function make(value, mode, state) {
                 let cell, out;
@@ -4905,7 +4905,7 @@ mod tests {
                 );
                 return out;
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -5183,7 +5183,7 @@ mod tests {
 
     #[test]
     fn proves_exact_slow_cell_update_state_and_selector_capture() -> TestResult {
-        let source = r#"
+        let source = r"
             let outer_phase;
             const C = function() { enter(this); };
             function enter(state) {
@@ -5203,7 +5203,7 @@ mod tests {
                 ), out;
             }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -5252,7 +5252,7 @@ mod tests {
 
     #[test]
     fn proves_real_style_resolver_index_cancellation() -> TestResult {
-        let source = r#"
+        let source = r"
             let outer_phase;
             const C = function() { enter(this); };
             function enter(state) {
@@ -5300,7 +5300,7 @@ mod tests {
                 return key * 5 * key + -39 * key + 23;
             }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -5458,7 +5458,7 @@ mod tests {
 
     #[test]
     fn forwarding_order_allows_flattened_use_after_forward() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() { install(this, 7, function handler() {}); };
             function install(state, key, handler, pc) {
                 pc = 0;
@@ -5471,7 +5471,7 @@ mod tests {
             }
             function write(state, key, handler) { state.T[key] = handler; }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -5523,7 +5523,7 @@ mod tests {
 
     #[test]
     fn forwarding_order_uses_recovered_key_across_delegate_edge() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() { install(this, 7, function handler() {}); };
             function install(state, key, handler) {
                 return write(state, key, handler);
@@ -5537,7 +5537,7 @@ mod tests {
             }
             function sink(state, key, handler) { state.T[key] = handler; }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -5589,7 +5589,7 @@ mod tests {
 
     #[test]
     fn forwarding_order_rejects_handler_invocation_before_forward() -> TestResult {
-        let source = r#"
+        let source = r"
             const C = function() { install(this, 7, function handler() {}); };
             function install(state, key, handler) {
                 handler();
@@ -5597,7 +5597,7 @@ mod tests {
             }
             function write(state, key, handler) { state.T[key] = handler; }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -5649,7 +5649,7 @@ mod tests {
 
     #[test]
     fn exact_registry_assignment_rejects_call_specialized_unreachable_branch() -> TestResult {
-        let source = r#"
+        let source = r"
             let phase;
             const C = function() { enter(this); };
             function enter(state) {
@@ -5675,7 +5675,7 @@ mod tests {
                 ), out;
             }
             new C();
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -5731,7 +5731,7 @@ mod tests {
 
     #[test]
     fn specialization_rejects_reachable_handler_write() -> TestResult {
-        let source = r#"
+        let source = r"
             let phase;
             const C = function() { enter(this); };
             function enter(state) {
@@ -5750,7 +5750,7 @@ mod tests {
                 ), out;
             }
             new C();
-        "#;
+        ";
         assert!(!specialized_call(source, "make(48")?);
 
         Ok(())
@@ -5758,7 +5758,7 @@ mod tests {
 
     #[test]
     fn specialization_rejects_outer_arguments_parameter_alias() -> TestResult {
-        let source = r#"
+        let source = r"
             let phase;
             const C = function() { enter(this); };
             function enter(state) {
@@ -5777,7 +5777,7 @@ mod tests {
                 ), out;
             }
             new C();
-        "#;
+        ";
         assert!(!specialized_call(source, "make(48")?);
 
         Ok(())
@@ -5785,7 +5785,7 @@ mod tests {
 
     #[test]
     fn specialization_rejects_false_slow_guard() -> TestResult {
-        let source = r#"
+        let source = r"
             let phase;
             const C = function() { enter(this); };
             function enter(state) {
@@ -5803,7 +5803,7 @@ mod tests {
                 ), out;
             }
             new C();
-        "#;
+        ";
         assert!(!specialized_call(source, "make(7")?);
 
         Ok(())
@@ -5812,7 +5812,7 @@ mod tests {
     #[test]
     fn rejects_factory_when_phase_value_is_local() -> TestResult {
         assert!(shapes(
-            r#"
+            r"
             function make(mode, state, handler, phase, q, cell, out) {
                 return (mode | 48) == mode && (
                     handler = [11, handler, 87],
@@ -5823,7 +5823,7 @@ mod tests {
                     out = cell
                 ), out;
             }
-            "#,
+            ",
         )
         .is_empty());
 

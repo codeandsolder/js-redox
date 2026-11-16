@@ -309,7 +309,7 @@ fn main() -> Result<()> {
     )?;
 
     let mut index = String::from(
-        r#"# Proven lazy-cell handler captures
+        r"# Proven lazy-cell handler captures
 
 These are the original functions proven to flow into lazy-cell wrappers.
 They are **not** necessarily the functions executed by a specific browser invocation.
@@ -328,7 +328,7 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
 
 | Exact key | Handler function | Evidence | Direct eval sites (including nested) | External bindings | Original source bytes | Factory call bytes |
 |---:|---|---|---:|---:|---|---|
-"#,
+",
     );
     let mut written = std::collections::BTreeSet::new();
     for (capture, surface) in captured_handlers.iter().zip(&handler_surfaces) {

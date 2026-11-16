@@ -1184,7 +1184,7 @@ function issueAjaxRequest(verb, finalPath, eltData) {
 
     #[test]
     fn xhr_binding_candidates_do_not_include_reassigned_or_shadowed_xhr() -> Result<()> {
-        let source = r#"
+        let source = r"
 function falsePositive(XMLHttpRequest) {
     const fake = new XMLHttpRequest();
     const payload = {fake};
@@ -1196,7 +1196,7 @@ changed.open('POST', 'https://fake.invalid/reassigned');
 const real = new XMLHttpRequest();
 unknown(real);
 real.open('PUT', 'https://candidate.invalid/path');
-"#;
+";
         let rows = analyze_api_surface(source)?;
         assert_eq!(rows.len(), 1, "{rows:#?}");
         assert_eq!(rows[0].kind, "xhr_open_candidate");

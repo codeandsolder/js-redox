@@ -1003,7 +1003,7 @@ mod tests {
     #[ignore = "requires Node; ECMAScript constructor evaluation-order oracle"]
     fn node_confirms_construct_after_spreads_and_invalid_callee_args() -> anyhow::Result<()> {
         use std::process::Command;
-        let script = r#"
+        let script = r"
 const output=[];
 function scenario(name,run) {
   const events=[];
@@ -1043,7 +1043,7 @@ scenario('no-args',({mark,C})=>{
   new (mark('ctor-value',C));
 });
 console.log(JSON.stringify(output));
-"#;
+";
         let result = Command::new("node").arg("-e").arg(script).output()?;
         assert!(result.status.success(), "{result:?}");
         let actual: serde_json::Value = serde_json::from_slice(&result.stdout)?;
@@ -1140,7 +1140,7 @@ console.log(JSON.stringify(output));
     #[ignore = "requires installed Node; void and getter runtime oracle"]
     fn node_confirms_void_evaluates_reads_calls_setters_and_can_throw() -> anyhow::Result<()> {
         use std::process::Command;
-        let source = r#"
+        let source = r"
 const log = [];
 const target = new Proxy({}, {
   set(o,k,v){ log.push('set:'+k);return Reflect.set(o,k,v);}
@@ -1152,7 +1152,7 @@ log.push('result:'+String(value));
 try {void noSuchBindingOfAnyKind} catch(e) {log.push('throw:'+e.name)}
 log.push('typeof:'+typeof noSuchBindingOfAnyKind);
 console.log(JSON.stringify(log));
-"#;
+";
         let result = Command::new("node").arg("-e").arg(source).output()?;
         assert!(result.status.success(), "{result:?}");
         let values: serde_json::Value = serde_json::from_slice(&result.stdout)?;
@@ -1174,7 +1174,7 @@ console.log(JSON.stringify(log));
     #[ignore = "requires installed Node; direct evaluation-order oracle"]
     fn node_confirms_call_spread_array_and_object_evaluation_phases() -> anyhow::Result<()> {
         use std::process::Command;
-        let script = r#"
+        let script = r"
 const events=[];
 const mark=(name,val)=>{events.push(name);return val;};
 const obj=new Proxy({run(...args){
@@ -1212,7 +1212,7 @@ optional?.run(mark('should-not-run',1));
 const optionalTrace=events.splice(0);
 console.log(JSON.stringify({call,objectTrace,arrayTrace,memberTrace,
   sequenceTrace,nullTrace,optionalTrace,objectKeys:Object.keys(object),array}));
-"#;
+";
         let result = Command::new("node").arg("-e").arg(script).output()?;
         assert!(result.status.success(), "{result:?}");
         let value: serde_json::Value = serde_json::from_slice(&result.stdout)?;
@@ -1276,7 +1276,7 @@ console.log(JSON.stringify({call,objectTrace,arrayTrace,memberTrace,
     #[ignore = "requires installed Node; differential runtime oracle"]
     fn node_confirms_computed_key_getvalue_vs_putvalue_coercion_order() -> anyhow::Result<()> {
         use std::process::Command;
-        let script = r#"
+        let script = r"
 const result = [];
 function run(mode) {
   const events = [];
@@ -1297,7 +1297,7 @@ function run(mode) {
 }
 for(const mode of ['simple','compound','logical','nullish'])run(mode);
 console.log(JSON.stringify(result));
-"#;
+";
         let output = Command::new("node").arg("-e").arg(script).output()?;
         assert!(output.status.success(), "{output:?}");
         let actual: serde_json::Value = serde_json::from_slice(&output.stdout)?;

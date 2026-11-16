@@ -292,13 +292,13 @@ mod tests {
 
     #[test]
     fn reduces_selector_polynomial_to_captured_slot() -> TestResult {
-        let source = r#"
+        let source = r"
             function f(v, T, H, q, U) {
                 return 6 + (q() | 0) * T - T * H + 61 * H * H
                     - 305 * v * v * H + U[1] * v * T + 5 * v * v * T
                     + 2379 * v * H - 1403 * H;
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());

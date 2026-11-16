@@ -321,13 +321,13 @@ mod tests {
     #[test]
     fn annotates_conditional_string_alias_but_keeps_property_access_executable(
     ) -> anyhow::Result<()> {
-        let source = r#"function start(H,T,JM){
+        let source = r"function start(H,T,JM){
           T='push';JM='length';
           H.length<2 && (T=H);
           if(H.length<2){JM=H;}
           const closure=()=>{const out=[];out[T](1);return out[JM]};
           return closure();
-        }"#;
+        }";
         let result = explain_property_aliases(source)?
             .ok_or_else(|| anyhow::anyhow!("missing lexical aliases"))?;
         assert_eq!(result.annotated_reads, 2);
@@ -379,8 +379,8 @@ mod tests {
 
     #[test]
     fn distinguishes_shadowed_binding_and_does_not_annotate_unproven_alias() -> anyhow::Result<()> {
-        let source = r#"function f(T,obj){T='push';const a=obj[T];
-            function g(T){return obj[T]};return a;}"#;
+        let source = r"function f(T,obj){T='push';const a=obj[T];
+            function g(T){return obj[T]};return a;}";
         let result = explain_property_aliases(source)?
             .ok_or_else(|| anyhow::anyhow!("missing lexical alias"))?;
         assert_eq!(result.annotated_reads, 1);

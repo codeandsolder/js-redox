@@ -275,11 +275,11 @@ mod tests {
 
     #[test]
     fn rejects_reassigned_aliases_and_dynamic_global_resolution() -> Result<(), BudgetExceeded> {
-        let source = r#"
+        let source = r"
             var host = window;
             host = fake;
             host.WebAssembly.instantiate(bytes, imports);
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
@@ -291,13 +291,13 @@ mod tests {
             collect_global_aliases(&parsed.program, semantic.semantic.scoping(), &test_budget())?;
         assert!(aliases.is_empty());
 
-        let source = r#"
+        let source = r"
             function f(scope) {
                 with (scope) {
                     return WebAssembly.instantiate(bytes, imports);
                 }
             }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());

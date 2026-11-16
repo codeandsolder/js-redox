@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn separates_nested_effects_and_external_binding_identity() -> anyhow::Result<()> {
-        let source = r#"
+        let source = r"
             let external;
             const handler = function(arg) {
                 const own = 1;
@@ -496,7 +496,7 @@ mod tests {
                 return nested;
             };
             function unrelated() { eval(external); }
-        "#;
+        ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());

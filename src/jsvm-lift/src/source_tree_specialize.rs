@@ -915,10 +915,10 @@ mod tests {
 
     #[test]
     fn function_call_wrapper_propagates_literal_selectors_to_true_leaf() -> Result<()> {
-        let source = r#"const leaf=(opcode,selector,flag)=>opcode===88&&selector===4&&flag?7:0;
+        let source = r"const leaf=(opcode,selector,flag)=>opcode===88&&selector===4&&flag?7:0;
             const wrapper=(selector,flag)=>leaf.call(this,88,selector,!!flag);
             const outer=(selector,flag)=>wrapper(selector,flag);
-            const api={};api.run=()=>outer(4,1);"#;
+            const api={};api.run=()=>outer(4,1);";
         let views = reconstruct_caller_views(source, Some("run"))?;
         let variants = specialize_resolved_call_graph(source, &views)?;
         let leaf = variants
@@ -936,9 +936,9 @@ mod tests {
 
     #[test]
     fn function_call_wrapper_skips_this_argument_even_when_literal() -> Result<()> {
-        let source = r#"const leaf=(a,b)=>a+b;
+        let source = r"const leaf=(a,b)=>a+b;
             const wrapper=x=>leaf.call(100,7,x);
-            const api={};api.run=()=>wrapper(2);"#;
+            const api={};api.run=()=>wrapper(2);";
         let views = reconstruct_caller_views(source, Some("run"))?;
         let variants = specialize_resolved_call_graph(source, &views)?;
         let leaf = variants
@@ -951,10 +951,10 @@ mod tests {
 
     #[test]
     fn carries_computed_bitwise_and_conditional_values_through_multiple_helpers() -> Result<()> {
-        let src = r#"const leaf=(selector,flag)=>selector ? flag : 0;
+        let src = r"const leaf=(selector,flag)=>selector ? flag : 0;
             const outer=(left,right)=>leaf((left|0)+(right|0),right>4);
             const middle=(p,q)=>outer(p,q);
-            const api={};api.run=()=>middle(4,7);"#;
+            const api={};api.run=()=>middle(4,7);";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         let leaf = variants
@@ -968,9 +968,9 @@ mod tests {
 
     #[test]
     fn computed_caller_values_do_not_cross_combine_different_paths() -> Result<()> {
-        let src = r#"const leaf=(selector,which)=>selector+which;
+        let src = r"const leaf=(selector,which)=>selector+which;
             const middle=(a,b)=>leaf((a<<2)|b,a-b);
-            const api={};api.run=()=>middle(1,2)+middle(3,1);"#;
+            const api={};api.run=()=>middle(1,2)+middle(3,1);";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         let mut pairs = variants
@@ -991,12 +991,12 @@ mod tests {
 
     #[test]
     fn computed_constructor_arguments_respect_original_symbol_identity() -> Result<()> {
-        let src = r#"function Leaf(selector){this.value=selector;}
+        let src = r"function Leaf(selector){this.value=selector;}
             const middle=(x)=>{
                 const nested=(x)=>x+100;
                 return new Leaf((x|0)+4);
             };
-            const api={};api.run=()=>middle(5);"#;
+            const api={};api.run=()=>middle(5);";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         let leaf = variants
@@ -1030,9 +1030,9 @@ mod tests {
 
     #[test]
     fn computed_argument_with_undefined_parameter_is_not_assumed_known() -> Result<()> {
-        let src = r#"const leaf=(selector)=>selector;
+        let src = r"const leaf=(selector)=>selector;
             const middle=(x,y)=>leaf(x+(y|0));
-            const api={};api.run=(unknown)=>middle(3,unknown);"#;
+            const api={};api.run=(unknown)=>middle(3,unknown);";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         assert!(variants.iter().all(|v| v.helper != "leaf"), "{variants:?}");
@@ -1041,9 +1041,9 @@ mod tests {
 
     #[test]
     fn computed_expression_short_circuits_an_unknown_parameter() -> Result<()> {
-        let src = r#"const leaf=(selector)=>selector;
+        let src = r"const leaf=(selector)=>selector;
             const middle=(flag,unknown)=>leaf(flag ? 42 : unknown);
-            const api={};api.run=(unknown)=>middle(true,unknown);"#;
+            const api={};api.run=(unknown)=>middle(true,unknown);";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         assert!(
@@ -1057,9 +1057,9 @@ mod tests {
 
     #[test]
     fn recursive_computed_selectors_terminate_without_a_depth_constant() -> Result<()> {
-        let src = r#"const leaf=(selector)=>selector;
+        let src = r"const leaf=(selector)=>selector;
             const recurse=(n)=>{leaf(n);return n < 100 ? recurse(n+1) : n;};
-            const api={};api.run=()=>recurse(1);"#;
+            const api={};api.run=()=>recurse(1);";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         assert!(
@@ -1074,9 +1074,9 @@ mod tests {
 
     #[test]
     fn computed_argument_value_preserves_negative_zero() -> Result<()> {
-        let src = r#"const leaf=(value)=>1/value;
+        let src = r"const leaf=(value)=>1/value;
             const middle=(n)=>leaf(n*-1);
-            const api={};api.run=()=>middle(0);"#;
+            const api={};api.run=()=>middle(0);";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         let leaf = variants
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[test]
     fn evaluates_pure_argument_expressions_and_immutable_lexical_aliases() -> Result<()> {
-        let src = r#"const base=2+3;
+        let src = r"const base=2+3;
           const doubled=base*2;
           const through=(v,flag)=>v?flag:0;
           const leaf=(x,y,z)=>[x,y,z];
@@ -1097,7 +1097,7 @@ mod tests {
               const other=doubled+1;
               return leaf(other, !false, through(0,7))
                   +leaf(2**3, -0, null);
-          };"#;
+          };";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         let left = variants
@@ -1121,12 +1121,12 @@ mod tests {
 
     #[test]
     fn lexical_symbols_not_name_strings_and_var_hoisting_not_guessed() -> Result<()> {
-        let src = r#"const x=2;const leaf=(a,b)=>a+b;
+        let src = r"const x=2;const leaf=(a,b)=>a+b;
           const api={};api.run=()=>{
             const x=9;
             if(false) var conditional=7;
             return leaf(x,conditional);
-          };"#;
+          };";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         let leaf = variants
@@ -1239,12 +1239,12 @@ mod tests {
 
     #[test]
     fn recovers_distinct_literal_variants_from_original_lexical_graph() -> Result<()> {
-        let src = r#"const helper=function(selector,value){
+        let src = r"const helper=function(selector,value){
             if(selector===3)return value+1;
             return value*2;
         };
         const api={};
-        api.run=function(x) {return helper(3,x)+helper(4,x);};"#;
+        api.run=function(x) {return helper(3,x)+helper(4,x);};";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 2, "{variants:?}");
@@ -1261,8 +1261,8 @@ mod tests {
 
     #[test]
     fn uses_unchanged_subset_when_other_literal_parameter_is_written() -> Result<()> {
-        let src = r#"const helper=function(a,b){a=9;return b+a;};
-          const api={};api.run=()=>helper(3,4);"#;
+        let src = r"const helper=function(a,b){a=9;return b+a;};
+          const api={};api.run=()=>helper(3,4);";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 1, "{variants:?}");
@@ -1274,8 +1274,8 @@ mod tests {
 
     #[test]
     fn spread_argument_positions_are_never_misidentified() -> Result<()> {
-        let src = r#"const helper=(a,b)=>a+b;
-          const api={};api.run=(xs)=>helper(...xs,42)+helper(3,...xs);"#;
+        let src = r"const helper=(a,b)=>a+b;
+          const api={};api.run=(xs)=>helper(...xs,42)+helper(3,...xs);";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 1, "{variants:?}");
@@ -1285,11 +1285,11 @@ mod tests {
 
     #[test]
     fn same_spelling_in_another_scope_is_not_the_target_function() -> Result<()> {
-        let src = r#"const helper=(a)=>a*3;
+        let src = r"const helper=(a)=>a*3;
           const api={};api.run=()=>{
               const helper=(a)=>a*4;
               return helper(7);
-          };"#;
+          };";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 1, "{variants:?}");
@@ -1300,7 +1300,7 @@ mod tests {
 
     #[test]
     fn contextual_super_expression_does_not_abort_other_valid_helpers() -> Result<()> {
-        let src = r#"class Base { method(x){return x;} }
+        let src = r"class Base { method(x){return x;} }
           class Child extends Base {
             method(){
               const contextual=(x)=>super.method(x);
@@ -1308,7 +1308,7 @@ mod tests {
               const api={};api.run=()=>contextual(3)+regular(4);
               return api;
             }
-          }"#;
+          }";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 1, "{variants:?}");
@@ -1319,8 +1319,8 @@ mod tests {
 
     #[test]
     fn unused_literal_arguments_do_not_produce_redundant_variants() -> Result<()> {
-        let src = r#"const helper=(selector,unused)=>selector*2;
-            const api={};api.run=()=>helper(3,7)+helper(3,8);"#;
+        let src = r"const helper=(selector,unused)=>selector*2;
+            const api={};api.run=()=>helper(3,7)+helper(3,8);";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 1, "{variants:?}");
@@ -1331,8 +1331,8 @@ mod tests {
 
     #[test]
     fn constructor_call_and_same_literal_tuple_deduplicate() -> Result<()> {
-        let src = r#"function Helper(flag){this.result=flag?1:0;}
-          const api={};api.run=()=>[new Helper(true),new Helper(true)];"#;
+        let src = r"function Helper(flag){this.result=flag?1:0;}
+          const api={};api.run=()=>[new Helper(true),new Helper(true)];";
         let views = reconstruct_caller_views(src, Some("run"))?;
         let variants = specialize_resolved_call_graph(src, &views)?;
         assert_eq!(variants.len(), 1, "{variants:?}");

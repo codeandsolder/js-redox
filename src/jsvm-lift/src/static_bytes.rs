@@ -1890,10 +1890,10 @@ mod tests {
 
     #[test]
     fn compile_and_validate_are_exact_byte_observation_sinks() {
-        let source = r#"
+        let source = r"
             WebAssembly.compile(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
             WebAssembly.validate(Uint8Array.of(0, 97, 115, 109, 1, 0, 0, 0));
-        "#;
+        ";
         let artifacts = recover(source);
         assert_eq!(artifacts.len(), 2);
         assert_eq!(artifacts[0].bytes, b"\0asm\x01\0\0\0");
@@ -1904,15 +1904,15 @@ mod tests {
 
     #[test]
     fn invalid_validate_input_is_not_claimed_as_a_wasm_artifact() {
-        let source = r#"
+        let source = r"
             WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 255, 255, 255, 255]));
-        "#;
+        ";
         assert!(recover(source).is_empty());
     }
 
     #[test]
     fn self_contained_sink_does_not_require_enclosing_control_flow_replay() {
-        let source = r#"
+        let source = r"
             try {
                 unknownSideEffect();
                 const module = new WebAssembly.Module(
@@ -1921,7 +1921,7 @@ mod tests {
             } catch (error) {
                 report(error);
             }
-        "#;
+        ";
         let artifacts = recover(source);
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].bytes, b"\0asm\x01\0\0\0");
@@ -1929,18 +1929,18 @@ mod tests {
 
     #[test]
     fn recovers_wasm_from_numeric_uint8array_carriers() {
-        let constructor = r#"
+        let constructor = r"
             const module = new WebAssembly.Module(
                 new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0])
             );
-        "#;
+        ";
         let artifacts = recover(constructor);
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].bytes, b"\0asm\x01\0\0\0");
 
-        let of = r#"
+        let of = r"
             WebAssembly.instantiate(Uint8Array.of(0, 97, 115, 109, 1, 0, 0, 0), {});
-        "#;
+        ";
         let artifacts = recover(of);
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].bytes, b"\0asm\x01\0\0\0");
@@ -1948,14 +1948,14 @@ mod tests {
 
     #[test]
     fn numeric_uint8array_carriers_fail_closed_on_non_bytes() {
-        let fractional = r#"
+        let fractional = r"
             WebAssembly.instantiate(new Uint8Array([0, 97, 115, 109, 1.5, 0, 0, 0]), {});
-        "#;
+        ";
         assert!(recover(fractional).is_empty());
 
-        let out_of_range = r#"
+        let out_of_range = r"
             WebAssembly.instantiate(Uint8Array.of(0, 97, 115, 109, 256, 0, 0, 0), {});
-        "#;
+        ";
         assert!(recover(out_of_range).is_empty());
     }
 
