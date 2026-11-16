@@ -504,7 +504,7 @@ impl Collector<'_> {
         }
 
         if lower == "atob"
-            || lower.ends_with(".atob")
+            || has_dotted_member_suffix(&lower, "atob")
             || (callee == "Buffer.from"
                 && it
                     .arguments
@@ -522,10 +522,10 @@ impl Collector<'_> {
         }
 
         if matches!(callee, "eval" | "Function")
-            || callee.ends_with(".eval")
-            || lower.ends_with(".constructor")
+            || has_dotted_member_suffix(callee, "eval")
+            || has_dotted_member_suffix(&lower, "constructor")
         {
-            let static_source = if callee == "eval" || callee.ends_with(".eval") {
+            let static_source = if callee == "eval" || has_dotted_member_suffix(callee, "eval") {
                 it.arguments
                     .first()
                     .is_none_or(|arg| Self::argument_static_string(arg).is_some())
@@ -569,7 +569,7 @@ impl Collector<'_> {
     }
 
     fn record_string_assembly_calls(&mut self, it: &CallExpression<'_>, callee: &str) {
-        if callee.ends_with(".join") {
+        if has_dotted_member_suffix(callee, "join") {
             if let Expression::StaticMemberExpression(member) = &it.callee {
                 let empty_or_tiny_separator = it
                     .arguments
@@ -959,6 +959,15 @@ fn plus_binary_stats(expr: &BinaryExpression<'_>) -> (usize, usize) {
     walk_expr(&expr.left, &mut parts, &mut strings);
     walk_expr(&expr.right, &mut parts, &mut strings);
     (parts, strings)
+}
+
+// Distinguish JavaScript member-name checks from filename extensions.
+// This is exactly equivalent to a final `.name` suffix comparison and
+// intentionally respects case sensitivity at each call site.
+fn has_dotted_member_suffix(callee: &str, member: &str) -> bool {
+    callee
+        .rsplit_once('.')
+        .is_some_and(|(_, name)| name == member)
 }
 
 fn is_identifierish(value: &str) -> bool {
@@ -1669,6 +1678,23 @@ mod tests {
     };
     use anyhow::{Context, Result};
     use std::{fs, path::PathBuf};
+
+    #[test]
+    fn dotted_member_suffix_checks_keep_javascript_case_semantics() {
+        assert!(super::has_dotted_member_suffix("receiver.eval", "eval"));
+        assert!(super::has_dotted_member_suffix(".eval", "eval"));
+        assert!(!super::has_dotted_member_suffix("eval", "eval"));
+        assert!(!super::has_dotted_member_suffix("receiver.Eval", "eval"));
+        assert!(!super::has_dotted_member_suffix(
+            "receiver.evalExtra",
+            "eval"
+        ));
+        assert!(super::has_dotted_member_suffix("outer.inner.join", "join"));
+        assert!(!super::has_dotted_member_suffix(
+            "outer.inner.joined",
+            "join"
+        ));
+    }
 
     fn options() -> SusScanOptions {
         SusScanOptions {

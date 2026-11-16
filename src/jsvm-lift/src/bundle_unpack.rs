@@ -1459,7 +1459,9 @@ impl Collector<'_, '_> {
             return;
         }
         let callee = self.fragment(call.callee.span()).trim().to_string();
-        if !(callee.ends_with(".push")
+        if !(callee
+            .rsplit_once('.')
+            .is_some_and(|(_, method)| method == "push")
             || callee.ends_with("['push']")
             || callee.ends_with("[\"push\"]"))
         {

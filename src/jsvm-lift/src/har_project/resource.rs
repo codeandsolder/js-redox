@@ -39,20 +39,23 @@ pub(crate) fn resource_kind(url: &str, mime: &str) -> &'static str {
         .ok()
         .map(|u| u.path().to_ascii_lowercase())
         .unwrap_or_default();
-    if m == "application/wasm" || path.ends_with(".wasm") {
+    // URL paths (not query strings) are already ASCII-lowercased above.
+    // Compare the final extension component, not a case-folded filename.
+    let extension = path.rsplit_once('.').map(|(_, suffix)| suffix);
+    if m == "application/wasm" || extension == Some("wasm") {
         "wasm"
     } else if m.contains("javascript")
         || m.contains("ecmascript")
-        || path.ends_with(".js")
-        || path.ends_with(".mjs")
-        || path.ends_with(".cjs")
+        || extension == Some("js")
+        || extension == Some("mjs")
+        || extension == Some("cjs")
     {
         "javascript"
-    } else if m == "text/html" || m == "application/xhtml+xml" || path.ends_with(".html") {
+    } else if m == "text/html" || m == "application/xhtml+xml" || extension == Some("html") {
         "html"
-    } else if m.contains("json") || path.ends_with(".json") || path.ends_with(".map") {
+    } else if m.contains("json") || extension == Some("json") || extension == Some("map") {
         "json"
-    } else if m == "text/css" || path.ends_with(".css") {
+    } else if m == "text/css" || extension == Some("css") {
         "css"
     } else if m.starts_with("text/") || m.contains("xml") || m.contains("svg") {
         "text"
@@ -329,6 +332,45 @@ pub(super) fn write_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_resource_kind_uses_only_case_normalized_path_extension() {
+        assert_eq!(
+            resource_kind(
+                "https://fixture.invalid/APP.JS?query=.wasm",
+                "application/octet-stream"
+            ),
+            "javascript"
+        );
+        assert_eq!(
+            resource_kind(
+                "https://fixture.invalid/package.WASM",
+                "application/octet-stream"
+            ),
+            "wasm"
+        );
+        assert_eq!(
+            resource_kind(
+                "https://fixture.invalid/page.HTML",
+                "application/octet-stream"
+            ),
+            "html"
+        );
+        assert_eq!(
+            resource_kind(
+                "https://fixture.invalid/data.MAP",
+                "application/octet-stream"
+            ),
+            "json"
+        );
+        assert_eq!(
+            resource_kind(
+                "https://fixture.invalid/script.js/child",
+                "application/octet-stream"
+            ),
+            "binary"
+        );
+    }
 
     #[test]
     fn javascript_transport_is_reclassified_from_captured_content() {
