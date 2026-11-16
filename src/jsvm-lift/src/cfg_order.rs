@@ -47,7 +47,7 @@ fn enclosing_execution_context(semantic: &Semantic<'_>, node_id: NodeId) -> Opti
         })
 }
 
-fn usable_edge(edge: &EdgeType) -> bool {
+const fn usable_edge(edge: &EdgeType) -> bool {
     !matches!(edge, EdgeType::NewFunction | EdgeType::Unreachable)
 }
 

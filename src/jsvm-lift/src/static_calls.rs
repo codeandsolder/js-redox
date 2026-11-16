@@ -50,7 +50,7 @@ pub struct StaticCallGraph {
     pub possibly_reachable_from_top_level: Vec<[u32; 2]>,
 }
 
-fn pair(span: Span) -> [u32; 2] {
+const fn pair(span: Span) -> [u32; 2] {
     [span.start, span.end]
 }
 

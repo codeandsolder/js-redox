@@ -128,7 +128,7 @@ impl AnalysisBudgets {
     }
 
     #[must_use]
-    pub fn root(&self) -> &WorkBudget {
+    pub const fn root(&self) -> &WorkBudget {
         &self.root
     }
 }

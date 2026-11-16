@@ -82,7 +82,7 @@ fn first_base_href(html: &str) -> Option<String> {
     None
 }
 
-fn scheduling_class(
+const fn scheduling_class(
     executable: bool,
     module: bool,
     src: bool,

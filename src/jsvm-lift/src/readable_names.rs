@@ -253,7 +253,7 @@ fn meaningful_property_name(name: &str) -> bool {
         && identifier::is_identifier_name(name)
 }
 
-fn minified_binding(name: &str) -> bool {
+const fn minified_binding(name: &str) -> bool {
     // Keep existing human names. This pass should improve minified lexical
     // aliases, not rename an intentionally descriptive local variable.
     name.len() <= 3

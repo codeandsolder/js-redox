@@ -260,7 +260,7 @@ fn object_u64(value: &Value, key: &str) -> Result<u64> {
         .with_context(|| format!("{key} must be a non-negative integer"))
 }
 
-fn materialization_name(value: Materialization) -> &'static str {
+const fn materialization_name(value: Materialization) -> &'static str {
     match value {
         Materialization::HardLink => "hardlink",
         Materialization::Copy => "copy",

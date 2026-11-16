@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 
 type FunctionKey = (u32, u32);
 
-fn key(span: Span) -> FunctionKey {
+const fn key(span: Span) -> FunctionKey {
     (span.start, span.end)
 }
 fn unparen<'e, 'a>(mut expr: &'e Expression<'a>) -> &'e Expression<'a> {

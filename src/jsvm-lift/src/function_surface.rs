@@ -37,7 +37,7 @@ pub struct FunctionSourceSurface {
     pub executed_behavior_proven: bool,
 }
 
-fn range(span: Span) -> [u32; 2] {
+const fn range(span: Span) -> [u32; 2] {
     [span.start, span.end]
 }
 
@@ -81,7 +81,7 @@ fn is_ident(expr: &Expression<'_>, name: &str) -> bool {
     matches!(strip_parens(expr), Expression::Identifier(id) if id.name == name)
 }
 
-fn member_target_kind(target: &oxc_ast::ast::AssignmentTarget<'_>) -> Option<&'static str> {
+const fn member_target_kind(target: &oxc_ast::ast::AssignmentTarget<'_>) -> Option<&'static str> {
     match target {
         oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(_) => {
             Some("computed_member_write")
@@ -105,7 +105,7 @@ struct SurfaceAccumulator {
 }
 
 impl SurfaceAccumulator {
-    fn new(span: Span) -> Self {
+    const fn new(span: Span) -> Self {
         Self {
             span,
             nested_functions: Vec::new(),

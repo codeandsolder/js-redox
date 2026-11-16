@@ -280,7 +280,7 @@ fn instance_display(scoping: &Scoping, key: InstanceKey) -> String {
     }
 }
 
-fn instance_kind(key: InstanceKey) -> &'static str {
+const fn instance_kind(key: InstanceKey) -> &'static str {
     match key {
         InstanceKey::Binding(_) => "stable_instance_binding",
         InstanceKey::PromiseResult(_) => "instantiate_promise_result",
@@ -825,7 +825,7 @@ struct ExitFlow {
 }
 
 impl ExitFlow {
-    fn normal(assigned: bool) -> Self {
+    const fn normal(assigned: bool) -> Self {
         Self {
             normal_unassigned: !assigned,
             normal_assigned: assigned,
@@ -834,7 +834,7 @@ impl ExitFlow {
         }
     }
 
-    fn merge(&mut self, other: Self) {
+    const fn merge(&mut self, other: Self) {
         self.normal_unassigned |= other.normal_unassigned;
         self.normal_assigned |= other.normal_assigned;
         self.good_return |= other.good_return;
@@ -842,7 +842,7 @@ impl ExitFlow {
     }
 }
 
-fn span_contains(outer: Span, inner: Span) -> bool {
+const fn span_contains(outer: Span, inner: Span) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 

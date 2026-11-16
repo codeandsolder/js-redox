@@ -100,7 +100,7 @@ fn safe_source_path(raw: &str, ordinal: usize) -> PathBuf {
     components.into_iter().collect()
 }
 
-fn hex_value(byte: u8) -> Option<u8> {
+const fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
