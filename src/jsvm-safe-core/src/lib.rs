@@ -5918,197 +5918,198 @@ mod tests {
         );
     }
 
+    const ORDERED_EXCEPTION_CASES: &[(&str, &str, &str, Option<&str>, &str)] = &[
+        (
+            "property-compound",
+            r#"function f(obj, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[(state = 4, "x")] += log.push("may throw");
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "compound-key-resume";
+                    else if (state === 6) return "compound-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (e) {}
+            }"#,
+            "compound-key-resume",
+            None,
+            "compound-unobservable-later",
+        ),
+        (
+            "property-logical",
+            r#"function f(obj, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[(state = 4, "x")] ||= (state = 5, log.push("may throw"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "logical-getter-resume";
+                    else if (state === 5) return "logical-rhs-resume";
+                    else if (state === 6) return "logical-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (e) {}
+            }"#,
+            "logical-getter-resume",
+            Some("logical-rhs-resume"),
+            "logical-unobservable-later",
+        ),
+        (
+            "property-nullish",
+            r#"function f(obj, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[(state = 4, "x")] ??= (state = 5, log.push("may throw"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "nullish-getter-resume";
+                    else if (state === 5) return "nullish-rhs-resume";
+                    else if (state === 6) return "nullish-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (e) {}
+            }"#,
+            "nullish-getter-resume",
+            Some("nullish-rhs-resume"),
+            "nullish-unobservable-later",
+        ),
+        (
+            "other-identifier-rhs",
+            r#"function f(log) {
+                let state = 1;
+                let other;
+                while (true) try {
+                    if (state === 1) {
+                        other = (state = 4, log.push("may throw"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "identifier-rhs-resume";
+                    else if (state === 6) return "identifier-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (e) {}
+            }"#,
+            "identifier-rhs-resume",
+            None,
+            "identifier-unobservable-later",
+        ),
+        (
+            "other-identifier-logical",
+            r#"function f(log, truthy) {
+                let state = 1;
+                let other = truthy;
+                while (true) try {
+                    if (state === 1) {
+                        other &&= (state = 4, log.push("may throw"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "identifier-logical-rhs-resume";
+                    else if (state === 6) return "identifier-logical-unobservable";
+                    else if (state === 7) return "normal";
+                } catch (e) {}
+            }"#,
+            "identifier-logical-rhs-resume",
+            None,
+            "identifier-logical-unobservable",
+        ),
+        (
+            "computed-property-update",
+            r#"function f(obj) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj[(state = 4, "x")]++;
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "update-member-resume";
+                    else if (state === 6) return "update-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (e) {}
+            }"#,
+            "update-member-resume",
+            None,
+            "update-unobservable-later",
+        ),
+        (
+            "optional-computed-member",
+            r#"function f(obj) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj?.[(state = 4, "x")];
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "optional-computed-resume";
+                    else if (state === 6) return "optional-unobservable-later";
+                    else if (state === 7) return "normal";
+                } catch (e) {}
+            }"#,
+            "optional-computed-resume",
+            None,
+            "optional-unobservable-later",
+        ),
+        (
+            "optional-call-argument",
+            r#"function f(fn, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        fn?.(state = 4, log.push("may throw"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "optional-call-resume";
+                    else if (state === 6) return "optional-call-unobservable";
+                    else if (state === 7) return "normal";
+                } catch (e) {}
+            }"#,
+            "optional-call-resume",
+            None,
+            "optional-call-unobservable",
+        ),
+        (
+            "nested-optional-call",
+            r#"function f(obj, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj?.[(state = 4, "child")].method(state = 5, log.push("may throw"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "nested-optional-getter-resume";
+                    else if (state === 5) return "nested-optional-call-resume";
+                    else if (state === 6) return "nested-optional-unobservable";
+                    else if (state === 7) return "normal";
+                } catch (e) {}
+            }"#,
+            "nested-optional-getter-resume",
+            Some("nested-optional-call-resume"),
+            "nested-optional-unobservable",
+        ),
+        (
+            "optional-computed-call",
+            r#"function f(obj, log) {
+                let state = 1;
+                while (true) try {
+                    if (state === 1) {
+                        obj?.[(state = 4, "method")]?.(state = 5, log.push("may throw"));
+                        state = 6;
+                        state = 7;
+                    } else if (state === 4) return "optional-method-getter-resume";
+                    else if (state === 5) return "optional-method-argument-resume";
+                    else if (state === 6) return "optional-method-unobservable";
+                    else if (state === 7) return "normal";
+                } catch (e) {}
+            }"#,
+            "optional-method-getter-resume",
+            Some("optional-method-argument-resume"),
+            "optional-method-unobservable",
+        ),
+    ];
+
     #[test]
     fn exception_dispatcher_ordered_assignment_update_optional_chain_cases() {
-        let cases: &[(&str, &str, &str, Option<&str>, &str)] = &[
-            (
-                "property-compound",
-                r#"function f(obj, log) {
-                    let state = 1;
-                    while (true) try {
-                        if (state === 1) {
-                            obj[(state = 4, "x")] += log.push("may throw");
-                            state = 6;
-                            state = 7;
-                        } else if (state === 4) return "compound-key-resume";
-                        else if (state === 6) return "compound-unobservable-later";
-                        else if (state === 7) return "normal";
-                    } catch (e) {}
-                }"#,
-                "compound-key-resume",
-                None,
-                "compound-unobservable-later",
-            ),
-            (
-                "property-logical",
-                r#"function f(obj, log) {
-                    let state = 1;
-                    while (true) try {
-                        if (state === 1) {
-                            obj[(state = 4, "x")] ||= (state = 5, log.push("may throw"));
-                            state = 6;
-                            state = 7;
-                        } else if (state === 4) return "logical-getter-resume";
-                        else if (state === 5) return "logical-rhs-resume";
-                        else if (state === 6) return "logical-unobservable-later";
-                        else if (state === 7) return "normal";
-                    } catch (e) {}
-                }"#,
-                "logical-getter-resume",
-                Some("logical-rhs-resume"),
-                "logical-unobservable-later",
-            ),
-            (
-                "property-nullish",
-                r#"function f(obj, log) {
-                    let state = 1;
-                    while (true) try {
-                        if (state === 1) {
-                            obj[(state = 4, "x")] ??= (state = 5, log.push("may throw"));
-                            state = 6;
-                            state = 7;
-                        } else if (state === 4) return "nullish-getter-resume";
-                        else if (state === 5) return "nullish-rhs-resume";
-                        else if (state === 6) return "nullish-unobservable-later";
-                        else if (state === 7) return "normal";
-                    } catch (e) {}
-                }"#,
-                "nullish-getter-resume",
-                Some("nullish-rhs-resume"),
-                "nullish-unobservable-later",
-            ),
-            (
-                "other-identifier-rhs",
-                r#"function f(log) {
-                    let state = 1;
-                    let other;
-                    while (true) try {
-                        if (state === 1) {
-                            other = (state = 4, log.push("may throw"));
-                            state = 6;
-                            state = 7;
-                        } else if (state === 4) return "identifier-rhs-resume";
-                        else if (state === 6) return "identifier-unobservable-later";
-                        else if (state === 7) return "normal";
-                    } catch (e) {}
-                }"#,
-                "identifier-rhs-resume",
-                None,
-                "identifier-unobservable-later",
-            ),
-            (
-                "other-identifier-logical",
-                r#"function f(log, truthy) {
-                    let state = 1;
-                    let other = truthy;
-                    while (true) try {
-                        if (state === 1) {
-                            other &&= (state = 4, log.push("may throw"));
-                            state = 6;
-                            state = 7;
-                        } else if (state === 4) return "identifier-logical-rhs-resume";
-                        else if (state === 6) return "identifier-logical-unobservable";
-                        else if (state === 7) return "normal";
-                    } catch (e) {}
-                }"#,
-                "identifier-logical-rhs-resume",
-                None,
-                "identifier-logical-unobservable",
-            ),
-            (
-                "computed-property-update",
-                r#"function f(obj) {
-                    let state = 1;
-                    while (true) try {
-                        if (state === 1) {
-                            obj[(state = 4, "x")]++;
-                            state = 6;
-                            state = 7;
-                        } else if (state === 4) return "update-member-resume";
-                        else if (state === 6) return "update-unobservable-later";
-                        else if (state === 7) return "normal";
-                    } catch (e) {}
-                }"#,
-                "update-member-resume",
-                None,
-                "update-unobservable-later",
-            ),
-            (
-                "optional-computed-member",
-                r#"function f(obj) {
-                    let state = 1;
-                    while (true) try {
-                        if (state === 1) {
-                            obj?.[(state = 4, "x")];
-                            state = 6;
-                            state = 7;
-                        } else if (state === 4) return "optional-computed-resume";
-                        else if (state === 6) return "optional-unobservable-later";
-                        else if (state === 7) return "normal";
-                    } catch (e) {}
-                }"#,
-                "optional-computed-resume",
-                None,
-                "optional-unobservable-later",
-            ),
-            (
-                "optional-call-argument",
-                r#"function f(fn, log) {
-                    let state = 1;
-                    while (true) try {
-                        if (state === 1) {
-                            fn?.(state = 4, log.push("may throw"));
-                            state = 6;
-                            state = 7;
-                        } else if (state === 4) return "optional-call-resume";
-                        else if (state === 6) return "optional-call-unobservable";
-                        else if (state === 7) return "normal";
-                    } catch (e) {}
-                }"#,
-                "optional-call-resume",
-                None,
-                "optional-call-unobservable",
-            ),
-            (
-                "nested-optional-call",
-                r#"function f(obj, log) {
-                    let state = 1;
-                    while (true) try {
-                        if (state === 1) {
-                            obj?.[(state = 4, "child")].method(state = 5, log.push("may throw"));
-                            state = 6;
-                            state = 7;
-                        } else if (state === 4) return "nested-optional-getter-resume";
-                        else if (state === 5) return "nested-optional-call-resume";
-                        else if (state === 6) return "nested-optional-unobservable";
-                        else if (state === 7) return "normal";
-                    } catch (e) {}
-                }"#,
-                "nested-optional-getter-resume",
-                Some("nested-optional-call-resume"),
-                "nested-optional-unobservable",
-            ),
-            (
-                "optional-computed-call",
-                r#"function f(obj, log) {
-                    let state = 1;
-                    while (true) try {
-                        if (state === 1) {
-                            obj?.[(state = 4, "method")]?.(state = 5, log.push("may throw"));
-                            state = 6;
-                            state = 7;
-                        } else if (state === 4) return "optional-method-getter-resume";
-                        else if (state === 5) return "optional-method-argument-resume";
-                        else if (state === 6) return "optional-method-unobservable";
-                        else if (state === 7) return "normal";
-                    } catch (e) {}
-                }"#,
-                "optional-method-getter-resume",
-                Some("optional-method-argument-resume"),
-                "optional-method-unobservable",
-            ),
-        ];
-        for (case, source, first_catch, second_catch, unobservable) in cases {
+        for (case, source, first_catch, second_catch, unobservable) in ORDERED_EXCEPTION_CASES {
             let Some(result) = deobfuscate(source, 12) else {
                 unreachable!("valid source for case {case}")
             };
@@ -7755,9 +7756,7 @@ sink(alias(0x10), alias(0x11));
         );
     }
 
-    #[test]
-    fn decoder_only_recovery_generalizes_split_provider_sequence_accessor_and_nested_rotation() {
-        let source = r"
+    const SPLIT_PROVIDER_ROTATION_SOURCE: &str = r"
 function provider(table) {
     return table = `12!34!56!78`.split(`!`), provider = function() { return table; }, provider();
 }
@@ -7788,6 +7787,10 @@ for (
 ) {}
 sink(decode(0x10), decode(0x11));
 ";
+
+    #[test]
+    fn decoder_only_recovery_generalizes_split_provider_sequence_accessor_and_nested_rotation() {
+        let source = SPLIT_PROVIDER_ROTATION_SOURCE;
         let recovered = recover_static_decoders(source, 8);
         assert!(recovered.is_some());
         let recovered = recovered.unwrap_or_else(|| unreachable!());
@@ -7802,7 +7805,11 @@ sink(decode(0x10), decode(0x11));
         );
         assert!(recovered.source.contains("sink(\"34\", \"56\")"));
         assert!(recovered.source.contains("void 0"));
+    }
 
+    #[test]
+    fn decoder_only_recovery_rejects_shadowed_parse_int_mismatched_checksum_and_proto() {
+        let source = SPLIT_PROVIDER_ROTATION_SOURCE;
         let shadowed_parse_int = source.replace(
             "function(provider_arg, target, indices, alias, table, sum) {",
             "function(provider_arg, target, indices, alias, table, sum) { function parseInt() { return 36; }",
@@ -7847,7 +7854,11 @@ sink(decode(0x10), decode(0x11));
             rejected.transforms.get("materialize_decoder_rotation"),
             None
         );
+    }
 
+    #[test]
+    fn decoder_only_recovery_rejects_shadowed_parameters_and_decoder_alias() {
+        let source = SPLIT_PROVIDER_ROTATION_SOURCE;
         let shadowed_parameter = source.replace(
             "        ) try {\n            if (",
             "        ) try {\n            let indices = { a: 0x20, b: 0x21 };\n            if (",
@@ -7873,7 +7884,11 @@ sink(decode(0x10), decode(0x11));
             rejected.transforms.get("materialize_decoder_rotation"),
             None
         );
+    }
 
+    #[test]
+    fn decoder_only_recovery_rejects_rebound_and_collapsed_bindings() {
+        let source = SPLIT_PROVIDER_ROTATION_SOURCE;
         let provider_rebound = source.replace(
             "sink(decode(0x10), decode(0x11));",
             "provider = replacement; sink(decode(0x10), decode(0x11));",

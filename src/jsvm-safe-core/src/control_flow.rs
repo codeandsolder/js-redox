@@ -2514,6 +2514,27 @@ impl Collector<'_, '_> {
         Some((ArithmeticCaseOutcome::Flow(flow), register_reads_rewritten))
     }
 
+    /// Model and render selector initializers in source order and count only
+    /// register reads whose value was actually proven and substituted.
+    fn arithmetic_selector_statements(
+        &self,
+        setup: &ArithmeticStateSetup<'_>,
+        env: &mut HashMap<String, Value>,
+        chunks: &mut Vec<String>,
+    ) -> Option<usize> {
+        let mut register_reads_rewritten = 0;
+        for selector_stmt in setup.selector_stmts {
+            let Statement::VariableDeclaration(_) = selector_stmt else {
+                return None;
+            };
+            let (rendered, rewritten) = self.render_statement_with_env(selector_stmt, env);
+            register_reads_rewritten += rewritten;
+            simulate_statement(selector_stmt, &setup.state_var, env, &setup.register_arrays)?;
+            chunks.push(rendered);
+        }
+        Some(register_reads_rewritten)
+    }
+
     fn finish_arithmetic_branch(
         &self,
         setup: &ArithmeticStateSetup<'_>,
@@ -2548,20 +2569,8 @@ impl Collector<'_, '_> {
             }
             state_path.push(state_key);
 
-            for selector_stmt in setup.selector_stmts {
-                let Statement::VariableDeclaration(_) = selector_stmt else {
-                    return None;
-                };
-                let (rendered, rewritten) = self.render_statement_with_env(selector_stmt, &env);
-                register_reads_rewritten += rewritten;
-                simulate_statement(
-                    selector_stmt,
-                    &setup.state_var,
-                    &mut env,
-                    &setup.register_arrays,
-                )?;
-                chunks.push(rendered);
-            }
+            register_reads_rewritten +=
+                self.arithmetic_selector_statements(setup, &mut env, &mut chunks)?;
 
             let start = select_switch_case(setup.switch, &env)?;
             let (outcome, rewritten) = self.simulate_arithmetic_case(
@@ -2630,20 +2639,8 @@ impl Collector<'_, '_> {
             }
             state_path.push(state_key);
 
-            for selector_stmt in setup.selector_stmts {
-                let Statement::VariableDeclaration(_decl) = selector_stmt else {
-                    return None;
-                };
-                let (rendered, rewritten) = self.render_statement_with_env(selector_stmt, &env);
-                register_reads_rewritten += rewritten;
-                simulate_statement(
-                    selector_stmt,
-                    &setup.state_var,
-                    &mut env,
-                    &setup.register_arrays,
-                )?;
-                chunks.push(rendered);
-            }
+            register_reads_rewritten +=
+                self.arithmetic_selector_statements(&setup, &mut env, &mut chunks)?;
 
             let start = select_switch_case(setup.switch, &env)?;
             let (outcome, rewritten) = self.simulate_arithmetic_case(
