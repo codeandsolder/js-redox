@@ -1465,31 +1465,15 @@ fn specialize_shape_for_call(
     })
 }
 
-/// Promote one structural slow-cell factory shape to an exact call proof.
-///
-/// The call must select the guarded slow branch from exact integer arguments;
-/// its exact-origin parameter must be the shape's state parameter; and neither
-/// the state binding nor the incoming handler binding may have a reachable
-/// write before their respective capture events. Property contents and cell
-/// resolver semantics remain separate obligations.
-#[must_use]
-pub fn proven_slow_lazy_cell_factory_call(
+// The caller has already selected a unique structural factory shape.
+// Only matching function spans may provide exact-call specialization evidence.
+fn specialize_exact_slow_factory_shape(
     source: &str,
     program: &Program<'_>,
     semantic: &Semantic<'_>,
+    shape: &SlowLazyCellFactoryShape,
     call: &ProvenOriginDirectCall,
 ) -> Option<ProvenSlowLazyCellFactoryCall> {
-    let mut shapes = structurally_proven_slow_lazy_cell_factory_shapes(program, semantic.scoping())
-        .into_iter()
-        .filter(|shape| {
-            shape.function_start == call.callee.function_start
-                && shape.function_end == call.callee.function_end
-        });
-    let shape = shapes.next()?;
-    if shapes.next().is_some() {
-        return None;
-    }
-
     struct Harness<'s, 'p, 'm, 'c> {
         source: &'s str,
         program: &'p Program<'p>,
@@ -1523,12 +1507,40 @@ pub fn proven_slow_lazy_cell_factory_call(
         source,
         program,
         semantic,
-        shape: &shape,
+        shape,
         call,
         result: None,
     };
     harness.visit_program(program);
     harness.result.flatten()
+}
+
+/// Promote one structural slow-cell factory shape to an exact call proof.
+///
+/// The call must select the guarded slow branch from exact integer arguments;
+/// its exact-origin parameter must be the shape's state parameter; and neither
+/// the state binding nor the incoming handler binding may have a reachable
+/// write before their respective capture events. Property contents and cell
+/// resolver semantics remain separate obligations.
+#[must_use]
+pub fn proven_slow_lazy_cell_factory_call(
+    source: &str,
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    call: &ProvenOriginDirectCall,
+) -> Option<ProvenSlowLazyCellFactoryCall> {
+    let mut shapes = structurally_proven_slow_lazy_cell_factory_shapes(program, semantic.scoping())
+        .into_iter()
+        .filter(|shape| {
+            shape.function_start == call.callee.function_start
+                && shape.function_end == call.callee.function_end
+        });
+    let shape = shapes.next()?;
+    if shapes.next().is_some() {
+        return None;
+    }
+
+    specialize_exact_slow_factory_shape(source, program, semantic, &shape, call)
 }
 
 fn slow_sequence<'a>(
@@ -1833,49 +1845,15 @@ fn registry_receiver_and_path<'a>(
     }
 }
 
-/// Prove that a specialized slow-cell factory call is directly stored into a
-/// computed registry slot whose key is passed through one factory parameter.
-///
-/// The registry receiver must be the same symbol as the factory's proven
-/// exact-origin state argument. The computed key must be the unique
-/// symbol-resolved call argument matching the assignment key. This establishes
-/// the structural key bridge only; it does not prove later reads see this write.
-#[must_use]
-pub fn proven_slow_lazy_cell_registry_assignment(
+// Collect registry assignments to this exact factory call. An assignment is
+// usable only when exactly one matching source-level registry write was found.
+fn unique_factory_registry_assignment(
     program: &Program<'_>,
     semantic: &Semantic<'_>,
+    state_argument: (u32, u32),
+    factory_parameters: &[SymbolId],
     factory_call: &ProvenSlowLazyCellFactoryCall,
 ) -> Option<ProvenSlowLazyCellRegistryAssignment> {
-    let shape = &factory_call.shape;
-    let state_argument = factory_call
-        .call
-        .argument_spans
-        .get(shape.state_parameter_index)
-        .copied()?;
-
-    let mut factory_parameters = None;
-    struct Parameters<'o> {
-        start: u32,
-        end: u32,
-        output: &'o mut Option<Vec<SymbolId>>,
-    }
-    impl<'a> Visit<'a> for Parameters<'_> {
-        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if function.span.start == self.start && function.span.end == self.end {
-                *self.output = parameter_symbols(function);
-                return;
-            }
-            walk::walk_function(self, function, flags);
-        }
-    }
-    Parameters {
-        start: shape.function_start,
-        end: shape.function_end,
-        output: &mut factory_parameters,
-    }
-    .visit_program(program);
-    let factory_parameters = factory_parameters?;
-
     struct Collector<'s, 'c, 'p> {
         scoping: &'s Scoping,
         call: &'c ProvenOriginDirectCall,
@@ -1974,7 +1952,7 @@ pub fn proven_slow_lazy_cell_registry_assignment(
         scoping: semantic.scoping(),
         call: &factory_call.call,
         state_argument,
-        factory_parameters: &factory_parameters,
+        factory_parameters,
         proven: Vec::new(),
         factory_call,
     };
@@ -1983,6 +1961,38 @@ pub fn proven_slow_lazy_cell_registry_assignment(
         return None;
     };
     Some(proven.clone())
+}
+
+/// Prove that a specialized slow-cell factory call is directly stored into a
+/// computed registry slot whose key is passed through one factory parameter.
+///
+/// The registry receiver must be the same symbol as the factory's proven
+/// exact-origin state argument. The computed key must be the unique
+/// symbol-resolved call argument matching the assignment key. This establishes
+/// the structural key bridge only; it does not prove later reads see this write.
+#[must_use]
+pub fn proven_slow_lazy_cell_registry_assignment(
+    program: &Program<'_>,
+    semantic: &Semantic<'_>,
+    factory_call: &ProvenSlowLazyCellFactoryCall,
+) -> Option<ProvenSlowLazyCellRegistryAssignment> {
+    let shape = &factory_call.shape;
+    let state_argument = factory_call
+        .call
+        .argument_spans
+        .get(shape.state_parameter_index)
+        .copied()?;
+
+    let factory_parameters =
+        function_parameter_symbols_at(program, shape.function_start, shape.function_end)?;
+
+    unique_factory_registry_assignment(
+        program,
+        semantic,
+        state_argument,
+        &factory_parameters,
+        factory_call,
+    )
 }
 
 fn function_parameter_symbols_at(
@@ -2557,39 +2567,17 @@ fn proven_slow_lazy_cell_captured_value_path(
         return None;
     }
 
-    let mut nested_value_symbol = None;
-    struct Probe<'o> {
-        nested_call_start: u32,
-        nested_call_end: u32,
-        nested_value_index: usize,
-        scoping: &'o Scoping,
-        nested_value_symbol: &'o mut Option<SymbolId>,
-    }
-    impl<'a> Visit<'a> for Probe<'_> {
-        fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
-            if call.span.start == self.nested_call_start && call.span.end == self.nested_call_end {
-                *self.nested_value_symbol = call
-                    .arguments
-                    .get(self.nested_value_index)
-                    .and_then(|argument| argument.as_expression())
-                    .and_then(|expression| reference_symbol(self.scoping, expression));
-                return;
-            }
-            walk::walk_call_expression(self, call);
-        }
-    }
-    Probe {
-        nested_call_start: exact_assignment.assignment.factory_call.call.call_start,
-        nested_call_end: exact_assignment.assignment.factory_call.call.call_end,
-        nested_value_index: exact_assignment
+    let nested_value_symbol = call_argument_symbol_at(
+        program,
+        semantic.scoping(),
+        exact_assignment.assignment.factory_call.call.call_start,
+        exact_assignment.assignment.factory_call.call.call_end,
+        exact_assignment
             .assignment
             .factory_call
             .shape
             .handler_parameter_index,
-        scoping: semantic.scoping(),
-        nested_value_symbol: &mut nested_value_symbol,
-    }
-    .visit_program(program);
+    );
     if nested_value_symbol != Some(current_symbol)
         || !symbol_only_forwarded_at_direct_call(
             source,
