@@ -3054,6 +3054,25 @@ fn exception_multi_entry_cycle_regions(
 /// Their bodies are emitted once in path order, followed by one shared join
 /// body, still inside the original try/catch. Independent catch/initializer
 /// entries and external side/join predecessors always prevent absorption.
+/// Reachability is counted per distinct predecessor state; repeated
+/// conditional successor arms cannot create additional incoming entries.
+fn exception_normal_incoming_sources(
+    cases: &BTreeMap<u64, Option<Route>>,
+    reachable: &BTreeSet<u64>,
+) -> Option<BTreeMap<u64, BTreeSet<u64>>> {
+    let mut incoming = BTreeMap::<u64, BTreeSet<u64>>::new();
+    for &label in reachable {
+        let route = cases.get(&label)?.as_ref()?;
+        let mut targets = Vec::new();
+        route.targets(&mut targets);
+        for target in targets {
+            incoming.entry(target).or_default().insert(label);
+        }
+    }
+
+    Some(incoming)
+}
+
 fn exception_diamond_regions(
     dispatcher: &Statement<'_>,
     state: &str,
@@ -3066,17 +3085,7 @@ fn exception_diamond_regions(
     let ExceptionSourceCaseIndex { statements, tests } =
         indexed_exception_source_cases(dispatcher, state, effects, source)?;
 
-    let mut incoming = BTreeMap::<u64, BTreeSet<u64>>::new();
-    for &label in entry.reachable {
-        let Some(Some(route)) = cases.get(&label) else {
-            return None;
-        };
-        let mut targets = Vec::new();
-        route.targets(&mut targets);
-        for target in targets {
-            incoming.entry(target).or_default().insert(label);
-        }
-    }
+    let incoming = exception_normal_incoming_sources(cases, entry.reachable)?;
 
     let text_of = |label| exception_case_text(label, &statements, edits, source);
 

@@ -935,6 +935,125 @@ fn expose_static_strings_allow_with(
 
 /// # Errors
 /// Returns `BudgetExceeded` if the configured work budget is exhausted.
+/// Resolve the unique lexical decoder/provider association and only
+/// report callsite replacements for unambiguous symbol bindings.
+fn base91_collect_iteration_proofs(
+    source: &str,
+    program: &oxc_ast::ast::Program<'_>,
+    scoping: &Scoping,
+    strings: &StringValueCollector,
+    iteration: usize,
+    budget: &WorkBudget,
+) -> Result<(Vec<Replacement>, Vec<Base91DecoderProof>), BudgetExceeded> {
+    let mut function_collector = FunctionCollector {
+        scoping,
+        functions: Vec::new(),
+        scope_spans: HashMap::new(),
+    };
+    function_collector.visit_program(program);
+    budget.checkpoint()?;
+    let mut call_collector = FunctionCallCollector {
+        scoping,
+        calls: HashMap::new(),
+    };
+    call_collector.visit_program(program);
+    let mut provider_collector = ProviderCollector {
+        scoping,
+        providers: Vec::new(),
+    };
+    provider_collector.visit_program(program);
+    budget.checkpoint()?;
+    let mut array_collector = SimpleArrayCollector::default();
+    array_collector.visit_program(program);
+    let mut wrapper_collector = WrapperLinkCollector {
+        scoping,
+        links: Vec::new(),
+    };
+    wrapper_collector.visit_program(program);
+    budget.checkpoint()?;
+    let discovery = DecoderDiscoveryContext {
+        source,
+        scoping,
+        scope_spans: &function_collector.scope_spans,
+        functions: &function_collector.functions,
+        calls: &call_collector.calls,
+        wrapper_links: &wrapper_collector.links,
+        string_values: &strings.values,
+        arrays: &array_collector.arrays,
+    };
+    let decoders = discover_decoders(&discovery, &provider_collector.providers);
+    budget.checkpoint()?;
+    let mut decoder_map = HashMap::new();
+    let mut ambiguous = HashSet::new();
+    for decoder in &decoders {
+        if decoder_map
+            .insert(decoder.decoder_symbol, decoder)
+            .is_some()
+        {
+            ambiguous.insert(decoder.decoder_symbol);
+        }
+    }
+    for symbol in ambiguous {
+        decoder_map.remove(&symbol);
+    }
+    let mut call_collector = Base91CallCollector {
+        scoping,
+        decoders: &decoder_map,
+        arrays: &array_collector.by_symbol,
+        replacements: Vec::new(),
+        counts: HashMap::new(),
+    };
+    call_collector.visit_program(program);
+    budget.checkpoint()?;
+    let mut iteration_proofs = Vec::new();
+    for decoder in &decoders {
+        let count = call_collector
+            .counts
+            .get(&decoder.decoder_symbol)
+            .copied()
+            .unwrap_or(0);
+        if count > 0 || iteration == 1 {
+            iteration_proofs.push(Base91DecoderProof {
+                decoder: decoder.decoder.clone(),
+                provider: decoder.provider.provider.clone(),
+                transform: decoder.transform.clone(),
+                rotation: decoder.provider.rotation,
+                table_entries: decoder.provider.values.len(),
+                scope_start: decoder.scope_start,
+                scope_end: decoder.scope_end,
+                declaration_start: decoder.declaration_start,
+                replacements: count,
+                iteration,
+            });
+        }
+    }
+    let replacements = call_collector.replacements;
+    Ok((replacements, iteration_proofs))
+}
+
+/// Sum exactly the static-table and concatenation transformations
+/// separately from the direct decoder calls while preserving count names.
+fn base91_record_exposure(
+    exposure: BTreeMap<String, usize>,
+    decoder_calls: usize,
+    transforms: &mut BTreeMap<String, usize>,
+) -> (usize, usize) {
+    let table_reads = exposure
+        .get("static_string_table_lookup")
+        .copied()
+        .unwrap_or(0);
+    let concat_folds = exposure.get("literal_string_concat").copied().unwrap_or(0);
+    for (kind, count) in exposure {
+        *transforms.entry(kind).or_default() += count;
+    }
+    if decoder_calls > 0 {
+        *transforms.entry("base91_decoder_call".into()).or_default() += decoder_calls;
+    }
+    (table_reads, concat_folds)
+}
+
+/// # Errors
+/// Returns `BudgetExceeded` when the configured bounded work budget is exhausted.
 pub fn recover_base91_strings_with_source_mode(
     source: &str,
     max_iterations: usize,
@@ -983,90 +1102,14 @@ pub fn recover_base91_strings_with_source_mode(
             break;
         }
         budget.checkpoint()?;
-        let scoping = semantic_ret.semantic.scoping();
-        let mut function_collector = FunctionCollector {
-            scoping,
-            functions: Vec::new(),
-            scope_spans: HashMap::new(),
-        };
-        function_collector.visit_program(&program);
-        budget.checkpoint()?;
-        let mut call_collector = FunctionCallCollector {
-            scoping,
-            calls: HashMap::new(),
-        };
-        call_collector.visit_program(&program);
-        let mut provider_collector = ProviderCollector {
-            scoping,
-            providers: Vec::new(),
-        };
-        provider_collector.visit_program(&program);
-        budget.checkpoint()?;
-        let mut array_collector = SimpleArrayCollector::default();
-        array_collector.visit_program(&program);
-        let mut wrapper_collector = WrapperLinkCollector {
-            scoping,
-            links: Vec::new(),
-        };
-        wrapper_collector.visit_program(&program);
-        budget.checkpoint()?;
-        let discovery = DecoderDiscoveryContext {
-            source: &current,
-            scoping,
-            scope_spans: &function_collector.scope_spans,
-            functions: &function_collector.functions,
-            calls: &call_collector.calls,
-            wrapper_links: &wrapper_collector.links,
-            string_values: &string_collector.values,
-            arrays: &array_collector.arrays,
-        };
-        let decoders = discover_decoders(&discovery, &provider_collector.providers);
-        budget.checkpoint()?;
-        let mut decoder_map = HashMap::new();
-        let mut ambiguous = HashSet::new();
-        for decoder in &decoders {
-            if decoder_map
-                .insert(decoder.decoder_symbol, decoder)
-                .is_some()
-            {
-                ambiguous.insert(decoder.decoder_symbol);
-            }
-        }
-        for symbol in ambiguous {
-            decoder_map.remove(&symbol);
-        }
-        let mut call_collector = Base91CallCollector {
-            scoping,
-            decoders: &decoder_map,
-            arrays: &array_collector.by_symbol,
-            replacements: Vec::new(),
-            counts: HashMap::new(),
-        };
-        call_collector.visit_program(&program);
-        budget.checkpoint()?;
-        let mut iteration_proofs = Vec::new();
-        for decoder in &decoders {
-            let count = call_collector
-                .counts
-                .get(&decoder.decoder_symbol)
-                .copied()
-                .unwrap_or(0);
-            if count > 0 || iteration == 1 {
-                iteration_proofs.push(Base91DecoderProof {
-                    decoder: decoder.decoder.clone(),
-                    provider: decoder.provider.provider.clone(),
-                    transform: decoder.transform.clone(),
-                    rotation: decoder.provider.rotation,
-                    table_entries: decoder.provider.values.len(),
-                    scope_start: decoder.scope_start,
-                    scope_end: decoder.scope_end,
-                    declaration_start: decoder.declaration_start,
-                    replacements: count,
-                    iteration,
-                });
-            }
-        }
-        let replacements = call_collector.replacements;
+        let (replacements, iteration_proofs) = base91_collect_iteration_proofs(
+            &current,
+            &program,
+            semantic_ret.semantic.scoping(),
+            &string_collector,
+            iteration,
+            budget,
+        )?;
         let mut counts = Counts::default();
         let next = if replacements.is_empty() {
             current.clone()
@@ -1091,17 +1134,8 @@ pub fn recover_base91_strings_with_source_mode(
         else {
             return Ok(None);
         };
-        let table_reads = exposure
-            .get("static_string_table_lookup")
-            .copied()
-            .unwrap_or(0);
-        let concat_folds = exposure.get("literal_string_concat").copied().unwrap_or(0);
-        for (kind, count) in exposure {
-            *transforms.entry(kind).or_default() += count;
-        }
-        if decoder_calls > 0 {
-            *transforms.entry("base91_decoder_call".into()).or_default() += decoder_calls;
-        }
+        let (table_reads, concat_folds) =
+            base91_record_exposure(exposure, decoder_calls, &mut transforms);
         total_replacements += decoder_calls + table_reads + concat_folds;
         proofs.extend(iteration_proofs);
         iterations.push(Base91Iteration {

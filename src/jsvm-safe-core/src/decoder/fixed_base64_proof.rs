@@ -809,6 +809,133 @@ fn fixed_base64_setup_proven(
             == Some(FixedBase64Init::Alphabet)
 }
 
+/// Prove all four sextet reads and three exact output bytes before
+/// accepting a fixed Base64 decoder, preserving ordered evaluator state.
+fn fixed_base64_prove_payload(
+    expressions: &[&Expression<'_>],
+    evaluator: &mut FixedBase64Eval<'_>,
+) -> Option<SymbolId> {
+    let [compute0, compute1, compute2, append0, append1, append2] = expressions else {
+        return None;
+    };
+    if evaluator.value(compute0).is_none()
+        || evaluator.value(compute1).is_none()
+        || evaluator.value(compute2).is_none()
+        || evaluator.next_sextet != 4
+    {
+        return None;
+    }
+    let expected = fixed_base64_expected_bytes();
+    let (output, first) = fixed_base64_append(append0, evaluator)?;
+    let (second_output, second) = fixed_base64_sentinel_append(append1, evaluator, 2)?;
+    let (third_output, third) = fixed_base64_sentinel_append(append2, evaluator, 3)?;
+    if output != second_output || output != third_output || [first, second, third] != expected {
+        return None;
+    }
+    Some(output)
+}
+
+/// Only a pure length comparison against the proven input and cursor
+/// may bound this decoder loop.
+fn fixed_base64_loop_guard(
+    expression: &Expression<'_>,
+    input: SymbolId,
+    cursor: SymbolId,
+    scoping: &Scoping,
+) -> bool {
+    let Expression::BinaryExpression(test) = unparenthesized(expression) else {
+        return false;
+    };
+    let loop_test = match test.operator.as_str() {
+        "<" => {
+            statically_resolved_identifier_symbol(&test.left, scoping) == Some(cursor)
+                && matches!(unparenthesized(&test.right), Expression::StaticMemberExpression(member)
+                    if !member.optional
+                        && member.property.name.as_str() == "length"
+                        && statically_resolved_identifier_symbol(&member.object, scoping) == Some(input))
+        }
+        ">" => {
+            statically_resolved_identifier_symbol(&test.right, scoping) == Some(cursor)
+                && matches!(unparenthesized(&test.left), Expression::StaticMemberExpression(member)
+                    if !member.optional
+                        && member.property.name.as_str() == "length"
+                        && statically_resolved_identifier_symbol(&member.object, scoping) == Some(input))
+        }
+        _ => false,
+    };
+    loop_test
+}
+
+/// The direct decoder and nested-IIFE variant have different guard
+/// and binding lifetime proofs; normalize only after both prove valid.
+struct FixedBase64DecodeTarget<'a> {
+    function: &'a oxc_ast::ast::Function<'a>,
+    body: &'a oxc_ast::ast::FunctionBody<'a>,
+    source: SymbolId,
+    iife: bool,
+}
+
+fn fixed_base64_decode_target<'a>(
+    function: &'a oxc_ast::ast::Function<'a>,
+    scoping: &Scoping,
+    aliases: &HashMap<SymbolId, u32>,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> Option<FixedBase64DecodeTarget<'a>> {
+    if function.r#async
+        || function.generator
+        || !function_parameters_have_no_runtime_effects(function)
+    {
+        return None;
+    }
+    let outer_body = function.body.as_ref()?;
+    let iife = fixed_decoder_iife_wrapper_proven(function, scoping, aliases);
+    let (decode_function, decode_body, source, direct_guard_end) = if iife {
+        let nested = fixed_decoder_iife_function(outer_body)?;
+        if nested.r#async
+            || nested.generator
+            || !function_parameters_have_no_runtime_effects(nested)
+        {
+            return None;
+        }
+        let body = nested.body.as_ref()?;
+        let Some(BindingPattern::BindingIdentifier(source)) = nested
+            .params
+            .items
+            .first()
+            .map(|parameter| &parameter.pattern)
+        else {
+            return None;
+        };
+        let source = source.symbol_id.get()?;
+        (nested, body, source, None)
+    } else {
+        if !fixed_decoder_control_shape(outer_body) {
+            return None;
+        }
+        let (source, guard_end) = fixed_base64_direct_source(function, scoping)?;
+        (function, outer_body, source, Some(guard_end))
+    };
+
+    if let Some(guard_end) = direct_guard_end {
+        for reference_id in scoping.get_resolved_reference_ids(source) {
+            let span = reference_spans.get(reference_id)?;
+            if guard_end <= span.start
+                && span.end <= decode_body.span.end
+                && scoping.get_reference(*reference_id).is_write()
+            {
+                return None;
+            }
+        }
+    }
+
+    Some(FixedBase64DecodeTarget {
+        function: decode_function,
+        body: decode_body,
+        source,
+        iife,
+    })
+}
+
 pub(super) fn fixed_base64_algorithm_proven(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
@@ -816,64 +943,15 @@ pub(super) fn fixed_base64_algorithm_proven(
     reference_spans: &HashMap<ReferenceId, Span>,
     alphabet: &str,
 ) -> bool {
-    if function.r#async
-        || function.generator
-        || !function_parameters_have_no_runtime_effects(function)
-    {
-        return false;
-    }
-    let Some(outer_body) = function.body.as_ref() else {
+    let Some(FixedBase64DecodeTarget {
+        function: decode_function,
+        body: decode_body,
+        source,
+        iife,
+    }) = fixed_base64_decode_target(function, scoping, aliases, reference_spans)
+    else {
         return false;
     };
-    let iife = fixed_decoder_iife_wrapper_proven(function, scoping, aliases);
-    let (decode_function, decode_body, source, direct_guard_end) = if iife {
-        let Some(nested) = fixed_decoder_iife_function(outer_body) else {
-            return false;
-        };
-        if nested.r#async
-            || nested.generator
-            || !function_parameters_have_no_runtime_effects(nested)
-        {
-            return false;
-        }
-        let Some(body) = nested.body.as_ref() else {
-            return false;
-        };
-        let Some(BindingPattern::BindingIdentifier(source)) = nested
-            .params
-            .items
-            .first()
-            .map(|parameter| &parameter.pattern)
-        else {
-            return false;
-        };
-        let Some(source) = source.symbol_id.get() else {
-            return false;
-        };
-        (nested, body, source, None)
-    } else {
-        if !fixed_decoder_control_shape(outer_body) {
-            return false;
-        }
-        let Some((source, guard_end)) = fixed_base64_direct_source(function, scoping) else {
-            return false;
-        };
-        (function, outer_body, source, Some(guard_end))
-    };
-
-    if let Some(guard_end) = direct_guard_end {
-        for reference_id in scoping.get_resolved_reference_ids(source) {
-            let Some(span) = reference_spans.get(reference_id) else {
-                return false;
-            };
-            if guard_end <= span.start
-                && span.end <= decode_body.span.end
-                && scoping.get_reference(*reference_id).is_write()
-            {
-                return false;
-            }
-        }
-    }
 
     let loops = decode_body
         .statements
@@ -892,9 +970,6 @@ pub(super) fn fixed_base64_algorithm_proven(
     let Some(expressions) = fixed_base64_loop_expressions(&for_statement.body) else {
         return false;
     };
-    let [compute0, compute1, compute2, append0, append1, append2] = expressions.as_slice() else {
-        return false;
-    };
     let mut evaluator = FixedBase64Eval {
         scoping,
         values: HashMap::new(),
@@ -903,28 +978,9 @@ pub(super) fn fixed_base64_algorithm_proven(
         cursor: None,
         next_sextet: 0,
     };
-    if evaluator.value(compute0).is_none()
-        || evaluator.value(compute1).is_none()
-        || evaluator.value(compute2).is_none()
-        || evaluator.next_sextet != 4
-    {
-        return false;
-    }
-    let expected = fixed_base64_expected_bytes();
-    let Some((output, first)) = fixed_base64_append(append0, &mut evaluator) else {
+    let Some(output) = fixed_base64_prove_payload(&expressions, &mut evaluator) else {
         return false;
     };
-    let Some((second_output, second)) = fixed_base64_sentinel_append(append1, &mut evaluator, 2)
-    else {
-        return false;
-    };
-    let Some((third_output, third)) = fixed_base64_sentinel_append(append2, &mut evaluator, 3)
-    else {
-        return false;
-    };
-    if output != second_output || output != third_output || [first, second, third] != expected {
-        return false;
-    }
     let (Some(alphabet_symbol), Some(input), Some(cursor)) =
         (evaluator.alphabet, evaluator.input, evaluator.cursor)
     else {
@@ -946,28 +1002,10 @@ pub(super) fn fixed_base64_algorithm_proven(
     {
         return false;
     }
-    let Some(Expression::BinaryExpression(test)) = for_statement.test.as_ref().map(unparenthesized)
-    else {
+    let Some(test) = for_statement.test.as_ref() else {
         return false;
     };
-    let loop_test = match test.operator.as_str() {
-        "<" => {
-            statically_resolved_identifier_symbol(&test.left, scoping) == Some(cursor)
-                && matches!(unparenthesized(&test.right), Expression::StaticMemberExpression(member)
-                    if !member.optional
-                        && member.property.name.as_str() == "length"
-                        && statically_resolved_identifier_symbol(&member.object, scoping) == Some(input))
-        }
-        ">" => {
-            statically_resolved_identifier_symbol(&test.right, scoping) == Some(cursor)
-                && matches!(unparenthesized(&test.left), Expression::StaticMemberExpression(member)
-                    if !member.optional
-                        && member.property.name.as_str() == "length"
-                        && statically_resolved_identifier_symbol(&member.object, scoping) == Some(input))
-        }
-        _ => false,
-    };
-    if !loop_test {
+    if !fixed_base64_loop_guard(test, input, cursor, scoping) {
         return false;
     }
     let Some(Statement::ReturnStatement(return_statement)) = decode_body.statements.last() else {
