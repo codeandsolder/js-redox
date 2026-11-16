@@ -124,6 +124,10 @@ fn enclosing_context_and_guard(
 /// A symbol gets a candidate only when exactly one function definition is
 /// visible in this source's declarations/variable initializers. Any distinct
 /// definitions invalidate the direct edge rather than guessing a target.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn analyze_static_calls(
     semantic: &Semantic<'_>,
     budget: &WorkBudget,

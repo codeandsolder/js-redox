@@ -56,6 +56,10 @@ fn enclosing_function(semantic: &Semantic<'_>, node: &oxc_semantic::AstNode<'_>)
 /// Shadowing and unrelated scopes do not contaminate the result. Nested
 /// functions are considered possible hazards without asserting their call.
 /// Budget exhaustion never silently means no hazards.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn audit_lexical_binding_mutation(
     semantic: &Semantic<'_>,
     symbol: SymbolId,

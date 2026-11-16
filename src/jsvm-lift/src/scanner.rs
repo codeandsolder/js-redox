@@ -846,6 +846,11 @@ fn sort_scan_inventory(scanner: &mut Scanner<'_>) {
         .sort_by_key(|table| std::cmp::Reverse(table.function_values));
 }
 
+/// Scan JavaScript source through the bounded core analysis.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn scan_source_core(
     source: &str,
     source_mode: SourceMode,

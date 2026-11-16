@@ -97,6 +97,11 @@ fn joined_origin_and_key(
     Some((ProvenRegistryObjectOrigin::from(&call.callee), exact_key))
 }
 
+/// Join registry reads with independently proven receiver origins.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn proven_origin_registry_read_calls(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -127,6 +132,11 @@ pub fn proven_origin_registry_read_calls(
     Ok(proven)
 }
 
+/// Join registry value installs with proven receiver origins.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn proven_origin_registry_value_installs(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -164,6 +174,11 @@ pub fn proven_origin_registry_value_installs(
     Ok(proven)
 }
 
+/// Find registry handler installs with proven receiver origins.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn proven_origin_registry_handler_installs(
     program: &Program<'_>,
     scoping: &Scoping,

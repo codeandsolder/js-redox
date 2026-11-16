@@ -501,6 +501,11 @@ impl<'a> Visit<'a> for CallCollector<'_> {
     }
 }
 
+/// Find statically proven forwarding alias installer calls.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn static_alias_installer_calls(
     source: &str,
     budget: &WorkBudget,

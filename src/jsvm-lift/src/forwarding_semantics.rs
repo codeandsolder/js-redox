@@ -3025,6 +3025,11 @@ impl<'a> Visit<'a> for RegistryReadCallCollector<'_, '_> {
     }
 }
 
+/// Identify registry reads backed by recognized accessor proofs.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn structurally_proven_registry_read_calls(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -3202,6 +3207,10 @@ impl<'a> Visit<'a> for LazyRegistryReadCallCollector<'_, '_> {
 ///
 /// The returned selector span belongs to the accessor function body; callers may
 /// feed it into symbolic normalization separately.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn structurally_proven_lazy_registry_read_calls(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -3344,6 +3353,10 @@ impl<'a> Visit<'a> for RegistryForwardingValueCallCollector<'_, '_> {
 
 /// Find all calls through structurally proven registry forwarders, preserving
 /// the exact source span of the evaluated value that enters the forwarder.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn structurally_proven_registry_forwarding_value_calls(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -3455,6 +3468,11 @@ impl<'a> Visit<'a> for RegistryForwardingCallCollector<'_, '_> {
     }
 }
 
+/// Identify forwarding calls with proven registry connections.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn structurally_proven_registry_forwarding_calls(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -3478,6 +3496,11 @@ pub fn structurally_proven_registry_forwarding_calls(
     Ok(calls.calls)
 }
 
+/// Find source-proven forwarding installer calls.
+///
+/// # Errors
+///
+/// Returns `BudgetExceeded` if the supplied analysis budget is exhausted.
 pub fn structurally_proven_forwarding_installers(
     program: &Program<'_>,
     scoping: &Scoping,
