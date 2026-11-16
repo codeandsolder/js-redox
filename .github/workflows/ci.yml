@@ -14,10 +14,10 @@ permissions:
 
 jobs:
   rust:
-    name: Rust 1.99 quality gate
+    name: Rust 1.100 quality gate
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
     with:
-      rust-toolchain: "1.99.1"
+      rust-toolchain: "1.100.0"
       rust-components: "rustfmt clippy"
       timeout-minutes: 20
       command: |
@@ -36,17 +36,17 @@ jobs:
             "$python_files" "$python_shebang_files"
           exit 1
         fi
-        cargo +1.99.1 fmt --all -- --check
-        cargo +1.99.1 test --locked --workspace
-        cargo +1.99.1 clippy --locked --workspace --all-targets -- -D warnings
+        cargo +1.100.0 fmt --all -- --check
+        cargo +1.100.0 test --locked --workspace
+        cargo +1.100.0 clippy --locked --workspace --all-targets -- -D warnings
 
   semantic:
     name: Semantic/runtime regressions
     needs: rust
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
     with:
-      rust-toolchain: "1.99.1"
+      rust-toolchain: "1.100.0"
       timeout-minutes: 20
       command: |
         node tools/cloak-recorder/check-nested-cdp-session.mjs
-        cargo +1.99.1 test -p jsvm-lift --lib depythonify_safe_deob_ -- --ignored --nocapture
+        cargo +1.100.0 test -p jsvm-lift --lib depythonify_safe_deob_ -- --ignored --nocapture
