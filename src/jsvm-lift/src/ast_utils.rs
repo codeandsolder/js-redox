@@ -1,6 +1,7 @@
 use crate::numeric::exact_u64;
 use oxc_ast::ast::{AssignmentTarget, Expression};
 
+#[must_use]
 pub fn expr_ident<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
     match expr {
         Expression::Identifier(id) => Some(id.name.as_str()),
@@ -9,6 +10,7 @@ pub fn expr_ident<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
     }
 }
 
+#[must_use]
 pub fn target_ident<'a>(target: &'a AssignmentTarget<'a>) -> Option<&'a str> {
     match target {
         AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.as_str()),
@@ -16,6 +18,7 @@ pub fn target_ident<'a>(target: &'a AssignmentTarget<'a>) -> Option<&'a str> {
     }
 }
 
+#[must_use]
 pub fn numeric_u64(expr: &Expression<'_>) -> Option<u64> {
     match expr {
         Expression::NumericLiteral(number) => exact_u64(number.value),

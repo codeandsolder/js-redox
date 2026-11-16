@@ -351,6 +351,7 @@ pub fn detect_static_string_join(call: &CallExpression<'_>) -> Option<EmbeddedCo
     })
 }
 
+#[must_use]
 pub fn detect_function_constructor(
     kind: &str,
     start: u32,

@@ -79,6 +79,7 @@ impl<'a> Visit<'a> for EvidenceVisitor<'_> {
     }
 }
 
+#[must_use]
 pub fn expression_evidence(source: &str, expr: &Expression<'_>) -> ExprEvidence {
     let mut visitor = EvidenceVisitor {
         source,
@@ -109,6 +110,7 @@ fn evidence_reaches_computed_inner(
     false
 }
 
+#[must_use]
 pub fn evidence_reaches_computed(
     evidence: &ExprEvidence,
     vars: &HashMap<String, ExprEvidence>,

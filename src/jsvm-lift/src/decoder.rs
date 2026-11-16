@@ -63,6 +63,7 @@ pub struct DecoderCandidate {
     pub preview: String,
 }
 
+#[must_use]
 pub fn origin_ident(expr: &Expression<'_>) -> Option<String> {
     match expr {
         Expression::Identifier(id) => Some(id.name.to_string()),
@@ -74,6 +75,7 @@ pub fn origin_ident(expr: &Expression<'_>) -> Option<String> {
     }
 }
 
+#[must_use]
 pub fn origin_u64(expr: &Expression<'_>) -> Option<u64> {
     match expr {
         Expression::NumericLiteral(n) => exact_u64(n.value),
@@ -123,6 +125,7 @@ fn base_offset_shape(expr: &Expression<'_>) -> Option<IndexShape> {
     })
 }
 
+#[must_use]
 pub fn index_shape(expr: &Expression<'_>) -> Option<IndexShape> {
     match expr {
         Expression::ParenthesizedExpression(paren) => index_shape(&paren.expression),
@@ -155,6 +158,7 @@ pub fn index_shape(expr: &Expression<'_>) -> Option<IndexShape> {
     }
 }
 
+#[must_use]
 pub fn resolve_alias(name: &str, aliases: &HashMap<String, String>) -> String {
     let mut current = name.to_string();
     let mut seen = HashSet::new();
@@ -167,6 +171,7 @@ pub fn resolve_alias(name: &str, aliases: &HashMap<String, String>) -> String {
     current
 }
 
+#[must_use]
 pub fn derive_candidates(function_id: &str, accesses: &[IndexedAccess]) -> Vec<DecoderCandidate> {
     let mut out = Vec::new();
     for access in accesses {
@@ -388,6 +393,7 @@ pub fn complete_selector_masks(
     }
 }
 
+#[must_use]
 pub fn observed_opcodes(decoder: &DecoderCandidate, builders: &[PushBuilderCandidate]) -> Vec<u64> {
     let (Some(builder_start), Ok(width)) = (decoder.builder_start, usize::try_from(decoder.width))
     else {
