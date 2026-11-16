@@ -6,7 +6,6 @@
 //! without assuming the temporary was otherwise unused.
 //! This is an analyst-only source view, never a rewrite of captured executable
 //! reconstruction. Never infer values from spelling alone.
-use anyhow::Result;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentTarget, Expression, Function, FunctionBody,
@@ -348,7 +347,9 @@ impl<'a> Visit<'a> for ReturnFlow<'_> {
 
 /// Recover direct return values through a provably unobservable terminal
 /// temporary. Independently reparse/re-resolve each edit to avoid overlaps.
-pub fn recover_terminal_returns(source: &str) -> Result<RecoveredReturns> {
+/// Unsupported or invalid source is returned unchanged instead of raising an error.
+#[must_use]
+pub fn recover_terminal_returns(source: &str) -> RecoveredReturns {
     let mut output = source.to_owned();
     let mut adjacent_returns = 0;
     let mut labeled_joins = 0;
@@ -407,23 +408,22 @@ pub fn recover_terminal_returns(source: &str) -> Result<RecoveredReturns> {
             break;
         }
     }
-    Ok(RecoveredReturns {
+    RecoveredReturns {
         source: output,
         adjacent_returns,
         labeled_joins,
         guarded_joins,
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::recover_terminal_returns;
-    use anyhow::Result;
 
     #[test]
-    fn rewrites_adjacent_assignment_when_unused_elsewhere() -> Result<()> {
+    fn rewrites_adjacent_assignment_when_unused_elsewhere() {
         let src = "const f = function(q, x){sideEffect();q = x+3;return q;};";
-        let out = recover_terminal_returns(src)?;
+        let out = recover_terminal_returns(src);
         assert_eq!(out.adjacent_returns, 1);
         assert_eq!(out.labeled_joins, 0);
         assert!(
@@ -431,23 +431,21 @@ mod tests {
             "{}",
             out.source
         );
-        Ok(())
     }
 
     #[test]
-    fn rewrites_labeled_join_with_independent_side_effects() -> Result<()> {
+    fn rewrites_labeled_join_with_independent_side_effects() {
         let src = "const V=function(J,Y,H){a:{if(J.Y){H=w8(J,J.D);break a;}if((Y=$X(8,J,true),Y)&128){Y^=128;}H=Y;}return H;};";
-        let out = recover_terminal_returns(src)?;
+        let out = recover_terminal_returns(src);
         assert_eq!(out.labeled_joins, 1);
         assert!(out.source.contains("return (w8(J,J.D));"), "{}", out.source);
         assert!(out.source.contains("return (Y);"), "{}", out.source);
         assert!(!out.source.contains("break a"), "{}", out.source);
         assert!(!out.source.contains("return H"), "{}", out.source);
-        Ok(())
     }
 
     #[test]
-    fn never_remove_writes_observed_through_aliases_or_dynamic_scope() -> Result<()> {
+    fn never_remove_writes_observed_through_aliases_or_dynamic_scope() {
         let unsafe_cases = [
             "function f(q){const g=()=>q;q=2;return q;}",
             "function f(q){q=2;console.log(q);return q;}",
@@ -457,15 +455,14 @@ mod tests {
             "function f(q){q=2;return arguments[0];}",
         ];
         for src in unsafe_cases {
-            let out = recover_terminal_returns(src)?;
+            let out = recover_terminal_returns(src);
             assert_eq!(out.source, src, "{src} -> {}", out.source);
             assert_eq!(out.adjacent_returns, 0);
         }
-        Ok(())
     }
 
     #[test]
-    fn terminal_store_is_dead_after_earlier_reads_and_writes() -> Result<()> {
+    fn terminal_store_is_dead_after_earlier_reads_and_writes() {
         for (source, expected_kind) in [
             ("function f(q){q++;q=2;return q;}", "adjacent"),
             ("function f(q){log(q);q=3;return q;}", "adjacent"),
@@ -479,7 +476,7 @@ mod tests {
                 "labeled",
             ),
         ] {
-            let out = recover_terminal_returns(source)?;
+            let out = recover_terminal_returns(source);
             let count = match expected_kind {
                 "adjacent" => out.adjacent_returns,
                 "guarded" => out.guarded_joins,
@@ -488,11 +485,10 @@ mod tests {
             };
             assert_eq!(count, 1, "{source}: {}", out.source);
         }
-        Ok(())
     }
 
     #[test]
-    fn closure_capture_keeps_terminal_assignments_observable() -> Result<()> {
+    fn closure_capture_keeps_terminal_assignments_observable() {
         for source in [
             "function f(q){const g=function(){return q;};q=3;return q;}",
             "function f(q){const g=()=>()=>q;q=3;return q;}",
@@ -500,62 +496,57 @@ mod tests {
             "function f(q,x){const obj={m(){return q;}};if(x){q=left();}return q;}",
             "function f(q,x){const g=(x=q)=>x;if(x){q=left();}return q;}",
         ] {
-            let out = recover_terminal_returns(source)?;
+            let out = recover_terminal_returns(source);
             assert_eq!(out.source, source, "{source}: {}", out.source);
         }
-        Ok(())
     }
 
     #[test]
-    fn respect_reference_identity_and_preserve_early_exit_behavior() -> Result<()> {
+    fn respect_reference_identity_and_preserve_early_exit_behavior() {
         let cases = [
             "function f(q,x){let q=2;q=x;return q;}",
             "const f=function(H){a:{if(x){H=first();break a;}H=second();}other();return H;};",
             "function f(H){a:{if(x){H=first();break a;}H=second();}return arguments[0];}",
         ];
         for src in cases {
-            let out = recover_terminal_returns(src)?;
+            let out = recover_terminal_returns(src);
             assert_eq!(out.source, src, "{src} -> {}", out.source);
         }
-        Ok(())
     }
 
     #[test]
-    fn guarded_assignment_preserves_initial_return_value_on_false_path() -> Result<()> {
+    fn guarded_assignment_preserves_initial_return_value_on_false_path() {
         let src = "function f(q, x){if(x){q=touch(x);}return q;}";
-        let out = recover_terminal_returns(src)?;
+        let out = recover_terminal_returns(src);
         assert_eq!(out.guarded_joins, 1);
         assert!(out.source.contains("return (touch(x));"), "{}", out.source);
         assert!(out.source.ends_with("return q;}"), "{}", out.source);
-        Ok(())
     }
 
     #[test]
-    fn complete_if_else_join_returns_each_branch_directly() -> Result<()> {
+    fn complete_if_else_join_returns_each_branch_directly() {
         let src = "function f(q, x){if(x)q=left();else{q=right();}return q;}";
-        let out = recover_terminal_returns(src)?;
+        let out = recover_terminal_returns(src);
         assert_eq!(out.guarded_joins, 1);
         assert!(out.source.contains("return (left());"), "{}", out.source);
         assert!(out.source.contains("return (right());"), "{}", out.source);
         assert!(!out.source.contains("return q;"), "{}", out.source);
-        Ok(())
     }
 
     #[test]
-    fn guarded_labeled_join_recovers_original_multimode_helper() -> Result<()> {
+    fn guarded_labeled_join_recovers_original_multimode_helper() {
         let src = "const V=function(J,Q,Y,L,H){if((Q>>2&5)==1){a:{if(J.Y){H=w8(J,J.D);break a;}if((Y=$X(8,J,true),Y)&128){Y^=128;L=$X(2,J,true);Y=(Y<<2)+(L|0);}H=Y;}}return H;};";
-        let out = recover_terminal_returns(src)?;
+        let out = recover_terminal_returns(src);
         assert_eq!(out.guarded_joins, 1, "{}", out.source);
         assert_eq!(out.labeled_joins, 0);
         assert!(out.source.contains("return (w8(J,J.D));"), "{}", out.source);
         assert!(out.source.contains("return (Y);"), "{}", out.source);
         assert!(out.source.contains("return H;"), "{}", out.source);
         assert!(!out.source.contains("break a;"), "{}", out.source);
-        Ok(())
     }
 
     #[test]
-    fn guarded_joins_reject_intermediate_effects_or_observable_bindings() -> Result<()> {
+    fn guarded_joins_reject_intermediate_effects_or_observable_bindings() {
         for src in [
             "function f(x,q){if(x){q=left();after();}return q;}",
             "function f(x,q){if(x){q=left();}else{right();}return q;}",
@@ -565,15 +556,14 @@ mod tests {
             "function f(x,q){if(x){a:{if(x){q=left();break a;}q=right();}other();}return q;}",
             "function f(x,q){if(x){q=left();}return arguments[0];}",
         ] {
-            let out = recover_terminal_returns(src)?;
+            let out = recover_terminal_returns(src);
             assert_eq!(out.source, src, "{src} -> {}", out.source);
             assert_eq!(out.guarded_joins, 0);
         }
-        Ok(())
     }
 
     #[test]
-    fn enclosing_lexical_assignments_are_observable_and_must_remain() -> Result<()> {
+    fn enclosing_lexical_assignments_are_observable_and_must_remain() {
         for src in [
             "let shared;function f(){shared=touch();return shared;}",
             "let shared;const f=()=>{shared=touch();return shared;};",
@@ -581,33 +571,31 @@ mod tests {
             "function outer(){let q;const inner=()=>{if(flag){q=touch();}return q;};return inner;}",
             "let state;function f(flag){if(flag){state=one();}else{state=two();}return state;}",
         ] {
-            let out = recover_terminal_returns(src)?;
+            let out = recover_terminal_returns(src);
             assert_eq!(out.source, src, "{src} -> {}", out.source);
             assert_eq!(
                 out.adjacent_returns + out.labeled_joins + out.guarded_joins,
                 0
             );
         }
-        Ok(())
     }
 
     #[test]
-    fn function_owned_bindings_work_in_arrows_methods_and_nested_functions() -> Result<()> {
+    fn function_owned_bindings_work_in_arrows_methods_and_nested_functions() {
         for src in [
             "const f=(q,x)=>{if(x){q=touch(x);}return q;};",
             "class C{method(q,x){if(x){q=touch(x);}return q;}}",
             "function outer(){const f=function(q,x){if(x){q=touch(x);}return q;};return f;}",
         ] {
-            let out = recover_terminal_returns(src)?;
+            let out = recover_terminal_returns(src);
             assert_eq!(out.guarded_joins, 1, "{src}: {}", out.source);
         }
-        Ok(())
     }
 
     #[test]
-    fn guarded_return_keeps_effectful_prefix_and_local_block_scope() -> Result<()> {
+    fn guarded_return_keeps_effectful_prefix_and_local_block_scope() {
         let src = "function f(q,x){if(x){log('prefix');let local=touch();if(local<0)return -1;q=combine(local,q);}return q;}";
-        let out = recover_terminal_returns(src)?;
+        let out = recover_terminal_returns(src);
         assert_eq!(out.guarded_joins, 1, "{}", out.source);
         assert!(
             out.source
@@ -621,13 +609,12 @@ mod tests {
             out.source
         );
         assert!(out.source.ends_with("return q;}"), "{}", out.source);
-        Ok(())
     }
 
     #[test]
-    fn complete_if_else_joins_keep_both_effectful_prefixes() -> Result<()> {
+    fn complete_if_else_joins_keep_both_effectful_prefixes() {
         let src = "function f(q,x){if(x){log(1);const v=a();q=left(v,q);}else{log(2);const v=b();q=right(v,q);}return q;}";
-        let out = recover_terminal_returns(src)?;
+        let out = recover_terminal_returns(src);
         assert_eq!(out.guarded_joins, 1, "{}", out.source);
         assert!(out
             .source
@@ -636,13 +623,12 @@ mod tests {
             .source
             .contains("log(2);const v=b();return (right(v,q));"));
         assert!(!out.source.contains("return q;"), "{}", out.source);
-        Ok(())
     }
 
     #[test]
-    fn knitsail_hv_callback_prefix_is_preserved() -> Result<()> {
+    fn knitsail_hv_callback_prefix_is_preserved() {
         let src = "const hV=function(J,Q,Y,u){if(!(J-5&14)){Q(function(n){n(Y);});u=[function(){return Y;},function(){}];}return u;};";
-        let out = recover_terminal_returns(src)?;
+        let out = recover_terminal_returns(src);
         assert_eq!(out.guarded_joins, 1, "{}", out.source);
         assert!(
             out.source
@@ -652,26 +638,24 @@ mod tests {
         );
         assert!(out.source.contains("return u;"), "{}", out.source);
         assert!(!out.source.contains("u=[function()"), "{}", out.source);
-        Ok(())
     }
 
     #[test]
-    fn prefix_early_exits_or_loop_controls_keep_their_original_order() -> Result<()> {
+    fn prefix_early_exits_or_loop_controls_keep_their_original_order() {
         for src in [
             "function f(q,x){if(x){if(q)return 7;trace();q=one();}return q;}",
             "function f(q,x){if(x){label:{if(q)break label;trace();}q=one();}return q;}",
             "function f(q,x){if(x){for(let n=0;n<3;n++){trace(n);if(n===1)break;}q=one();}return q;}",
         ] {
-            let out = recover_terminal_returns(src)?;
+            let out = recover_terminal_returns(src);
             assert_eq!(out.guarded_joins, 1, "{src}: {}", out.source);
             assert!(out.source.contains("return (one());"), "{}", out.source);
             assert!(!out.source.contains("q=one();"), "{}", out.source);
         }
-        Ok(())
     }
 
     #[test]
-    fn nonterminal_assignment_still_must_remain() -> Result<()> {
+    fn nonterminal_assignment_still_must_remain() {
         for src in [
             "function f(q,x){if(x){q=one();trace();}return q;}",
             "function f(q,x){if(x){trace();q=one();trace();}return q;}",
@@ -679,18 +663,16 @@ mod tests {
             "function f(q,x){if(x){q=one();}else{q=two();trace();}return q;}",
             "function f(q,x){const saved=()=>q;if(x){trace();q=one();}return q;}",
         ] {
-            let out = recover_terminal_returns(src)?;
+            let out = recover_terminal_returns(src);
             assert_eq!(out.source, src, "{src}: {}", out.source);
             assert_eq!(out.guarded_joins, 0);
         }
-        Ok(())
     }
 
     #[test]
-    fn detached_invalid_source_is_unchanged() -> Result<()> {
+    fn detached_invalid_source_is_unchanged() {
         let src = "function f ( { not valid";
-        let out = recover_terminal_returns(src)?;
+        let out = recover_terminal_returns(src);
         assert_eq!(out.source, src);
-        Ok(())
     }
 }
