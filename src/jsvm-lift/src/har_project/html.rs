@@ -10,7 +10,7 @@ use html_escape::decode_html_entities;
 use std::collections::HashMap;
 use url::Url;
 
-pub(crate) fn document_base(html: &str, final_url: &Url) -> Url {
+pub fn document_base(html: &str, final_url: &Url) -> Url {
     let lower = html.to_ascii_lowercase();
     let mut from = 0;
     while let Some(relative) = lower[from..].find("<base") {
@@ -39,7 +39,7 @@ pub(crate) fn document_base(html: &str, final_url: &Url) -> Url {
     final_url.clone()
 }
 
-pub(crate) fn script_preload_links(html: &str) -> Vec<(String, &'static str)> {
+pub fn script_preload_links(html: &str) -> Vec<(String, &'static str)> {
     let lower = html.to_ascii_lowercase();
     let mut from = 0;
     let mut urls = Vec::new();
@@ -85,12 +85,12 @@ pub(crate) fn script_preload_links(html: &str) -> Vec<(String, &'static str)> {
 }
 
 #[derive(Debug)]
-pub(crate) struct ScriptTag {
+pub struct ScriptTag {
     pub(crate) attrs: HashMap<String, String>,
     pub(crate) body: String,
 }
 
-pub(crate) const fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
+pub const fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
     let mut quote = None;
     while i < bytes.len() {
         let b = bytes[i];
@@ -108,7 +108,7 @@ pub(crate) const fn find_tag_end(bytes: &[u8], mut i: usize) -> Option<usize> {
     None
 }
 
-pub(crate) fn parse_attrs(tag: &str) -> HashMap<String, String> {
+pub fn parse_attrs(tag: &str) -> HashMap<String, String> {
     let bytes = tag.as_bytes();
     let mut out = HashMap::new();
     let mut i = 0usize;
@@ -173,7 +173,7 @@ pub(crate) fn parse_attrs(tag: &str) -> HashMap<String, String> {
     out
 }
 
-pub(crate) fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
+pub fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
     let lower = html.to_ascii_lowercase();
     let bytes = html.as_bytes();
     let mut out = Vec::new();
@@ -199,7 +199,7 @@ pub(crate) fn extract_script_tags(html: &str) -> Vec<ScriptTag> {
     out
 }
 
-pub(crate) fn script_type(attrs: &HashMap<String, String>) -> String {
+pub fn script_type(attrs: &HashMap<String, String>) -> String {
     script_type_essence(attrs.get("type").map(String::as_str))
 }
 

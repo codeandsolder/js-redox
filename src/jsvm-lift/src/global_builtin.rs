@@ -51,7 +51,7 @@ fn global_object_name(
     })
 }
 
-pub(crate) fn collect_global_aliases(
+pub fn collect_global_aliases(
     program: &Program<'_>,
     scoping: &Scoping,
     budget: &WorkBudget,
@@ -116,7 +116,7 @@ pub(crate) fn collect_global_aliases(
     }
 }
 
-pub(crate) fn global_constructor(
+pub fn global_constructor(
     scoping: &Scoping,
     global_aliases: &HashMap<SymbolId, String>,
     callee: &Expression<'_>,
@@ -180,7 +180,7 @@ fn namespace_global(
     }
 }
 
-pub(crate) fn namespace_member_name<'a>(
+pub fn namespace_member_name<'a>(
     scoping: &Scoping,
     global_aliases: &HashMap<SymbolId, String>,
     expression: &'a Expression<'a>,

@@ -4,7 +4,7 @@ use std::{
 };
 
 #[derive(Debug)]
-pub(crate) struct TestFailure {
+pub struct TestFailure {
     context: &'static str,
     detail: String,
 }
@@ -33,9 +33,9 @@ impl Display for TestFailure {
 
 impl Error for TestFailure {}
 
-pub(crate) type TestResult = Result<(), TestFailure>;
+pub type TestResult = Result<(), TestFailure>;
 
-pub(crate) trait TestValue<T> {
+pub trait TestValue<T> {
     fn test_value(self, context: &'static str) -> Result<T, TestFailure>;
 }
 
@@ -51,7 +51,7 @@ impl<T, E: Debug> TestValue<T> for Result<T, E> {
     }
 }
 
-pub(crate) fn source_slice<'a>(
+pub fn source_slice<'a>(
     source: &'a str,
     start: u32,
     end: u32,
@@ -62,7 +62,7 @@ pub(crate) fn source_slice<'a>(
     source.get(start..end).test_value(context)
 }
 
-pub(crate) fn source_offset(
+pub fn source_offset(
     source: &str,
     needle: &str,
     context: &'static str,
@@ -71,16 +71,12 @@ pub(crate) fn source_offset(
     u32::try_from(offset).map_err(|error| TestFailure::error(context, error))
 }
 
-pub(crate) fn source_rfind(
-    source: &str,
-    needle: &str,
-    context: &'static str,
-) -> Result<u32, TestFailure> {
+pub fn source_rfind(source: &str, needle: &str, context: &'static str) -> Result<u32, TestFailure> {
     let offset = source.rfind(needle).test_value(context)?;
     u32::try_from(offset).map_err(|error| TestFailure::error(context, error))
 }
 
-pub(crate) fn source_span(
+pub fn source_span(
     source: &str,
     needle: &str,
     context: &'static str,

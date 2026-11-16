@@ -3,17 +3,17 @@ use anyhow::Result;
 use std::path::PathBuf;
 use work_budget::WorkBudget;
 
-pub(crate) mod html;
+pub mod html;
 mod materialize;
 mod parse;
-pub(crate) mod resource;
+pub mod resource;
 
 use materialize::materialize_project;
 use parse::read_har;
 
 /// Inputs controlling one HAR-to-capture-project import.
 #[derive(Debug)]
-pub(crate) struct HarProjectOptions {
+pub struct HarProjectOptions {
     pub har: PathBuf,
     pub output: PathBuf,
     pub overwrite: bool,
@@ -21,13 +21,13 @@ pub(crate) struct HarProjectOptions {
 
 /// Small import result for callers that need counts without decoding the manifest again.
 #[derive(Debug)]
-pub(crate) struct HarProjectSummary {
+pub struct HarProjectSummary {
     pub(crate) resources: usize,
     pub(crate) script_records: usize,
 }
 
 /// Materialize a HAR capture as a canonical capture project.
-pub(crate) fn import_har_project(
+pub fn import_har_project(
     args: &HarProjectOptions,
     budget: &WorkBudget,
 ) -> Result<HarProjectSummary> {
