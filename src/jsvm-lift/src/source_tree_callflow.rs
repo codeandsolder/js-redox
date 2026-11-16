@@ -794,15 +794,15 @@ fn format_view(view: &CallerView, original: &str) -> String {
     for path in &view.paths {
         let _ = write!(output, "## `{}`\n\n", path.functions.join(" → "));
         for edge in &path.links {
-            let _ = write!(
+            let _ = writeln!(
                 output,
-                "- `{}` → `{}` (**{}** at source bytes {}..{})\n",
+                "- `{}` → `{}` (**{}** at source bytes {}..{})",
                 edge.caller, edge.callee, edge.kind, edge.span[0], edge.span[1]
             );
             if let Some(receiver) = &edge.this_argument {
-                let _ = write!(
+                let _ = writeln!(
                     output,
-                    "  - this receiver: {receiver} (not a formal parameter)\n"
+                    "  - this receiver: {receiver} (not a formal parameter)"
                 );
             }
             for (idx, arg) in edge.arguments.iter().enumerate() {
@@ -810,9 +810,9 @@ fn format_view(view: &CallerView, original: &str) -> String {
                     || "dynamic expression".to_owned(),
                     |param| format!("caller parameter `{param}`"),
                 );
-                let _ = write!(
+                let _ = writeln!(
                     output,
-                    "  - argument {idx}: `{}` ← {prefix}\n",
+                    "  - argument {idx}: `{}` ← {prefix}",
                     arg.expression
                 );
             }
@@ -820,8 +820,8 @@ fn format_view(view: &CallerView, original: &str) -> String {
         output.push_str("\n**Leaf parameter provenance:**\n\n");
         for param in &path.leaf_parameters {
             if let Some(receiver) = &param.constructed_receiver {
-                let _ = write!(output,
-                    "- {} (parameter {}) comes from fresh receiver of new {} at source bytes {}..{}; inherited property behavior remains dynamic\n",
+                let _ = writeln!(output,
+                    "- {} (parameter {}) comes from fresh receiver of new {} at source bytes {}..{}; inherited property behavior remains dynamic",
                     param.param, param.index, receiver.constructor,
                     receiver.new_call_span[0], receiver.new_call_span[1]
                 );
@@ -829,16 +829,16 @@ fn format_view(view: &CallerView, original: &str) -> String {
             }
             match (&param.from_entry, &param.from_entry_index) {
                 (Some(name), Some(index)) => {
-                    let _ = write!(
+                    let _ = writeln!(
                         output,
-                        "- `{}` (parameter {}) ← entry `{}` (parameter {})\n",
+                        "- `{}` (parameter {}) ← entry `{}` (parameter {})",
                         param.param, param.index, name, index
                     );
                 }
                 _ => {
-                    let _ = write!(
+                    let _ = writeln!(
                         output,
-                        "- `{}` (parameter {}) ← dynamic/unknown (`{}`)\n",
+                        "- `{}` (parameter {}) ← dynamic/unknown (`{}`)",
                         param.param, param.index, param.input_expression
                     );
                 }
@@ -852,9 +852,9 @@ fn format_view(view: &CallerView, original: &str) -> String {
         "Function byte spans identify both endpoints; cycles do not truncate the graph.\n\n",
     );
     for edge in &view.reachable_edges {
-        let _ = write!(
+        let _ = writeln!(
             output,
-            "- {} ({}..{}) to {} ({}..{}) via {} at {}..{}\n",
+            "- {} ({}..{}) to {} ({}..{}) via {} at {}..{}",
             edge.call.caller,
             edge.from_span[0],
             edge.from_span[1],
@@ -888,9 +888,9 @@ fn format_view(view: &CallerView, original: &str) -> String {
             if parameter.unknown_or_nonentry_input {
                 names.push("unknown/non-entry input".to_owned());
             }
-            let _ = write!(
+            let _ = writeln!(
                 output,
-                "  - {} (parameter {}) ← {}\n",
+                "  - {} (parameter {}) ← {}",
                 parameter.name,
                 parameter.index,
                 names.join(" or ")

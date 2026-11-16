@@ -320,9 +320,9 @@ by AST type and byte length, not evaluated or silently truncated.
             || "none".to_owned(),
             |guard| format!("{} ({} total)", guard, node.guard_depth),
         );
-        let _ = write!(
+        let _ = writeln!(
             output,
-            "| {} | {} | {} {} | {} | {} | {} | {}:{} ({}–{}) |\n",
+            "| {} | {} | {} {} | {} | {} | {} | {}:{} ({}–{}) |",
             depth,
             index + 1,
             target,
@@ -573,9 +573,9 @@ in the original JavaScript. Byte ranges refer to that readable helper.
                 || "root of this chain".to_owned(),
                 |parent| collector.slot(parent, call.span),
             );
-            let _ = write!(
+            let _ = writeln!(
                 markdown,
-                "| {} | `{}` | line {line}:{column}, bytes {}–{} | {slot} |\n",
+                "| {} | `{}` | line {line}:{column}, bytes {}–{} | {slot} |",
                 depth + 1,
                 label(&call.callee),
                 call.span.start,
