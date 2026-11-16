@@ -32,10 +32,12 @@ pub struct RegistryAccessorResultUse {
     /// accessor returned a registered handler.
     pub cfg_write_free_path: bool,
 }
-/// A proven lazy-registry *accessor shape* whose returned value might reach
-/// an indirect call. The fast path calls the cell update method; the slow path
-/// returns a property of that cell after an update. This is NOT a proof that
-/// either result equals the registered handler.
+/// A proven lazy-registry *accessor shape* whose returned value might reach an
+/// indirect call.
+///
+/// The fast path calls the cell update method; the slow path returns a property of
+/// that cell after an update. This is NOT a proof that either result equals the
+/// registered handler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LazyRegistryAccessorResultUse {
     pub result: RegistryAccessorResultUse,
@@ -88,8 +90,9 @@ pub fn join_lazy_accessor_results(
     Ok(result)
 }
 
-/// A structural lazy accessor-to-call relation whose registry receiver also
-/// has an exact allocation/constructor origin at the SAME accessor call.
+/// A structural lazy accessor-to-call relation whose registry receiver also has an
+/// exact allocation/constructor origin at the SAME accessor call.
+///
 /// The dynamic key may remain unknown. This does NOT prove a returned handler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExactOriginLazyAccessorResultUse {

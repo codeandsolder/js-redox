@@ -200,9 +200,10 @@ pub struct CallerPath {
     pub leaf_parameters: Vec<ForwardedParameter>,
 }
 
-/// Each reachable edge is stored once per original callsite. This graph is
-/// complete across statically resolved targets even when the browsable path
-/// index is depth-limited to avoid combinatorial explosion.
+/// Each reachable edge is stored once per original callsite.
+///
+/// This graph is complete across statically resolved targets even when the
+/// browsable path index is depth-limited to avoid combinatorial explosion.
 #[derive(Clone, Debug, Serialize)]
 pub struct ResolvedCallEdge {
     pub from_span: [u32; 2],
@@ -210,9 +211,11 @@ pub struct ResolvedCallEdge {
     pub call: CallLink,
 }
 
-/// A function parameter may have several entry-origin possibilities when
-/// multiple statically possible callsites converge. An unknown/literal input
-/// is represented separately; it never becomes a guessed entry parameter.
+/// A function parameter may have several entry-origin possibilities when multiple
+/// statically possible callsites converge.
+///
+/// An unknown/literal input is represented separately; it never becomes a guessed
+/// entry parameter.
 #[derive(Clone, Debug, Serialize)]
 pub struct ReachableParameter {
     pub name: String,
@@ -937,8 +940,10 @@ fn format_view(view: &CallerView, original: &str) -> String {
 }
 
 /// Discover exported member-assigned entry functions and their exact direct
-/// lexical call chains. `entry_member` optionally narrows to one member name;
-/// matching applies to AST property declarations, not arbitrary text.
+/// lexical call chains.
+///
+/// `entry_member` optionally narrows to one member name; matching applies to AST
+/// property declarations, not arbitrary text.
 pub fn reconstruct_caller_views(
     source: &str,
     entry_member: Option<&str>,

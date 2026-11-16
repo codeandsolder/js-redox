@@ -1,6 +1,7 @@
-//! Join a capture's initial HTML script source candidates to existing
-//! counter-positive V8 source instances, without inferring handler calls or
-//! asserting which HTML tag necessarily scheduled a same-byte script.
+//! Correlate initial HTML script candidates with counter-positive V8 instances.
+//!
+//! Do not infer handler calls or claim a particular HTML tag scheduled a
+//! script when multiple tags have identical source bytes.
 use crate::document_entrypoints::DocumentEntrypoints;
 use serde::Serialize;
 use serde_json::Value;
@@ -96,8 +97,10 @@ fn positive_instance(
 }
 
 /// Correlate initial HTML source *bytes* with counter-positive JS script
-/// instances. Identical bytes in separate tags/frames or injected scripts
-/// mean that an exact digest match is NOT proof a specific tag executed.
+/// instances.
+///
+/// Identical bytes in separate tags/frames or injected scripts mean that an exact
+/// digest match is NOT proof a specific tag executed.
 pub fn join_initial_source_coverage(
     documents: &[DocumentEntrypoints],
     runtime_scripts: &Value,

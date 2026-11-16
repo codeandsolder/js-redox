@@ -87,11 +87,12 @@ pub struct TableVmCandidate {
     pub architecture: String,
 }
 
-/// A call can consume a lazy registry-accessor result on a write-free CFG
-/// path, and both sites can refer to the same proven registry allocation.
-/// This is deliberately NOT a confirmed handler dispatch: the accessor may
-/// return a wrapper/projection rather than the originally installed function,
-/// and a CFG path does not prove that branch is feasible at runtime.
+/// A call can consume a lazy registry-accessor result on a write-free CFG path,
+/// and both sites can refer to the same proven registry allocation.
+///
+/// This is deliberately NOT a confirmed handler dispatch: the accessor may return
+/// a wrapper/projection rather than the originally installed function, and a CFG
+/// path does not prove that branch is feasible at runtime.
 #[derive(Debug, Clone, Serialize)]
 pub struct LazyRegistryIndirectCallCandidate {
     pub table_binding: String,
@@ -1498,10 +1499,12 @@ pub fn analyze(
     Ok(analysis)
 }
 
-/// Analyze handler tables while canonicalizing proven registry receivers by
-/// exact allocation identity. Install and read flows may differ: constructor
-/// initialization typically proves installs, while a seeded runtime method flow
-/// proves later reads through helper parameters.
+/// Analyze handler tables while canonicalizing proven registry receivers by exact
+/// allocation identity.
+///
+/// Install and read flows may differ: constructor initialization typically proves
+/// installs, while a seeded runtime method flow proves later reads through helper
+/// parameters.
 pub fn analyze_with_registry_origins(
     source: &str,
     program: &oxc_ast::ast::Program<'_>,

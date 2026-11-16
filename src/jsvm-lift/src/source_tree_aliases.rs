@@ -391,10 +391,12 @@ mod tests {
     }
 }
 
-/// A captured function can be linked to original lexical symbols only after
-/// its source-span and source-hash provenance are checked against the *raw*
-/// original program. Pretty-printed code has different offsets and must not
-/// silently serve as the provenance source.
+/// A captured function can be linked to original lexical symbols only after its
+/// source-span and source-hash provenance are checked against the *raw* original
+/// program.
+///
+/// Pretty-printed code has different offsets and must not silently serve as the
+/// provenance source.
 #[derive(Clone, Debug, Serialize)]
 pub struct CapturedAlias {
     pub binding: String,

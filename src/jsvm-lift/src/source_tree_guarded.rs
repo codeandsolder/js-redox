@@ -1,6 +1,8 @@
 //! Install source-proven, selector-specific fast paths *inside* the original
-//! function body. The original callable, its .call lookup and its unmodified
-//! fallback body remain in place. Guards inspect only simple formal bindings.
+//! function body.
+//!
+//! The original callable, its .call lookup and its unmodified fallback body remain
+//! in place. Guards inspect only simple formal bindings.
 //!
 //! Caller supplies variants proven by source_tree_specialize and transformed
 //! through the ordinary safe deobfuscator; this module rechecks the binding

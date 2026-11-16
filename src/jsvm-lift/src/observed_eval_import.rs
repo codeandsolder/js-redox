@@ -378,10 +378,11 @@ fn bytes_to_utf16(text: &str, offset: u32) -> Result<usize> {
     Ok(prefix.encode_utf16().count())
 }
 
-/// Inventory *all* executable unresolved direct-eval calls in the original
-/// source, including those with no capturable first argument. The producer
-/// refuses incomplete "all sites" captures instead of silently skipping
-/// unsupported cases.
+/// Inventory *all* executable unresolved direct-eval calls in the original source,
+/// including those with no capturable first argument.
+///
+/// The producer refuses incomplete "all sites" captures instead of silently
+/// skipping unsupported cases.
 pub fn discover_direct_eval_sites(original_path: &Path) -> Result<serde_json::Value> {
     let bytes = fs::read(original_path)?;
     let code = String::from_utf8(bytes.clone())?;

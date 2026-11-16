@@ -37,8 +37,10 @@ pub struct ProvenRegistryForwardingCall {
 }
 
 /// Structural proof that a call feeds one evaluated value through a proven
-/// registry forwarder. Unlike [`ProvenRegistryForwardingCall`], this does not
-/// require the value expression itself to be a function literal.
+/// registry forwarder.
+///
+/// Unlike [`ProvenRegistryForwardingCall`], this does not require the value
+/// expression itself to be a function literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenRegistryForwardingValueCall {
     pub call_start: u32,
@@ -69,8 +71,10 @@ pub struct ProvenRegistryReadCall {
 
 /// Structural proof that a registry accessor routes the loaded cell through a
 /// truthiness probe, an update method, and a projected property on the same
-/// symbol. This intentionally does not assign semantics to those properties; a
-/// lazy-cell theorem must separately prove what the cell object does.
+/// symbol.
+///
+/// This intentionally does not assign semantics to those properties; a lazy-cell
+/// theorem must separately prove what the cell object does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenLazyRegistryReadCall {
     pub read: ProvenRegistryReadCall,
@@ -3194,8 +3198,10 @@ impl<'a> Visit<'a> for LazyRegistryReadCallCollector<'_, '_> {
 }
 
 /// Find call sites of registry accessors whose loaded cell follows one proven
-/// lazy-accessor shape. The returned selector span belongs to the accessor
-/// function body; callers may feed it into symbolic normalization separately.
+/// lazy-accessor shape.
+///
+/// The returned selector span belongs to the accessor function body; callers may
+/// feed it into symbolic normalization separately.
 pub fn structurally_proven_lazy_registry_read_calls(
     program: &Program<'_>,
     scoping: &Scoping,

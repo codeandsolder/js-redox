@@ -1,5 +1,7 @@
 //! Restore descriptive lexical names from explicit metadata embedded in bundled
-//! JavaScript. This is ONLY a presentation transform for `src/_readable/`.
+//! JavaScript.
+//!
+//! This is ONLY a presentation transform for `src/_readable/`.
 //! `src/_deobfuscated/` keeps the semantics-preserving original names.
 use jsvm_safe_core::{eval_static_primitive, statically_resolved_symbol, StaticPrimitiveValue};
 use oxc_allocator::Allocator;
@@ -627,9 +629,10 @@ pub fn recover_readable_names(source: &str) -> Option<(String, usize)> {
     recover_readable_names_with_imports(source, None)
 }
 
-/// Recover component names imported from captured ESM modules. The caller
-/// supplies exact specifier-to-export mappings resolved by the project graph.
-/// Public ESM export names and import paths remain exactly as captured.
+/// Recover component names imported from captured ESM modules.
+///
+/// The caller supplies exact specifier-to-export mappings resolved by the project
+/// graph. Public ESM export names and import paths remain exactly as captured.
 pub fn recover_readable_names_with_imports(
     source: &str,
     imports: Option<&ImportedNames>,

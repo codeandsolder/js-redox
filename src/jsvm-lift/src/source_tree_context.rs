@@ -496,6 +496,7 @@ impl<'a> Visit<'a> for HandlerCallAnnotator<'_> {
 
 /// Generate local, inline provenance at direct helper calls, preserving the
 /// original program's binding distinction (including shadowed parameters).
+///
 /// The context extractor supplies the unique original-name join, while this
 /// handler's own Oxc scoping checks the actual reference at each call.
 pub fn annotate_handler_helper_calls(

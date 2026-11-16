@@ -1,6 +1,8 @@
-//! Compose initial HTML module roots with the existing contextual JS-reference
-//! and import-map resolver output. Never equate raw and transformed source bytes
-//! or interpret imported source offsets against the original capture.
+//! Compose initial HTML module roots with the existing contextual JS-reference and
+//! import-map resolver output.
+//!
+//! Never equate raw and transformed source bytes or interpret imported source
+//! offsets against the original capture.
 use crate::{
     capture_project::CaptureManifest,
     document_entrypoints::{CapturedScriptSource, DocumentEntrypoints},
