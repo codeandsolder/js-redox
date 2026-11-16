@@ -1272,6 +1272,78 @@ pub struct IntegerParameterEvent<'a> {
     pub parameter_bindings: &'a BTreeMap<usize, i64>,
 }
 
+// A protected event must be enclosed by exactly one while at the same
+// function level; nested functions and arrow bodies are deliberately ignored.
+fn unique_protected_while_span(body: &FunctionBody<'_>, event: Span) -> Option<Span> {
+    struct LoopProbe {
+        event: Span,
+        loops: Vec<Span>,
+    }
+    impl<'a> Visit<'a> for LoopProbe {
+        fn visit_while_statement(&mut self, statement: &WhileStatement<'a>) {
+            if statement.span.start <= self.event.start && self.event.end <= statement.span.end {
+                self.loops.push(statement.span);
+            }
+            walk::walk_while_statement(self, statement);
+        }
+        fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+        }
+    }
+    let mut loops = LoopProbe {
+        event,
+        loops: Vec::new(),
+    };
+    loops.visit_function_body(body);
+    match loops.loops.as_slice() {
+        [loop_span] => Some(*loop_span),
+        _ => None,
+    }
+}
+
+// Reject any state variable references captured by a nested function,
+// preserving the exact nested-depth accounting for functions and arrow bodies.
+fn protected_loop_captures_state(while_statement: &WhileStatement<'_>, state_var: &str) -> bool {
+    struct NestedStateReferenceProbe<'s> {
+        state_var: &'s str,
+        nested_depth: usize,
+        found: bool,
+    }
+    impl<'a> Visit<'a> for NestedStateReferenceProbe<'_> {
+        fn visit_identifier_reference(
+            &mut self,
+            identifier: &oxc_ast::ast::IdentifierReference<'a>,
+        ) {
+            if self.nested_depth > 0 && identifier.name.as_str() == self.state_var {
+                self.found = true;
+            }
+        }
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            self.nested_depth += 1;
+            walk::walk_function(self, function, flags);
+            self.nested_depth -= 1;
+        }
+        fn visit_arrow_function_expression(
+            &mut self,
+            function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+            self.nested_depth += 1;
+            walk::walk_arrow_function_expression(self, function);
+            self.nested_depth -= 1;
+        }
+    }
+    let mut nested_state = NestedStateReferenceProbe {
+        state_var,
+        nested_depth: 0,
+        found: false,
+    };
+    nested_state.visit_while_statement(while_statement);
+    nested_state.found
+}
+
 /// Prove an event unreachable inside a protected flattened state loop of the
 /// form `while (...) try { if (state == ...) ... } catch (...) { ... }` for a
 /// concrete direct call.
@@ -1323,32 +1395,7 @@ pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
                 return;
             };
 
-            struct LoopProbe {
-                event: Span,
-                loops: Vec<Span>,
-            }
-            impl<'a> Visit<'a> for LoopProbe {
-                fn visit_while_statement(&mut self, statement: &WhileStatement<'a>) {
-                    if statement.span.start <= self.event.start
-                        && self.event.end <= statement.span.end
-                    {
-                        self.loops.push(statement.span);
-                    }
-                    walk::walk_while_statement(self, statement);
-                }
-                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-                fn visit_arrow_function_expression(
-                    &mut self,
-                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                ) {
-                }
-            }
-            let mut loops = LoopProbe {
-                event: self.event,
-                loops: Vec::new(),
-            };
-            loops.visit_function_body(body);
-            let [loop_span] = loops.loops.as_slice() else {
+            let Some(loop_span) = unique_protected_while_span(body, self.event) else {
                 self.result = Some(false);
                 return;
             };
@@ -1400,41 +1447,7 @@ pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
                         return;
                     };
 
-                    struct NestedStateReferenceProbe<'s> {
-                        state_var: &'s str,
-                        nested_depth: usize,
-                        found: bool,
-                    }
-                    impl<'a> Visit<'a> for NestedStateReferenceProbe<'_> {
-                        fn visit_identifier_reference(
-                            &mut self,
-                            identifier: &oxc_ast::ast::IdentifierReference<'a>,
-                        ) {
-                            if self.nested_depth > 0 && identifier.name.as_str() == self.state_var {
-                                self.found = true;
-                            }
-                        }
-                        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-                            self.nested_depth += 1;
-                            walk::walk_function(self, function, flags);
-                            self.nested_depth -= 1;
-                        }
-                        fn visit_arrow_function_expression(
-                            &mut self,
-                            function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                        ) {
-                            self.nested_depth += 1;
-                            walk::walk_arrow_function_expression(self, function);
-                            self.nested_depth -= 1;
-                        }
-                    }
-                    let mut nested_state = NestedStateReferenceProbe {
-                        state_var: &state_var,
-                        nested_depth: 0,
-                        found: false,
-                    };
-                    nested_state.visit_while_statement(while_statement);
-                    if nested_state.found {
+                    if protected_loop_captures_state(while_statement, &state_var) {
                         self.result = Some(false);
                         return;
                     }
@@ -1535,7 +1548,7 @@ pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
             let mut runner = Runner {
                 source: self.source,
                 event: self.event,
-                target: *loop_span,
+                target: loop_span,
                 env,
                 result: None,
             };
@@ -5428,6 +5441,96 @@ mod tests {
         }
     }
 
+    // Keep the original tests' first-level traversal and last-matching-span
+    // behavior. This visitor deliberately does not enter nested function bodies.
+    fn last_direct_function_span(program: &Program<'_>) -> Option<Span> {
+        struct DirectFunctionSpan(Option<Span>);
+        impl<'a> Visit<'a> for DirectFunctionSpan {
+            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
+                self.0 = Some(function.span);
+            }
+        }
+        let mut finder = DirectFunctionSpan(None);
+        finder.visit_program(program);
+        finder.0
+    }
+
+    #[test]
+    fn protected_loop_selection_rejects_ambiguous_nested_enclosures() -> TestResult {
+        let source = "function f() { while (a) { while (b) { target(); } } }";
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let function = parsed
+            .program
+            .body
+            .first()
+            .and_then(|statement| match statement {
+                Statement::FunctionDeclaration(function) => Some(function),
+                _ => None,
+            })
+            .test_value("function declaration")?;
+        let body = function.body.as_deref().test_value("function body")?;
+        let event = source_span(source, "target()", "target call")?;
+        assert_eq!(unique_protected_while_span(body, event), None);
+
+        let source = "function f() { while (a) { target(); } }";
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let function = parsed
+            .program
+            .body
+            .first()
+            .and_then(|statement| match statement {
+                Statement::FunctionDeclaration(function) => Some(function),
+                _ => None,
+            })
+            .test_value("simple function declaration")?;
+        let body = function
+            .body
+            .as_deref()
+            .test_value("simple function body")?;
+        let event = source_span(source, "target()", "simple target call")?;
+        assert!(unique_protected_while_span(body, event).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn protected_loop_capture_probe_respects_nested_function_depth() -> TestResult {
+        let allocator = Allocator::default();
+        let parsed = parse_program(
+            &allocator,
+            "while (true) { state; const closure = () => state; }",
+            SourceType::cjs(),
+        );
+        assert!(parsed.is_clean());
+        let statement = parsed
+            .program
+            .body
+            .first()
+            .and_then(|statement| match statement {
+                Statement::WhileStatement(statement) => Some(statement),
+                _ => None,
+            })
+            .test_value("while statement")?;
+        assert!(protected_loop_captures_state(statement, "state"));
+        assert!(!protected_loop_captures_state(statement, "other"));
+
+        let parsed = parse_program(&allocator, "while (true) { state; }", SourceType::cjs());
+        assert!(parsed.is_clean());
+        let statement = parsed
+            .program
+            .body
+            .first()
+            .and_then(|statement| match statement {
+                Statement::WhileStatement(statement) => Some(statement),
+                _ => None,
+            })
+            .test_value("direct while statement")?;
+        assert!(!protected_loop_captures_state(statement, "state"));
+        Ok(())
+    }
+
     fn detect(source: &str) -> DetectedStateMachines {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -6287,17 +6390,7 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
-        struct FunctionSpan {
-            span: Option<Span>,
-        }
-        impl<'a> Visit<'a> for FunctionSpan {
-            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
-                self.span = Some(function.span);
-            }
-        }
-        let mut function = FunctionSpan { span: None };
-        function.visit_program(&parsed.program);
-        let function = function.span.test_value("function span")?;
+        let function = last_direct_function_span(&parsed.program).test_value("function span")?;
         let start = source_offset(source, "sink(Y)", "sink(Y) offset")?;
         let event = Span::new(start, start + 7);
         assert!(
@@ -6339,17 +6432,7 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
-        struct FunctionSpan {
-            span: Option<Span>,
-        }
-        impl<'a> Visit<'a> for FunctionSpan {
-            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
-                self.span = Some(function.span);
-            }
-        }
-        let mut function = FunctionSpan { span: None };
-        function.visit_program(&parsed.program);
-        let function = function.span.test_value("function span")?;
+        let function = last_direct_function_span(&parsed.program).test_value("function span")?;
         let start = source_offset(source, "sink(Y)", "sink(Y) offset")?;
         let event = Span::new(start, start + 7);
         assert!(
@@ -6380,17 +6463,7 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
-        struct FunctionSpan {
-            span: Option<Span>,
-        }
-        impl<'a> Visit<'a> for FunctionSpan {
-            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
-                self.span = Some(function.span);
-            }
-        }
-        let mut function = FunctionSpan { span: None };
-        function.visit_program(&parsed.program);
-        let function = function.span.test_value("function span")?;
+        let function = last_direct_function_span(&parsed.program).test_value("function span")?;
         let start = source_offset(source, "sink(Y)", "sink(Y) offset")?;
         let event = Span::new(start, start + 7);
         assert!(
@@ -6600,15 +6673,7 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
-        struct FunctionSpan(Option<Span>);
-        impl<'a> Visit<'a> for FunctionSpan {
-            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
-                self.0 = Some(function.span);
-            }
-        }
-        let mut function = FunctionSpan(None);
-        function.visit_program(&parsed.program);
-        let function = function.0.test_value("function span")?;
+        let function = last_direct_function_span(&parsed.program).test_value("function span")?;
         let start = source_offset(source, "target()", "target() offset")?;
         let event = Span::new(start, start + 8);
         assert!(
@@ -6650,15 +6715,7 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
-        struct FunctionSpan(Option<Span>);
-        impl<'a> Visit<'a> for FunctionSpan {
-            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
-                self.0 = Some(function.span);
-            }
-        }
-        let mut function = FunctionSpan(None);
-        function.visit_program(&parsed.program);
-        let function = function.0.test_value("function span")?;
+        let function = last_direct_function_span(&parsed.program).test_value("function span")?;
         let start = source_offset(source, "target()", "target() offset")?;
         assert!(
             prove_function_structured_branch_event_unreachable_with_integer_parameters(
@@ -6686,15 +6743,7 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
-        struct FunctionSpan(Option<Span>);
-        impl<'a> Visit<'a> for FunctionSpan {
-            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
-                self.0 = Some(function.span);
-            }
-        }
-        let mut function = FunctionSpan(None);
-        function.visit_program(&parsed.program);
-        let function = function.0.test_value("function span")?;
+        let function = last_direct_function_span(&parsed.program).test_value("function span")?;
         let event_start = source_offset(source, "observe(cell)", "observe call")?
             .checked_add(u32::try_from("observe(".len()).test_value("observe prefix length")?)
             .test_value("observe argument offset")?;
@@ -6803,15 +6852,7 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
-        struct FunctionSpan(Option<Span>);
-        impl<'a> Visit<'a> for FunctionSpan {
-            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
-                self.0 = Some(function.span);
-            }
-        }
-        let mut function = FunctionSpan(None);
-        function.visit_program(&parsed.program);
-        let function = function.0.test_value("function span")?;
+        let function = last_direct_function_span(&parsed.program).test_value("function span")?;
         let start = source_offset(source, "L = U & Q", "L = U & Q offset")?;
         assert!(
             prove_function_structured_branch_event_unreachable_with_integer_parameters(
@@ -6837,15 +6878,7 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
-        struct FunctionSpan(Option<Span>);
-        impl<'a> Visit<'a> for FunctionSpan {
-            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
-                self.0 = Some(function.span);
-            }
-        }
-        let mut function = FunctionSpan(None);
-        function.visit_program(&parsed.program);
-        let function = function.0.test_value("function span")?;
+        let function = last_direct_function_span(&parsed.program).test_value("function span")?;
         let start = source_offset(source, "state = 1", "state = 1 offset")?;
         assert!(
             prove_function_structured_branch_event_unreachable_with_integer_parameters(
@@ -6871,15 +6904,7 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
-        struct FunctionSpan(Option<Span>);
-        impl<'a> Visit<'a> for FunctionSpan {
-            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
-                self.0 = Some(function.span);
-            }
-        }
-        let mut function = FunctionSpan(None);
-        function.visit_program(&parsed.program);
-        let function = function.0.test_value("function span")?;
+        let function = last_direct_function_span(&parsed.program).test_value("function span")?;
         let start = source_offset(source, "target()", "target() offset")?;
         let event = Span::new(start, start + 8);
         assert!(
@@ -6922,17 +6947,7 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
-        struct FunctionSpan {
-            span: Option<Span>,
-        }
-        impl<'a> Visit<'a> for FunctionSpan {
-            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
-                self.span = Some(function.span);
-            }
-        }
-        let mut function = FunctionSpan { span: None };
-        function.visit_program(&parsed.program);
-        let function = function.span.test_value("function span")?;
+        let function = last_direct_function_span(&parsed.program).test_value("function span")?;
         let start = source_offset(source, "sink(J)", "sink(J) offset")?;
         let event = Span::new(start, start + 7);
         assert!(
@@ -6967,17 +6982,8 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
-        struct FunctionSpan {
-            span: Option<Span>,
-        }
-        impl<'a> Visit<'a> for FunctionSpan {
-            fn visit_function(&mut self, function: &Function<'a>, _flags: ScopeFlags) {
-                self.span = Some(function.span);
-            }
-        }
-        let mut function = FunctionSpan { span: None };
-        function.visit_program(&parsed.program);
-        let function = function.span.test_value("protected function span")?;
+        let function =
+            last_direct_function_span(&parsed.program).test_value("protected function span")?;
         let event = source_span(source, "target()", "protected target event")?;
         Ok(
             prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
