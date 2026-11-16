@@ -363,8 +363,8 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
             fs::write(handlers_dir.join(&name), format!("{header}{readable}"))?;
         }
         let _ =
-            write!(index,
-            "| {} | [view](handlers/{}) | [evidence](handlers/{}) | {} | {} | {}..{} | {}..{} |\n",
+            writeln!(index,
+            "| {} | [view](handlers/{}) | [evidence](handlers/{}) | {} | {} | {}..{} | {}..{} |",
             capture.exact_key,
             name,
             evidence_name,
@@ -434,9 +434,9 @@ For the complete evidence, see the per-handler evidence JSON files and analysis.
                 } else {
                     matching_handlers.join(", ")
                 };
-                let _ = write!(
+                let _ = writeln!(
                     index,
-                    "| {phase_label} | {label} | {start}..{end} | {enclosing} | {related} |\n"
+                    "| {phase_label} | {label} | {start}..{end} | {enclosing} | {related} |"
                 );
             }
         }

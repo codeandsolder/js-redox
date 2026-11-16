@@ -784,7 +784,7 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
             *total_transforms.entry(kind.to_owned()).or_default() += count;
         }
         let n: usize = transforms.values().sum();
-        let _ = write!(md, "| [{label}]({label}) | {n} | {status} |\n");
+        let _ = writeln!(md, "| [{label}]({label}) | {n} | {status} |");
         rows.push(json!({
             "path": label,
             "status": status,
@@ -952,9 +952,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(folder.join(&explained_relative), &explained.source)?;
-                let _ = write!(
+                let _ = writeln!(
                     explained_index,
-                    "- [{}]({}) — {} explained accesses across {} bindings\n",
+                    "- [{}]({}) — {} explained accesses across {} bindings",
                     helper.name,
                     explained_relative.trim_start_matches("explained/"),
                     explained.annotated_reads,
@@ -1022,9 +1022,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                         || owner.to_owned(),
                         |span| format!("{owner} ({}..{})", span[0], span[1]),
                     );
-                    let _ = write!(
+                    let _ = writeln!(
                         report,
-                        "| {}..{} | {}..{} | {} | {} | {} |\n",
+                        "| {}..{} | {}..{} | {} | {} | {} |",
                         site.reference[0],
                         site.reference[1],
                         site.operation[0],
@@ -1061,9 +1061,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 "or execution-order proof.\n\n",
             ));
             for (name, path) in &binding_write_rows {
-                let _ = write!(
+                let _ = writeln!(
                     index,
-                    "- [{}]({})\n",
+                    "- [{}]({})",
                     name,
                     path.trim_start_matches("binding-writes/"),
                 );
@@ -1086,9 +1086,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                  helper and executable bytes are unchanged.\n\n",
             );
             for (name, path) in &call_layout_rows {
-                let _ = write!(
+                let _ = writeln!(
                     index,
-                    "- [{name}]({})\n",
+                    "- [{name}]({})",
                     path.trim_start_matches("expression-layouts/")
                 );
             }
@@ -1106,9 +1106,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 "# Assignment containment in long expressions\n\nThese source-backed AST outlines show nested writes, enclosing assignment relationships and conditional guard ancestry, not execution order.\n\n",
             );
             for (name, path) in &assignment_outline_rows {
-                let _ = write!(
+                let _ = writeln!(
                     index,
-                    "- [{name}]({})\n",
+                    "- [{name}]({})",
                     path.trim_start_matches("assignment-outlines/")
                 );
             }
@@ -1125,9 +1125,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 "# Ordered evaluation phases in long assignments\n\n                 Static AST-derived phase plans, not runtime traces. Guards                  identify mutually exclusive branches and opaque subtrees                  preserve unknown internal ordering. Source offsets belong                  to the readable lexical helper, not the captured original.\n\n",
             );
             for (name, path) in &ordered_phase_rows {
-                let _ = write!(
+                let _ = writeln!(
                     index,
-                    "- [{name}]({})\n",
+                    "- [{name}]({})",
                     path.trim_start_matches("evaluation-phases/")
                 );
             }
@@ -1147,9 +1147,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                  original helper for conditional evaluation and receiver semantics.\n\n",
             );
             for (name, path, layout_path) in &call_spine_rows {
-                let _ = write!(
+                let _ = writeln!(
                     index,
-                    "- [{name}]({}) — [source layout](../{layout_path})\n",
+                    "- [{name}]({}) — [source layout](../{layout_path})",
                     path.trim_start_matches("call-spines/")
                 );
             }
@@ -1250,9 +1250,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 fs::create_dir_all(parent)?;
             }
             fs::write(folder.join(&relative), &annotated.source)?;
-            let _ = write!(
+            let _ = writeln!(
                 annotated_index,
-                "- [{}]({}) — {} original lexical helper call annotations: {}\n",
+                "- [{}]({}) — {} original lexical helper call annotations: {}",
                 handler.path,
                 handler.path,
                 annotated.call_count,
@@ -1299,9 +1299,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 fs::create_dir_all(parent)?;
             }
             fs::write(folder.join(&relative), expanded.source)?;
-            let _ = write!(
+            let _ = writeln!(
                 expanded_index,
-                "- [{}]({}) — {} original helper calls expanded: {}\n",
+                "- [{}]({}) — {} original helper calls expanded: {}",
                 handler.path,
                 handler.path,
                 expanded.expanded_calls,
@@ -1415,9 +1415,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _ = write!(
+            let _ = writeln!(
                 specializations_md,
-                "- [{}]({display_file}) ({constants}), used at {caller_links}\n",
+                "- [{}]({display_file}) ({constants}), used at {caller_links}",
                 specialized.helper
             );
             specialization_rows.push(json!({
@@ -1458,7 +1458,7 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _ = write!(md, "- [{}]({}) — {}\n", handler.path, handler.path, links);
+            let _ = writeln!(md, "- [{}]({}) — {}", handler.path, handler.path, links);
         }
         // Only a *byte-identical raw* original allows the source spans and
         // the pre-existing SHA-256 headers to identify external lexical
@@ -1495,9 +1495,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                         fs::create_dir_all(parent)?;
                     }
                     fs::write(&destination, &view.annotated_source)?;
-                    let _ = write!(
+                    let _ = writeln!(
                         index,
-                        "- [{}]({}) — {} explained accesses, original bytes {}..{}\n",
+                        "- [{}]({}) — {} explained accesses, original bytes {}..{}",
                         view.input_path,
                         view.input_path,
                         view.annotated_reads,
@@ -1561,7 +1561,7 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                     if !helpers.is_empty() {
                         source.push_str("## Reconstructed helper implementations\n\n");
                         for (name, path) in helpers {
-                            let _ = write!(source, "- [`{name}`](../{path})\n");
+                            let _ = writeln!(source, "- [`{name}`](../{path})");
                         }
                         source.push('\n');
                     }
@@ -1626,9 +1626,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                             "## Captured handlers from the original lexical function\n\n",
                         );
                         for path in &linked {
-                            let _ = write!(
+                            let _ = writeln!(
                                 source,
-                                "- [Original-bound `{}`](../{})\n",
+                                "- [Original-bound `{}`](../{})",
                                 Path::new(path)
                                     .file_name()
                                     .and_then(|name| name.to_str())
@@ -1639,9 +1639,9 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                         source.push('\n');
                     }
                     fs::write(folder.join(&relative), &source)?;
-                    let _ = write!(
+                    let _ = writeln!(
                         index,
-                        "- [{}](entry-{index_num}.md): {} resolved paths\n",
+                        "- [{}](entry-{index_num}.md): {} resolved paths",
                         view.entry,
                         view.paths.len()
                     );
@@ -2091,7 +2091,7 @@ fn write_callsite_specializations(
     navigable.push_str("rewrite counts indicate additional semantic simplifications.\n\n");
     navigable.push_str("## Largest source reductions\n\n");
     for (_, _, _, summary) in ranked.iter().take(20) {
-        let _ = write!(navigable, "- {summary}\n");
+        let _ = writeln!(navigable, "- {summary}");
     }
     navigable.push_str("\n## All variants grouped by resolved helper\n\n");
     for ((name, span), variants) in grouped {
@@ -2103,7 +2103,7 @@ fn write_callsite_specializations(
             variants.len()
         );
         for variant in variants {
-            let _ = write!(navigable, "- {variant}\n");
+            let _ = writeln!(navigable, "- {variant}");
         }
         navigable.push('\n');
     }
@@ -2132,9 +2132,9 @@ fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
     for (number, view) in views.iter().enumerate() {
         let path = format!("entry-{number}.md");
         fs::write(args.output.join(&path), &view.source)?;
-        let _ = write!(
+        let _ = writeln!(
             index,
-            "- [{}]({path}) — {} resolved paths\n",
+            "- [{}]({path}) — {} resolved paths",
             view.entry,
             view.paths.len()
         );
