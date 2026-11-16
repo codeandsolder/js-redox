@@ -257,7 +257,7 @@ fn polish_lexical_helper_view(
     format_output: bool,
     budgets: &AnalysisBudgets,
 ) -> Result<PolishedHelperView> {
-    let reflowed = reflow_single_trip_loops(&source)?;
+    let reflowed = reflow_single_trip_loops(&source);
     let (source, mut subsequent_transforms, post_reflow_error) = if reflowed.rewritten_loops == 0 {
         (source, BTreeMap::new(), None)
     } else {
@@ -278,7 +278,7 @@ fn polish_lexical_helper_view(
         }
     };
 
-    let returns = recover_terminal_returns(&source)?;
+    let returns = recover_terminal_returns(&source);
     let adjacent_returns = returns.adjacent_returns;
     let labeled_return_joins = returns.labeled_joins;
     let guarded_return_joins = returns.guarded_joins;

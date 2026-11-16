@@ -5,7 +5,6 @@
 //! earlier branch continues that same loop. Preserve the initialization,
 //! condition, and evaluation effects of guarded breaks while eliminating
 //! unreachable updates and the loop control frame. Original source is retained.
-use anyhow::Result;
 use jsvm_safe_core::{is_inert_static_literal, known_static_bool_with_resolver};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -267,7 +266,9 @@ impl<'a> Visit<'a> for LoopCandidate<'_> {
 ///
 /// Reparse each pass so nested candidates become eligible after the containing
 /// loop has been rewritten.
-pub fn reflow_single_trip_loops(source: &str) -> Result<ReflowedLoops> {
+/// Invalid detached syntax is left unchanged; this pass has no recoverable errors.
+#[must_use]
+pub fn reflow_single_trip_loops(source: &str) -> ReflowedLoops {
     let mut output = source.to_owned();
     let mut rewritten_loops = 0;
     loop {
@@ -319,36 +320,34 @@ pub fn reflow_single_trip_loops(source: &str) -> Result<ReflowedLoops> {
             break;
         }
     }
-    Ok(ReflowedLoops {
+    ReflowedLoops {
         source: output,
         rewritten_loops,
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::reflow_single_trip_loops;
-    use anyhow::Result;
 
     #[test]
-    fn reflow_const_function_with_resolved_outer_lexical_and_guarded_break() -> Result<()> {
+    fn reflow_const_function_with_resolved_outer_lexical_and_guarded_break() {
         let src = r#"const oU = function(log) {
             log.push("step");
             Hm = 42;
             while ({}) if (log.push("loop"), true) break;
             return Hm;
         };"#;
-        let out = reflow_single_trip_loops(src)?;
+        let out = reflow_single_trip_loops(src);
         assert_eq!(out.rewritten_loops, 1, "{:?}", out);
         assert!(!out.source.contains("while"), "{}", out.source);
         assert!(out.source.contains("log.push"), "{}", out.source);
-        Ok(())
     }
 
     #[test]
-    fn for_preserves_initializer_and_guard_but_eliminates_update() -> Result<()> {
+    fn for_preserves_initializer_and_guard_but_eliminates_update() {
         let src = "function f(t){for (init(); t; update()) { work(); break; } return 2;}";
-        let out = reflow_single_trip_loops(src)?;
+        let out = reflow_single_trip_loops(src);
         assert_eq!(out.rewritten_loops, 1);
         assert!(
             out.source.contains("init(); if (t) { work();"),
@@ -356,23 +355,21 @@ mod tests {
             out.source
         );
         assert!(!out.source.contains("update()"));
-        Ok(())
     }
 
     #[test]
-    fn labeled_original_helper_breaks_remain_legal() -> Result<()> {
+    fn labeled_original_helper_breaks_remain_legal() {
         let src = "const O=function(J,Q,Y,q){for(0;(Q&90)==Q;true){a:{if(J.Y){q=w8(J,J.D);break a;}q=Y;}break;}return q;};";
-        let out = reflow_single_trip_loops(src)?;
+        let out = reflow_single_trip_loops(src);
         assert_eq!(out.rewritten_loops, 1);
         assert!(out.source.contains("a:{if(J.Y)"), "{}", out.source);
         assert!(out.source.contains("if ((Q&90)==Q)"), "{}", out.source);
-        Ok(())
     }
 
     #[test]
-    fn nested_loops_reflow_and_preserve_inner_continue() -> Result<()> {
+    fn nested_loops_reflow_and_preserve_inner_continue() {
         let src = "function f(x){while(x){for(let i=0;i<3;i++){if(i)continue;}emit();break;}}";
-        let out = reflow_single_trip_loops(src)?;
+        let out = reflow_single_trip_loops(src);
         assert_eq!(out.rewritten_loops, 1);
         assert!(
             out.source.contains("for(let i=0;i<3;i++)"),
@@ -380,21 +377,19 @@ mod tests {
             out.source
         );
         assert!(out.source.contains("if (x)"), "{}", out.source);
-        Ok(())
     }
 
     #[test]
-    fn while_and_do_while_guard_evaluation() -> Result<()> {
+    fn while_and_do_while_guard_evaluation() {
         let src = "function f(x){while(check(x)){if(x)return 4;break;}do{work(x);break;}while(shouldNotRun());}";
-        let out = reflow_single_trip_loops(src)?;
+        let out = reflow_single_trip_loops(src);
         assert_eq!(out.rewritten_loops, 2);
         assert!(out.source.contains("if (check(x))"), "{}", out.source);
         assert!(!out.source.contains("shouldNotRun()"), "{}", out.source);
-        Ok(())
     }
 
     #[test]
-    fn reflows_effectful_but_truthy_guarded_breaks() -> Result<()> {
+    fn reflows_effectful_but_truthy_guarded_breaks() {
         let source = r#"function f(){
             while ({}) if ((trace.push("while"), {})) break;
             while ("X") if ((trace.push("again"), true)) {break;}
@@ -404,7 +399,7 @@ mod tests {
             }
             do if ((trace.push("do"), {})) break; while (never());
         }"#;
-        let out = reflow_single_trip_loops(source)?;
+        let out = reflow_single_trip_loops(source);
         assert_eq!(out.rewritten_loops, 4, "{}", out.source);
         assert!(!out.source.contains("while ("), "{}", out.source);
         assert!(!out.source.contains("update()"), "{}", out.source);
@@ -424,11 +419,10 @@ mod tests {
                 out.source
             );
         }
-        Ok(())
     }
 
     #[test]
-    fn discards_inert_guard_values_but_keeps_every_effect() -> Result<()> {
+    fn discards_inert_guard_values_but_keeps_every_effect() {
         let source = r#"function f(log, obj){
             while (true) if ((log.push("first"), (obj.value, {}))) break;
             while ("X") if ((log.push("second"), [])) break;
@@ -436,7 +430,7 @@ mod tests {
             while (true) if ((log.push("fourth"), "always")) break;
             while (true) if ((log.push("fifth"), /x/)) break;
         }"#;
-        let out = reflow_single_trip_loops(source)?;
+        let out = reflow_single_trip_loops(source);
         assert_eq!(out.rewritten_loops, 5, "{}", out.source);
         for preserved in [
             "log.push(\"first\")",
@@ -455,22 +449,20 @@ mod tests {
         for inert in ["({});", "[];", "(17);", "(\"always\");", "(/x/);"] {
             assert!(!out.source.contains(inert), "{inert}: {}", out.source);
         }
-        Ok(())
     }
 
     #[test]
-    fn retains_completion_sensitive_guards_at_script_level() -> Result<()> {
+    fn retains_completion_sensitive_guards_at_script_level() {
         let source = "while(true)if((trace(),{}))break;";
-        let out = reflow_single_trip_loops(source)?;
+        let out = reflow_single_trip_loops(source);
         assert_eq!(out.rewritten_loops, 0);
         assert_eq!(out.source, source);
-        Ok(())
     }
 
     #[test]
-    fn preserves_direct_eval_and_accessor_effects_in_guard_prefixes() -> Result<()> {
+    fn preserves_direct_eval_and_accessor_effects_in_guard_prefixes() {
         let source = "function f(obj){while(true)if((eval('obj.seen=1'),obj.value,{}))break;}";
-        let out = reflow_single_trip_loops(source)?;
+        let out = reflow_single_trip_loops(source);
         assert_eq!(out.rewritten_loops, 1);
         assert!(
             out.source.contains("(eval('obj.seen=1'));"),
@@ -479,11 +471,10 @@ mod tests {
         );
         assert!(out.source.contains("(obj.value);"), "{}", out.source);
         assert!(!out.source.contains("({});"), "{}", out.source);
-        Ok(())
     }
 
     #[test]
-    fn does_not_assume_effectful_or_false_guards_are_truthy() -> Result<()> {
+    fn does_not_assume_effectful_or_false_guards_are_truthy() {
         for source in [
             "function f(x){while('X')if(x)break;}",
             "function f(){while('X')if((effect(),false))break;}",
@@ -493,47 +484,43 @@ mod tests {
             "function f(){while('X'){if((effect(),{}))continue;}}",
             "function f(){while('X'){if((effect(),{}))break outer;}}",
         ] {
-            let out = reflow_single_trip_loops(source)?;
+            let out = reflow_single_trip_loops(source);
             assert_eq!(out.rewritten_loops, 0, "{source}: {}", out.source);
             assert_eq!(out.source, source);
         }
-        Ok(())
     }
 
     #[test]
-    fn one_trip_guarded_break_rejects_outer_loop_escapes() -> Result<()> {
+    fn one_trip_guarded_break_rejects_outer_loop_escapes() {
         for source in [
             "function f(x){outer:while(x){if(x)continue outer;if((tick(),{}))break;}}",
             "function f(x){while(x){if(x)continue;if((tick(),{}))break;}}",
             "function f(x){while(x){if(x)break;if((tick(),{}))break;}}",
         ] {
-            let out = reflow_single_trip_loops(source)?;
+            let out = reflow_single_trip_loops(source);
             assert_eq!(out.rewritten_loops, 0, "{source}: {}", out.source);
         }
-        Ok(())
     }
 
     #[test]
-    fn unsupported_detached_syntax_does_not_fail_the_source_tree() -> Result<()> {
+    fn unsupported_detached_syntax_does_not_fail_the_source_tree() {
         let src = "function f( { this is not valid";
-        let out = reflow_single_trip_loops(src)?;
+        let out = reflow_single_trip_loops(src);
         assert_eq!(out.source, src);
         assert_eq!(out.rewritten_loops, 0);
-        Ok(())
     }
 
     #[test]
-    fn rejects_paths_that_can_break_early_or_repeat_loop() -> Result<()> {
+    fn rejects_paths_that_can_break_early_or_repeat_loop() {
         for src in [
             "function f(x){while(x){if(x)continue;break;}}",
             "function f(x){for(;x;update()){if(x)break;work();break;}}",
             "function f(x){outer:while(x){if(x)continue outer;break;}}",
             "function f(x){while(x){switch(x){case 1: continue;}break;}}",
         ] {
-            let out = reflow_single_trip_loops(src)?;
+            let out = reflow_single_trip_loops(src);
             assert_eq!(out.rewritten_loops, 0, "{src}: {}", out.source);
             assert_eq!(out.source, src);
         }
-        Ok(())
     }
 }
