@@ -382,6 +382,7 @@ fn is_tiny_proxy_function(expr: &Expression<'_>) -> bool {
     }
 }
 
+#[must_use]
 pub fn apiish_name(value: &str) -> bool {
     matches!(
         value,

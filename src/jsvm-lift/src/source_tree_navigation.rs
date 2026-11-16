@@ -453,6 +453,7 @@ fn label(raw: &str) -> String {
 /// Two independent navigational projections. A deep call chain supplies an
 /// optional Markdown outline, while any long expression can receive a layout
 /// even if the helper has no deeply nested calls.
+#[must_use]
 pub fn helper_navigation(source: &str, helper_path: &str) -> Option<HelperNavigation> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::unambiguous());

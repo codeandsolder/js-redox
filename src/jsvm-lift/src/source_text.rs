@@ -1,3 +1,4 @@
+#[must_use]
 pub fn preview(source: &str, start: u32, end: u32, cap: usize) -> String {
     let start = start as usize;
     let end = (end as usize).min(source.len());
