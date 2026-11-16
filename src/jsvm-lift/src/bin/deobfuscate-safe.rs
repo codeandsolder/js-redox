@@ -25,6 +25,7 @@ use jsvm_lift::{
     source_tree_specialize::{specialize_calls, specialize_resolved_call_graph},
 };
 use serde_json::json;
+use std::fmt::Write as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -512,16 +513,16 @@ fn materialize_full_lexical_context(
             if changed { " (polished)" } else { "" },
         );
         if let Some(path) = &layout_path {
-            entry.push_str(&format!(" · [expression layout]({path})"));
+            let _ = write!(entry, " · [expression layout]({path})");
         }
         if let Some(path) = &outline_path {
-            entry.push_str(&format!(" · [assignment outline]({path})"));
+            let _ = write!(entry, " · [assignment outline]({path})");
         }
         if let Some(path) = &ordered_phase_path {
-            entry.push_str(&format!(" · [evaluation phases]({path})"));
+            let _ = write!(entry, " · [evaluation phases]({path})");
         }
         if let Some(path) = &call_spine_path {
-            entry.push_str(&format!(" · [call spine]({path})"));
+            let _ = write!(entry, " · [call spine]({path})");
         }
         entry.push('\n');
         if from_original {
@@ -783,7 +784,7 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
             *total_transforms.entry(kind.to_owned()).or_default() += count;
         }
         let n: usize = transforms.values().sum();
-        md.push_str(&format!("| [{label}]({label}) | {n} | {status} |\n"));
+        let _ = write!(md, "| [{label}]({label}) | {n} | {status} |\n");
         rows.push(json!({
             "path": label,
             "status": status,
@@ -951,13 +952,14 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(folder.join(&explained_relative), &explained.source)?;
-                explained_index.push_str(&format!(
+                let _ = write!(
+                    explained_index,
                     "- [{}]({}) — {} explained accesses across {} bindings\n",
                     helper.name,
                     explained_relative.trim_start_matches("explained/"),
                     explained.annotated_reads,
                     explained.aliases.len()
-                ));
+                );
                 explained_rows.push(json!({
                     "helper": helper.name,
                     "source_path": relative,
@@ -966,12 +968,12 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                     "aliases": explained.aliases,
                 }));
             }
-            helper_index.push_str(&format!("- [{}]({})", helper.name, relative));
+            let _ = write!(helper_index, "- [{}]({})", helper.name, relative);
             if helper.mutable_binding {
                 helper_index.push_str(" — **binding reassigned in original program**");
             }
             if !helper.references.is_empty() {
-                helper_index.push_str(&format!(" — uses {}", helper.references.join(", ")));
+                let _ = write!(helper_index, " — uses {}", helper.references.join(", "));
             }
             helper_index.push('\n');
             if !helper.write_sites.is_empty() {
@@ -1020,7 +1022,8 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                         || owner.to_owned(),
                         |span| format!("{owner} ({}..{})", span[0], span[1]),
                     );
-                    report.push_str(&format!(
+                    let _ = write!(
+                        report,
                         "| {}..{} | {}..{} | {} | {} | {} |\n",
                         site.reference[0],
                         site.reference[1],
@@ -1029,7 +1032,7 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                         site.operation_kind,
                         owner,
                         value,
-                    ));
+                    );
                 }
                 fs::write(folder.join(&report_path), report)?;
                 binding_write_rows.push((helper.name.clone(), report_path));
@@ -1058,11 +1061,12 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 "or execution-order proof.\n\n",
             ));
             for (name, path) in &binding_write_rows {
-                index.push_str(&format!(
+                let _ = write!(
+                    index,
                     "- [{}]({})\n",
                     name,
                     path.trim_start_matches("binding-writes/"),
-                ));
+                );
             }
             fs::write(folder.join("binding-writes/README.md"), index)?;
             helper_index.push_str(
@@ -1082,10 +1086,11 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                  helper and executable bytes are unchanged.\n\n",
             );
             for (name, path) in &call_layout_rows {
-                index.push_str(&format!(
+                let _ = write!(
+                    index,
                     "- [{name}]({})\n",
                     path.trim_start_matches("expression-layouts/")
-                ));
+                );
             }
             fs::write(folder.join("expression-layouts/README.md"), index)?;
             helper_index.push_str(
@@ -1101,10 +1106,11 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 "# Assignment containment in long expressions\n\nThese source-backed AST outlines show nested writes, enclosing assignment relationships and conditional guard ancestry, not execution order.\n\n",
             );
             for (name, path) in &assignment_outline_rows {
-                index.push_str(&format!(
+                let _ = write!(
+                    index,
                     "- [{name}]({})\n",
                     path.trim_start_matches("assignment-outlines/")
-                ));
+                );
             }
             fs::write(folder.join("assignment-outlines/README.md"), index)?;
             helper_index.push_str(
@@ -1119,10 +1125,11 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 "# Ordered evaluation phases in long assignments\n\n                 Static AST-derived phase plans, not runtime traces. Guards                  identify mutually exclusive branches and opaque subtrees                  preserve unknown internal ordering. Source offsets belong                  to the readable lexical helper, not the captured original.\n\n",
             );
             for (name, path) in &ordered_phase_rows {
-                index.push_str(&format!(
+                let _ = write!(
+                    index,
                     "- [{name}]({})\n",
                     path.trim_start_matches("evaluation-phases/")
-                ));
+                );
             }
             fs::write(folder.join("evaluation-phases/README.md"), index)?;
             helper_index.push_str(
@@ -1140,10 +1147,11 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                  original helper for conditional evaluation and receiver semantics.\n\n",
             );
             for (name, path, layout_path) in &call_spine_rows {
-                index.push_str(&format!(
+                let _ = write!(
+                    index,
                     "- [{name}]({}) — [source layout](../{layout_path})\n",
                     path.trim_start_matches("call-spines/")
-                ));
+                );
             }
             fs::write(folder.join("call-spines/README.md"), index)?;
             helper_index.push_str(
@@ -1242,13 +1250,14 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 fs::create_dir_all(parent)?;
             }
             fs::write(folder.join(&relative), &annotated.source)?;
-            annotated_index.push_str(&format!(
+            let _ = write!(
+                annotated_index,
                 "- [{}]({}) — {} original lexical helper call annotations: {}\n",
                 handler.path,
                 handler.path,
                 annotated.call_count,
                 annotated.helpers.join(", ")
-            ));
+            );
             annotated_call_rows.push(json!({
                 "path": handler.path,
                 "annotated_path": relative,
@@ -1290,13 +1299,14 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 fs::create_dir_all(parent)?;
             }
             fs::write(folder.join(&relative), expanded.source)?;
-            expanded_index.push_str(&format!(
+            let _ = write!(
+                expanded_index,
                 "- [{}]({}) — {} original helper calls expanded: {}\n",
                 handler.path,
                 handler.path,
                 expanded.expanded_calls,
                 expanded.helpers.join(", ")
-            ));
+            );
             expanded_rows.push(json!({
                 "path": handler.path,
                 "expanded_path": relative,
@@ -1405,10 +1415,11 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            specializations_md.push_str(&format!(
+            let _ = write!(
+                specializations_md,
                 "- [{}]({display_file}) ({constants}), used at {caller_links}\n",
                 specialized.helper
-            ));
+            );
             specialization_rows.push(json!({
                 "helper": specialized.helper,
                 "arguments": specialized.arguments,
@@ -1447,10 +1458,7 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            md.push_str(&format!(
-                "- [{}]({}) — {}\n",
-                handler.path, handler.path, links
-            ));
+            let _ = write!(md, "- [{}]({}) — {}\n", handler.path, handler.path, links);
         }
         // Only a *byte-identical raw* original allows the source spans and
         // the pre-existing SHA-256 headers to identify external lexical
@@ -1487,14 +1495,15 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                         fs::create_dir_all(parent)?;
                     }
                     fs::write(&destination, &view.annotated_source)?;
-                    index.push_str(&format!(
+                    let _ = write!(
+                        index,
                         "- [{}]({}) — {} explained accesses, original bytes {}..{}\n",
                         view.input_path,
                         view.input_path,
                         view.annotated_reads,
                         view.original_span[0],
                         view.original_span[1]
-                    ));
+                    );
                     origin_rows.push(json!({
                         "input_path": view.input_path,
                         "annotated_path": format!("handler-origins/{}", view.input_path),
@@ -1552,7 +1561,7 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                     if !helpers.is_empty() {
                         source.push_str("## Reconstructed helper implementations\n\n");
                         for (name, path) in helpers {
-                            source.push_str(&format!("- [`{name}`](../{path})\n"));
+                            let _ = write!(source, "- [`{name}`](../{path})\n");
                         }
                         source.push('\n');
                     }
@@ -1606,33 +1615,36 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                         let complete = format!("caller-views/entry-{index_num}-all.md");
                         fs::write(folder.join(&complete), &view.source)?;
                         source = view.render_paths(&original, &focused_paths);
-                        source
-                            .push_str(&format!(
+                        let _ = write!(
+                            source,
                             "[All {} directly resolved call paths](entry-{index_num}-all.md).\n\n",
-                            view.paths.len()));
+                            view.paths.len()
+                        );
                     }
                     if !linked.is_empty() {
                         source.push_str(
                             "## Captured handlers from the original lexical function\n\n",
                         );
                         for path in &linked {
-                            source.push_str(&format!(
+                            let _ = write!(
+                                source,
                                 "- [Original-bound `{}`](../{})\n",
                                 Path::new(path)
                                     .file_name()
                                     .and_then(|name| name.to_str())
                                     .unwrap_or(path),
                                 path
-                            ));
+                            );
                         }
                         source.push('\n');
                     }
                     fs::write(folder.join(&relative), &source)?;
-                    index.push_str(&format!(
+                    let _ = write!(
+                        index,
                         "- [{}](entry-{index_num}.md): {} resolved paths\n",
                         view.entry,
                         view.paths.len()
-                    ));
+                    );
                     caller_view_rows.push(json!({
                         "entry": view.entry,
                         "entry_span": view.entry_span,
@@ -1644,24 +1656,24 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                         "reachable_functions": view.reachable_functions,
                     }));
                 }
-                index.push_str(&format!(
+                let _ = write!(index,
                     "\n[Browse {} original callsite-specialized helper bodies](specializations/README.md).\n",
                     graph_specialization_rows.len()
-                ));
+                );
                 fs::write(dir.join("README.md"), index)?;
-                helper_index.push_str(&format!(
+                let _ = write!(helper_index,
                     "\n[{} source-resolved helper variants](caller-views/specializations/README.md).\n",
                     graph_specialization_rows.len()
-                ));
+                );
                 helper_index
                     .push_str("\n[Caller-oriented parameter origins](caller-views/README.md).\n");
                 fs::write(folder.join("README.md"), &helper_index)?;
                 md.push_str("\n## Caller-oriented source and argument forwarding\n\n");
                 md.push_str("[Browse exact lexical call chains](lexical-context/caller-views/README.md).\n\n");
-                md.push_str(&format!(
+                let _ = write!(md,
                     "[Browse {} callsite-specialized readable helper bodies](lexical-context/caller-views/specializations/README.md).\n\n",
                     graph_specialization_rows.len()
-                ));
+                );
             }
         }
         let mut full_context = if let Some(iterations) = args.context_full_iterations {
@@ -1722,15 +1734,15 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 report["guarded_executable"] = metadata.clone();
             }
             let mut index = fs::read_to_string(whole_dir.join("README.md"))?;
-            index.push_str(&format!(
+            let _ = write!(index,
                 "\n[Guarded executable whole-program recovery]({relative}): {} proven fast paths in {} original function(s). Original fallback retained; captured source untouched.\n",
                 guarded.fast_paths, guarded.targeted_functions,
-            ));
+            );
             fs::write(whole_dir.join("README.md"), index)?;
-            md.push_str(&format!(
+            let _ = write!(md,
                 "\n[Browse source-proven guarded whole-program executable](lexical-context/whole-program/{relative}): {} fast paths.\n",
                 guarded.fast_paths,
-            ));
+            );
         }
         let mut context_json_value = json!({
             "caller_view_count": caller_view_rows.len(),
@@ -2079,18 +2091,19 @@ fn write_callsite_specializations(
     navigable.push_str("rewrite counts indicate additional semantic simplifications.\n\n");
     navigable.push_str("## Largest source reductions\n\n");
     for (_, _, _, summary) in ranked.iter().take(20) {
-        navigable.push_str(&format!("- {summary}\n"));
+        let _ = write!(navigable, "- {summary}\n");
     }
     navigable.push_str("\n## All variants grouped by resolved helper\n\n");
     for ((name, span), variants) in grouped {
-        navigable.push_str(&format!(
+        let _ = write!(
+            navigable,
             "### {name} — original bytes {}..{} ({} variants)\n\n",
             span[0],
             span[1],
             variants.len()
-        ));
+        );
         for variant in variants {
-            navigable.push_str(&format!("- {variant}\n"));
+            let _ = write!(navigable, "- {variant}\n");
         }
         navigable.push('\n');
     }
@@ -2119,11 +2132,12 @@ fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
     for (number, view) in views.iter().enumerate() {
         let path = format!("entry-{number}.md");
         fs::write(args.output.join(&path), &view.source)?;
-        index.push_str(&format!(
+        let _ = write!(
+            index,
             "- [{}]({path}) — {} resolved paths\n",
             view.entry,
             view.paths.len()
-        ));
+        );
         manifest.push(json!({
             "entry": view.entry,
             "entry_span": view.entry_span,
@@ -2173,10 +2187,10 @@ fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
         if let Some(guarded) = install_guarded_specializations(&original, &proven)? {
             let name = "executable-guarded.js";
             fs::write(args.output.join(name), &guarded.source)?;
-            index.push_str(&format!(
+            let _ = write!(index,
                 "\n[Executable guarded specialization]({name}): {} fast paths across {} functions, original bodies retained as fallbacks.\n",
                 guarded.fast_paths, guarded.targeted_functions
-            ));
+            );
             Some(json!({
                 "path": name,
                 "fast_paths": guarded.fast_paths,

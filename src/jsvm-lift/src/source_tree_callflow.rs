@@ -19,6 +19,7 @@ use oxc_syntax::{scope::ScopeFlags, symbol::SymbolId};
 use rolldown_redox::ecmascript::parse_program;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
 
 type FunctionKey = (u32, u32);
 
@@ -791,47 +792,56 @@ fn format_view(view: &CallerView, original: &str) -> String {
     output.push_str("Parameter arrows trace unchanged, directly forwarded bindings only. ");
     output.push_str("Potential indirect `eval`, mapped `arguments`, or dynamic mutations require runtime analysis before claiming values are invariant.\n\n");
     for path in &view.paths {
-        output.push_str(&format!("## `{}`\n\n", path.functions.join(" → ")));
+        let _ = write!(output, "## `{}`\n\n", path.functions.join(" → "));
         for edge in &path.links {
-            output.push_str(&format!(
+            let _ = write!(
+                output,
                 "- `{}` → `{}` (**{}** at source bytes {}..{})\n",
                 edge.caller, edge.callee, edge.kind, edge.span[0], edge.span[1]
-            ));
+            );
             if let Some(receiver) = &edge.this_argument {
-                output.push_str(&format!(
+                let _ = write!(
+                    output,
                     "  - this receiver: {receiver} (not a formal parameter)\n"
-                ));
+                );
             }
             for (idx, arg) in edge.arguments.iter().enumerate() {
                 let prefix = arg.caller_param.as_ref().map_or_else(
                     || "dynamic expression".to_owned(),
                     |param| format!("caller parameter `{param}`"),
                 );
-                output.push_str(&format!(
+                let _ = write!(
+                    output,
                     "  - argument {idx}: `{}` ← {prefix}\n",
                     arg.expression
-                ));
+                );
             }
         }
         output.push_str("\n**Leaf parameter provenance:**\n\n");
         for param in &path.leaf_parameters {
             if let Some(receiver) = &param.constructed_receiver {
-                output.push_str(&format!(
+                let _ = write!(output,
                     "- {} (parameter {}) comes from fresh receiver of new {} at source bytes {}..{}; inherited property behavior remains dynamic\n",
                     param.param, param.index, receiver.constructor,
                     receiver.new_call_span[0], receiver.new_call_span[1]
-                ));
+                );
                 continue;
             }
             match (&param.from_entry, &param.from_entry_index) {
-                (Some(name), Some(index)) => output.push_str(&format!(
-                    "- `{}` (parameter {}) ← entry `{}` (parameter {})\n",
-                    param.param, param.index, name, index
-                )),
-                _ => output.push_str(&format!(
-                    "- `{}` (parameter {}) ← dynamic/unknown (`{}`)\n",
-                    param.param, param.index, param.input_expression
-                )),
+                (Some(name), Some(index)) => {
+                    let _ = write!(
+                        output,
+                        "- `{}` (parameter {}) ← entry `{}` (parameter {})\n",
+                        param.param, param.index, name, index
+                    );
+                }
+                _ => {
+                    let _ = write!(
+                        output,
+                        "- `{}` (parameter {}) ← dynamic/unknown (`{}`)\n",
+                        param.param, param.index, param.input_expression
+                    );
+                }
             }
         }
         output.push('\n');
@@ -842,7 +852,8 @@ fn format_view(view: &CallerView, original: &str) -> String {
         "Function byte spans identify both endpoints; cycles do not truncate the graph.\n\n",
     );
     for edge in &view.reachable_edges {
-        output.push_str(&format!(
+        let _ = write!(
+            output,
             "- {} ({}..{}) to {} ({}..{}) via {} at {}..{}\n",
             edge.call.caller,
             edge.from_span[0],
@@ -853,15 +864,16 @@ fn format_view(view: &CallerView, original: &str) -> String {
             edge.call.kind,
             edge.call.span[0],
             edge.call.span[1],
-        ));
+        );
     }
     output.push_str("\n## Parameters reachable at arbitrary call depth\n\n");
     output.push_str("Each function is listed once. Origins are unions across all statically possible caller paths; unknown or non-entry inputs are explicit.\n\n");
     for function in &view.reachable_functions {
-        output.push_str(&format!(
+        let _ = write!(
+            output,
             "- **{}** ({}..{}, shortest call depth {})",
             function.name, function.span[0], function.span[1], function.shortest_call_depth
-        ));
+        );
         if function.parameters.is_empty() {
             output.push_str(" — no parameters\n");
             continue;
@@ -876,12 +888,13 @@ fn format_view(view: &CallerView, original: &str) -> String {
             if parameter.unknown_or_nonentry_input {
                 names.push("unknown/non-entry input".to_owned());
             }
-            output.push_str(&format!(
+            let _ = write!(
+                output,
                 "  - {} (parameter {}) ← {}\n",
                 parameter.name,
                 parameter.index,
                 names.join(" or ")
-            ));
+            );
         }
     }
     output.push_str("\n## Original source excerpts\n\n");
@@ -910,10 +923,11 @@ fn format_view(view: &CallerView, original: &str) -> String {
                 .max()
                 .unwrap_or(0);
             let fence = "`".repeat(3.max(max_run + 1));
-            output.push_str(&format!(
+            let _ = write!(
+                output,
                 "### `{label}` — bytes {}..{}\n\n{fence}js\n{excerpt}\n{fence}\n\n",
                 span[0], span[1]
-            ));
+            );
             if clipped {
                 output.push_str("*Excerpt truncated; follow the original source / helper implementation link for the complete function.*\n\n");
             }

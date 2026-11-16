@@ -18,6 +18,7 @@ use oxc_syntax::{
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
+use std::fmt::Write as _;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
@@ -1149,7 +1150,8 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
             capture.capture_id, executable_sha, site.start, site.end,
         );
         if let Some(loader) = outer {
-            origin_text.push_str(&format!(
+            let _ = write!(
+                origin_text,
                 "- Outer loader SHA-256: {}\n\
                  - Loader indirect eval source interval: {}..{}\n\
                  - Stripped leading newline units: {}\n",
@@ -1157,26 +1159,28 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
                 loader.indirect_eval_site.start,
                 loader.indirect_eval_site.end,
                 capture.stripped_leading_newline.unwrap_or(0)
-            ));
+            );
         }
         origin_text.push_str("\n## AST lexical matches\n\n");
         for found in &capture.matches {
-            origin_text.push_str(&format!(
+            let _ = write!(
+                origin_text,
                 "- [{}]({}) (line {}, AST lexical structure)\n",
                 found.path,
                 relative_link(&origin, &found.path),
                 found.line
-            ));
+            );
             backlinks
                 .entry(found.path.clone())
                 .or_default()
                 .push((origin.clone(), found.line));
         }
         if !capture.parse_failures.is_empty() {
-            origin_text.push_str(&format!(
+            let _ = write!(
+                origin_text,
                 "\nIncomplete static scan: {} files could not be parsed; see origin.json.\n",
                 capture.parse_failures.len()
-            ));
+            );
         }
         if capture.matches.is_empty() {
             origin_text.push_str("\nNo matching static lexical site was found.\n");
@@ -1211,32 +1215,36 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
                 serde_json::to_string(&e.thrown_types)?
             );
             if let Some(indices) = &e.global_event_indices {
-                details.push_str(&format!(
+                let _ = write!(
+                    details,
                     "- Global execution event indices: {}\n",
                     serde_json::to_string(indices)?
-                ));
+                );
             }
             if let Some(bytes) = &entry.readable {
                 let fmt = format!("{}/readable/{}.js", capture.relative, e.sha256);
                 write_file(staging.path(), &fmt, bytes)?;
-                details.push_str(&format!(
+                let _ = write!(
+                    details,
                     "- [Readable analyst view]({})\n",
                     relative_link(&page, &fmt)
-                ));
+                );
             } else {
-                details.push_str(&format!(
+                let _ = write!(
+                    details,
                     "- Standalone formatter status: {}\n",
                     e.readable_status
-                ));
+                );
             }
             write_file(staging.path(), &page, details.as_bytes())?;
-            listing.push_str(&format!(
+            let _ = write!(
+                listing,
                 "- [{}]({}) - {} source units, {} event(s)\n",
                 &e.sha256[..16],
                 relative_link(&readme, &page),
                 e.utf16_length,
                 e.occurrences
-            ));
+            );
         }
         write_file(staging.path(), &readme, listing.as_bytes())?;
         // Preserve the complete externally captured manifest byte-for-byte:
@@ -1256,7 +1264,8 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
         } else {
             format!("Direct executable {}", &executable_sha[..12])
         };
-        index.push_str(&format!(
+        let _ = write!(
+            index,
             "- [{label} / eval {}..{} / capture {}]({}) - {} calls, {} strings\n",
             site.start,
             site.end,
@@ -1264,7 +1273,7 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
             relative_link("runtime-observed/README.md", &readme),
             m.event_count,
             m.unique_source_count
-        ));
+        );
         let mut record = json!({
             "captureSha256":capture.capture_id,
             "executableSha256":executable_sha,
@@ -1312,11 +1321,12 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
              Lexical structural matches, not whole-function equivalence.\n\n"
         );
         for (origin, line) in refs {
-            text.push_str(&format!(
+            let _ = write!(
+                text,
                 "- Line {}: [verified observed eval origin]({})\n",
                 line,
                 relative_link(&sidecar, &origin)
-            ));
+            );
         }
         sidecars.push((sidecar, text));
     }

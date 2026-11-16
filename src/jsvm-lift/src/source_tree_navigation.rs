@@ -15,6 +15,7 @@ use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::scope::ScopeFlags;
 use rolldown_redox::ecmascript::parse_program;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 const MIN_DEPTH: usize = 8;
 const MAX_INDENT_DEPTH: usize = 18;
@@ -319,7 +320,8 @@ by AST type and byte length, not evaluated or silently truncated.
             || "none".to_owned(),
             |guard| format!("{} ({} total)", guard, node.guard_depth),
         );
-        output.push_str(&format!(
+        let _ = write!(
+            output,
             "| {} | {} | {} {} | {} | {} | {} | {}:{} ({}–{}) |\n",
             depth,
             index + 1,
@@ -332,7 +334,7 @@ by AST type and byte length, not evaluated or silently truncated.
             col,
             node.span.start,
             node.span.end,
-        ));
+        );
         for &child in &children[index] {
             emit(nodes, children, source, child, depth + 1, output);
         }
@@ -340,10 +342,11 @@ by AST type and byte length, not evaluated or silently truncated.
     for root in roots {
         let node = &nodes[root];
         let (line, col) = line_col(source, node.span.start as usize);
-        output.push_str(&format!(
+        let _ = write!(
+            output,
             "\n## Long assignment at {line}:{col} ({} source bytes)\n\n",
             node.span.end - node.span.start,
-        ));
+        );
         output.push_str("| Depth | ID | Assignment target/operator | Assigned RHS | Containment | Nearest guard | Source location |\n|---:|---:|---|---|---|---|---|\n");
         emit(nodes, &children, source, root, 0, &mut output);
         output.push(char::from(10));
@@ -570,13 +573,14 @@ in the original JavaScript. Byte ranges refer to that readable helper.
                 || "root of this chain".to_owned(),
                 |parent| collector.slot(parent, call.span),
             );
-            markdown.push_str(&format!(
+            let _ = write!(
+                markdown,
                 "| {} | `{}` | line {line}:{column}, bytes {}–{} | {slot} |\n",
                 depth + 1,
                 label(&call.callee),
                 call.span.start,
                 call.span.end,
-            ));
+            );
         }
         Some(markdown)
     };

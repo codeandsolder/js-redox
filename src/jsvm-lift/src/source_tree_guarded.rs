@@ -17,6 +17,7 @@ use oxc_span::SourceType;
 use oxc_syntax::scope::ScopeFlags;
 use rolldown_redox::ecmascript::parse_program;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 #[derive(Debug, Clone)]
 pub struct GuardedVariant {
@@ -256,7 +257,7 @@ impl SelectorDispatch {
         let mut output = String::new();
         let mut paths = 0;
         for (source, (count, tests)) in by_body {
-            output.push_str(&format!("if ({}) {{\n{source}}}\n", tests.join(" || ")));
+            let _ = write!(output, "if ({}) {{\n{source}}}\n", tests.join(" || "));
             paths += count;
         }
         Ok((output, paths))

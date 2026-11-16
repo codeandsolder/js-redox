@@ -16,6 +16,7 @@ use oxc_span::SourceType;
 use oxc_syntax::{identifier, keyword};
 use rolldown_redox::ecmascript::parse_program;
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -388,7 +389,7 @@ fn link_destination(path: &str) -> String {
         if byte.is_ascii_alphanumeric() || b"/-_.~".contains(&byte) {
             output.push(char::from(byte));
         } else {
-            output.push_str(&format!("%{byte:02X}"));
+            let _ = write!(output, "%{byte:02X}");
         }
     }
     output

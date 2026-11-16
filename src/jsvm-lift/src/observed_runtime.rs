@@ -12,6 +12,7 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 use std::{collections::BTreeMap, fs, path::Path};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -244,7 +245,7 @@ pub fn materialize_observed_runtime_sources(
     }
     if summary.witnessed_sources > 0 {
         for (heading, links) in grouped_links {
-            readme.push_str(&format!("## {heading} ({})\n\n", links.len()));
+            let _ = write!(readme, "## {heading} ({})\n\n", links.len());
             for link in links {
                 readme.push_str(&link);
                 readme.push('\n');
