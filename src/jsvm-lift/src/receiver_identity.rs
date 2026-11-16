@@ -34,7 +34,7 @@ struct FunctionKey {
 }
 
 impl FunctionKey {
-    fn of(function: &Function<'_>) -> Self {
+    const fn of(function: &Function<'_>) -> Self {
         Self {
             start: function.span.start,
             end: function.span.end,
@@ -466,7 +466,7 @@ impl<'c, 'f> ContextProbe<'c, 'f> {
         self.poller.finish()
     }
 
-    fn next_evaluation_order(&mut self) -> u64 {
+    const fn next_evaluation_order(&mut self) -> u64 {
         let order = self.evaluation_order;
         self.evaluation_order = self.evaluation_order.saturating_add(1);
         order

@@ -25,7 +25,7 @@ struct Plan<'s> {
     phases: Vec<Phase>,
 }
 impl<'s> Plan<'s> {
-    fn new(source: &'s str) -> Self {
+    const fn new(source: &'s str) -> Self {
         Self {
             source,
             guards: Vec::new(),

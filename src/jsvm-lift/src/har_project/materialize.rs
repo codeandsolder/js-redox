@@ -244,7 +244,7 @@ fn response_body_expected(method: &str, status: i64) -> bool {
     !((100..200).contains(&status) || (300..400).contains(&status) || matches!(status, 204 | 205))
 }
 
-fn response_body_complete(body_expected: bool, network_failed: bool) -> bool {
+const fn response_body_complete(body_expected: bool, network_failed: bool) -> bool {
     !body_expected || !network_failed
 }
 

@@ -156,7 +156,7 @@ fn unparenthesized<'a>(mut expression: &'a Expression<'a>) -> &'a Expression<'a>
     expression
 }
 
-fn span_contains(outer: Span, inner: Span) -> bool {
+const fn span_contains(outer: Span, inner: Span) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 

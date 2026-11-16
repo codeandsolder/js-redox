@@ -42,7 +42,7 @@ impl SourceMode {
     }
 
     #[must_use]
-    pub fn source_type(self) -> SourceType {
+    pub const fn source_type(self) -> SourceType {
         match self {
             Self::Auto => SourceType::unambiguous(),
             Self::Module => SourceType::mjs(),

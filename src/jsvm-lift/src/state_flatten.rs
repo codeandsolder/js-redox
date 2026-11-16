@@ -1716,7 +1716,7 @@ pub fn prove_function_structured_branch_event_unreachable_with_integer_parameter
                 excluded: bool,
             }
             impl BranchProbe<'_> {
-                fn contains(span: Span, event: Span) -> bool {
+                const fn contains(span: Span, event: Span) -> bool {
                     span.start <= event.start && event.end <= span.end
                 }
             }

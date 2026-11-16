@@ -185,7 +185,7 @@ fn main() -> Result<()> {
             guards: Vec<serde_json::Value>,
         }
         impl Probe<'_> {
-            fn contains(span: Span, event: Span) -> bool {
+            const fn contains(span: Span, event: Span) -> bool {
                 span.start <= event.start && event.end <= span.end
             }
             fn snippet(&self, span: Span) -> String {

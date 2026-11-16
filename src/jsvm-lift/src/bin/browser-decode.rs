@@ -16,7 +16,7 @@ enum DecodeKindArg {
 }
 
 impl DecodeKindArg {
-    fn script_kind(self) -> Option<ScriptKind> {
+    const fn script_kind(self) -> Option<ScriptKind> {
         match self {
             Self::Module => Some(ScriptKind::Module),
             Self::Classic => Some(ScriptKind::Classic),
