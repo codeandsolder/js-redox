@@ -550,7 +550,7 @@ fn line_col(source: &str, start: usize) -> (usize, usize) {
         pre.rsplit('\n').next().unwrap_or("").chars().count() + 1,
     )
 }
-pub(super) fn ordered_assignment_phases(source: &str, program: &Program<'_>) -> Option<String> {
+pub fn ordered_assignment_phases(source: &str, program: &Program<'_>) -> Option<String> {
     let roots = long_assignment_roots(source, program);
     if roots.is_empty() {
         return None;

@@ -100,7 +100,7 @@ fn append_reachable<'a>(
 /// statically resolved transitive JavaScript imports. Returns the number of
 /// distinct declared script entries; an empty index is still useful for
 /// explaining why there is no HTML-root code path in a capture.
-pub(crate) fn write_entrypoint_index(
+pub fn write_entrypoint_index(
     project: &Path,
     manifest: &Value,
     source_index: &Value,
