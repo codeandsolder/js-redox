@@ -226,7 +226,7 @@ fn parse<'a>(
 ///
 /// # Errors
 ///
-/// Fails when the work budget is exhausted or neither module nor CommonJS mode produces a clean parse.
+/// Fails when the work budget is exhausted or neither module nor `CommonJS` mode produces a clean parse.
 pub fn extract_js_references(source: &str, budget: &WorkBudget) -> Result<Vec<JsReference>> {
     budget.checkpoint()?;
     let allocator = Allocator::default();

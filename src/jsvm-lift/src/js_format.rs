@@ -18,7 +18,7 @@ fn generate(source: &str, source_type: SourceType, budget: &WorkBudget) -> Resul
     Ok(Some(output))
 }
 
-/// Format JavaScript source using Oxc with a module-first, CommonJS fallback.
+/// Format JavaScript source using Oxc with a module-first, `CommonJS` fallback.
 ///
 /// # Errors
 ///
