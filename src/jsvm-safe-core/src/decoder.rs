@@ -515,6 +515,36 @@ fn self_rewriting_split_provider(
     stable_provider.then_some(table)
 }
 
+/// Only the public positional parameter may be adjusted by a fixed
+/// numeric subtraction before any provider-table access.
+fn sequence_decoder_offset(
+    offset_assignment: &Expression<'_>,
+    public_param_symbol: SymbolId,
+    scoping: &Scoping,
+) -> Option<i64> {
+    let (offset_target, offset_value) = assignment_identifier(offset_assignment)?;
+    if statically_resolved_symbol(scoping, offset_target.reference_id.get()?)
+        != Some(public_param_symbol)
+    {
+        return None;
+    }
+    let Expression::BinaryExpression(offset_binary) = unparenthesized(offset_value) else {
+        return None;
+    };
+    if offset_binary.operator.as_str() != "-" {
+        return None;
+    }
+    let Expression::Identifier(offset_source) = unparenthesized(&offset_binary.left) else {
+        return None;
+    };
+    if statically_resolved_symbol(scoping, offset_source.reference_id.get()?)
+        != Some(public_param_symbol)
+    {
+        return None;
+    }
+    expression_integer(&offset_binary.right)
+}
+
 fn sequence_decoder_shape(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
@@ -552,27 +582,7 @@ fn sequence_decoder_shape(
         return None;
     };
 
-    let (offset_target, offset_value) = assignment_identifier(offset_assignment)?;
-    if statically_resolved_symbol(scoping, offset_target.reference_id.get()?)
-        != Some(public_param_symbol)
-    {
-        return None;
-    }
-    let Expression::BinaryExpression(offset_binary) = unparenthesized(offset_value) else {
-        return None;
-    };
-    if offset_binary.operator.as_str() != "-" {
-        return None;
-    }
-    let Expression::Identifier(offset_source) = unparenthesized(&offset_binary.left) else {
-        return None;
-    };
-    if statically_resolved_symbol(scoping, offset_source.reference_id.get()?)
-        != Some(public_param_symbol)
-    {
-        return None;
-    }
-    let offset = expression_integer(&offset_binary.right)?;
+    let offset = sequence_decoder_offset(offset_assignment, public_param_symbol, scoping)?;
 
     let (table_target, table_value) = assignment_identifier(table_assignment)?;
     let table_symbol = statically_resolved_symbol(scoping, table_target.reference_id.get()?)?;
@@ -880,100 +890,98 @@ fn function_parameters_have_no_runtime_effects(function: &oxc_ast::ast::Function
         .is_none_or(|rest| matches!(rest.rest.argument, BindingPattern::BindingIdentifier(_)))
 }
 
+/// Scoped IIFE guards must prove the exact table-load/alias pattern.
+fn string_literal_via_aliases(
+    expression: &Expression<'_>,
+    scoping: &Scoping,
+    aliases: &HashMap<SymbolId, u32>,
+) -> bool {
+    let mut used = HashSet::new();
+    eval_from_char_code_concat(expression, scoping, aliases, &mut used).as_deref() == Some("string")
+}
+
+fn typeof_table_assignment<'a>(
+    expression: &'a Expression<'a>,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    let Expression::UnaryExpression(unary) = unparenthesized(expression) else {
+        return None;
+    };
+    if unary.operator.as_str() != "typeof" {
+        return None;
+    }
+    let Expression::AssignmentExpression(assignment) = unparenthesized(&unary.argument) else {
+        return None;
+    };
+    if assignment.operator.as_str() != "=" {
+        return None;
+    }
+    let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(alias) = &assignment.left else {
+        return None;
+    };
+    let Expression::ComputedMemberExpression(member) = unparenthesized(&assignment.right) else {
+        return None;
+    };
+    let Expression::Identifier(table) = unparenthesized(&member.object) else {
+        return None;
+    };
+    let Expression::Identifier(index) = unparenthesized(&member.expression) else {
+        return None;
+    };
+    Some((
+        alias.name.as_str(),
+        table.name.as_str(),
+        index.name.as_str(),
+    ))
+}
+
+fn typeof_identifier<'a>(expression: &'a Expression<'a>) -> Option<&'a str> {
+    let Expression::UnaryExpression(unary) = unparenthesized(expression) else {
+        return None;
+    };
+    if unary.operator.as_str() != "typeof" {
+        return None;
+    }
+    let Expression::Identifier(identifier) = unparenthesized(&unary.argument) else {
+        return None;
+    };
+    Some(identifier.name.as_str())
+}
+
+fn preceding_table_load<'a>(
+    body: &'a oxc_ast::ast::FunctionBody<'a>,
+    alias: &str,
+) -> Option<(&'a str, &'a str)> {
+    let [Statement::VariableDeclaration(declaration), Statement::ReturnStatement(_)] =
+        body.statements.as_slice()
+    else {
+        return None;
+    };
+    let [declarator] = declaration.declarations.as_slice() else {
+        return None;
+    };
+    let BindingPattern::BindingIdentifier(id) = &declarator.id else {
+        return None;
+    };
+    if id.name.as_str() != alias {
+        return None;
+    }
+    let Expression::ComputedMemberExpression(member) = declarator.init.as_ref()? else {
+        return None;
+    };
+    let Expression::Identifier(table) = unparenthesized(&member.object) else {
+        return None;
+    };
+    let Expression::Identifier(index) = unparenthesized(&member.expression) else {
+        return None;
+    };
+    Some((table.name.as_str(), index.name.as_str()))
+}
+
 fn fixed_decoder_iife_wrapper_proven(
     function: &oxc_ast::ast::Function<'_>,
     scoping: &Scoping,
     aliases: &HashMap<SymbolId, u32>,
 ) -> bool {
-    fn string_literal_via_aliases(
-        expression: &Expression<'_>,
-        scoping: &Scoping,
-        aliases: &HashMap<SymbolId, u32>,
-    ) -> bool {
-        let mut used = HashSet::new();
-        eval_from_char_code_concat(expression, scoping, aliases, &mut used).as_deref()
-            == Some("string")
-    }
-
-    fn typeof_table_assignment<'a>(
-        expression: &'a Expression<'a>,
-    ) -> Option<(&'a str, &'a str, &'a str)> {
-        let Expression::UnaryExpression(unary) = unparenthesized(expression) else {
-            return None;
-        };
-        if unary.operator.as_str() != "typeof" {
-            return None;
-        }
-        let Expression::AssignmentExpression(assignment) = unparenthesized(&unary.argument) else {
-            return None;
-        };
-        if assignment.operator.as_str() != "=" {
-            return None;
-        }
-        let oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(alias) = &assignment.left
-        else {
-            return None;
-        };
-        let Expression::ComputedMemberExpression(member) = unparenthesized(&assignment.right)
-        else {
-            return None;
-        };
-        let Expression::Identifier(table) = unparenthesized(&member.object) else {
-            return None;
-        };
-        let Expression::Identifier(index) = unparenthesized(&member.expression) else {
-            return None;
-        };
-        Some((
-            alias.name.as_str(),
-            table.name.as_str(),
-            index.name.as_str(),
-        ))
-    }
-
-    fn typeof_identifier<'a>(expression: &'a Expression<'a>) -> Option<&'a str> {
-        let Expression::UnaryExpression(unary) = unparenthesized(expression) else {
-            return None;
-        };
-        if unary.operator.as_str() != "typeof" {
-            return None;
-        }
-        let Expression::Identifier(identifier) = unparenthesized(&unary.argument) else {
-            return None;
-        };
-        Some(identifier.name.as_str())
-    }
-
-    fn preceding_table_load<'a>(
-        body: &'a oxc_ast::ast::FunctionBody<'a>,
-        alias: &str,
-    ) -> Option<(&'a str, &'a str)> {
-        let [Statement::VariableDeclaration(declaration), Statement::ReturnStatement(_)] =
-            body.statements.as_slice()
-        else {
-            return None;
-        };
-        let [declarator] = declaration.declarations.as_slice() else {
-            return None;
-        };
-        let BindingPattern::BindingIdentifier(id) = &declarator.id else {
-            return None;
-        };
-        if id.name.as_str() != alias {
-            return None;
-        }
-        let Expression::ComputedMemberExpression(member) = declarator.init.as_ref()? else {
-            return None;
-        };
-        let Expression::Identifier(table) = unparenthesized(&member.object) else {
-            return None;
-        };
-        let Expression::Identifier(index) = unparenthesized(&member.expression) else {
-            return None;
-        };
-        Some((table.name.as_str(), index.name.as_str()))
-    }
-
     let Some(body) = function.body.as_ref() else {
         return false;
     };
@@ -996,21 +1004,25 @@ fn fixed_decoder_iife_wrapper_proven(
         return false;
     }
 
-    let guard = if let Some(parts) = typeof_table_assignment(&test.left) {
-        string_literal_via_aliases(&test.right, scoping, aliases).then_some(parts)
-    } else if let Some(parts) = typeof_table_assignment(&test.right) {
-        string_literal_via_aliases(&test.left, scoping, aliases).then_some(parts)
-    } else if string_literal_via_aliases(&test.right, scoping, aliases) {
-        typeof_identifier(&test.left).and_then(|alias| {
-            preceding_table_load(body, alias).map(|(table, index)| (alias, table, index))
-        })
-    } else if string_literal_via_aliases(&test.left, scoping, aliases) {
-        typeof_identifier(&test.right).and_then(|alias| {
-            preceding_table_load(body, alias).map(|(table, index)| (alias, table, index))
-        })
-    } else {
-        None
-    };
+    let guard = typeof_table_assignment(&test.left).map_or_else(
+        || match typeof_table_assignment(&test.right) {
+            Some(parts) => {
+                string_literal_via_aliases(&test.left, scoping, aliases).then_some(parts)
+            }
+            None if string_literal_via_aliases(&test.right, scoping, aliases) => {
+                typeof_identifier(&test.left).and_then(|alias| {
+                    preceding_table_load(body, alias).map(|(table, index)| (alias, table, index))
+                })
+            }
+            None if string_literal_via_aliases(&test.left, scoping, aliases) => {
+                typeof_identifier(&test.right).and_then(|alias| {
+                    preceding_table_load(body, alias).map(|(table, index)| (alias, table, index))
+                })
+            }
+            None => None,
+        },
+        |parts| string_literal_via_aliases(&test.right, scoping, aliases).then_some(parts),
+    );
     let Some((alias, _table, index)) = guard else {
         return false;
     };
@@ -2577,6 +2589,29 @@ fn rotation_statement_matches(source: &str, statement: &Statement<'_>, array_ali
     pattern.is_match(fragment(source, statement.span))
 }
 
+/// A closed-over rotation table must come from one statically resolved,
+/// zero-argument provider function; dynamic calls cannot establish the table.
+fn closed_rotation_provider_name(
+    table_decl: &oxc_ast::ast::VariableDeclarator<'_>,
+    scoping: &Scoping,
+) -> Option<String> {
+    let Some(Expression::CallExpression(provider_call)) = &table_decl.init else {
+        return None;
+    };
+    if provider_call.optional || !provider_call.arguments.is_empty() {
+        return None;
+    }
+    let Expression::Identifier(provider) = &provider_call.callee else {
+        return None;
+    };
+    let provider_reference = provider.reference_id.get()?;
+    let provider_symbol = statically_resolved_symbol(scoping, provider_reference)?;
+    scoping
+        .symbol_flags(provider_symbol)
+        .is_function()
+        .then(|| provider.name.to_string())
+}
+
 fn closed_over_rotation_iife(
     source: &str,
     call: &CallExpression<'_>,
@@ -2623,20 +2658,7 @@ fn closed_over_rotation_iife(
     let BindingPattern::BindingIdentifier(array_alias) = &table_decl.id else {
         return None;
     };
-    let Some(Expression::CallExpression(provider_call)) = &table_decl.init else {
-        return None;
-    };
-    if provider_call.optional || !provider_call.arguments.is_empty() {
-        return None;
-    }
-    let Expression::Identifier(provider) = &provider_call.callee else {
-        return None;
-    };
-    let provider_reference = provider.reference_id.get()?;
-    let provider_symbol = statically_resolved_symbol(scoping, provider_reference)?;
-    if !scoping.symbol_flags(provider_symbol).is_function() {
-        return None;
-    }
+    let provider_name = closed_rotation_provider_name(table_decl, scoping)?;
 
     let Statement::TryStatement(try_statement) = &for_statement.body else {
         return None;
@@ -2680,7 +2702,7 @@ fn closed_over_rotation_iife(
     stable_aliases.insert(decoder.name.to_string(), decoder_alias.name.to_string());
     let standalone = statement_span.is_some();
     Some(RotationIife {
-        provider: provider.name.to_string(),
+        provider: provider_name,
         target,
         array_param: array_alias.name.to_string(),
         count_param: String::new(),
@@ -2863,6 +2885,64 @@ const fn span_contains(outer: Span, inner: Span) -> bool {
     outer.start <= inner.start && inner.end <= outer.end
 }
 
+/// All table references must occur exclusively in the one rotation call
+/// or the one proven decoder read, without writes or outside observers.
+fn fixed_rotation_references_confined(
+    array: &StaticArrayInfo,
+    function: &VariableFunctionInfo,
+    rotation: &RotationIife,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> bool {
+    let mut decoder_reads = 0usize;
+    let mut rotation_reads = 0usize;
+    let mut safe_references = true;
+    for reference_id in scoping.get_resolved_reference_ids(array.symbol) {
+        let Some(span) = reference_spans.get(reference_id).copied() else {
+            safe_references = false;
+            break;
+        };
+        let reference = scoping.get_reference(*reference_id);
+        if reference.is_write() || reference.flags().is_member_write_target() {
+            safe_references = false;
+            break;
+        }
+        if span_contains(function.span, span) {
+            decoder_reads += 1;
+        } else if span_contains(rotation.statement_span, span) {
+            rotation_reads += 1;
+        } else {
+            safe_references = false;
+            break;
+        }
+    }
+    safe_references && decoder_reads == 1 && rotation_reads == 1
+}
+
+/// Candidate discovery is lexical only; semantic table and rotation
+/// confinement checks remain mandatory before materializing any table.
+fn fixed_rotated_candidate_names(source: &str, function: &VariableFunctionInfo) -> HashSet<String> {
+    let Some(public_param) = function.params.first() else {
+        return HashSet::new();
+    };
+    let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
+        return HashSet::new();
+    };
+    let body = fragment(source, function.span);
+    let candidate_names = access
+        .captures_iter(body)
+        .filter(|captures| {
+            captures
+                .get(2)
+                .is_some_and(|capture| capture.as_str() == public_param)
+        })
+        .filter_map(|captures| captures.get(1).map(|capture| capture.as_str()))
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+
+    candidate_names
+}
+
 fn detect_fixed_rotated_direct_decoders(
     source: &str,
     program: &oxc_ast::ast::Program<'_>,
@@ -2892,26 +2972,10 @@ fn detect_fixed_rotated_direct_decoders(
             continue;
         }
 
-        let Some(public_param) = function.params.first() else {
-            continue;
-        };
-        let Some(access) = DIRECT_ARRAY_ACCESS_RE.as_ref() else {
-            continue;
-        };
-        let body = fragment(source, function.span);
-        let candidate_names = access
-            .captures_iter(body)
-            .filter(|captures| {
-                captures
-                    .get(2)
-                    .is_some_and(|capture| capture.as_str() == public_param)
-            })
-            .filter_map(|captures| captures.get(1).map(|capture| capture.as_str()))
-            .collect::<HashSet<_>>();
-
+        let candidate_names = fixed_rotated_candidate_names(source, function);
         for array in candidate_names
             .into_iter()
-            .filter_map(|name| arrays_by_name.get(name))
+            .filter_map(|name| arrays_by_name.get(name.as_str()))
             .flat_map(|candidates| candidates.iter().copied())
         {
             let Some(offset) = simple_direct_decoder_offset(source, function, array) else {
@@ -2941,29 +3005,13 @@ fn detect_fixed_rotated_direct_decoders(
             if !between.chars().all(|ch| ch.is_whitespace() || ch == ';') {
                 continue;
             }
-            let mut decoder_reads = 0usize;
-            let mut rotation_reads = 0usize;
-            let mut safe_references = true;
-            for reference_id in scoping.get_resolved_reference_ids(array.symbol) {
-                let Some(span) = reference_spans.get(reference_id).copied() else {
-                    safe_references = false;
-                    break;
-                };
-                let reference = scoping.get_reference(*reference_id);
-                if reference.is_write() || reference.flags().is_member_write_target() {
-                    safe_references = false;
-                    break;
-                }
-                if span_contains(function.span, span) {
-                    decoder_reads += 1;
-                } else if span_contains(rotation.statement_span, span) {
-                    rotation_reads += 1;
-                } else {
-                    safe_references = false;
-                    break;
-                }
-            }
-            if !safe_references || decoder_reads != 1 || rotation_reads != 1 {
+            if !fixed_rotation_references_confined(
+                array,
+                function,
+                rotation,
+                scoping,
+                reference_spans,
+            ) {
                 continue;
             }
 
