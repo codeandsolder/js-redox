@@ -52,6 +52,88 @@ impl Lowered {
         }
     }
 
+    /// Preserve evaluation order and short-circuit effects when only a
+    /// boolean branch condition is needed for a discarded expression.
+    fn emit_logical(
+        &mut self,
+        logical: &oxc_ast::ast::LogicalExpression<'_>,
+        source: &str,
+        scoping: &Scoping,
+        depth: usize,
+    ) -> Option<()> {
+        self.structured = true;
+        let and = logical.operator.as_str() == "&&";
+        if let Some(value) = eval(&logical.left) {
+            if value.truthy() == and {
+                self.emit(&logical.right, source, scoping, depth + 1)?;
+            }
+            return Some(());
+        }
+        if eval(&logical.right).is_some() {
+            // The result is discarded; this RHS is pure, so only
+            // the LHS's evaluation may have effects or throw.
+            return self.emit(&logical.left, source, scoping, depth + 1);
+        }
+        let mut branch = Self::default();
+        branch.emit(&logical.right, source, scoping, depth + 1)?;
+        if branch.statements.is_empty() {
+            return self.emit(&logical.left, source, scoping, depth + 1);
+        }
+        let test = fragment(source, logical.left.span());
+        let test = if and {
+            format!("({test})")
+        } else {
+            format!("!({test})")
+        };
+        self.statements.push(format!(
+            "if ({test}) {{\n{}\n}}",
+            branch.statements.join("\n")
+        ));
+        Some(())
+    }
+
+    fn emit_conditional(
+        &mut self,
+        conditional: &oxc_ast::ast::ConditionalExpression<'_>,
+        source: &str,
+        scoping: &Scoping,
+        depth: usize,
+    ) -> Option<()> {
+        self.structured = true;
+        if let Some(value) = eval(&conditional.test) {
+            return self.emit(
+                if value.truthy() {
+                    &conditional.consequent
+                } else {
+                    &conditional.alternate
+                },
+                source,
+                scoping,
+                depth + 1,
+            );
+        }
+        let mut yes = Self::default();
+        let mut no = Self::default();
+        yes.emit(&conditional.consequent, source, scoping, depth + 1)?;
+        no.emit(&conditional.alternate, source, scoping, depth + 1)?;
+        if yes.statements.is_empty() && no.statements.is_empty() {
+            return self.emit(&conditional.test, source, scoping, depth + 1);
+        }
+        let test = fragment(source, conditional.test.span());
+        let body = match (yes.statements.is_empty(), no.statements.is_empty()) {
+            (false, false) => format!(
+                "if ({test}) {{\n{}\n}} else {{\n{}\n}}",
+                yes.statements.join("\n"),
+                no.statements.join("\n")
+            ),
+            (false, true) => format!("if ({test}) {{\n{}\n}}", yes.statements.join("\n")),
+            (true, false) => format!("if (!({test})) {{\n{}\n}}", no.statements.join("\n")),
+            (true, true) => unreachable!(),
+        };
+        self.statements.push(body);
+        Some(())
+    }
+
     fn emit(
         &mut self,
         expr: &Expression<'_>,
@@ -76,70 +158,10 @@ impl Lowered {
             Expression::LogicalExpression(logical)
                 if matches!(logical.operator.as_str(), "&&" | "||") =>
             {
-                self.structured = true;
-                let and = logical.operator.as_str() == "&&";
-                if let Some(value) = eval(&logical.left) {
-                    if value.truthy() == and {
-                        self.emit(&logical.right, source, scoping, depth + 1)?;
-                    }
-                    return Some(());
-                }
-                if eval(&logical.right).is_some() {
-                    // The result is discarded; this RHS is pure, so only
-                    // the LHS's evaluation may have effects or throw.
-                    return self.emit(&logical.left, source, scoping, depth + 1);
-                }
-                let mut branch = Self::default();
-                branch.emit(&logical.right, source, scoping, depth + 1)?;
-                if branch.statements.is_empty() {
-                    return self.emit(&logical.left, source, scoping, depth + 1);
-                }
-                let test = fragment(source, logical.left.span());
-                let test = if and {
-                    format!("({test})")
-                } else {
-                    format!("!({test})")
-                };
-                self.statements.push(format!(
-                    "if ({test}) {{\n{}\n}}",
-                    branch.statements.join("\n")
-                ));
-                Some(())
+                self.emit_logical(logical, source, scoping, depth)
             }
             Expression::ConditionalExpression(conditional) => {
-                self.structured = true;
-                if let Some(value) = eval(&conditional.test) {
-                    return self.emit(
-                        if value.truthy() {
-                            &conditional.consequent
-                        } else {
-                            &conditional.alternate
-                        },
-                        source,
-                        scoping,
-                        depth + 1,
-                    );
-                }
-                let mut yes = Self::default();
-                let mut no = Self::default();
-                yes.emit(&conditional.consequent, source, scoping, depth + 1)?;
-                no.emit(&conditional.alternate, source, scoping, depth + 1)?;
-                if yes.statements.is_empty() && no.statements.is_empty() {
-                    return self.emit(&conditional.test, source, scoping, depth + 1);
-                }
-                let test = fragment(source, conditional.test.span());
-                let body = match (yes.statements.is_empty(), no.statements.is_empty()) {
-                    (false, false) => format!(
-                        "if ({test}) {{\n{}\n}} else {{\n{}\n}}",
-                        yes.statements.join("\n"),
-                        no.statements.join("\n")
-                    ),
-                    (false, true) => format!("if ({test}) {{\n{}\n}}", yes.statements.join("\n")),
-                    (true, false) => format!("if (!({test})) {{\n{}\n}}", no.statements.join("\n")),
-                    (true, true) => unreachable!(),
-                };
-                self.statements.push(body);
-                Some(())
+                self.emit_conditional(conditional, source, scoping, depth)
             }
             Expression::AssignmentExpression(assign) if assign.operator.as_str() == "=" => {
                 // LHS reference evaluation may be moved past RHS prefixes

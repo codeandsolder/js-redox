@@ -211,115 +211,106 @@ struct PureFunctionCollector<'c> {
     functions: HashMap<SymbolId, PureFunction>,
 }
 
-impl<'a> Visit<'a> for PureFunctionCollector<'_> {
-    fn visit_function(&mut self, f: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
-        if !f.r#async && !f.generator && f.params.rest.is_none() {
-            if let (Some(id), Some(body)) = (&f.id, &f.body) {
-                if let Some(symbol) = id.symbol_id.get() {
-                    let immutable =
-                        self.scoping.get_resolved_reference_ids(symbol).iter().all(
-                            |reference_id| !self.scoping.get_reference(*reference_id).is_write(),
-                        );
-                    if immutable {
-                        let mut params = HashMap::new();
-                        let mut valid_params = true;
-                        for (index, parameter) in f.params.items.iter().enumerate() {
-                            let BindingPattern::BindingIdentifier(parameter_id) =
-                                &parameter.pattern
-                            else {
-                                valid_params = false;
-                                break;
-                            };
-                            if parameter.initializer.is_some()
-                                || params
-                                    .insert(parameter_id.name.to_string(), index)
-                                    .is_some()
-                            {
-                                valid_params = false;
-                                break;
-                            }
-                        }
-                        if valid_params {
-                            let mut locals = HashMap::new();
-                            let mut expression = None;
-                            let mut valid_body = !body.statements.is_empty();
-                            for (statement_index, statement) in body.statements.iter().enumerate() {
-                                match statement {
-                                    Statement::VariableDeclaration(declaration)
-                                        if declaration.kind == VariableDeclarationKind::Var
-                                            && statement_index + 1 < body.statements.len() =>
-                                    {
-                                        for declarator in &declaration.declarations {
-                                            let BindingPattern::BindingIdentifier(identifier) =
-                                                &declarator.id
-                                            else {
-                                                valid_body = false;
-                                                break;
-                                            };
-                                            if params.contains_key(identifier.name.as_str())
-                                                || locals.contains_key(identifier.name.as_str())
-                                            {
-                                                valid_body = false;
-                                                break;
-                                            }
-                                            let Some(initializer) = &declarator.init else {
-                                                valid_body = false;
-                                                break;
-                                            };
-                                            let Some(compiled) =
-                                                compile_pure_expr(initializer, &params, &locals)
-                                            else {
-                                                valid_body = false;
-                                                break;
-                                            };
-                                            if !compiled.is_effect_free() {
-                                                valid_body = false;
-                                                break;
-                                            }
-                                            locals.insert(identifier.name.to_string(), compiled);
-                                        }
-                                        if !valid_body {
-                                            break;
-                                        }
-                                    }
-                                    Statement::ReturnStatement(ret)
-                                        if statement_index + 1 == body.statements.len() =>
-                                    {
-                                        let Some(argument) = &ret.argument else {
-                                            valid_body = false;
-                                            break;
-                                        };
-                                        expression = compile_pure_expr(argument, &params, &locals);
-                                        if expression.is_none() {
-                                            valid_body = false;
-                                        }
-                                    }
-                                    _ => {
-                                        valid_body = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if valid_body {
-                                if let Some(expression) = expression {
-                                    self.functions.insert(
-                                        symbol,
-                                        PureFunction {
-                                            param_count: f.params.items.len(),
-                                            expression,
-                                            declaration_span: (f.r#type
-                                                == oxc_ast::ast::FunctionType::FunctionDeclaration)
-                                                .then_some(f.span),
-                                        },
-                                    );
-                                }
-                            }
-                        }
+/// Compile only simple positional bindings; unsupported parameters cannot
+/// be modeled by the pure evaluator without additional call-time semantics.
+fn pure_parameter_bindings(
+    function: &oxc_ast::ast::Function<'_>,
+) -> Option<HashMap<String, usize>> {
+    if function.r#async || function.generator || function.params.rest.is_some() {
+        return None;
+    }
+    let mut params = HashMap::new();
+    for (index, parameter) in function.params.items.iter().enumerate() {
+        let BindingPattern::BindingIdentifier(parameter_id) = &parameter.pattern else {
+            return None;
+        };
+        if parameter.initializer.is_some()
+            || params
+                .insert(parameter_id.name.to_string(), index)
+                .is_some()
+        {
+            return None;
+        }
+    }
+    Some(params)
+}
+
+/// Evaluate local declarations in source order, admitting only effect-free
+/// initializers before a final return. A rejected statement rejects the whole
+/// candidate, not merely the affected local binding.
+fn pure_function_body(
+    statements: &[Statement<'_>],
+    params: &HashMap<String, usize>,
+) -> Option<PureExpr> {
+    let mut locals = HashMap::new();
+    let mut expression = None;
+    if statements.is_empty() {
+        return None;
+    }
+    for (index, statement) in statements.iter().enumerate() {
+        match statement {
+            Statement::VariableDeclaration(declaration)
+                if declaration.kind == VariableDeclarationKind::Var
+                    && index + 1 < statements.len() =>
+            {
+                for declarator in &declaration.declarations {
+                    let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                        return None;
+                    };
+                    if params.contains_key(identifier.name.as_str())
+                        || locals.contains_key(identifier.name.as_str())
+                    {
+                        return None;
                     }
+                    let compiled = compile_pure_expr(declarator.init.as_ref()?, params, &locals)?;
+                    if !compiled.is_effect_free() {
+                        return None;
+                    }
+                    locals.insert(identifier.name.to_string(), compiled);
                 }
             }
+            Statement::ReturnStatement(ret) if index + 1 == statements.len() => {
+                expression = Some(compile_pure_expr(ret.argument.as_ref()?, params, &locals)?);
+            }
+            _ => return None,
         }
-        walk::walk_function(self, f, flags);
+    }
+    expression
+}
+
+fn proven_pure_function(
+    function: &oxc_ast::ast::Function<'_>,
+    scoping: &Scoping,
+) -> Option<(SymbolId, PureFunction)> {
+    let id = function.id.as_ref()?;
+    let body = function.body.as_ref()?;
+    let symbol = id.symbol_id.get()?;
+    if scoping
+        .get_resolved_reference_ids(symbol)
+        .iter()
+        .any(|reference_id| scoping.get_reference(*reference_id).is_write())
+    {
+        return None;
+    }
+    let params = pure_parameter_bindings(function)?;
+    let expression = pure_function_body(&body.statements, &params)?;
+    Some((
+        symbol,
+        PureFunction {
+            param_count: function.params.items.len(),
+            expression,
+            declaration_span: (function.r#type == oxc_ast::ast::FunctionType::FunctionDeclaration)
+                .then_some(function.span),
+        },
+    ))
+}
+
+impl<'a> Visit<'a> for PureFunctionCollector<'_> {
+    fn visit_function(&mut self, function: &oxc_ast::ast::Function<'a>, flags: ScopeFlags) {
+        if let Some((symbol, pure)) = proven_pure_function(function, self.scoping) {
+            self.functions.insert(symbol, pure);
+        }
+        walk::walk_function(self, function, flags);
     }
 }
 
