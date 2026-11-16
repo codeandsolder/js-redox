@@ -347,6 +347,7 @@ impl<'a> Visit<'a> for ReturnFlow<'_> {
 
 /// Recover direct return values through a provably unobservable terminal
 /// temporary. Independently reparse/re-resolve each edit to avoid overlaps.
+///
 /// Unsupported or invalid source is returned unchanged instead of raising an error.
 #[must_use]
 pub fn recover_terminal_returns(source: &str) -> RecoveredReturns {

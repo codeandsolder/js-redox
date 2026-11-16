@@ -1325,7 +1325,7 @@ fn analyze_program(
     options: &SusScanOptions,
     program: &oxc_ast::ast::Program<'_>,
     state: ParseAnalysisState,
-) -> Result<SusFileReport> {
+) -> SusFileReport {
     let ParseAnalysisState {
         diagnostics,
         parser_fatal_error,
@@ -1386,7 +1386,7 @@ fn analyze_program(
         .map_or(0, |cluster| cluster.score);
     let lines = line_starts(source);
 
-    Ok(SusFileReport {
+    SusFileReport {
         input: input.display().to_string(),
         bytes: source.len(),
         decode_encoding: "UTF-8".to_string(),
@@ -1413,7 +1413,7 @@ fn analyze_program(
                 .map(|signal| materialize_signal(signal, &lines))
                 .collect()
         }),
-    })
+    }
 }
 
 /// Analyze decoded JavaScript source using the supplied scan options.
@@ -1431,7 +1431,7 @@ pub fn analyze_source(
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
     if !parsed.fatal_error {
-        return analyze_program(
+        return Ok(analyze_program(
             source,
             input,
             options,
@@ -1444,7 +1444,7 @@ pub fn analyze_source(
                 parse_recovery: None,
                 opaque_parse_spans: Vec::new(),
             },
-        );
+        ));
     }
 
     let initial_diagnostics = parsed.diagnostics.len();
@@ -1453,7 +1453,7 @@ pub fn analyze_source(
         let classic_allocator = Allocator::default();
         let classic = Parser::new(&classic_allocator, source, SourceType::cjs()).parse();
         if !classic.fatal_error {
-            return analyze_program(
+            return Ok(analyze_program(
                 source,
                 input,
                 options,
@@ -1466,14 +1466,14 @@ pub fn analyze_source(
                     parse_recovery: Some("classic-script-fallback".to_string()),
                     opaque_parse_spans: Vec::new(),
                 },
-            );
+            ));
         }
         if let Some(recovery) = recover_browser_legacy_call_assignments(source, SourceType::cjs()) {
             let recovery_allocator = Allocator::default();
             let recovered =
                 Parser::new(&recovery_allocator, &recovery.source, SourceType::cjs()).parse();
             if !recovered.fatal_error {
-                return analyze_program(
+                return Ok(analyze_program(
                     source,
                     input,
                     options,
@@ -1494,14 +1494,14 @@ pub fn analyze_source(
                             })
                             .collect(),
                     },
-                );
+                ));
             }
         }
     } else if let Some(recovery) = recover_browser_legacy_call_assignments(source, source_type) {
         let recovery_allocator = Allocator::default();
         let recovered = Parser::new(&recovery_allocator, &recovery.source, source_type).parse();
         if !recovered.fatal_error {
-            return analyze_program(
+            return Ok(analyze_program(
                 source,
                 input,
                 options,
@@ -1522,11 +1522,11 @@ pub fn analyze_source(
                         })
                         .collect(),
                 },
-            );
+            ));
         }
     }
 
-    analyze_program(
+    Ok(analyze_program(
         source,
         input,
         options,
@@ -1539,7 +1539,7 @@ pub fn analyze_source(
             parse_recovery: None,
             opaque_parse_spans: Vec::new(),
         },
-    )
+    ))
 }
 
 fn path_allows_classic_fallback(path: &Path) -> bool {
