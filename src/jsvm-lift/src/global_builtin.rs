@@ -208,13 +208,57 @@ pub(crate) fn namespace_member_name<'a>(
 mod tests {
     use super::*;
 
-    fn test_budget() -> WorkBudget {
-        WorkBudget::unlimited("global-builtin-test")
-    }
     use oxc_allocator::Allocator;
     use oxc_semantic::SemanticBuilder;
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
+
+    fn test_budget() -> WorkBudget {
+        WorkBudget::unlimited("global-builtin-test")
+    }
+
+    struct ResolvedBuiltinsProbe<'c, 'g> {
+        scoping: &'c Scoping,
+        aliases: &'g HashMap<SymbolId, String>,
+        wasm: bool,
+        data_view: bool,
+    }
+    impl<'a> Visit<'a> for ResolvedBuiltinsProbe<'_, '_> {
+        fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+            if namespace_member_name(self.scoping, self.aliases, &call.callee, "WebAssembly")
+                .is_some_and(|(member, global)| member == "instantiate" && global == "window")
+            {
+                self.wasm = true;
+            }
+            walk::walk_call_expression(self, call);
+        }
+
+        fn visit_new_expression(&mut self, expression: &oxc_ast::ast::NewExpression<'a>) {
+            if global_constructor(self.scoping, self.aliases, &expression.callee, "DataView")
+                .as_deref()
+                == Some("window")
+            {
+                self.data_view = true;
+            }
+            walk::walk_new_expression(self, expression);
+        }
+    }
+
+    struct DynamicGlobalProbe<'c, 'g> {
+        scoping: &'c Scoping,
+        aliases: &'g HashMap<SymbolId, String>,
+        resolved: bool,
+    }
+    impl<'a> Visit<'a> for DynamicGlobalProbe<'_, '_> {
+        fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+            if namespace_member_name(self.scoping, self.aliases, &call.callee, "WebAssembly")
+                .is_some()
+            {
+                self.resolved = true;
+            }
+            walk::walk_call_expression(self, call);
+        }
+    }
 
     #[test]
     fn resolves_direct_transitive_and_computed_global_builtins() -> Result<(), BudgetExceeded> {
@@ -235,33 +279,7 @@ mod tests {
         let aliases = collect_global_aliases(&parsed.program, scoping, &test_budget())?;
         assert_eq!(aliases.len(), 2);
 
-        struct Probe<'c, 'g> {
-            scoping: &'c Scoping,
-            aliases: &'g HashMap<SymbolId, String>,
-            wasm: bool,
-            data_view: bool,
-        }
-        impl<'a> Visit<'a> for Probe<'_, '_> {
-            fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
-                if namespace_member_name(self.scoping, self.aliases, &call.callee, "WebAssembly")
-                    .is_some_and(|(member, global)| member == "instantiate" && global == "window")
-                {
-                    self.wasm = true;
-                }
-                walk::walk_call_expression(self, call);
-            }
-
-            fn visit_new_expression(&mut self, expression: &oxc_ast::ast::NewExpression<'a>) {
-                if global_constructor(self.scoping, self.aliases, &expression.callee, "DataView")
-                    .as_deref()
-                    == Some("window")
-                {
-                    self.data_view = true;
-                }
-                walk::walk_new_expression(self, expression);
-            }
-        }
-        let mut probe = Probe {
+        let mut probe = ResolvedBuiltinsProbe {
             scoping,
             aliases: &aliases,
             wasm: false,
@@ -308,22 +326,7 @@ mod tests {
         let scoping = semantic.semantic.scoping();
         let aliases = collect_global_aliases(&parsed.program, scoping, &test_budget())?;
 
-        struct Probe<'c, 'g> {
-            scoping: &'c Scoping,
-            aliases: &'g HashMap<SymbolId, String>,
-            resolved: bool,
-        }
-        impl<'a> Visit<'a> for Probe<'_, '_> {
-            fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
-                if namespace_member_name(self.scoping, self.aliases, &call.callee, "WebAssembly")
-                    .is_some()
-                {
-                    self.resolved = true;
-                }
-                walk::walk_call_expression(self, call);
-            }
-        }
-        let mut probe = Probe {
+        let mut probe = DynamicGlobalProbe {
             scoping,
             aliases: &aliases,
             resolved: false,

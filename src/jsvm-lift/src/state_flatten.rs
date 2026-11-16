@@ -1036,27 +1036,6 @@ fn exact_integer_parameter_env(
     scoping: &Scoping,
     parameter_bindings: &BTreeMap<usize, i64>,
 ) -> Option<HashMap<String, Scalar>> {
-    let mut env = HashMap::new();
-    for (index, value) in parameter_bindings {
-        let parameter = function.params.items.get(*index)?;
-        let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
-            return None;
-        };
-        let symbol = identifier.symbol_id.get()?;
-        if scoping
-            .get_resolved_reference_ids(symbol)
-            .iter()
-            .any(|reference_id| scoping.get_reference(*reference_id).is_write())
-        {
-            // A mutable exact call argument cannot be assumed to retain its
-            // entry value, but it also must not invalidate unrelated stable
-            // parameter facts. Omit it from the scalar environment; any branch
-            // that actually depends on it will then fail closed as unknown.
-            continue;
-        }
-        env.insert(identifier.name.to_string(), Scalar::Int(*value));
-    }
-
     #[derive(Default)]
     struct DynamicScalarProbe {
         dynamic_scope: bool,
@@ -1087,6 +1066,27 @@ fn exact_integer_parameter_env(
         ) {
         }
     }
+    let mut env = HashMap::new();
+    for (index, value) in parameter_bindings {
+        let parameter = function.params.items.get(*index)?;
+        let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern else {
+            return None;
+        };
+        let symbol = identifier.symbol_id.get()?;
+        if scoping
+            .get_resolved_reference_ids(symbol)
+            .iter()
+            .any(|reference_id| scoping.get_reference(*reference_id).is_write())
+        {
+            // A mutable exact call argument cannot be assumed to retain its
+            // entry value, but it also must not invalidate unrelated stable
+            // parameter facts. Omit it from the scalar environment; any branch
+            // that actually depends on it will then fail closed as unknown.
+            continue;
+        }
+        env.insert(identifier.name.to_string(), Scalar::Int(*value));
+    }
+
     let mut probe = DynamicScalarProbe::default();
     probe.visit_function_body(function.body.as_deref()?);
     (!probe.dynamic_scope && !probe.arguments_object).then_some(env)

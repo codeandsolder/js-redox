@@ -308,10 +308,10 @@ fn match_directives(
     directives: &BTreeMap<String, Vec<Value>>,
     patterns: &RuntimePatterns,
 ) -> (&'static str, Vec<Value>) {
+    const PLACEHOLDER: &str = " = __placeholder";
     if let Some(exact) = directives.get(expression) {
         return ("exact", exact.clone());
     }
-    const PLACEHOLDER: &str = " = __placeholder";
     if let Some(target) = expression.strip_suffix(PLACEHOLDER) {
         let matches = directives
             .get(target)
