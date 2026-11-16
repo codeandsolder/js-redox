@@ -137,7 +137,7 @@ fn terminal_guard_test<'a>(statement: &'a Statement<'a>) -> Option<&'a Expressio
 }
 
 /// Evaluate only the effects of an expression whose result is discarded.
-/// Every comma operand still performs GetValue, including getters and direct
+/// Every comma operand still performs `GetValue`, including getters and direct
 /// eval calls. The shared inert-literal proof allows us to omit only operands
 /// that cannot invoke code, read bindings, or throw.
 fn discarded_guard_effects(test: &Expression<'_>, source: &str) -> Option<String> {

@@ -251,7 +251,7 @@ fn comment_text(alias: &PropertyAlias) -> String {
     format!(" /* property alias: {shortened} */")
 }
 
-/// Annotate only references resolved to the *same original AST SymbolId*.
+/// Annotate only references resolved to the *same original AST `SymbolId`*.
 /// Shadowed aliases and unrelated names are never joined by spelling.
 pub fn explain_property_aliases(source: &str) -> Result<Option<AnnotatedAliases>> {
     let allocator = Allocator::default();

@@ -1,7 +1,7 @@
 //! Static *callsite* specializations of original lexical helper functions.
 //!
 //! The actual helper source remains intact. Each derivative substitutes
-//! constant arguments only at references to the same parameter SymbolId,
+//! constant arguments only at references to the same parameter `SymbolId`,
 //! and is then passed through the existing JS deobfuscator. This is useful
 //! program recovery, not an independently runnable replacement module.
 use crate::source_tree_callflow::{CallerView, ResolvedCallEdge};
@@ -165,7 +165,7 @@ impl<'a> Visit<'a> for StablePrimitiveBindings<'_> {
 }
 
 /// Primitive arguments at exact source-resolved original callsites. Resolve
-/// literal expressions and immutable lexical constant chains by SymbolId.
+/// literal expressions and immutable lexical constant chains by `SymbolId`.
 /// Calls with a spread stop collecting at its position: later indexes cannot
 /// be reliably mapped to formal parameters.
 #[derive(Clone, Debug)]
@@ -182,7 +182,7 @@ struct ExpressionEdit {
 }
 
 /// A copy of one original argument expression, with all allowable identifier
-/// substitutions proven against the original lexical semantic SymbolIds.
+/// substitutions proven against the original lexical semantic `SymbolIds`.
 #[derive(Clone, Debug)]
 struct OriginalComputedArgument {
     source: String,

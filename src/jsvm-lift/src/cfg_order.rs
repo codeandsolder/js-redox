@@ -501,7 +501,7 @@ fn prove_required_before_node_budgeted(
 /// This is an existential graph fact, NOT input-feasibility, branch reachability,
 /// dispatcher identity, or must-reach value provenance. Feasible JavaScript
 /// execution is an independent obligation. The source and sink must resolve to
-/// the same execution context. Oxc's NewFunction and Unreachable edges are
+/// the same execution context. Oxc's `NewFunction` and `Unreachable` edges are
 /// ignored; graph cycles are handled with a visited set.
 ///
 /// Only normal, jump, loop and finalizer traversal is considered; exception

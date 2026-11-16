@@ -231,7 +231,7 @@ fn append_registry_path(mut binding: String, registry_path: &[String]) -> String
 }
 
 /// Compose existing independent proofs only after the concrete handler table
-/// has been materialized. Never promote these edges to table_vms.
+/// has been materialized. Never promote these edges to `table_vms`.
 fn collect_lazy_registry_indirect_calls(
     program: &oxc_ast::ast::Program<'_>,
     semantic: &oxc_semantic::Semantic<'_>,

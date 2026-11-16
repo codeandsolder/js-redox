@@ -33,7 +33,7 @@ pub struct DocumentScriptRoot {
     pub async_attribute: bool,
     pub defer_attribute: bool,
     pub nomodule_attribute: bool,
-    /// parser_blocking, deferred, asynchronous, or inert.
+    /// `parser_blocking`, deferred, asynchronous, or inert.
     pub scheduling_class: &'static str,
     pub src: Option<String>,
     pub resolved_url: Option<String>,

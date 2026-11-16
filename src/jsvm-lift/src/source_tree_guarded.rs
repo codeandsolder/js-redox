@@ -4,7 +4,7 @@
 //! The original callable, its .call lookup and its unmodified fallback body remain
 //! in place. Guards inspect only simple formal bindings.
 //!
-//! Caller supplies variants proven by source_tree_specialize and transformed
+//! Caller supplies variants proven by `source_tree_specialize` and transformed
 //! through the ordinary safe deobfuscator; this module rechecks the binding
 //! proof and lexical identity before installing any branch.
 use crate::source_tree_specialize::specialize_function;
