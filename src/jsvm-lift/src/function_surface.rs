@@ -477,9 +477,10 @@ mod tests {
                 .count(),
             1
         );
-        assert!(unrelated.nested_functions.is_empty());
-        assert!(
-            analyze_function_source_surfaces(source, &semantic.semantic, &[], &budget)?.is_empty()
+        assert_eq!(unrelated.nested_functions.len(), 0);
+        assert_eq!(
+            analyze_function_source_surfaces(source, &semantic.semantic, &[], &budget)?.len(),
+            0
         );
         Ok(())
     }

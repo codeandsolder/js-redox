@@ -1306,14 +1306,14 @@ mod tests {
             .iter()
             .find(|function| function.name == ".run")
             .ok_or_else(|| anyhow::anyhow!("entry missing"))?;
-        assert!(entry.parameters[0].possible_entry_indices.is_empty());
+        assert_eq!(entry.parameters[0].possible_entry_indices.len(), 0);
         assert!(entry.parameters[0].unknown_or_nonentry_input);
         let helper = view
             .reachable_functions
             .iter()
             .find(|function| function.name == "helper")
             .ok_or_else(|| anyhow::anyhow!("helper missing"))?;
-        assert!(helper.parameters[0].possible_entry_indices.is_empty());
+        assert_eq!(helper.parameters[0].possible_entry_indices.len(), 0);
         assert!(helper.parameters[0].unknown_or_nonentry_input);
         Ok(())
     }
@@ -1328,7 +1328,7 @@ mod tests {
             .find(|function| function.name == "leaf")
             .ok_or_else(|| anyhow::anyhow!("zero-parameter intermediary blocked leaf"))?;
         assert_eq!(leaf.shortest_call_depth, 2);
-        assert!(leaf.parameters[0].possible_entry_indices.is_empty());
+        assert_eq!(leaf.parameters[0].possible_entry_indices.len(), 0);
         assert!(leaf.parameters[0].unknown_or_nonentry_input);
         Ok(())
     }

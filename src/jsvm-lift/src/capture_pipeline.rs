@@ -401,7 +401,7 @@ mod tests {
                         .iter()
                         .filter(|unit| unit["vm_kind"] == "direct_switch")
                         .collect::<Vec<_>>();
-                    assert!(!devirtualized.is_empty());
+                    assert_ne!(devirtualized.len(), 0);
                     assert!(devirtualized.iter().all(|unit| {
                         ["source_path", "pseudocode_path"].iter().all(|field| {
                             unit[*field]
@@ -421,7 +421,7 @@ mod tests {
                         .iter()
                         .filter(|unit| unit["vm_kind"] == "function_table")
                         .collect::<Vec<_>>();
-                    assert!(!devirtualized.is_empty());
+                    assert_ne!(devirtualized.len(), 0);
                     assert!(devirtualized
                         .iter()
                         .any(|unit| unit["handler_count"].as_u64().unwrap_or_default() >= 74));
@@ -546,7 +546,7 @@ mod tests {
                                 && unit["parent_scan_id"].as_u64() == Some(scan_id)
                         })
                         .collect::<Vec<_>>();
-                    assert!(!devirtualized.is_empty());
+                    assert_ne!(devirtualized.len(), 0);
                     assert!(devirtualized
                         .iter()
                         .any(|unit| unit["handler_count"].as_u64().unwrap_or_default() >= 74));

@@ -2747,6 +2747,7 @@ pub fn proven_slow_lazy_cell_captured_handler_install(
 }
 
 /// Join the independently proven resolver index and captured logical handler.
+///
 /// Slot equality is already discharged by the resolver theorem; this step only
 /// requires both proofs to refer to the same exact wrapper assignment.
 #[must_use]
@@ -4559,8 +4560,9 @@ mod tests {
 
     #[test]
     fn rejects_factory_when_handler_is_not_captured_directly() -> TestResult {
-        assert!(shapes(
-            r"
+        assert_eq!(
+            shapes(
+                r"
             let phase;
             function make(mode, state, handler, q, cell, out) {
                 return (mode | 48) == mode && (
@@ -4573,8 +4575,10 @@ mod tests {
                 ), out;
             }
             ",
-        )
-        .is_empty());
+            )
+            .len(),
+            0
+        );
 
         Ok(())
     }
@@ -4910,11 +4914,14 @@ mod tests {
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         assert!(parsed.is_clean());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(super::structurally_proven_fast_lazy_cell_factory_shapes(
-            &parsed.program,
-            semantic.semantic.scoping(),
-        )
-        .is_empty());
+        assert_eq!(
+            super::structurally_proven_fast_lazy_cell_factory_shapes(
+                &parsed.program,
+                semantic.semantic.scoping(),
+            )
+            .len(),
+            0
+        );
 
         Ok(())
     }
@@ -5811,8 +5818,9 @@ mod tests {
 
     #[test]
     fn rejects_factory_when_phase_value_is_local() -> TestResult {
-        assert!(shapes(
-            r"
+        assert_eq!(
+            shapes(
+                r"
             function make(mode, state, handler, phase, q, cell, out) {
                 return (mode | 48) == mode && (
                     handler = [11, handler, 87],
@@ -5824,8 +5832,10 @@ mod tests {
                 ), out;
             }
             ",
-        )
-        .is_empty());
+            )
+            .len(),
+            0
+        );
 
         Ok(())
     }

@@ -1,4 +1,5 @@
 //! Link exported component identities across the **captured** ESM graph.
+//!
 //! This only rewrites local bindings in `src/_readable/` and never changes
 //! import specifiers, public ESM export names, or exact deobfuscated sources.
 use crate::{

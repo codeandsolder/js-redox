@@ -488,6 +488,7 @@ impl<'a> Visit<'a> for CapturedReads<'_> {
 }
 
 /// Produce handler-specific *browsing* views, not executable replacements.
+///
 /// The source hash, original function spans and external symbols are all
 /// checked in the raw source AST. A same-named reference is annotated in a
 /// transformed handler only if it remains unresolved *and* the original

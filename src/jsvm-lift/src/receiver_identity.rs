@@ -6168,15 +6168,18 @@ mod tests {
 
     #[test]
     fn rejects_conflicting_prototype_string_assignment() {
-        assert!(prototype_strings(
-            r#"
+        assert_eq!(
+            prototype_strings(
+                r#"
                 const C = function() {};
                 C.prototype.factory = "create";
                 C.prototype.factory = "other";
                 new C();
             "#,
-        )
-        .is_empty());
+            )
+            .len(),
+            0
+        );
     }
 
     #[test]
@@ -6550,12 +6553,15 @@ mod tests {
             .with_check_syntax_error(true)
             .build(&parsed.program);
         assert!(semantic.diagnostics.is_empty());
-        assert!(test_proof(structurally_matched_prototype_method_calls(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &test_budget()
-        ))
-        .is_empty());
+        assert_eq!(
+            test_proof(structurally_matched_prototype_method_calls(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget()
+            ))
+            .len(),
+            0
+        );
     }
 
     #[test]
@@ -6633,12 +6639,15 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(test_proof(structurally_proven_origin_exposures(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &test_budget()
-        ))
-        .is_empty());
+        assert_eq!(
+            test_proof(structurally_proven_origin_exposures(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget()
+            ))
+            .len(),
+            0
+        );
     }
 
     #[test]
@@ -7085,12 +7094,15 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(test_proof(structurally_proven_origin_exposures(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &test_budget()
-        ))
-        .is_empty());
+        assert_eq!(
+            test_proof(structurally_proven_origin_exposures(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget()
+            ))
+            .len(),
+            0
+        );
         let writes = test_proof(structurally_proven_member_write_origins(
             &parsed.program,
             semantic.semantic.scoping(),
@@ -7163,7 +7175,7 @@ mod tests {
             .member_calls
             .iter()
             .any(|call| { call.context == edge.callee && call.property == "finish" }));
-        assert!(flow.exposures.is_empty());
+        assert_eq!(flow.exposures.len(), 0);
 
         Ok(())
     }
@@ -7178,12 +7190,15 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(test_proof(structurally_proven_origin_direct_calls(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &test_budget()
-        ))
-        .is_empty());
+        assert_eq!(
+            test_proof(structurally_proven_origin_direct_calls(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget()
+            ))
+            .len(),
+            0
+        );
     }
 
     #[test]
@@ -7275,7 +7290,7 @@ mod tests {
             function start(state) { state = other; state.run(); }
             new C();
         ";
-        assert!(calls(source).is_empty());
+        assert_eq!(calls(source).len(), 0);
     }
 
     #[test]
@@ -7285,7 +7300,7 @@ mod tests {
             function start(state) { eval("state = other"); state.run(); }
             new C();
         "#;
-        assert!(calls(source).is_empty());
+        assert_eq!(calls(source).len(), 0);
     }
 
     #[test]
@@ -7483,7 +7498,7 @@ mod tests {
         ));
         assert_eq!(calls.len(), 2);
         assert!(calls[0].caller.this_origin);
-        assert!(calls[0].caller.parameter_indices.is_empty());
+        assert_eq!(calls[0].caller.parameter_indices.len(), 0);
         assert_eq!(calls[0].callee.parameter_indices, vec![0]);
         assert_eq!(calls[1].caller.parameter_indices, vec![0]);
         assert_eq!(calls[1].callee.parameter_indices, vec![0]);
@@ -7546,7 +7561,7 @@ mod tests {
             C.prototype.run = function() {};
             sink(C.prototype);
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -7556,7 +7571,7 @@ mod tests {
             C.prototype.run = function() {};
             sink(flag ? C.prototype : {});
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -7796,13 +7811,14 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(
+        assert_eq!(
             test_proof(super::structurally_proven_prototype_method_phase_closures(
                 &parsed.program,
                 semantic.semantic.scoping(),
                 &test_budget()
             ))
-            .is_empty()
+            .len(),
+            0
         );
     }
 
@@ -7843,13 +7859,14 @@ mod tests {
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(
+        assert_eq!(
             test_proof(super::structurally_proven_prototype_method_phase_closures(
                 &parsed.program,
                 semantic.semantic.scoping(),
                 &test_budget()
             ))
-            .is_empty()
+            .len(),
+            0
         );
     }
 
@@ -7887,7 +7904,7 @@ mod tests {
             unknown();
             p.run = function() {};
         ";
-        assert!(method_assignments(source).is_empty());
+        assert_eq!(method_assignments(source).len(), 0);
     }
 
     #[test]
@@ -7924,7 +7941,7 @@ mod tests {
             C.prototype.run = function() {};
             unknown(C);
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -7934,7 +7951,7 @@ mod tests {
             C.prototype.run = function() {};
             const Alias = C;
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -7944,7 +7961,7 @@ mod tests {
             C.prototype.run = function() {};
             C[key] = value;
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -7954,7 +7971,7 @@ mod tests {
             C.prototype.run = function() {};
             unknown(C[key]);
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -7976,7 +7993,7 @@ mod tests {
             C.prototype.run = function() {};
             if (flag) unknown(C);
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -7998,7 +8015,7 @@ mod tests {
             C.prototype.run = function() {};
             if (flag) C.prototype.run = function() {};
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -8009,7 +8026,7 @@ mod tests {
             p.run = function() {};
             if (flag) p.run = function() {};
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -8019,7 +8036,7 @@ mod tests {
             C.prototype.run = function() {};
             C.prototype.run += 1;
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -8029,7 +8046,7 @@ mod tests {
             C.prototype.run = function() {};
             C.prototype.run++;
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -8039,7 +8056,7 @@ mod tests {
             C.prototype.run = function() {};
             delete C.prototype.run;
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -8057,7 +8074,7 @@ mod tests {
             semantic.semantic.scoping(),
             &test_budget(),
         ));
-        assert!(stable.is_empty());
+        assert_eq!(stable.len(), 0);
     }
 
     #[test]
@@ -8067,7 +8084,7 @@ mod tests {
             C.prototype.run = function() {};
             C.prototype.__proto__ = {};
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -8077,7 +8094,7 @@ mod tests {
             C.prototype.run = function() {};
             C.prototype["__proto__"] = {};
         "#;
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -8087,7 +8104,7 @@ mod tests {
             C.prototype.run = function() {};
             C.prototype[key] = 1;
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
         assert_eq!(method_assignments(source).len(), 1);
     }
 
@@ -8098,7 +8115,7 @@ mod tests {
             C.prototype.run = function() {};
             unknown(C.prototype);
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
         assert_eq!(method_assignments(source).len(), 1);
     }
 
@@ -8110,7 +8127,7 @@ mod tests {
             p.run = function() {};
             p.touch();
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -8121,7 +8138,7 @@ mod tests {
             p.run = function() {};
             p[key]();
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -8131,7 +8148,7 @@ mod tests {
             C.prototype.run = function() {};
             unknown([C.prototype]);
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -8141,7 +8158,7 @@ mod tests {
             C.prototype.run = function() {};
             unknown({ value: C.prototype });
         ";
-        assert!(lookup_targets(source).is_empty());
+        assert_eq!(lookup_targets(source).len(), 0);
     }
 
     #[test]
@@ -8216,7 +8233,7 @@ mod tests {
             }
             new C();
         ";
-        assert!(writes(source).is_empty());
+        assert_eq!(writes(source).len(), 0);
     }
 
     #[test]
@@ -8254,7 +8271,7 @@ mod tests {
         ));
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].receiver_reads, vec!["base"]);
-        assert!(effects[0].receiver_calls.is_empty());
+        assert_eq!(effects[0].receiver_calls.len(), 0);
         assert!(!effects[0].mutates_receiver);
         assert!(!effects[0].exposes_receiver);
         assert!(!effects[0].dynamic_receiver_access);
@@ -8298,6 +8315,6 @@ mod tests {
             }
             new C();
         ";
-        assert!(calls(source).is_empty());
+        assert_eq!(calls(source).len(), 0);
     }
 }
