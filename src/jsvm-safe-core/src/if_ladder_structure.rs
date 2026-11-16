@@ -267,6 +267,96 @@ fn assigned_state_in_initializer(expr: &Expression<'_>, state: &str) -> Option<u
 /// Statement-form state dispatchers are the same graph as ternary
 /// dispatchers, with effects spread across statement blocks instead of
 /// comma expressions. Keep the original effect order and lexical scope.
+/// Compose the guarded transitions of a lexical block without moving
+/// lexical declarations or observable effects outside their original scope.
+fn parse_statement_block_route(
+    block: &oxc_ast::ast::BlockStatement<'_>,
+    state: &str,
+    exit: u64,
+    source: &str,
+) -> Option<Route> {
+    let (last, prefix) = block.body.split_last()?;
+    // Compose any number of ordered numeric-state guards after a
+    // modeled state selection. Each guard observes the state left
+    // by its predecessor, including earlier guard writes. The
+    // source statements stay in their original try/catch region.
+    let mut guard_start = block.body.len();
+    while guard_start > 0 {
+        let Statement::IfStatement(guard) = &block.body[guard_start - 1] else {
+            break;
+        };
+        if guard.alternate.is_some() || state_test(&guard.test, state).is_none() {
+            break;
+        }
+        guard_start -= 1;
+    }
+    if guard_start > 0 && guard_start < block.body.len() {
+        let (before, guards) = block.body.split_at(guard_start);
+        let (prior, earlier) = before.split_last()?;
+        if earlier.iter().any(|statement| {
+            matches!(
+                statement,
+                Statement::VariableDeclaration(declaration)
+                    if declaration.kind != VariableDeclarationKind::Var
+            ) || matches!(
+                statement,
+                Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_)
+            )
+        }) {
+            return None;
+        }
+        let mut route = parse_statement_route(prior, state, exit, source)?;
+        for statement in guards {
+            let Statement::IfStatement(guard) = statement else {
+                return None;
+            };
+            let matched = state_test(&guard.test, state)?;
+            // The numeric comparison itself is pure. A guard that
+            // cannot match any modeled normal successor contributes
+            // no transition, even if its body is otherwise opaque.
+            // The synthetic exit is an abrupt completion, not a
+            // numeric state that a following statement can observe.
+            if matched == exit || !route.has_target(matched) {
+                continue;
+            }
+            let follow_up = parse_statement_route(&guard.consequent, state, exit, source)?;
+            if !splice_conditional_successor(&mut route, matched, &follow_up) {
+                return None;
+            }
+        }
+        let mut effects = earlier
+            .iter()
+            .map(|statement| fragment(source, statement.span()).to_owned())
+            .collect::<Vec<_>>();
+        effects.append(&mut route.effects);
+        route.effects = effects;
+        return Some(route);
+    }
+    // Moving a block-local declaration outside its original block
+    // changes temporal-dead-zone/closure semantics. Retain those
+    // structures until the graph emitter can render lexical regions.
+    if prefix.iter().any(|statement| {
+        matches!(
+            statement,
+            Statement::VariableDeclaration(declaration)
+                if declaration.kind != oxc_ast::ast::VariableDeclarationKind::Var
+        ) || matches!(
+            statement,
+            Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_)
+        )
+    }) {
+        return None;
+    }
+    let mut route = parse_statement_route(last, state, exit, source)?;
+    let mut effects = prefix
+        .iter()
+        .map(|statement| fragment(source, statement.span()).to_owned())
+        .collect::<Vec<_>>();
+    effects.append(&mut route.effects);
+    route.effects = effects;
+    Some(route)
+}
+
 fn parse_statement_route(
     stmt: &Statement<'_>,
     state: &str,
@@ -296,88 +386,7 @@ fn parse_statement_route(
                 next: Next::State(target),
             })
         }
-        Statement::BlockStatement(block) => {
-            let (last, prefix) = block.body.split_last()?;
-            // Compose any number of ordered numeric-state guards after a
-            // modeled state selection. Each guard observes the state left
-            // by its predecessor, including earlier guard writes. The
-            // source statements stay in their original try/catch region.
-            let mut guard_start = block.body.len();
-            while guard_start > 0 {
-                let Statement::IfStatement(guard) = &block.body[guard_start - 1] else {
-                    break;
-                };
-                if guard.alternate.is_some() || state_test(&guard.test, state).is_none() {
-                    break;
-                }
-                guard_start -= 1;
-            }
-            if guard_start > 0 && guard_start < block.body.len() {
-                let (before, guards) = block.body.split_at(guard_start);
-                let (prior, earlier) = before.split_last()?;
-                if earlier.iter().any(|statement| {
-                    matches!(
-                        statement,
-                        Statement::VariableDeclaration(declaration)
-                            if declaration.kind != VariableDeclarationKind::Var
-                    ) || matches!(
-                        statement,
-                        Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_)
-                    )
-                }) {
-                    return None;
-                }
-                let mut route = parse_statement_route(prior, state, exit, source)?;
-                for statement in guards {
-                    let Statement::IfStatement(guard) = statement else {
-                        return None;
-                    };
-                    let matched = state_test(&guard.test, state)?;
-                    // The numeric comparison itself is pure. A guard that
-                    // cannot match any modeled normal successor contributes
-                    // no transition, even if its body is otherwise opaque.
-                    // The synthetic exit is an abrupt completion, not a
-                    // numeric state that a following statement can observe.
-                    if matched == exit || !route.has_target(matched) {
-                        continue;
-                    }
-                    let follow_up = parse_statement_route(&guard.consequent, state, exit, source)?;
-                    if !splice_conditional_successor(&mut route, matched, &follow_up) {
-                        return None;
-                    }
-                }
-                let mut effects = earlier
-                    .iter()
-                    .map(|statement| fragment(source, statement.span()).to_owned())
-                    .collect::<Vec<_>>();
-                effects.append(&mut route.effects);
-                route.effects = effects;
-                return Some(route);
-            }
-            // Moving a block-local declaration outside its original block
-            // changes temporal-dead-zone/closure semantics. Retain those
-            // structures until the graph emitter can render lexical regions.
-            if prefix.iter().any(|statement| {
-                matches!(
-                    statement,
-                    Statement::VariableDeclaration(declaration)
-                        if declaration.kind != oxc_ast::ast::VariableDeclarationKind::Var
-                ) || matches!(
-                    statement,
-                    Statement::FunctionDeclaration(_) | Statement::ClassDeclaration(_)
-                )
-            }) {
-                return None;
-            }
-            let mut route = parse_statement_route(last, state, exit, source)?;
-            let mut effects = prefix
-                .iter()
-                .map(|statement| fragment(source, statement.span()).to_owned())
-                .collect::<Vec<_>>();
-            effects.append(&mut route.effects);
-            route.effects = effects;
-            Some(route)
-        }
+        Statement::BlockStatement(block) => parse_statement_block_route(block, state, exit, source),
         Statement::IfStatement(branch) => Some(Route {
             effects: Vec::new(),
             next: Next::Choose {
@@ -1466,6 +1475,470 @@ fn bound_inert_exception_assignment(
 /// their *normally completing* successors. A return/throw has no successor.
 /// Complex writes in a test or other opaque statement invalidate this
 /// refinement, leaving the conservative exceptional-root collector in charge.
+/// Analyze source-order state transitions and exceptional entry roots using
+/// one invocation-local state walker. Kept independent of the dispatcher
+/// graph so every AST branch must prove the same fail-closed invariants.
+struct SequentialExceptionScan<'s> {
+    roots: BTreeSet<u64>,
+    symbol: SymbolId,
+    state: &'s str,
+    source: &'s str,
+    scoping: &'s Scoping,
+    reference_spans: &'s HashMap<ReferenceId, Span>,
+}
+impl SequentialExceptionScan<'_> {
+    fn has_state_write(&self, span: Span) -> bool {
+        self.scoping
+            .get_resolved_reference_ids(self.symbol)
+            .iter()
+            .any(|reference_id| {
+                self.scoping.get_reference(*reference_id).is_write()
+                    && self
+                        .reference_spans
+                        .get(reference_id)
+                        .is_none_or(|write| span.start <= write.start && write.end <= span.end)
+            })
+    }
+
+    fn opaque_statement_is_write_free(&self, statement: &Statement<'_>) -> bool {
+        if self.has_state_write(statement.span()) {
+            return false;
+        }
+        let mut writes = ExceptionStateWrites {
+            symbol: self.symbol,
+            state_name: self.state,
+            scoping: self.scoping,
+            source: self.source,
+            targets: BTreeSet::new(),
+            modeled_writes: BTreeSet::new(),
+            unsafe_write: false,
+        };
+        writes.visit_statement(statement);
+        !writes.unsafe_write && writes.targets.is_empty()
+    }
+
+    fn expression_is_write_free(&self, expression: &Expression<'_>) -> bool {
+        if self.has_state_write(expression.span()) {
+            return false;
+        }
+        let mut writes = ExceptionStateWrites {
+            symbol: self.symbol,
+            state_name: self.state,
+            scoping: self.scoping,
+            source: self.source,
+            targets: BTreeSet::new(),
+            modeled_writes: BTreeSet::new(),
+            unsafe_write: false,
+        };
+        writes.visit_expression(expression);
+        !writes.unsafe_write && writes.targets.is_empty()
+    }
+
+    /// Evaluate the receiver (or constructor) and arguments in ECMAScript
+    /// order. Spreading an argument can throw *after* evaluating its
+    /// expression, when retrieving/iterating the spread value.
+    fn call_arguments(
+        &mut self,
+        arguments: &[oxc_ast::ast::Argument<'_>],
+        mut states: BTreeSet<u64>,
+    ) -> Option<BTreeSet<u64>> {
+        for argument in arguments {
+            if let oxc_ast::ast::Argument::SpreadElement(spread) = argument {
+                states = self.expression(&spread.argument, states)?;
+                self.roots.extend(states.iter().copied());
+            } else {
+                states = self.expression(argument.as_expression()?, states)?;
+            }
+        }
+        Some(states)
+    }
+
+    /// Evaluate a property reference, optionally skipping its computed
+    /// key and access on a nullish receiver. An optional chain can still
+    /// throw while evaluating the receiver or the executed property.
+    fn member_reference(
+        &mut self,
+        member: &oxc_ast::ast::MemberExpression<'_>,
+        incoming: BTreeSet<u64>,
+    ) -> Option<BTreeSet<u64>> {
+        let (object, key, optional) = match member {
+            oxc_ast::ast::MemberExpression::ComputedMemberExpression(value) => {
+                (&value.object, Some(&value.expression), value.optional)
+            }
+            oxc_ast::ast::MemberExpression::StaticMemberExpression(value) => {
+                (&value.object, None, value.optional)
+            }
+            oxc_ast::ast::MemberExpression::PrivateFieldExpression(value) => {
+                (&value.object, None, value.optional)
+            }
+        };
+        let after_object = self.expression(object, incoming)?;
+        let after_access = if let Some(key) = key {
+            self.expression(key, after_object.clone())?
+        } else {
+            after_object.clone()
+        };
+        self.roots.extend(after_access.iter().copied());
+        if optional {
+            let mut merged = after_object;
+            merged.extend(after_access);
+            (merged.len() <= 2048).then_some(merged)
+        } else {
+            Some(after_access)
+        }
+    }
+
+    /// Calls within optional chains can skip argument evaluation even
+    /// when the final call node itself is not marked optional.
+    fn evaluated_call(
+        &mut self,
+        call: &CallExpression<'_>,
+        incoming: BTreeSet<u64>,
+        within_chain: bool,
+    ) -> Option<BTreeSet<u64>> {
+        if matches!(
+            unparen(&call.callee),
+            Expression::Identifier(id) if id.name == "eval"
+        ) {
+            return None;
+        }
+        let after_callee = self.expression(&call.callee, incoming)?;
+        let after_args = self.call_arguments(&call.arguments, after_callee.clone())?;
+        self.roots.extend(after_args.iter().copied());
+        if call.optional || within_chain {
+            let mut merged = after_callee;
+            merged.extend(after_args);
+            (merged.len() <= 2048).then_some(merged)
+        } else {
+            Some(after_args)
+        }
+    }
+
+    /// Evaluate the portions of an expression whose JS evaluation order
+    /// is explicit in the AST. A normal result is a set of possible state
+    /// values; roots collect the values observed before a possible throw.
+    /// Unknown expression shapes are accepted only if they cannot write
+    /// the dispatcher state, preserving the original broad fallback.
+    /// Walk source-ordered side effects, retaining exceptional numeric states.
+    fn array_literal(
+        &mut self,
+        array: &oxc_ast::ast::ArrayExpression<'_>,
+        incoming: BTreeSet<u64>,
+    ) -> Option<BTreeSet<u64>> {
+        // Elements execute left-to-right; an elision has no
+        // expression to evaluate. Spread iteration can throw
+        // after evaluating the spread's argument.
+        let mut states = incoming;
+        for element in &array.elements {
+            match element {
+                ArrayExpressionElement::SpreadElement(spread) => {
+                    states = self.expression(&spread.argument, states)?;
+                    self.roots.extend(states.iter().copied());
+                }
+                ArrayExpressionElement::Elision(_) => {}
+                other => {
+                    states = self.expression(other.as_expression()?, states)?;
+                }
+            }
+        }
+        Some(states)
+    }
+
+    /// Walk source-ordered side effects, retaining exceptional numeric states.
+    fn object_literal(
+        &mut self,
+        object: &oxc_ast::ast::ObjectExpression<'_>,
+        incoming: BTreeSet<u64>,
+    ) -> Option<BTreeSet<u64>> {
+        // Object literal entries are evaluated from left to right.
+        // Computed keys run before their corresponding values,
+        // and ToPropertyKey can throw before value evaluation.
+        // Spread performs CopyDataProperties *after* evaluating
+        // its argument: property enumeration/getters can throw
+        // before a subsequent object entry executes.
+        let mut states = incoming;
+        for entry in &object.properties {
+            match entry {
+                oxc_ast::ast::ObjectPropertyKind::SpreadProperty(spread) => {
+                    states = self.expression(&spread.argument, states)?;
+                    self.roots.extend(states.iter().copied());
+                }
+                oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property) => {
+                    if property.computed {
+                        states = self.expression(property.key.as_expression()?, states)?;
+                        self.roots.extend(states.iter().copied());
+                    }
+                    // For accessors and methods this evaluates a
+                    // function expression, not its body. Lexical
+                    // capture is separately rejected by the
+                    // confined_exception_state proof.
+                    states = self.expression(&property.value, states)?;
+                }
+            }
+        }
+        Some(states)
+    }
+
+    /// Walk source-ordered side effects, retaining exceptional numeric states.
+    fn assignment_expression(
+        &mut self,
+        expression: &Expression<'_>,
+        assignment: &oxc_ast::ast::AssignmentExpression<'_>,
+        incoming: BTreeSet<u64>,
+    ) -> Option<BTreeSet<u64>> {
+        if let Some(target) =
+            bound_inert_exception_assignment(expression, self.symbol, self.scoping)
+        {
+            return Some(BTreeSet::from([target]));
+        }
+        // In an assignment, evaluate the LHS reference and
+        // (for compound operators) read its old value before the
+        // RHS. Conversions, setters and proxy traps may throw
+        // after the RHS. Logical assignments can skip the RHS.
+        let after_target = if let Some(member) = assignment.left.as_member_expression() {
+            self.member_reference(member, incoming)?
+        } else if let AssignmentTarget::AssignmentTargetIdentifier(id) = &assignment.left {
+            if id.name == self.state
+                || id
+                    .reference_id
+                    .get()
+                    .and_then(|reference| self.scoping.get_reference(reference).symbol_id())
+                    == Some(self.symbol)
+            {
+                // A non-inert write to the dispatcher itself can
+                // commit an unbounded or unmodeled numeric value.
+                return None;
+            }
+            incoming
+        } else {
+            // Destructuring targets can perform arbitrary nested
+            // writes, property accesses, defaults and iteration.
+            return None;
+        };
+        let after_rhs = self.expression(&assignment.right, after_target.clone())?;
+        self.roots.extend(after_rhs.iter().copied());
+        if assignment.operator.is_logical() {
+            let mut merged = after_target;
+            merged.extend(after_rhs);
+            (merged.len() <= 2048).then_some(merged)
+        } else {
+            Some(after_rhs)
+        }
+    }
+
+    /// Tagged substitutions are evaluated without the ToString coercion
+    /// applied to ordinary templates; preserve the later tag call throw root.
+    fn tagged_template(
+        &mut self,
+        tagged: &oxc_ast::ast::TaggedTemplateExpression<'_>,
+        incoming: BTreeSet<u64>,
+    ) -> Option<BTreeSet<u64>> {
+        // The tag (including any property getter) evaluates
+        // before substitutions. Tagged substitutions are passed
+        // raw, without the ToString conversion of untagged
+        // templates, and the tag invocation follows all of them.
+        // Treat direct eval conservatively as with calls.
+        if matches!(
+            unparen(&tagged.tag),
+            Expression::Identifier(id) if id.name == "eval"
+        ) {
+            return None;
+        }
+        let mut states = self.expression(&tagged.tag, incoming)?;
+        for value in &tagged.quasi.expressions {
+            states = self.expression(value, states)?;
+        }
+        self.roots.extend(states.iter().copied());
+        Some(states)
+    }
+
+    fn expression(
+        &mut self,
+        expression: &Expression<'_>,
+        incoming: BTreeSet<u64>,
+    ) -> Option<BTreeSet<u64>> {
+        if incoming.is_empty() {
+            return Some(incoming);
+        }
+        match unparen(expression) {
+            Expression::SequenceExpression(sequence) => {
+                let mut states = incoming;
+                for item in &sequence.expressions {
+                    states = self.expression(item, states)?;
+                }
+                Some(states)
+            }
+            Expression::ConditionalExpression(conditional) => {
+                let after_test = self.expression(&conditional.test, incoming)?;
+                let yes = self.expression(&conditional.consequent, after_test.clone())?;
+                let no = self.expression(&conditional.alternate, after_test)?;
+                let mut merged = yes;
+                merged.extend(no);
+                (merged.len() <= 2048).then_some(merged)
+            }
+            Expression::LogicalExpression(logical) => {
+                // &&, || and ?? may skip the right operand. Keep both
+                // possible completions unless a separate constant proof
+                // proves the selection; this is a safe path union.
+                let left = self.expression(&logical.left, incoming)?;
+                let right = self.expression(&logical.right, left.clone())?;
+                let mut merged = left;
+                merged.extend(right);
+                (merged.len() <= 2048).then_some(merged)
+            }
+            Expression::BinaryExpression(binary) => {
+                // ECMAScript evaluates and obtains the left value before
+                // the right. The operator itself can then throw (e.g.
+                // ToPrimitive, mixed BigInt arithmetic, in, instanceof)
+                // after both operands have committed their state writes.
+                let after_left = self.expression(&binary.left, incoming)?;
+                let after_right = self.expression(&binary.right, after_left)?;
+                self.roots.extend(after_right.iter().copied());
+                Some(after_right)
+            }
+            Expression::PrivateInExpression(private) => {
+                let after_right = self.expression(&private.right, incoming)?;
+                // Private-brand validation is performed after the RHS.
+                self.roots.extend(after_right.iter().copied());
+                Some(after_right)
+            }
+            Expression::UnaryExpression(unary) => {
+                // Operand evaluation precedes unary conversion or
+                // deletion. ToNumber, ToPrimitive and a proxy's
+                // deleteProperty trap may throw after the operand
+                // committed its numeric dispatcher-state write.
+                let after_argument = self.expression(&unary.argument, incoming)?;
+                self.roots.extend(after_argument.iter().copied());
+                Some(after_argument)
+            }
+            Expression::TemplateLiteral(template) => {
+                // Each substitution evaluates and then undergoes ToString
+                // before the next substitution. Symbol/ToPrimitive
+                // coercion can throw with the newly committed state.
+                let mut states = incoming;
+                for value in &template.expressions {
+                    states = self.expression(value, states)?;
+                    self.roots.extend(states.iter().copied());
+                }
+                Some(states)
+            }
+            Expression::TaggedTemplateExpression(tagged) => self.tagged_template(tagged, incoming),
+            Expression::ArrayExpression(array) => self.array_literal(array, incoming),
+            Expression::ObjectExpression(object) => self.object_literal(object, incoming),
+            member @ (Expression::ComputedMemberExpression(_)
+            | Expression::StaticMemberExpression(_)
+            | Expression::PrivateFieldExpression(_)) => {
+                self.member_reference(member.as_member_expression()?, incoming)
+            }
+            Expression::ChainExpression(chain) => match &chain.expression {
+                oxc_ast::ast::ChainElement::CallExpression(call) => {
+                    self.evaluated_call(call, incoming, true)
+                }
+                member => self.member_reference(member.as_member_expression()?, incoming),
+            },
+            Expression::CallExpression(call) => self.evaluated_call(call, incoming, false),
+            Expression::NewExpression(new) => {
+                let after_callee = self.expression(&new.callee, incoming)?;
+                let after_args = self.call_arguments(&new.arguments, after_callee)?;
+                self.roots.extend(after_args.iter().copied());
+                Some(after_args)
+            }
+            Expression::AssignmentExpression(assignment) => {
+                self.assignment_expression(expression, assignment, incoming)
+            }
+            Expression::UpdateExpression(update) => {
+                if let Some(member) = update.argument.as_member_expression() {
+                    // Evaluate receiver and computed key, then perform
+                    // GetValue, ToNumeric and PutValue in that order.
+                    // Each may throw; updates of the dispatcher binding
+                    // itself remain on the conservative fallback.
+                    self.member_reference(member, incoming)
+                } else if self.expression_is_write_free(expression) {
+                    self.roots.extend(incoming.iter().copied());
+                    Some(incoming)
+                } else {
+                    None
+                }
+            }
+            other => {
+                if let Some(target) =
+                    bound_inert_exception_assignment(other, self.symbol, self.scoping)
+                {
+                    return Some(BTreeSet::from([target]));
+                }
+                // Calls, getters, template interpolation, destructuring,
+                // computed LHS references and nonliteral assignment RHS
+                // may throw before or after hidden writes. Do not infer
+                // any changes to the state from those expressions.
+                if !self.expression_is_write_free(other) {
+                    return None;
+                }
+                self.roots.extend(incoming.iter().copied());
+                Some(incoming)
+            }
+        }
+    }
+
+    fn statement(
+        &mut self,
+        statement: &Statement<'_>,
+        incoming: BTreeSet<u64>,
+    ) -> Option<BTreeSet<u64>> {
+        if incoming.is_empty() {
+            return Some(incoming);
+        }
+        match statement {
+            Statement::BlockStatement(block) => {
+                let mut states = incoming;
+                for item in &block.body {
+                    states = self.statement(item, states)?;
+                }
+                Some(states)
+            }
+            Statement::IfStatement(branch) => {
+                // Evaluation of the test can itself assign the numeric
+                // state and later throw, before choosing either arm.
+                let after_test = self.expression(&branch.test, incoming)?;
+                let yes = self.statement(&branch.consequent, after_test.clone())?;
+                let no = match branch.alternate.as_ref() {
+                    Some(other) => self.statement(other, after_test)?,
+                    None => after_test,
+                };
+                let mut merged = yes;
+                merged.extend(no);
+                (merged.len() <= 2048).then_some(merged)
+            }
+            Statement::ExpressionStatement(expression) => {
+                self.expression(&expression.expression, incoming)
+            }
+            Statement::ReturnStatement(ret) => {
+                if let Some(argument) = &ret.argument {
+                    self.expression(argument, incoming)?;
+                }
+                // The expression may throw, but a successful return
+                // has no normal continuation into following statements.
+                Some(BTreeSet::new())
+            }
+            Statement::ThrowStatement(throw) => {
+                let at_throw = self.expression(&throw.argument, incoming)?;
+                // The completed throw explicitly exposes the final
+                // state value even if the argument itself was inert.
+                self.roots.extend(at_throw);
+                Some(BTreeSet::new())
+            }
+            other => {
+                // Unknown statements are permitted only when none of
+                // their expression effects can mutate the state binding.
+                if !self.opaque_statement_is_write_free(other) {
+                    return None;
+                }
+                self.roots.extend(incoming.iter().copied());
+                Some(incoming)
+            }
+        }
+    }
+}
+
 fn sequential_exception_roots(
     body: &Statement<'_>,
     initial: u64,
@@ -1475,437 +1948,7 @@ fn sequential_exception_roots(
     scoping: &Scoping,
     reference_spans: &HashMap<ReferenceId, Span>,
 ) -> Option<BTreeSet<u64>> {
-    struct Scan<'s> {
-        roots: BTreeSet<u64>,
-        symbol: SymbolId,
-        state: &'s str,
-        source: &'s str,
-        scoping: &'s Scoping,
-        reference_spans: &'s HashMap<ReferenceId, Span>,
-    }
-    impl Scan<'_> {
-        fn has_state_write(&self, span: Span) -> bool {
-            self.scoping
-                .get_resolved_reference_ids(self.symbol)
-                .iter()
-                .any(|reference_id| {
-                    self.scoping.get_reference(*reference_id).is_write()
-                        && self
-                            .reference_spans
-                            .get(reference_id)
-                            .is_none_or(|write| span.start <= write.start && write.end <= span.end)
-                })
-        }
-
-        fn opaque_statement_is_write_free(&self, statement: &Statement<'_>) -> bool {
-            if self.has_state_write(statement.span()) {
-                return false;
-            }
-            let mut writes = ExceptionStateWrites {
-                symbol: self.symbol,
-                state_name: self.state,
-                scoping: self.scoping,
-                source: self.source,
-                targets: BTreeSet::new(),
-                modeled_writes: BTreeSet::new(),
-                unsafe_write: false,
-            };
-            writes.visit_statement(statement);
-            !writes.unsafe_write && writes.targets.is_empty()
-        }
-
-        fn expression_is_write_free(&self, expression: &Expression<'_>) -> bool {
-            if self.has_state_write(expression.span()) {
-                return false;
-            }
-            let mut writes = ExceptionStateWrites {
-                symbol: self.symbol,
-                state_name: self.state,
-                scoping: self.scoping,
-                source: self.source,
-                targets: BTreeSet::new(),
-                modeled_writes: BTreeSet::new(),
-                unsafe_write: false,
-            };
-            writes.visit_expression(expression);
-            !writes.unsafe_write && writes.targets.is_empty()
-        }
-
-        /// Evaluate the receiver (or constructor) and arguments in ECMAScript
-        /// order. Spreading an argument can throw *after* evaluating its
-        /// expression, when retrieving/iterating the spread value.
-        fn call_arguments(
-            &mut self,
-            arguments: &[oxc_ast::ast::Argument<'_>],
-            mut states: BTreeSet<u64>,
-        ) -> Option<BTreeSet<u64>> {
-            for argument in arguments {
-                if let oxc_ast::ast::Argument::SpreadElement(spread) = argument {
-                    states = self.expression(&spread.argument, states)?;
-                    self.roots.extend(states.iter().copied());
-                } else {
-                    states = self.expression(argument.as_expression()?, states)?;
-                }
-            }
-            Some(states)
-        }
-
-        /// Evaluate a property reference, optionally skipping its computed
-        /// key and access on a nullish receiver. An optional chain can still
-        /// throw while evaluating the receiver or the executed property.
-        fn member_reference(
-            &mut self,
-            member: &oxc_ast::ast::MemberExpression<'_>,
-            incoming: BTreeSet<u64>,
-        ) -> Option<BTreeSet<u64>> {
-            let (object, key, optional) = match member {
-                oxc_ast::ast::MemberExpression::ComputedMemberExpression(value) => {
-                    (&value.object, Some(&value.expression), value.optional)
-                }
-                oxc_ast::ast::MemberExpression::StaticMemberExpression(value) => {
-                    (&value.object, None, value.optional)
-                }
-                oxc_ast::ast::MemberExpression::PrivateFieldExpression(value) => {
-                    (&value.object, None, value.optional)
-                }
-            };
-            let after_object = self.expression(object, incoming)?;
-            let after_access = if let Some(key) = key {
-                self.expression(key, after_object.clone())?
-            } else {
-                after_object.clone()
-            };
-            self.roots.extend(after_access.iter().copied());
-            if optional {
-                let mut merged = after_object;
-                merged.extend(after_access);
-                (merged.len() <= 2048).then_some(merged)
-            } else {
-                Some(after_access)
-            }
-        }
-
-        /// Calls within optional chains can skip argument evaluation even
-        /// when the final call node itself is not marked optional.
-        fn evaluated_call(
-            &mut self,
-            call: &CallExpression<'_>,
-            incoming: BTreeSet<u64>,
-            within_chain: bool,
-        ) -> Option<BTreeSet<u64>> {
-            if matches!(
-                unparen(&call.callee),
-                Expression::Identifier(id) if id.name == "eval"
-            ) {
-                return None;
-            }
-            let after_callee = self.expression(&call.callee, incoming)?;
-            let after_args = self.call_arguments(&call.arguments, after_callee.clone())?;
-            self.roots.extend(after_args.iter().copied());
-            if call.optional || within_chain {
-                let mut merged = after_callee;
-                merged.extend(after_args);
-                (merged.len() <= 2048).then_some(merged)
-            } else {
-                Some(after_args)
-            }
-        }
-
-        /// Evaluate the portions of an expression whose JS evaluation order
-        /// is explicit in the AST. A normal result is a set of possible state
-        /// values; roots collect the values observed before a possible throw.
-        /// Unknown expression shapes are accepted only if they cannot write
-        /// the dispatcher state, preserving the original broad fallback.
-        fn expression(
-            &mut self,
-            expression: &Expression<'_>,
-            incoming: BTreeSet<u64>,
-        ) -> Option<BTreeSet<u64>> {
-            if incoming.is_empty() {
-                return Some(incoming);
-            }
-            match unparen(expression) {
-                Expression::SequenceExpression(sequence) => {
-                    let mut states = incoming;
-                    for item in &sequence.expressions {
-                        states = self.expression(item, states)?;
-                    }
-                    Some(states)
-                }
-                Expression::ConditionalExpression(conditional) => {
-                    let after_test = self.expression(&conditional.test, incoming)?;
-                    let yes = self.expression(&conditional.consequent, after_test.clone())?;
-                    let no = self.expression(&conditional.alternate, after_test)?;
-                    let mut merged = yes;
-                    merged.extend(no);
-                    (merged.len() <= 2048).then_some(merged)
-                }
-                Expression::LogicalExpression(logical) => {
-                    // &&, || and ?? may skip the right operand. Keep both
-                    // possible completions unless a separate constant proof
-                    // proves the selection; this is a safe path union.
-                    let left = self.expression(&logical.left, incoming)?;
-                    let right = self.expression(&logical.right, left.clone())?;
-                    let mut merged = left;
-                    merged.extend(right);
-                    (merged.len() <= 2048).then_some(merged)
-                }
-                Expression::BinaryExpression(binary) => {
-                    // ECMAScript evaluates and obtains the left value before
-                    // the right. The operator itself can then throw (e.g.
-                    // ToPrimitive, mixed BigInt arithmetic, in, instanceof)
-                    // after both operands have committed their state writes.
-                    let after_left = self.expression(&binary.left, incoming)?;
-                    let after_right = self.expression(&binary.right, after_left)?;
-                    self.roots.extend(after_right.iter().copied());
-                    Some(after_right)
-                }
-                Expression::PrivateInExpression(private) => {
-                    let after_right = self.expression(&private.right, incoming)?;
-                    // Private-brand validation is performed after the RHS.
-                    self.roots.extend(after_right.iter().copied());
-                    Some(after_right)
-                }
-                Expression::UnaryExpression(unary) => {
-                    // Operand evaluation precedes unary conversion or
-                    // deletion. ToNumber, ToPrimitive and a proxy's
-                    // deleteProperty trap may throw after the operand
-                    // committed its numeric dispatcher-state write.
-                    let after_argument = self.expression(&unary.argument, incoming)?;
-                    self.roots.extend(after_argument.iter().copied());
-                    Some(after_argument)
-                }
-                Expression::TemplateLiteral(template) => {
-                    // Each substitution evaluates and then undergoes ToString
-                    // before the next substitution. Symbol/ToPrimitive
-                    // coercion can throw with the newly committed state.
-                    let mut states = incoming;
-                    for value in &template.expressions {
-                        states = self.expression(value, states)?;
-                        self.roots.extend(states.iter().copied());
-                    }
-                    Some(states)
-                }
-                Expression::TaggedTemplateExpression(tagged) => {
-                    // The tag (including any property getter) evaluates
-                    // before substitutions. Tagged substitutions are passed
-                    // raw, without the ToString conversion of untagged
-                    // templates, and the tag invocation follows all of them.
-                    // Treat direct eval conservatively as with calls.
-                    if matches!(
-                        unparen(&tagged.tag),
-                        Expression::Identifier(id) if id.name == "eval"
-                    ) {
-                        return None;
-                    }
-                    let mut states = self.expression(&tagged.tag, incoming)?;
-                    for value in &tagged.quasi.expressions {
-                        states = self.expression(value, states)?;
-                    }
-                    self.roots.extend(states.iter().copied());
-                    Some(states)
-                }
-                Expression::ArrayExpression(array) => {
-                    // Elements execute left-to-right; an elision has no
-                    // expression to evaluate. Spread iteration can throw
-                    // after evaluating the spread's argument.
-                    let mut states = incoming;
-                    for element in &array.elements {
-                        match element {
-                            ArrayExpressionElement::SpreadElement(spread) => {
-                                states = self.expression(&spread.argument, states)?;
-                                self.roots.extend(states.iter().copied());
-                            }
-                            ArrayExpressionElement::Elision(_) => {}
-                            other => {
-                                states = self.expression(other.as_expression()?, states)?;
-                            }
-                        }
-                    }
-                    Some(states)
-                }
-                Expression::ObjectExpression(object) => {
-                    // Object literal entries are evaluated from left to right.
-                    // Computed keys run before their corresponding values,
-                    // and ToPropertyKey can throw before value evaluation.
-                    // Spread performs CopyDataProperties *after* evaluating
-                    // its argument: property enumeration/getters can throw
-                    // before a subsequent object entry executes.
-                    let mut states = incoming;
-                    for entry in &object.properties {
-                        match entry {
-                            oxc_ast::ast::ObjectPropertyKind::SpreadProperty(spread) => {
-                                states = self.expression(&spread.argument, states)?;
-                                self.roots.extend(states.iter().copied());
-                            }
-                            oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property) => {
-                                if property.computed {
-                                    states =
-                                        self.expression(property.key.as_expression()?, states)?;
-                                    self.roots.extend(states.iter().copied());
-                                }
-                                // For accessors and methods this evaluates a
-                                // function expression, not its body. Lexical
-                                // capture is separately rejected by the
-                                // confined_exception_state proof.
-                                states = self.expression(&property.value, states)?;
-                            }
-                        }
-                    }
-                    Some(states)
-                }
-                member @ (Expression::ComputedMemberExpression(_)
-                | Expression::StaticMemberExpression(_)
-                | Expression::PrivateFieldExpression(_)) => {
-                    self.member_reference(member.as_member_expression()?, incoming)
-                }
-                Expression::ChainExpression(chain) => match &chain.expression {
-                    oxc_ast::ast::ChainElement::CallExpression(call) => {
-                        self.evaluated_call(call, incoming, true)
-                    }
-                    member => self.member_reference(member.as_member_expression()?, incoming),
-                },
-                Expression::CallExpression(call) => self.evaluated_call(call, incoming, false),
-                Expression::NewExpression(new) => {
-                    let after_callee = self.expression(&new.callee, incoming)?;
-                    let after_args = self.call_arguments(&new.arguments, after_callee)?;
-                    self.roots.extend(after_args.iter().copied());
-                    Some(after_args)
-                }
-                Expression::AssignmentExpression(assignment) => {
-                    if let Some(target) =
-                        bound_inert_exception_assignment(expression, self.symbol, self.scoping)
-                    {
-                        return Some(BTreeSet::from([target]));
-                    }
-                    // In an assignment, evaluate the LHS reference and
-                    // (for compound operators) read its old value before the
-                    // RHS. Conversions, setters and proxy traps may throw
-                    // after the RHS. Logical assignments can skip the RHS.
-                    let after_target = if let Some(member) = assignment.left.as_member_expression()
-                    {
-                        self.member_reference(member, incoming)?
-                    } else if let AssignmentTarget::AssignmentTargetIdentifier(id) =
-                        &assignment.left
-                    {
-                        if id.name == self.state
-                            || id.reference_id.get().and_then(|reference| {
-                                self.scoping.get_reference(reference).symbol_id()
-                            }) == Some(self.symbol)
-                        {
-                            // A non-inert write to the dispatcher itself can
-                            // commit an unbounded or unmodeled numeric value.
-                            return None;
-                        }
-                        incoming
-                    } else {
-                        // Destructuring targets can perform arbitrary nested
-                        // writes, property accesses, defaults and iteration.
-                        return None;
-                    };
-                    let after_rhs = self.expression(&assignment.right, after_target.clone())?;
-                    self.roots.extend(after_rhs.iter().copied());
-                    if assignment.operator.is_logical() {
-                        let mut merged = after_target;
-                        merged.extend(after_rhs);
-                        (merged.len() <= 2048).then_some(merged)
-                    } else {
-                        Some(after_rhs)
-                    }
-                }
-                Expression::UpdateExpression(update) => {
-                    if let Some(member) = update.argument.as_member_expression() {
-                        // Evaluate receiver and computed key, then perform
-                        // GetValue, ToNumeric and PutValue in that order.
-                        // Each may throw; updates of the dispatcher binding
-                        // itself remain on the conservative fallback.
-                        self.member_reference(member, incoming)
-                    } else if self.expression_is_write_free(expression) {
-                        self.roots.extend(incoming.iter().copied());
-                        Some(incoming)
-                    } else {
-                        None
-                    }
-                }
-                other => {
-                    if let Some(target) =
-                        bound_inert_exception_assignment(other, self.symbol, self.scoping)
-                    {
-                        return Some(BTreeSet::from([target]));
-                    }
-                    // Calls, getters, template interpolation, destructuring,
-                    // computed LHS references and nonliteral assignment RHS
-                    // may throw before or after hidden writes. Do not infer
-                    // any changes to the state from those expressions.
-                    if !self.expression_is_write_free(other) {
-                        return None;
-                    }
-                    self.roots.extend(incoming.iter().copied());
-                    Some(incoming)
-                }
-            }
-        }
-
-        fn statement(
-            &mut self,
-            statement: &Statement<'_>,
-            incoming: BTreeSet<u64>,
-        ) -> Option<BTreeSet<u64>> {
-            if incoming.is_empty() {
-                return Some(incoming);
-            }
-            match statement {
-                Statement::BlockStatement(block) => {
-                    let mut states = incoming;
-                    for item in &block.body {
-                        states = self.statement(item, states)?;
-                    }
-                    Some(states)
-                }
-                Statement::IfStatement(branch) => {
-                    // Evaluation of the test can itself assign the numeric
-                    // state and later throw, before choosing either arm.
-                    let after_test = self.expression(&branch.test, incoming)?;
-                    let yes = self.statement(&branch.consequent, after_test.clone())?;
-                    let no = match branch.alternate.as_ref() {
-                        Some(other) => self.statement(other, after_test)?,
-                        None => after_test,
-                    };
-                    let mut merged = yes;
-                    merged.extend(no);
-                    (merged.len() <= 2048).then_some(merged)
-                }
-                Statement::ExpressionStatement(expression) => {
-                    self.expression(&expression.expression, incoming)
-                }
-                Statement::ReturnStatement(ret) => {
-                    if let Some(argument) = &ret.argument {
-                        self.expression(argument, incoming)?;
-                    }
-                    // The expression may throw, but a successful return
-                    // has no normal continuation into following statements.
-                    Some(BTreeSet::new())
-                }
-                Statement::ThrowStatement(throw) => {
-                    let at_throw = self.expression(&throw.argument, incoming)?;
-                    // The completed throw explicitly exposes the final
-                    // state value even if the argument itself was inert.
-                    self.roots.extend(at_throw);
-                    Some(BTreeSet::new())
-                }
-                other => {
-                    // Unknown statements are permitted only when none of
-                    // their expression effects can mutate the state binding.
-                    if !self.opaque_statement_is_write_free(other) {
-                        return None;
-                    }
-                    self.roots.extend(incoming.iter().copied());
-                    Some(incoming)
-                }
-            }
-        }
-    }
-    let mut scan = Scan {
+    let mut scan = SequentialExceptionScan {
         roots: BTreeSet::new(),
         symbol,
         state,
@@ -3840,6 +3883,575 @@ pub struct CatchScopeEvidence<'a> {
     pub reference_spans: &'a HashMap<ReferenceId, Span>,
 }
 
+/// Retarget only graph-proven inert terminal transitions while retaining
+/// each source-ordered case test and return completion in its original scope.
+struct ExceptionTerminalProofs {
+    retargeted: BTreeMap<u64, Vec<TerminalStateEdit>>,
+    terminal_returns: BTreeMap<u64, (String, Option<SymbolId>)>,
+}
+
+fn exception_terminal_proofs(
+    loop_stmt: &WhileStatement<'_>,
+    dispatcher: &Statement<'_>,
+    state: &str,
+    scoping: &Scoping,
+    source: &str,
+    cases: &mut BTreeMap<u64, Option<Route>>,
+) -> Option<ExceptionTerminalProofs> {
+    // Skipping an iteration is only valid if its loop predicate is pure and
+    // invariably true. Keep all catch-root entries, and never collapse a
+    // self-loop or cyclic chain of effect-free state assignments.
+    let mut retargeted = BTreeMap::new();
+    let mut terminal_returns = BTreeMap::new();
+    if known_bool(&loop_stmt.test) == Some(true) {
+        let mut silent = BTreeMap::new();
+        let mut cursor = dispatcher;
+        loop {
+            let Statement::IfStatement(branch) = cursor else {
+                return None;
+            };
+            let label = state_test(&branch.test, state)?;
+            if let Some(target) = inert_exception_transition(&branch.consequent, state) {
+                silent.insert(label, target);
+            }
+            if let Some(completion) = nonthrowing_return(&branch.consequent, scoping, source) {
+                terminal_returns.insert(label, completion);
+            }
+            match branch.alternate.as_ref() {
+                Some(other @ Statement::IfStatement(_)) => cursor = other,
+                None => break,
+                Some(_) => return None,
+            }
+        }
+        // Retarget terminal numeric assignments in any supported branch, not
+        // only in already-silent branches. Prefix effects and conditions
+        // remain in their original positions; the CFG and text edits agree.
+        let mut cursor = dispatcher;
+        loop {
+            let Statement::IfStatement(branch) = cursor else {
+                return None;
+            };
+            let label = state_test(&branch.test, state)?;
+            if let Some(Some(route)) = cases.get_mut(&label) {
+                let edits = verified_terminal_edits(&branch.consequent, state, &silent, route);
+                if !edits.is_empty() {
+                    retargeted.insert(label, edits);
+                }
+            }
+            match branch.alternate.as_ref() {
+                Some(other @ Statement::IfStatement(_)) => cursor = other,
+                None => break,
+                Some(_) => return None,
+            }
+        }
+    }
+
+    Some(ExceptionTerminalProofs {
+        retargeted,
+        terminal_returns,
+    })
+}
+
+/// Preserve AST provenance of each executable source case, including
+/// the synthetic trailing completion outside the numeric dispatcher.
+fn exception_source_case_bodies<'node, 'ast>(
+    dispatcher: &'node Statement<'ast>,
+    state: &str,
+    trailing_exit: Option<(u64, &'node Statement<'ast>)>,
+) -> Option<BTreeMap<u64, &'node Statement<'ast>>> {
+    let mut source_cases = BTreeMap::new();
+    if let Some((target, tail)) = trailing_exit {
+        source_cases.insert(target, tail);
+    }
+    let mut cursor = dispatcher;
+    loop {
+        let Statement::IfStatement(branch) = cursor else {
+            return None;
+        };
+        source_cases.insert(state_test(&branch.test, state)?, &branch.consequent);
+        match branch.alternate.as_ref() {
+            Some(other @ Statement::IfStatement(_)) => cursor = other,
+            None => break,
+            Some(_) => return None,
+        }
+    }
+
+    Some(source_cases)
+}
+
+/// Exact proof context for exceptional retry roots of a numeric state.
+struct ExceptionCatchReachability<'a> {
+    state: &'a str,
+    symbol: SymbolId,
+    scoping: &'a Scoping,
+    source: &'a str,
+    reference_spans: &'a HashMap<ReferenceId, Span>,
+    catch_retries_unchanged: bool,
+    confined_state: bool,
+}
+
+fn reachable_exception_states(
+    context: ExceptionCatchReachability<'_>,
+    cases: &BTreeMap<u64, Option<Route>>,
+    source_cases: &BTreeMap<u64, &Statement<'_>>,
+    roots: &mut BTreeSet<u64>,
+) -> Option<BTreeSet<u64>> {
+    let ExceptionCatchReachability {
+        state,
+        symbol,
+        scoping,
+        source,
+        reference_spans,
+        catch_retries_unchanged,
+        confined_state,
+    } = context;
+    let effects = ExceptionLoopEffectContext { scoping };
+    let exit = u64::MAX;
+    let mut reachable = BTreeSet::new();
+    let mut work = VecDeque::from_iter(roots.iter().copied());
+    while let Some(current) = work.pop_front() {
+        if current == exit || !reachable.insert(current) {
+            continue;
+        }
+        let route = cases.get(&current)?.as_ref()?;
+        let mut next = Vec::new();
+        route.targets(&mut next);
+        work.extend(next);
+
+        if catch_retries_unchanged {
+            let body = *source_cases.get(&current)?;
+            if body.may_have_side_effects(&effects)
+                && inert_exception_transition(body, state).is_none()
+            {
+                let exact = confined_state
+                    .then(|| {
+                        sequential_exception_roots(
+                            body,
+                            current,
+                            symbol,
+                            state,
+                            source,
+                            scoping,
+                            reference_spans,
+                        )
+                    })
+                    .flatten();
+                let possible = if let Some(at_throw) = exact {
+                    at_throw
+                } else {
+                    // A conditional, expression-nested or otherwise
+                    // unsequenced write can throw before or after any of its
+                    // finite state assignments. Keep all possible values.
+                    let mut state_writes = ExceptionStateWrites {
+                        symbol,
+                        state_name: state,
+                        scoping,
+                        source,
+                        targets: BTreeSet::new(),
+                        modeled_writes: BTreeSet::new(),
+                        unsafe_write: false,
+                    };
+                    state_writes.visit_statement(body);
+                    if !state_writes.accounts_for_writes(body.span(), reference_spans) {
+                        return None;
+                    }
+                    let mut conservative = state_writes.targets;
+                    conservative.insert(current);
+                    conservative
+                };
+                for target in possible {
+                    if target == exit {
+                        return None;
+                    }
+                    roots.insert(target);
+                    work.push_back(target);
+                }
+            }
+        }
+    }
+
+    Some(reachable)
+}
+
+struct ExceptionReachableCases<'a, 'ast> {
+    cases: &'a BTreeMap<u64, Option<Route>>,
+    source_cases: &'a BTreeMap<u64, &'a Statement<'ast>>,
+    reachable: &'a BTreeSet<u64>,
+}
+
+/// Elide only catch-invisible, unaliased intermediate writes. Preserve
+/// exact byte offsets for subsequent AST spans and dispatcher comparisons.
+fn rewritten_exception_source(
+    handler: &oxc_ast::ast::CatchClause<'_>,
+    symbol: SymbolId,
+    scoping: &Scoping,
+    source: &str,
+    catch_retries_unchanged: bool,
+    proof: ExceptionReachableCases<'_, '_>,
+) -> Option<Option<String>> {
+    // Once every normal and exceptional state edge is established, prove
+    // which intermediate *standalone* state writes are dead. A catch that
+    // implicitly resumes the interrupted state, reads that state, or an
+    // escaping/aliased binding forbids this reduction. Keep source spans
+    // byte-identical by substituting an empty statement and padding, so
+    // precomputed semantic spans and CFG transitions remain valid.
+    let ExceptionReachableCases {
+        cases,
+        source_cases,
+        reachable,
+    } = proof;
+    let mut rewritten_source = None;
+    if !catch_retries_unchanged
+        && exception_state_is_unaliased(symbol, scoping)
+        && !state_binding_read(symbol, scoping, |reads| {
+            reads.visit_block_statement(&handler.body);
+        })
+    {
+        let mut dead = Vec::new();
+        let case_labels = cases.keys().copied().collect::<BTreeSet<_>>();
+        for &label in reachable {
+            if let Some(&body) = source_cases.get(&label) {
+                dead_exception_state_writes(body, true, symbol, scoping, &mut dead, &case_labels);
+            }
+        }
+        if !dead.is_empty() {
+            let mut replacement = source.to_owned();
+            dead.sort_by_key(|span| std::cmp::Reverse(span.start));
+            for span in dead {
+                let start = usize::try_from(span.start).ok()?;
+                let end = usize::try_from(span.end).ok()?;
+                let width = end.checked_sub(start)?;
+                if width == 0
+                    || !replacement.is_char_boundary(start)
+                    || !replacement.is_char_boundary(end)
+                {
+                    return None;
+                }
+                replacement.replace_range(start..end, &format!(";{}", " ".repeat(width - 1)));
+            }
+            rewritten_source = Some(replacement);
+        }
+    }
+    Some(rewritten_source)
+}
+
+struct ExceptionRegionProof<'a, 'ast> {
+    dispatcher: &'a Statement<'ast>,
+    state: &'a str,
+    roots: &'a BTreeSet<u64>,
+    reachable: &'a BTreeSet<u64>,
+    retargeted: &'a BTreeMap<u64, Vec<TerminalStateEdit>>,
+    source: &'a str,
+    scoping: &'a Scoping,
+    excluded: BTreeSet<u64>,
+    constant_true_loop: bool,
+}
+
+struct ExceptionRegions {
+    combined: BTreeMap<u64, String>,
+    absorbed: BTreeSet<u64>,
+    guards: BTreeMap<u64, String>,
+}
+
+/// Fold only independently proven regions and preserve the original
+/// exclusion set for synthetic trailing completions.
+/// Try the increasingly general closed-region proofs in order. A failed
+/// proof must leave the CFG unchanged, and no alternative may run after a
+/// successful, absorbing transformation.
+fn discover_exception_branch_regions(
+    dispatcher: &Statement<'_>,
+    state: &str,
+    entry: ExceptionEntryProof<'_>,
+    cases: &mut BTreeMap<u64, Option<Route>>,
+    retargeted: &BTreeMap<u64, Vec<TerminalStateEdit>>,
+    effects: &ExceptionLoopEffectContext<'_>,
+    source: &str,
+) -> Option<ExceptionRegions> {
+    let mut expanded_tests = BTreeMap::new();
+    let (mut combined, mut absorbed) =
+        exception_diamond_regions(dispatcher, state, entry, cases, retargeted, effects, source)?;
+    if absorbed.is_empty() {
+        let (regions, members) = exception_branching_dag_regions(
+            dispatcher, state, entry, cases, retargeted, effects, source,
+        )?;
+        combined = regions;
+        absorbed = members;
+    }
+    if absorbed.is_empty() {
+        let (regions, members) = exception_scc_backedge_regions(
+            dispatcher, state, entry, cases, retargeted, effects, source,
+        )?;
+        combined = regions;
+        absorbed = members;
+    }
+    if absorbed.is_empty() {
+        let rewrite = exception_multi_entry_cycle_regions(
+            dispatcher, state, entry, cases, retargeted, effects, source,
+        )?;
+        combined = rewrite.combined;
+        absorbed = rewrite.absorbed;
+        expanded_tests = rewrite.guards;
+    }
+    Some(ExceptionRegions {
+        combined,
+        absorbed,
+        guards: expanded_tests,
+    })
+}
+
+fn recover_exception_regions(
+    context: ExceptionRegionProof<'_, '_>,
+    cases: &mut BTreeMap<u64, Option<Route>>,
+) -> Option<ExceptionRegions> {
+    let ExceptionRegionProof {
+        dispatcher,
+        state,
+        roots,
+        reachable,
+        retargeted,
+        source,
+        scoping,
+        excluded,
+        constant_true_loop,
+    } = context;
+    let effects = ExceptionLoopEffectContext { scoping };
+    let exit = u64::MAX;
+    // Recover one closed conditional region (compact two-arm or general DAG),
+    // then recover independent linear
+    // regions against the UPDATED CFG. Protect the diamond's entry and
+    // absorbed states so a second rewrite cannot discard its source body.
+    // This preserves disjoint straight-line improvements in the same pass.
+    let (combined_regions, absorbed_regions, expanded_tests) = if constant_true_loop {
+        // The source of a trailing completion is *outside* the dispatcher.
+        // Its synthetic CFG exit must never be moved into an inlined region.
+        let ExceptionRegions {
+            mut combined,
+            mut absorbed,
+            guards: expanded_tests,
+        } = discover_exception_branch_regions(
+            dispatcher,
+            state,
+            ExceptionEntryProof {
+                roots,
+                reachable,
+                excluded: &excluded,
+            },
+            cases,
+            retargeted,
+            &effects,
+            source,
+        )?;
+        let mut after_diamond = reachable.clone();
+        if !absorbed.is_empty() {
+            after_diamond.clear();
+            let mut work = VecDeque::from_iter(roots.iter().copied());
+            while let Some(current) = work.pop_front() {
+                if current == exit || !after_diamond.insert(current) {
+                    continue;
+                }
+                let route = cases.get(&current)?.as_ref()?;
+                let mut next = Vec::new();
+                route.targets(&mut next);
+                work.extend(next);
+            }
+        }
+        let mut excluded = excluded;
+        excluded.extend(absorbed.iter().copied());
+        excluded.extend(combined.keys().copied());
+        let (linear, linear_absorbed) = single_entry_exception_regions(
+            dispatcher,
+            state,
+            ExceptionEntryProof {
+                roots,
+                reachable: &after_diamond,
+                excluded: &excluded,
+            },
+            cases,
+            retargeted,
+            &effects,
+            source,
+        )?;
+        combined.extend(linear);
+        absorbed.extend(linear_absorbed);
+        (combined, absorbed, expanded_tests)
+    } else {
+        (BTreeMap::new(), BTreeSet::new(), BTreeMap::new())
+    };
+    Some(ExceptionRegions {
+        combined: combined_regions,
+        absorbed: absorbed_regions,
+        guards: expanded_tests,
+    })
+}
+
+/// A terminal return may leave the dispatcher only if its original
+/// lexical binding and pure test remain valid at the hoisted call site.
+fn exception_terminal_completion_tail(
+    loop_stmt: &WhileStatement<'_>,
+    dispatcher: &Statement<'_>,
+    state: &str,
+    scoping: &Scoping,
+    source: &str,
+    reachable: &BTreeSet<u64>,
+    terminal_returns: &BTreeMap<u64, (String, Option<SymbolId>)>,
+) -> Option<Vec<(u64, String, String)>> {
+    let effects = ExceptionLoopEffectContext { scoping };
+    // Extract a single common return sink rather than duplicating it in
+    // predecessor states. Each incoming state assignment remains observable
+    // in its original source position. Only the proven inert loop predicate
+    // and pure numeric dispatch comparisons are advanced across the return.
+    let mut completion_tail = Vec::new();
+    if known_bool(&loop_stmt.test) == Some(true) {
+        let mut cursor = dispatcher;
+        loop {
+            let Statement::IfStatement(branch) = cursor else {
+                return None;
+            };
+            let label = state_test(&branch.test, state)?;
+            if branch.test.may_have_side_effects(&effects) {
+                return None;
+            }
+            if reachable.contains(&label) {
+                if let Some((completion, binding)) = terminal_returns.get(&label) {
+                    // This tail is emitted in the original try block, beside
+                    // the dispatch statement. A return identifier must bind
+                    // to precisely the same symbol in that enclosing scope.
+                    let Expression::BinaryExpression(test) = unparen(&branch.test) else {
+                        return None;
+                    };
+                    let state_id = [unparen(&test.left), unparen(&test.right)]
+                        .into_iter()
+                        .find_map(|side| match side {
+                            Expression::Identifier(id) if id.name == state => Some(id),
+                            _ => None,
+                        })?;
+                    let scope = scoping
+                        .get_reference(state_id.reference_id.get()?)
+                        .scope_id();
+                    if binding.is_none_or(|symbol| {
+                        scoping.find_binding(scope, scoping.symbol_name(symbol).into())
+                            == Some(symbol)
+                    }) {
+                        completion_tail.push((
+                            label,
+                            fragment(source, branch.test.span()).to_owned(),
+                            completion.clone(),
+                        ));
+                    }
+                }
+            }
+            match branch.alternate.as_ref() {
+                Some(other @ Statement::IfStatement(_)) => cursor = other,
+                None => break,
+                Some(_) => return None,
+            }
+        }
+    }
+
+    Some(completion_tail)
+}
+
+struct ExceptionRenderContext<'a, 'ast> {
+    dispatcher: &'a Statement<'ast>,
+    state: &'a str,
+    source: &'a str,
+    reachable: &'a BTreeSet<u64>,
+    absorbed_regions: &'a BTreeSet<u64>,
+    combined_regions: &'a BTreeMap<u64, String>,
+    retargeted: &'a BTreeMap<u64, Vec<TerminalStateEdit>>,
+    expanded_tests: &'a BTreeMap<u64, String>,
+    completion_tail: Vec<(u64, String, String)>,
+    dispatch_case_count: usize,
+}
+
+/// Reconstruct only supported reachable alternatives; preserve unreachable
+/// var hoisting and reject unsupported Annex-B declaration effects.
+fn render_exception_pruned(context: ExceptionRenderContext<'_, '_>) -> Option<String> {
+    let ExceptionRenderContext {
+        dispatcher,
+        state,
+        source,
+        reachable,
+        absorbed_regions,
+        combined_regions,
+        retargeted,
+        expanded_tests,
+        completion_tail,
+        dispatch_case_count,
+    } = context;
+    let mut alternatives = Vec::new();
+    let mut hoisted = HoistedVars::default();
+    let mut cursor = dispatcher;
+    loop {
+        let Statement::IfStatement(branch) = cursor else {
+            return None;
+        };
+        let label = state_test(&branch.test, state)?;
+        if completion_tail
+            .iter()
+            .any(|(terminal, _, _)| *terminal == label)
+        {
+            // One common terminal return is emitted after the dispatcher.
+        } else if absorbed_regions.contains(&label) {
+            // Its original body now occurs inside the sole entering region,
+            // so no declaration or observable effect is discarded.
+        } else if reachable.contains(&label) {
+            let consequent = if let Some(region) = combined_regions.get(&label) {
+                region.clone()
+            } else {
+                match retargeted.get(&label) {
+                    Some(edits) => print_terminal_edits(&branch.consequent, source, edits)?,
+                    None => fragment(source, branch.consequent.span()).to_owned(),
+                }
+            };
+            let test = expanded_tests
+                .get(&label)
+                .map_or_else(|| fragment(source, branch.test.span()), String::as_str);
+            alternatives.push(format!("if ({test}) {consequent}"));
+        } else {
+            hoisted.visit_statement(&branch.consequent);
+        }
+        match branch.alternate.as_ref() {
+            Some(other @ Statement::IfStatement(_)) => cursor = other,
+            None => break,
+            Some(_) => return None,
+        }
+    }
+    // Unreachable var declarations still create function-scoped bindings.
+    // Annex B function declarations have separate binding rules, so keep
+    // such a dispatcher unchanged rather than silently discarding them.
+    if hoisted.unsupported || hoisted.function_declaration {
+        return None;
+    }
+    if (alternatives.len() == dispatch_case_count
+        && retargeted.is_empty()
+        && completion_tail.is_empty())
+        || (alternatives.is_empty() && completion_tail.is_empty())
+    {
+        return None;
+    }
+    let mut text = if alternatives.is_empty() {
+        String::new()
+    } else {
+        let mut text = alternatives.remove(0);
+        for branch in alternatives {
+            text.push_str(" else ");
+            text.push_str(&branch);
+        }
+        text
+    };
+    for (_, test, completion) in completion_tail {
+        write!(&mut text, "\nif ({test}) {completion}").ok()?;
+    }
+    if !hoisted.names.is_empty() {
+        text = format!(
+            "var {};\n{text}",
+            hoisted.names.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Some(text)
+}
+
 pub fn prune_exception_dispatcher(
     loop_stmt: &WhileStatement<'_>,
     state: &str,
@@ -3934,53 +4546,10 @@ pub fn prune_exception_dispatcher(
         );
     }
 
-    // Skipping an iteration is only valid if its loop predicate is pure and
-    // invariably true. Keep all catch-root entries, and never collapse a
-    // self-loop or cyclic chain of effect-free state assignments.
-    let mut retargeted = BTreeMap::new();
-    let mut terminal_returns = BTreeMap::new();
-    if known_bool(&loop_stmt.test) == Some(true) {
-        let mut silent = BTreeMap::new();
-        let mut cursor = dispatcher;
-        loop {
-            let Statement::IfStatement(branch) = cursor else {
-                return None;
-            };
-            let label = state_test(&branch.test, state)?;
-            if let Some(target) = inert_exception_transition(&branch.consequent, state) {
-                silent.insert(label, target);
-            }
-            if let Some(completion) = nonthrowing_return(&branch.consequent, scoping, source) {
-                terminal_returns.insert(label, completion);
-            }
-            match branch.alternate.as_ref() {
-                Some(other @ Statement::IfStatement(_)) => cursor = other,
-                None => break,
-                Some(_) => return None,
-            }
-        }
-        // Retarget terminal numeric assignments in any supported branch, not
-        // only in already-silent branches. Prefix effects and conditions
-        // remain in their original positions; the CFG and text edits agree.
-        let mut cursor = dispatcher;
-        loop {
-            let Statement::IfStatement(branch) = cursor else {
-                return None;
-            };
-            let label = state_test(&branch.test, state)?;
-            if let Some(Some(route)) = cases.get_mut(&label) {
-                let edits = verified_terminal_edits(&branch.consequent, state, &silent, route);
-                if !edits.is_empty() {
-                    retargeted.insert(label, edits);
-                }
-            }
-            match branch.alternate.as_ref() {
-                Some(other @ Statement::IfStatement(_)) => cursor = other,
-                None => break,
-                Some(_) => return None,
-            }
-        }
-    }
+    let ExceptionTerminalProofs {
+        retargeted,
+        terminal_returns,
+    } = exception_terminal_proofs(loop_stmt, dispatcher, state, scoping, source, &mut cases)?;
 
     // The catch can change the numeric state explicitly, or complete normally
     // and retry at any state value held when a source case throws. Those values
@@ -4002,239 +4571,58 @@ pub fn prune_exception_dispatcher(
         catch_scope.reference_spans,
     );
     let confined_state = catch_retries_unchanged && confined_exception_state(symbol, scoping);
-    let mut source_cases = BTreeMap::new();
-    if let Some((target, tail)) = trailing_exit {
-        source_cases.insert(target, tail);
-    }
-    let mut cursor = dispatcher;
-    loop {
-        let Statement::IfStatement(branch) = cursor else {
-            return None;
-        };
-        source_cases.insert(state_test(&branch.test, state)?, &branch.consequent);
-        match branch.alternate.as_ref() {
-            Some(other @ Statement::IfStatement(_)) => cursor = other,
-            None => break,
-            Some(_) => return None,
-        }
-    }
+    let source_cases = exception_source_case_bodies(dispatcher, state, trailing_exit)?;
 
     let mut roots = writes.targets;
     roots.insert(initial);
-    let mut reachable = BTreeSet::new();
-    let mut work = VecDeque::from_iter(roots.iter().copied());
-    while let Some(current) = work.pop_front() {
-        if current == exit || !reachable.insert(current) {
-            continue;
-        }
-        let route = cases.get(&current)?.as_ref()?;
-        let mut next = Vec::new();
-        route.targets(&mut next);
-        work.extend(next);
+    let mut reachable = reachable_exception_states(
+        ExceptionCatchReachability {
+            state,
+            symbol,
+            scoping,
+            source,
+            reference_spans: catch_scope.reference_spans,
+            catch_retries_unchanged,
+            confined_state,
+        },
+        &cases,
+        &source_cases,
+        &mut roots,
+    )?;
 
-        if catch_retries_unchanged {
-            let body = *source_cases.get(&current)?;
-            if body.may_have_side_effects(&effects)
-                && inert_exception_transition(body, state).is_none()
-            {
-                let exact = confined_state
-                    .then(|| {
-                        sequential_exception_roots(
-                            body,
-                            current,
-                            symbol,
-                            state,
-                            source,
-                            scoping,
-                            catch_scope.reference_spans,
-                        )
-                    })
-                    .flatten();
-                let possible = if let Some(at_throw) = exact {
-                    at_throw
-                } else {
-                    // A conditional, expression-nested or otherwise
-                    // unsequenced write can throw before or after any of its
-                    // finite state assignments. Keep all possible values.
-                    let mut state_writes = ExceptionStateWrites {
-                        symbol,
-                        state_name: state,
-                        scoping,
-                        source,
-                        targets: BTreeSet::new(),
-                        modeled_writes: BTreeSet::new(),
-                        unsafe_write: false,
-                    };
-                    state_writes.visit_statement(body);
-                    if !state_writes.accounts_for_writes(body.span(), catch_scope.reference_spans) {
-                        return None;
-                    }
-                    let mut conservative = state_writes.targets;
-                    conservative.insert(current);
-                    conservative
-                };
-                for target in possible {
-                    if target == exit {
-                        return None;
-                    }
-                    roots.insert(target);
-                    work.push_back(target);
-                }
-            }
-        }
-    }
-
-    // Once every normal and exceptional state edge is established, prove
-    // which intermediate *standalone* state writes are dead. A catch that
-    // implicitly resumes the interrupted state, reads that state, or an
-    // escaping/aliased binding forbids this reduction. Keep source spans
-    // byte-identical by substituting an empty statement and padding, so
-    // precomputed semantic spans and CFG transitions remain valid.
-    let mut rewritten_source = None;
-    if !catch_retries_unchanged
-        && exception_state_is_unaliased(symbol, scoping)
-        && !state_binding_read(symbol, scoping, |reads| {
-            reads.visit_block_statement(&handler.body);
-        })
-    {
-        let mut dead = Vec::new();
-        let case_labels = cases.keys().copied().collect::<BTreeSet<_>>();
-        for &label in &reachable {
-            if let Some(&body) = source_cases.get(&label) {
-                dead_exception_state_writes(body, true, symbol, scoping, &mut dead, &case_labels);
-            }
-        }
-        if !dead.is_empty() {
-            let mut replacement = source.to_owned();
-            dead.sort_by_key(|span| std::cmp::Reverse(span.start));
-            for span in dead {
-                let start = usize::try_from(span.start).ok()?;
-                let end = usize::try_from(span.end).ok()?;
-                let width = end.checked_sub(start)?;
-                if width == 0
-                    || !replacement.is_char_boundary(start)
-                    || !replacement.is_char_boundary(end)
-                {
-                    return None;
-                }
-                replacement.replace_range(start..end, &format!(";{}", " ".repeat(width - 1)));
-            }
-            rewritten_source = Some(replacement);
-        }
-    }
+    let rewritten_source = rewritten_exception_source(
+        handler,
+        symbol,
+        scoping,
+        source,
+        catch_retries_unchanged,
+        ExceptionReachableCases {
+            cases: &cases,
+            source_cases: &source_cases,
+            reachable: &reachable,
+        },
+    )?;
     let source = rewritten_source.as_deref().unwrap_or(source);
 
-    // Recover one closed conditional region (compact two-arm or general DAG),
-    // then recover independent linear
-    // regions against the UPDATED CFG. Protect the diamond's entry and
-    // absorbed states so a second rewrite cannot discard its source body.
-    // This preserves disjoint straight-line improvements in the same pass.
-    let mut expanded_tests = BTreeMap::new();
-    let (combined_regions, absorbed_regions) = if known_bool(&loop_stmt.test) == Some(true) {
-        // The source of a trailing completion is *outside* the dispatcher.
-        // Its synthetic CFG exit must never be moved into an inlined region.
-        let excluded = trailing_exit.map_or_default(|(target, _)| BTreeSet::from([target]));
-        let (mut combined, mut absorbed) = exception_diamond_regions(
+    let ExceptionRegions {
+        combined: combined_regions,
+        absorbed: absorbed_regions,
+        guards: expanded_tests,
+    } = recover_exception_regions(
+        ExceptionRegionProof {
             dispatcher,
             state,
-            ExceptionEntryProof {
-                roots: &roots,
-                reachable: &reachable,
-                excluded: &excluded,
-            },
-            &mut cases,
-            &retargeted,
-            &effects,
+            roots: &roots,
+            reachable: &reachable,
+            retargeted: &retargeted,
             source,
-        )?;
-        if absorbed.is_empty() {
-            let (regions, members) = exception_branching_dag_regions(
-                dispatcher,
-                state,
-                ExceptionEntryProof {
-                    roots: &roots,
-                    reachable: &reachable,
-                    excluded: &excluded,
-                },
-                &mut cases,
-                &retargeted,
-                &effects,
-                source,
-            )?;
-            combined = regions;
-            absorbed = members;
-        }
-        if absorbed.is_empty() {
-            let (regions, members) = exception_scc_backedge_regions(
-                dispatcher,
-                state,
-                ExceptionEntryProof {
-                    roots: &roots,
-                    reachable: &reachable,
-                    excluded: &excluded,
-                },
-                &mut cases,
-                &retargeted,
-                &effects,
-                source,
-            )?;
-            combined = regions;
-            absorbed = members;
-        }
-        if absorbed.is_empty() {
-            let rewrite = exception_multi_entry_cycle_regions(
-                dispatcher,
-                state,
-                ExceptionEntryProof {
-                    roots: &roots,
-                    reachable: &reachable,
-                    excluded: &excluded,
-                },
-                &cases,
-                &retargeted,
-                &effects,
-                source,
-            )?;
-            combined = rewrite.combined;
-            absorbed = rewrite.absorbed;
-            expanded_tests = rewrite.guards;
-        }
-        let mut after_diamond = reachable.clone();
-        if !absorbed.is_empty() {
-            after_diamond.clear();
-            let mut work = VecDeque::from_iter(roots.iter().copied());
-            while let Some(current) = work.pop_front() {
-                if current == exit || !after_diamond.insert(current) {
-                    continue;
-                }
-                let route = cases.get(&current)?.as_ref()?;
-                let mut next = Vec::new();
-                route.targets(&mut next);
-                work.extend(next);
-            }
-        }
-        let mut excluded = excluded;
-        excluded.extend(absorbed.iter().copied());
-        excluded.extend(combined.keys().copied());
-        let (linear, linear_absorbed) = single_entry_exception_regions(
-            dispatcher,
-            state,
-            ExceptionEntryProof {
-                roots: &roots,
-                reachable: &after_diamond,
-                excluded: &excluded,
-            },
-            &mut cases,
-            &retargeted,
-            &effects,
-            source,
-        )?;
-        combined.extend(linear);
-        absorbed.extend(linear_absorbed);
-        (combined, absorbed)
-    } else {
-        (BTreeMap::new(), BTreeSet::new())
-    };
+            scoping,
+            excluded: trailing_exit.map_or_default(|(target, _)| BTreeSet::from([target])),
+            constant_true_loop: known_bool(&loop_stmt.test) == Some(true),
+        },
+        &mut cases,
+    )?;
+
     if !absorbed_regions.is_empty() {
         reachable.clear();
         let mut work = VecDeque::from_iter(roots.iter().copied());
@@ -4249,130 +4637,28 @@ pub fn prune_exception_dispatcher(
         }
     }
 
-    // Extract a single common return sink rather than duplicating it in
-    // predecessor states. Each incoming state assignment remains observable
-    // in its original source position. Only the proven inert loop predicate
-    // and pure numeric dispatch comparisons are advanced across the return.
-    let mut completion_tail = Vec::new();
-    if known_bool(&loop_stmt.test) == Some(true) {
-        let mut cursor = dispatcher;
-        loop {
-            let Statement::IfStatement(branch) = cursor else {
-                return None;
-            };
-            let label = state_test(&branch.test, state)?;
-            if branch.test.may_have_side_effects(&effects) {
-                return None;
-            }
-            if reachable.contains(&label) {
-                if let Some((completion, binding)) = terminal_returns.get(&label) {
-                    // This tail is emitted in the original try block, beside
-                    // the dispatch statement. A return identifier must bind
-                    // to precisely the same symbol in that enclosing scope.
-                    let Expression::BinaryExpression(test) = unparen(&branch.test) else {
-                        return None;
-                    };
-                    let state_id = [unparen(&test.left), unparen(&test.right)]
-                        .into_iter()
-                        .find_map(|side| match side {
-                            Expression::Identifier(id) if id.name == state => Some(id),
-                            _ => None,
-                        })?;
-                    let scope = scoping
-                        .get_reference(state_id.reference_id.get()?)
-                        .scope_id();
-                    if binding.is_none_or(|symbol| {
-                        scoping.find_binding(scope, scoping.symbol_name(symbol).into())
-                            == Some(symbol)
-                    }) {
-                        completion_tail.push((
-                            label,
-                            fragment(source, branch.test.span()).to_owned(),
-                            completion.clone(),
-                        ));
-                    }
-                }
-            }
-            match branch.alternate.as_ref() {
-                Some(other @ Statement::IfStatement(_)) => cursor = other,
-                None => break,
-                Some(_) => return None,
-            }
-        }
-    }
+    let completion_tail = exception_terminal_completion_tail(
+        loop_stmt,
+        dispatcher,
+        state,
+        scoping,
+        source,
+        &reachable,
+        &terminal_returns,
+    )?;
 
-    let mut alternatives = Vec::new();
-    let mut hoisted = HoistedVars::default();
-    let mut cursor = dispatcher;
-    loop {
-        let Statement::IfStatement(branch) = cursor else {
-            return None;
-        };
-        let label = state_test(&branch.test, state)?;
-        if completion_tail
-            .iter()
-            .any(|(terminal, _, _)| *terminal == label)
-        {
-            // One common terminal return is emitted after the dispatcher.
-        } else if absorbed_regions.contains(&label) {
-            // Its original body now occurs inside the sole entering region,
-            // so no declaration or observable effect is discarded.
-        } else if reachable.contains(&label) {
-            let consequent = if let Some(region) = combined_regions.get(&label) {
-                region.clone()
-            } else {
-                match retargeted.get(&label) {
-                    Some(edits) => print_terminal_edits(&branch.consequent, source, edits)?,
-                    None => fragment(source, branch.consequent.span()).to_owned(),
-                }
-            };
-            let test = expanded_tests
-                .get(&label)
-                .map_or_else(|| fragment(source, branch.test.span()), String::as_str);
-            alternatives.push(format!("if ({test}) {consequent}"));
-        } else {
-            hoisted.visit_statement(&branch.consequent);
-        }
-        match branch.alternate.as_ref() {
-            Some(other @ Statement::IfStatement(_)) => cursor = other,
-            None => break,
-            Some(_) => return None,
-        }
-    }
-    // Unreachable var declarations still create function-scoped bindings.
-    // Annex B function declarations have separate binding rules, so keep
-    // such a dispatcher unchanged rather than silently discarding them.
-    if hoisted.unsupported || hoisted.function_declaration {
-        return None;
-    }
-    let dispatch_case_count = cases.len() - usize::from(trailing_exit.is_some());
-    if (alternatives.len() == dispatch_case_count
-        && retargeted.is_empty()
-        && completion_tail.is_empty())
-        || (alternatives.is_empty() && completion_tail.is_empty())
-    {
-        return None;
-    }
-    let mut text = if alternatives.is_empty() {
-        String::new()
-    } else {
-        let mut text = alternatives.remove(0);
-        for branch in alternatives {
-            text.push_str(" else ");
-            text.push_str(&branch);
-        }
-        text
-    };
-    for (_, test, completion) in completion_tail {
-        write!(&mut text, "\nif ({test}) {completion}").ok()?;
-    }
-    if !hoisted.names.is_empty() {
-        text = format!(
-            "var {};\n{text}",
-            hoisted.names.into_iter().collect::<Vec<_>>().join(", ")
-        );
-    }
-    Some(text)
+    render_exception_pruned(ExceptionRenderContext {
+        dispatcher,
+        state,
+        source,
+        reachable: &reachable,
+        absorbed_regions: &absorbed_regions,
+        combined_regions: &combined_regions,
+        retargeted: &retargeted,
+        expanded_tests: &expanded_tests,
+        completion_tail,
+        dispatch_case_count: cases.len() - usize::from(trailing_exit.is_some()),
+    })
 }
 
 /// Recover a while loop preceded by a numeric state initializer in the same
