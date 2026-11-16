@@ -823,67 +823,8 @@ impl Collector<'_, '_> {
                     }
                 }
             }
-            // Exception-driven dispatchers often use a constant-true loop,
-            // rather than testing the state in the condition. The original
-            // lexical initializer and write-provenance still prove its entry.
             if let Statement::WhileStatement(loop_stmt) = stmt {
-                if let Statement::TryStatement(protected) = &loop_stmt.body {
-                    let mut rewritten = false;
-                    for (&symbol, &(initial, init_span)) in &reaching {
-                        if !self.safe_numeric_state_binding(symbol)
-                            || !self.reaching_state_is_stable(symbol, init_span, loop_stmt.span)
-                        {
-                            continue;
-                        }
-                        let state = self.scoping.symbol_name(symbol);
-                        if let Some(code) = if_ladder_structure::prune_exception_dispatcher(
-                            loop_stmt,
-                            state,
-                            initial,
-                            symbol,
-                            self.scoping,
-                            self.source,
-                            if_ladder_structure::CatchScopeEvidence {
-                                reaching: &reaching,
-                                reference_spans: self.reference_spans,
-                            },
-                        ) {
-                            if let Some(dispatcher) = protected.block.body.first() {
-                                self.push(dispatcher.span(), code, "exception_state_pruned");
-                                rewritten = true;
-                                break;
-                            }
-                        }
-                    }
-                    // On subsequent fixed-point passes a recovered multi-entry
-                    // dispatcher may use an OR guard, so the original CFG
-                    // recognizer no longer matches its case shape. Reuse the
-                    // same exceptional liveness proof on that structured AST.
-                    // Never emit overlapping rewrites with a CFG reduction.
-                    if !rewritten {
-                        for (&symbol, &(_, init_span)) in &reaching {
-                            if !self.safe_numeric_state_binding(symbol)
-                                || !self.reaching_state_is_stable(symbol, init_span, loop_stmt.span)
-                            {
-                                continue;
-                            }
-                            for span in
-                                if_ladder_structure::dead_intermediate_writes_in_structured_try(
-                                    loop_stmt,
-                                    symbol,
-                                    self.scoping,
-                                    self.source,
-                                    if_ladder_structure::CatchScopeEvidence {
-                                        reaching: &reaching,
-                                        reference_spans: self.reference_spans,
-                                    },
-                                )
-                            {
-                                self.push(span, ";".to_owned(), "dead_intermediate_state_write");
-                            }
-                        }
-                    }
-                }
+                self.reconstruct_exception_reaching_while(loop_stmt, &reaching);
             }
             match stmt {
                 Statement::BlockStatement(block) => {
@@ -909,6 +850,70 @@ impl Collector<'_, '_> {
                     && self.safe_numeric_state_binding(symbol)
                 {
                     reaching.insert(symbol, (initial, init_span));
+                }
+            }
+        }
+    }
+
+    /// Preserve the exact exceptional state liveness and source provenance
+    /// for an entry-proven while loop, including already structured retries.
+    fn reconstruct_exception_reaching_while(
+        &mut self,
+        loop_stmt: &oxc_ast::ast::WhileStatement<'_>,
+        reaching: &HashMap<SymbolId, (u64, Span)>,
+    ) {
+        if let Statement::TryStatement(protected) = &loop_stmt.body {
+            let mut rewritten = false;
+            for (&symbol, &(initial, init_span)) in reaching {
+                if !self.safe_numeric_state_binding(symbol)
+                    || !self.reaching_state_is_stable(symbol, init_span, loop_stmt.span)
+                {
+                    continue;
+                }
+                let state = self.scoping.symbol_name(symbol);
+                if let Some(code) = if_ladder_structure::prune_exception_dispatcher(
+                    loop_stmt,
+                    state,
+                    initial,
+                    symbol,
+                    self.scoping,
+                    self.source,
+                    if_ladder_structure::CatchScopeEvidence {
+                        reaching: &reaching,
+                        reference_spans: self.reference_spans,
+                    },
+                ) {
+                    if let Some(dispatcher) = protected.block.body.first() {
+                        self.push(dispatcher.span(), code, "exception_state_pruned");
+                        rewritten = true;
+                        break;
+                    }
+                }
+            }
+            // On subsequent fixed-point passes a recovered multi-entry
+            // dispatcher may use an OR guard, so the original CFG
+            // recognizer no longer matches its case shape. Reuse the
+            // same exceptional liveness proof on that structured AST.
+            // Never emit overlapping rewrites with a CFG reduction.
+            if !rewritten {
+                for (&symbol, &(_, init_span)) in reaching {
+                    if !self.safe_numeric_state_binding(symbol)
+                        || !self.reaching_state_is_stable(symbol, init_span, loop_stmt.span)
+                    {
+                        continue;
+                    }
+                    for span in if_ladder_structure::dead_intermediate_writes_in_structured_try(
+                        loop_stmt,
+                        symbol,
+                        self.scoping,
+                        self.source,
+                        if_ladder_structure::CatchScopeEvidence {
+                            reaching: &reaching,
+                            reference_spans: self.reference_spans,
+                        },
+                    ) {
+                        self.push(span, ";".to_owned(), "dead_intermediate_state_write");
+                    }
                 }
             }
         }

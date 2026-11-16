@@ -1183,6 +1183,51 @@ fn iife_body<'a>(expr: &'a Expression<'a>) -> Option<&'a oxc_ast::ast::FunctionB
     }
 }
 
+/// Handle register-array and local numeric updates while retaining the
+/// original uncertainty behavior for writes to the dispatcher state.
+fn simulate_update_expression(
+    expr: &Expression<'_>,
+    update: &oxc_ast::ast::UpdateExpression<'_>,
+    state_var: &str,
+    env: &mut HashMap<String, Value>,
+) -> Option<StateFlow> {
+    if let Some((name, index)) = direct_update_slot(&update.argument, env) {
+        let slot = register_slot(&name, index);
+        let Some(Value::Number(current)) = env.get(&slot).cloned() else {
+            env.remove(&slot);
+            return Some(StateFlow::Normal);
+        };
+        let next = match update.operator.as_str() {
+            "++" => current + 1.0,
+            "--" => current - 1.0,
+            _ => return None,
+        };
+        env.insert(slot, Value::Number(next));
+        return Some(StateFlow::Normal);
+    }
+    let Some(name) = direct_update_name(&update.argument) else {
+        if expression_mentions(expr, state_var) {
+            return None;
+        }
+        invalidate_non_state(env, state_var);
+        return Some(StateFlow::Normal);
+    };
+    let Some(Value::Number(current)) = env.get(name).cloned() else {
+        if name == state_var {
+            return None;
+        }
+        env.remove(name);
+        return Some(StateFlow::Normal);
+    };
+    let next = match update.operator.as_str() {
+        "++" => current + 1.0,
+        "--" => current - 1.0,
+        _ => return None,
+    };
+    env.insert(name.to_string(), Value::Number(next));
+    Some(StateFlow::Normal)
+}
+
 fn simulate_expression(
     expr: &Expression<'_>,
     state_var: &str,
@@ -1223,41 +1268,7 @@ fn simulate_expression(
             Some(StateFlow::Normal)
         }
         Expression::UpdateExpression(update) => {
-            if let Some((name, index)) = direct_update_slot(&update.argument, env) {
-                let slot = register_slot(&name, index);
-                let Some(Value::Number(current)) = env.get(&slot).cloned() else {
-                    env.remove(&slot);
-                    return Some(StateFlow::Normal);
-                };
-                let next = match update.operator.as_str() {
-                    "++" => current + 1.0,
-                    "--" => current - 1.0,
-                    _ => return None,
-                };
-                env.insert(slot, Value::Number(next));
-                return Some(StateFlow::Normal);
-            }
-            let Some(name) = direct_update_name(&update.argument) else {
-                if expression_mentions(expr, state_var) {
-                    return None;
-                }
-                invalidate_non_state(env, state_var);
-                return Some(StateFlow::Normal);
-            };
-            let Some(Value::Number(current)) = env.get(name).cloned() else {
-                if name == state_var {
-                    return None;
-                }
-                env.remove(name);
-                return Some(StateFlow::Normal);
-            };
-            let next = match update.operator.as_str() {
-                "++" => current + 1.0,
-                "--" => current - 1.0,
-                _ => return None,
-            };
-            env.insert(name.to_string(), Value::Number(next));
-            Some(StateFlow::Normal)
+            simulate_update_expression(expr, update, state_var, env)
         }
         Expression::UnaryExpression(unary) if unary.operator.as_str() == "delete" => {
             if let Expression::ComputedMemberExpression(member) = &unary.argument {

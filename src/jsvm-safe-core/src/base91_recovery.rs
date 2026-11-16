@@ -704,6 +704,83 @@ struct DecoderDiscoveryContext<'a> {
     arrays: &'a HashMap<String, Vec<Value>>,
 }
 
+/// Keep attribution to a provider guarded by the original declaration
+/// ordering, lexical scope, and exact reachable transform symbol.
+fn discover_decoder_candidate(
+    context: &DecoderDiscoveryContext<'_>,
+    provider: &ProviderTable,
+    decoder: &FunctionInfo,
+) -> Option<DecoderCandidate> {
+    let declaration_start = decoder.span.start as usize;
+    let (scope_start, scope_end) = function_scope_span(
+        context.scoping,
+        context.scope_spans,
+        decoder.owner_scope,
+        context.source.len(),
+    )?;
+    if decoder.owner_scope == provider.owner_scope {
+        // A same-scope helper must precede the table's initialization.
+        if declaration_start >= provider.assignment_start {
+            return None;
+        }
+    } else if !scope_is_descendant_of(context.scoping, decoder.owner_scope, provider.owner_scope)
+        || scope_start <= provider.assignment_end
+    {
+        return None;
+    }
+    let body = function_body(context.source, decoder);
+    if body.len() > 4096 || !body.contains("typeof") || !body.contains("return") {
+        return None;
+    }
+    let implementation_scopes = reachable_nested_function_scopes(
+        context.scoping,
+        decoder,
+        context.functions,
+        context.calls,
+    );
+    let transforms = context
+        .wrapper_links
+        .iter()
+        .filter(|link| {
+            link.provider_symbol == provider.provider_symbol
+                && implementation_scopes
+                    .contains(&owning_function_scope(context.scoping, link.scope))
+        })
+        .map(|link| link.transform_symbol)
+        .collect::<HashSet<_>>();
+    if transforms.len() != 1 {
+        return None;
+    }
+    let transform_symbol = transforms.iter().next().copied()?;
+    let transform_fn = context.functions.iter().find(|function| {
+        function.symbol == transform_symbol
+            && function.span.start < decoder.span.start
+            && function.owner_scope == decoder.owner_scope
+    })?;
+    let transform_body = function_body(context.source, transform_fn);
+    let alphabet = context
+        .string_values
+        .iter()
+        .filter(|literal| {
+            transform_fn.span.start <= literal.span.start
+                && literal.span.end <= transform_fn.span.end
+        })
+        .map(|literal| literal.value.clone())
+        .find(|candidate| looks_like_base91_decoder(transform_body, candidate, context.arrays))?;
+    let mut rotated = provider.clone();
+    rotated.values.rotate_left(rotated.rotation);
+    Some(DecoderCandidate {
+        decoder: decoder.name.clone(),
+        decoder_symbol: decoder.symbol,
+        provider: rotated,
+        transform: transform_fn.name.clone(),
+        alphabet,
+        declaration_start,
+        scope_start,
+        scope_end,
+    })
+}
+
 fn discover_decoders(
     context: &DecoderDiscoveryContext<'_>,
     providers: &[ProviderTable],
@@ -715,93 +792,12 @@ fn discover_decoders(
         }) else {
             continue;
         };
-        for decoder in context.functions {
-            let declaration_start = decoder.span.start as usize;
-            let Some((scope_start, scope_end)) = function_scope_span(
-                context.scoping,
-                context.scope_spans,
-                decoder.owner_scope,
-                context.source.len(),
-            ) else {
-                continue;
-            };
-            if decoder.owner_scope == provider.owner_scope {
-                // The canonical generated scaffold hoists same-scope decoder
-                // helpers before the rotated table is initialized. A helper
-                // declared after that initialization is not attributed to the
-                // table merely because it happens to share its binding.
-                if declaration_start >= provider.assignment_start {
-                    continue;
-                }
-            } else if !scope_is_descendant_of(
-                context.scoping,
-                decoder.owner_scope,
-                provider.owner_scope,
-            ) || scope_start <= provider.assignment_end
-            {
-                continue;
-            }
-            let body = function_body(context.source, decoder);
-            if body.len() > 4096 || !body.contains("typeof") || !body.contains("return") {
-                continue;
-            }
-            let implementation_scopes = reachable_nested_function_scopes(
-                context.scoping,
-                decoder,
-                context.functions,
-                context.calls,
-            );
-            let transforms = context
-                .wrapper_links
+        out.extend(
+            context
+                .functions
                 .iter()
-                .filter(|link| {
-                    link.provider_symbol == provider.provider_symbol
-                        && implementation_scopes
-                            .contains(&owning_function_scope(context.scoping, link.scope))
-                })
-                .map(|link| link.transform_symbol)
-                .collect::<HashSet<_>>();
-            if transforms.len() != 1 {
-                continue;
-            }
-            let Some(transform_symbol) = transforms.iter().next().copied() else {
-                continue;
-            };
-            let Some(transform_fn) = context.functions.iter().find(|function| {
-                function.symbol == transform_symbol
-                    && function.span.start < decoder.span.start
-                    && function.owner_scope == decoder.owner_scope
-            }) else {
-                continue;
-            };
-            let transform_body = function_body(context.source, transform_fn);
-            let Some(alphabet) = context
-                .string_values
-                .iter()
-                .filter(|literal| {
-                    transform_fn.span.start <= literal.span.start
-                        && literal.span.end <= transform_fn.span.end
-                })
-                .map(|literal| literal.value.clone())
-                .find(|candidate| {
-                    looks_like_base91_decoder(transform_body, candidate, context.arrays)
-                })
-            else {
-                continue;
-            };
-            let mut rotated = provider.clone();
-            rotated.values.rotate_left(rotated.rotation);
-            out.push(DecoderCandidate {
-                decoder: decoder.name.clone(),
-                decoder_symbol: decoder.symbol,
-                provider: rotated,
-                transform: transform_fn.name.clone(),
-                alphabet,
-                declaration_start,
-                scope_start,
-                scope_end,
-            });
-        }
+                .filter_map(|decoder| discover_decoder_candidate(context, provider, decoder)),
+        );
     }
     out.sort_by_key(|decoder| {
         (
