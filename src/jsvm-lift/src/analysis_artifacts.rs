@@ -195,6 +195,11 @@ pub fn artifact_path(project: &Path, spec: ArtifactSpec) -> PathBuf {
     project.join(spec.relative_path)
 }
 
+/// Validate one artifact's root, schema and required field shapes.
+///
+/// # Errors
+///
+/// Fails when the root is not an object, its schema does not match the artifact contract, or a required array/object field is missing or incorrectly typed.
 pub fn validate_artifact<'a>(
     document: &'a Value,
     spec: ArtifactSpec,
@@ -224,6 +229,11 @@ pub fn validate_artifact<'a>(
     Ok(object)
 }
 
+/// Construct an artifact with a schema owned by its contract.
+///
+/// # Errors
+///
+/// Fails if the payload already defines the reserved `schema` field or if the completed artifact violates the required field shapes.
 pub fn build_artifact(
     spec: ArtifactSpec,
     mut payload: serde_json::Map<String, Value>,
@@ -237,6 +247,11 @@ pub fn build_artifact(
     Ok(document)
 }
 
+/// Read, decode and validate a schema-specific analysis artifact.
+///
+/// # Errors
+///
+/// Fails on file-read errors, invalid JSON, a mismatched schema or missing/incorrect required fields.
 pub fn read_artifact(path: &Path, spec: ArtifactSpec) -> Result<Value> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read {} {}", spec.name, path.display()))?;
@@ -246,6 +261,11 @@ pub fn read_artifact(path: &Path, spec: ArtifactSpec) -> Result<Value> {
     Ok(document)
 }
 
+/// Load a project artifact, optionally accepting its absence.
+///
+/// # Errors
+///
+/// Propagates read, parse and validation failures; a missing optional artifact returns `Ok(None)`.
 pub fn load_artifact(project: &Path, spec: ArtifactSpec, optional: bool) -> Result<Option<Value>> {
     let path = artifact_path(project, spec);
     if optional && !path.exists() {
@@ -254,6 +274,11 @@ pub fn load_artifact(project: &Path, spec: ArtifactSpec, optional: bool) -> Resu
     read_artifact(&path, spec).map(Some)
 }
 
+/// Validate and write a pretty-printed artifact to a path.
+///
+/// # Errors
+///
+/// Fails on schema or field-shape violations, directory creation errors, serialization errors or file-write errors.
 pub fn write_artifact_path(path: &Path, spec: ArtifactSpec, document: &Value) -> Result<()> {
     validate_artifact(document, spec, &path.display().to_string())?;
     if let Some(parent) = path.parent() {
@@ -264,6 +289,11 @@ pub fn write_artifact_path(path: &Path, spec: ArtifactSpec, document: &Value) ->
     fs::write(path, encoded).with_context(|| format!("writing {}", path.display()))
 }
 
+/// Write a validated analysis artifact at its project-relative path.
+///
+/// # Errors
+///
+/// Propagates validation, serialization and filesystem errors from `write_artifact_path`.
 pub fn write_artifact(project: &Path, spec: ArtifactSpec, document: &Value) -> Result<()> {
     write_artifact_path(&artifact_path(project, spec), spec, document)
 }

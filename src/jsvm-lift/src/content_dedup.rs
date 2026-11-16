@@ -8,6 +8,11 @@ pub enum Materialization {
     Copy,
 }
 
+/// Compute a lowercase hexadecimal SHA-256 digest of a file.
+///
+/// # Errors
+///
+/// Fails when the source file cannot be opened or read.
 pub fn sha256_path(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -38,6 +43,11 @@ pub fn default_jobs(cap: usize) -> usize {
         .clamp(1, cap.max(1))
 }
 
+/// Materialize a source file using a hard link when possible, otherwise copy it.
+///
+/// # Errors
+///
+/// Fails when destination parent directories cannot be created, an existing destination cannot be inspected or removed, or the fallback file copy fails.
 pub fn link_or_copy(source: &Path, dest: &Path) -> Result<Materialization> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
