@@ -731,7 +731,7 @@ mod tests {
             .find(|row| {
                 row.get("output_path")
                     .and_then(Value::as_str)
-                    .is_some_and(|path| path.ends_with(".js"))
+                    .is_some_and(|path| path.rsplit_once('.').is_some_and(|(_, ext)| ext == "js"))
             })
             .context("executable inline script missing")?;
         assert_eq!(
