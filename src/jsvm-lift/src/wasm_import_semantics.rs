@@ -1067,7 +1067,7 @@ mod tests {
                 if (flag) sideEffect(); view.setUint32(address, 1, false);
             };
         ";
-        assert!(proven_wasm_import_data_view_set_u32_shapes(source).is_empty());
+        assert_eq!(proven_wasm_import_data_view_set_u32_shapes(source).len(), 0);
     }
 
     #[test]
@@ -1081,7 +1081,7 @@ mod tests {
                     : view.setUint32(address, 2, false);
             };
         ";
-        assert!(proven_wasm_import_data_view_set_u32_shapes(source).is_empty());
+        assert_eq!(proven_wasm_import_data_view_set_u32_shapes(source).len(), 0);
         assert_eq!(
             proven_wasm_import_data_view_set_u32_shape_at_offset(source, "wbg", "conditional", 5)
                 .map(|shape| shape.offset_value),
@@ -1127,7 +1127,10 @@ mod tests {
                 view.setUint32(address, 1, false);
             };
         ";
-        assert!(proven_wasm_import_data_view_set_u32_shapes(direct_eval).is_empty());
+        assert_eq!(
+            proven_wasm_import_data_view_set_u32_shapes(direct_eval).len(),
+            0
+        );
 
         let with_scope = r"
             var host = window; var imports = { wbg: {} };
@@ -1137,7 +1140,10 @@ mod tests {
                 view.setUint32(address, 1, false);
             };
         ";
-        assert!(proven_wasm_import_data_view_set_u32_shapes(with_scope).is_empty());
+        assert_eq!(
+            proven_wasm_import_data_view_set_u32_shapes(with_scope).len(),
+            0
+        );
     }
 
     #[test]
@@ -1191,7 +1197,7 @@ mod tests {
         ";
         let analysis = proven_wasm_import_semantics_for(source, "wbg", "target", 5);
         assert_eq!(analysis.shapes.len(), 1);
-        assert!(analysis.import_object_usages.is_empty());
+        assert_eq!(analysis.import_object_usages.len(), 0);
     }
 
     #[test]
@@ -1239,7 +1245,7 @@ mod tests {
             WebAssembly.instantiate(bytes(), imports);
         ";
         let analysis = proven_wasm_import_semantics_for(conditional, "wbg", "target", 5);
-        assert!(analysis.import_object_usages.is_empty());
+        assert_eq!(analysis.import_object_usages.len(), 0);
 
         let nested_installer = r"
             var imports = { wbg: {} };
@@ -1250,7 +1256,7 @@ mod tests {
             WebAssembly.instantiate(bytes(), imports);
         ";
         let analysis = proven_wasm_import_semantics_for(nested_installer, "wbg", "target", 5);
-        assert!(analysis.import_object_usages.is_empty());
+        assert_eq!(analysis.import_object_usages.len(), 0);
 
         let conditional_factory = r"
             function tQ() {
@@ -1265,7 +1271,7 @@ mod tests {
             WebAssembly.instantiate(bytes(), imports);
         ";
         let analysis = proven_wasm_import_semantics_for(conditional_factory, "wbg", "target", 5);
-        assert!(analysis.import_object_usages.is_empty());
+        assert_eq!(analysis.import_object_usages.len(), 0);
 
         let conditional_alias = r"
             function tQ() {
@@ -1280,7 +1286,7 @@ mod tests {
             WebAssembly.instantiate(bytes(), imports);
         ";
         let analysis = proven_wasm_import_semantics_for(conditional_alias, "wbg", "target", 5);
-        assert!(analysis.import_object_usages.is_empty());
+        assert_eq!(analysis.import_object_usages.len(), 0);
 
         let early_return_factory = r"
             function tQ() {
@@ -1294,7 +1300,7 @@ mod tests {
             WebAssembly.instantiate(bytes(), imports);
         ";
         let analysis = proven_wasm_import_semantics_for(early_return_factory, "wbg", "target", 5);
-        assert!(analysis.import_object_usages.is_empty());
+        assert_eq!(analysis.import_object_usages.len(), 0);
     }
 
     #[test]
@@ -1306,7 +1312,7 @@ mod tests {
             WebAssembly.instantiate(bytes(), imports);
         ";
         let analysis = proven_wasm_import_semantics_for(source, "wbg", "target", 5);
-        assert!(analysis.import_object_usages.is_empty());
+        assert_eq!(analysis.import_object_usages.len(), 0);
     }
 
     #[test]
@@ -1324,7 +1330,7 @@ mod tests {
         ";
         let analysis = proven_wasm_import_semantics_for(shadowed, "wbg", "target", 5);
         assert_eq!(analysis.shapes.len(), 1);
-        assert!(analysis.import_object_usages.is_empty());
+        assert_eq!(analysis.import_object_usages.len(), 0);
 
         let reassigned = r"
             var host = window;
@@ -1338,7 +1344,7 @@ mod tests {
         ";
         let analysis = proven_wasm_import_semantics_for(reassigned, "wbg", "target", 5);
         assert_eq!(analysis.shapes.len(), 1);
-        assert!(analysis.import_object_usages.is_empty());
+        assert_eq!(analysis.import_object_usages.len(), 0);
     }
 
     #[test]
@@ -1618,9 +1624,10 @@ mod tests {
                 receiver.set(source, offset >>> 0);
             };
         ";
-        assert!(proven_wasm_import_semantics(source)
-            .handler_semantics
-            .is_empty());
+        assert_eq!(
+            proven_wasm_import_semantics(source).handler_semantics.len(),
+            0
+        );
     }
 
     #[test]
@@ -1764,9 +1771,12 @@ mod tests {
             if (enabled) init(instance);
             instance.exports.copy(input);
         "#;
-        assert!(proven_wasm_import_semantics(conditional)
-            .module_memory_identity_proofs
-            .is_empty());
+        assert_eq!(
+            proven_wasm_import_semantics(conditional)
+                .module_memory_identity_proofs
+                .len(),
+            0
+        );
 
         let internally_conditional = r#"
             var m = window;
@@ -1787,9 +1797,12 @@ mod tests {
             init(instance);
             instance.exports.copy(input);
         "#;
-        assert!(proven_wasm_import_semantics(internally_conditional)
-            .module_memory_identity_proofs
-            .is_empty());
+        assert_eq!(
+            proven_wasm_import_semantics(internally_conditional)
+                .module_memory_identity_proofs
+                .len(),
+            0
+        );
 
         let reassigned = r#"
             var m = window;
@@ -1811,9 +1824,12 @@ mod tests {
             exports_binding = replacement;
             instance.exports.copy(input);
         "#;
-        assert!(proven_wasm_import_semantics(reassigned)
-            .module_memory_identity_proofs
-            .is_empty());
+        assert_eq!(
+            proven_wasm_import_semantics(reassigned)
+                .module_memory_identity_proofs
+                .len(),
+            0
+        );
 
         let escaped_instance = r#"
             var m = window;
@@ -1836,9 +1852,12 @@ mod tests {
             var alias = instance;
             alias.exports.copy(input);
         "#;
-        assert!(proven_wasm_import_semantics(escaped_instance)
-            .module_memory_identity_proofs
-            .is_empty());
+        assert_eq!(
+            proven_wasm_import_semantics(escaped_instance)
+                .module_memory_identity_proofs
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -1888,9 +1907,12 @@ mod tests {
                 table.set(base, void 0);
             };
         ";
-        assert!(proven_wasm_import_semantics(shadowed)
-            .proof_normalized_handler_semantics
-            .is_empty());
+        assert_eq!(
+            proven_wasm_import_semantics(shadowed)
+                .proof_normalized_handler_semantics
+                .len(),
+            0
+        );
 
         let side_effect = r"
             var exports_binding;
@@ -1903,9 +1925,12 @@ mod tests {
                 table.set(base, void 0);
             };
         ";
-        assert!(proven_wasm_import_semantics(side_effect)
-            .proof_normalized_handler_semantics
-            .is_empty());
+        assert_eq!(
+            proven_wasm_import_semantics(side_effect)
+                .proof_normalized_handler_semantics
+                .len(),
+            0
+        );
 
         let hidden_getter = r"
             var exports_binding;
@@ -1918,9 +1943,12 @@ mod tests {
                 table.set(base, void 0);
             };
         ";
-        assert!(proven_wasm_import_semantics(hidden_getter)
-            .proof_normalized_handler_semantics
-            .is_empty());
+        assert_eq!(
+            proven_wasm_import_semantics(hidden_getter)
+                .proof_normalized_handler_semantics
+                .len(),
+            0
+        );
 
         let outer_write = r"
             var exports_binding, escaped;
@@ -1933,9 +1961,12 @@ mod tests {
                 table.set(base, void 0);
             };
         ";
-        assert!(proven_wasm_import_semantics(outer_write)
-            .proof_normalized_handler_semantics
-            .is_empty());
+        assert_eq!(
+            proven_wasm_import_semantics(outer_write)
+                .proof_normalized_handler_semantics
+                .len(),
+            0
+        );
 
         let duplicate = r"
             var exports_binding;
@@ -1948,9 +1979,12 @@ mod tests {
             };
             imports.wbg.__wbindgen_init_externref_table = function() {};
         ";
-        assert!(proven_wasm_import_semantics(duplicate)
-            .proof_normalized_handler_semantics
-            .is_empty());
+        assert_eq!(
+            proven_wasm_import_semantics(duplicate)
+                .proof_normalized_handler_semantics
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -1962,6 +1996,6 @@ mod tests {
                 view.setUint32(address, 1, false);
             };
         ";
-        assert!(proven_wasm_import_data_view_set_u32_shapes(source).is_empty());
+        assert_eq!(proven_wasm_import_data_view_set_u32_shapes(source).len(), 0);
     }
 }

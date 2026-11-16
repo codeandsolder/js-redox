@@ -286,6 +286,7 @@ fn is_definite(s: &Semantic<'_>, d: &Source, call: Span, writes: &[Span]) -> boo
         })
 }
 /// Non-definite edges are structural candidates, never confirmed dispatch.
+///
 /// Definite edges prove a local call-result reaching definition, but do not
 /// assign any semantics to the registry accessor's returned object.
 pub fn analyze(
@@ -417,7 +418,7 @@ mod tests {
         let reads =
             structurally_proven_registry_read_calls(&parsed.program, ret.semantic.scoping(), &b)
                 .test_value("reads")?;
-        assert!(!reads.is_empty());
+        assert_ne!(reads.len(), 0);
         analyze(&ret.semantic, &reads, &b).test_value("edges")
     }
     #[test]
@@ -538,8 +539,9 @@ mod tests {
 
     #[test]
     fn shadowing_and_eval_do_not_prove_dispatch() -> TestResult {
-        assert!(
-            inspect("function run(s,k){ let h=read(s,k); { const h=other; h(); } }")?.is_empty()
+        assert_eq!(
+            inspect("function run(s,k){ let h=read(s,k); { const h=other; h(); } }")?.len(),
+            0
         );
         let e = inspect("function run(s,k){ let h=read(s,k); eval('h=other'); h(); }")?;
         assert_eq!(e.len(), 1);
@@ -748,49 +750,64 @@ mod tests {
         assert_eq!(joined[0].exact_key, None);
         let mut wrong_path = origin.clone();
         wrong_path.read.registry_path = vec!["unrelated".into()];
-        assert!(join_exact_origin_lazy_accessor_results(
-            std::slice::from_ref(&lazy),
-            &[wrong_path],
-            &budget,
-        )
-        .test_value("path reject")?
-        .is_empty());
+        assert_eq!(
+            join_exact_origin_lazy_accessor_results(
+                std::slice::from_ref(&lazy),
+                &[wrong_path],
+                &budget,
+            )
+            .test_value("path reject")?
+            .len(),
+            0
+        );
         let mut wrong_receiver = origin.clone();
         wrong_receiver.read.receiver_start = 6;
-        assert!(join_exact_origin_lazy_accessor_results(
-            std::slice::from_ref(&lazy),
-            &[wrong_receiver],
-            &budget,
-        )
-        .test_value("receiver reject")?
-        .is_empty());
+        assert_eq!(
+            join_exact_origin_lazy_accessor_results(
+                std::slice::from_ref(&lazy),
+                &[wrong_receiver],
+                &budget,
+            )
+            .test_value("receiver reject")?
+            .len(),
+            0
+        );
         let mut wrong_key = origin.clone();
         wrong_key.read.key_end = 11;
-        assert!(join_exact_origin_lazy_accessor_results(
-            std::slice::from_ref(&lazy),
-            &[wrong_key],
-            &budget,
-        )
-        .test_value("key reject")?
-        .is_empty());
+        assert_eq!(
+            join_exact_origin_lazy_accessor_results(
+                std::slice::from_ref(&lazy),
+                &[wrong_key],
+                &budget,
+            )
+            .test_value("key reject")?
+            .len(),
+            0
+        );
         let mut wrong_call = origin.clone();
         wrong_call.read.call_start = 6;
-        assert!(join_exact_origin_lazy_accessor_results(
-            std::slice::from_ref(&lazy),
-            &[wrong_call],
-            &budget,
-        )
-        .test_value("call reject")?
-        .is_empty());
+        assert_eq!(
+            join_exact_origin_lazy_accessor_results(
+                std::slice::from_ref(&lazy),
+                &[wrong_call],
+                &budget,
+            )
+            .test_value("call reject")?
+            .len(),
+            0
+        );
         let mut conflict = origin.clone();
         conflict.origin.allocation_start = 501;
-        assert!(join_exact_origin_lazy_accessor_results(
-            std::slice::from_ref(&lazy),
-            &[origin.clone(), conflict],
-            &budget,
-        )
-        .test_value("ambiguous origin reject")?
-        .is_empty());
+        assert_eq!(
+            join_exact_origin_lazy_accessor_results(
+                std::slice::from_ref(&lazy),
+                &[origin.clone(), conflict],
+                &budget,
+            )
+            .test_value("ambiguous origin reject")?
+            .len(),
+            0
+        );
         let duplicate =
             join_exact_origin_lazy_accessor_results(&[lazy], &[origin.clone(), origin], &budget)
                 .test_value("duplicate same proof")?;

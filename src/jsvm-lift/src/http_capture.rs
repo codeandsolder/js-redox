@@ -1,4 +1,5 @@
 //! Lightweight HTTP-root acquisition for the existing capture-project pipeline.
+//!
 //! This does not run JavaScript. It walks declared HTML scripts, module imports,
 //! static worker references and source directives, then emits a normal HAR.
 use crate::{

@@ -3595,13 +3595,16 @@ mod tests {
             .test_value("outer literal value")?;
         assert_eq!(root.registry_path, vec!["handlers"]);
         assert!(root.registry_key_confined);
-        assert!(structurally_proven_registry_forwarding_calls(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &test_budget(),
-        )
-        .test_value("registry function forwarding proof")?
-        .is_empty());
+        assert_eq!(
+            structurally_proven_registry_forwarding_calls(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget(),
+            )
+            .test_value("registry function forwarding proof")?
+            .len(),
+            0
+        );
 
         Ok(())
     }
@@ -3749,7 +3752,7 @@ mod tests {
             (replace(), install)(state, 7, function(a) { return a + 1; });
         ",
         )?;
-        assert!(calls.is_empty());
+        assert_eq!(calls.len(), 0);
 
         Ok(())
     }
@@ -3804,7 +3807,7 @@ mod tests {
             install((swap(), state), 7, function(a) { return a + 1; });
         ",
         )?;
-        assert!(calls.is_empty());
+        assert_eq!(calls.len(), 0);
 
         Ok(())
     }
@@ -3819,7 +3822,7 @@ mod tests {
             install(state, 7, function(a) { return a; });
         ",
         )?;
-        assert!(calls.is_empty());
+        assert_eq!(calls.len(), 0);
 
         Ok(())
     }
@@ -3834,7 +3837,7 @@ mod tests {
             install(state, 7, function(a) { return a; }, 12);
         ",
         )?;
-        assert!(calls.is_empty());
+        assert_eq!(calls.len(), 0);
 
         Ok(())
     }
@@ -4028,13 +4031,16 @@ mod tests {
         ";
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(super::structurally_proven_lazy_registry_read_calls(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &test_budget(),
-        )
-        .test_value("lazy registry proof")?
-        .is_empty());
+        assert_eq!(
+            super::structurally_proven_lazy_registry_read_calls(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget(),
+            )
+            .test_value("lazy registry proof")?
+            .len(),
+            0
+        );
 
         Ok(())
     }
@@ -4053,13 +4059,16 @@ mod tests {
         ";
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(super::structurally_proven_lazy_registry_read_calls(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &test_budget(),
-        )
-        .test_value("lazy registry proof")?
-        .is_empty());
+        assert_eq!(
+            super::structurally_proven_lazy_registry_read_calls(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget(),
+            )
+            .test_value("lazy registry proof")?
+            .len(),
+            0
+        );
 
         Ok(())
     }
@@ -4078,13 +4087,16 @@ mod tests {
         "#;
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(super::structurally_proven_lazy_registry_read_calls(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &test_budget(),
-        )
-        .test_value("lazy registry proof")?
-        .is_empty());
+        assert_eq!(
+            super::structurally_proven_lazy_registry_read_calls(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget(),
+            )
+            .test_value("lazy registry proof")?
+            .len(),
+            0
+        );
 
         Ok(())
     }
@@ -4102,13 +4114,16 @@ mod tests {
         ";
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(super::structurally_proven_lazy_registry_read_calls(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &test_budget(),
-        )
-        .test_value("lazy registry proof")?
-        .is_empty());
+        assert_eq!(
+            super::structurally_proven_lazy_registry_read_calls(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget(),
+            )
+            .test_value("lazy registry proof")?
+            .len(),
+            0
+        );
 
         Ok(())
     }
@@ -4127,13 +4142,16 @@ mod tests {
         ";
         let parsed = parse_program(&allocator, source, SourceType::cjs());
         let semantic = SemanticBuilder::new().build(&parsed.program);
-        assert!(super::structurally_proven_lazy_registry_read_calls(
-            &parsed.program,
-            semantic.semantic.scoping(),
-            &test_budget(),
-        )
-        .test_value("lazy registry proof")?
-        .is_empty());
+        assert_eq!(
+            super::structurally_proven_lazy_registry_read_calls(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                &test_budget(),
+            )
+            .test_value("lazy registry proof")?
+            .len(),
+            0
+        );
 
         Ok(())
     }
@@ -4167,7 +4185,7 @@ mod tests {
             get(state, opcode);
         ",
         )?;
-        assert!(reads.is_empty());
+        assert_eq!(reads.len(), 0);
 
         Ok(())
     }
@@ -4209,7 +4227,7 @@ mod tests {
             delegate(state, 9, function(a) { return a; });
         ",
         )?;
-        assert!(calls.is_empty());
+        assert_eq!(calls.len(), 0);
 
         Ok(())
     }

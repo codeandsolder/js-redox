@@ -302,7 +302,7 @@ mod tests {
             .test_value("outer literal value")?;
         assert_eq!(root.exact_key, 7);
         assert_eq!(root.install.registry_path, vec!["T"]);
-        assert!(handlers.is_empty());
+        assert_eq!(handlers.len(), 0);
         Ok(())
     }
 
@@ -366,7 +366,7 @@ mod tests {
             proven_origin_registry_read_calls(&parsed.program, scoping, &flow, &test_budget())
                 .test_value("proven_origin_registry_read_calls")?;
         assert_eq!(installs.len(), 1);
-        assert!(reads.is_empty());
+        assert_eq!(reads.len(), 0);
         Ok(())
     }
 }

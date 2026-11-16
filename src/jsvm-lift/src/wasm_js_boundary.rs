@@ -2144,8 +2144,8 @@ mod tests {
         let (bad_bindings, bad_returns, bad_graph) =
             source_word_semantic_overlay(&inconsistent, &interpretations);
         assert!(!bad_graph);
-        assert!(bad_bindings.is_empty());
-        assert!(bad_returns.is_empty());
+        assert_eq!(bad_bindings.len(), 0);
+        assert_eq!(bad_returns.len(), 0);
 
         let mut normalization_mismatch = analysis.clone();
         normalization_mismatch["returns"][0]["normalized_semantic_ir"] =
@@ -2153,8 +2153,8 @@ mod tests {
         let (bad_bindings, bad_returns, bad_graph) =
             source_word_semantic_overlay(&normalization_mismatch, &interpretations);
         assert!(!bad_graph);
-        assert!(bad_bindings.is_empty());
-        assert!(bad_returns.is_empty());
+        assert_eq!(bad_bindings.len(), 0);
+        assert_eq!(bad_returns.len(), 0);
 
         let mut cyclic = analysis.clone();
         cyclic["runtime_bindings"][0]["runtime_dependencies"] = json!([20]);
@@ -2170,7 +2170,7 @@ mod tests {
         let (bad_bindings, bad_returns, bad_graph) =
             source_word_semantic_overlay(&cyclic, &interpretations);
         assert!(!bad_graph);
-        assert!(bad_bindings.is_empty());
-        assert!(bad_returns.is_empty());
+        assert_eq!(bad_bindings.len(), 0);
+        assert_eq!(bad_returns.len(), 0);
     }
 }

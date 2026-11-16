@@ -354,6 +354,7 @@ pub fn reconstruct_context(
 }
 
 /// An executable-looking, but presentation-only, copy of an extracted handler.
+///
 /// Every annotation is attached to an *unresolved lexical call* in the
 /// extracted AST and to a uniquely resolved original-source helper. This is
 /// not a replacement for the captured handler or proof-checked JS.
@@ -771,7 +772,7 @@ mod tests {
             assert!(names.contains(&"table"));
             assert!(names.contains(&"mutable"));
             assert_eq!(context.handlers[0].linked_helpers.len(), 2);
-            assert!(context.handlers[1].linked_helpers.is_empty());
+            assert_eq!(context.handlers[1].linked_helpers.len(), 0);
             assert!(context.unmatched_names.contains("missing"));
             let varint = context.helpers.iter().find(|item| item.name == "varint");
             assert!(varint.is_some());

@@ -1652,7 +1652,7 @@ mod tests {
         let Ok(analysis) = analysis else {
             return;
         };
-        assert!(analysis.inline_wasm_literals.is_empty());
+        assert_eq!(analysis.inline_wasm_literals.len(), 0);
     }
 
     #[test]
@@ -1752,7 +1752,7 @@ mod tests {
         let Ok(analysis) = analysis else {
             return;
         };
-        assert!(analysis.artifacts.is_empty());
+        assert_eq!(analysis.artifacts.len(), 0);
         assert_eq!(analysis.sink_diagnostics.len(), 1);
         assert_eq!(
             analysis.sink_diagnostics[0].sink_failure,
@@ -1774,7 +1774,7 @@ mod tests {
                 return WebAssembly.instantiate(bytes, imports);
             }
         "#;
-        assert!(recover(escaped).is_empty());
+        assert_eq!(recover(escaped).len(), 0);
 
         let out_of_bounds = r#"
             function load(imports) {
@@ -1787,7 +1787,7 @@ mod tests {
                 return WebAssembly.instantiate(bytes, imports);
             }
         "#;
-        assert!(recover(out_of_bounds).is_empty());
+        assert_eq!(recover(out_of_bounds).len(), 0);
     }
 
     #[test]
@@ -1803,7 +1803,7 @@ mod tests {
                 return WebAssembly.instantiate(bytes, imports);
             }
         "#;
-        assert!(recover(source).is_empty());
+        assert_eq!(recover(source).len(), 0);
     }
 
     #[test]
@@ -1821,7 +1821,7 @@ mod tests {
                 return WebAssembly.instantiate(bytes, imports);
             }
         "#;
-        assert!(recover(blocked).is_empty());
+        assert_eq!(recover(blocked).len(), 0);
 
         let safe = r#"
             function load(imports, scope) {
@@ -1907,7 +1907,7 @@ mod tests {
         let source = r"
             WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 255, 255, 255, 255]));
         ";
-        assert!(recover(source).is_empty());
+        assert_eq!(recover(source).len(), 0);
     }
 
     #[test]
@@ -1951,12 +1951,12 @@ mod tests {
         let fractional = r"
             WebAssembly.instantiate(new Uint8Array([0, 97, 115, 109, 1.5, 0, 0, 0]), {});
         ";
-        assert!(recover(fractional).is_empty());
+        assert_eq!(recover(fractional).len(), 0);
 
         let out_of_range = r"
             WebAssembly.instantiate(Uint8Array.of(0, 97, 115, 109, 256, 0, 0, 0), {});
         ";
-        assert!(recover(out_of_range).is_empty());
+        assert_eq!(recover(out_of_range).len(), 0);
     }
 
     #[test]
@@ -1990,7 +1990,7 @@ mod tests {
                 return WebAssembly.instantiate(bytes, imports);
             }
         "#;
-        assert!(recover(reassigned).is_empty());
+        assert_eq!(recover(reassigned).len(), 0);
     }
 
     #[test]
@@ -2027,7 +2027,7 @@ mod tests {
                 return WebAssembly.instantiate(bytes, imports);
             }
         "#;
-        assert!(recover(source).is_empty());
+        assert_eq!(recover(source).len(), 0);
     }
 
     #[test]
@@ -2044,6 +2044,6 @@ mod tests {
                 return WebAssembly.instantiate(bytes, imports);
             }
         "#;
-        assert!(recover(source).is_empty());
+        assert_eq!(recover(source).len(), 0);
     }
 }

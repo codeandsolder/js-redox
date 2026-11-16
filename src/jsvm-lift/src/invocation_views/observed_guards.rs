@@ -406,12 +406,18 @@ mod tests {
         // Inspector expressions unrelated to the actual AST test are not guards.
         let mut unrelated = guard.clone();
         unrelated["expressions"][0]["expression"] = json!("value !== 34");
-        assert!(observe(project, &identities, "main", &[unrelated], &budget)?.is_empty());
+        assert_eq!(
+            observe(project, &identities, "main", &[unrelated], &budget)?.len(),
+            0
+        );
 
         // No source-triple identity: no path claims.
         let mut unresolved = guard;
         unresolved["frames"][0]["source_identity"] = json!("unresolved");
-        assert!(observe(project, &identities, "main", &[unresolved], &budget)?.is_empty());
+        assert_eq!(
+            observe(project, &identities, "main", &[unresolved], &budget)?.len(),
+            0
+        );
         Ok(())
     }
 
