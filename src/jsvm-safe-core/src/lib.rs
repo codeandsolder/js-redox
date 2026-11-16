@@ -879,7 +879,7 @@ impl Collector<'_, '_> {
                     self.scoping,
                     self.source,
                     if_ladder_structure::CatchScopeEvidence {
-                        reaching: &reaching,
+                        reaching,
                         reference_spans: self.reference_spans,
                     },
                 ) {
@@ -908,7 +908,7 @@ impl Collector<'_, '_> {
                         self.scoping,
                         self.source,
                         if_ladder_structure::CatchScopeEvidence {
-                            reaching: &reaching,
+                            reaching,
                             reference_spans: self.reference_spans,
                         },
                     ) {
