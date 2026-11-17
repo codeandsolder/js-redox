@@ -54,6 +54,16 @@
       ],
       "groupName": "Rust toolchain",
       "automerge": false
+    },
+    {
+      "description": "Preserve pinned Rust 1.99/ZIPP Knitsail research harness dependency versions",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchFileNames": [
+        "prototypes/zipp-knitsail/**"
+      ],
+      "enabled": false
     }
   ]
 }
