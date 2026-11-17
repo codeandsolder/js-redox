@@ -75,7 +75,6 @@ pub fn link_or_copy(source: &Path, dest: &Path) -> Result<Materialization> {
 mod tests {
     use super::{default_jobs, sha256_path};
     use anyhow::Result;
-    use sha2::{Digest, Sha256};
     use std::fs;
 
     #[test]
@@ -83,13 +82,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("source.bin");
         for size in [0, 1, 1024 * 1024, 2 * 1024 * 1024 + 37] {
-            let bytes = (0..size).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+            let bytes = vec![0x5a_u8; size];
             fs::write(&path, &bytes)?;
-            let expected = Sha256::digest(&bytes)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            assert_eq!(sha256_path(&path)?, expected);
+            assert_eq!(sha256_path(&path)?, crate::sha256_hex(&bytes));
         }
         Ok(())
     }
