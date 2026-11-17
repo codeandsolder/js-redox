@@ -1,3 +1,4 @@
+use crate::probe_result::ProbeResult;
 use crate::{
     cfg_order::prove_event_before_barriers,
     forwarding_semantics::ProvenLazyRegistryReadCall,
@@ -426,19 +427,34 @@ fn symbol_references_in_function(
     probe.references
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastGetterReturn {
+    Direct,
+    Guarded(Span),
+}
+
+impl FastGetterReturn {
+    fn guard(self) -> Option<Span> {
+        match self {
+            Self::Direct => None,
+            Self::Guarded(span) => Some(span),
+        }
+    }
+}
+
 fn fast_getter_return(
     scoping: &Scoping,
     function: &Function<'_>,
     captured: SymbolId,
-) -> Option<Option<Span>> {
+) -> Option<FastGetterReturn> {
     if function.r#async || function.generator || function.params.rest.is_some() {
         return None;
     }
     let body = function.body.as_deref()?;
     match body.statements.as_slice() {
-        [Statement::ReturnStatement(ret)] => {
-            (reference_symbol(scoping, ret.argument.as_ref()?) == Some(captured)).then_some(None)
-        }
+        [Statement::ReturnStatement(ret)] => (reference_symbol(scoping, ret.argument.as_ref()?)
+            == Some(captured))
+        .then_some(FastGetterReturn::Direct),
         [Statement::WhileStatement(statement)] => {
             let Statement::BlockStatement(block) = &statement.body else {
                 return None;
@@ -447,7 +463,7 @@ fn fast_getter_return(
                 return None;
             };
             (reference_symbol(scoping, ret.argument.as_ref()?) == Some(captured))
-                .then_some(Some(statement.test.span()))
+                .then_some(FastGetterReturn::Guarded(statement.test.span()))
         }
         _ => None,
     }
@@ -630,7 +646,7 @@ impl<'a> Visit<'a> for FastLazyCellCandidateCollector<'_, '_> {
                                 *value_parameter_index,
                                 assignment.span,
                                 function.span,
-                                *entry_condition,
+                                entry_condition.guard(),
                             ));
                         }
                         AssignmentTarget::StaticMemberExpression(member)
@@ -1467,17 +1483,17 @@ fn specialize_exact_slow_factory_shape(
         semantic: &'m Semantic<'m>,
         shape: &'c SlowLazyCellFactoryShape,
         call: &'c ProvenOriginDirectCall,
-        result: Option<Option<ProvenSlowLazyCellFactoryCall>>,
+        result: ProbeResult<ProvenSlowLazyCellFactoryCall>,
     }
     impl<'a> Visit<'a> for Harness<'_, 'a, '_, '_> {
         fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if self.result.is_some() {
+            if self.result.is_decided() {
                 return;
             }
             if function.span.start == self.shape.function_start
                 && function.span.end == self.shape.function_end
             {
-                self.result = Some(specialize_shape_for_call(
+                self.result = ProbeResult::resolve(specialize_shape_for_call(
                     self.source,
                     self.program,
                     self.semantic,
@@ -1496,10 +1512,10 @@ fn specialize_exact_slow_factory_shape(
         semantic,
         shape,
         call,
-        result: None,
+        result: ProbeResult::default(),
     };
     harness.visit_program(program);
-    harness.result.flatten()
+    harness.result.into_proven()
 }
 
 /// Promote one structural slow-cell factory shape to an exact call proof.
@@ -1789,18 +1805,18 @@ pub fn proven_slow_lazy_cell_update_state(
     struct Harness<'m, 'c> {
         semantic: &'m Semantic<'m>,
         factory_call: &'c ProvenSlowLazyCellFactoryCall,
-        result: Option<Option<ProvenSlowLazyCellUpdateState>>,
+        result: ProbeResult<ProvenSlowLazyCellUpdateState>,
     }
     impl<'a> Visit<'a> for Harness<'_, '_> {
         fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if self.result.is_some() {
+            if self.result.is_decided() {
                 return;
             }
             let shape = &self.factory_call.shape;
             if function.span.start == shape.function_start
                 && function.span.end == shape.function_end
             {
-                self.result = Some(analyze_slow_lazy_cell_update_state(
+                self.result = ProbeResult::resolve(analyze_slow_lazy_cell_update_state(
                     function,
                     self.semantic,
                     self.factory_call,
@@ -1813,10 +1829,10 @@ pub fn proven_slow_lazy_cell_update_state(
     let mut harness = Harness {
         semantic,
         factory_call,
-        result: None,
+        result: ProbeResult::default(),
     };
     harness.visit_program(program);
-    harness.result.flatten()
+    harness.result.into_proven()
 }
 
 fn registry_receiver_and_path<'a>(
@@ -2024,15 +2040,15 @@ fn call_argument_symbol_at(
         call_start: u32,
         call_end: u32,
         argument_index: usize,
-        output: &'o mut Option<Option<SymbolId>>,
+        output: &'o mut ProbeResult<SymbolId>,
     }
     impl<'a> Visit<'a> for Probe<'_, '_> {
         fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
-            if self.output.is_some() {
+            if self.output.is_decided() {
                 return;
             }
             if call.span.start == self.call_start && call.span.end == self.call_end {
-                *self.output = Some(
+                *self.output = ProbeResult::resolve(
                     call.arguments
                         .get(self.argument_index)
                         .and_then(|argument| argument.as_expression())
@@ -2044,7 +2060,7 @@ fn call_argument_symbol_at(
         }
     }
 
-    let mut output = None;
+    let mut output = ProbeResult::default();
     Probe {
         scoping,
         call_start,
@@ -2053,7 +2069,7 @@ fn call_argument_symbol_at(
         output: &mut output,
     }
     .visit_program(program);
-    output.flatten()
+    output.into_proven()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3282,16 +3298,16 @@ struct SlowResolverIndexHarness<'s, 'p, 'm, 'u> {
     selector_key_symbol: SymbolId,
     exact_assignment: &'u ProvenSlowLazyCellExactRegistryAssignment,
     phase_value: i64,
-    result: Option<Option<ProvenSlowLazyCellResolverIndex>>,
+    result: ProbeResult<ProvenSlowLazyCellResolverIndex>,
 }
 impl<'a> Visit<'a> for SlowResolverIndexHarness<'_, 'a, '_, '_> {
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-        if self.result.is_some() {
+        if self.result.is_decided() {
             return;
         }
         let shape = &self.update_state.factory_call.shape;
         if function.span.start == shape.function_start && function.span.end == shape.function_end {
-            self.result = Some(analyze_slow_lazy_cell_resolver_index(
+            self.result = ProbeResult::resolve(analyze_slow_lazy_cell_resolver_index(
                 self.source,
                 self.program,
                 self.semantic,
@@ -3346,10 +3362,10 @@ pub fn proven_slow_lazy_cell_resolver_index(
         selector_key_symbol,
         exact_assignment,
         phase_value,
-        result: None,
+        result: ProbeResult::default(),
     };
     harness.visit_program(program);
-    harness.result.flatten()
+    harness.result.into_proven()
 }
 
 /// Prove both state-object facts required for slow-cell construction.
@@ -4473,7 +4489,7 @@ mod tests {
         SlowLazyCellResolverIndexFacts,
     };
     use crate::test_support::{
-        source_offset, source_rfind, source_slice, TestFailure, TestResult, TestValue,
+        source_offset, source_rfind, source_slice, source_span, TestFailure, TestResult, TestValue,
     };
     use crate::{
         forwarding_semantics::structurally_proven_lazy_registry_read_calls,
@@ -4488,6 +4504,33 @@ mod tests {
     use oxc_span::{GetSpan, SourceType, Span};
     use rolldown_redox::ecmascript::parse_program;
     use work_budget::WorkBudget;
+
+    #[test]
+    fn fast_getter_shape_preserves_direct_and_guarded_returns() -> TestResult {
+        let source = "function direct(captured){return captured;}\n\
+            function guarded(captured){while(flag){return captured;}}\n\
+            function unrelated(captured){return other;}";
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let scoping = semantic.semantic.scoping();
+        let mut shapes = Vec::new();
+        for statement in &parsed.program.body {
+            let Statement::FunctionDeclaration(function) = statement else {
+                continue;
+            };
+            let parameter = super::parameter_symbol(&function.params.items[0])
+                .test_value("getter parameter")?;
+            shapes.push(super::fast_getter_return(scoping, function, parameter));
+        }
+        assert_eq!(shapes.len(), 3);
+        assert_eq!(shapes[0], Some(super::FastGetterReturn::Direct));
+        let guard = source_span(source, "flag", "guard span")?;
+        assert_eq!(shapes[1], Some(super::FastGetterReturn::Guarded(guard)));
+        assert_eq!(shapes[2], None);
+        Ok(())
+    }
 
     fn test_budget() -> WorkBudget {
         WorkBudget::unlimited("lazy-cell-test")

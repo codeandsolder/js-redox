@@ -74,6 +74,7 @@ pub mod wasm_materialize;
 pub mod wasm_resource_provenance;
 
 pub mod pipeline;
+mod probe_result;
 
 /// Stable FNV-1a 64-bit hash used by persisted js-redox shape/identity formats.
 #[must_use]
