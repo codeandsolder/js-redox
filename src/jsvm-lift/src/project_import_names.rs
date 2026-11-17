@@ -18,7 +18,7 @@ use rolldown_redox::ecmascript::parse_program;
 use serde_json::Value;
 use std::fmt::Write as _;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{btree_map::Entry, BTreeMap, BTreeSet},
     fs,
     path::{Component, Path},
 };
@@ -342,7 +342,6 @@ fn exported_names(modules: &BTreeMap<String, SourceModule>) -> BTreeMap<String, 
                     if key == "default" || explicit.contains(key.as_str()) {
                         continue;
                     }
-                    use std::collections::btree_map::Entry;
                     match stars.entry(key.clone()) {
                         Entry::Vacant(entry) => {
                             entry.insert(Some(name.clone()));
@@ -544,7 +543,6 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
             continue;
         }
         if let (Some(url), Some(raw)) = (field(unit, "url"), field(unit, "raw_path")) {
-            use std::collections::btree_map::Entry;
             match urls.entry(url.to_owned()) {
                 Entry::Vacant(entry) => {
                     entry.insert(Some(raw.to_owned()));
@@ -584,7 +582,6 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
             ) else {
                 continue;
             };
-            use std::collections::btree_map::Entry;
             match map.entry(spec.to_owned()) {
                 Entry::Vacant(entry) => {
                     entry.insert(Some(url.to_owned()));
