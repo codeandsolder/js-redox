@@ -103,10 +103,11 @@ fn insert_suffix(path: &str, suffix: &str) -> String {
     let parent = p.parent().unwrap_or_else(|| Path::new(""));
     let stem = p.file_stem().and_then(|x| x.to_str()).unwrap_or("resource");
     let ext = p.extension().and_then(|x| x.to_str());
-    let name = match ext {
-        Some(ext) => format!("{stem}{suffix}.{ext}"),
-        None => format!("{stem}{suffix}"),
-    };
+    let mut name = format!("{stem}{suffix}");
+    if let Some(ext) = ext {
+        name.push('.');
+        name.push_str(ext);
+    }
     parent
         .join(name)
         .to_string_lossy()
@@ -328,6 +329,19 @@ pub(super) fn write_resource(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suffix_insertion_preserves_filename_extensions() {
+        assert_eq!(
+            insert_suffix("resources/app.js", "-2"),
+            "resources/app-2.js"
+        );
+        assert_eq!(insert_suffix("resources/app", "-2"), "resources/app-2");
+        assert_eq!(
+            insert_suffix("resources/app.tar.gz", "-2"),
+            "resources/app.tar-2.gz"
+        );
+    }
 
     #[test]
     fn url_resource_kind_uses_only_case_normalized_path_extension() {

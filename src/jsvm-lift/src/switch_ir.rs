@@ -817,13 +817,16 @@ fn lift_switch_vm(source: &str, function: &FunctionInfo, map: &DirectSwitchMap) 
         .saturating_sub(function.start)
         .min(function.end.saturating_sub(function.start)) as usize;
     let function_prefix = function_text.get(..prefix_len).unwrap_or(function_text);
-    let (selector_style, roles, helpers) = if let Some(helper) = call_selector(&map.selector) {
-        let (roles, helpers) = call_family_roles(function_prefix, &semantics, &helper);
-        ("call".to_string(), roles, helpers)
-    } else {
-        let (roles, helpers) = indexed_family_roles(map, &semantics);
-        ("indexed".to_string(), roles, helpers)
-    };
+    let (selector_style, roles, helpers) = call_selector(&map.selector).map_or_else(
+        || {
+            let (roles, helpers) = indexed_family_roles(map, &semantics);
+            ("indexed".to_owned(), roles, helpers)
+        },
+        |helper| {
+            let (roles, helpers) = call_family_roles(function_prefix, &semantics, &helper);
+            ("call".to_owned(), roles, helpers)
+        },
+    );
     let handlers = map
         .handlers
         .iter()

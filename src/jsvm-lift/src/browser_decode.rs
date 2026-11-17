@@ -266,20 +266,25 @@ pub fn decode_html(
     default_encoding: Option<&str>,
 ) -> DecodedHtml {
     let bom_encoding = Encoding::for_bom(bytes).map(|(encoding, _)| encoding);
-    let (selected, decode_source, uncertain) = if let Some(encoding) = bom_encoding {
-        (encoding, DecodeSource::Bom, false)
-    } else if let Some(encoding) = transport_content_type.and_then(content_type_charset) {
-        (encoding, DecodeSource::HtmlTransport, false)
-    } else if let Some(encoding) = sniff_html_meta_encoding(bytes) {
-        (encoding, DecodeSource::HtmlMeta, false)
-    } else {
-        let encoding = label_encoding(default_encoding).unwrap_or(WINDOWS_1252);
-        (
-            html_compatible_encoding(encoding),
-            DecodeSource::HtmlFallback,
-            true,
-        )
-    };
+    let (selected, decode_source, uncertain) = bom_encoding
+        .map(|encoding| (encoding, DecodeSource::Bom, false))
+        .or_else(|| {
+            transport_content_type
+                .and_then(content_type_charset)
+                .map(|encoding| (encoding, DecodeSource::HtmlTransport, false))
+        })
+        .or_else(|| {
+            sniff_html_meta_encoding(bytes)
+                .map(|encoding| (encoding, DecodeSource::HtmlMeta, false))
+        })
+        .unwrap_or_else(|| {
+            let encoding = label_encoding(default_encoding).unwrap_or(WINDOWS_1252);
+            (
+                html_compatible_encoding(encoding),
+                DecodeSource::HtmlFallback,
+                true,
+            )
+        });
     let (source, actual_encoding, had_errors) = selected.decode(bytes);
     DecodedHtml {
         source: source.into_owned(),
@@ -442,6 +447,21 @@ mod tests {
         assert_eq!(decoded.encoding, "UTF-8");
         assert_eq!(decoded.decode_source, DecodeSource::Bom);
         assert_eq!(decoded.bom_encoding.as_deref(), Some("UTF-8"));
+    }
+
+    #[test]
+    fn html_bom_overrides_conflicting_transport_meta_and_default() {
+        let decoded = super::decode_html(
+            b"\xef\xbb\xbf<meta charset=windows-1252><script>const value='\xc2\xa9';</script>",
+            Some("text/html; charset=windows-1252"),
+            Some("windows-1252"),
+        );
+        assert_eq!(decoded.decode_source, DecodeSource::Bom);
+        assert_eq!(decoded.encoding, "UTF-8");
+        assert_eq!(decoded.bom_encoding.as_deref(), Some("UTF-8"));
+        assert!(decoded.source.contains("const value='©';"));
+        assert!(!decoded.uncertain);
+        assert!(!decoded.had_errors);
     }
 
     #[test]

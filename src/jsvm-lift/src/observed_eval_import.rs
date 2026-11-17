@@ -1071,14 +1071,15 @@ fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedC
         counted == manifest.event_count,
         "observed event count mismatch"
     );
-    let prefix = if let Some(loader) = outer {
-        format!(
-            "runtime-observed/loader-{}/executable-{}",
-            loader.sha256, executable_sha256
-        )
-    } else {
-        format!("runtime-observed/direct-{}", executable_sha256)
-    };
+    let prefix = outer.map_or_else(
+        || format!("runtime-observed/direct-{executable_sha256}"),
+        |loader| {
+            format!(
+                "runtime-observed/loader-{}/executable-{executable_sha256}",
+                loader.sha256
+            )
+        },
+    );
     let relative = format!(
         "{prefix}/eval-{}-{}/capture-{}",
         executable_site.start, executable_site.end, capture_id
@@ -1273,15 +1274,16 @@ pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput])
             &format!("{}/manifest.json", capture.relative),
             &capture.original_manifest,
         )?;
-        let label = if let Some(loader) = outer {
-            format!(
-                "Outer {} / executable {}",
-                &loader.sha256[..12],
-                &executable_sha[..12]
-            )
-        } else {
-            format!("Direct executable {}", &executable_sha[..12])
-        };
+        let label = outer.map_or_else(
+            || format!("Direct executable {}", &executable_sha[..12]),
+            |loader| {
+                format!(
+                    "Outer {} / executable {}",
+                    &loader.sha256[..12],
+                    &executable_sha[..12]
+                )
+            },
+        );
         let _ = writeln!(
             index,
             "- [{label} / eval {}..{} / capture {}]({}) - {} calls, {} strings",

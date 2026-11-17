@@ -162,14 +162,18 @@ pub fn write_entrypoint_index(
         let ordinal = script.get("ordinal").and_then(Value::as_u64).unwrap_or(0);
         lines.push(format!("## {} — script {ordinal}", display(document)));
         lines.push(String::new());
-        let roots_for_script = if let Some(src) = string(script, "resolved_src") {
-            lines.push(format!("HTML `src`: `{}`", display(src)));
-            by_url.get(src).cloned().unwrap_or_default()
-        } else if let Some(raw) = string(script, "output_path") {
-            by_raw.get(raw).copied().into_iter().collect()
-        } else {
-            Vec::new()
-        };
+        let roots_for_script = string(script, "resolved_src").map_or_else(
+            || {
+                string(script, "output_path")
+                    .and_then(|raw| by_raw.get(raw).copied())
+                    .into_iter()
+                    .collect()
+            },
+            |src| {
+                lines.push(format!("HTML `src`: `{}`", display(src)));
+                by_url.get(src).cloned().unwrap_or_default()
+            },
+        );
         if roots_for_script.is_empty() {
             lines.push("Source body not present in this capture.".into());
             lines.push(String::new());
