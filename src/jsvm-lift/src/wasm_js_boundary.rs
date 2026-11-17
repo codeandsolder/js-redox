@@ -2244,8 +2244,97 @@ pub fn correlate_project(
 
 #[cfg(test)]
 mod tests {
-    use super::source_word_semantic_overlay;
+    use super::{
+        source_word_semantic_overlay, BoundaryCorrelation, BoundaryExport, CopyImportNames,
+    };
     use serde_json::json;
+
+    #[test]
+    fn copied_source_requires_unique_exact_import_handlers() {
+        let module = json!({"sha256":"example"});
+        let export = json!({"export":"copy"});
+        let null = serde_json::Value::Null;
+        let imports = vec![
+            json!({"module":"wbg", "name":"set"}),
+            json!({"module":"wbg", "name":"ctor"}),
+        ];
+        let carriers = Vec::new();
+        let scope = BoundaryExport {
+            module: &module,
+            export: &export,
+            analysis: &null,
+            report: &null,
+            function_imports: &imports,
+            carrier_candidates: &carriers,
+        };
+        let candidate = json!({"set_import_function":0,"constructor_import_function":1});
+        let names = CopyImportNames::from_candidate(&imports, &candidate);
+        assert_eq!(names.set_name, Some("set"));
+        assert_eq!(names.constructor_name, Some("ctor"));
+
+        let set = json!({"kind":"typed_array_set","import_module":"wbg","import_name":"set"});
+        let ctor = json!({
+            "kind":"uint32_array_constructor",
+            "import_module":"wbg",
+            "import_name":"ctor",
+            "element_width_bits":32
+        });
+        let exact = json!({"handler_semantics":[set,ctor],"import_object_usages":[]});
+        let proof = BoundaryCorrelation::match_copied_source(
+            &scope,
+            &candidate,
+            names,
+            "src/carrier.js",
+            &exact,
+        );
+        assert!(
+            proof.is_some(),
+            "unique exact handler pair must yield source-local evidence"
+        );
+        let Some(proof) = proof else {
+            return;
+        };
+        assert_eq!(proof["source_path"], "src/carrier.js");
+        assert_eq!(proof["module_memory_identity_proofs"], json!([]));
+        assert_eq!(proof["import_binding_identity_proofs"], json!([]));
+
+        let duplicate = json!({"handler_semantics":[set,set,ctor]});
+        assert!(
+            BoundaryCorrelation::match_copied_source(
+                &scope,
+                &candidate,
+                names,
+                "src/carrier.js",
+                &duplicate,
+            )
+            .is_none(),
+            "duplicate handler matches must not be silently accepted"
+        );
+        let wrong_module = json!({"handler_semantics":[
+            {"kind":"typed_array_set","import_module":"foreign","import_name":"set"},
+            ctor
+        ]});
+        assert!(BoundaryCorrelation::match_copied_source(
+            &scope,
+            &candidate,
+            names,
+            "src/carrier.js",
+            &wrong_module
+        )
+        .is_none());
+        let invalid_width = json!({"handler_semantics":[
+            set,
+            {"kind":"uint32_array_constructor","import_module":"wbg","import_name":"ctor","element_width_bits":16}
+        ]});
+        assert!(BoundaryCorrelation::match_copied_source(
+            &scope,
+            &candidate,
+            names,
+            "src/carrier.js",
+            &invalid_width
+        )
+        .is_none());
+    }
 
     #[test]
     fn source_word_overlay_tracks_transitive_runtime_dependencies() {
