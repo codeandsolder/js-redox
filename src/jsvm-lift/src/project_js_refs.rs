@@ -1047,7 +1047,7 @@ pub fn scan_project_references(
         .get("summary")
         .and_then(|summary| summary.get("import_map_scripts"))
         .cloned()
-        .unwrap_or(Value::from(0));
+        .unwrap_or_else(|| Value::from(0));
     let document = json!({
         "schema": JS_REFERENCES.schema,
         "extractor": "jsvm_lift::js_refs",

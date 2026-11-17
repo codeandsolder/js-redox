@@ -230,7 +230,7 @@ pub fn analyze_static_calls(
     }
     Ok(StaticCallGraph {
         schema: "jsvm-static-calls/v1",
-        functions: functions.into_iter().map(|(a, b)| [a, b]).collect(),
+        functions: functions.into_iter().map(Into::into).collect(),
         direct_edges,
         unresolved_calls,
         possibly_reachable_from_top_level: reachable.into_iter().collect(),
