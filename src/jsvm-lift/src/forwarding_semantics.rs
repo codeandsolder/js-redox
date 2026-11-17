@@ -2089,6 +2089,47 @@ impl<'a, R: RegistryFunctionProofResolver> Visit<'a> for RegistryFunctionCollect
     }
 }
 
+// All registry call proofs have source-span identities; retain the established
+// stable sorting and duplicate-elimination policy across the distinct outputs.
+fn sort_unique_calls_by_key<T, K: Ord>(mut calls: Vec<T>, mut key: impl FnMut(&T) -> K) -> Vec<T> {
+    calls.sort_by_key(|call| key(call));
+    calls.dedup_by_key(|call| key(call));
+    calls
+}
+
+// The proof-specific visitors only supply call recognition; scanning, budget
+// finalization and stable source-span deduplication are common.
+fn collect_registry_calls<'a, C: Visit<'a>, T>(
+    program: &Program<'a>,
+    mut collector: C,
+    poller: impl FnOnce(&mut C) -> &mut BudgetPoller,
+    take_calls: impl FnOnce(C) -> Vec<T>,
+    span: impl FnMut(&T) -> (u32, u32),
+) -> Result<Vec<T>, BudgetExceeded> {
+    collector.visit_program(program);
+    poller(&mut collector).finish()?;
+    Ok(sort_unique_calls_by_key(take_calls(collector), span))
+}
+
+// All direct proof families share the same single-pass collection and
+// fail-closed budget contract. Delegate expansion is deliberately separate:
+// its outer loop consumes budget, but has no extra upfront checkpoint.
+fn collect_registry_function_proofs<R: RegistryFunctionProofResolver>(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    budget: &WorkBudget,
+    resolver: R,
+) -> Result<HashMap<SymbolId, R::Proof>, BudgetExceeded> {
+    budget.checkpoint()?;
+    let mut collector = RegistryFunctionCollector::new(scoping, budget, resolver);
+    collector.visit_program(program);
+    collector.poller.finish()?;
+    if let Some(error) = collector.budget_error.take() {
+        return Err(error);
+    }
+    Ok(collector.proofs)
+}
+
 struct ForwarderResolution;
 
 impl RegistryFunctionProofResolver for ForwarderResolution {
@@ -2995,28 +3036,19 @@ pub fn structurally_proven_registry_read_calls(
     scoping: &Scoping,
     budget: &WorkBudget,
 ) -> Result<Vec<ProvenRegistryReadCall>, BudgetExceeded> {
-    budget.checkpoint()?;
-    let mut accessors = RegistryFunctionCollector::new(scoping, budget, AccessorResolution);
-    accessors.visit_program(program);
-    accessors.poller.finish()?;
-    if let Some(error) = accessors.budget_error.take() {
-        return Err(error);
-    }
-    let mut calls = RegistryReadCallCollector {
-        scoping,
-        proofs: &accessors.proofs,
-        calls: Vec::new(),
-        poller: BudgetPoller::new(budget, 256),
-    };
-    calls.visit_program(program);
-    calls.poller.finish()?;
-    calls
-        .calls
-        .sort_by_key(|call| (call.call_start, call.call_end));
-    calls
-        .calls
-        .dedup_by_key(|call| (call.call_start, call.call_end));
-    Ok(calls.calls)
+    let proofs = collect_registry_function_proofs(program, scoping, budget, AccessorResolution)?;
+    collect_registry_calls(
+        program,
+        RegistryReadCallCollector {
+            scoping,
+            proofs: &proofs,
+            calls: Vec::new(),
+            poller: BudgetPoller::new(budget, 256),
+        },
+        |collector| &mut collector.poller,
+        |collector| collector.calls,
+        |call| (call.call_start, call.call_end),
+    )
 }
 
 struct LazyRegistryReadCallCollector<'c, 'p> {
@@ -3102,28 +3134,20 @@ pub fn structurally_proven_lazy_registry_read_calls(
     scoping: &Scoping,
     budget: &WorkBudget,
 ) -> Result<Vec<ProvenLazyRegistryReadCall>, BudgetExceeded> {
-    budget.checkpoint()?;
-    let mut accessors = RegistryFunctionCollector::new(scoping, budget, LazyAccessorResolution);
-    accessors.visit_program(program);
-    accessors.poller.finish()?;
-    if let Some(error) = accessors.budget_error.take() {
-        return Err(error);
-    }
-    let mut calls = LazyRegistryReadCallCollector {
-        scoping,
-        proofs: &accessors.proofs,
-        calls: Vec::new(),
-        poller: BudgetPoller::new(budget, 256),
-    };
-    calls.visit_program(program);
-    calls.poller.finish()?;
-    calls
-        .calls
-        .sort_by_key(|call| (call.read.call_start, call.read.call_end));
-    calls
-        .calls
-        .dedup_by_key(|call| (call.read.call_start, call.read.call_end));
-    Ok(calls.calls)
+    let proofs =
+        collect_registry_function_proofs(program, scoping, budget, LazyAccessorResolution)?;
+    collect_registry_calls(
+        program,
+        LazyRegistryReadCallCollector {
+            scoping,
+            proofs: &proofs,
+            calls: Vec::new(),
+            poller: BudgetPoller::new(budget, 256),
+        },
+        |collector| &mut collector.poller,
+        |collector| collector.calls,
+        |call| (call.read.call_start, call.read.call_end),
+    )
 }
 
 fn registry_forwarder_proofs(
@@ -3131,22 +3155,12 @@ fn registry_forwarder_proofs(
     scoping: &Scoping,
     budget: &WorkBudget,
 ) -> Result<HashMap<SymbolId, RegistryForwarderProof>, BudgetExceeded> {
-    budget.checkpoint()?;
-    let mut forwarders = RegistryFunctionCollector::new(scoping, budget, ForwarderResolution);
-    forwarders.visit_program(program);
-    forwarders.poller.finish()?;
-    if let Some(error) = forwarders.budget_error.take() {
-        return Err(error);
-    }
+    let mut proofs =
+        collect_registry_function_proofs(program, scoping, budget, ForwarderResolution)?;
     loop {
         budget.consume(1)?;
-        let mut delegates = RegistryFunctionCollector::new(
-            scoping,
-            budget,
-            DelegateResolution {
-                known: &forwarders.proofs,
-            },
-        );
+        let mut delegates =
+            RegistryFunctionCollector::new(scoping, budget, DelegateResolution { known: &proofs });
         delegates.visit_program(program);
         delegates.poller.finish()?;
         if let Some(error) = delegates.budget_error.take() {
@@ -3155,19 +3169,131 @@ fn registry_forwarder_proofs(
         if delegates.proofs.is_empty() {
             break;
         }
-        forwarders.proofs.extend(delegates.proofs);
+        proofs.extend(delegates.proofs);
     }
-    Ok(forwarders.proofs)
+    Ok(proofs)
 }
 
-struct RegistryForwardingValueCallCollector<'c, 'p> {
+// The two forwarding call results have identical callee/argument proof
+// obligations. Keep the result-specific evidence in statically selected modes.
+trait ForwardingCallProof {
+    type Call;
+
+    fn build(
+        call: &CallExpression<'_>,
+        receiver: &Expression<'_>,
+        key: &Expression<'_>,
+        value: &Expression<'_>,
+        proof: &RegistryForwarderProof,
+    ) -> Option<Self::Call>;
+
+    fn source_span(call: &Self::Call) -> (u32, u32);
+}
+
+struct ForwardingValueMode;
+
+impl ForwardingCallProof for ForwardingValueMode {
+    type Call = ProvenRegistryForwardingValueCall;
+
+    fn build(
+        call: &CallExpression<'_>,
+        receiver: &Expression<'_>,
+        key: &Expression<'_>,
+        value: &Expression<'_>,
+        proof: &RegistryForwarderProof,
+    ) -> Option<Self::Call> {
+        Some(ProvenRegistryForwardingValueCall {
+            call_start: call.span.start,
+            call_end: call.span.end,
+            receiver_start: receiver.span().start,
+            receiver_end: receiver.span().end,
+            key_start: key.span().start,
+            key_end: key.span().end,
+            value_start: value.span().start,
+            value_end: value.span().end,
+            registry_path: proof.registry_path.clone(),
+            registry_key_confined: proof.registry_key_confined,
+        })
+    }
+
+    fn source_span(call: &Self::Call) -> (u32, u32) {
+        (call.call_start, call.call_end)
+    }
+}
+
+struct ForwardingHandlerMode;
+
+impl ForwardingCallProof for ForwardingHandlerMode {
+    type Call = ProvenRegistryForwardingCall;
+
+    fn build(
+        call: &CallExpression<'_>,
+        receiver: &Expression<'_>,
+        key: &Expression<'_>,
+        value: &Expression<'_>,
+        proof: &RegistryForwarderProof,
+    ) -> Option<Self::Call> {
+        let (handler_start, handler_end, handler_params, handler_async) = match value {
+            Expression::FunctionExpression(function) => (
+                function.span.start,
+                function.span.end,
+                function.params.items.len(),
+                function.r#async,
+            ),
+            Expression::ArrowFunctionExpression(function) => (
+                function.span.start,
+                function.span.end,
+                function.params.items.len(),
+                function.r#async,
+            ),
+            _ => return None,
+        };
+        Some(ProvenRegistryForwardingCall {
+            call_start: call.span.start,
+            call_end: call.span.end,
+            receiver_start: receiver.span().start,
+            receiver_end: receiver.span().end,
+            key_start: key.span().start,
+            key_end: key.span().end,
+            registry_path: proof.registry_path.clone(),
+            registry_key_confined: proof.registry_key_confined,
+            handler_start,
+            handler_end,
+            handler_params,
+            handler_async,
+        })
+    }
+
+    fn source_span(call: &Self::Call) -> (u32, u32) {
+        (call.call_start, call.call_end)
+    }
+}
+
+struct RegistryForwardingCallCollector<'c, 'p, M: ForwardingCallProof> {
     scoping: &'c Scoping,
     proofs: &'p HashMap<SymbolId, RegistryForwarderProof>,
-    calls: Vec<ProvenRegistryForwardingValueCall>,
+    calls: Vec<M::Call>,
     poller: BudgetPoller,
+    mode: std::marker::PhantomData<M>,
 }
 
-impl<'a> Visit<'a> for RegistryForwardingValueCallCollector<'_, '_> {
+impl<'c, 'p, M: ForwardingCallProof> RegistryForwardingCallCollector<'c, 'p, M> {
+    fn new(
+        scoping: &'c Scoping,
+        proofs: &'p HashMap<SymbolId, RegistryForwarderProof>,
+        budget: &WorkBudget,
+    ) -> Self {
+        Self {
+            scoping,
+            proofs,
+            calls: Vec::new(),
+            poller: BudgetPoller::new(budget, 256),
+            mode: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, M: ForwardingCallProof> Visit<'a> for RegistryForwardingCallCollector<'_, '_, M> {
     fn visit_expression(&mut self, expression: &Expression<'a>) {
         if !self.poller.poll(1) {
             return;
@@ -3203,18 +3329,9 @@ impl<'a> Visit<'a> for RegistryForwardingValueCallCollector<'_, '_> {
                             .and_then(Argument::as_expression)
                             .map(last_sequence_expression);
                         if let (Some(receiver), Some(key), Some(value)) = (receiver, key, value) {
-                            self.calls.push(ProvenRegistryForwardingValueCall {
-                                call_start: call.span.start,
-                                call_end: call.span.end,
-                                receiver_start: receiver.span().start,
-                                receiver_end: receiver.span().end,
-                                key_start: key.span().start,
-                                key_end: key.span().end,
-                                value_start: value.span().start,
-                                value_end: value.span().end,
-                                registry_path: proof.registry_path.clone(),
-                                registry_key_confined: proof.registry_key_confined,
-                            });
+                            if let Some(evidence) = M::build(call, receiver, key, value, proof) {
+                                self.calls.push(evidence);
+                            }
                         }
                     }
                 }
@@ -3222,6 +3339,21 @@ impl<'a> Visit<'a> for RegistryForwardingValueCallCollector<'_, '_> {
         }
         walk::walk_call_expression(self, call);
     }
+}
+
+fn collect_forwarding_call_proofs<M: ForwardingCallProof>(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    budget: &WorkBudget,
+) -> Result<Vec<M::Call>, BudgetExceeded> {
+    let proofs = registry_forwarder_proofs(program, scoping, budget)?;
+    collect_registry_calls(
+        program,
+        RegistryForwardingCallCollector::<M>::new(scoping, &proofs, budget),
+        |collector| &mut collector.poller,
+        |collector| collector.calls,
+        M::source_span,
+    )
 }
 
 /// Find all calls through structurally proven registry forwarders, preserving
@@ -3235,110 +3367,7 @@ pub fn structurally_proven_registry_forwarding_value_calls(
     scoping: &Scoping,
     budget: &WorkBudget,
 ) -> Result<Vec<ProvenRegistryForwardingValueCall>, BudgetExceeded> {
-    let proofs = registry_forwarder_proofs(program, scoping, budget)?;
-    let mut calls = RegistryForwardingValueCallCollector {
-        scoping,
-        proofs: &proofs,
-        calls: Vec::new(),
-        poller: BudgetPoller::new(budget, 256),
-    };
-    calls.visit_program(program);
-    calls.poller.finish()?;
-    calls
-        .calls
-        .sort_by_key(|call| (call.call_start, call.call_end));
-    calls
-        .calls
-        .dedup_by_key(|call| (call.call_start, call.call_end));
-    Ok(calls.calls)
-}
-
-struct RegistryForwardingCallCollector<'c, 'p> {
-    scoping: &'c Scoping,
-    proofs: &'p HashMap<SymbolId, RegistryForwarderProof>,
-    calls: Vec<ProvenRegistryForwardingCall>,
-    poller: BudgetPoller,
-}
-impl<'a> Visit<'a> for RegistryForwardingCallCollector<'_, '_> {
-    fn visit_expression(&mut self, expression: &Expression<'a>) {
-        if !self.poller.poll(1) {
-            return;
-        }
-        walk::walk_expression(self, expression);
-    }
-
-    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if !call.optional {
-            if let Expression::Identifier(callee) = last_sequence_expression(&call.callee) {
-                if let Some(symbol) = callee
-                    .reference_id
-                    .get()
-                    .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
-                    .filter(|symbol| symbol_binding_is_stable(self.scoping, *symbol))
-                {
-                    if let Some(proof) = self.proofs.get(&symbol) {
-                        let receiver = usize::try_from(proof.receiver_argument)
-                            .ok()
-                            .and_then(|index| call.arguments.get(index))
-                            .and_then(Argument::as_expression)
-                            .and_then(|expression| {
-                                stable_receiver_expression(self.scoping, expression)
-                            });
-                        let key = usize::try_from(proof.key_argument)
-                            .ok()
-                            .and_then(|index| call.arguments.get(index))
-                            .and_then(Argument::as_expression)
-                            .map(last_sequence_expression);
-                        let value = usize::try_from(proof.value_argument)
-                            .ok()
-                            .and_then(|index| call.arguments.get(index))
-                            .and_then(Argument::as_expression)
-                            .map(last_sequence_expression);
-                        if let (Some(receiver), Some(key), Some(value)) = (receiver, key, value) {
-                            let handler = match value {
-                                Expression::FunctionExpression(function) => Some((
-                                    function.span.start,
-                                    function.span.end,
-                                    function.params.items.len(),
-                                    function.r#async,
-                                )),
-                                Expression::ArrowFunctionExpression(function) => Some((
-                                    function.span.start,
-                                    function.span.end,
-                                    function.params.items.len(),
-                                    function.r#async,
-                                )),
-                                _ => None,
-                            };
-                            if let Some((
-                                handler_start,
-                                handler_end,
-                                handler_params,
-                                handler_async,
-                            )) = handler
-                            {
-                                self.calls.push(ProvenRegistryForwardingCall {
-                                    call_start: call.span.start,
-                                    call_end: call.span.end,
-                                    receiver_start: receiver.span().start,
-                                    receiver_end: receiver.span().end,
-                                    key_start: key.span().start,
-                                    key_end: key.span().end,
-                                    registry_path: proof.registry_path.clone(),
-                                    registry_key_confined: proof.registry_key_confined,
-                                    handler_start,
-                                    handler_end,
-                                    handler_params,
-                                    handler_async,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        walk::walk_call_expression(self, call);
-    }
+    collect_forwarding_call_proofs::<ForwardingValueMode>(program, scoping, budget)
 }
 
 /// Identify forwarding calls with proven registry connections.
@@ -3351,22 +3380,7 @@ pub fn structurally_proven_registry_forwarding_calls(
     scoping: &Scoping,
     budget: &WorkBudget,
 ) -> Result<Vec<ProvenRegistryForwardingCall>, BudgetExceeded> {
-    let proofs = registry_forwarder_proofs(program, scoping, budget)?;
-    let mut calls = RegistryForwardingCallCollector {
-        scoping,
-        proofs: &proofs,
-        calls: Vec::new(),
-        poller: BudgetPoller::new(budget, 256),
-    };
-    calls.visit_program(program);
-    calls.poller.finish()?;
-    calls
-        .calls
-        .sort_by_key(|call| (call.call_start, call.call_end));
-    calls
-        .calls
-        .dedup_by_key(|call| (call.call_start, call.call_end));
-    Ok(calls.calls)
+    collect_forwarding_call_proofs::<ForwardingHandlerMode>(program, scoping, budget)
 }
 
 /// Find source-proven forwarding installer calls.
