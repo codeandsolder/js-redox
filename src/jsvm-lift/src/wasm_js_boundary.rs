@@ -450,6 +450,30 @@ fn semantic_ir_ssa_shape(expression: &Value) -> Option<(BTreeSet<i64>, BTreeSet<
     Some((definitions, references))
 }
 
+fn visit_runtime_dependency(
+    value: i64,
+    graph: &BTreeMap<i64, Vec<i64>>,
+    state: &mut BTreeMap<i64, u8>,
+) -> bool {
+    match state.get(&value).copied().unwrap_or(0) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    state.insert(value, 1);
+    let Some(dependencies) = graph.get(&value) else {
+        return false;
+    };
+    if !dependencies
+        .iter()
+        .all(|dependency| visit_runtime_dependency(*dependency, graph, state))
+    {
+        return false;
+    }
+    state.insert(value, 2);
+    true
+}
+
 fn semantic_runtime_graph(analysis: &Value) -> Option<SemanticRuntimeGraph> {
     let bindings = analysis.get("runtime_bindings")?.as_array()?;
     let returns = analysis.get("returns")?.as_array()?;
@@ -535,29 +559,10 @@ fn semantic_runtime_graph(analysis: &Value) -> Option<SemanticRuntimeGraph> {
     }
 
     let mut state = BTreeMap::<i64, u8>::new();
-    fn visit(value: i64, graph: &BTreeMap<i64, Vec<i64>>, state: &mut BTreeMap<i64, u8>) -> bool {
-        match state.get(&value).copied().unwrap_or(0) {
-            1 => return false,
-            2 => return true,
-            _ => {}
-        }
-        state.insert(value, 1);
-        let Some(dependencies) = graph.get(&value) else {
-            return false;
-        };
-        if !dependencies
-            .iter()
-            .all(|dependency| visit(*dependency, graph, state))
-        {
-            return false;
-        }
-        state.insert(value, 2);
-        true
-    }
     if !graph
         .keys()
         .copied()
-        .all(|value| visit(value, &graph, &mut state))
+        .all(|value| visit_runtime_dependency(value, &graph, &mut state))
     {
         return None;
     }

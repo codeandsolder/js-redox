@@ -3562,6 +3562,35 @@ fn phase_closure_for_method_assignment(
     proven
 }
 
+struct PrototypeMethodPhaseClosureCollector<'c, 'm> {
+    scoping: &'c Scoping,
+    methods: &'m HashMap<(u32, u32), ProvenPrototypeMethodAssignment>,
+    proven: Vec<ProvenPrototypeMethodPhaseClosure>,
+    poller: BudgetPoller,
+}
+impl<'a> Visit<'a> for PrototypeMethodPhaseClosureCollector<'_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if let Some(method) = self
+            .methods
+            .get(&(assignment.span.start, assignment.span.end))
+        {
+            self.proven.extend(phase_closure_for_method_assignment(
+                assignment,
+                method,
+                self.scoping,
+            ));
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+}
+
 /// Find prototype methods whose exact method body and a pure captured phase
 /// closure are installed by the same guaranteed zero-argument IIFE return.
 ///
@@ -3579,39 +3608,7 @@ pub fn structurally_proven_prototype_method_phase_closures(
         .map(|method| ((method.assignment_start, method.assignment_end), method))
         .collect::<HashMap<_, _>>();
 
-    struct Collector<'c, 'm> {
-        scoping: &'c Scoping,
-        methods: &'m HashMap<(u32, u32), ProvenPrototypeMethodAssignment>,
-        proven: Vec<ProvenPrototypeMethodPhaseClosure>,
-        poller: BudgetPoller,
-    }
-    impl<'a> Visit<'a> for Collector<'_, '_> {
-        fn visit_expression(&mut self, expression: &Expression<'a>) {
-            if !self.poller.poll(1) {
-                return;
-            }
-            walk::walk_expression(self, expression);
-        }
-
-        fn visit_assignment_expression(
-            &mut self,
-            assignment: &oxc_ast::ast::AssignmentExpression<'a>,
-        ) {
-            if let Some(method) = self
-                .methods
-                .get(&(assignment.span.start, assignment.span.end))
-            {
-                self.proven.extend(phase_closure_for_method_assignment(
-                    assignment,
-                    method,
-                    self.scoping,
-                ));
-            }
-            walk::walk_assignment_expression(self, assignment);
-        }
-    }
-
-    let mut collector = Collector {
+    let mut collector = PrototypeMethodPhaseClosureCollector {
         scoping,
         methods: &by_span,
         proven: Vec::new(),
@@ -4909,13 +4906,14 @@ pub fn structurally_proven_runtime_origin_flow(
     semantic: &Semantic<'_>,
     budget: &WorkBudget,
 ) -> Result<ProvenOriginFlow, BudgetExceeded> {
+    type MethodKey = (u32, u32, String);
+
     budget.checkpoint()?;
     let scoping = semantic.scoping();
     let mut flow = structurally_proven_origin_flow(program, scoping, budget)?;
     let lookup_targets =
         structurally_proven_prototype_method_lookup_targets(program, scoping, budget)?;
 
-    type MethodKey = (u32, u32, String);
     let mut targets = HashMap::<MethodKey, Vec<ProvenPrototypeMethodLookupTarget>>::new();
     for target in lookup_targets {
         targets

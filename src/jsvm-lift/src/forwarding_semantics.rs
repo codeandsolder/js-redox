@@ -1803,6 +1803,99 @@ impl<'a> Visit<'a> for RegistryWriteCollector<'_, '_> {
     }
 }
 
+#[derive(Default)]
+struct RegistryKeyUsageProbe {
+    allowed_path_uses: HashSet<(u32, u32)>,
+    path_uses: HashSet<(u32, u32)>,
+    invalid_index: bool,
+}
+
+struct RegistryKeyUsageWalker<'c, 'p, 'b> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    boxes: &'b HashSet<SymbolId>,
+    receiver_argument: u32,
+    key_argument: u32,
+    registry_path: &'p [String],
+    probe: RegistryKeyUsageProbe,
+    poller: BudgetPoller,
+}
+
+impl RegistryKeyUsageWalker<'_, '_, '_> {
+    fn record_extended_path(
+        &mut self,
+        object: &Expression<'_>,
+        property: Option<String>,
+        span: oxc_span::Span,
+    ) {
+        let Some(property) = property else {
+            return;
+        };
+        let Some((receiver, mut path)) =
+            parameter_member_path(self.scoping, object, self.parameters, self.boxes)
+        else {
+            return;
+        };
+        path.push(property);
+        if receiver == self.receiver_argument && path == self.registry_path {
+            self.probe.path_uses.insert((span.start, span.end));
+        }
+    }
+}
+
+impl<'a> Visit<'a> for RegistryKeyUsageWalker<'_, '_, '_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if !self.poller.poll(1) {
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+
+    fn visit_static_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::StaticMemberExpression<'a>,
+    ) {
+        self.record_extended_path(
+            &member.object,
+            Some(member.property.name.to_string()),
+            member.span,
+        );
+        walk::walk_static_member_expression(self, member);
+    }
+
+    fn visit_computed_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::ComputedMemberExpression<'a>,
+    ) {
+        if parameter_member_path(self.scoping, &member.object, self.parameters, self.boxes)
+            .is_some_and(|(receiver, path)| {
+                receiver == self.receiver_argument && path == self.registry_path
+            })
+        {
+            let object_span = member.object.span();
+            self.probe
+                .allowed_path_uses
+                .insert((object_span.start, object_span.end));
+            if member.optional
+                || argument_index_expr(
+                    self.scoping,
+                    &member.expression,
+                    self.parameters,
+                    self.boxes,
+                ) != Some(self.key_argument)
+            {
+                self.probe.invalid_index = true;
+            }
+        }
+        let property = match &member.expression {
+            Expression::StringLiteral(value) => string_literal_value(value),
+            _ => None,
+        };
+        self.record_extended_path(&member.object, property, member.span);
+        walk::walk_computed_member_expression(self, member);
+    }
+}
+
 fn registry_key_confined_in_body(
     scoping: &Scoping,
     body: &FunctionBody<'_>,
@@ -1815,107 +1908,14 @@ fn registry_key_confined_in_body(
         return Ok(false);
     }
 
-    #[derive(Default)]
-    struct Probe {
-        allowed_path_uses: HashSet<(u32, u32)>,
-        path_uses: HashSet<(u32, u32)>,
-        invalid_index: bool,
-    }
-
-    struct Walker<'c, 'p, 'b> {
-        scoping: &'c Scoping,
-        parameters: &'p [SymbolId],
-        boxes: &'b HashSet<SymbolId>,
-        receiver_argument: u32,
-        key_argument: u32,
-        registry_path: &'p [String],
-        probe: Probe,
-        poller: BudgetPoller,
-    }
-
-    impl Walker<'_, '_, '_> {
-        fn record_extended_path(
-            &mut self,
-            object: &Expression<'_>,
-            property: Option<String>,
-            span: oxc_span::Span,
-        ) {
-            let Some(property) = property else {
-                return;
-            };
-            let Some((receiver, mut path)) =
-                parameter_member_path(self.scoping, object, self.parameters, self.boxes)
-            else {
-                return;
-            };
-            path.push(property);
-            if receiver == self.receiver_argument && path == self.registry_path {
-                self.probe.path_uses.insert((span.start, span.end));
-            }
-        }
-    }
-
-    impl<'a> Visit<'a> for Walker<'_, '_, '_> {
-        fn visit_expression(&mut self, expression: &Expression<'a>) {
-            if !self.poller.poll(1) {
-                return;
-            }
-            walk::walk_expression(self, expression);
-        }
-
-        fn visit_static_member_expression(
-            &mut self,
-            member: &oxc_ast::ast::StaticMemberExpression<'a>,
-        ) {
-            self.record_extended_path(
-                &member.object,
-                Some(member.property.name.to_string()),
-                member.span,
-            );
-            walk::walk_static_member_expression(self, member);
-        }
-
-        fn visit_computed_member_expression(
-            &mut self,
-            member: &oxc_ast::ast::ComputedMemberExpression<'a>,
-        ) {
-            if parameter_member_path(self.scoping, &member.object, self.parameters, self.boxes)
-                .is_some_and(|(receiver, path)| {
-                    receiver == self.receiver_argument && path == self.registry_path
-                })
-            {
-                let object_span = member.object.span();
-                self.probe
-                    .allowed_path_uses
-                    .insert((object_span.start, object_span.end));
-                if member.optional
-                    || argument_index_expr(
-                        self.scoping,
-                        &member.expression,
-                        self.parameters,
-                        self.boxes,
-                    ) != Some(self.key_argument)
-                {
-                    self.probe.invalid_index = true;
-                }
-            }
-            let property = match &member.expression {
-                Expression::StringLiteral(value) => string_literal_value(value),
-                _ => None,
-            };
-            self.record_extended_path(&member.object, property, member.span);
-            walk::walk_computed_member_expression(self, member);
-        }
-    }
-
-    let mut walker = Walker {
+    let mut walker = RegistryKeyUsageWalker {
         scoping,
         parameters,
         boxes,
         receiver_argument: proof.receiver_argument,
         key_argument: proof.key_argument,
         registry_path: &proof.registry_path,
-        probe: Probe::default(),
+        probe: RegistryKeyUsageProbe::default(),
         poller: BudgetPoller::new(budget, 256),
     };
     walker.visit_function_body(body);

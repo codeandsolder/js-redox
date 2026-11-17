@@ -19,6 +19,54 @@ fn arg_u32(args: &[std::ffi::OsString], prefix: &str) -> Result<u32> {
         .with_context(|| format!("missing {prefix}<u32>"))
 }
 
+struct ParameterWriteInventoryProbe<'s> {
+    function_start: u32,
+    function_end: u32,
+    scoping: &'s oxc_semantic::Scoping,
+    nodes: &'s oxc_semantic::AstNodes<'s>,
+    output: Vec<serde_json::Value>,
+}
+impl<'a> Visit<'a> for ParameterWriteInventoryProbe<'_> {
+    fn visit_function(
+        &mut self,
+        function: &oxc_ast::ast::Function<'a>,
+        flags: oxc_syntax::scope::ScopeFlags,
+    ) {
+        if function.span.start == self.function_start && function.span.end == self.function_end {
+            for (index, parameter) in function.params.items.iter().enumerate() {
+                let oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) =
+                    &parameter.pattern
+                else {
+                    continue;
+                };
+                let Some(symbol) = identifier.symbol_id.get() else {
+                    continue;
+                };
+                let writes = self
+                    .scoping
+                    .get_resolved_reference_ids(symbol)
+                    .iter()
+                    .filter_map(|reference_id| {
+                        let reference = self.scoping.get_reference(*reference_id);
+                        reference.is_write().then(|| {
+                            let span = self.nodes.get_node(reference.node_id()).kind().span();
+                            json!([span.start, span.end])
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                self.output.push(json!({
+                    "index": index,
+                    "name": identifier.name.as_str(),
+                    "declaration": [identifier.span.start, identifier.span.end],
+                    "writes": writes,
+                }));
+            }
+            return;
+        }
+        walk::walk_function(self, function, flags);
+    }
+}
+
 fn main() -> Result<()> {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let path = args
@@ -116,57 +164,7 @@ fn main() -> Result<()> {
             .with_build_nodes(true)
             .build(&parsed.program);
         let scoping = semantic.semantic.scoping();
-        struct Params<'s> {
-            function_start: u32,
-            function_end: u32,
-            scoping: &'s oxc_semantic::Scoping,
-            nodes: &'s oxc_semantic::AstNodes<'s>,
-            output: Vec<serde_json::Value>,
-        }
-        impl<'a> Visit<'a> for Params<'_> {
-            fn visit_function(
-                &mut self,
-                function: &oxc_ast::ast::Function<'a>,
-                flags: oxc_syntax::scope::ScopeFlags,
-            ) {
-                if function.span.start == self.function_start
-                    && function.span.end == self.function_end
-                {
-                    for (index, parameter) in function.params.items.iter().enumerate() {
-                        let oxc_ast::ast::BindingPattern::BindingIdentifier(identifier) =
-                            &parameter.pattern
-                        else {
-                            continue;
-                        };
-                        let Some(symbol) = identifier.symbol_id.get() else {
-                            continue;
-                        };
-                        let writes = self
-                            .scoping
-                            .get_resolved_reference_ids(symbol)
-                            .iter()
-                            .filter_map(|reference_id| {
-                                let reference = self.scoping.get_reference(*reference_id);
-                                reference.is_write().then(|| {
-                                    let span =
-                                        self.nodes.get_node(reference.node_id()).kind().span();
-                                    json!([span.start, span.end])
-                                })
-                            })
-                            .collect::<Vec<_>>();
-                        self.output.push(json!({
-                            "index": index,
-                            "name": identifier.name.as_str(),
-                            "declaration": [identifier.span.start, identifier.span.end],
-                            "writes": writes,
-                        }));
-                    }
-                    return;
-                }
-                walk::walk_function(self, function, flags);
-            }
-        }
-        let mut params = Params {
+        let mut params = ParameterWriteInventoryProbe {
             function_start,
             function_end,
             scoping,
