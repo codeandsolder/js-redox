@@ -1344,6 +1344,137 @@ fn protected_loop_captures_state(while_statement: &WhileStatement<'_>, state_var
     nested_state.found
 }
 
+struct ProtectedLoopReachabilityRunner<'s> {
+    source: &'s str,
+    event: Span,
+    target: Span,
+    env: HashMap<String, Scalar>,
+    result: Option<bool>,
+}
+impl<'a> Visit<'a> for ProtectedLoopReachabilityRunner<'_> {
+    fn visit_while_statement(&mut self, while_statement: &WhileStatement<'a>) {
+        if self.result.is_some() {
+            return;
+        }
+        if while_statement.span != self.target {
+            walk::walk_while_statement(self, while_statement);
+            return;
+        }
+        if !control_test_is_effect_free(&while_statement.test) {
+            self.result = Some(false);
+            return;
+        }
+        let Statement::TryStatement(try_statement) = &while_statement.body else {
+            self.result = Some(false);
+            return;
+        };
+        let (Some(handler), None) = (&try_statement.handler, &try_statement.finalizer) else {
+            self.result = Some(false);
+            return;
+        };
+        let Some((state_var, event_state)) =
+            branch_state_variable_for_span(&try_statement.block, self.event)
+        else {
+            self.result = Some(false);
+            return;
+        };
+
+        if protected_loop_captures_state(while_statement, &state_var) {
+            self.result = Some(false);
+            return;
+        }
+
+        let mut evidence = IfLadderEvidenceVisitor {
+            state_var: &state_var,
+            evidence: IfLadderEvidence::default(),
+        };
+        evidence.visit_block_statement(&try_statement.block);
+        if evidence.evidence.compared_states.len() < 4 || evidence.evidence.state_assignments < 4 {
+            self.result = Some(false);
+            return;
+        }
+
+        for _ in 0..256 {
+            let Some(Scalar::Int(state)) = self.env.get(&state_var).copied() else {
+                self.result = Some(false);
+                return;
+            };
+            if u64::try_from(state).ok() == Some(event_state) {
+                self.result = Some(false);
+                return;
+            }
+
+            let mut semantic = Vec::new();
+            let mut ambiguous_envs = Vec::new();
+            match exec_statements(
+                &try_statement.block.body,
+                self.source,
+                &state_var,
+                &mut self.env,
+                &mut semantic,
+                &mut ambiguous_envs,
+            ) {
+                ExecStatus::Return | ExecStatus::Break => {
+                    self.result = Some(true);
+                    return;
+                }
+                ExecStatus::Throw => {
+                    let mut catch_semantic = Vec::new();
+                    let mut catch_ambiguous_envs = Vec::new();
+                    match exec_statements(
+                        &handler.body.body,
+                        self.source,
+                        &state_var,
+                        &mut self.env,
+                        &mut catch_semantic,
+                        &mut catch_ambiguous_envs,
+                    ) {
+                        ExecStatus::Return | ExecStatus::Throw | ExecStatus::Break => {
+                            self.result = Some(true);
+                            return;
+                        }
+                        ExecStatus::Normal => {
+                            if !catch_semantic.is_empty() {
+                                self.result = Some(false);
+                                return;
+                            }
+                        }
+                    }
+                }
+                ExecStatus::Normal => {
+                    for snapshot in ambiguous_envs {
+                        let mut catch_env = snapshot;
+                        let mut catch_semantic = Vec::new();
+                        let mut catch_ambiguous_envs = Vec::new();
+                        let catch_status = exec_statements(
+                            &handler.body.body,
+                            self.source,
+                            &state_var,
+                            &mut catch_env,
+                            &mut catch_semantic,
+                            &mut catch_ambiguous_envs,
+                        );
+                        if !matches!(
+                            catch_status,
+                            ExecStatus::Return | ExecStatus::Throw | ExecStatus::Break
+                        ) {
+                            self.result = Some(false);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        self.result = Some(false);
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
 /// Prove an event unreachable inside a protected flattened state loop of the
 /// form `while (...) try { if (state == ...) ... } catch (...) { ... }` for a
 /// concrete direct call.
@@ -1411,141 +1542,7 @@ pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
                 return;
             }
 
-            struct Runner<'s> {
-                source: &'s str,
-                event: Span,
-                target: Span,
-                env: HashMap<String, Scalar>,
-                result: Option<bool>,
-            }
-            impl<'a> Visit<'a> for Runner<'_> {
-                fn visit_while_statement(&mut self, while_statement: &WhileStatement<'a>) {
-                    if self.result.is_some() {
-                        return;
-                    }
-                    if while_statement.span != self.target {
-                        walk::walk_while_statement(self, while_statement);
-                        return;
-                    }
-                    if !control_test_is_effect_free(&while_statement.test) {
-                        self.result = Some(false);
-                        return;
-                    }
-                    let Statement::TryStatement(try_statement) = &while_statement.body else {
-                        self.result = Some(false);
-                        return;
-                    };
-                    let (Some(handler), None) = (&try_statement.handler, &try_statement.finalizer)
-                    else {
-                        self.result = Some(false);
-                        return;
-                    };
-                    let Some((state_var, event_state)) =
-                        branch_state_variable_for_span(&try_statement.block, self.event)
-                    else {
-                        self.result = Some(false);
-                        return;
-                    };
-
-                    if protected_loop_captures_state(while_statement, &state_var) {
-                        self.result = Some(false);
-                        return;
-                    }
-
-                    let mut evidence = IfLadderEvidenceVisitor {
-                        state_var: &state_var,
-                        evidence: IfLadderEvidence::default(),
-                    };
-                    evidence.visit_block_statement(&try_statement.block);
-                    if evidence.evidence.compared_states.len() < 4
-                        || evidence.evidence.state_assignments < 4
-                    {
-                        self.result = Some(false);
-                        return;
-                    }
-
-                    for _ in 0..256 {
-                        let Some(Scalar::Int(state)) = self.env.get(&state_var).copied() else {
-                            self.result = Some(false);
-                            return;
-                        };
-                        if u64::try_from(state).ok() == Some(event_state) {
-                            self.result = Some(false);
-                            return;
-                        }
-
-                        let mut semantic = Vec::new();
-                        let mut ambiguous_envs = Vec::new();
-                        match exec_statements(
-                            &try_statement.block.body,
-                            self.source,
-                            &state_var,
-                            &mut self.env,
-                            &mut semantic,
-                            &mut ambiguous_envs,
-                        ) {
-                            ExecStatus::Return | ExecStatus::Break => {
-                                self.result = Some(true);
-                                return;
-                            }
-                            ExecStatus::Throw => {
-                                let mut catch_semantic = Vec::new();
-                                let mut catch_ambiguous_envs = Vec::new();
-                                match exec_statements(
-                                    &handler.body.body,
-                                    self.source,
-                                    &state_var,
-                                    &mut self.env,
-                                    &mut catch_semantic,
-                                    &mut catch_ambiguous_envs,
-                                ) {
-                                    ExecStatus::Return | ExecStatus::Throw | ExecStatus::Break => {
-                                        self.result = Some(true);
-                                        return;
-                                    }
-                                    ExecStatus::Normal => {
-                                        if !catch_semantic.is_empty() {
-                                            self.result = Some(false);
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            ExecStatus::Normal => {
-                                for snapshot in ambiguous_envs {
-                                    let mut catch_env = snapshot;
-                                    let mut catch_semantic = Vec::new();
-                                    let mut catch_ambiguous_envs = Vec::new();
-                                    let catch_status = exec_statements(
-                                        &handler.body.body,
-                                        self.source,
-                                        &state_var,
-                                        &mut catch_env,
-                                        &mut catch_semantic,
-                                        &mut catch_ambiguous_envs,
-                                    );
-                                    if !matches!(
-                                        catch_status,
-                                        ExecStatus::Return | ExecStatus::Throw | ExecStatus::Break
-                                    ) {
-                                        self.result = Some(false);
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    self.result = Some(false);
-                }
-                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-                fn visit_arrow_function_expression(
-                    &mut self,
-                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                ) {
-                }
-            }
-
-            let mut runner = Runner {
+            let mut runner = ProtectedLoopReachabilityRunner {
                 source: self.source,
                 event: self.event,
                 target: loop_span,
@@ -1569,6 +1566,30 @@ pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
     };
     harness.visit_program(program);
     harness.result.unwrap_or(false)
+}
+
+struct ExactBooleanExpressionProbe<'e> {
+    env: &'e HashMap<String, Scalar>,
+    target: Span,
+    result: Option<Option<bool>>,
+}
+impl<'a> Visit<'a> for ExactBooleanExpressionProbe<'_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if self.result.is_some() {
+            return;
+        }
+        if expression.span() == self.target {
+            self.result = Some(branch_truthiness(expression, self.env));
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
 }
 
 /// Evaluate one side-effect-free boolean expression in an exact function under
@@ -1617,31 +1638,7 @@ pub fn proven_function_boolean_expression_with_integer_parameters(
                 return;
             };
 
-            struct ExpressionProbe<'e> {
-                env: &'e HashMap<String, Scalar>,
-                target: Span,
-                result: Option<Option<bool>>,
-            }
-            impl<'a> Visit<'a> for ExpressionProbe<'_> {
-                fn visit_expression(&mut self, expression: &Expression<'a>) {
-                    if self.result.is_some() {
-                        return;
-                    }
-                    if expression.span() == self.target {
-                        self.result = Some(branch_truthiness(expression, self.env));
-                        return;
-                    }
-                    walk::walk_expression(self, expression);
-                }
-                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-                fn visit_arrow_function_expression(
-                    &mut self,
-                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                ) {
-                }
-            }
-
-            let mut probe = ExpressionProbe {
+            let mut probe = ExactBooleanExpressionProbe {
                 env: &env,
                 target: self.expression,
                 result: None,
@@ -1661,6 +1658,98 @@ pub fn proven_function_boolean_expression_with_integer_parameters(
     };
     harness.visit_program(program);
     harness.result.flatten()
+}
+
+struct StructuredBranchExclusionProbe<'e> {
+    env: &'e HashMap<String, Scalar>,
+    event: Span,
+    excluded: bool,
+}
+impl StructuredBranchExclusionProbe<'_> {
+    const fn contains(span: Span, event: Span) -> bool {
+        span.start <= event.start && event.end <= span.end
+    }
+}
+impl<'a> Visit<'a> for StructuredBranchExclusionProbe<'_> {
+    fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
+        if self.excluded {
+            return;
+        }
+        let in_consequent = Self::contains(statement.consequent.span(), self.event);
+        let in_alternate = statement
+            .alternate
+            .as_ref()
+            .is_some_and(|alternate| Self::contains(alternate.span(), self.event));
+        if in_consequent || in_alternate {
+            if let Some(test) = branch_truthiness(&statement.test, self.env) {
+                if (in_consequent && !test) || (in_alternate && test) {
+                    self.excluded = true;
+                    return;
+                }
+            }
+        }
+        walk::walk_if_statement(self, statement);
+    }
+
+    fn visit_conditional_expression(
+        &mut self,
+        expression: &oxc_ast::ast::ConditionalExpression<'a>,
+    ) {
+        if self.excluded {
+            return;
+        }
+        let in_consequent = Self::contains(expression.consequent.span(), self.event);
+        let in_alternate = Self::contains(expression.alternate.span(), self.event);
+        if in_consequent || in_alternate {
+            if let Some(test) = branch_truthiness(&expression.test, self.env) {
+                if (in_consequent && !test) || (in_alternate && test) {
+                    self.excluded = true;
+                    return;
+                }
+            }
+        }
+        walk::walk_conditional_expression(self, expression);
+    }
+
+    fn visit_logical_expression(&mut self, expression: &oxc_ast::ast::LogicalExpression<'a>) {
+        if self.excluded {
+            return;
+        }
+        if Self::contains(expression.right.span(), self.event) {
+            if let Some(lhs) = branch_truthiness(&expression.left, self.env) {
+                let skips_right = match expression.operator.as_str() {
+                    "&&" => !lhs,
+                    "||" => lhs,
+                    _ => false,
+                };
+                if skips_right {
+                    self.excluded = true;
+                    return;
+                }
+            }
+        }
+        walk::walk_logical_expression(self, expression);
+    }
+
+    fn visit_while_statement(&mut self, statement: &oxc_ast::ast::WhileStatement<'a>) {
+        if self.excluded {
+            return;
+        }
+        if Self::contains(statement.body.span(), self.event)
+            && branch_truthiness(&statement.test, self.env) == Some(false)
+        {
+            self.excluded = true;
+            return;
+        }
+        walk::walk_while_statement(self, statement);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
 }
 
 /// Prove event exclusion by a structured branch for exact integer formals.
@@ -1710,102 +1799,7 @@ pub fn prove_function_structured_branch_event_unreachable_with_integer_parameter
                 return;
             };
 
-            struct BranchProbe<'e> {
-                env: &'e HashMap<String, Scalar>,
-                event: Span,
-                excluded: bool,
-            }
-            impl BranchProbe<'_> {
-                const fn contains(span: Span, event: Span) -> bool {
-                    span.start <= event.start && event.end <= span.end
-                }
-            }
-            impl<'a> Visit<'a> for BranchProbe<'_> {
-                fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
-                    if self.excluded {
-                        return;
-                    }
-                    let in_consequent = Self::contains(statement.consequent.span(), self.event);
-                    let in_alternate = statement
-                        .alternate
-                        .as_ref()
-                        .is_some_and(|alternate| Self::contains(alternate.span(), self.event));
-                    if in_consequent || in_alternate {
-                        if let Some(test) = branch_truthiness(&statement.test, self.env) {
-                            if (in_consequent && !test) || (in_alternate && test) {
-                                self.excluded = true;
-                                return;
-                            }
-                        }
-                    }
-                    walk::walk_if_statement(self, statement);
-                }
-
-                fn visit_conditional_expression(
-                    &mut self,
-                    expression: &oxc_ast::ast::ConditionalExpression<'a>,
-                ) {
-                    if self.excluded {
-                        return;
-                    }
-                    let in_consequent = Self::contains(expression.consequent.span(), self.event);
-                    let in_alternate = Self::contains(expression.alternate.span(), self.event);
-                    if in_consequent || in_alternate {
-                        if let Some(test) = branch_truthiness(&expression.test, self.env) {
-                            if (in_consequent && !test) || (in_alternate && test) {
-                                self.excluded = true;
-                                return;
-                            }
-                        }
-                    }
-                    walk::walk_conditional_expression(self, expression);
-                }
-
-                fn visit_logical_expression(
-                    &mut self,
-                    expression: &oxc_ast::ast::LogicalExpression<'a>,
-                ) {
-                    if self.excluded {
-                        return;
-                    }
-                    if Self::contains(expression.right.span(), self.event) {
-                        if let Some(lhs) = branch_truthiness(&expression.left, self.env) {
-                            let skips_right = match expression.operator.as_str() {
-                                "&&" => !lhs,
-                                "||" => lhs,
-                                _ => false,
-                            };
-                            if skips_right {
-                                self.excluded = true;
-                                return;
-                            }
-                        }
-                    }
-                    walk::walk_logical_expression(self, expression);
-                }
-
-                fn visit_while_statement(&mut self, statement: &oxc_ast::ast::WhileStatement<'a>) {
-                    if self.excluded {
-                        return;
-                    }
-                    if Self::contains(statement.body.span(), self.event)
-                        && branch_truthiness(&statement.test, self.env) == Some(false)
-                    {
-                        self.excluded = true;
-                        return;
-                    }
-                    walk::walk_while_statement(self, statement);
-                }
-
-                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-                fn visit_arrow_function_expression(
-                    &mut self,
-                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                ) {
-                }
-            }
-
-            let mut probe = BranchProbe {
+            let mut probe = StructuredBranchExclusionProbe {
                 env: &env,
                 event: self.event,
                 excluded: false,
@@ -1825,6 +1819,107 @@ pub fn prove_function_structured_branch_event_unreachable_with_integer_parameter
     };
     harness.visit_program(program);
     harness.result.unwrap_or(false)
+}
+
+struct StructuredSwitchExclusionProbe<'e> {
+    env: &'e HashMap<String, Scalar>,
+    event: Span,
+    proofs: Vec<bool>,
+}
+impl<'a> Visit<'a> for StructuredSwitchExclusionProbe<'_> {
+    fn visit_switch_statement(&mut self, switch: &SwitchStatement<'a>) {
+        if !(switch.span.start <= self.event.start && self.event.end <= switch.span.end) {
+            walk::walk_switch_statement(self, switch);
+            return;
+        }
+        let target = switch.cases.iter().position(|case| {
+            case.span.start <= self.event.start && self.event.end <= case.span.end
+        });
+        let Some(target) = target else {
+            walk::walk_switch_statement(self, switch);
+            return;
+        };
+        let Some(discriminant) = eval_expr(&switch.discriminant, self.env) else {
+            self.proofs.push(false);
+            return;
+        };
+
+        // A target case whose own label is definitely unequal to the
+        // already-evaluated discriminant cannot be selected directly.
+        // It can then only be reached by fallthrough from an earlier
+        // selected/default case. If every earlier case unconditionally
+        // terminates, opaque earlier case labels are irrelevant: match,
+        // non-match, or throw all prevent the target consequent.
+        let target_case = &switch.cases[target];
+        let event_in_target_consequent = target_case.consequent.iter().any(|statement| {
+            statement.span().start <= self.event.start && self.event.end <= statement.span().end
+        });
+        let target_mismatches = target_case.test.as_ref().is_some_and(|test| {
+            eval_expr(test, self.env).is_some_and(|value| value != discriminant)
+                || match (
+                    boolean_result_on_normal_completion(&switch.discriminant, self.env),
+                    boolean_result_on_normal_completion(test, self.env),
+                ) {
+                    (Some(left), Some(right)) => left != right,
+                    _ => false,
+                }
+        });
+        let prior_cases_terminate = switch.cases[..target].iter().all(|case| {
+            case.consequent.last().is_some_and(|statement| {
+                matches!(
+                    statement,
+                    Statement::BreakStatement(_)
+                        | Statement::ReturnStatement(_)
+                        | Statement::ThrowStatement(_)
+                )
+            })
+        });
+        if event_in_target_consequent && target_mismatches && prior_cases_terminate {
+            self.proofs.push(true);
+            return;
+        }
+
+        let mut default = None;
+        let mut selected = None;
+        for (index, case) in switch.cases.iter().enumerate() {
+            let Some(test) = case.test.as_ref() else {
+                default = Some(index);
+                continue;
+            };
+            let Some(value) = eval_expr(test, self.env) else {
+                self.proofs.push(false);
+                return;
+            };
+            if value == discriminant {
+                selected = Some(index);
+                break;
+            }
+        }
+        let selected = selected.or(default);
+        let proof = match selected {
+            None => true,
+            Some(selected) if selected > target => true,
+            Some(selected) if selected == target => false,
+            Some(selected) => switch.cases[selected]
+                .consequent
+                .last()
+                .is_some_and(|statement| {
+                    matches!(
+                        statement,
+                        Statement::BreakStatement(_)
+                            | Statement::ReturnStatement(_)
+                            | Statement::ThrowStatement(_)
+                    )
+                }),
+        };
+        self.proofs.push(proof);
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
 }
 
 /// Prove that an event inside a structured `switch` cannot execute for exact
@@ -1872,112 +1967,7 @@ pub fn prove_function_switch_event_unreachable_with_integer_parameters(
                 return;
             };
 
-            struct SwitchProbe<'e> {
-                env: &'e HashMap<String, Scalar>,
-                event: Span,
-                proofs: Vec<bool>,
-            }
-            impl<'a> Visit<'a> for SwitchProbe<'_> {
-                fn visit_switch_statement(&mut self, switch: &SwitchStatement<'a>) {
-                    if !(switch.span.start <= self.event.start && self.event.end <= switch.span.end)
-                    {
-                        walk::walk_switch_statement(self, switch);
-                        return;
-                    }
-                    let target = switch.cases.iter().position(|case| {
-                        case.span.start <= self.event.start && self.event.end <= case.span.end
-                    });
-                    let Some(target) = target else {
-                        walk::walk_switch_statement(self, switch);
-                        return;
-                    };
-                    let Some(discriminant) = eval_expr(&switch.discriminant, self.env) else {
-                        self.proofs.push(false);
-                        return;
-                    };
-
-                    // A target case whose own label is definitely unequal to the
-                    // already-evaluated discriminant cannot be selected directly.
-                    // It can then only be reached by fallthrough from an earlier
-                    // selected/default case. If every earlier case unconditionally
-                    // terminates, opaque earlier case labels are irrelevant: match,
-                    // non-match, or throw all prevent the target consequent.
-                    let target_case = &switch.cases[target];
-                    let event_in_target_consequent =
-                        target_case.consequent.iter().any(|statement| {
-                            statement.span().start <= self.event.start
-                                && self.event.end <= statement.span().end
-                        });
-                    let target_mismatches = target_case.test.as_ref().is_some_and(|test| {
-                        eval_expr(test, self.env).is_some_and(|value| value != discriminant)
-                            || match (
-                                boolean_result_on_normal_completion(&switch.discriminant, self.env),
-                                boolean_result_on_normal_completion(test, self.env),
-                            ) {
-                                (Some(left), Some(right)) => left != right,
-                                _ => false,
-                            }
-                    });
-                    let prior_cases_terminate = switch.cases[..target].iter().all(|case| {
-                        case.consequent.last().is_some_and(|statement| {
-                            matches!(
-                                statement,
-                                Statement::BreakStatement(_)
-                                    | Statement::ReturnStatement(_)
-                                    | Statement::ThrowStatement(_)
-                            )
-                        })
-                    });
-                    if event_in_target_consequent && target_mismatches && prior_cases_terminate {
-                        self.proofs.push(true);
-                        return;
-                    }
-
-                    let mut default = None;
-                    let mut selected = None;
-                    for (index, case) in switch.cases.iter().enumerate() {
-                        let Some(test) = case.test.as_ref() else {
-                            default = Some(index);
-                            continue;
-                        };
-                        let Some(value) = eval_expr(test, self.env) else {
-                            self.proofs.push(false);
-                            return;
-                        };
-                        if value == discriminant {
-                            selected = Some(index);
-                            break;
-                        }
-                    }
-                    let selected = selected.or(default);
-                    let proof = match selected {
-                        None => true,
-                        Some(selected) if selected > target => true,
-                        Some(selected) if selected == target => false,
-                        Some(selected) => {
-                            switch.cases[selected]
-                                .consequent
-                                .last()
-                                .is_some_and(|statement| {
-                                    matches!(
-                                        statement,
-                                        Statement::BreakStatement(_)
-                                            | Statement::ReturnStatement(_)
-                                            | Statement::ThrowStatement(_)
-                                    )
-                                })
-                        }
-                    };
-                    self.proofs.push(proof);
-                }
-                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-                fn visit_arrow_function_expression(
-                    &mut self,
-                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                ) {
-                }
-            }
-            let mut probe = SwitchProbe {
+            let mut probe = StructuredSwitchExclusionProbe {
                 env: &env,
                 event: self.event,
                 proofs: Vec::new(),
@@ -2031,6 +2021,47 @@ pub fn prove_function_if_ladder_states_before_event_with_integer_parameters(
             facts,
             Some(required_states),
         )
+}
+
+#[derive(Default)]
+struct ScalarControlSafetyProbe<'n> {
+    state_var: &'n str,
+    dynamic_scope: bool,
+    arguments_object: bool,
+    nested_state_reference: bool,
+    nested_depth: usize,
+}
+impl<'a> Visit<'a> for ScalarControlSafetyProbe<'_> {
+    fn visit_with_statement(&mut self, _statement: &oxc_ast::ast::WithStatement<'a>) {
+        self.dynamic_scope = true;
+    }
+    fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
+        if matches!(&call.callee, Expression::Identifier(id) if id.name.as_str() == "eval") {
+            self.dynamic_scope = true;
+        }
+        walk::walk_call_expression(self, call);
+    }
+    fn visit_identifier_reference(&mut self, identifier: &oxc_ast::ast::IdentifierReference<'a>) {
+        if identifier.name.as_str() == "arguments" && self.nested_depth == 0 {
+            self.arguments_object = true;
+        }
+        if identifier.name.as_str() == self.state_var && self.nested_depth > 0 {
+            self.nested_state_reference = true;
+        }
+    }
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        self.nested_depth += 1;
+        walk::walk_function(self, function, flags);
+        self.nested_depth -= 1;
+    }
+    fn visit_arrow_function_expression(
+        &mut self,
+        function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+        self.nested_depth += 1;
+        walk::walk_arrow_function_expression(self, function);
+        self.nested_depth -= 1;
+    }
 }
 
 fn prove_function_if_ladder_goal_with_integer_parameters(
@@ -2091,50 +2122,6 @@ fn prove_function_if_ladder_goal_with_integer_parameters(
                 bindings.insert(identifier.name.to_string(), *value);
             }
 
-            #[derive(Default)]
-            struct ScalarControlSafetyProbe<'n> {
-                state_var: &'n str,
-                dynamic_scope: bool,
-                arguments_object: bool,
-                nested_state_reference: bool,
-                nested_depth: usize,
-            }
-            impl<'a> Visit<'a> for ScalarControlSafetyProbe<'_> {
-                fn visit_with_statement(&mut self, _statement: &oxc_ast::ast::WithStatement<'a>) {
-                    self.dynamic_scope = true;
-                }
-                fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
-                    if matches!(&call.callee, Expression::Identifier(id) if id.name.as_str() == "eval")
-                    {
-                        self.dynamic_scope = true;
-                    }
-                    walk::walk_call_expression(self, call);
-                }
-                fn visit_identifier_reference(
-                    &mut self,
-                    identifier: &oxc_ast::ast::IdentifierReference<'a>,
-                ) {
-                    if identifier.name.as_str() == "arguments" && self.nested_depth == 0 {
-                        self.arguments_object = true;
-                    }
-                    if identifier.name.as_str() == self.state_var && self.nested_depth > 0 {
-                        self.nested_state_reference = true;
-                    }
-                }
-                fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-                    self.nested_depth += 1;
-                    walk::walk_function(self, function, flags);
-                    self.nested_depth -= 1;
-                }
-                fn visit_arrow_function_expression(
-                    &mut self,
-                    function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                ) {
-                    self.nested_depth += 1;
-                    walk::walk_arrow_function_expression(self, function);
-                    self.nested_depth -= 1;
-                }
-            }
             // Unknown calls may mutate arbitrary objects or throw, but they
             // cannot rewrite these lexical scalar controls unless the function
             // itself opens one of the dynamic/aliasing routes below.
@@ -6273,6 +6260,27 @@ mod tests {
         Ok(())
     }
 
+    struct IfLadderMachineFinder<'m> {
+        source: &'m str,
+        machine: Option<IfLadderStateMachineCandidate>,
+    }
+    impl<'a> Visit<'a> for IfLadderMachineFinder<'_> {
+        fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+            for pair in body.statements.windows(2) {
+                let [init, Statement::WhileStatement(statement)] = pair else {
+                    continue;
+                };
+                if let Some(machine) =
+                    detect_while_state_machine(self.source, "test", init, statement)
+                {
+                    self.machine = Some(machine);
+                    return;
+                }
+            }
+            walk::walk_function_body(self, body);
+        }
+    }
+
     #[test]
     fn proves_order_from_pre_detected_while_machine() -> TestResult {
         let source = r"
@@ -6288,27 +6296,7 @@ mod tests {
         ";
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
-        struct Finder<'m> {
-            source: &'m str,
-            machine: Option<IfLadderStateMachineCandidate>,
-        }
-        impl<'a> Visit<'a> for Finder<'_> {
-            fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
-                for pair in body.statements.windows(2) {
-                    let [init, Statement::WhileStatement(statement)] = pair else {
-                        continue;
-                    };
-                    if let Some(machine) =
-                        detect_while_state_machine(self.source, "test", init, statement)
-                    {
-                        self.machine = Some(machine);
-                        return;
-                    }
-                }
-                walk::walk_function_body(self, body);
-            }
-        }
-        let mut finder = Finder {
+        let mut finder = IfLadderMachineFinder {
             source,
             machine: None,
         };
