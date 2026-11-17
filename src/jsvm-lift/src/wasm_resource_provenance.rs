@@ -380,7 +380,7 @@ impl<'r> ResponseEvidenceIndex<'r> {
         row: &Map<String, Value>,
         session: &str,
         url: &str,
-        resolved: ResolvedResponse,
+        resolved: &ResolvedResponse,
         runtime_scripts: &HashMap<(String, String), Value>,
     ) -> Value {
         let initiator = row.get("initiator").and_then(Value::as_object);
@@ -459,7 +459,7 @@ impl<'r> ResponseEvidenceIndex<'r> {
                     row,
                     &session,
                     url,
-                    resolved,
+                    &resolved,
                     runtime_scripts,
                 )),
                 Err(reason) => results.unmatched.push(json!({
@@ -703,7 +703,7 @@ mod tests {
         assert_eq!(fallback.byte_len, json!(8));
         assert_eq!(fallback.digest, "same");
 
-        let short_requests = vec![request.clone()];
+        let short_requests = vec![request];
         let index = ResponseEvidenceIndex::build(&resources, &short_requests, &budget)?;
         assert_eq!(
             index.resolve(URL, None).err(),
