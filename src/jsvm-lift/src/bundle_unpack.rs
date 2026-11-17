@@ -259,12 +259,48 @@ impl<'a> Visit<'a> for ExportCollector<'_> {
     }
 }
 
+/// Distinct AMD loader assignments observed on the same local receiver.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum AmdLoaderMember {
+    Define = 0b0001,
+    Require = 0b0010,
+    RequireJs = 0b0100,
+    LoadModules = 0b1000,
+}
+
+impl AmdLoaderMember {
+    fn from_property(property: &str) -> Option<Self> {
+        match property {
+            "define" => Some(Self::Define),
+            "require" => Some(Self::Require),
+            "requirejs" => Some(Self::RequireJs),
+            "loadModules" => Some(Self::LoadModules),
+            _ => None,
+        }
+    }
+}
+
+/// Accumulate observations without allocating an independent set per loader.
 #[derive(Default)]
-struct AmdLoaderEvidence {
-    define_assignment: bool,
-    require_assignment: bool,
-    requirejs_assignment: bool,
-    load_modules_assignment: bool,
+struct AmdLoaderEvidence(u8);
+
+impl AmdLoaderEvidence {
+    const fn observe(&mut self, member: AmdLoaderMember) {
+        self.0 |= member as u8;
+    }
+
+    const fn contains(&self, member: AmdLoaderMember) -> bool {
+        self.0 & member as u8 != 0
+    }
+
+    const fn supports_named_modules(&self, module_count: usize) -> bool {
+        let multiple_modules = module_count >= 2;
+        self.contains(AmdLoaderMember::Define)
+            && ((self.contains(AmdLoaderMember::Require)
+                && (self.contains(AmdLoaderMember::RequireJs) || multiple_modules))
+                || (self.contains(AmdLoaderMember::LoadModules) && multiple_modules))
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -627,12 +663,8 @@ impl Collector<'_, '_> {
             return;
         };
         let evidence = self.amd_loader_evidence.entry(symbol).or_default();
-        match property.as_str() {
-            "define" => evidence.define_assignment = true,
-            "require" => evidence.require_assignment = true,
-            "requirejs" => evidence.requirejs_assignment = true,
-            "loadModules" => evidence.load_modules_assignment = true,
-            _ => {}
+        if let Some(member) = AmdLoaderMember::from_property(&property) {
+            evidence.observe(member);
         }
     }
 
@@ -1630,11 +1662,7 @@ pub fn analyze_bundle_source(
                         .amd_loader_evidence
                         .get(&symbol)
                         .is_some_and(|evidence| {
-                            evidence.define_assignment
-                                && ((evidence.require_assignment
-                                    && (evidence.requirejs_assignment || group.modules.len() >= 2))
-                                    || (evidence.load_modules_assignment
-                                        && group.modules.len() >= 2))
+                            evidence.supports_named_modules(group.modules.len())
                         }),
                 };
                 proven.then_some(group)
@@ -1694,6 +1722,44 @@ pub fn analyze_bundle_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amd_loader_evidence_preserves_assignment_combinations() {
+        use AmdLoaderMember::{Define, LoadModules, Require, RequireJs};
+
+        let mut evidence = AmdLoaderEvidence::default();
+        assert!(!evidence.supports_named_modules(3));
+        evidence.observe(Define);
+        assert!(!evidence.supports_named_modules(3));
+        evidence.observe(Require);
+        assert!(!evidence.supports_named_modules(1));
+        assert!(evidence.supports_named_modules(2));
+        evidence.observe(RequireJs);
+        assert!(evidence.supports_named_modules(1));
+
+        let mut modules_loader = AmdLoaderEvidence::default();
+        modules_loader.observe(Define);
+        modules_loader.observe(LoadModules);
+        assert!(!modules_loader.supports_named_modules(1));
+        assert!(modules_loader.supports_named_modules(2));
+
+        let mut missing_define = AmdLoaderEvidence::default();
+        missing_define.observe(Require);
+        missing_define.observe(RequireJs);
+        missing_define.observe(LoadModules);
+        assert!(!missing_define.supports_named_modules(2));
+
+        for member in [Define, Require, RequireJs, LoadModules] {
+            assert!(AmdLoaderMember::from_property(match member {
+                Define => "define",
+                Require => "require",
+                RequireJs => "requirejs",
+                LoadModules => "loadModules",
+            })
+            .is_some());
+        }
+        assert!(AmdLoaderMember::from_property("unrelated").is_none());
+    }
 
     #[test]
     fn webpack_bootstrap_requires_proven_local_loader_assignment() -> Result<(), BudgetExceeded> {
