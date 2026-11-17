@@ -527,6 +527,11 @@ Names come from readable source and statically resolved captured ESM exports. Th
 
 /// Make downstream imports use descriptive component names in the readable
 /// view only. The existing module resolution artifact is authoritative.
+///
+/// # Errors
+///
+/// Fails if existing project artifacts cannot be loaded, an indexed readable module cannot be
+/// read, or renamed output and related artifacts cannot be persisted.
 pub fn propagate_imported_names(project: &Path) -> Result<usize> {
     let Some(refs) = load_artifact(project, JS_REFERENCES, true)? else {
         return Ok(0);

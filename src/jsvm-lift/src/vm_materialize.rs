@@ -613,6 +613,12 @@ fn materialize_table_vms(
     Ok(units)
 }
 
+/// Materialize verified VM interpretations from the project analysis index.
+///
+/// # Errors
+///
+/// Fails on malformed or unreadable index and source artifacts, insufficient analysis budget,
+/// or errors creating, serializing or writing materialized VM views.
 pub fn materialize_project(
     project: &Path,
     budgets: &AnalysisBudgets,

@@ -225,6 +225,11 @@ fn handler_free_references(source: &str) -> Result<BTreeSet<String>> {
 /// The entrypoint matches by unique name because a standalone extracted
 /// function no longer carries its old lexical IDs. After that initial join,
 /// traversal stays inside the original semantic symbol graph.
+///
+/// # Errors
+///
+/// Rejects invalid original JavaScript and propagates contextual handler/source-validation
+/// failures; missing or ambiguous joins are handled without inventing source identities.
 pub fn reconstruct_context(
     original: &str,
     handler_sources: &[(String, String)],
@@ -499,6 +504,11 @@ impl<'a> Visit<'a> for HandlerCallAnnotator<'_> {
 ///
 /// The context extractor supplies the unique original-name join, while this
 /// handler's own Oxc scoping checks the actual reference at each call.
+///
+/// # Errors
+///
+/// Propagates invalid readable-handler JavaScript, failures collecting literal call constants,
+/// and invalid UTF-8 insertion spans from the specialization-aware annotator.
 pub fn annotate_handler_helper_calls(
     source: &str,
     context: &ContextSourceTree,
@@ -507,6 +517,13 @@ pub fn annotate_handler_helper_calls(
     annotate_handler_helper_calls_with_specializations(source, context, handler, &[])
 }
 
+/// Annotate source-resolved helper calls, optionally linking specialized helpers.
+///
+/// # Errors
+///
+/// Fails on malformed readable-handler JavaScript, invalid call-constant extraction or a
+/// non-UTF-8-aligned original insertion span. Unsupported or ambiguous helper joins return no
+/// annotation.
 pub fn annotate_handler_helper_calls_with_specializations(
     source: &str,
     context: &ContextSourceTree,

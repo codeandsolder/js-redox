@@ -1385,6 +1385,12 @@ fn matching_usages(document: &Value, import_module: &str, import_name: &str) -> 
         .collect()
 }
 
+/// Correlate recovered WebAssembly module identities with JavaScript boundary usage.
+///
+/// # Errors
+///
+/// Fails when required WebAssembly/deobfuscation artifacts are unavailable or malformed, when
+/// generated reports cannot be persisted, or when the analysis budget is exhausted.
 pub fn correlate_project(
     project: &Path,
     budgets: &AnalysisBudgets,

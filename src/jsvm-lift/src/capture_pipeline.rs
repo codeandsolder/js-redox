@@ -57,6 +57,11 @@ pub struct CapturePipelineSummary {
 ///
 /// Pipeline ordering lives here rather than in the CLI so tests and other callers
 /// exercise the same supported workflow without spawning sibling Rust binaries.
+///
+/// # Errors
+///
+/// Rejects bundle materialization without safe deobfuscation. Also propagates capture import,
+/// project artifact read/write, subordinate analysis and resource-budget failures.
 pub fn recover_capture_project(options: &CapturePipelineOptions) -> Result<CapturePipelineSummary> {
     ensure!(
         !options.bundle_materialization || options.safe_deobfuscation,

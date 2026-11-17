@@ -209,6 +209,12 @@ fn add_observed_callable_definition(
     Ok(())
 }
 
+/// Build the project source/provenance graph from indexed capture evidence.
+///
+/// # Errors
+///
+/// Fails when the project path cannot be resolved, its manifest or linked artifacts cannot be
+/// read or persisted, or the graph traversal exhausts its analysis budget.
 pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<SourceGraphSummary> {
     let budget = budgets.operation(
         AnalysisOperation::SourceGraph,

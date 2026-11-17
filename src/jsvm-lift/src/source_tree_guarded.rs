@@ -271,6 +271,13 @@ struct ProvenFastPath {
     body: String,
 }
 
+/// Install only proof-checked guarded specializations in source code.
+///
+/// # Errors
+///
+/// Rejects invalid original JavaScript or lexical semantics and generated output that fails
+/// parsing or verification; unsupported specializations return no result instead of a
+/// fabricated proof.
 pub fn install_guarded_specializations(
     original: &str,
     variants: &[GuardedVariant],

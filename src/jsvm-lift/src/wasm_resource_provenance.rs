@@ -203,6 +203,12 @@ fn observation_key(row: &Value) -> (String, String, String, String) {
     )
 }
 
+/// Correlate captured runtime WebAssembly resources with module provenance.
+///
+/// # Errors
+///
+/// Fails on invalid project path or capture manifest, failed artifact loading/persistence, or
+/// exhaustion of the runtime analysis budget.
 pub fn correlate_wasm_resource_provenance(
     project: &Path,
     budgets: &AnalysisBudgets,

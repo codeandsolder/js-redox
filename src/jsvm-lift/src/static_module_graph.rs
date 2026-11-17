@@ -233,6 +233,12 @@ fn match_root(
 /// Dynamic imports are retained as candidate edges but not followed.
 /// Missing modules are explicit, and same-URL different capture responses
 /// remain distinct alternatives. All source bytes are rehashed on use.
+///
+/// # Errors
+///
+/// Fails if the source index or reference inventory lacks its required arrays, or if the work
+/// budget is exhausted. Source decoding and linking failures from delegated helpers also
+/// propagate.
 pub fn link_static_modules(
     project: &Path,
     documents: &[DocumentEntrypoints],

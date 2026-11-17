@@ -417,6 +417,12 @@ fn source_code(
     Some((text, "har_resource", resource_id(linked)))
 }
 
+/// Compose two parsed source maps at the specified downstream source ordinal.
+///
+/// # Errors
+///
+/// Fails if either input is not a valid source map or the work budget is exhausted during
+/// parsing or composition.
 pub fn compose_sourcemap_json(
     downstream_json: &str,
     upstream_json: &str,
@@ -627,6 +633,13 @@ fn recovered_count(rows: &[Value]) -> usize {
         .count()
 }
 
+/// Recover and compose chained source maps for the capture project.
+///
+/// # Errors
+///
+/// Fails when the project cannot be resolved, its manifest/maps cannot be read or parsed,
+/// source-map composition or serialization fails, output files cannot be written, or the
+/// analysis budget is exhausted.
 pub fn recover_project_sourcemaps(
     project: &Path,
     budgets: &AnalysisBudgets,

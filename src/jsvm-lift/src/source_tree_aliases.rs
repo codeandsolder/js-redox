@@ -253,6 +253,11 @@ fn comment_text(alias: &PropertyAlias) -> String {
 
 /// Annotate only references resolved to the *same original AST `SymbolId`*.
 /// Shadowed aliases and unrelated names are never joined by spelling.
+///
+/// # Errors
+///
+/// Rejects source text that cannot be parsed as valid JavaScript; unsupported but valid alias
+/// patterns return no proof instead.
 pub fn explain_property_aliases(source: &str) -> Result<Option<AnnotatedAliases>> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::unambiguous());
@@ -495,6 +500,12 @@ impl<'a> Visit<'a> for CapturedReads<'_> {
 /// checked in the raw source AST. A same-named reference is annotated in a
 /// transformed handler only if it remains unresolved *and* the original
 /// capture had one uniquely resolved lexical symbol for that property name.
+///
+/// # Errors
+///
+/// Rejects invalid original or transformed JavaScript and inconsistent
+/// original-function/source-span evidence. Unmatched or ambiguous origins are not promoted to
+/// proofs.
 pub fn explain_captured_handler_origins(
     raw_original: &str,
     handlers: &[(String, String)],

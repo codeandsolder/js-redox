@@ -101,6 +101,11 @@ impl<'a> Visit<'a> for Calls<'_> {
     }
 }
 
+/// Collect literal-argument calls from a valid handler source.
+///
+/// # Errors
+///
+/// Rejects source that cannot be parsed cleanly as JavaScript.
 pub fn literal_calls(source: &str) -> Result<Vec<LiteralCall>> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::unambiguous());
@@ -514,6 +519,11 @@ struct CallContext {
 /// attached to at least one real resolved incoming callsite.
 ///
 /// This is a path-specific source-reading view, not an executable replacement.
+///
+/// # Errors
+///
+/// Rejects invalid original JavaScript; failures in source transformation or verification
+/// propagate rather than yielding unsupported specialized code.
 pub fn specialize_resolved_call_graph(
     original: &str,
     views: &[CallerView],
@@ -814,6 +824,11 @@ impl<'a> Visit<'a> for ParameterReferences<'_> {
 /// Leaves the parameter list, function name, and external closures unchanged.
 /// Rejects dynamic scope and any write or arguments alias to the substituted
 /// parameters.
+///
+/// # Errors
+///
+/// Rejects malformed helper JavaScript. Valid but unsafe or unprovable substitutions return
+/// `Ok(None)` instead of an error.
 pub fn specialize_function(source: &str, constants: &[(usize, String)]) -> Result<Option<String>> {
     let allocator = Allocator::default();
     let parsed = parse_program(&allocator, source, SourceType::unambiguous());
@@ -881,6 +896,11 @@ pub struct Specialization {
 
 /// Group same-constant callsites into one specialized helper body each.
 /// Their exact arguments are included in the ID; no arbitrary case cap.
+///
+/// # Errors
+///
+/// Propagates parsing failures from handler call-site extraction and source-validation
+/// failures from helper specialization.
 pub fn specialize_calls(
     handlers: &[(String, String)],
     helpers: &BTreeMap<String, String>,

@@ -383,6 +383,11 @@ fn bytes_to_utf16(text: &str, offset: u32) -> Result<usize> {
 ///
 /// The producer refuses incomplete "all sites" captures instead of silently
 /// skipping unsupported cases.
+///
+/// # Errors
+///
+/// Fails when the original executable cannot be read or decoded as UTF-8, when AST/source
+/// slices or byte-to-UTF-16 offsets are invalid, or when direct-eval site parsing fails.
 pub fn discover_direct_eval_sites(original_path: &Path) -> Result<serde_json::Value> {
     let bytes = fs::read(original_path)?;
     let code = String::from_utf8(bytes.clone())?;
@@ -631,6 +636,12 @@ struct BundleCapture {
 
 /// Expand one already exported multi-site run into independently validated
 /// per-site captures. No fabricated loader or cross-site source attribution.
+///
+/// # Errors
+///
+/// Rejects unsupported bundle schema, invalid or mismatched SHA-256 identities, inconsistent
+/// capture-site records and unsafe paths; also propagates bundle file I/O and JSON decoding
+/// errors.
 pub fn expand_observed_direct_bundle(
     bundle_root: &Path,
     executable: &Path,
@@ -1090,6 +1101,12 @@ fn prepare_capture(output: &Path, input: &ObservedEvalInput) -> Result<PreparedC
 }
 
 /// Attach verified observed source evidence without running sample JavaScript.
+///
+/// # Errors
+///
+/// Rejects a missing output project, an already existing runtime-observed subtree or duplicate
+/// capture identities. Propagates capture integrity checks, filesystem staging, and
+/// evidence/report serialization errors.
 pub fn attach_observed_eval_sources(output: &Path, inputs: &[ObservedEvalInput]) -> Result<()> {
     if inputs.is_empty() {
         return Ok(());

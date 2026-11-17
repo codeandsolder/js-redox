@@ -487,6 +487,12 @@ fn set_resolution_fields(target: &mut Map<String, Value>, source: &Value) {
     }
 }
 
+/// Scan project JavaScript references under the recorded capture/module context.
+///
+/// # Errors
+///
+/// Fails on exhausted analysis budget, missing or invalid manifest/source-index artifacts,
+/// unreadable source files, or errors writing the reference inventory.
 pub fn scan_project_references(
     project: &Path,
     jobs: Option<usize>,
