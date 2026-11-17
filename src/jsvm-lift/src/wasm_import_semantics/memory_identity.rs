@@ -1003,32 +1003,40 @@ fn statements_flow(
 #[cfg(test)]
 mod flow_tests {
     use super::{statements_flow, ExitFlow, WriteStates};
+    use crate::test_support::{TestFailure, TestResult, TestValue};
     use oxc_allocator::Allocator;
     use oxc_ast::ast::Statement;
     use oxc_span::{SourceType, Span};
     use rolldown_redox::ecmascript::parse_program;
 
-    fn exit_flow(source: &str) -> Option<ExitFlow> {
+    fn exit_flow(source: &str) -> Result<Option<ExitFlow>, TestFailure> {
+        const WRITE: &str = "target = value";
         let allocator = Allocator::default();
         let fixture = format!("function sample() {{ {source} }}");
         let parsed = parse_program(&allocator, &fixture, SourceType::cjs());
         assert!(parsed.is_clean(), "invalid fixture: {source}");
-        let [Statement::FunctionDeclaration(function)] = parsed.program.body.as_slice() else {
-            panic!("missing fixture function");
-        };
-        let Some(body) = function.body.as_ref() else {
-            panic!("missing fixture body");
-        };
-        let offset = fixture
-            .find("target = value")
-            .expect("assignment in fixture");
-        let start = u32::try_from(offset).expect("small test fixture");
-        let end = start + 14;
-        statements_flow(&body.statements, false, Span::new(start, end))
+        let function = parsed
+            .program
+            .body
+            .first()
+            .and_then(|statement| match statement {
+                Statement::FunctionDeclaration(function) => Some(function),
+                _ => None,
+            })
+            .test_value("fixture function")?;
+        let body = function.body.as_ref().test_value("fixture function body")?;
+        let offset = fixture.find(WRITE).test_value("fixture assignment span")?;
+        let start = u32::try_from(offset).test_value("fixture assignment offset")?;
+        let length = u32::try_from(WRITE.len()).test_value("fixture assignment length")?;
+        Ok(statements_flow(
+            &body.statements,
+            false,
+            Span::new(start, start + length),
+        ))
     }
 
     #[test]
-    fn combines_assigned_and_unassigned_paths_without_treating_them_as_proven() {
+    fn combines_assigned_and_unassigned_paths_without_treating_them_as_proven() -> TestResult {
         let cases = [
             (
                 "target = value;",
@@ -1074,16 +1082,18 @@ mod flow_tests {
             ),
         ];
         for (source, normal, returned, proven) in cases {
-            let flow = exit_flow(source).expect("simple statement flow should be representable");
+            let flow = exit_flow(source)?.test_value("simple statement flow")?;
             assert_eq!(flow.normal, normal, "{source}");
             assert_eq!(flow.returned, returned, "{source}");
             assert_eq!(flow.write_dominates_normal_exit(), proven, "{source}");
         }
+        Ok(())
     }
 
     #[test]
-    fn rejects_ambiguous_write_inside_branch_test() {
-        assert!(exit_flow("if (target = value) { return; }").is_none());
+    fn rejects_ambiguous_write_inside_branch_test() -> TestResult {
+        assert!(exit_flow("if (target = value) { return; }")?.is_none());
+        Ok(())
     }
 
     #[test]
