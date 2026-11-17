@@ -2064,6 +2064,147 @@ impl<'a> Visit<'a> for ScalarControlSafetyProbe<'_> {
     }
 }
 
+struct BoundStateVariableCollector<'s> {
+    source: &'s str,
+    event: Span,
+    vars: Vec<String>,
+}
+impl BoundStateVariableCollector<'_> {
+    fn scan_statement_list(&mut self, statements: &[Statement<'_>]) {
+        for pair in statements.windows(2) {
+            let [init, Statement::WhileStatement(while_statement)] = pair else {
+                continue;
+            };
+            let Some(machine) =
+                detect_while_state_machine(self.source, "bound-call", init, while_statement)
+            else {
+                continue;
+            };
+            if machine.start <= self.event.start && self.event.end <= machine.end {
+                self.vars.push(machine.state_var);
+            }
+        }
+    }
+}
+impl<'a> Visit<'a> for BoundStateVariableCollector<'_> {
+    fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+        self.scan_statement_list(&body.statements);
+        walk::walk_function_body(self, body);
+    }
+    fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+        self.scan_statement_list(&block.body);
+        walk::walk_block_statement(self, block);
+    }
+    fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+        let detected = detect_for_state_machines(self.source, "bound-call", statement);
+        self.vars.extend(
+            detected
+                .if_ladder_machines
+                .into_iter()
+                .filter(|machine| {
+                    machine.start <= self.event.start && self.event.end <= machine.end
+                })
+                .map(|machine| machine.state_var),
+        );
+        walk::walk_for_statement(self, statement);
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+struct BoundStateMachineCollector<'s, 'b, 'r> {
+    source: &'s str,
+    event: Span,
+    bindings: &'b BTreeMap<String, i64>,
+    required_states: Option<&'r [u64]>,
+    matches: usize,
+    result: bool,
+}
+impl BoundStateMachineCollector<'_, '_, '_> {
+    fn scan_statement_list(&mut self, statements: &[Statement<'_>]) {
+        for pair in statements.windows(2) {
+            let [init, Statement::WhileStatement(while_statement)] = pair else {
+                continue;
+            };
+            let Some(machine) =
+                detect_while_state_machine(self.source, "bound-call", init, while_statement)
+            else {
+                continue;
+            };
+            if machine.start <= self.event.start && self.event.end <= machine.end {
+                self.matches += 1;
+                self.result = self.required_states.map_or_else(
+                    || {
+                        prove_machine_event_unreachable_with_integer_bindings(
+                            &machine,
+                            &while_statement.body,
+                            self.event,
+                            self.bindings,
+                        )
+                    },
+                    |required_states| {
+                        prove_machine_states_before_event_with_integer_bindings(
+                            &machine,
+                            &while_statement.body,
+                            required_states,
+                            self.event,
+                            self.bindings,
+                        )
+                    },
+                );
+            }
+        }
+    }
+}
+impl<'a> Visit<'a> for BoundStateMachineCollector<'_, '_, '_> {
+    fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+        self.scan_statement_list(&body.statements);
+        walk::walk_function_body(self, body);
+    }
+    fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+        self.scan_statement_list(&block.body);
+        walk::walk_block_statement(self, block);
+    }
+    fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+        let detected = detect_for_state_machines(self.source, "bound-call", statement);
+        for machine in detected.if_ladder_machines {
+            if machine.start <= self.event.start && self.event.end <= machine.end {
+                self.matches += 1;
+                self.result = self.required_states.map_or_else(
+                    || {
+                        prove_machine_event_unreachable_with_integer_bindings(
+                            &machine,
+                            &statement.body,
+                            self.event,
+                            self.bindings,
+                        )
+                    },
+                    |required_states| {
+                        prove_machine_states_before_event_with_integer_bindings(
+                            &machine,
+                            &statement.body,
+                            required_states,
+                            self.event,
+                            self.bindings,
+                        )
+                    },
+                );
+            }
+        }
+        walk::walk_for_statement(self, statement);
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
 fn prove_function_if_ladder_goal_with_integer_parameters(
     source: &str,
     program: &Program<'_>,
@@ -2125,61 +2266,7 @@ fn prove_function_if_ladder_goal_with_integer_parameters(
             // Unknown calls may mutate arbitrary objects or throw, but they
             // cannot rewrite these lexical scalar controls unless the function
             // itself opens one of the dynamic/aliasing routes below.
-            struct StateVarCollector<'s> {
-                source: &'s str,
-                event: Span,
-                vars: Vec<String>,
-            }
-            impl StateVarCollector<'_> {
-                fn scan_statement_list(&mut self, statements: &[Statement<'_>]) {
-                    for pair in statements.windows(2) {
-                        let [init, Statement::WhileStatement(while_statement)] = pair else {
-                            continue;
-                        };
-                        let Some(machine) = detect_while_state_machine(
-                            self.source,
-                            "bound-call",
-                            init,
-                            while_statement,
-                        ) else {
-                            continue;
-                        };
-                        if machine.start <= self.event.start && self.event.end <= machine.end {
-                            self.vars.push(machine.state_var);
-                        }
-                    }
-                }
-            }
-            impl<'a> Visit<'a> for StateVarCollector<'_> {
-                fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
-                    self.scan_statement_list(&body.statements);
-                    walk::walk_function_body(self, body);
-                }
-                fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
-                    self.scan_statement_list(&block.body);
-                    walk::walk_block_statement(self, block);
-                }
-                fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
-                    let detected = detect_for_state_machines(self.source, "bound-call", statement);
-                    self.vars.extend(
-                        detected
-                            .if_ladder_machines
-                            .into_iter()
-                            .filter(|machine| {
-                                machine.start <= self.event.start && self.event.end <= machine.end
-                            })
-                            .map(|machine| machine.state_var),
-                    );
-                    walk::walk_for_statement(self, statement);
-                }
-                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-                fn visit_arrow_function_expression(
-                    &mut self,
-                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                ) {
-                }
-            }
-            let mut state_vars = StateVarCollector {
+            let mut state_vars = BoundStateVariableCollector {
                 source: self.source,
                 event: self.event,
                 vars: Vec::new(),
@@ -2200,98 +2287,7 @@ fn prove_function_if_ladder_goal_with_integer_parameters(
                 return;
             }
 
-            struct MachineCollector<'s, 'b, 'r> {
-                source: &'s str,
-                event: Span,
-                bindings: &'b BTreeMap<String, i64>,
-                required_states: Option<&'r [u64]>,
-                matches: usize,
-                result: bool,
-            }
-            impl MachineCollector<'_, '_, '_> {
-                fn scan_statement_list(&mut self, statements: &[Statement<'_>]) {
-                    for pair in statements.windows(2) {
-                        let [init, Statement::WhileStatement(while_statement)] = pair else {
-                            continue;
-                        };
-                        let Some(machine) = detect_while_state_machine(
-                            self.source,
-                            "bound-call",
-                            init,
-                            while_statement,
-                        ) else {
-                            continue;
-                        };
-                        if machine.start <= self.event.start && self.event.end <= machine.end {
-                            self.matches += 1;
-                            self.result = self.required_states.map_or_else(
-                                || {
-                                    prove_machine_event_unreachable_with_integer_bindings(
-                                        &machine,
-                                        &while_statement.body,
-                                        self.event,
-                                        self.bindings,
-                                    )
-                                },
-                                |required_states| {
-                                    prove_machine_states_before_event_with_integer_bindings(
-                                        &machine,
-                                        &while_statement.body,
-                                        required_states,
-                                        self.event,
-                                        self.bindings,
-                                    )
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-            impl<'a> Visit<'a> for MachineCollector<'_, '_, '_> {
-                fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
-                    self.scan_statement_list(&body.statements);
-                    walk::walk_function_body(self, body);
-                }
-                fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
-                    self.scan_statement_list(&block.body);
-                    walk::walk_block_statement(self, block);
-                }
-                fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
-                    let detected = detect_for_state_machines(self.source, "bound-call", statement);
-                    for machine in detected.if_ladder_machines {
-                        if machine.start <= self.event.start && self.event.end <= machine.end {
-                            self.matches += 1;
-                            self.result = self.required_states.map_or_else(
-                                || {
-                                    prove_machine_event_unreachable_with_integer_bindings(
-                                        &machine,
-                                        &statement.body,
-                                        self.event,
-                                        self.bindings,
-                                    )
-                                },
-                                |required_states| {
-                                    prove_machine_states_before_event_with_integer_bindings(
-                                        &machine,
-                                        &statement.body,
-                                        required_states,
-                                        self.event,
-                                        self.bindings,
-                                    )
-                                },
-                            );
-                        }
-                    }
-                    walk::walk_for_statement(self, statement);
-                }
-                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-                fn visit_arrow_function_expression(
-                    &mut self,
-                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                ) {
-                }
-            }
-            let mut collector = MachineCollector {
+            let mut collector = BoundStateMachineCollector {
                 source: self.source,
                 event: self.event,
                 bindings: &bindings,
