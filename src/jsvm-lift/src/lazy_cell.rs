@@ -501,6 +501,225 @@ struct FastLazyCellCandidate {
     updater_assignment: Span,
 }
 
+struct FastLazyCellCandidateCollector<'c, 'p> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    returned_symbol: SymbolId,
+    candidates: Vec<FastLazyCellCandidate>,
+}
+impl<'a> Visit<'a> for FastLazyCellCandidateCollector<'_, '_> {
+    fn visit_logical_expression(&mut self, logical: &oxc_ast::ast::LogicalExpression<'a>) {
+        if logical.operator.as_str() == "&&" {
+            if let Expression::SequenceExpression(sequence) = strip_parentheses(&logical.right) {
+                let mode_refs =
+                    direct_parameter_references(self.scoping, &logical.left, self.parameters);
+                let mode_refs = mode_refs.into_iter().collect::<Vec<_>>();
+                let [mode_parameter_index] = mode_refs.as_slice() else {
+                    walk::walk_logical_expression(self, logical);
+                    return;
+                };
+                let mode_parameter_index = *mode_parameter_index;
+                let mut cell = None;
+                let mut getter = None;
+                let mut updater = None;
+                let mut returned_cell_assignment = None;
+
+                for expression in &sequence.expressions {
+                    let Some(assignment) = assignment_expression(expression) else {
+                        continue;
+                    };
+                    if let Some(target) = assignment_symbol(self.scoping, &assignment.left) {
+                        if let Expression::CallExpression(call) =
+                            last_sequence_expression(&assignment.right)
+                        {
+                            if !call.optional && call.arguments.len() == 1 {
+                                let Some(argument) = call.arguments[0].as_expression() else {
+                                    continue;
+                                };
+                                let Some((state_parameter_index, prototype_field)) =
+                                    parameter_member(self.scoping, argument, self.parameters)
+                                else {
+                                    continue;
+                                };
+                                let Expression::ComputedMemberExpression(callee) =
+                                    last_sequence_expression(&call.callee)
+                                else {
+                                    continue;
+                                };
+                                if callee.optional {
+                                    continue;
+                                }
+                                let Some(object_constructor_symbol) =
+                                    reference_symbol(self.scoping, &callee.object)
+                                else {
+                                    continue;
+                                };
+                                let Some((method_state_index, method_key_field)) = parameter_member(
+                                    self.scoping,
+                                    &callee.expression,
+                                    self.parameters,
+                                ) else {
+                                    continue;
+                                };
+                                if method_state_index != state_parameter_index {
+                                    continue;
+                                }
+                                cell = Some((
+                                    target,
+                                    state_parameter_index,
+                                    prototype_field,
+                                    method_key_field,
+                                    assignment.span,
+                                    object_constructor_symbol,
+                                ));
+                                continue;
+                            }
+                        }
+                        if target == self.returned_symbol {
+                            if let Some((cell_symbol, ..)) = cell.as_ref() {
+                                if reference_symbol(self.scoping, &assignment.right)
+                                    == Some(*cell_symbol)
+                                {
+                                    returned_cell_assignment = Some(assignment.span);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    let Some((cell_symbol, state_parameter_index, _, method_key_field, _, _)) =
+                        cell.as_ref()
+                    else {
+                        continue;
+                    };
+                    match &assignment.left {
+                        AssignmentTarget::ComputedMemberExpression(member)
+                            if !member.optional
+                                && reference_symbol(self.scoping, &member.object)
+                                    == Some(*cell_symbol) =>
+                        {
+                            let Some((key_state_index, key_field)) =
+                                parameter_member(self.scoping, &member.expression, self.parameters)
+                            else {
+                                continue;
+                            };
+                            if key_state_index != *state_parameter_index
+                                || key_field != *method_key_field
+                            {
+                                continue;
+                            }
+                            let Expression::FunctionExpression(function) =
+                                last_sequence_expression(&assignment.right)
+                            else {
+                                continue;
+                            };
+                            let mut value_matches = Vec::new();
+                            for (index, parameter) in self.parameters.iter().enumerate() {
+                                if let Some(entry_condition) =
+                                    fast_getter_return(self.scoping, function, *parameter)
+                                {
+                                    value_matches.push((index, entry_condition));
+                                }
+                            }
+                            let [(value_parameter_index, entry_condition)] =
+                                value_matches.as_slice()
+                            else {
+                                continue;
+                            };
+                            getter = Some((
+                                *value_parameter_index,
+                                assignment.span,
+                                function.span,
+                                *entry_condition,
+                            ));
+                        }
+                        AssignmentTarget::StaticMemberExpression(member)
+                            if !member.optional
+                                && reference_symbol(self.scoping, &member.object)
+                                    == Some(*cell_symbol) =>
+                        {
+                            let Expression::FunctionExpression(function) =
+                                last_sequence_expression(&assignment.right)
+                            else {
+                                continue;
+                            };
+                            let mut value_matches = Vec::new();
+                            for (index, parameter) in self.parameters.iter().enumerate() {
+                                if fast_updater_replaces_capture(self.scoping, function, *parameter)
+                                {
+                                    value_matches.push(index);
+                                }
+                            }
+                            let [value_parameter_index] = value_matches.as_slice() else {
+                                continue;
+                            };
+                            updater = Some((
+                                *value_parameter_index,
+                                member.property.name.to_string(),
+                                assignment.span,
+                                function.span,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if let (
+                    Some((
+                        cell_symbol,
+                        state_parameter_index,
+                        prototype_field,
+                        method_key_field,
+                        cell_construction,
+                        object_constructor_symbol,
+                    )),
+                    Some((
+                        getter_value,
+                        getter_assignment,
+                        getter_function,
+                        getter_entry_condition,
+                    )),
+                    Some((updater_value, updater_property, updater_assignment, updater_function)),
+                    Some(returned_cell_assignment),
+                ) = (cell, getter, updater, returned_cell_assignment)
+                {
+                    if getter_value == updater_value
+                        && getter_value != mode_parameter_index
+                        && state_parameter_index != mode_parameter_index
+                        && state_parameter_index != getter_value
+                    {
+                        self.candidates.push(FastLazyCellCandidate {
+                            guard: logical.left.span(),
+                            mode_parameter_index,
+                            value_parameter_index: getter_value,
+                            state_parameter_index,
+                            prototype_field,
+                            method_key_field,
+                            updater_property,
+                            cell_construction,
+                            getter_function,
+                            getter_entry_condition,
+                            updater_function,
+                            returned_cell_assignment,
+                            object_constructor_symbol,
+                            cell_symbol,
+                            getter_assignment,
+                            updater_assignment,
+                        });
+                    }
+                }
+            }
+        }
+        walk::walk_logical_expression(self, logical);
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
 fn fast_shape_for_function(
     function: &Function<'_>,
     scoping: &Scoping,
@@ -523,239 +742,7 @@ fn fast_shape_for_function(
     }
     let returned_symbol = reference_symbol(scoping, ret.argument.as_ref()?)?;
 
-    struct Collector<'c, 'p> {
-        scoping: &'c Scoping,
-        parameters: &'p [SymbolId],
-        returned_symbol: SymbolId,
-        candidates: Vec<FastLazyCellCandidate>,
-    }
-    impl<'a> Visit<'a> for Collector<'_, '_> {
-        fn visit_logical_expression(&mut self, logical: &oxc_ast::ast::LogicalExpression<'a>) {
-            if logical.operator.as_str() == "&&" {
-                if let Expression::SequenceExpression(sequence) = strip_parentheses(&logical.right)
-                {
-                    let mode_refs =
-                        direct_parameter_references(self.scoping, &logical.left, self.parameters);
-                    let mode_refs = mode_refs.into_iter().collect::<Vec<_>>();
-                    let [mode_parameter_index] = mode_refs.as_slice() else {
-                        walk::walk_logical_expression(self, logical);
-                        return;
-                    };
-                    let mode_parameter_index = *mode_parameter_index;
-                    let mut cell = None;
-                    let mut getter = None;
-                    let mut updater = None;
-                    let mut returned_cell_assignment = None;
-
-                    for expression in &sequence.expressions {
-                        let Some(assignment) = assignment_expression(expression) else {
-                            continue;
-                        };
-                        if let Some(target) = assignment_symbol(self.scoping, &assignment.left) {
-                            if let Expression::CallExpression(call) =
-                                last_sequence_expression(&assignment.right)
-                            {
-                                if !call.optional && call.arguments.len() == 1 {
-                                    let Some(argument) = call.arguments[0].as_expression() else {
-                                        continue;
-                                    };
-                                    let Some((state_parameter_index, prototype_field)) =
-                                        parameter_member(self.scoping, argument, self.parameters)
-                                    else {
-                                        continue;
-                                    };
-                                    let Expression::ComputedMemberExpression(callee) =
-                                        last_sequence_expression(&call.callee)
-                                    else {
-                                        continue;
-                                    };
-                                    if callee.optional {
-                                        continue;
-                                    }
-                                    let Some(object_constructor_symbol) =
-                                        reference_symbol(self.scoping, &callee.object)
-                                    else {
-                                        continue;
-                                    };
-                                    let Some((method_state_index, method_key_field)) =
-                                        parameter_member(
-                                            self.scoping,
-                                            &callee.expression,
-                                            self.parameters,
-                                        )
-                                    else {
-                                        continue;
-                                    };
-                                    if method_state_index != state_parameter_index {
-                                        continue;
-                                    }
-                                    cell = Some((
-                                        target,
-                                        state_parameter_index,
-                                        prototype_field,
-                                        method_key_field,
-                                        assignment.span,
-                                        object_constructor_symbol,
-                                    ));
-                                    continue;
-                                }
-                            }
-                            if target == self.returned_symbol {
-                                if let Some((cell_symbol, ..)) = cell.as_ref() {
-                                    if reference_symbol(self.scoping, &assignment.right)
-                                        == Some(*cell_symbol)
-                                    {
-                                        returned_cell_assignment = Some(assignment.span);
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-
-                        let Some((cell_symbol, state_parameter_index, _, method_key_field, _, _)) =
-                            cell.as_ref()
-                        else {
-                            continue;
-                        };
-                        match &assignment.left {
-                            AssignmentTarget::ComputedMemberExpression(member)
-                                if !member.optional
-                                    && reference_symbol(self.scoping, &member.object)
-                                        == Some(*cell_symbol) =>
-                            {
-                                let Some((key_state_index, key_field)) = parameter_member(
-                                    self.scoping,
-                                    &member.expression,
-                                    self.parameters,
-                                ) else {
-                                    continue;
-                                };
-                                if key_state_index != *state_parameter_index
-                                    || key_field != *method_key_field
-                                {
-                                    continue;
-                                }
-                                let Expression::FunctionExpression(function) =
-                                    last_sequence_expression(&assignment.right)
-                                else {
-                                    continue;
-                                };
-                                let mut value_matches = Vec::new();
-                                for (index, parameter) in self.parameters.iter().enumerate() {
-                                    if let Some(entry_condition) =
-                                        fast_getter_return(self.scoping, function, *parameter)
-                                    {
-                                        value_matches.push((index, entry_condition));
-                                    }
-                                }
-                                let [(value_parameter_index, entry_condition)] =
-                                    value_matches.as_slice()
-                                else {
-                                    continue;
-                                };
-                                getter = Some((
-                                    *value_parameter_index,
-                                    assignment.span,
-                                    function.span,
-                                    *entry_condition,
-                                ));
-                            }
-                            AssignmentTarget::StaticMemberExpression(member)
-                                if !member.optional
-                                    && reference_symbol(self.scoping, &member.object)
-                                        == Some(*cell_symbol) =>
-                            {
-                                let Expression::FunctionExpression(function) =
-                                    last_sequence_expression(&assignment.right)
-                                else {
-                                    continue;
-                                };
-                                let mut value_matches = Vec::new();
-                                for (index, parameter) in self.parameters.iter().enumerate() {
-                                    if fast_updater_replaces_capture(
-                                        self.scoping,
-                                        function,
-                                        *parameter,
-                                    ) {
-                                        value_matches.push(index);
-                                    }
-                                }
-                                let [value_parameter_index] = value_matches.as_slice() else {
-                                    continue;
-                                };
-                                updater = Some((
-                                    *value_parameter_index,
-                                    member.property.name.to_string(),
-                                    assignment.span,
-                                    function.span,
-                                ));
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    if let (
-                        Some((
-                            cell_symbol,
-                            state_parameter_index,
-                            prototype_field,
-                            method_key_field,
-                            cell_construction,
-                            object_constructor_symbol,
-                        )),
-                        Some((
-                            getter_value,
-                            getter_assignment,
-                            getter_function,
-                            getter_entry_condition,
-                        )),
-                        Some((
-                            updater_value,
-                            updater_property,
-                            updater_assignment,
-                            updater_function,
-                        )),
-                        Some(returned_cell_assignment),
-                    ) = (cell, getter, updater, returned_cell_assignment)
-                    {
-                        if getter_value == updater_value
-                            && getter_value != mode_parameter_index
-                            && state_parameter_index != mode_parameter_index
-                            && state_parameter_index != getter_value
-                        {
-                            self.candidates.push(FastLazyCellCandidate {
-                                guard: logical.left.span(),
-                                mode_parameter_index,
-                                value_parameter_index: getter_value,
-                                state_parameter_index,
-                                prototype_field,
-                                method_key_field,
-                                updater_property,
-                                cell_construction,
-                                getter_function,
-                                getter_entry_condition,
-                                updater_function,
-                                returned_cell_assignment,
-                                object_constructor_symbol,
-                                cell_symbol,
-                                getter_assignment,
-                                updater_assignment,
-                            });
-                        }
-                    }
-                }
-            }
-            walk::walk_logical_expression(self, logical);
-        }
-        fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-        fn visit_arrow_function_expression(
-            &mut self,
-            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-        ) {
-        }
-    }
-
-    let mut collector = Collector {
+    let mut collector = FastLazyCellCandidateCollector {
         scoping,
         parameters: &parameters,
         returned_symbol,
