@@ -85,7 +85,11 @@ mod tests {
         for size in [0, 1, 1024 * 1024, 2 * 1024 * 1024 + 37] {
             let bytes = (0..size).map(|i| (i % 251) as u8).collect::<Vec<_>>();
             fs::write(&path, &bytes)?;
-            assert_eq!(sha256_path(&path)?, format!("{:x}", Sha256::digest(&bytes)));
+            let expected = Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(sha256_path(&path)?, expected);
         }
         Ok(())
     }
