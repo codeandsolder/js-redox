@@ -73,6 +73,12 @@ fn compact(value: Option<&Value>) -> String {
         .unwrap_or_else(|| "{}".into())
 }
 
+/// Regenerate the project README from its durable analysis artifacts.
+///
+/// # Errors
+///
+/// Fails if the project cannot be resolved, manifest/artifact data cannot be read or
+/// serialized, the README cannot be written, or the analysis budget is exhausted.
 pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Result<()> {
     let budget = budgets.operation(
         AnalysisOperation::ProjectReadme,

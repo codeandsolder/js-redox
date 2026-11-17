@@ -323,6 +323,11 @@ impl CallExpander<'_> {
 ///
 /// This file is an analyst projection only: function-stack traces and source
 /// reflection can still differ.
+///
+/// # Errors
+///
+/// Rejects invalid input handler JavaScript and generated source that fails parse validation;
+/// dynamic or otherwise unsupported inline paths yield no expansion.
 pub fn expand_helper_returns(
     source: &str,
     context: &ContextSourceTree,

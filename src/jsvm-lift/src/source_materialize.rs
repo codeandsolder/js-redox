@@ -267,6 +267,13 @@ const fn materialization_name(value: Materialization) -> &'static str {
     }
 }
 
+/// Materialize the captured source tree with verified source identities.
+///
+/// # Errors
+///
+/// Fails if capture/index metadata is missing or inconsistent, recorded source bytes cannot be
+/// read, content-addressed paths or SHA-256 digests fail validation, duplicate source inputs
+/// are found, output files cannot be written, or the materialization budget is exhausted.
 pub fn materialize_capture_source(
     project: &Path,
     jobs: Option<usize>,

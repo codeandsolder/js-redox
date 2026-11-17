@@ -716,6 +716,12 @@ fn lift_table_vms(
     Ok(vms)
 }
 
+/// Materialize the table-based VM representation from a scan report.
+///
+/// # Errors
+///
+/// Fails on exhausted work budget, unreadable source or scan-report files, malformed
+/// scan-report JSON, or serialization/output-file write failures.
 pub fn materialize(
     source_path: &Path,
     scan_path: &Path,

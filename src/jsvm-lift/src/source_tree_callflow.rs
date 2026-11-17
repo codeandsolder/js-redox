@@ -944,6 +944,11 @@ fn format_view(view: &CallerView, original: &str) -> String {
 ///
 /// `entry_member` optionally narrows to one member name; matching applies to AST
 /// property declarations, not arbitrary text.
+///
+/// # Errors
+///
+/// Rejects JavaScript that does not parse cleanly; unresolved or unsupported call chains are
+/// omitted from the result rather than treated as proven calls.
 pub fn reconstruct_caller_views(
     source: &str,
     entry_member: Option<&str>,

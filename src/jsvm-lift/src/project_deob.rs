@@ -322,6 +322,12 @@ fn as_object_mut(value: &mut Value) -> Result<&mut Map<String, Value>> {
         .context("artifact row must be an object")
 }
 
+/// Produce the deobfuscated project view from the indexed original sources.
+///
+/// # Errors
+///
+/// Fails on a missing or malformed source index, unreadable original source, output
+/// directory/write failures, failed artifact processing, or exhausted analysis budget.
 pub fn materialize_project_deobfuscation(
     project: &Path,
     options: &ProjectDeobOptions,

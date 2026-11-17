@@ -453,6 +453,12 @@ fn queue_unit(
     Some(scan_id)
 }
 
+/// Scan indexed project sources for supported VM forms and persist their findings.
+///
+/// # Errors
+///
+/// Fails if the source index is unavailable, source files or metadata cannot be read, analysis
+/// output cannot be created or written, or an analysis budget is exceeded.
 pub fn scan_project(project: &Path, options: &ProjectScanOptions) -> Result<ProjectScanSummary> {
     let stage_budget = options
         .budgets

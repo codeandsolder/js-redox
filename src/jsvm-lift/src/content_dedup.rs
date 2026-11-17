@@ -17,7 +17,7 @@ pub fn sha256_path(path: &Path) -> Result<String> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let count = file
             .read(&mut buffer)
@@ -73,7 +73,22 @@ pub fn link_or_copy(source: &Path, dest: &Path) -> Result<Materialization> {
 
 #[cfg(test)]
 mod tests {
-    use super::default_jobs;
+    use super::{default_jobs, sha256_path};
+    use anyhow::Result;
+    use sha2::{Digest, Sha256};
+    use std::fs;
+
+    #[test]
+    fn sha256_path_streams_empty_and_multi_chunk_files() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("source.bin");
+        for size in [0, 1, 1024 * 1024, 2 * 1024 * 1024 + 37] {
+            let bytes = (0..size).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+            fs::write(&path, &bytes)?;
+            assert_eq!(sha256_path(&path)?, format!("{:x}", Sha256::digest(&bytes)));
+        }
+        Ok(())
+    }
 
     #[test]
     fn default_jobs_is_never_zero_and_respects_cap() {

@@ -24,6 +24,11 @@ fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 
 /// Analyze every selected JavaScript view in a capture project and persist the
 /// canonical `capture-api-surface/v2` artifact.
+///
+/// # Errors
+///
+/// Fails when the required source index is missing, when source/artifact I/O or artifact
+/// persistence fails, or when the analysis budget is exhausted.
 pub fn analyze_project_api_surface(project: &Path, budgets: &AnalysisBudgets) -> Result<Value> {
     let stage_budget = budgets.scope(format!("api-surface-project:{}", project.display()));
     stage_budget.checkpoint()?;

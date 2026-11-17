@@ -392,6 +392,12 @@ fn build_observed_path_view(
 /// source offsets from transformed code as original CDP locations.
 ///
 /// Re-runnable on an already reconstructed project; no deobfuscation rescan.
+///
+/// # Errors
+///
+/// Fails if capture artifacts cannot be loaded or the required runtime source inventory is
+/// absent, when a referenced source identity or file cannot be verified, on output
+/// filesystem/serialization errors, or when the analysis budget is exhausted.
 pub fn materialize_invocation_views(project: &Path, budgets: &AnalysisBudgets) -> Result<usize> {
     let Some(mut trace) = load_artifact(project, SELECTIVE_TRACE, true)? else {
         return Ok(0);

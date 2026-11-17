@@ -143,6 +143,13 @@ fn analyze_module(
     Ok(())
 }
 
+/// Extract and analyze verified WebAssembly modules from the capture project.
+///
+/// # Errors
+///
+/// Fails when the project/manifest cannot be resolved or read, an indexed module cannot be
+/// read or analyzed, output artifacts cannot be written, or the WebAssembly analysis budget is
+/// exhausted.
 pub fn materialize_wasm(
     project: &Path,
     wax: Option<&Path>,

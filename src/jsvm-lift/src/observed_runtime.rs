@@ -90,6 +90,12 @@ fn classification_heading(classification: &str) -> &'static str {
 
 /// Recovered source bytes are checked against their capture CAS identities.
 /// Only counter-positive script instances are included in this curated tree.
+///
+/// # Errors
+///
+/// Fails if capture metadata/artifacts or source files cannot be read or written; rejects
+/// invalid content-addressed paths, malformed source digests and digest mismatches. Budget and
+/// output materialization errors also propagate.
 pub fn materialize_observed_runtime_sources(
     project: &Path,
     budgets: &AnalysisBudgets,

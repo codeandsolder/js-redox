@@ -229,6 +229,13 @@ fn har_entry(
 ///
 /// Fails if the root HTML cannot be fetched. Individual dependency failures are
 /// represented in the HAR and in the returned summary without aborting the graph.
+///
+/// # Errors
+///
+/// Rejects nonpositive capture limits, invalid or non-HTTP(S) root URLs, failed root requests
+/// and non-successful root responses. Client construction, HAR serialization and filesystem
+/// writes can also fail; individual dependency failures are recorded without aborting the
+/// capture.
 pub fn capture_url_to_har(
     requested: &str,
     har_path: &Path,

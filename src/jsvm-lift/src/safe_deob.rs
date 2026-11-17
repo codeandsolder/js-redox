@@ -137,6 +137,12 @@ pub struct SafeDeobOutcome {
     pub report: SafeDeobReport,
 }
 
+/// Run conservative, source-mode-aware deobfuscation and produce its proof report.
+///
+/// # Errors
+///
+/// Fails if the source is rejected by safe deobfuscation or rewrite validation, or if
+/// work-budget checks or downstream proof analyses fail.
 pub fn deobfuscate_source(
     original: &str,
     input_label: impl Into<String>,

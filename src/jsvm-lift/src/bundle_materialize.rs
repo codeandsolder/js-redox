@@ -397,6 +397,12 @@ fn report_for_group(
     Ok((digest.to_owned(), result))
 }
 
+/// Materialize recovered bundle modules from verified deobfuscation evidence.
+///
+/// # Errors
+///
+/// Fails on an exhausted budget, absent or malformed deobfuscation/source-index artifacts,
+/// unreadable bundle inputs, or errors preparing and writing the materialized module outputs.
 pub fn materialize_bundle_modules(
     project: &Path,
     jobs: Option<usize>,
