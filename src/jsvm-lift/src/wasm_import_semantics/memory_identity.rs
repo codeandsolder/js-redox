@@ -1383,137 +1383,144 @@ fn unique_exact_instance_paths(
         .collect()
 }
 
-pub(super) fn collect_module_memory_identity_proofs(
-    source: &str,
-    program: &Program<'_>,
-    scoping: &Scoping,
-    global_aliases: &HashMap<SymbolId, String>,
-    instantiation_sites: &HashMap<(u32, u32), Vec<WasmInstantiationSite>>,
-    budget: &WorkBudget,
-) -> Result<Vec<WasmModuleMemoryIdentityProof>, BudgetExceeded> {
-    budget.checkpoint()?;
-    let mut function_collector = FunctionCollector {
-        scoping,
-        functions: HashMap::new(),
-    };
-    function_collector.visit_program(program);
-    budget.checkpoint()?;
+struct MemoryProofContext<'p, 'a> {
+    source: &'p str,
+    program: &'p Program<'a>,
+    scoping: &'p Scoping,
+    global_aliases: &'p HashMap<SymbolId, String>,
+    instantiation_sites: &'p HashMap<(u32, u32), Vec<WasmInstantiationSite>>,
+    budget: &'p WorkBudget,
+}
 
-    let mut write_collector = ExportsWriteCollector {
-        scoping,
-        functions: &function_collector.functions,
-        function_stack: Vec::new(),
-        writes: HashMap::new(),
-    };
-    write_collector.visit_program(program);
-    budget.checkpoint()?;
+struct MemoryProofFacts {
+    functions: HashMap<SymbolId, FunctionInfo>,
+    writes: HashMap<SymbolId, Vec<Option<ExportsWrite>>>,
+    getters: Vec<MemoryGetterCandidate>,
+    bindings: Vec<ExactInstancePath>,
+    promises: Vec<ExactInstancePath>,
+    uint32_array_lengths: HashMap<SymbolId, usize>,
+}
 
-    let mut getter_collector = MemoryGetterCollector {
-        scoping,
-        candidates: Vec::new(),
-    };
-    getter_collector.visit_program(program);
-    budget.checkpoint()?;
+impl MemoryProofContext<'_, '_> {
+    // Preserve the original visitor ordering and its budget checkpoints.
+    fn gather_facts(&self) -> Result<MemoryProofFacts, BudgetExceeded> {
+        self.budget.checkpoint()?;
+        let mut functions = FunctionCollector {
+            scoping: self.scoping,
+            functions: HashMap::new(),
+        };
+        functions.visit_program(self.program);
+        self.budget.checkpoint()?;
 
-    let mut binding_collector = InstanceBindingCollector {
-        scoping,
-        paths: Vec::new(),
-    };
-    binding_collector.visit_program(program);
-    budget.checkpoint()?;
+        let mut writes = ExportsWriteCollector {
+            scoping: self.scoping,
+            functions: &functions.functions,
+            function_stack: Vec::new(),
+            writes: HashMap::new(),
+        };
+        writes.visit_program(self.program);
+        self.budget.checkpoint()?;
 
-    let mut promise_collector = PromiseInstanceCollector {
-        scoping,
-        paths: Vec::new(),
-    };
-    promise_collector.visit_program(program);
-    budget.checkpoint()?;
+        let mut getters = MemoryGetterCollector {
+            scoping: self.scoping,
+            candidates: Vec::new(),
+        };
+        getters.visit_program(self.program);
+        self.budget.checkpoint()?;
 
-    let mut length_collector = StableUint32ArrayLengthCollector {
-        scoping,
-        global_aliases,
-        lengths: HashMap::new(),
-    };
-    length_collector.visit_program(program);
-    budget.checkpoint()?;
+        let mut bindings = InstanceBindingCollector {
+            scoping: self.scoping,
+            paths: Vec::new(),
+        };
+        bindings.visit_program(self.program);
+        self.budget.checkpoint()?;
 
-    let mut proofs = Vec::new();
-    for getter in getter_collector.candidates {
-        if scoping
+        let mut promises = PromiseInstanceCollector {
+            scoping: self.scoping,
+            paths: Vec::new(),
+        };
+        promises.visit_program(self.program);
+        self.budget.checkpoint()?;
+
+        let mut lengths = StableUint32ArrayLengthCollector {
+            scoping: self.scoping,
+            global_aliases: self.global_aliases,
+            lengths: HashMap::new(),
+        };
+        lengths.visit_program(self.program);
+        self.budget.checkpoint()?;
+
+        Ok(MemoryProofFacts {
+            functions: functions.functions,
+            writes: writes.writes,
+            getters: getters.candidates,
+            bindings: bindings.paths,
+            promises: promises.paths,
+            uint32_array_lengths: lengths.lengths,
+        })
+    }
+
+    /// The gate for one getter: exact binding, initializer dominance, closed
+    /// helper references, exact instance provenance and complete export edges.
+    fn prove_getter(
+        &self,
+        facts: &MemoryProofFacts,
+        getter: &MemoryGetterCandidate,
+    ) -> Result<Option<Vec<WasmModuleMemoryIdentityProof>>, BudgetExceeded> {
+        if self
+            .scoping
             .symbol_ids()
-            .filter(|symbol| scoping.symbol_name(*symbol) == getter.exports_binding)
+            .filter(|symbol| self.scoping.symbol_name(*symbol) == getter.exports_binding)
             .count()
             != 1
         {
-            continue;
+            return Ok(None);
         }
-        let Some(write) =
-            exact_write_relation(scoping, &write_collector.writes, getter.exports_symbol)
+        let Some(write) = exact_write_relation(self.scoping, &facts.writes, getter.exports_symbol)
         else {
-            continue;
+            return Ok(None);
         };
-        let Some(function) = function_collector.functions.get(&write.helper) else {
-            continue;
+        let Some(function) = facts.functions.get(&write.helper) else {
+            return Ok(None);
         };
         let Some(initializer_proof) = normalized_initializer_proof(
-            source,
+            self.source,
             &function.name,
             &getter.exports_binding,
             write.parameter,
-            budget,
+            self.budget,
         )?
         else {
-            continue;
+            return Ok(None);
         };
         if !initializer_proof.write_dominates_normal_exit {
-            continue;
+            return Ok(None);
         }
         let exact_instances = unique_exact_instance_paths(
-            scoping,
-            &getter,
-            instantiation_sites,
-            &binding_collector.paths,
-            &promise_collector.paths,
+            self.scoping,
+            getter,
+            self.instantiation_sites,
+            &facts.bindings,
+            &facts.promises,
         );
         if exact_instances.is_empty() {
-            continue;
+            return Ok(None);
         }
-
-        let mut helper_references = HelperReferenceCollector {
-            scoping,
-            helper: write.helper,
-            parameter: write.parameter,
-            calls: Vec::new(),
+        let Some(helper_calls) =
+            closed_helper_calls(self.program, self.scoping, write, &exact_instances)
+        else {
+            return Ok(None);
         };
-        helper_references.visit_program(program);
-        let resolved_reference_count = scoping.get_resolved_reference_ids(write.helper).len();
-        if helper_references.calls.is_empty()
-            || helper_references.calls.len() != resolved_reference_count
-            || helper_references.calls.iter().any(Option::is_none)
-        {
-            continue;
-        }
-        let helper_calls = helper_references
-            .calls
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        if helper_calls
-            .iter()
-            .any(|call| !exact_instances.contains_key(&call.key))
-        {
-            continue;
-        }
 
         let mut regions = RegionCollector {
-            scoping,
-            global_aliases,
-            uint32_array_lengths: &length_collector.lengths,
+            scoping: self.scoping,
+            global_aliases: self.global_aliases,
+            uint32_array_lengths: &facts.uint32_array_lengths,
             helper: write.helper,
             parameter: write.parameter,
             regions: Vec::new(),
         };
-        regions.visit_program(program);
+        regions.visit_program(self.program);
         let all_export_calls = regions
             .regions
             .iter()
@@ -1523,21 +1530,76 @@ pub(super) fn collect_module_memory_identity_proofs(
             .collect::<HashSet<_>>();
         if exact_instances.keys().copied().any(|key| {
             !exact_instance_references_are_closed(
-                program,
-                scoping,
+                self.program,
+                self.scoping,
                 key,
                 &helper_calls,
                 &all_export_calls,
             )
         }) {
-            continue;
+            return Ok(None);
         }
-        let proof_start = proofs.len();
-        let observed_exports = all_export_calls;
+        Ok(VerifiedGetter {
+            getter,
+            function,
+            write,
+            initializer_proof,
+            exact_instances,
+        }
+        .materialize(self.scoping, regions.regions, &all_export_calls))
+    }
+}
+
+/// Every resolved reference to the initializer must be a direct invocation
+/// over an instance already identified with this getter's exact import object.
+fn closed_helper_calls(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    write: ExportsWrite,
+    exact_instances: &HashMap<InstanceKey, WasmInstantiationSite>,
+) -> Option<Vec<HelperCall>> {
+    let mut references = HelperReferenceCollector {
+        scoping,
+        helper: write.helper,
+        parameter: write.parameter,
+        calls: Vec::new(),
+    };
+    references.visit_program(program);
+    if references.calls.is_empty()
+        || references.calls.len() != scoping.get_resolved_reference_ids(write.helper).len()
+        || references.calls.iter().any(Option::is_none)
+    {
+        return None;
+    }
+    let calls = references.calls.into_iter().flatten().collect::<Vec<_>>();
+    calls
+        .iter()
+        .all(|call| exact_instances.contains_key(&call.key))
+        .then_some(calls)
+}
+
+struct VerifiedGetter<'r> {
+    getter: &'r MemoryGetterCandidate,
+    function: &'r FunctionInfo,
+    write: ExportsWrite,
+    initializer_proof: NormalizedInitializerProof,
+    exact_instances: HashMap<InstanceKey, WasmInstantiationSite>,
+}
+
+impl VerifiedGetter<'_> {
+    /// Construct candidate outputs independently and accept them atomically.
+    /// No partially covered getter may leak one of its apparently valid edges.
+    fn materialize(
+        self,
+        scoping: &Scoping,
+        regions: Vec<RegionFacts>,
+        observed_exports: &HashSet<(InstanceKey, u32, u32)>,
+    ) -> Option<Vec<WasmModuleMemoryIdentityProof>> {
+        let mut proofs = Vec::new();
         let mut covered_exports = HashSet::new();
-        for region in regions.regions {
+        for region in regions {
             for initializer in &region.initializers {
-                let Some(site) = exact_instances.get(&initializer.call.key) else {
+                let Some(site) = self.exact_instances.get(&initializer.call.key) else {
                     continue;
                 };
                 if site.end > initializer.call.start {
@@ -1570,23 +1632,25 @@ pub(super) fn collect_module_memory_identity_proofs(
                     covered_exports.insert((initializer.call.key, call.call_start, call.call_end));
                 }
                 proofs.push(WasmModuleMemoryIdentityProof {
-                    import_module: getter.import_module.clone(),
-                    import_name: getter.import_name.clone(),
-                    assignment_start: getter.assignment_start,
-                    assignment_end: getter.assignment_end,
-                    import_object: getter.import_object.clone(),
+                    import_module: self.getter.import_module.clone(),
+                    import_name: self.getter.import_name.clone(),
+                    assignment_start: self.getter.assignment_start,
+                    assignment_end: self.getter.assignment_end,
+                    import_object: self.getter.import_object.clone(),
                     instance_binding: instance_display(scoping, initializer.call.key),
                     instance_identity_kind: instance_kind(initializer.call.key),
-                    exports_binding: getter.exports_binding.clone(),
+                    exports_binding: self.getter.exports_binding.clone(),
                     memory_export_name: "memory".to_string(),
-                    initializer_function: function.name.clone(),
-                    initializer_parameter: write.parameter,
+                    initializer_function: self.function.name.clone(),
+                    initializer_parameter: self.write.parameter,
                     initializer_call_starts: vec![initializer.call.start],
                     initializer_exports_write_dominates_normal_exit: true,
-                    initializer_only_wasm_export_call: initializer_proof
+                    initializer_only_wasm_export_call: self
+                        .initializer_proof
                         .only_start_export_call
                         .then(|| "__wbindgen_start".to_string()),
-                    initializer_non_start_effects_memory_disjoint: initializer_proof
+                    initializer_non_start_effects_memory_disjoint: self
+                        .initializer_proof
                         .non_start_effects_memory_disjoint,
                     standard_js_numeric_builtin_semantics_required: true,
                     instantiation_site: site.clone(),
@@ -1596,11 +1660,34 @@ pub(super) fn collect_module_memory_identity_proofs(
                 });
             }
         }
-        if observed_exports != covered_exports {
-            proofs.truncate(proof_start);
+        (observed_exports == &covered_exports).then_some(proofs)
+    }
+}
+
+pub(super) fn collect_module_memory_identity_proofs(
+    source: &str,
+    program: &Program<'_>,
+    scoping: &Scoping,
+    global_aliases: &HashMap<SymbolId, String>,
+    instantiation_sites: &HashMap<(u32, u32), Vec<WasmInstantiationSite>>,
+    budget: &WorkBudget,
+) -> Result<Vec<WasmModuleMemoryIdentityProof>, BudgetExceeded> {
+    let context = MemoryProofContext {
+        source,
+        program,
+        scoping,
+        global_aliases,
+        instantiation_sites,
+        budget,
+    };
+    let facts = context.gather_facts()?;
+    let mut proofs = Vec::new();
+    for getter in &facts.getters {
+        if let Some(accepted) = context.prove_getter(&facts, getter)? {
+            proofs.extend(accepted);
         }
     }
-    proofs.sort_by(|left, right| {
+    proofs.sort_by(|left: &WasmModuleMemoryIdentityProof, right| {
         left.assignment_start
             .cmp(&right.assignment_start)
             .then_with(|| {

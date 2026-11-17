@@ -1704,6 +1704,44 @@ mod tests {
     }
 
     #[test]
+    fn memory_identity_discards_all_proofs_if_one_export_is_uncovered() {
+        let mixed = r#"
+            var m = window;
+            function bA(A) {
+                if (Uint8Array.fromBase64) return [Uint8Array.fromBase64(A).buffer, false];
+                for (var Q = atob(A), g = new Uint8Array(Q.length), E = 0; E < Q.length; E++) g[E] = Q.charCodeAt(E);
+                return [g.buffer, false];
+            }
+            var exports_binding;
+            function init(instance) { exports_binding = instance.exports; return exports_binding; }
+            function tQ() {
+                var imports = {}; imports.wbg = {};
+                imports.wbg.__wbindgen_memory = function() { return exports_binding.memory; };
+                return imports;
+            }
+            var N = "AGFzbQEAAAA=", G = bA(N)[0], imports = tQ();
+            var instance = new m.WebAssembly.Instance(new m.WebAssembly.Module(G), imports);
+            instance.exports.uncovered(input);
+            init(instance);
+            instance.exports.covered(input);
+        "#;
+        assert!(
+            proven_wasm_import_semantics(mixed)
+                .module_memory_identity_proofs
+                .is_empty(),
+            "a later proven export must not hide an earlier uncovered one"
+        );
+
+        let covered_only = mixed.replace("instance.exports.uncovered(input);", "");
+        let analysis = proven_wasm_import_semantics(&covered_only);
+        assert_eq!(analysis.module_memory_identity_proofs.len(), 1);
+        assert_eq!(
+            analysis.module_memory_identity_proofs[0].export_calls[0].export_name,
+            "covered"
+        );
+    }
+
+    #[test]
     fn module_memory_identity_reports_uint32_source_length_only_when_static() {
         let source = r#"
             var m = window;
