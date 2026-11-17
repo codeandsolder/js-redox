@@ -327,7 +327,7 @@ pub(crate) fn resolve_with_import_map(
         scopes.sort_by_key(|scope| std::cmp::Reverse(scope.len()));
         for scope in scopes {
             if let Some((resolved, key)) =
-                resolve_in_specifier_map(&normalized, &import_map.scopes[scope])
+                resolve_in_specifier_map(normalized, &import_map.scopes[scope])
             {
                 let resolution = if resolved.is_some() {
                     "import_map_scope"
@@ -343,7 +343,7 @@ pub(crate) fn resolve_with_import_map(
                 );
             }
         }
-        if let Some((resolved, key)) = resolve_in_specifier_map(&normalized, &import_map.imports) {
+        if let Some((resolved, key)) = resolve_in_specifier_map(normalized, &import_map.imports) {
             let resolution = if resolved.is_some() {
                 "import_map"
             } else {
