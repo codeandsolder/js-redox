@@ -1693,106 +1693,116 @@ impl BoundaryCorrelation<'_> {
 
     // Proven source-specific handlers, instantiation binding and memory
     // edges are collected before interpreting any copied destination words.
+    // Only complete, unique handler semantics are admissible source proofs.
+    fn match_copied_source(
+        scope: &BoundaryExport<'_>,
+        candidate: &Value,
+        names: CopyImportNames<'_>,
+        relative: &str,
+        document: &Value,
+    ) -> Option<Value> {
+        let CopyImportNames {
+            set_module: Some(set_module),
+            set_name: Some(set_name),
+            constructor_module: Some(constructor_module),
+            constructor_name: Some(constructor_name),
+            memory_module,
+            memory_name,
+        } = names
+        else {
+            return None;
+        };
+        let module = scope.module;
+        let report = scope.report;
+        let function_imports = scope.function_imports;
+        let export_name = string_field(scope.export, "export");
+        let set_matches = matching_handler(document, set_module, set_name, "typed_array_set");
+        let constructor_matches = matching_handler(
+            document,
+            constructor_module,
+            constructor_name,
+            "uint32_array_constructor",
+        )
+        .into_iter()
+        .filter(|handler| usize_field(handler, "element_width_bits") == Some(32))
+        .collect::<Vec<_>>();
+        if set_matches.len() != 1 || constructor_matches.len() != 1 {
+            return None;
+        }
+        let set_usages = matching_usages(document, set_module, set_name);
+        let constructor_usages = matching_usages(document, constructor_module, constructor_name);
+        let binding_proofs = common_exact_binding_proofs(
+            &set_usages,
+            &constructor_usages,
+            string_field(module, "sha256"),
+        );
+        let memory_match_context = ModuleMemoryMatchContext {
+            document,
+            module_sha256: string_field(module, "sha256"),
+            export_name,
+            binding_proofs: &binding_proofs,
+            report,
+        };
+        let memory_proofs = matching_module_memory_proofs(
+            &memory_match_context,
+            memory_module,
+            memory_name,
+            candidate,
+        );
+        let length_barrier_proofs = source_length_barrier_proofs(
+            document,
+            function_imports,
+            candidate,
+            string_field(module, "sha256"),
+            &binding_proofs,
+        );
+        Some(json!({
+            "source_path": relative,
+            "set_handler": set_matches[0],
+            "constructor_handler": constructor_matches[0],
+            "import_binding_identity_proofs": binding_proofs,
+            "module_memory_identity_proofs": memory_proofs,
+            "source_length_barrier_proofs": length_barrier_proofs,
+        }));
+    }
+
     fn collect_copied_source_proofs(
         &mut self,
         scope: &BoundaryExport<'_>,
         candidate: &Value,
         names: CopyImportNames<'_>,
     ) -> Result<Vec<Value>> {
-        let CopyImportNames {
-            set_module,
-            set_name,
-            constructor_module,
-            constructor_name,
-            memory_module,
-            memory_name,
-        } = names;
-        let module = scope.module;
-        let report = scope.report;
-        let export_name = string_field(scope.export, "export");
-        let function_imports = scope.function_imports;
-        let carrier_candidates = scope.carrier_candidates;
-        let project = self.project;
-        let budgets = self.budgets;
-        let stage_budget = &self.stage_budget;
-        let full_cache = &mut self.full_cache;
-        let carrier_sources = &mut self.carrier_sources;
         let mut proofs = Vec::new();
-        if let (
-            Some(set_module),
-            Some(set_name),
-            Some(constructor_module),
-            Some(constructor_name),
-        ) = (set_module, set_name, constructor_module, constructor_name)
+        if names.set_module.is_some()
+            && names.set_name.is_some()
+            && names.constructor_module.is_some()
+            && names.constructor_name.is_some()
         {
-            for relative in carrier_candidates {
-                stage_budget.checkpoint()?;
-                let source = project.join(relative);
+            for relative in scope.carrier_candidates {
+                self.stage_budget.checkpoint()?;
+                let source = self.project.join(relative);
                 if !source.is_file() {
                     continue;
                 }
-                carrier_sources.insert(relative.clone());
-                if !full_cache.contains_key(relative) {
-                    let budget = budgets.operation_under(
-                        stage_budget,
+                self.carrier_sources.insert(relative.clone());
+                if !self.full_cache.contains_key(relative) {
+                    let budget = self.budgets.operation_under(
+                        &self.stage_budget,
                         AnalysisOperation::WasmAnalysis,
                         source.display().to_string(),
                     );
-                    full_cache.insert(relative.clone(), semantics_for_source(&source, &budget)?);
+                    self.full_cache
+                        .insert(relative.clone(), semantics_for_source(&source, &budget)?);
                 }
-                let document = full_cache
+                let document = self
+                    .full_cache
                     .get(relative)
                     .context("missing full semantics cache")?;
-                let set_matches =
-                    matching_handler(document, set_module, set_name, "typed_array_set");
-                let constructor_matches = matching_handler(
-                    document,
-                    constructor_module,
-                    constructor_name,
-                    "uint32_array_constructor",
-                )
-                .into_iter()
-                .filter(|handler| usize_field(handler, "element_width_bits") == Some(32))
-                .collect::<Vec<_>>();
-                if set_matches.len() != 1 || constructor_matches.len() != 1 {
-                    continue;
+                if let Some(proof) =
+                    Self::match_copied_source(scope, candidate, names, relative, document)
+                {
+                    proofs.push(proof);
                 }
-                let set_usages = matching_usages(document, set_module, set_name);
-                let constructor_usages =
-                    matching_usages(document, constructor_module, constructor_name);
-                let binding_proofs = common_exact_binding_proofs(
-                    &set_usages,
-                    &constructor_usages,
-                    string_field(module, "sha256"),
-                );
-                let memory_match_context = ModuleMemoryMatchContext {
-                    document,
-                    module_sha256: string_field(module, "sha256"),
-                    export_name,
-                    binding_proofs: &binding_proofs,
-                    report,
-                };
-                let memory_proofs = matching_module_memory_proofs(
-                    &memory_match_context,
-                    memory_module,
-                    memory_name,
-                    candidate,
-                );
-                let length_barrier_proofs = source_length_barrier_proofs(
-                    document,
-                    function_imports,
-                    candidate,
-                    string_field(module, "sha256"),
-                    &binding_proofs,
-                );
-                proofs.push(json!({
-                    "source_path": relative,
-                    "set_handler": set_matches[0],
-                    "constructor_handler": constructor_matches[0],
-                    "import_binding_identity_proofs": binding_proofs,
-                    "module_memory_identity_proofs": memory_proofs,
-                    "source_length_barrier_proofs": length_barrier_proofs,
-                }));
             }
         }
         Ok(proofs)
