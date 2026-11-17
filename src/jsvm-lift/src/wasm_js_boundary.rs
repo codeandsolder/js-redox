@@ -1394,6 +1394,14 @@ struct BoundaryExport<'a> {
     carrier_candidates: &'a [String],
 }
 
+struct HostEffectEvidence<'a> {
+    raw_module: Option<&'a str>,
+    raw_import: Option<&'a str>,
+    offset: Option<u32>,
+    proofs: Vec<Value>,
+    usage_proofs: Vec<Value>,
+}
+
 struct BoundaryCorrelation<'a> {
     project: &'a Path,
     budgets: &'a AnalysisBudgets,
@@ -1481,8 +1489,6 @@ impl BoundaryCorrelation<'_> {
     }
 
     fn host_effect_pair(&mut self, scope: &BoundaryExport<'_>, pair: &Value) -> Result<Value> {
-        let module = scope.module;
-        let export = scope.export;
         let function_imports = scope.function_imports;
         let carrier_candidates = scope.carrier_candidates;
         let project = self.project;
@@ -1490,7 +1496,6 @@ impl BoundaryCorrelation<'_> {
         let stage_budget = &self.stage_budget;
         let targeted_cache = &mut self.targeted_cache;
         let carrier_sources = &mut self.carrier_sources;
-        let host_import = pair.get("host_import").cloned().unwrap_or(Value::Null);
         let host_import_function = usize_field(pair, "host_import_function");
         let raw_import = host_import_function
             .and_then(|index| function_imports.get(index))
@@ -1557,6 +1562,36 @@ impl BoundaryCorrelation<'_> {
             }
         }
 
+        Ok(Self::format_host_effect_row(
+            scope,
+            pair,
+            HostEffectEvidence {
+                raw_module,
+                raw_import,
+                offset,
+                proofs,
+                usage_proofs,
+            },
+        ))
+    }
+
+    fn format_host_effect_row(
+        scope: &BoundaryExport<'_>,
+        pair: &Value,
+        evidence: HostEffectEvidence<'_>,
+    ) -> Value {
+        let module = scope.module;
+        let export = scope.export;
+        let carrier_candidates = scope.carrier_candidates;
+        let HostEffectEvidence {
+            raw_module,
+            raw_import,
+            offset,
+            proofs,
+            usage_proofs,
+        } = evidence;
+        let host_import = pair.get("host_import").cloned().unwrap_or(Value::Null);
+
         let exact_binding_proofs =
             exact_module_usage_proofs(&usage_proofs, string_field(module, "sha256"));
         let mut relation = serde_json::Map::new();
@@ -1616,7 +1651,7 @@ impl BoundaryCorrelation<'_> {
         if !ambiguities.is_empty() {
             row["ambiguity"] = ambiguities.join("; ").into();
         }
-        Ok(row)
+        row
     }
 
     fn copied_input_candidate(
