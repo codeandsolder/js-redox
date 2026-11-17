@@ -1000,119 +1000,6 @@ fn statements_flow(
     Some(completed)
 }
 
-#[cfg(test)]
-mod flow_tests {
-    use super::{statements_flow, ExitFlow, WriteStates};
-    use crate::test_support::{TestFailure, TestResult, TestValue};
-    use oxc_allocator::Allocator;
-    use oxc_ast::ast::Statement;
-    use oxc_span::{SourceType, Span};
-    use rolldown_redox::ecmascript::parse_program;
-
-    fn exit_flow(source: &str) -> Result<Option<ExitFlow>, TestFailure> {
-        const WRITE: &str = "target = value";
-        let allocator = Allocator::default();
-        let fixture = format!("function sample() {{ {source} }}");
-        let parsed = parse_program(&allocator, &fixture, SourceType::cjs());
-        assert!(parsed.is_clean(), "invalid fixture: {source}");
-        let function = parsed
-            .program
-            .body
-            .first()
-            .and_then(|statement| match statement {
-                Statement::FunctionDeclaration(function) => Some(function),
-                _ => None,
-            })
-            .test_value("fixture function")?;
-        let body = function.body.as_ref().test_value("fixture function body")?;
-        let offset = fixture.find(WRITE).test_value("fixture assignment span")?;
-        let start = u32::try_from(offset).test_value("fixture assignment offset")?;
-        let length = u32::try_from(WRITE.len()).test_value("fixture assignment length")?;
-        Ok(statements_flow(
-            &body.statements,
-            false,
-            Span::new(start, start + length),
-        ))
-    }
-
-    #[test]
-    fn combines_assigned_and_unassigned_paths_without_treating_them_as_proven() -> TestResult {
-        let cases = [
-            (
-                "target = value;",
-                WriteStates::only(true),
-                WriteStates::default(),
-                true,
-            ),
-            (
-                "target = value; return;",
-                WriteStates::default(),
-                WriteStates::only(true),
-                true,
-            ),
-            (
-                "if (cond) { target = value; }",
-                WriteStates(WriteStates::UNASSIGNED | WriteStates::ASSIGNED),
-                WriteStates::default(),
-                false,
-            ),
-            (
-                "if (cond) { target = value; return; } else { return; }",
-                WriteStates::default(),
-                WriteStates(WriteStates::UNASSIGNED | WriteStates::ASSIGNED),
-                false,
-            ),
-            (
-                "if (cond) { return; } target = value;",
-                WriteStates::only(true),
-                WriteStates::only(false),
-                false,
-            ),
-            (
-                "return; target = value;",
-                WriteStates::default(),
-                WriteStates::only(false),
-                false,
-            ),
-            (
-                "throw err; target = value;",
-                WriteStates::default(),
-                WriteStates::default(),
-                false,
-            ),
-        ];
-        for (source, normal, returned, proven) in cases {
-            let flow = exit_flow(source)?.test_value("simple statement flow")?;
-            assert_eq!(flow.normal, normal, "{source}");
-            assert_eq!(flow.returned, returned, "{source}");
-            assert_eq!(flow.write_dominates_normal_exit(), proven, "{source}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_ambiguous_write_inside_branch_test() -> TestResult {
-        assert!(exit_flow("if (target = value) { return; }")?.is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn write_state_joins_are_idempotent_and_order_independent() {
-        let mut states = WriteStates::only(true);
-        states.union(WriteStates::only(false));
-        assert_eq!(
-            states,
-            WriteStates(WriteStates::UNASSIGNED | WriteStates::ASSIGNED)
-        );
-        states.union(WriteStates::only(true));
-        assert_eq!(
-            states,
-            WriteStates(WriteStates::UNASSIGNED | WriteStates::ASSIGNED)
-        );
-        assert!(states.contains(true) && states.contains(false));
-    }
-}
-
 struct NormalizedWriteCollector<'c> {
     scoping: &'c Scoping,
     parameter_symbol: SymbolId,
@@ -1725,4 +1612,117 @@ pub(super) fn collect_module_memory_identity_proofs(
     });
     proofs.dedup();
     Ok(proofs)
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::{statements_flow, ExitFlow, WriteStates};
+    use crate::test_support::{TestFailure, TestResult, TestValue};
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::Statement;
+    use oxc_span::{SourceType, Span};
+    use rolldown_redox::ecmascript::parse_program;
+
+    fn exit_flow(source: &str) -> Result<Option<ExitFlow>, TestFailure> {
+        const WRITE: &str = "target = value";
+        let allocator = Allocator::default();
+        let fixture = format!("function sample() {{ {source} }}");
+        let parsed = parse_program(&allocator, &fixture, SourceType::cjs());
+        assert!(parsed.is_clean(), "invalid fixture: {source}");
+        let function = parsed
+            .program
+            .body
+            .first()
+            .and_then(|statement| match statement {
+                Statement::FunctionDeclaration(function) => Some(function),
+                _ => None,
+            })
+            .test_value("fixture function")?;
+        let body = function.body.as_ref().test_value("fixture function body")?;
+        let offset = fixture.find(WRITE).test_value("fixture assignment span")?;
+        let start = u32::try_from(offset).test_value("fixture assignment offset")?;
+        let length = u32::try_from(WRITE.len()).test_value("fixture assignment length")?;
+        Ok(statements_flow(
+            &body.statements,
+            false,
+            Span::new(start, start + length),
+        ))
+    }
+
+    #[test]
+    fn combines_assigned_and_unassigned_paths_without_treating_them_as_proven() -> TestResult {
+        let cases = [
+            (
+                "target = value;",
+                WriteStates::only(true),
+                WriteStates::default(),
+                true,
+            ),
+            (
+                "target = value; return;",
+                WriteStates::default(),
+                WriteStates::only(true),
+                true,
+            ),
+            (
+                "if (cond) { target = value; }",
+                WriteStates(WriteStates::UNASSIGNED | WriteStates::ASSIGNED),
+                WriteStates::default(),
+                false,
+            ),
+            (
+                "if (cond) { target = value; return; } else { return; }",
+                WriteStates::default(),
+                WriteStates(WriteStates::UNASSIGNED | WriteStates::ASSIGNED),
+                false,
+            ),
+            (
+                "if (cond) { return; } target = value;",
+                WriteStates::only(true),
+                WriteStates::only(false),
+                false,
+            ),
+            (
+                "return; target = value;",
+                WriteStates::default(),
+                WriteStates::only(false),
+                false,
+            ),
+            (
+                "throw err; target = value;",
+                WriteStates::default(),
+                WriteStates::default(),
+                false,
+            ),
+        ];
+        for (source, normal, returned, proven) in cases {
+            let flow = exit_flow(source)?.test_value("simple statement flow")?;
+            assert_eq!(flow.normal, normal, "{source}");
+            assert_eq!(flow.returned, returned, "{source}");
+            assert_eq!(flow.write_dominates_normal_exit(), proven, "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_ambiguous_write_inside_branch_test() -> TestResult {
+        assert!(exit_flow("if (target = value) { return; }")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn write_state_joins_are_idempotent_and_order_independent() {
+        let mut states = WriteStates::only(true);
+        states.union(WriteStates::only(false));
+        assert_eq!(
+            states,
+            WriteStates(WriteStates::UNASSIGNED | WriteStates::ASSIGNED)
+        );
+        states.union(WriteStates::only(true));
+        assert_eq!(
+            states,
+            WriteStates(WriteStates::UNASSIGNED | WriteStates::ASSIGNED)
+        );
+        assert!(states.contains(true) && states.contains(false));
+    }
 }
