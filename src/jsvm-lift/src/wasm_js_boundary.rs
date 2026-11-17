@@ -1763,7 +1763,7 @@ impl BoundaryCorrelation<'_> {
             "import_binding_identity_proofs": binding_proofs,
             "module_memory_identity_proofs": memory_proofs,
             "source_length_barrier_proofs": length_barrier_proofs,
-        }));
+        }))
     }
 
     fn collect_copied_source_proofs(
