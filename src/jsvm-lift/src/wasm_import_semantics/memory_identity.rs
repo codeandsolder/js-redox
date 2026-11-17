@@ -1412,13 +1412,16 @@ impl MemoryProofContext<'_, '_> {
         functions.visit_program(self.program);
         self.budget.checkpoint()?;
 
-        let mut writes = ExportsWriteCollector {
-            scoping: self.scoping,
-            functions: &functions.functions,
-            function_stack: Vec::new(),
-            writes: HashMap::new(),
+        let writes = {
+            let mut collector = ExportsWriteCollector {
+                scoping: self.scoping,
+                functions: &functions.functions,
+                function_stack: Vec::new(),
+                writes: HashMap::new(),
+            };
+            collector.visit_program(self.program);
+            collector.writes
         };
-        writes.visit_program(self.program);
         self.budget.checkpoint()?;
 
         let mut getters = MemoryGetterCollector {
@@ -1452,7 +1455,7 @@ impl MemoryProofContext<'_, '_> {
 
         Ok(MemoryProofFacts {
             functions: functions.functions,
-            writes: writes.writes,
+            writes,
             getters: getters.candidates,
             bindings: bindings.paths,
             promises: promises.paths,
