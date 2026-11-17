@@ -1385,6 +1385,715 @@ fn matching_usages(document: &Value, import_module: &str, import_name: &str) -> 
         .collect()
 }
 
+struct BoundaryExport<'a> {
+    module: &'a Value,
+    export: &'a Value,
+    analysis: &'a Value,
+    report: &'a Value,
+    function_imports: &'a [Value],
+    carrier_candidates: &'a [String],
+}
+
+struct BoundaryCorrelation<'a> {
+    project: &'a Path,
+    budgets: &'a AnalysisBudgets,
+    stage_budget: WorkBudget,
+    deob_by_raw: BTreeMap<String, String>,
+    targeted_cache: HashMap<(String, String, String, u32), Value>,
+    full_cache: HashMap<String, Value>,
+    host_effect_rows: Vec<Value>,
+    copied_input_rows: Vec<Value>,
+    skipped_modules: Vec<Value>,
+    carrier_sources: BTreeSet<String>,
+}
+
+impl BoundaryCorrelation<'_> {
+    fn process_module(&mut self, module: &Value) -> Result<()> {
+        let (deep, report, function_imports, carrier_candidates) = {
+            let project = self.project;
+            let stage_budget = &self.stage_budget;
+            let deob_by_raw = &self.deob_by_raw;
+            let skipped_modules = &mut self.skipped_modules;
+            stage_budget.checkpoint()?;
+            if string_field(module, "status") != Some("ok")
+                || string_field(module, "deep_path").is_none()
+            {
+                return Ok(());
+            }
+            let deep_path =
+                project.join(string_field(module, "deep_path").context("missing deep path")?);
+            let report_path =
+                project.join(string_field(module, "report_path").context("missing report path")?);
+            let deep = read_json(&deep_path)?;
+            let report = read_json(&report_path)?;
+            let function_imports = array_field(&report, "imports")
+                .iter()
+                .filter(|imported| string_field(imported, "kind") == Some("function"))
+                .cloned()
+                .collect::<Vec<_>>();
+            if string_field(&deep, "schema") != Some("wasm-redox/deep-v14") {
+                skipped_modules.push(json!({
+                    "sha256": module.get("sha256").cloned().unwrap_or(Value::Null),
+                    "schema": deep.get("schema").cloned().unwrap_or(Value::Null),
+                    "reason": "host-effect/read proof requires wasm-redox/deep-v14",
+                }));
+                return Ok(());
+            }
+
+            let mut carrier_candidates = Vec::<String>::new();
+            for origin in array_field(module, "origins") {
+                stage_budget.checkpoint()?;
+                let Some(raw) = string_field(origin, "source_path") else {
+                    continue;
+                };
+                let Some(output) = deob_by_raw.get(raw) else {
+                    continue;
+                };
+                if !carrier_candidates.contains(output) {
+                    carrier_candidates.push(output.clone());
+                }
+            }
+            (deep, report, function_imports, carrier_candidates)
+        };
+        for export in array_field(&deep, "exports") {
+            self.stage_budget.checkpoint()?;
+            let analysis = export.get("analysis").unwrap_or(&Value::Null);
+            let scope = BoundaryExport {
+                module,
+                export,
+                analysis,
+                report: &report,
+                function_imports: &function_imports,
+                carrier_candidates: &carrier_candidates,
+            };
+            for pair in array_field(analysis, "opaque_host_effect_memory_reads") {
+                self.stage_budget.checkpoint()?;
+                let row = self.host_effect_pair(&scope, pair)?;
+                self.host_effect_rows.push(row);
+            }
+            for candidate in array_field(analysis, "externref_bulk_copy_candidates") {
+                self.stage_budget.checkpoint()?;
+                let row = self.copied_input_candidate(&scope, candidate)?;
+                self.copied_input_rows.push(row);
+            }
+        }
+        Ok(())
+    }
+
+    fn host_effect_pair(&mut self, scope: &BoundaryExport<'_>, pair: &Value) -> Result<Value> {
+        let module = scope.module;
+        let export = scope.export;
+        let function_imports = scope.function_imports;
+        let carrier_candidates = scope.carrier_candidates;
+        let project = self.project;
+        let budgets = self.budgets;
+        let stage_budget = &self.stage_budget;
+        let targeted_cache = &mut self.targeted_cache;
+        let carrier_sources = &mut self.carrier_sources;
+        let host_import = pair.get("host_import").cloned().unwrap_or(Value::Null);
+        let host_import_function = usize_field(pair, "host_import_function");
+        let raw_import = host_import_function
+            .and_then(|index| function_imports.get(index))
+            .and_then(|imported| string_field(imported, "name"));
+        let raw_module = host_import_function
+            .and_then(|index| function_imports.get(index))
+            .and_then(|imported| string_field(imported, "module"));
+        let offset = u32_field(pair, "offset");
+        let mut proofs = Vec::new();
+        let mut usage_proofs = Vec::new();
+
+        if let (Some(raw_module), Some(raw_import), Some(offset)) = (raw_module, raw_import, offset)
+        {
+            for relative in carrier_candidates {
+                stage_budget.checkpoint()?;
+                let source = project.join(relative);
+                if !source.is_file() {
+                    continue;
+                }
+                carrier_sources.insert(relative.clone());
+                let key = (
+                    relative.clone(),
+                    raw_module.to_owned(),
+                    raw_import.to_owned(),
+                    offset,
+                );
+                if !targeted_cache.contains_key(&key) {
+                    targeted_cache.insert(key.clone(), {
+                        let budget = budgets.operation_under(
+                            stage_budget,
+                            AnalysisOperation::WasmAnalysis,
+                            source.display().to_string(),
+                        );
+                        targeted_semantics_for_source(
+                            &source, raw_module, raw_import, offset, &budget,
+                        )?
+                    });
+                }
+                let probe = targeted_cache.get(&key).context("missing targeted cache")?;
+                let writes = array_field(probe, "shapes");
+                anyhow::ensure!(
+                    writes.len() <= 1,
+                    "ambiguous JS WASM-import proof for {}: {}@{}",
+                    source.display(),
+                    raw_import,
+                    offset
+                );
+                if let Some(write) = writes.first() {
+                    let mut proof = write.clone();
+                    proof
+                        .as_object_mut()
+                        .context("write proof must be object")?
+                        .insert("source_path".into(), relative.clone().into());
+                    proofs.push(proof);
+                }
+                for usage in array_field(probe, "import_object_usages") {
+                    let mut proof = usage.clone();
+                    proof
+                        .as_object_mut()
+                        .context("usage proof must be object")?
+                        .insert("source_path".into(), relative.clone().into());
+                    usage_proofs.push(proof);
+                }
+            }
+        }
+
+        let exact_binding_proofs =
+            exact_module_usage_proofs(&usage_proofs, string_field(module, "sha256"));
+        let mut relation = serde_json::Map::new();
+        for field in [
+            "block",
+            "host_effect_value",
+            "host_wrapper_function",
+            "host_import_function",
+            "memory_read_value",
+            "memory_read_helper",
+            "base_value",
+            "runtime_binding",
+        ] {
+            relation.insert(
+                field.into(),
+                pair.get(field).cloned().unwrap_or(Value::Null),
+            );
+        }
+        let mut row = json!({
+            "module_sha256": module.get("sha256").cloned().unwrap_or(Value::Null),
+            "export": export.get("export").cloned().unwrap_or(Value::Null),
+            "host_import": host_import,
+            "raw_host_import_module": raw_module,
+            "raw_host_import": raw_import,
+            "offset": offset,
+            "carrier_candidates": carrier_candidates,
+            "correlation_basis": "exact_import_module_and_name",
+            "js_import_object_instantiation_site_proven": usage_proofs.len() == 1,
+            "js_import_object_instantiation_site_proofs": usage_proofs,
+            "import_binding_identity_proven": exact_binding_proofs.len() == 1,
+            "import_binding_identity_proofs": exact_binding_proofs,
+            "import_binding_identity_limitation": if exact_binding_proofs.len() == 1 {
+                Value::Null
+            } else {
+                "no unique carrier proof ties this exact recovered module SHA to the exact import object at one WebAssembly instantiation site".into()
+            },
+            "js_set_u32_shape_proven": proofs.len() == 1,
+            "js_set_u32_shape_proofs": proofs,
+            "wasm_relation": Value::Object(relation),
+        });
+        let mut ambiguities = Vec::new();
+        if proofs.len() > 1 {
+            row["js_set_u32_shape_proven"] = false.into();
+            ambiguities.push("multiple carrier sources prove the same import write/offset");
+        }
+        if usage_proofs.len() > 1 {
+            row["js_import_object_instantiation_site_proven"] = false.into();
+            ambiguities.push(
+                "multiple carrier sources prove import-object WebAssembly instantiation sites",
+            );
+        }
+        if exact_binding_proofs.len() > 1 {
+            row["import_binding_identity_proven"] = false.into();
+            ambiguities
+                .push("multiple carrier sources prove exact module/import-object binding identity");
+        }
+        if !ambiguities.is_empty() {
+            row["ambiguity"] = ambiguities.join("; ").into();
+        }
+        Ok(row)
+    }
+
+    fn copied_input_candidate(
+        &mut self,
+        scope: &BoundaryExport<'_>,
+        candidate: &Value,
+    ) -> Result<Value> {
+        let module = scope.module;
+        let export = scope.export;
+        let analysis = scope.analysis;
+        let report = scope.report;
+        let function_imports = scope.function_imports;
+        let carrier_candidates = scope.carrier_candidates;
+        let export_name = string_field(export, "export");
+        let project = self.project;
+        let budgets = self.budgets;
+        let stage_budget = &self.stage_budget;
+        let full_cache = &mut self.full_cache;
+        let carrier_sources = &mut self.carrier_sources;
+        let set_import = usize_field(candidate, "set_import_function")
+            .and_then(|index| function_imports.get(index));
+        let constructor_import = usize_field(candidate, "constructor_import_function")
+            .and_then(|index| function_imports.get(index));
+        let memory_import = usize_field(candidate, "constructor_input_memory_import_function")
+            .and_then(|index| function_imports.get(index));
+        let set_module = set_import.and_then(|imported| string_field(imported, "module"));
+        let set_name = set_import.and_then(|imported| string_field(imported, "name"));
+        let constructor_module =
+            constructor_import.and_then(|imported| string_field(imported, "module"));
+        let constructor_name =
+            constructor_import.and_then(|imported| string_field(imported, "name"));
+        let memory_module = memory_import.and_then(|imported| string_field(imported, "module"));
+        let memory_name = memory_import.and_then(|imported| string_field(imported, "name"));
+
+        let mut proofs = Vec::new();
+        if let (
+            Some(set_module),
+            Some(set_name),
+            Some(constructor_module),
+            Some(constructor_name),
+        ) = (set_module, set_name, constructor_module, constructor_name)
+        {
+            for relative in carrier_candidates {
+                stage_budget.checkpoint()?;
+                let source = project.join(relative);
+                if !source.is_file() {
+                    continue;
+                }
+                carrier_sources.insert(relative.clone());
+                if !full_cache.contains_key(relative) {
+                    let budget = budgets.operation_under(
+                        stage_budget,
+                        AnalysisOperation::WasmAnalysis,
+                        source.display().to_string(),
+                    );
+                    full_cache.insert(relative.clone(), semantics_for_source(&source, &budget)?);
+                }
+                let document = full_cache
+                    .get(relative)
+                    .context("missing full semantics cache")?;
+                let set_matches =
+                    matching_handler(document, set_module, set_name, "typed_array_set");
+                let constructor_matches = matching_handler(
+                    document,
+                    constructor_module,
+                    constructor_name,
+                    "uint32_array_constructor",
+                )
+                .into_iter()
+                .filter(|handler| usize_field(handler, "element_width_bits") == Some(32))
+                .collect::<Vec<_>>();
+                if set_matches.len() != 1 || constructor_matches.len() != 1 {
+                    continue;
+                }
+                let set_usages = matching_usages(document, set_module, set_name);
+                let constructor_usages =
+                    matching_usages(document, constructor_module, constructor_name);
+                let binding_proofs = common_exact_binding_proofs(
+                    &set_usages,
+                    &constructor_usages,
+                    string_field(module, "sha256"),
+                );
+                let memory_match_context = ModuleMemoryMatchContext {
+                    document,
+                    module_sha256: string_field(module, "sha256"),
+                    export_name,
+                    binding_proofs: &binding_proofs,
+                    report,
+                };
+                let memory_proofs = matching_module_memory_proofs(
+                    &memory_match_context,
+                    memory_module,
+                    memory_name,
+                    candidate,
+                );
+                let length_barrier_proofs = source_length_barrier_proofs(
+                    document,
+                    function_imports,
+                    candidate,
+                    string_field(module, "sha256"),
+                    &binding_proofs,
+                );
+                proofs.push(json!({
+                    "source_path": relative,
+                    "set_handler": set_matches[0],
+                    "constructor_handler": constructor_matches[0],
+                    "import_binding_identity_proofs": binding_proofs,
+                    "module_memory_identity_proofs": memory_proofs,
+                    "source_length_barrier_proofs": length_barrier_proofs,
+                }));
+            }
+        }
+
+        let copied_binding_proofs = proofs
+            .iter()
+            .flat_map(|proof| {
+                let source = string_field(proof, "source_path")
+                    .unwrap_or_default()
+                    .to_owned();
+                array_field(proof, "import_binding_identity_proofs")
+                    .iter()
+                    .cloned()
+                    .map(move |mut binding| {
+                        if let Some(object) = binding.as_object_mut() {
+                            object.insert("source_path".into(), source.clone().into());
+                        }
+                        binding
+                    })
+            })
+            .collect::<Vec<_>>();
+        let module_memory_proofs = proofs
+            .iter()
+            .flat_map(|proof| {
+                let source = string_field(proof, "source_path")
+                    .unwrap_or_default()
+                    .to_owned();
+                array_field(proof, "module_memory_identity_proofs")
+                    .iter()
+                    .cloned()
+                    .map(move |mut memory| {
+                        if let Some(object) = memory.as_object_mut() {
+                            object.insert("source_path".into(), source.clone().into());
+                        }
+                        memory
+                    })
+            })
+            .collect::<Vec<_>>();
+        let module_memory_sources = module_memory_proofs
+            .iter()
+            .filter_map(|proof| string_field(proof, "source_path"))
+            .collect::<BTreeSet<_>>();
+        let module_memory_proven = !module_memory_proofs.is_empty()
+            && module_memory_sources.len() == 1
+            && proofs.len() == 1
+            && copied_binding_proofs.len() == 1;
+        let destination_loads = array_field(candidate, "destination_loads");
+        let source_length_lower_bound = fixed_uint32_source_length_lower_bound(
+            if module_memory_proven {
+                &module_memory_proofs
+            } else {
+                &[]
+            },
+            export_name,
+            usize_field(candidate, "source_entry_parameter"),
+        );
+        let required_length_barriers = destination_loads
+            .iter()
+            .flat_map(|load| array_field(load, "source_length_import_barriers"))
+            .filter_map(Value::as_u64)
+            .filter_map(|value| usize::try_from(value).ok())
+            .collect::<BTreeSet<_>>();
+        let length_barrier_proofs = proofs
+            .iter()
+            .flat_map(|proof| {
+                let source = string_field(proof, "source_path")
+                    .unwrap_or_default()
+                    .to_owned();
+                array_field(proof, "source_length_barrier_proofs")
+                    .iter()
+                    .cloned()
+                    .map(move |mut barrier| {
+                        if let Some(object) = barrier.as_object_mut() {
+                            object.insert("source_path".into(), source.clone().into());
+                        }
+                        barrier
+                    })
+            })
+            .collect::<Vec<_>>();
+        let proven_length_barriers = length_barrier_proofs
+            .iter()
+            .filter_map(|proof| usize_field(proof, "function_import"))
+            .collect::<BTreeSet<_>>();
+        let required_internal_barriers = destination_loads
+            .iter()
+            .flat_map(|load| array_field(load, "internal_memory_mutation_call_barriers"))
+            .filter_map(Value::as_u64)
+            .filter_map(|value| usize::try_from(value).ok())
+            .collect::<BTreeSet<_>>();
+        let base_destination_byte_integrity_proven = !destination_loads.is_empty()
+            && source_length_lower_bound.is_some()
+            && destination_loads.iter().all(|load| {
+                bool_field(load, "unresolved_intervening_memory_mutation") == Some(false)
+                    && array_field(load, "other_import_call_barriers").is_empty()
+            })
+            && proven_length_barriers == required_length_barriers
+            && (required_length_barriers.is_empty() || proofs.len() == 1);
+        let element_shift = usize_field(candidate, "destination_element_index_shift");
+        let base_zero_bits =
+            usize_field(candidate, "destination_base_guaranteed_trailing_zero_bits");
+        let static_destination_base_alignment_proven =
+            element_shift == Some(2) && base_zero_bits.is_some_and(|bits| bits >= 2);
+
+        let mut fresh_alignment_proof = None;
+        let mut fresh_document = None;
+        if module_memory_proven && module_memory_sources.len() == 1 {
+            if let Some(source_path) = module_memory_sources.iter().next() {
+                fresh_document = full_cache.get(*source_path);
+                if let Some(document) = fresh_document {
+                    let context = CopiedInputProofContext {
+                        project,
+                        module,
+                        report,
+                        function_imports: function_imports,
+                        document,
+                        module_memory_proofs: &module_memory_proofs,
+                        binding_proofs: &copied_binding_proofs,
+                        export_name,
+                        budget: stage_budget,
+                    };
+                    stage_budget.checkpoint()?;
+                    fresh_alignment_proof = fresh_destination_alignment_proof(&context, candidate);
+                    stage_budget.checkpoint()?;
+                }
+            }
+        }
+        let destination_base_alignment_proven =
+            static_destination_base_alignment_proven || fresh_alignment_proof.is_some();
+        let fresh_cleanup_proof =
+            if base_destination_byte_integrity_proven && !required_internal_barriers.is_empty() {
+                match (fresh_document, fresh_alignment_proof.as_ref()) {
+                    (Some(document), Some(alignment)) => {
+                        let context = CopiedInputProofContext {
+                            project,
+                            module,
+                            report,
+                            function_imports: function_imports,
+                            document,
+                            module_memory_proofs: &module_memory_proofs,
+                            binding_proofs: &copied_binding_proofs,
+                            export_name,
+                            budget: stage_budget,
+                        };
+                        stage_budget.checkpoint()?;
+                        let proof =
+                            fresh_cleanup_disjointness_proof(&context, candidate, Some(alignment));
+                        stage_budget.checkpoint()?;
+                        proof
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        let destination_byte_integrity_proven = base_destination_byte_integrity_proven
+            && (required_internal_barriers.is_empty() || fresh_cleanup_proof.is_some());
+        let (destination_load_interpretations, _) = interpreted_destination_loads(
+            candidate,
+            if module_memory_proven {
+                &module_memory_proofs
+            } else {
+                &[]
+            },
+            export_name,
+            destination_byte_integrity_proven,
+            destination_base_alignment_proven,
+        );
+        let destination_load_interpretation_proven = module_memory_proven
+            && destination_byte_integrity_proven
+            && !destination_load_interpretations.is_empty()
+            && destination_load_interpretations.len() == destination_loads.len();
+        let (source_word_runtime_bindings, source_word_returns, runtime_graph_proven) =
+            if destination_load_interpretation_proven {
+                source_word_semantic_overlay(analysis, &destination_load_interpretations)
+            } else {
+                (Vec::new(), Vec::new(), false)
+            };
+        let source_word_semantic_overlay_proven = destination_load_interpretation_proven
+            && !source_word_runtime_bindings.is_empty()
+            && source_word_runtime_bindings.len() == destination_load_interpretations.len();
+        let source_word_return_dependencies_proven = source_word_semantic_overlay_proven
+            && runtime_graph_proven
+            && !source_word_returns.is_empty();
+
+        let destination_alignment_basis = if static_destination_base_alignment_proven {
+            Value::String("static_ssa".into())
+        } else if fresh_alignment_proof.is_some() {
+            Value::String("fresh_exact_evaluation".into())
+        } else {
+            Value::Null
+        };
+        let destination_load_limitation = if destination_load_interpretation_proven {
+            Value::Null
+        } else if !module_memory_proven {
+            "module-memory identity is not proven".into()
+        } else if !destination_byte_integrity_proven {
+            "a potentially memory-mutating path exists between the proven Uint32Array.set and at least one destination load".into()
+        } else if !destination_base_alignment_proven {
+            "the destination base is not proven aligned to the Uint32Array element width".into()
+        } else {
+            "the exact carrier export-call argument is not proven to be a fixed-length Uint32Array covering every destination load".into()
+        };
+        let source_word_overlay_limitation = if source_word_semantic_overlay_proven {
+            Value::Null
+        } else if !destination_load_interpretation_proven {
+            "destination-load interpretation is not proven".into()
+        } else {
+            "the deep runtime-binding report does not preserve a unique binding for every interpreted load SSA value".into()
+        };
+        let source_word_return_limitation = if source_word_return_dependencies_proven {
+            Value::Null
+        } else if !source_word_semantic_overlay_proven {
+            "source-word runtime binding identity is not proven".into()
+        } else {
+            "the deep runtime dependency graph or semantic return records are missing, invalid, cyclic, or empty".into()
+        };
+
+        let mut row = json!({
+            "module_sha256": module.get("sha256").cloned().unwrap_or(Value::Null),
+            "export": export.get("export").cloned().unwrap_or(Value::Null),
+            "carrier_candidates": carrier_candidates,
+            "correlation_basis": "exact_import_module_and_name",
+            "raw_set_import_module": set_module,
+            "raw_set_import": set_name,
+            "raw_constructor_import_module": constructor_module,
+            "raw_constructor_import": constructor_name,
+            "raw_memory_import_module": memory_module,
+            "raw_memory_import": memory_name,
+            "wasm_structural_copy_candidate_proven": true,
+            "wasm_candidate": candidate,
+            "js_typed_array_copy_semantics_proven": proofs.len() == 1,
+            "js_typed_array_copy_semantics_proofs": proofs,
+            "import_binding_identity_proven": copied_binding_proofs.len() == 1,
+            "import_binding_identity_proofs": copied_binding_proofs,
+            "module_memory_identity_proven": module_memory_proven,
+            "module_memory_identity_proofs": module_memory_proofs,
+            "module_memory_identity_limitation": if module_memory_proven { Value::Null } else { "no unique carrier source proves that the constructor input comes from the exported memory of the exact module instance executing this copied-input export".into() },
+            "destination_byte_integrity_proven": destination_byte_integrity_proven,
+            "required_internal_memory_mutation_call_barriers": required_internal_barriers,
+            "fresh_cleanup_disjointness_proof": fresh_cleanup_proof,
+            "source_length_barrier_proofs": length_barrier_proofs,
+            "static_destination_base_alignment_proven": static_destination_base_alignment_proven,
+            "fresh_destination_base_alignment_proof": fresh_alignment_proof,
+            "destination_base_alignment_proven": destination_base_alignment_proven,
+            "destination_base_alignment_basis": destination_alignment_basis,
+            "destination_load_interpretation_proven": destination_load_interpretation_proven,
+            "destination_load_interpretations": destination_load_interpretations,
+            "source_word_semantic_overlay_proven": source_word_semantic_overlay_proven,
+            "source_word_runtime_bindings": source_word_runtime_bindings,
+            "runtime_dependency_graph_proven": runtime_graph_proven,
+            "source_word_return_dependencies_proven": source_word_return_dependencies_proven,
+            "source_word_returns": if source_word_return_dependencies_proven { Value::Array(source_word_returns) } else { Value::Array(Vec::new()) },
+            "source_word_return_dependencies_limitation": source_word_return_limitation,
+            "source_word_semantic_overlay_limitation": source_word_overlay_limitation,
+            "source_uint32_array_length_lower_bound": source_length_lower_bound,
+            "destination_load_interpretation_limitation": destination_load_limitation,
+            "destination_load_interpretation_contract": "each proven i32.load reads the unchanged Uint32Array.set destination word corresponding to ToUint32(source[index]); numeric equality requires little-endian typed-array storage",
+        });
+        if proofs.len() > 1 {
+            row["js_typed_array_copy_semantics_proven"] = false.into();
+            row["ambiguity"] =
+                "multiple carrier sources prove the same constructor/set import semantics".into();
+        }
+        if copied_binding_proofs.len() > 1 {
+            row["import_binding_identity_proven"] = false.into();
+            let prefix = string_field(&row, "ambiguity").unwrap_or_default();
+            row["ambiguity"] = format!(
+                "{}{}multiple exact module/import-object binding proofs",
+                prefix,
+                if prefix.is_empty() { "" } else { "; " }
+            )
+            .into();
+        }
+        if module_memory_sources.len() > 1 {
+            row["module_memory_identity_proven"] = false.into();
+            row["module_memory_identity_limitation"] =
+                "multiple carrier sources prove module-memory identity".into();
+            let prefix = string_field(&row, "ambiguity").unwrap_or_default();
+            row["ambiguity"] = format!(
+                "{}{}multiple module-memory carrier proofs",
+                prefix,
+                if prefix.is_empty() { "" } else { "; " }
+            )
+            .into();
+        }
+        Ok(row)
+    }
+
+    fn finish(self) -> Result<WasmJsBoundarySummary> {
+        let Self {
+            project,
+            stage_budget,
+            targeted_cache,
+            full_cache,
+            host_effect_rows,
+            copied_input_rows,
+            skipped_modules,
+            carrier_sources,
+            ..
+        } = self;
+        let module_count = host_effect_rows
+            .iter()
+            .chain(&copied_input_rows)
+            .filter_map(|row| string_field(row, "module_sha256"))
+            .collect::<BTreeSet<_>>()
+            .len();
+        let summary = json!({
+            "host_effect_pairs": host_effect_rows.len(),
+            "proven_js_set_u32_shapes": host_effect_rows.iter().filter(|row| bool_field(row, "js_set_u32_shape_proven") == Some(true)).count(),
+            "proven_js_import_object_instantiation_sites": host_effect_rows.iter().filter(|row| bool_field(row, "js_import_object_instantiation_site_proven") == Some(true)).count(),
+            "opaque_host_effect_pairs": host_effect_rows.iter().filter(|row| bool_field(row, "js_set_u32_shape_proven") != Some(true)).count(),
+            "copied_input_candidates": copied_input_rows.len(),
+            "proven_js_typed_array_copy_semantics": copied_input_rows.iter().filter(|row| bool_field(row, "js_typed_array_copy_semantics_proven") == Some(true)).count(),
+            "proven_host_import_binding_identities": host_effect_rows.iter().filter(|row| bool_field(row, "import_binding_identity_proven") == Some(true)).count(),
+            "proven_copied_input_binding_identities": copied_input_rows.iter().filter(|row| bool_field(row, "import_binding_identity_proven") == Some(true)).count(),
+            "proven_module_memory_identities": copied_input_rows.iter().filter(|row| bool_field(row, "module_memory_identity_proven") == Some(true)).count(),
+            "proven_destination_byte_integrities": copied_input_rows.iter().filter(|row| bool_field(row, "destination_byte_integrity_proven") == Some(true)).count(),
+            "proven_destination_base_alignments": copied_input_rows.iter().filter(|row| bool_field(row, "destination_base_alignment_proven") == Some(true)).count(),
+            "proven_destination_load_interpretations": copied_input_rows.iter().filter(|row| bool_field(row, "destination_load_interpretation_proven") == Some(true)).count(),
+            "proven_source_word_semantic_overlays": copied_input_rows.iter().filter(|row| bool_field(row, "source_word_semantic_overlay_proven") == Some(true)).count(),
+            "proven_source_word_return_dependencies": copied_input_rows.iter().filter(|row| bool_field(row, "source_word_return_dependencies_proven") == Some(true)).count(),
+            "modules": module_count,
+            "carrier_sources": carrier_sources.len(),
+            "probe_invocations": targeted_cache.len() + full_cache.len(),
+            "skipped_modules": skipped_modules.len(),
+        });
+        let document = json!({
+            "schema": WASM_JS_BOUNDARY.schema,
+            "wasm_schema_required": "wasm-redox/deep-v14",
+            "js_schema": "jsvm-wasm-import-semantics/v8",
+            "safe_static_only": true,
+            "bounded_wasm_ir_interpretation": true,
+            "source_word_semantic_overlay_contract": "deep runtime bindings and semantic returns preserve raw plus normalized structured semantic IR and exact SSA runtime-dependency edges. Boundary validation requires both IR forms to have the same exact runtime leaf set as the declared direct dependencies and to contain no duplicate definitions or dangling SSA references. Proven copied loads become source_word leaves in both boundary IR forms; unmatched runtime leaves retain exact identity plus transitive source-word provenance. Presentation is rendered from the validated structured IR; no $runtimeN text matching is used.",
+            "correlation_contract": "cross-language claims require exact WASM import module+name matches. Host-effect writes and typed-array input-copy candidates remain independent evidence families; source-word interpretation additionally requires exact instance/exported-memory identity, path-complete destination-byte integrity, destination-base element alignment, and fixed Uint32Array source coverage. Fresh-state alignment may use bounded Waffle-IR interpretation only after rejecting module start functions, imported state, imported or indirect calls, recursion, and all table operations in the evaluated call graph.",
+            "memory_write_interpretation": "DataView and typed-array interpretations require standard unmodified platform builtins; numeric equality between Uint32Array elements and WASM i32 loads additionally requires little-endian typed-array storage",
+            "host_effect_rows": host_effect_rows,
+            "copied_input_rows": copied_input_rows,
+            "skipped_modules": skipped_modules,
+            "summary": summary,
+        });
+        stage_budget.checkpoint()?;
+        write_artifact(project, WASM_JS_BOUNDARY, &document)?;
+
+        Ok(WasmJsBoundarySummary {
+            host_effect_pairs: usize_field(&document["summary"], "host_effect_pairs").unwrap_or(0),
+            proven_js_set_u32_shapes: usize_field(&document["summary"], "proven_js_set_u32_shapes")
+                .unwrap_or(0),
+            copied_input_candidates: usize_field(&document["summary"], "copied_input_candidates")
+                .unwrap_or(0),
+            proven_js_typed_array_copy_semantics: usize_field(
+                &document["summary"],
+                "proven_js_typed_array_copy_semantics",
+            )
+            .unwrap_or(0),
+            proven_module_memory_identities: usize_field(
+                &document["summary"],
+                "proven_module_memory_identities",
+            )
+            .unwrap_or(0),
+            proven_destination_load_interpretations: usize_field(
+                &document["summary"],
+                "proven_destination_load_interpretations",
+            )
+            .unwrap_or(0),
+        })
+    }
+}
+
 /// Correlate recovered WebAssembly module identities with JavaScript boundary usage.
 ///
 /// # Errors
@@ -1412,650 +2121,22 @@ pub fn correlate_project(
             (i64_field(unit, "exit") == Some(0)).then(|| (raw.to_owned(), output.to_owned()))
         })
         .collect::<BTreeMap<_, _>>();
-
-    let mut targeted_cache = HashMap::<(String, String, String, u32), Value>::new();
-    let mut full_cache = HashMap::<String, Value>::new();
-    let mut host_effect_rows = Vec::<Value>::new();
-    let mut copied_input_rows = Vec::<Value>::new();
-    let mut skipped_modules = Vec::<Value>::new();
-    let mut carrier_sources = BTreeSet::<String>::new();
-
+    let mut context = BoundaryCorrelation {
+        project,
+        budgets,
+        stage_budget,
+        deob_by_raw,
+        targeted_cache: HashMap::new(),
+        full_cache: HashMap::new(),
+        host_effect_rows: Vec::new(),
+        copied_input_rows: Vec::new(),
+        skipped_modules: Vec::new(),
+        carrier_sources: BTreeSet::new(),
+    };
     for module in array_field(&wasm_index, "modules") {
-        stage_budget.checkpoint()?;
-        if string_field(module, "status") != Some("ok")
-            || string_field(module, "deep_path").is_none()
-        {
-            continue;
-        }
-        let deep_path =
-            project.join(string_field(module, "deep_path").context("missing deep path")?);
-        let report_path =
-            project.join(string_field(module, "report_path").context("missing report path")?);
-        let deep = read_json(&deep_path)?;
-        let report = read_json(&report_path)?;
-        let function_imports = array_field(&report, "imports")
-            .iter()
-            .filter(|imported| string_field(imported, "kind") == Some("function"))
-            .cloned()
-            .collect::<Vec<_>>();
-        if string_field(&deep, "schema") != Some("wasm-redox/deep-v14") {
-            skipped_modules.push(json!({
-                "sha256": module.get("sha256").cloned().unwrap_or(Value::Null),
-                "schema": deep.get("schema").cloned().unwrap_or(Value::Null),
-                "reason": "host-effect/read proof requires wasm-redox/deep-v14",
-            }));
-            continue;
-        }
-
-        let mut carrier_candidates = Vec::<String>::new();
-        for origin in array_field(module, "origins") {
-            stage_budget.checkpoint()?;
-            let Some(raw) = string_field(origin, "source_path") else {
-                continue;
-            };
-            let Some(output) = deob_by_raw.get(raw) else {
-                continue;
-            };
-            if !carrier_candidates.contains(output) {
-                carrier_candidates.push(output.clone());
-            }
-        }
-
-        for export in array_field(&deep, "exports") {
-            stage_budget.checkpoint()?;
-            let analysis = export.get("analysis").unwrap_or(&Value::Null);
-            let export_name = string_field(export, "export");
-
-            for pair in array_field(analysis, "opaque_host_effect_memory_reads") {
-                stage_budget.checkpoint()?;
-                let host_import = pair.get("host_import").cloned().unwrap_or(Value::Null);
-                let host_import_function = usize_field(pair, "host_import_function");
-                let raw_import = host_import_function
-                    .and_then(|index| function_imports.get(index))
-                    .and_then(|imported| string_field(imported, "name"));
-                let raw_module = host_import_function
-                    .and_then(|index| function_imports.get(index))
-                    .and_then(|imported| string_field(imported, "module"));
-                let offset = u32_field(pair, "offset");
-                let mut proofs = Vec::new();
-                let mut usage_proofs = Vec::new();
-
-                if let (Some(raw_module), Some(raw_import), Some(offset)) =
-                    (raw_module, raw_import, offset)
-                {
-                    for relative in &carrier_candidates {
-                        stage_budget.checkpoint()?;
-                        let source = project.join(relative);
-                        if !source.is_file() {
-                            continue;
-                        }
-                        carrier_sources.insert(relative.clone());
-                        let key = (
-                            relative.clone(),
-                            raw_module.to_owned(),
-                            raw_import.to_owned(),
-                            offset,
-                        );
-                        if !targeted_cache.contains_key(&key) {
-                            targeted_cache.insert(key.clone(), {
-                                let budget = budgets.operation_under(
-                                    &stage_budget,
-                                    AnalysisOperation::WasmAnalysis,
-                                    source.display().to_string(),
-                                );
-                                targeted_semantics_for_source(
-                                    &source, raw_module, raw_import, offset, &budget,
-                                )?
-                            });
-                        }
-                        let probe = targeted_cache.get(&key).context("missing targeted cache")?;
-                        let writes = array_field(probe, "shapes");
-                        anyhow::ensure!(
-                            writes.len() <= 1,
-                            "ambiguous JS WASM-import proof for {}: {}@{}",
-                            source.display(),
-                            raw_import,
-                            offset
-                        );
-                        if let Some(write) = writes.first() {
-                            let mut proof = write.clone();
-                            proof
-                                .as_object_mut()
-                                .context("write proof must be object")?
-                                .insert("source_path".into(), relative.clone().into());
-                            proofs.push(proof);
-                        }
-                        for usage in array_field(probe, "import_object_usages") {
-                            let mut proof = usage.clone();
-                            proof
-                                .as_object_mut()
-                                .context("usage proof must be object")?
-                                .insert("source_path".into(), relative.clone().into());
-                            usage_proofs.push(proof);
-                        }
-                    }
-                }
-
-                let exact_binding_proofs =
-                    exact_module_usage_proofs(&usage_proofs, string_field(module, "sha256"));
-                let mut relation = serde_json::Map::new();
-                for field in [
-                    "block",
-                    "host_effect_value",
-                    "host_wrapper_function",
-                    "host_import_function",
-                    "memory_read_value",
-                    "memory_read_helper",
-                    "base_value",
-                    "runtime_binding",
-                ] {
-                    relation.insert(
-                        field.into(),
-                        pair.get(field).cloned().unwrap_or(Value::Null),
-                    );
-                }
-                let mut row = json!({
-                    "module_sha256": module.get("sha256").cloned().unwrap_or(Value::Null),
-                    "export": export.get("export").cloned().unwrap_or(Value::Null),
-                    "host_import": host_import,
-                    "raw_host_import_module": raw_module,
-                    "raw_host_import": raw_import,
-                    "offset": offset,
-                    "carrier_candidates": carrier_candidates,
-                    "correlation_basis": "exact_import_module_and_name",
-                    "js_import_object_instantiation_site_proven": usage_proofs.len() == 1,
-                    "js_import_object_instantiation_site_proofs": usage_proofs,
-                    "import_binding_identity_proven": exact_binding_proofs.len() == 1,
-                    "import_binding_identity_proofs": exact_binding_proofs,
-                    "import_binding_identity_limitation": if exact_binding_proofs.len() == 1 {
-                        Value::Null
-                    } else {
-                        "no unique carrier proof ties this exact recovered module SHA to the exact import object at one WebAssembly instantiation site".into()
-                    },
-                    "js_set_u32_shape_proven": proofs.len() == 1,
-                    "js_set_u32_shape_proofs": proofs,
-                    "wasm_relation": Value::Object(relation),
-                });
-                let mut ambiguities = Vec::new();
-                if proofs.len() > 1 {
-                    row["js_set_u32_shape_proven"] = false.into();
-                    ambiguities.push("multiple carrier sources prove the same import write/offset");
-                }
-                if usage_proofs.len() > 1 {
-                    row["js_import_object_instantiation_site_proven"] = false.into();
-                    ambiguities.push(
-                        "multiple carrier sources prove import-object WebAssembly instantiation sites",
-                    );
-                }
-                if exact_binding_proofs.len() > 1 {
-                    row["import_binding_identity_proven"] = false.into();
-                    ambiguities.push(
-                        "multiple carrier sources prove exact module/import-object binding identity",
-                    );
-                }
-                if !ambiguities.is_empty() {
-                    row["ambiguity"] = ambiguities.join("; ").into();
-                }
-                host_effect_rows.push(row);
-            }
-
-            for candidate in array_field(analysis, "externref_bulk_copy_candidates") {
-                stage_budget.checkpoint()?;
-                let set_import = usize_field(candidate, "set_import_function")
-                    .and_then(|index| function_imports.get(index));
-                let constructor_import = usize_field(candidate, "constructor_import_function")
-                    .and_then(|index| function_imports.get(index));
-                let memory_import =
-                    usize_field(candidate, "constructor_input_memory_import_function")
-                        .and_then(|index| function_imports.get(index));
-                let set_module = set_import.and_then(|imported| string_field(imported, "module"));
-                let set_name = set_import.and_then(|imported| string_field(imported, "name"));
-                let constructor_module =
-                    constructor_import.and_then(|imported| string_field(imported, "module"));
-                let constructor_name =
-                    constructor_import.and_then(|imported| string_field(imported, "name"));
-                let memory_module =
-                    memory_import.and_then(|imported| string_field(imported, "module"));
-                let memory_name = memory_import.and_then(|imported| string_field(imported, "name"));
-
-                let mut proofs = Vec::new();
-                if let (
-                    Some(set_module),
-                    Some(set_name),
-                    Some(constructor_module),
-                    Some(constructor_name),
-                ) = (set_module, set_name, constructor_module, constructor_name)
-                {
-                    for relative in &carrier_candidates {
-                        stage_budget.checkpoint()?;
-                        let source = project.join(relative);
-                        if !source.is_file() {
-                            continue;
-                        }
-                        carrier_sources.insert(relative.clone());
-                        if !full_cache.contains_key(relative) {
-                            let budget = budgets.operation_under(
-                                &stage_budget,
-                                AnalysisOperation::WasmAnalysis,
-                                source.display().to_string(),
-                            );
-                            full_cache
-                                .insert(relative.clone(), semantics_for_source(&source, &budget)?);
-                        }
-                        let document = full_cache
-                            .get(relative)
-                            .context("missing full semantics cache")?;
-                        let set_matches =
-                            matching_handler(document, set_module, set_name, "typed_array_set");
-                        let constructor_matches = matching_handler(
-                            document,
-                            constructor_module,
-                            constructor_name,
-                            "uint32_array_constructor",
-                        )
-                        .into_iter()
-                        .filter(|handler| usize_field(handler, "element_width_bits") == Some(32))
-                        .collect::<Vec<_>>();
-                        if set_matches.len() != 1 || constructor_matches.len() != 1 {
-                            continue;
-                        }
-                        let set_usages = matching_usages(document, set_module, set_name);
-                        let constructor_usages =
-                            matching_usages(document, constructor_module, constructor_name);
-                        let binding_proofs = common_exact_binding_proofs(
-                            &set_usages,
-                            &constructor_usages,
-                            string_field(module, "sha256"),
-                        );
-                        let memory_match_context = ModuleMemoryMatchContext {
-                            document,
-                            module_sha256: string_field(module, "sha256"),
-                            export_name,
-                            binding_proofs: &binding_proofs,
-                            report: &report,
-                        };
-                        let memory_proofs = matching_module_memory_proofs(
-                            &memory_match_context,
-                            memory_module,
-                            memory_name,
-                            candidate,
-                        );
-                        let length_barrier_proofs = source_length_barrier_proofs(
-                            document,
-                            &function_imports,
-                            candidate,
-                            string_field(module, "sha256"),
-                            &binding_proofs,
-                        );
-                        proofs.push(json!({
-                            "source_path": relative,
-                            "set_handler": set_matches[0],
-                            "constructor_handler": constructor_matches[0],
-                            "import_binding_identity_proofs": binding_proofs,
-                            "module_memory_identity_proofs": memory_proofs,
-                            "source_length_barrier_proofs": length_barrier_proofs,
-                        }));
-                    }
-                }
-
-                let copied_binding_proofs = proofs
-                    .iter()
-                    .flat_map(|proof| {
-                        let source = string_field(proof, "source_path")
-                            .unwrap_or_default()
-                            .to_owned();
-                        array_field(proof, "import_binding_identity_proofs")
-                            .iter()
-                            .cloned()
-                            .map(move |mut binding| {
-                                if let Some(object) = binding.as_object_mut() {
-                                    object.insert("source_path".into(), source.clone().into());
-                                }
-                                binding
-                            })
-                    })
-                    .collect::<Vec<_>>();
-                let module_memory_proofs = proofs
-                    .iter()
-                    .flat_map(|proof| {
-                        let source = string_field(proof, "source_path")
-                            .unwrap_or_default()
-                            .to_owned();
-                        array_field(proof, "module_memory_identity_proofs")
-                            .iter()
-                            .cloned()
-                            .map(move |mut memory| {
-                                if let Some(object) = memory.as_object_mut() {
-                                    object.insert("source_path".into(), source.clone().into());
-                                }
-                                memory
-                            })
-                    })
-                    .collect::<Vec<_>>();
-                let module_memory_sources = module_memory_proofs
-                    .iter()
-                    .filter_map(|proof| string_field(proof, "source_path"))
-                    .collect::<BTreeSet<_>>();
-                let module_memory_proven = !module_memory_proofs.is_empty()
-                    && module_memory_sources.len() == 1
-                    && proofs.len() == 1
-                    && copied_binding_proofs.len() == 1;
-                let destination_loads = array_field(candidate, "destination_loads");
-                let source_length_lower_bound = fixed_uint32_source_length_lower_bound(
-                    if module_memory_proven {
-                        &module_memory_proofs
-                    } else {
-                        &[]
-                    },
-                    export_name,
-                    usize_field(candidate, "source_entry_parameter"),
-                );
-                let required_length_barriers = destination_loads
-                    .iter()
-                    .flat_map(|load| array_field(load, "source_length_import_barriers"))
-                    .filter_map(Value::as_u64)
-                    .filter_map(|value| usize::try_from(value).ok())
-                    .collect::<BTreeSet<_>>();
-                let length_barrier_proofs = proofs
-                    .iter()
-                    .flat_map(|proof| {
-                        let source = string_field(proof, "source_path")
-                            .unwrap_or_default()
-                            .to_owned();
-                        array_field(proof, "source_length_barrier_proofs")
-                            .iter()
-                            .cloned()
-                            .map(move |mut barrier| {
-                                if let Some(object) = barrier.as_object_mut() {
-                                    object.insert("source_path".into(), source.clone().into());
-                                }
-                                barrier
-                            })
-                    })
-                    .collect::<Vec<_>>();
-                let proven_length_barriers = length_barrier_proofs
-                    .iter()
-                    .filter_map(|proof| usize_field(proof, "function_import"))
-                    .collect::<BTreeSet<_>>();
-                let required_internal_barriers = destination_loads
-                    .iter()
-                    .flat_map(|load| array_field(load, "internal_memory_mutation_call_barriers"))
-                    .filter_map(Value::as_u64)
-                    .filter_map(|value| usize::try_from(value).ok())
-                    .collect::<BTreeSet<_>>();
-                let base_destination_byte_integrity_proven = !destination_loads.is_empty()
-                    && source_length_lower_bound.is_some()
-                    && destination_loads.iter().all(|load| {
-                        bool_field(load, "unresolved_intervening_memory_mutation") == Some(false)
-                            && array_field(load, "other_import_call_barriers").is_empty()
-                    })
-                    && proven_length_barriers == required_length_barriers
-                    && (required_length_barriers.is_empty() || proofs.len() == 1);
-                let element_shift = usize_field(candidate, "destination_element_index_shift");
-                let base_zero_bits =
-                    usize_field(candidate, "destination_base_guaranteed_trailing_zero_bits");
-                let static_destination_base_alignment_proven =
-                    element_shift == Some(2) && base_zero_bits.is_some_and(|bits| bits >= 2);
-
-                let mut fresh_alignment_proof = None;
-                let mut fresh_document = None;
-                if module_memory_proven && module_memory_sources.len() == 1 {
-                    if let Some(source_path) = module_memory_sources.iter().next() {
-                        fresh_document = full_cache.get(*source_path);
-                        if let Some(document) = fresh_document {
-                            let context = CopiedInputProofContext {
-                                project,
-                                module,
-                                report: &report,
-                                function_imports: &function_imports,
-                                document,
-                                module_memory_proofs: &module_memory_proofs,
-                                binding_proofs: &copied_binding_proofs,
-                                export_name,
-                                budget: &stage_budget,
-                            };
-                            stage_budget.checkpoint()?;
-                            fresh_alignment_proof =
-                                fresh_destination_alignment_proof(&context, candidate);
-                            stage_budget.checkpoint()?;
-                        }
-                    }
-                }
-                let destination_base_alignment_proven =
-                    static_destination_base_alignment_proven || fresh_alignment_proof.is_some();
-                let fresh_cleanup_proof = if base_destination_byte_integrity_proven
-                    && !required_internal_barriers.is_empty()
-                {
-                    match (fresh_document, fresh_alignment_proof.as_ref()) {
-                        (Some(document), Some(alignment)) => {
-                            let context = CopiedInputProofContext {
-                                project,
-                                module,
-                                report: &report,
-                                function_imports: &function_imports,
-                                document,
-                                module_memory_proofs: &module_memory_proofs,
-                                binding_proofs: &copied_binding_proofs,
-                                export_name,
-                                budget: &stage_budget,
-                            };
-                            stage_budget.checkpoint()?;
-                            let proof = fresh_cleanup_disjointness_proof(
-                                &context,
-                                candidate,
-                                Some(alignment),
-                            );
-                            stage_budget.checkpoint()?;
-                            proof
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                let destination_byte_integrity_proven = base_destination_byte_integrity_proven
-                    && (required_internal_barriers.is_empty() || fresh_cleanup_proof.is_some());
-                let (destination_load_interpretations, _) = interpreted_destination_loads(
-                    candidate,
-                    if module_memory_proven {
-                        &module_memory_proofs
-                    } else {
-                        &[]
-                    },
-                    export_name,
-                    destination_byte_integrity_proven,
-                    destination_base_alignment_proven,
-                );
-                let destination_load_interpretation_proven = module_memory_proven
-                    && destination_byte_integrity_proven
-                    && !destination_load_interpretations.is_empty()
-                    && destination_load_interpretations.len() == destination_loads.len();
-                let (source_word_runtime_bindings, source_word_returns, runtime_graph_proven) =
-                    if destination_load_interpretation_proven {
-                        source_word_semantic_overlay(analysis, &destination_load_interpretations)
-                    } else {
-                        (Vec::new(), Vec::new(), false)
-                    };
-                let source_word_semantic_overlay_proven = destination_load_interpretation_proven
-                    && !source_word_runtime_bindings.is_empty()
-                    && source_word_runtime_bindings.len() == destination_load_interpretations.len();
-                let source_word_return_dependencies_proven = source_word_semantic_overlay_proven
-                    && runtime_graph_proven
-                    && !source_word_returns.is_empty();
-
-                let destination_alignment_basis = if static_destination_base_alignment_proven {
-                    Value::String("static_ssa".into())
-                } else if fresh_alignment_proof.is_some() {
-                    Value::String("fresh_exact_evaluation".into())
-                } else {
-                    Value::Null
-                };
-                let destination_load_limitation = if destination_load_interpretation_proven {
-                    Value::Null
-                } else if !module_memory_proven {
-                    "module-memory identity is not proven".into()
-                } else if !destination_byte_integrity_proven {
-                    "a potentially memory-mutating path exists between the proven Uint32Array.set and at least one destination load".into()
-                } else if !destination_base_alignment_proven {
-                    "the destination base is not proven aligned to the Uint32Array element width"
-                        .into()
-                } else {
-                    "the exact carrier export-call argument is not proven to be a fixed-length Uint32Array covering every destination load".into()
-                };
-                let source_word_overlay_limitation = if source_word_semantic_overlay_proven {
-                    Value::Null
-                } else if !destination_load_interpretation_proven {
-                    "destination-load interpretation is not proven".into()
-                } else {
-                    "the deep runtime-binding report does not preserve a unique binding for every interpreted load SSA value".into()
-                };
-                let source_word_return_limitation = if source_word_return_dependencies_proven {
-                    Value::Null
-                } else if !source_word_semantic_overlay_proven {
-                    "source-word runtime binding identity is not proven".into()
-                } else {
-                    "the deep runtime dependency graph or semantic return records are missing, invalid, cyclic, or empty".into()
-                };
-
-                let mut row = json!({
-                    "module_sha256": module.get("sha256").cloned().unwrap_or(Value::Null),
-                    "export": export.get("export").cloned().unwrap_or(Value::Null),
-                    "carrier_candidates": carrier_candidates,
-                    "correlation_basis": "exact_import_module_and_name",
-                    "raw_set_import_module": set_module,
-                    "raw_set_import": set_name,
-                    "raw_constructor_import_module": constructor_module,
-                    "raw_constructor_import": constructor_name,
-                    "raw_memory_import_module": memory_module,
-                    "raw_memory_import": memory_name,
-                    "wasm_structural_copy_candidate_proven": true,
-                    "wasm_candidate": candidate,
-                    "js_typed_array_copy_semantics_proven": proofs.len() == 1,
-                    "js_typed_array_copy_semantics_proofs": proofs,
-                    "import_binding_identity_proven": copied_binding_proofs.len() == 1,
-                    "import_binding_identity_proofs": copied_binding_proofs,
-                    "module_memory_identity_proven": module_memory_proven,
-                    "module_memory_identity_proofs": module_memory_proofs,
-                    "module_memory_identity_limitation": if module_memory_proven { Value::Null } else { "no unique carrier source proves that the constructor input comes from the exported memory of the exact module instance executing this copied-input export".into() },
-                    "destination_byte_integrity_proven": destination_byte_integrity_proven,
-                    "required_internal_memory_mutation_call_barriers": required_internal_barriers,
-                    "fresh_cleanup_disjointness_proof": fresh_cleanup_proof,
-                    "source_length_barrier_proofs": length_barrier_proofs,
-                    "static_destination_base_alignment_proven": static_destination_base_alignment_proven,
-                    "fresh_destination_base_alignment_proof": fresh_alignment_proof,
-                    "destination_base_alignment_proven": destination_base_alignment_proven,
-                    "destination_base_alignment_basis": destination_alignment_basis,
-                    "destination_load_interpretation_proven": destination_load_interpretation_proven,
-                    "destination_load_interpretations": destination_load_interpretations,
-                    "source_word_semantic_overlay_proven": source_word_semantic_overlay_proven,
-                    "source_word_runtime_bindings": source_word_runtime_bindings,
-                    "runtime_dependency_graph_proven": runtime_graph_proven,
-                    "source_word_return_dependencies_proven": source_word_return_dependencies_proven,
-                    "source_word_returns": if source_word_return_dependencies_proven { Value::Array(source_word_returns) } else { Value::Array(Vec::new()) },
-                    "source_word_return_dependencies_limitation": source_word_return_limitation,
-                    "source_word_semantic_overlay_limitation": source_word_overlay_limitation,
-                    "source_uint32_array_length_lower_bound": source_length_lower_bound,
-                    "destination_load_interpretation_limitation": destination_load_limitation,
-                    "destination_load_interpretation_contract": "each proven i32.load reads the unchanged Uint32Array.set destination word corresponding to ToUint32(source[index]); numeric equality requires little-endian typed-array storage",
-                });
-                if proofs.len() > 1 {
-                    row["js_typed_array_copy_semantics_proven"] = false.into();
-                    row["ambiguity"] =
-                        "multiple carrier sources prove the same constructor/set import semantics"
-                            .into();
-                }
-                if copied_binding_proofs.len() > 1 {
-                    row["import_binding_identity_proven"] = false.into();
-                    let prefix = string_field(&row, "ambiguity").unwrap_or_default();
-                    row["ambiguity"] = format!(
-                        "{}{}multiple exact module/import-object binding proofs",
-                        prefix,
-                        if prefix.is_empty() { "" } else { "; " }
-                    )
-                    .into();
-                }
-                if module_memory_sources.len() > 1 {
-                    row["module_memory_identity_proven"] = false.into();
-                    row["module_memory_identity_limitation"] =
-                        "multiple carrier sources prove module-memory identity".into();
-                    let prefix = string_field(&row, "ambiguity").unwrap_or_default();
-                    row["ambiguity"] = format!(
-                        "{}{}multiple module-memory carrier proofs",
-                        prefix,
-                        if prefix.is_empty() { "" } else { "; " }
-                    )
-                    .into();
-                }
-                copied_input_rows.push(row);
-            }
-        }
+        context.process_module(module)?;
     }
-
-    let module_count = host_effect_rows
-        .iter()
-        .chain(&copied_input_rows)
-        .filter_map(|row| string_field(row, "module_sha256"))
-        .collect::<BTreeSet<_>>()
-        .len();
-    let summary = json!({
-        "host_effect_pairs": host_effect_rows.len(),
-        "proven_js_set_u32_shapes": host_effect_rows.iter().filter(|row| bool_field(row, "js_set_u32_shape_proven") == Some(true)).count(),
-        "proven_js_import_object_instantiation_sites": host_effect_rows.iter().filter(|row| bool_field(row, "js_import_object_instantiation_site_proven") == Some(true)).count(),
-        "opaque_host_effect_pairs": host_effect_rows.iter().filter(|row| bool_field(row, "js_set_u32_shape_proven") != Some(true)).count(),
-        "copied_input_candidates": copied_input_rows.len(),
-        "proven_js_typed_array_copy_semantics": copied_input_rows.iter().filter(|row| bool_field(row, "js_typed_array_copy_semantics_proven") == Some(true)).count(),
-        "proven_host_import_binding_identities": host_effect_rows.iter().filter(|row| bool_field(row, "import_binding_identity_proven") == Some(true)).count(),
-        "proven_copied_input_binding_identities": copied_input_rows.iter().filter(|row| bool_field(row, "import_binding_identity_proven") == Some(true)).count(),
-        "proven_module_memory_identities": copied_input_rows.iter().filter(|row| bool_field(row, "module_memory_identity_proven") == Some(true)).count(),
-        "proven_destination_byte_integrities": copied_input_rows.iter().filter(|row| bool_field(row, "destination_byte_integrity_proven") == Some(true)).count(),
-        "proven_destination_base_alignments": copied_input_rows.iter().filter(|row| bool_field(row, "destination_base_alignment_proven") == Some(true)).count(),
-        "proven_destination_load_interpretations": copied_input_rows.iter().filter(|row| bool_field(row, "destination_load_interpretation_proven") == Some(true)).count(),
-        "proven_source_word_semantic_overlays": copied_input_rows.iter().filter(|row| bool_field(row, "source_word_semantic_overlay_proven") == Some(true)).count(),
-        "proven_source_word_return_dependencies": copied_input_rows.iter().filter(|row| bool_field(row, "source_word_return_dependencies_proven") == Some(true)).count(),
-        "modules": module_count,
-        "carrier_sources": carrier_sources.len(),
-        "probe_invocations": targeted_cache.len() + full_cache.len(),
-        "skipped_modules": skipped_modules.len(),
-    });
-    let document = json!({
-        "schema": WASM_JS_BOUNDARY.schema,
-        "wasm_schema_required": "wasm-redox/deep-v14",
-        "js_schema": "jsvm-wasm-import-semantics/v8",
-        "safe_static_only": true,
-        "bounded_wasm_ir_interpretation": true,
-        "source_word_semantic_overlay_contract": "deep runtime bindings and semantic returns preserve raw plus normalized structured semantic IR and exact SSA runtime-dependency edges. Boundary validation requires both IR forms to have the same exact runtime leaf set as the declared direct dependencies and to contain no duplicate definitions or dangling SSA references. Proven copied loads become source_word leaves in both boundary IR forms; unmatched runtime leaves retain exact identity plus transitive source-word provenance. Presentation is rendered from the validated structured IR; no $runtimeN text matching is used.",
-        "correlation_contract": "cross-language claims require exact WASM import module+name matches. Host-effect writes and typed-array input-copy candidates remain independent evidence families; source-word interpretation additionally requires exact instance/exported-memory identity, path-complete destination-byte integrity, destination-base element alignment, and fixed Uint32Array source coverage. Fresh-state alignment may use bounded Waffle-IR interpretation only after rejecting module start functions, imported state, imported or indirect calls, recursion, and all table operations in the evaluated call graph.",
-        "memory_write_interpretation": "DataView and typed-array interpretations require standard unmodified platform builtins; numeric equality between Uint32Array elements and WASM i32 loads additionally requires little-endian typed-array storage",
-        "host_effect_rows": host_effect_rows,
-        "copied_input_rows": copied_input_rows,
-        "skipped_modules": skipped_modules,
-        "summary": summary,
-    });
-    stage_budget.checkpoint()?;
-    write_artifact(project, WASM_JS_BOUNDARY, &document)?;
-
-    Ok(WasmJsBoundarySummary {
-        host_effect_pairs: usize_field(&document["summary"], "host_effect_pairs").unwrap_or(0),
-        proven_js_set_u32_shapes: usize_field(&document["summary"], "proven_js_set_u32_shapes")
-            .unwrap_or(0),
-        copied_input_candidates: usize_field(&document["summary"], "copied_input_candidates")
-            .unwrap_or(0),
-        proven_js_typed_array_copy_semantics: usize_field(
-            &document["summary"],
-            "proven_js_typed_array_copy_semantics",
-        )
-        .unwrap_or(0),
-        proven_module_memory_identities: usize_field(
-            &document["summary"],
-            "proven_module_memory_identities",
-        )
-        .unwrap_or(0),
-        proven_destination_load_interpretations: usize_field(
-            &document["summary"],
-            "proven_destination_load_interpretations",
-        )
-        .unwrap_or(0),
-    })
+    context.finish()
 }
 
 #[cfg(test)]
