@@ -792,8 +792,7 @@ fn attach_observed_opcodes(scanner: &mut Scanner<'_>) {
                     && decoder.builder_start.is_some()
             })
             .max_by_key(|decoder| decoder.selector_masks.len())
-            .map(|decoder| observed_opcodes(decoder, &scanner.push_builders))
-            .unwrap_or_default();
+            .map_or_default(|decoder| observed_opcodes(decoder, &scanner.push_builders));
         let observed_set: BTreeSet<u64> = observed.iter().copied().collect();
         map.observed_opcodes = observed;
         for handler in &mut map.handlers {

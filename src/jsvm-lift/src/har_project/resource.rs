@@ -37,8 +37,7 @@ pub fn resource_kind(url: &str, mime: &str) -> &'static str {
     let m = mime_base(mime).to_ascii_lowercase();
     let path = Url::parse(url)
         .ok()
-        .map(|u| u.path().to_ascii_lowercase())
-        .unwrap_or_default();
+        .map_or_default(|u| u.path().to_ascii_lowercase());
     // URL paths (not query strings) are already ASCII-lowercased above.
     // Compare the final extension component, not a case-folded filename.
     let extension = path.rsplit_once('.').map(|(_, suffix)| suffix);
@@ -124,14 +123,11 @@ pub(super) fn output_path_for(url: &str, kind: &str, mime: &str) -> String {
     };
     let scheme = sanitize_component(parsed.scheme());
     let host = sanitize_component(parsed.host_str().unwrap_or("_no_host"));
-    let mut parts: Vec<String> = parsed
-        .path_segments()
-        .map(|it| {
-            it.filter(|s| !s.is_empty())
-                .map(sanitize_component)
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut parts: Vec<String> = parsed.path_segments().map_or_default(|it| {
+        it.filter(|s| !s.is_empty())
+            .map(sanitize_component)
+            .collect()
+    });
     if parts.is_empty() {
         parts.push(format!("index.{}", extension_for(kind, mime)));
     } else if let Some(last) = parts.last_mut() {

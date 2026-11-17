@@ -271,8 +271,7 @@ impl Collector<'_> {
                 probe
                     .magic
                     .as_deref()
-                    .map(|kind| format!(" ({kind})"))
-                    .unwrap_or_default()
+                    .map_or_default(|kind| format!(" ({kind})"))
             ),
         );
     }

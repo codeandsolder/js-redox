@@ -57,7 +57,7 @@ pub fn script_preload_links(html: &str) -> Vec<(String, &'static str)> {
             break;
         };
         let attrs = parse_attrs(&html[start..=end]);
-        let rel = attrs.get("rel").map(String::as_str).unwrap_or_default();
+        let rel = attrs.get("rel").map_or_default(String::as_str);
         let modulepreload = rel
             .split_ascii_whitespace()
             .any(|word| word.eq_ignore_ascii_case("modulepreload"));

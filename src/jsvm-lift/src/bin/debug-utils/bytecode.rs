@@ -271,8 +271,7 @@ pub fn dump_linked_bytecode(
                         .unwrap_or("?"),
                     domain
                         .as_ref()
-                        .map(|values| format!("{values:?}"))
-                        .unwrap_or_else(|| "?".to_owned())
+                        .map_or_else(|| "?".to_owned(), |values| format!("{values:?}"))
                 );
                 if let Some(domain) = &domain {
                     report_selector_domain.extend(domain.iter().copied());

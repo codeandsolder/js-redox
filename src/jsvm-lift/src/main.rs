@@ -43,8 +43,7 @@ fn print_embedded(report: &EmbeddedScanReport, min_score: u32, depth: usize) {
         report
             .dump_path
             .as_ref()
-            .map(|p| format!(" -> {p}"))
-            .unwrap_or_default()
+            .map_or_default(|p| format!(" -> {p}"))
     );
 
     for d in report.decoder_candidates.iter().take(12) {

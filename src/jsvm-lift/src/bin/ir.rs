@@ -116,7 +116,7 @@ fn main() -> Result<()> {
         .into_iter()
         .map(|vm| {
             let prov = provenance.get(&vm.decoder);
-            let observed = prov.map(|p| p.observed.clone()).unwrap_or_default();
+            let observed = prov.map_or_default(|p| p.observed.clone());
 
             let opcodes = vm
                 .opcodes

@@ -799,13 +799,13 @@ impl<'s> Analyzer<'s> {
         let Expression::ComputedMemberExpression(member) = unwrap_parens(expr) else {
             return;
         };
+        let empty_schedules = HashSet::new();
         let schedules = self
             .function_stack
             .last()
-            .map(|current| current.numeric_schedules.clone())
-            .unwrap_or_default();
+            .map_or(&empty_schedules, |current| &current.numeric_schedules);
         let schedule_backed =
-            match expression_uses_numeric_schedule(&member.expression, &schedules, &self.budget) {
+            match expression_uses_numeric_schedule(&member.expression, schedules, &self.budget) {
                 Ok(schedule_backed) => schedule_backed,
                 Err(error) => {
                     self.budget_error = Some(error);
@@ -937,14 +937,14 @@ impl<'s> Analyzer<'s> {
                     return;
                 }
                 let index = fragment(self.source, member.expression.span());
+                let empty_schedules = HashSet::new();
                 let schedules = self
                     .function_stack
                     .last()
-                    .map(|current| current.numeric_schedules.clone())
-                    .unwrap_or_default();
+                    .map_or(&empty_schedules, |current| &current.numeric_schedules);
                 let schedule_backed = match expression_uses_numeric_schedule(
                     &member.expression,
-                    &schedules,
+                    schedules,
                     &self.budget,
                 ) {
                     Ok(schedule_backed) => schedule_backed,

@@ -669,9 +669,7 @@ mod tests {
     use super::recover_readable_names;
 
     fn named(source: &str) -> String {
-        recover_readable_names(source)
-            .map(|(text, _)| text)
-            .unwrap_or_else(|| source.to_string())
+        recover_readable_names(source).map_or_else(|| source.to_string(), |(text, _)| text)
     }
 
     #[test]

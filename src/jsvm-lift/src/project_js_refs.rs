@@ -866,8 +866,7 @@ pub fn scan_project_references(
                 .to_owned();
             let mut choices = candidates
                 .get(&(row_id, ref_index))
-                .map(|map| map.values().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
+                .map_or_default(|map| map.values().cloned().collect::<Vec<_>>());
             if kind == DYNAMIC_GLOB_KIND {
                 let raw_matches = dynamic_glob_matches
                     .get(&(row_id, ref_index))
@@ -908,10 +907,7 @@ pub fn scan_project_references(
                     .collect::<BTreeSet<_>>();
                 let candidate_count = resolved.len();
                 let resolved_url = if candidate_count == 1 {
-                    resolved
-                        .pop_first()
-                        .map(Value::String)
-                        .unwrap_or(Value::Null)
+                    resolved.pop_first().map_or(Value::Null, Value::String)
                 } else {
                     Value::Null
                 };

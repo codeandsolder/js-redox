@@ -142,8 +142,7 @@ impl From<SourceModeArg> for SourceMode {
 
 fn source_mode(args: &SourceArgs) -> SourceMode {
     args.source_mode
-        .map(SourceMode::from)
-        .unwrap_or_else(|| SourceMode::for_path(&args.input))
+        .map_or_else(|| SourceMode::for_path(&args.input), SourceMode::from)
 }
 
 #[derive(ClapArgs, Debug)]
