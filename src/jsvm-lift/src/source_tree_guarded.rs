@@ -266,6 +266,11 @@ impl SelectorDispatch {
     }
 }
 
+struct ProvenFastPath {
+    constants: Vec<(usize, String)>,
+    body: String,
+}
+
 pub fn install_guarded_specializations(
     original: &str,
     variants: &[GuardedVariant],
@@ -285,10 +290,6 @@ pub fn install_guarded_specializations(
         slots: BTreeMap::new(),
     };
     collector.visit_program(&parsed.program);
-    struct ProvenFastPath {
-        constants: Vec<(usize, String)>,
-        body: String,
-    }
     let mut grouped = BTreeMap::<[u32; 2], Vec<ProvenFastPath>>::new();
     for variant in variants {
         let Some(slot) = collector.slots.get(&variant.function_span) else {
