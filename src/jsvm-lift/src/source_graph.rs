@@ -84,40 +84,48 @@ struct GraphBuilder {
 impl GraphBuilder {
     fn add_node(&mut self, id: impl Into<String>, fields: Value) -> Result<String> {
         let id = id.into();
-        let fields = fields
-            .as_object()
-            .context("graph node fields must be a JSON object")?;
+        let Value::Object(fields) = fields else {
+            anyhow::bail!("graph node fields must be a JSON object");
+        };
+        anyhow::ensure!(
+            !fields.contains_key("id"),
+            "graph node fields must not override the node id"
+        );
         if let Some(existing) = self.nodes.get_mut(&id) {
             let existing = existing
                 .as_object_mut()
                 .context("stored graph node must be an object")?;
             for (key, value) in fields {
-                if !value.is_null() && !existing.contains_key(key) {
-                    existing.insert(key.clone(), value.clone());
+                if !value.is_null() && !existing.contains_key(&key) {
+                    existing.insert(key, value);
                 }
             }
         } else {
-            let mut node = Map::new();
+            let mut node = fields;
             node.insert("id".into(), Value::String(id.clone()));
-            node.extend(fields.clone());
             self.nodes.insert(id.clone(), Value::Object(node));
         }
         Ok(id)
     }
 
     fn add_edge(&mut self, from: &str, to: &str, kind: &str, fields: Value) -> Result<()> {
-        let fields = fields
-            .as_object()
-            .context("graph edge fields must be a JSON object")?;
-        let frozen = format!("{from}\0{to}\0{kind}\0{}", serde_json::to_string(fields)?);
+        let Value::Object(fields) = fields else {
+            anyhow::bail!("graph edge fields must be a JSON object");
+        };
+        anyhow::ensure!(
+            !["from", "to", "kind"]
+                .iter()
+                .any(|key| fields.contains_key(*key)),
+            "graph edge fields must not override the edge endpoints or kind"
+        );
+        let frozen = format!("{from}\0{to}\0{kind}\0{}", serde_json::to_string(&fields)?);
         if !self.edge_seen.insert(frozen) {
             return Ok(());
         }
-        let mut edge = Map::new();
+        let mut edge = fields;
         edge.insert("from".into(), Value::String(from.to_string()));
         edge.insert("to".into(), Value::String(to.to_string()));
         edge.insert("kind".into(), Value::String(kind.to_string()));
-        edge.extend(fields.clone());
         self.edges.push(Value::Object(edge));
         Ok(())
     }
@@ -1912,6 +1920,84 @@ mod tests {
         analysis_artifacts::{load_artifact, SOURCE_GRAPH},
         capture_project::{write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME},
     };
+
+    #[test]
+    fn graph_builder_moves_evidence_without_overwriting_identity_or_existing_fields() -> Result<()>
+    {
+        let mut graph = GraphBuilder::default();
+        assert_eq!(
+            graph.add_node(
+                "source:a",
+                json!({"type":"resource","metadata":{"items":[1,2]},"empty":null}),
+            )?,
+            "source:a"
+        );
+        graph.add_node(
+            "source:a",
+            json!({"type":"not-a-resource","metadata":{"items":[3]},"new_field":42,"empty":"not-empty"}),
+        )?;
+        let node = &graph.nodes["source:a"];
+        assert_eq!(node["id"], "source:a");
+        assert_eq!(node["type"], "resource");
+        assert_eq!(node["metadata"]["items"], json!([1, 2]));
+        assert_eq!(node["new_field"], 42);
+        assert_eq!(node["empty"], Value::Null);
+
+        assert!(graph.add_node("source:a", json!({"id":"spoofed"})).is_err());
+        assert!(graph.add_node("source:b", json!([])).is_err());
+        assert_eq!(graph.nodes.len(), 1);
+
+        graph.add_edge(
+            "source:a",
+            "source:b",
+            "reference",
+            json!({"metadata":{"items":[1,2]}}),
+        )?;
+        graph.add_edge(
+            "source:a",
+            "source:b",
+            "reference",
+            json!({"metadata":{"items":[1,2]}}),
+        )?;
+        assert_eq!(graph.edges.len(), 1);
+        let edge = &graph.edges[0];
+        assert_eq!(edge["from"], "source:a");
+        assert_eq!(edge["to"], "source:b");
+        assert_eq!(edge["kind"], "reference");
+        assert_eq!(edge["metadata"]["items"], json!([1, 2]));
+        assert!(graph
+            .add_edge(
+                "source:a",
+                "source:b",
+                "reference",
+                json!({"from":"spoofed"})
+            )
+            .is_err());
+        assert!(graph
+            .add_edge("source:a", "source:b", "reference", json!({"to":"spoofed"}))
+            .is_err());
+        assert!(graph
+            .add_edge(
+                "source:a",
+                "source:b",
+                "reference",
+                json!({"kind":"spoofed"})
+            )
+            .is_err());
+        assert!(graph
+            .add_edge("source:a", "source:b", "reference", Value::Null)
+            .is_err());
+        assert_eq!(graph.edges.len(), 1);
+
+        graph.add_edge(
+            "source:a",
+            "source:b",
+            "reference",
+            json!({"metadata":{"items":[3]}}),
+        )?;
+        assert_eq!(graph.edges.len(), 2);
+        Ok(())
+    }
 
     #[test]
     fn runtime_script_exact_source_identity_connects_to_safe_deob_result() -> Result<()> {

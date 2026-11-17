@@ -367,8 +367,8 @@ struct SinkMutationCollector<'c> {
 }
 
 impl SinkMutationCollector<'_> {
-    fn record(&mut self, path: Option<String>) {
-        if let Some(family) = path.as_deref().and_then(sink_family) {
+    fn record(&mut self, path: Option<&str>) {
+        if let Some(family) = path.and_then(sink_family) {
             self.mutated.insert(family);
         }
     }
@@ -376,21 +376,18 @@ impl SinkMutationCollector<'_> {
 
 impl<'a> Visit<'a> for SinkMutationCollector<'_> {
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
-        self.record(assignment_global_path(self.scoping, &assignment.left));
+        self.record(assignment_global_path(self.scoping, &assignment.left).as_deref());
         walk::walk_assignment_expression(self, assignment);
     }
 
     fn visit_update_expression(&mut self, update: &oxc_ast::ast::UpdateExpression<'a>) {
-        self.record(simple_assignment_global_path(
-            self.scoping,
-            &update.argument,
-        ));
+        self.record(simple_assignment_global_path(self.scoping, &update.argument).as_deref());
         walk::walk_update_expression(self, update);
     }
 
     fn visit_unary_expression(&mut self, unary: &oxc_ast::ast::UnaryExpression<'a>) {
         if unary.operator.as_str() == "delete" {
-            self.record(global_path(self.scoping, &unary.argument));
+            self.record(global_path(self.scoping, &unary.argument).as_deref());
         }
         walk::walk_unary_expression(self, unary);
     }

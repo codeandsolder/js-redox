@@ -636,7 +636,7 @@ fn run_source_tree(mut args: SourceTreeArgs) -> Result<()> {
         && args.observed_direct.is_empty()
         && args.observed_direct_bundle.is_empty()
     {
-        println!("{}", build_source_tree(args)?);
+        println!("{}", build_source_tree(&args)?);
         return Ok(());
     }
     // Observed evidence can fail only after the static output is constructed.
@@ -677,7 +677,7 @@ fn run_source_tree(mut args: SourceTreeArgs) -> Result<()> {
         .prefix(".jsvm-observed-stage-")
         .tempdir_in(&parent)?;
     args.output = stage.path().join("tree");
-    let mut result = build_source_tree(args)?;
+    let mut result = build_source_tree(&args)?;
     anyhow::ensure!(
         fs::symlink_metadata(&destination).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
         "observed source-tree destination appeared during staging"
@@ -688,7 +688,7 @@ fn run_source_tree(mut args: SourceTreeArgs) -> Result<()> {
     Ok(())
 }
 
-fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
+fn build_source_tree(args: &SourceTreeArgs) -> Result<serde_json::Value> {
     let root = args
         .input
         .canonicalize()
@@ -1826,7 +1826,7 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
     }))
 }
 
-fn run_source(args: SourceArgs) -> Result<()> {
+fn run_source(args: &SourceArgs) -> Result<()> {
     let original = fs::read_to_string(&args.input)
         .with_context(|| format!("reading {}", args.input.display()))?;
     let budgets = AnalysisBudgets::standard("deobfuscate-safe");
@@ -1874,7 +1874,7 @@ fn run_source(args: SourceArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_project_names(args: ProjectNamesArgs) -> Result<()> {
+fn run_project_names(args: &ProjectNamesArgs) -> Result<()> {
     let project = args
         .project
         .canonicalize()
@@ -1892,7 +1892,7 @@ fn run_project_names(args: ProjectNamesArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_project(args: ProjectArgs) -> Result<()> {
+fn run_project(args: &ProjectArgs) -> Result<()> {
     let project = args
         .project
         .canonicalize()
@@ -2110,7 +2110,7 @@ fn write_callsite_specializations(
     Ok(specialization_rows)
 }
 
-fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
+fn run_caller_views(args: &CallerViewsArgs) -> Result<()> {
     let original = fs::read_to_string(&args.input)
         .with_context(|| format!("reading caller source {}", args.input.display()))?;
     let mut views = reconstruct_caller_views(&original, args.entry_member.as_deref())?;
@@ -2219,7 +2219,7 @@ fn run_caller_views(args: CallerViewsArgs) -> Result<()> {
 
 fn main() -> Result<()> {
     match Args::parse().command {
-        Command::Source(args) => run_source(args),
+        Command::Source(args) => run_source(&args),
         Command::EvalSites(args) => {
             println!(
                 "{}",
@@ -2228,9 +2228,9 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::SourceTree(args) => run_source_tree(args),
-        Command::CallerViews(args) => run_caller_views(args),
-        Command::Project(args) => run_project(args),
-        Command::ProjectNames(args) => run_project_names(args),
+        Command::CallerViews(args) => run_caller_views(&args),
+        Command::Project(args) => run_project(&args),
+        Command::ProjectNames(args) => run_project_names(&args),
     }
 }
 
@@ -2459,7 +2459,7 @@ mod tests {
             &input,
             "const deep=(x)=>x;const alias=deep;const middle=(p)=>alias(p);             const api={};api.run=(arg)=>middle(arg);",
         )?;
-        run_caller_views(CallerViewsArgs {
+        run_caller_views(&CallerViewsArgs {
             input,
             output: output.clone(),
             entry_member: Some("run".into()),
@@ -2512,7 +2512,7 @@ mod tests {
             &input,
             "const helper=function(selector,x){if(selector===3)return x+1;return x*2;};             const api={};api.run=(x)=>helper(3,x);",
         )?;
-        run_caller_views(CallerViewsArgs {
+        run_caller_views(&CallerViewsArgs {
             input,
             output: output.clone(),
             entry_member: Some("run".into()),
@@ -2569,7 +2569,7 @@ mod tests {
              const api={};api.first=()=>chosen(4,3);\
              api.second=()=>unrelated(9);api.third=()=>chosen(5,3);",
         )?;
-        run_caller_views(CallerViewsArgs {
+        run_caller_views(&CallerViewsArgs {
             input,
             output: output.clone(),
             entry_member: None,
@@ -2608,7 +2608,7 @@ mod tests {
         let source = tmp.path().join("source.js");
         let output = tmp.path().join("readable");
         fs::write(&source, "const helper=(x)=>x*3;          const api={};api.run=()=>{let r=helper(4);          {const helper=(x)=>x*4;r+=helper(5);}return r;};")?;
-        run_caller_views(CallerViewsArgs {
+        run_caller_views(&CallerViewsArgs {
             input: source,
             output: output.clone(),
             entry_member: Some("run".into()),
