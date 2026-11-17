@@ -1678,6 +1678,51 @@ impl SparseDirectDecoder {
     }
 }
 
+// Both complete and partially materialized tables need the same strict
+// binding and transform proof; only their candidate-selection rules differ.
+fn proven_direct_table_transform(
+    source: &str,
+    function: &DirectFnInfo,
+    table_symbol: SymbolId,
+    table_name: &str,
+    scoping: &Scoping,
+    reference_spans: &HashMap<ReferenceId, Span>,
+) -> Option<DecoderTransform> {
+    // The table must have exactly one confined read, without aliases,
+    // reassignment, member mutation or an external mutating array call.
+    let [reference_id] = scoping.get_resolved_reference_ids(table_symbol) else {
+        return None;
+    };
+    let reference = scoping.get_reference(*reference_id);
+    if reference.is_write() || reference.flags().is_member_write_target() {
+        return None;
+    }
+    let span = reference_spans.get(reference_id)?;
+    if function.span.start > span.start || span.end > function.span.end {
+        return None;
+    }
+
+    let mutator = compile_regex(&format!(
+        r"\b{}\s*\.\s*(?:copyWithin|fill|pop|push|reverse|shift|sort|splice|unshift)\s*\(",
+        regex::escape(table_name)
+    ))?;
+    if mutator.is_match(source) {
+        return None;
+    }
+
+    if function.standard_base64_table == Some(table_symbol) {
+        Some(DecoderTransform::StandardBase64)
+    } else if function.fixed_base64_algorithm_proven
+        && !function_has_external_write(function.span, scoping, reference_spans)
+    {
+        Some(DecoderTransform::FixedBase64Alphabet(
+            function.fixed_base64_alphabet.clone()?,
+        ))
+    } else {
+        None
+    }
+}
+
 fn detect_sparse_direct_table_decoders(
     source: &str,
     functions: &[DirectFnInfo],
@@ -1727,42 +1772,14 @@ fn detect_sparse_direct_table_decoders(
         // The table binding is immutable, and its only resolved read is the
         // decoder lookup proved above. Dynamic elements are allowed at table
         // construction time, but they can never be substituted by this path.
-        let table_references = scoping.get_resolved_reference_ids(array.symbol);
-        if table_references.len() != 1 {
-            continue;
-        }
-        let reference_id = table_references[0];
-        let reference = scoping.get_reference(reference_id);
-        if reference.is_write() || reference.flags().is_member_write_target() {
-            continue;
-        }
-        let Some(reference_span) = reference_spans.get(&reference_id) else {
-            continue;
-        };
-        if function.span.start > reference_span.start || reference_span.end > function.span.end {
-            continue;
-        }
-
-        let Some(mutator) = compile_regex(&format!(
-            r"\b{}\s*\.\s*(?:copyWithin|fill|pop|push|reverse|shift|sort|splice|unshift)\s*\(",
-            regex::escape(&array.name)
-        )) else {
-            continue;
-        };
-        if mutator.is_match(source) {
-            continue;
-        }
-
-        let transform = if function.standard_base64_table == Some(array.symbol) {
-            DecoderTransform::StandardBase64
-        } else if function.fixed_base64_algorithm_proven
-            && !function_has_external_write(function.span, scoping, reference_spans)
-        {
-            let Some(alphabet) = function.fixed_base64_alphabet.clone() else {
-                continue;
-            };
-            DecoderTransform::FixedBase64Alphabet(alphabet)
-        } else {
+        let Some(transform) = proven_direct_table_transform(
+            source,
+            function,
+            array.symbol,
+            &array.name,
+            scoping,
+            reference_spans,
+        ) else {
             continue;
         };
 
@@ -1891,42 +1908,14 @@ fn detect_direct_table_decoders(
         // and *inside* the decoder (an internal alias can otherwise mutate the
         // array before the returned lookup without writing the original
         // binding itself).
-        let table_references = scoping.get_resolved_reference_ids(array.symbol);
-        if table_references.len() != 1 {
-            continue;
-        }
-        let reference_id = table_references[0];
-        let reference = scoping.get_reference(reference_id);
-        if reference.is_write() || reference.flags().is_member_write_target() {
-            continue;
-        }
-        let Some(span) = reference_spans.get(&reference_id) else {
-            continue;
-        };
-        if function.span.start > span.start || span.end > function.span.end {
-            continue;
-        }
-
-        let Some(mutator) = compile_regex(&format!(
-            r"\b{}\s*\.\s*(?:copyWithin|fill|pop|push|reverse|shift|sort|splice|unshift)\s*\(",
-            regex::escape(&array.name)
-        )) else {
-            continue;
-        };
-        if mutator.is_match(source) {
-            continue;
-        }
-
-        let transform = if function.standard_base64_table == Some(array.symbol) {
-            DecoderTransform::StandardBase64
-        } else if function.fixed_base64_algorithm_proven
-            && !function_has_external_write(function.span, scoping, reference_spans)
-        {
-            let Some(alphabet) = function.fixed_base64_alphabet.clone() else {
-                continue;
-            };
-            DecoderTransform::FixedBase64Alphabet(alphabet)
-        } else {
+        let Some(transform) = proven_direct_table_transform(
+            source,
+            function,
+            array.symbol,
+            &array.name,
+            scoping,
+            reference_spans,
+        ) else {
             continue;
         };
 
