@@ -624,7 +624,7 @@ impl PathWalker<'_> {
                 })
                 .collect::<Vec<_>>();
             names.push(target.label.clone());
-            spans.push(next.into());
+            spans.push((*next).into());
             links.push(edge.clone());
             if links.len() >= 2 {
                 let leaf_parameters = target
