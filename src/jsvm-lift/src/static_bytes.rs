@@ -767,6 +767,8 @@ fn collect_json_wasm_carriers(
 }
 
 fn decoded_static_wasm_carriers(text: &str) -> Vec<(Vec<u8>, &'static str, Option<String>)> {
+    const MAX_JSON_NODES: usize = 100_000;
+
     if let Some(bytes) = decode_validated_wasm_base64(text) {
         return vec![(bytes, "base64", None)];
     }
@@ -780,7 +782,6 @@ fn decoded_static_wasm_carriers(text: &str) -> Vec<(Vec<u8>, &'static str, Optio
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return Vec::new();
     };
-    const MAX_JSON_NODES: usize = 100_000;
     let mut budget = MAX_JSON_NODES;
     let mut nested = Vec::new();
     collect_json_wasm_carriers(&value, "", 0, &mut budget, &mut nested);
