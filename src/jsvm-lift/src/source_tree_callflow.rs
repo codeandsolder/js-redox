@@ -408,15 +408,15 @@ impl Calls<'_> {
 
     fn emit(
         &mut self,
-        callee: &Expression<'_>,
+        callee_expression: &Expression<'_>,
         args: &[Argument<'_>],
         span: Span,
         kind: &'static str,
     ) {
-        let Some(&caller_key) = self.stack.last() else {
+        let Some(&origin_function_key) = self.stack.last() else {
             return;
         };
-        let (id, skip_receiver, kind) = match unparen(callee) {
+        let (id, skip_receiver, kind) = match unparen(callee_expression) {
             Expression::Identifier(id) => (id, false, kind),
             Expression::StaticMemberExpression(member)
                 if kind == "call" && !member.optional && member.property.name == "call" =>
@@ -435,22 +435,22 @@ impl Calls<'_> {
         else {
             return;
         };
-        let Some(&callee_key) = self.symbols.get(&target_symbol) else {
+        let Some(&target_function_key) = self.symbols.get(&target_symbol) else {
             return;
         };
         // A spread in receiver position may supply zero or several values;
         // no subsequent fixed formal parameter position can be inferred.
         if skip_receiver
-            && (self.unsafe_callers.contains(&caller_key)
-                || self.blocked_call_targets.contains(&callee_key)
+            && (self.unsafe_callers.contains(&origin_function_key)
+                || self.blocked_call_targets.contains(&target_function_key)
                 || matches!(args.first(), Some(Argument::SpreadElement(_))))
         {
             return;
         }
-        let Some(caller) = self.defs.get(&caller_key) else {
+        let Some(origin_definition) = self.defs.get(&origin_function_key) else {
             return;
         };
-        let Some(target) = self.defs.get(&callee_key) else {
+        let Some(target_definition) = self.defs.get(&target_function_key) else {
             return;
         };
         let mut prior_spread = false;
@@ -480,7 +480,7 @@ impl Calls<'_> {
                                 .iter()
                                 .any(|reference| self.scoping.get_reference(*reference).is_write())
                             {
-                                forward = caller.params.iter().enumerate().find_map(
+                                forward = origin_definition.params.iter().enumerate().find_map(
                                     |(index, (_, target))| {
                                         (*target == Some(original)).then_some(index)
                                     },
@@ -492,7 +492,7 @@ impl Calls<'_> {
                 ArgumentLink {
                     expression: fragment(self.source, arg_span).to_owned(),
                     positional,
-                    caller_param: forward.map(|idx| caller.params[idx].0.clone()),
+                    caller_param: forward.map(|idx| origin_definition.params[idx].0.clone()),
                     caller_param_index: forward,
                     is_direct_this: positional
                         && matches!(
@@ -503,8 +503,8 @@ impl Calls<'_> {
             })
             .collect();
         let call = CallLink {
-            caller: caller.label.clone(),
-            callee: target.label.clone(),
+            caller: origin_definition.label.clone(),
+            callee: target_definition.label.clone(),
             kind,
             span: [span.start, span.end],
             this_argument: if skip_receiver {
@@ -516,9 +516,9 @@ impl Calls<'_> {
             arguments,
         };
         self.edges
-            .entry(caller_key)
+            .entry(origin_function_key)
             .or_default()
-            .push((callee_key, call));
+            .push((target_function_key, call));
     }
 }
 impl<'a> Visit<'a> for Calls<'_> {

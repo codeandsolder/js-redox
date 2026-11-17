@@ -2516,8 +2516,10 @@ fn fast_cell_branch_parts(
 ) -> Option<(String, String)> {
     let probe_property = static_member_on_symbol(scoping, test, cell)?;
     let return_expression = first_return_expression(consequent)?;
-    let (update_property, call) = static_method_call_on_symbol(scoping, return_expression, cell)?;
-    call.arguments
+    let (update_property, update_invocation) =
+        static_method_call_on_symbol(scoping, return_expression, cell)?;
+    update_invocation
+        .arguments
         .is_empty()
         .then_some((probe_property, update_property))
 }
@@ -2560,9 +2562,9 @@ fn switch_fast_cell_branch_parts(
         let Statement::ReturnStatement(ret) = case.consequent.first()? else {
             return None;
         };
-        let (update_property, call) =
+        let (update_property, update_invocation) =
             static_method_call_on_symbol(scoping, ret.argument.as_ref()?, cell)?;
-        return call
+        return update_invocation
             .arguments
             .is_empty()
             .then_some((probe_property, update_property));
@@ -2607,8 +2609,8 @@ fn slow_cell_projection<'a>(
         return None;
     }
     let effect = one_effect_then_symbol(scoping, &projection.object, cell)?;
-    let (update_property, call) = static_method_call_on_symbol(scoping, effect, cell)?;
-    let [argument] = call.arguments.as_slice() else {
+    let (update_property, update_invocation) = static_method_call_on_symbol(scoping, effect, cell)?;
+    let [argument] = update_invocation.arguments.as_slice() else {
         return None;
     };
     let selector = argument.as_expression().map(last_sequence_expression)?;

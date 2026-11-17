@@ -475,7 +475,7 @@ Names come from readable source and statically resolved captured ESM exports. Th
         };
         writeln!(output, "## {}\n", symbol_index_link(module)?)?;
         writeln!(output, "Captured URL: {}\n", code_span(url))?;
-        let lines = declaration_lines(&module.source);
+        let declaration_lines_by_name = declaration_lines(&module.source);
         let mut sorted = exports.iter().collect::<Vec<_>>();
         sorted.sort_by(|(key_a, name_a), (key_b, name_b)| {
             name_a.cmp(name_b).then_with(|| key_a.cmp(key_b))
@@ -493,18 +493,18 @@ Names come from readable source and statically resolved captured ESM exports. Th
                 .iter()
                 .any(|(key, local)| key == public && local == descriptive)
             {
-                if let Some(line) = lines.get(descriptive) {
+                if let Some(line) = declaration_lines_by_name.get(descriptive) {
                     write!(output, "; declaration line {line}")?;
                 }
             }
             if let Some(consumers) = incoming.get(&(url.clone(), public.clone())) {
-                let links = consumers
+                let consumer_module_links = consumers
                     .iter()
                     .filter_map(|consumer| modules.get(consumer))
                     .map(symbol_index_link)
                     .collect::<Result<Vec<_>>>()?;
-                if !links.is_empty() {
-                    write!(output, "; imported by {}", links.join(", "))?;
+                if !consumer_module_links.is_empty() {
+                    write!(output, "; imported by {}", consumer_module_links.join(", "))?;
                 }
             }
             output.push('\n');

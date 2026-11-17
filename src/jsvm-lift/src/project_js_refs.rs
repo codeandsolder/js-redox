@@ -122,12 +122,12 @@ fn captured_dynamic_glob_matches(
     let Some(absolute_pattern) = join_url(base_url, &decoded) else {
         return Ok((None, Vec::new()));
     };
-    let matcher = dynamic_glob_regex(&absolute_pattern)?;
-    let mut matches = captured_urls
-        .filter(|url| matcher.is_match(url))
+    let glob_regex = dynamic_glob_regex(&absolute_pattern)?;
+    let mut matching_urls = captured_urls
+        .filter(|url| glob_regex.is_match(url))
         .collect::<Vec<_>>();
-    matches.sort();
-    Ok((Some(absolute_pattern), matches))
+    matching_urls.sort();
+    Ok((Some(absolute_pattern), matching_urls))
 }
 
 fn normalize_map_key(base_url: &str, key: &str) -> Option<String> {

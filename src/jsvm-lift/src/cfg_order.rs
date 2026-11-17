@@ -434,14 +434,14 @@ fn prove_required_before_node_budgeted(
 
     // Precompute the blocks that can reach the event once, rather than
     // re-running a graph search from every path-state below.
-    let mut reaches_event = HashSet::new();
+    let mut event_predecessors = HashSet::new();
     let mut reverse_queue = VecDeque::from([event_block]);
     let mut reverse_poller = BudgetPoller::new(budget, 128);
     while let Some(block) = reverse_queue.pop_front() {
         if !reverse_poller.poll(1) {
             break;
         }
-        if !reaches_event.insert(block) {
+        if !event_predecessors.insert(block) {
             continue;
         }
         for edge in cfg.graph().edges_directed(block, Direction::Incoming) {
@@ -454,13 +454,13 @@ fn prove_required_before_node_budgeted(
         }
     }
     reverse_poller.finish()?;
-    if !reaches_event.contains(&function_entry) {
+    if !event_predecessors.contains(&function_entry) {
         return Ok(false);
     }
 
     let mut queue = VecDeque::from([(function_entry, false)]);
     let mut seen = HashSet::new();
-    let mut reached_event = false;
+    let mut event_reached_on_path = false;
     let mut poller = BudgetPoller::new(budget, 128);
 
     while let Some((block, crossed_required)) = queue.pop_front() {
@@ -470,11 +470,11 @@ fn prove_required_before_node_budgeted(
         if !seen.insert((block, crossed_required)) {
             continue;
         }
-        if !reaches_event.contains(&block) {
+        if !event_predecessors.contains(&block) {
             continue;
         }
         if block == event_block {
-            reached_event = true;
+            event_reached_on_path = true;
             let required_here_before =
                 required_block == event_block && required.start < event.start;
             if !crossed_required && !required_here_before {
@@ -495,7 +495,7 @@ fn prove_required_before_node_budgeted(
         }
     }
     poller.finish()?;
-    Ok(reached_event)
+    Ok(event_reached_on_path)
 }
 
 /// Witness a possible path in the *syntactic CFG* from a completed source

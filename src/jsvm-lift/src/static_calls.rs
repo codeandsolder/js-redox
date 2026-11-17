@@ -178,7 +178,7 @@ pub fn analyze_static_calls(
             AstKind::NewExpression(expr) => (expr.span, &expr.callee, false, true),
             _ => continue,
         };
-        let (caller, path_dependent) = enclosing_context_and_guard(semantic, node_id);
+        let (enclosing_function, path_dependent) = enclosing_context_and_guard(semantic, node_id);
         let target = function_literal(callee)
             .map(|span| (span, "direct_inline_function"))
             .or_else(|| {
@@ -192,7 +192,7 @@ pub fn analyze_static_calls(
             });
         if let Some((target, resolution)) = target {
             direct_edges.push(StaticCallEdge {
-                caller,
+                caller: enclosing_function,
                 callee: pair(target),
                 call: pair(call),
                 resolution,
@@ -202,7 +202,7 @@ pub fn analyze_static_calls(
             });
         } else {
             unresolved_calls.push(StaticUnresolvedCall {
-                caller,
+                caller: enclosing_function,
                 call: pair(call),
                 callee_expression: pair(callee.span()),
                 callee_kind: callee_kind(callee),

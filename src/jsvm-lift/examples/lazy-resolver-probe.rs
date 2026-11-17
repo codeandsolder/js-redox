@@ -204,7 +204,7 @@ fn main() -> Result<()> {
                         None
                     };
                     for phase_value in &phase_values {
-                        let resolver = update.as_ref().and_then(|u| {
+                        let resolver_index_proof = update.as_ref().and_then(|u| {
                             proven_slow_lazy_cell_resolver_index(
                                 &source,
                                 &parsed.program,
@@ -218,16 +218,16 @@ fn main() -> Result<()> {
                                 },
                             )
                         });
-                        let resolved = resolver
+                        let resolved_handler_proof = resolver_index_proof
                             .as_ref()
                             .and_then(|r| proven_slow_lazy_cell_resolved_handler(r, &captured));
                         let compatible = carrier
                             .as_ref()
-                            .zip(resolved.as_ref())
+                            .zip(resolved_handler_proof.as_ref())
                             .and_then(|(c, r)| structurally_compatible_slow_lazy_cell_read(r, c))
                             .is_some();
                         per_phase.push(json!({
-                          "phase_value_assumed":phase_value,"resolver_index_proven":resolver.is_some(),
+                          "phase_value_assumed":phase_value,"resolver_index_proven":resolver_index_proof.is_some(),
                           "compatible_return_structure":compatible,
                           "accessor":[read.accessor_function_start,read.accessor_function_end],
                           "selector":[read.selector_start,read.selector_end],

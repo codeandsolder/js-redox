@@ -893,7 +893,7 @@ fn matching_module_memory_proofs(
                 })
         })
         .collect::<HashSet<_>>();
-    let mut matches = Vec::new();
+    let mut matching_proofs = Vec::new();
     for proof in array_field(context.document, "module_memory_identity_proofs") {
         if string_field(proof, "import_module") != Some(import_module)
             || string_field(proof, "import_name") != Some(import_name)
@@ -932,13 +932,13 @@ fn matching_module_memory_proofs(
         let [memory_export] = memory_exports.as_slice() else {
             continue;
         };
-        let mut matched = proof.clone();
-        if let Some(object) = matched.as_object_mut() {
+        let mut annotated_proof = proof.clone();
+        if let Some(object) = annotated_proof.as_object_mut() {
             object.insert("memory_export".into(), memory_export.clone());
         }
-        matches.push(matched);
+        matching_proofs.push(annotated_proof);
     }
-    matches
+    matching_proofs
 }
 
 fn verified_module_bytes(project: &Path, module: &Value) -> Option<(PathBuf, String, Vec<u8>)> {
