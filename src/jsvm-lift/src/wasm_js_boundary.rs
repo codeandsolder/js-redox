@@ -1402,6 +1402,43 @@ struct HostEffectEvidence<'a> {
     usage_proofs: Vec<Value>,
 }
 
+#[derive(Clone, Copy)]
+struct CopyImportNames<'a> {
+    set_module: Option<&'a str>,
+    set_name: Option<&'a str>,
+    constructor_module: Option<&'a str>,
+    constructor_name: Option<&'a str>,
+    memory_module: Option<&'a str>,
+    memory_name: Option<&'a str>,
+}
+
+impl<'a> CopyImportNames<'a> {
+    fn from_candidate(function_imports: &'a [Value], candidate: &Value) -> Self {
+        let set_import = usize_field(candidate, "set_import_function")
+            .and_then(|index| function_imports.get(index));
+        let constructor_import = usize_field(candidate, "constructor_import_function")
+            .and_then(|index| function_imports.get(index));
+        let memory_import = usize_field(candidate, "constructor_input_memory_import_function")
+            .and_then(|index| function_imports.get(index));
+        let set_module = set_import.and_then(|imported| string_field(imported, "module"));
+        let set_name = set_import.and_then(|imported| string_field(imported, "name"));
+        let constructor_module =
+            constructor_import.and_then(|imported| string_field(imported, "module"));
+        let constructor_name =
+            constructor_import.and_then(|imported| string_field(imported, "name"));
+        let memory_module = memory_import.and_then(|imported| string_field(imported, "module"));
+        let memory_name = memory_import.and_then(|imported| string_field(imported, "name"));
+        Self {
+            set_module,
+            set_name,
+            constructor_module,
+            constructor_name,
+            memory_module,
+            memory_name,
+        }
+    }
+}
+
 struct BoundaryCorrelation<'a> {
     project: &'a Path,
     budgets: &'a AnalysisBudgets,
@@ -1654,38 +1691,32 @@ impl BoundaryCorrelation<'_> {
         row
     }
 
-    fn copied_input_candidate(
+    // Proven source-specific handlers, instantiation binding and memory
+    // edges are collected before interpreting any copied destination words.
+    fn collect_copied_source_proofs(
         &mut self,
         scope: &BoundaryExport<'_>,
         candidate: &Value,
-    ) -> Result<Value> {
+        names: CopyImportNames<'_>,
+    ) -> Result<Vec<Value>> {
+        let CopyImportNames {
+            set_module,
+            set_name,
+            constructor_module,
+            constructor_name,
+            memory_module,
+            memory_name,
+        } = names;
         let module = scope.module;
-        let export = scope.export;
-        let analysis = scope.analysis;
         let report = scope.report;
+        let export_name = string_field(scope.export, "export");
         let function_imports = scope.function_imports;
         let carrier_candidates = scope.carrier_candidates;
-        let export_name = string_field(export, "export");
         let project = self.project;
         let budgets = self.budgets;
         let stage_budget = &self.stage_budget;
         let full_cache = &mut self.full_cache;
         let carrier_sources = &mut self.carrier_sources;
-        let set_import = usize_field(candidate, "set_import_function")
-            .and_then(|index| function_imports.get(index));
-        let constructor_import = usize_field(candidate, "constructor_import_function")
-            .and_then(|index| function_imports.get(index));
-        let memory_import = usize_field(candidate, "constructor_input_memory_import_function")
-            .and_then(|index| function_imports.get(index));
-        let set_module = set_import.and_then(|imported| string_field(imported, "module"));
-        let set_name = set_import.and_then(|imported| string_field(imported, "name"));
-        let constructor_module =
-            constructor_import.and_then(|imported| string_field(imported, "module"));
-        let constructor_name =
-            constructor_import.and_then(|imported| string_field(imported, "name"));
-        let memory_module = memory_import.and_then(|imported| string_field(imported, "module"));
-        let memory_name = memory_import.and_then(|imported| string_field(imported, "name"));
-
         let mut proofs = Vec::new();
         if let (
             Some(set_module),
@@ -1764,7 +1795,34 @@ impl BoundaryCorrelation<'_> {
                 }));
             }
         }
+        Ok(proofs)
+    }
 
+    fn copied_input_candidate(
+        &mut self,
+        scope: &BoundaryExport<'_>,
+        candidate: &Value,
+    ) -> Result<Value> {
+        let module = scope.module;
+        let export = scope.export;
+        let analysis = scope.analysis;
+        let report = scope.report;
+        let function_imports = scope.function_imports;
+        let carrier_candidates = scope.carrier_candidates;
+        let export_name = string_field(export, "export");
+        let names = CopyImportNames::from_candidate(function_imports, candidate);
+        let proofs = self.collect_copied_source_proofs(scope, candidate, names)?;
+        let CopyImportNames {
+            set_module,
+            set_name,
+            constructor_module,
+            constructor_name,
+            memory_module,
+            memory_name,
+        } = names;
+        let project = self.project;
+        let stage_budget = &self.stage_budget;
+        let full_cache = &self.full_cache;
         let copied_binding_proofs = proofs
             .iter()
             .flat_map(|proof| {
