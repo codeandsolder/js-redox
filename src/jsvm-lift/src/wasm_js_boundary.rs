@@ -1439,6 +1439,258 @@ impl<'a> CopyImportNames<'a> {
     }
 }
 
+struct CopiedSourceEvidence {
+    proofs: Vec<Value>,
+    copied_binding_proofs: Vec<Value>,
+    module_memory_proofs: Vec<Value>,
+    module_memory_sources: BTreeSet<String>,
+}
+
+impl CopiedSourceEvidence {
+    // Keep each source-local proof and its ordering, even when incomplete.
+    fn annotate(proofs: &[Value], field: &str) -> Vec<Value> {
+        proofs
+            .iter()
+            .flat_map(|proof| {
+                let source = string_field(proof, "source_path")
+                    .unwrap_or_default()
+                    .to_owned();
+                array_field(proof, field)
+                    .iter()
+                    .cloned()
+                    .map(move |mut nested| {
+                        if let Some(object) = nested.as_object_mut() {
+                            object.insert("source_path".into(), source.clone().into());
+                        }
+                        nested
+                    })
+            })
+            .collect()
+    }
+
+    fn new(proofs: Vec<Value>) -> Self {
+        let copied_binding_proofs = Self::annotate(&proofs, "import_binding_identity_proofs");
+        let module_memory_proofs = Self::annotate(&proofs, "module_memory_identity_proofs");
+        let module_memory_sources = module_memory_proofs
+            .iter()
+            .filter_map(|proof| string_field(proof, "source_path").map(ToOwned::to_owned))
+            .collect::<BTreeSet<_>>();
+        Self {
+            proofs,
+            copied_binding_proofs,
+            module_memory_proofs,
+            module_memory_sources,
+        }
+    }
+
+    // All exact instance evidence must come from a unique carrier.
+    fn module_memory_proven(&self) -> bool {
+        !self.module_memory_proofs.is_empty()
+            && self.module_memory_sources.len() == 1
+            && self.proofs.len() == 1
+            && self.copied_binding_proofs.len() == 1
+    }
+}
+
+struct CopyDestinationRequirements {
+    source_length_lower_bound: Option<usize>,
+    length_barrier_proofs: Vec<Value>,
+    required_internal_barriers: BTreeSet<usize>,
+    base_destination_byte_integrity_proven: bool,
+    static_destination_base_alignment_proven: bool,
+}
+
+impl CopyDestinationRequirements {
+    /// The pre-fresh-state proof requires every destination load to be
+    /// covered by a fixed source length and all import barrier identities.
+    fn assess(candidate: &Value, export_name: Option<&str>, source: &CopiedSourceEvidence) -> Self {
+        let destination_loads = array_field(candidate, "destination_loads");
+        let source_length_lower_bound = fixed_uint32_source_length_lower_bound(
+            if source.module_memory_proven() {
+                &source.module_memory_proofs
+            } else {
+                &[]
+            },
+            export_name,
+            usize_field(candidate, "source_entry_parameter"),
+        );
+        let required_length_barriers = destination_loads
+            .iter()
+            .flat_map(|load| array_field(load, "source_length_import_barriers"))
+            .filter_map(Value::as_u64)
+            .filter_map(|value| usize::try_from(value).ok())
+            .collect::<BTreeSet<_>>();
+        let length_barrier_proofs =
+            CopiedSourceEvidence::annotate(&source.proofs, "source_length_barrier_proofs");
+        let proven_length_barriers = length_barrier_proofs
+            .iter()
+            .filter_map(|proof| usize_field(proof, "function_import"))
+            .collect::<BTreeSet<_>>();
+        let required_internal_barriers = destination_loads
+            .iter()
+            .flat_map(|load| array_field(load, "internal_memory_mutation_call_barriers"))
+            .filter_map(Value::as_u64)
+            .filter_map(|value| usize::try_from(value).ok())
+            .collect::<BTreeSet<_>>();
+        let base_destination_byte_integrity_proven = !destination_loads.is_empty()
+            && source_length_lower_bound.is_some()
+            && destination_loads.iter().all(|load| {
+                bool_field(load, "unresolved_intervening_memory_mutation") == Some(false)
+                    && array_field(load, "other_import_call_barriers").is_empty()
+            })
+            && proven_length_barriers == required_length_barriers
+            && (required_length_barriers.is_empty() || source.proofs.len() == 1);
+        let element_shift = usize_field(candidate, "destination_element_index_shift");
+        let base_zero_bits =
+            usize_field(candidate, "destination_base_guaranteed_trailing_zero_bits");
+        let static_destination_base_alignment_proven =
+            element_shift == Some(2) && base_zero_bits.is_some_and(|bits| bits >= 2);
+        Self {
+            source_length_lower_bound,
+            length_barrier_proofs,
+            required_internal_barriers,
+            base_destination_byte_integrity_proven,
+            static_destination_base_alignment_proven,
+        }
+    }
+}
+
+struct FreshDestinationProof {
+    alignment: Option<Value>,
+    cleanup: Option<Value>,
+}
+
+impl FreshDestinationProof {
+    const fn base_alignment_proven(&self, requirements: &CopyDestinationRequirements) -> bool {
+        requirements.static_destination_base_alignment_proven || self.alignment.is_some()
+    }
+
+    fn byte_integrity_proven(&self, requirements: &CopyDestinationRequirements) -> bool {
+        requirements.base_destination_byte_integrity_proven
+            && (requirements.required_internal_barriers.is_empty() || self.cleanup.is_some())
+    }
+}
+
+struct CopyWordInterpretation {
+    destination_load_interpretations: Vec<Value>,
+    source_word_runtime_bindings: Vec<Value>,
+    source_word_returns: Vec<Value>,
+    runtime_graph_proven: bool,
+    destination_load_interpretation_proven: bool,
+}
+
+impl CopyWordInterpretation {
+    /// Runtime bindings are considered only after exact module memory,
+    /// unchanged destination bytes, alignment, and full load coverage.
+    fn evaluate(
+        candidate: &Value,
+        analysis: &Value,
+        export_name: Option<&str>,
+        source: &CopiedSourceEvidence,
+        requirements: &CopyDestinationRequirements,
+        fresh: &FreshDestinationProof,
+    ) -> Self {
+        let module_memory_proven = source.module_memory_proven();
+        let destination_byte_integrity_proven = fresh.byte_integrity_proven(requirements);
+        let destination_base_alignment_proven = fresh.base_alignment_proven(requirements);
+        let (destination_load_interpretations, _) = interpreted_destination_loads(
+            candidate,
+            if module_memory_proven {
+                &source.module_memory_proofs
+            } else {
+                &[]
+            },
+            export_name,
+            destination_byte_integrity_proven,
+            destination_base_alignment_proven,
+        );
+        let destination_load_interpretation_proven = module_memory_proven
+            && destination_byte_integrity_proven
+            && !destination_load_interpretations.is_empty()
+            && destination_load_interpretations.len()
+                == array_field(candidate, "destination_loads").len();
+        let (source_word_runtime_bindings, source_word_returns, runtime_graph_proven) =
+            if destination_load_interpretation_proven {
+                source_word_semantic_overlay(analysis, &destination_load_interpretations)
+            } else {
+                (Vec::new(), Vec::new(), false)
+            };
+        Self {
+            destination_load_interpretations,
+            source_word_runtime_bindings,
+            source_word_returns,
+            runtime_graph_proven,
+            destination_load_interpretation_proven,
+        }
+    }
+
+    const fn semantic_overlay_proven(&self) -> bool {
+        self.destination_load_interpretation_proven
+            && !self.source_word_runtime_bindings.is_empty()
+            && self.source_word_runtime_bindings.len()
+                == self.destination_load_interpretations.len()
+    }
+
+    const fn return_dependencies_proven(&self) -> bool {
+        self.semantic_overlay_proven()
+            && self.runtime_graph_proven
+            && !self.source_word_returns.is_empty()
+    }
+}
+
+struct CopyLimitations {
+    destination_load: Value,
+    source_word_overlay: Value,
+    source_word_return: Value,
+}
+
+impl CopyLimitations {
+    fn for_proofs(
+        source: &CopiedSourceEvidence,
+        requirements: &CopyDestinationRequirements,
+        fresh: &FreshDestinationProof,
+        interpretation: &CopyWordInterpretation,
+    ) -> Self {
+        let module_memory_proven = source.module_memory_proven();
+        let destination_byte_integrity_proven = fresh.byte_integrity_proven(requirements);
+        let destination_base_alignment_proven = fresh.base_alignment_proven(requirements);
+        let destination_load_interpretation_proven =
+            interpretation.destination_load_interpretation_proven;
+        let source_word_semantic_overlay_proven = interpretation.semantic_overlay_proven();
+        let source_word_return_dependencies_proven = interpretation.return_dependencies_proven();
+        let destination_load_limitation = if destination_load_interpretation_proven {
+            Value::Null
+        } else if !module_memory_proven {
+            "module-memory identity is not proven".into()
+        } else if !destination_byte_integrity_proven {
+            "a potentially memory-mutating path exists between the proven Uint32Array.set and at least one destination load".into()
+        } else if !destination_base_alignment_proven {
+            "the destination base is not proven aligned to the Uint32Array element width".into()
+        } else {
+            "the exact carrier export-call argument is not proven to be a fixed-length Uint32Array covering every destination load".into()
+        };
+        let source_word_overlay_limitation = if source_word_semantic_overlay_proven {
+            Value::Null
+        } else if !destination_load_interpretation_proven {
+            "destination-load interpretation is not proven".into()
+        } else {
+            "the deep runtime-binding report does not preserve a unique binding for every interpreted load SSA value".into()
+        };
+        let source_word_return_limitation = if source_word_return_dependencies_proven {
+            Value::Null
+        } else if !source_word_semantic_overlay_proven {
+            "source-word runtime binding identity is not proven".into()
+        } else {
+            "the deep runtime dependency graph or semantic return records are missing, invalid, cyclic, or empty".into()
+        };
+        Self {
+            destination_load: destination_load_limitation,
+            source_word_overlay: source_word_overlay_limitation,
+            source_word_return: source_word_return_limitation,
+        }
+    }
+}
+
 struct BoundaryCorrelation<'a> {
     project: &'a Path,
     budgets: &'a AnalysisBudgets,
@@ -1808,20 +2060,153 @@ impl BoundaryCorrelation<'_> {
         Ok(proofs)
     }
 
+    /// The bounded fresh evaluator is only consulted after unique module
+    /// memory identity; cleanup additionally requires an already validated
+    /// base byte-integrity proof and an exact fresh alignment witness.
+    fn fresh_destination_proofs(
+        &self,
+        scope: &BoundaryExport<'_>,
+        candidate: &Value,
+        source: &CopiedSourceEvidence,
+        requirements: &CopyDestinationRequirements,
+    ) -> Result<FreshDestinationProof> {
+        let mut alignment = None;
+        let mut fresh_document = None;
+        if source.module_memory_proven() && source.module_memory_sources.len() == 1 {
+            if let Some(source_path) = source.module_memory_sources.iter().next() {
+                fresh_document = self.full_cache.get(source_path);
+                if let Some(document) = fresh_document {
+                    let context = CopiedInputProofContext {
+                        project: self.project,
+                        module: scope.module,
+                        report: scope.report,
+                        function_imports: scope.function_imports,
+                        document,
+                        module_memory_proofs: &source.module_memory_proofs,
+                        binding_proofs: &source.copied_binding_proofs,
+                        export_name: string_field(scope.export, "export"),
+                        budget: &self.stage_budget,
+                    };
+                    self.stage_budget.checkpoint()?;
+                    alignment = fresh_destination_alignment_proof(&context, candidate);
+                    self.stage_budget.checkpoint()?;
+                }
+            }
+        }
+        let cleanup = if requirements.base_destination_byte_integrity_proven
+            && !requirements.required_internal_barriers.is_empty()
+        {
+            match (fresh_document, alignment.as_ref()) {
+                (Some(document), Some(alignment)) => {
+                    let context = CopiedInputProofContext {
+                        project: self.project,
+                        module: scope.module,
+                        report: scope.report,
+                        function_imports: scope.function_imports,
+                        document,
+                        module_memory_proofs: &source.module_memory_proofs,
+                        binding_proofs: &source.copied_binding_proofs,
+                        export_name: string_field(scope.export, "export"),
+                        budget: &self.stage_budget,
+                    };
+                    self.stage_budget.checkpoint()?;
+                    let proof =
+                        fresh_cleanup_disjointness_proof(&context, candidate, Some(alignment));
+                    self.stage_budget.checkpoint()?;
+                    proof
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Ok(FreshDestinationProof { alignment, cleanup })
+    }
+
     fn copied_input_candidate(
         &mut self,
         scope: &BoundaryExport<'_>,
         candidate: &Value,
     ) -> Result<Value> {
+        let names = CopyImportNames::from_candidate(scope.function_imports, candidate);
+        let proofs = self.collect_copied_source_proofs(scope, candidate, names)?;
+        let source = CopiedSourceEvidence::new(proofs);
+        let requirements = CopyDestinationRequirements::assess(
+            candidate,
+            string_field(scope.export, "export"),
+            &source,
+        );
+        let fresh = self.fresh_destination_proofs(scope, candidate, &source, &requirements)?;
+        let interpretation = CopyWordInterpretation::evaluate(
+            candidate,
+            scope.analysis,
+            string_field(scope.export, "export"),
+            &source,
+            &requirements,
+            &fresh,
+        );
+        Ok(Self::format_copied_input_row(
+            scope,
+            candidate,
+            names,
+            source,
+            requirements,
+            fresh,
+            interpretation,
+        ))
+    }
+
+    // Ambiguous carriers remain visible in the report, but never become
+    // an exact single-carrier source, binding or memory proof.
+    fn add_copied_ambiguity(
+        row: &mut Value,
+        proof_count: usize,
+        binding_count: usize,
+        memory_source_count: usize,
+    ) {
+        if proof_count > 1 {
+            row["js_typed_array_copy_semantics_proven"] = false.into();
+            row["ambiguity"] =
+                "multiple carrier sources prove the same constructor/set import semantics".into();
+        }
+        if binding_count > 1 {
+            row["import_binding_identity_proven"] = false.into();
+            let prefix = string_field(row, "ambiguity").unwrap_or_default();
+            row["ambiguity"] = format!(
+                "{}{}multiple exact module/import-object binding proofs",
+                prefix,
+                if prefix.is_empty() { "" } else { "; " }
+            )
+            .into();
+        }
+        if memory_source_count > 1 {
+            row["module_memory_identity_proven"] = false.into();
+            row["module_memory_identity_limitation"] =
+                "multiple carrier sources prove module-memory identity".into();
+            let prefix = string_field(row, "ambiguity").unwrap_or_default();
+            row["ambiguity"] = format!(
+                "{}{}multiple module-memory carrier proofs",
+                prefix,
+                if prefix.is_empty() { "" } else { "; " }
+            )
+            .into();
+        }
+    }
+
+    // A source-local handler match is not, by itself, an exact memory proof.
+    // Each separate proof condition is reflected in the final output row.
+    fn format_copied_input_row(
+        scope: &BoundaryExport<'_>,
+        candidate: &Value,
+        names: CopyImportNames<'_>,
+        source: CopiedSourceEvidence,
+        requirements: CopyDestinationRequirements,
+        fresh: FreshDestinationProof,
+        interpretation: CopyWordInterpretation,
+    ) -> Value {
         let module = scope.module;
         let export = scope.export;
-        let analysis = scope.analysis;
-        let report = scope.report;
-        let function_imports = scope.function_imports;
         let carrier_candidates = scope.carrier_candidates;
-        let export_name = string_field(export, "export");
-        let names = CopyImportNames::from_candidate(function_imports, candidate);
-        let proofs = self.collect_copied_source_proofs(scope, candidate, names)?;
         let CopyImportNames {
             set_module,
             set_name,
@@ -1830,189 +2215,37 @@ impl BoundaryCorrelation<'_> {
             memory_module,
             memory_name,
         } = names;
-        let project = self.project;
-        let stage_budget = &self.stage_budget;
-        let full_cache = &self.full_cache;
-        let copied_binding_proofs = proofs
-            .iter()
-            .flat_map(|proof| {
-                let source = string_field(proof, "source_path")
-                    .unwrap_or_default()
-                    .to_owned();
-                array_field(proof, "import_binding_identity_proofs")
-                    .iter()
-                    .cloned()
-                    .map(move |mut binding| {
-                        if let Some(object) = binding.as_object_mut() {
-                            object.insert("source_path".into(), source.clone().into());
-                        }
-                        binding
-                    })
-            })
-            .collect::<Vec<_>>();
-        let module_memory_proofs = proofs
-            .iter()
-            .flat_map(|proof| {
-                let source = string_field(proof, "source_path")
-                    .unwrap_or_default()
-                    .to_owned();
-                array_field(proof, "module_memory_identity_proofs")
-                    .iter()
-                    .cloned()
-                    .map(move |mut memory| {
-                        if let Some(object) = memory.as_object_mut() {
-                            object.insert("source_path".into(), source.clone().into());
-                        }
-                        memory
-                    })
-            })
-            .collect::<Vec<_>>();
-        let module_memory_sources = module_memory_proofs
-            .iter()
-            .filter_map(|proof| string_field(proof, "source_path"))
-            .collect::<BTreeSet<_>>();
-        let module_memory_proven = !module_memory_proofs.is_empty()
-            && module_memory_sources.len() == 1
-            && proofs.len() == 1
-            && copied_binding_proofs.len() == 1;
-        let destination_loads = array_field(candidate, "destination_loads");
-        let source_length_lower_bound = fixed_uint32_source_length_lower_bound(
-            if module_memory_proven {
-                &module_memory_proofs
-            } else {
-                &[]
-            },
-            export_name,
-            usize_field(candidate, "source_entry_parameter"),
-        );
-        let required_length_barriers = destination_loads
-            .iter()
-            .flat_map(|load| array_field(load, "source_length_import_barriers"))
-            .filter_map(Value::as_u64)
-            .filter_map(|value| usize::try_from(value).ok())
-            .collect::<BTreeSet<_>>();
-        let length_barrier_proofs = proofs
-            .iter()
-            .flat_map(|proof| {
-                let source = string_field(proof, "source_path")
-                    .unwrap_or_default()
-                    .to_owned();
-                array_field(proof, "source_length_barrier_proofs")
-                    .iter()
-                    .cloned()
-                    .map(move |mut barrier| {
-                        if let Some(object) = barrier.as_object_mut() {
-                            object.insert("source_path".into(), source.clone().into());
-                        }
-                        barrier
-                    })
-            })
-            .collect::<Vec<_>>();
-        let proven_length_barriers = length_barrier_proofs
-            .iter()
-            .filter_map(|proof| usize_field(proof, "function_import"))
-            .collect::<BTreeSet<_>>();
-        let required_internal_barriers = destination_loads
-            .iter()
-            .flat_map(|load| array_field(load, "internal_memory_mutation_call_barriers"))
-            .filter_map(Value::as_u64)
-            .filter_map(|value| usize::try_from(value).ok())
-            .collect::<BTreeSet<_>>();
-        let base_destination_byte_integrity_proven = !destination_loads.is_empty()
-            && source_length_lower_bound.is_some()
-            && destination_loads.iter().all(|load| {
-                bool_field(load, "unresolved_intervening_memory_mutation") == Some(false)
-                    && array_field(load, "other_import_call_barriers").is_empty()
-            })
-            && proven_length_barriers == required_length_barriers
-            && (required_length_barriers.is_empty() || proofs.len() == 1);
-        let element_shift = usize_field(candidate, "destination_element_index_shift");
-        let base_zero_bits =
-            usize_field(candidate, "destination_base_guaranteed_trailing_zero_bits");
-        let static_destination_base_alignment_proven =
-            element_shift == Some(2) && base_zero_bits.is_some_and(|bits| bits >= 2);
-
-        let mut fresh_alignment_proof = None;
-        let mut fresh_document = None;
-        if module_memory_proven && module_memory_sources.len() == 1 {
-            if let Some(source_path) = module_memory_sources.iter().next() {
-                fresh_document = full_cache.get(*source_path);
-                if let Some(document) = fresh_document {
-                    let context = CopiedInputProofContext {
-                        project,
-                        module,
-                        report,
-                        function_imports,
-                        document,
-                        module_memory_proofs: &module_memory_proofs,
-                        binding_proofs: &copied_binding_proofs,
-                        export_name,
-                        budget: stage_budget,
-                    };
-                    stage_budget.checkpoint()?;
-                    fresh_alignment_proof = fresh_destination_alignment_proof(&context, candidate);
-                    stage_budget.checkpoint()?;
-                }
-            }
-        }
-        let destination_base_alignment_proven =
-            static_destination_base_alignment_proven || fresh_alignment_proof.is_some();
-        let fresh_cleanup_proof =
-            if base_destination_byte_integrity_proven && !required_internal_barriers.is_empty() {
-                match (fresh_document, fresh_alignment_proof.as_ref()) {
-                    (Some(document), Some(alignment)) => {
-                        let context = CopiedInputProofContext {
-                            project,
-                            module,
-                            report,
-                            function_imports,
-                            document,
-                            module_memory_proofs: &module_memory_proofs,
-                            binding_proofs: &copied_binding_proofs,
-                            export_name,
-                            budget: stage_budget,
-                        };
-                        stage_budget.checkpoint()?;
-                        let proof =
-                            fresh_cleanup_disjointness_proof(&context, candidate, Some(alignment));
-                        stage_budget.checkpoint()?;
-                        proof
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-        let destination_byte_integrity_proven = base_destination_byte_integrity_proven
-            && (required_internal_barriers.is_empty() || fresh_cleanup_proof.is_some());
-        let (destination_load_interpretations, _) = interpreted_destination_loads(
-            candidate,
-            if module_memory_proven {
-                &module_memory_proofs
-            } else {
-                &[]
-            },
-            export_name,
-            destination_byte_integrity_proven,
-            destination_base_alignment_proven,
-        );
-        let destination_load_interpretation_proven = module_memory_proven
-            && destination_byte_integrity_proven
-            && !destination_load_interpretations.is_empty()
-            && destination_load_interpretations.len() == destination_loads.len();
-        let (source_word_runtime_bindings, source_word_returns, runtime_graph_proven) =
-            if destination_load_interpretation_proven {
-                source_word_semantic_overlay(analysis, &destination_load_interpretations)
-            } else {
-                (Vec::new(), Vec::new(), false)
-            };
-        let source_word_semantic_overlay_proven = destination_load_interpretation_proven
-            && !source_word_runtime_bindings.is_empty()
-            && source_word_runtime_bindings.len() == destination_load_interpretations.len();
-        let source_word_return_dependencies_proven = source_word_semantic_overlay_proven
-            && runtime_graph_proven
-            && !source_word_returns.is_empty();
-
+        let limitations =
+            CopyLimitations::for_proofs(&source, &requirements, &fresh, &interpretation);
+        let module_memory_proven = source.module_memory_proven();
+        let destination_base_alignment_proven = fresh.base_alignment_proven(&requirements);
+        let destination_byte_integrity_proven = fresh.byte_integrity_proven(&requirements);
+        let CopiedSourceEvidence {
+            proofs,
+            copied_binding_proofs,
+            module_memory_proofs,
+            module_memory_sources,
+        } = source;
+        let CopyDestinationRequirements {
+            source_length_lower_bound,
+            length_barrier_proofs,
+            required_internal_barriers,
+            static_destination_base_alignment_proven,
+            ..
+        } = requirements;
+        let FreshDestinationProof {
+            alignment: fresh_alignment_proof,
+            cleanup: fresh_cleanup_proof,
+        } = fresh;
+        let source_word_semantic_overlay_proven = interpretation.semantic_overlay_proven();
+        let source_word_return_dependencies_proven = interpretation.return_dependencies_proven();
+        let CopyWordInterpretation {
+            destination_load_interpretations,
+            source_word_runtime_bindings,
+            source_word_returns,
+            runtime_graph_proven,
+            destination_load_interpretation_proven,
+        } = interpretation;
         let destination_alignment_basis = if static_destination_base_alignment_proven {
             Value::String("static_ssa".into())
         } else if fresh_alignment_proof.is_some() {
@@ -2020,32 +2253,6 @@ impl BoundaryCorrelation<'_> {
         } else {
             Value::Null
         };
-        let destination_load_limitation = if destination_load_interpretation_proven {
-            Value::Null
-        } else if !module_memory_proven {
-            "module-memory identity is not proven".into()
-        } else if !destination_byte_integrity_proven {
-            "a potentially memory-mutating path exists between the proven Uint32Array.set and at least one destination load".into()
-        } else if !destination_base_alignment_proven {
-            "the destination base is not proven aligned to the Uint32Array element width".into()
-        } else {
-            "the exact carrier export-call argument is not proven to be a fixed-length Uint32Array covering every destination load".into()
-        };
-        let source_word_overlay_limitation = if source_word_semantic_overlay_proven {
-            Value::Null
-        } else if !destination_load_interpretation_proven {
-            "destination-load interpretation is not proven".into()
-        } else {
-            "the deep runtime-binding report does not preserve a unique binding for every interpreted load SSA value".into()
-        };
-        let source_word_return_limitation = if source_word_return_dependencies_proven {
-            Value::Null
-        } else if !source_word_semantic_overlay_proven {
-            "source-word runtime binding identity is not proven".into()
-        } else {
-            "the deep runtime dependency graph or semantic return records are missing, invalid, cyclic, or empty".into()
-        };
-
         let mut row = json!({
             "module_sha256": module.get("sha256").cloned().unwrap_or(Value::Null),
             "export": export.get("export").cloned().unwrap_or(Value::Null),
@@ -2081,40 +2288,19 @@ impl BoundaryCorrelation<'_> {
             "runtime_dependency_graph_proven": runtime_graph_proven,
             "source_word_return_dependencies_proven": source_word_return_dependencies_proven,
             "source_word_returns": if source_word_return_dependencies_proven { Value::Array(source_word_returns) } else { Value::Array(Vec::new()) },
-            "source_word_return_dependencies_limitation": source_word_return_limitation,
-            "source_word_semantic_overlay_limitation": source_word_overlay_limitation,
+            "source_word_return_dependencies_limitation": limitations.source_word_return,
+            "source_word_semantic_overlay_limitation": limitations.source_word_overlay,
             "source_uint32_array_length_lower_bound": source_length_lower_bound,
-            "destination_load_interpretation_limitation": destination_load_limitation,
+            "destination_load_interpretation_limitation": limitations.destination_load,
             "destination_load_interpretation_contract": "each proven i32.load reads the unchanged Uint32Array.set destination word corresponding to ToUint32(source[index]); numeric equality requires little-endian typed-array storage",
         });
-        if proofs.len() > 1 {
-            row["js_typed_array_copy_semantics_proven"] = false.into();
-            row["ambiguity"] =
-                "multiple carrier sources prove the same constructor/set import semantics".into();
-        }
-        if copied_binding_proofs.len() > 1 {
-            row["import_binding_identity_proven"] = false.into();
-            let prefix = string_field(&row, "ambiguity").unwrap_or_default();
-            row["ambiguity"] = format!(
-                "{}{}multiple exact module/import-object binding proofs",
-                prefix,
-                if prefix.is_empty() { "" } else { "; " }
-            )
-            .into();
-        }
-        if module_memory_sources.len() > 1 {
-            row["module_memory_identity_proven"] = false.into();
-            row["module_memory_identity_limitation"] =
-                "multiple carrier sources prove module-memory identity".into();
-            let prefix = string_field(&row, "ambiguity").unwrap_or_default();
-            row["ambiguity"] = format!(
-                "{}{}multiple module-memory carrier proofs",
-                prefix,
-                if prefix.is_empty() { "" } else { "; " }
-            )
-            .into();
-        }
-        Ok(row)
+        Self::add_copied_ambiguity(
+            &mut row,
+            proofs.len(),
+            copied_binding_proofs.len(),
+            module_memory_sources.len(),
+        );
+        row
     }
 
     fn finish(self) -> Result<WasmJsBoundarySummary> {
@@ -2245,9 +2431,107 @@ pub fn correlate_project(
 #[cfg(test)]
 mod tests {
     use super::{
-        source_word_semantic_overlay, BoundaryCorrelation, BoundaryExport, CopyImportNames,
+        source_word_semantic_overlay, BoundaryCorrelation, BoundaryExport, CopiedSourceEvidence,
+        CopyDestinationRequirements, CopyImportNames, CopyWordInterpretation,
+        FreshDestinationProof,
     };
     use serde_json::json;
+
+    #[test]
+    fn copied_proof_stages_keep_ambiguous_carriers_and_missing_barriers_unproven() {
+        let carrier = |path| {
+            json!({
+                "source_path": path,
+                "import_binding_identity_proofs": [{"import_object":"imports"}],
+                "module_memory_identity_proofs": [{"memory_export_name":"memory"}],
+                "source_length_barrier_proofs": [{"function_import":7}]
+            })
+        };
+        let unique = CopiedSourceEvidence::new(vec![carrier("src/a.js")]);
+        assert!(unique.module_memory_proven());
+        assert_eq!(unique.module_memory_proofs[0]["source_path"], "src/a.js");
+        let source = CopiedSourceEvidence::new(vec![carrier("src/a.js"), carrier("src/b.js")]);
+        assert!(!source.module_memory_proven());
+        assert_eq!(source.module_memory_sources.len(), 2);
+        let candidate = json!({
+            "destination_element_index_shift": 2,
+            "destination_base_guaranteed_trailing_zero_bits": 2,
+            "destination_loads": [{
+                "source_length_import_barriers": [7,9],
+                "internal_memory_mutation_call_barriers": [3,3,5],
+                "other_import_call_barriers": [],
+                "unresolved_intervening_memory_mutation": false
+            }]
+        });
+        let requirements = CopyDestinationRequirements::assess(&candidate, Some("copy"), &source);
+        assert_eq!(
+            requirements
+                .required_internal_barriers
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [3, 5]
+        );
+        assert!(requirements.static_destination_base_alignment_proven);
+        assert!(!requirements.base_destination_byte_integrity_proven);
+        let fresh = FreshDestinationProof {
+            alignment: None,
+            cleanup: None,
+        };
+        assert!(!fresh.byte_integrity_proven(&requirements));
+        let analysis = json!({});
+        let interpretation = CopyWordInterpretation::evaluate(
+            &candidate,
+            &analysis,
+            Some("copy"),
+            &source,
+            &requirements,
+            &fresh,
+        );
+        assert!(!interpretation.destination_load_interpretation_proven);
+        assert!(!interpretation.semantic_overlay_proven());
+        assert!(!interpretation.return_dependencies_proven());
+        let module = json!({"sha256":"sha"});
+        let export = json!({"export":"copy"});
+        let report = json!({});
+        let imports = Vec::new();
+        let carriers = vec!["src/a.js".to_owned(), "src/b.js".to_owned()];
+        let scope = BoundaryExport {
+            module: &module,
+            export: &export,
+            analysis: &analysis,
+            report: &report,
+            function_imports: &imports,
+            carrier_candidates: &carriers,
+        };
+        let names = CopyImportNames::from_candidate(&imports, &candidate);
+        let row = BoundaryCorrelation::format_copied_input_row(
+            &scope,
+            &candidate,
+            names,
+            source,
+            requirements,
+            fresh,
+            interpretation,
+        );
+        assert_eq!(row["js_typed_array_copy_semantics_proven"], false);
+        assert_eq!(row["import_binding_identity_proven"], false);
+        assert_eq!(row["module_memory_identity_proven"], false);
+        assert_eq!(row["destination_load_interpretation_proven"], false);
+        assert_eq!(
+            row["module_memory_identity_limitation"],
+            "multiple carrier sources prove module-memory identity"
+        );
+        assert_eq!(row["ambiguity"], "multiple carrier sources prove the same constructor/set import semantics; multiple exact module/import-object binding proofs; multiple module-memory carrier proofs");
+        assert_eq!(
+            row["module_memory_identity_proofs"][0]["source_path"],
+            "src/a.js"
+        );
+        assert_eq!(
+            row["module_memory_identity_proofs"][1]["source_path"],
+            "src/b.js"
+        );
+    }
 
     #[test]
     fn copied_source_requires_unique_exact_import_handlers() {
