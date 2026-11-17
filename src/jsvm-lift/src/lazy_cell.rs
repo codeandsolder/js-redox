@@ -5184,7 +5184,7 @@ mod tests {
             proven_slow_lazy_cell_captured_handler_from_value(&captured_value, install)
                 .test_value("handler specialization")?;
         assert_eq!(specialized, captured);
-        let resolver = proven_slow_lazy_cell_resolver_index(
+        let resolver_index_proof = proven_slow_lazy_cell_resolver_index(
             source,
             &parsed.program,
             &semantic.semantic,
@@ -5197,9 +5197,10 @@ mod tests {
             },
         )
         .test_value("resolver slot")?;
-        let resolved = proven_slow_lazy_cell_resolved_handler(&resolver, &captured)
-            .test_value("resolved handler")?;
-        let read = structurally_compatible_slow_lazy_cell_read(&resolved, &carrier)
+        let resolved_handler_proof =
+            proven_slow_lazy_cell_resolved_handler(&resolver_index_proof, &captured)
+                .test_value("resolved handler")?;
+        let read = structurally_compatible_slow_lazy_cell_read(&resolved_handler_proof, &carrier)
             .test_value("end-to-end lazy read")?;
         assert_eq!(read.resolved_handler.resolver.exact_key_value, 7);
         assert_eq!(read.resolved_handler.resolver.handler_slot, 6);

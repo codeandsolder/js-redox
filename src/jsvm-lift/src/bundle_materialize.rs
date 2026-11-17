@@ -281,7 +281,7 @@ fn write_module_readme(module_root: &Path, bundles: &[Value], modules: &[Value])
             .and_then(Value::as_u64)
             .context("bundle_id must be a non-negative integer")?;
         let rows = by_bundle.get(&bundle_id).cloned().unwrap_or_default();
-        let named = rows
+        let named_export_rows = rows
             .iter()
             .filter(|row| array_len(row, "export_names") > 0)
             .copied()
@@ -290,7 +290,9 @@ fn write_module_readme(module_root: &Path, bundles: &[Value], modules: &[Value])
             .iter()
             .filter(|row| bool_field(row, "commonjs_export") && array_len(row, "export_names") == 0)
             .count();
-        let anonymous = rows.len().saturating_sub(named.len() + commonjs_only);
+        let anonymous = rows
+            .len()
+            .saturating_sub(named_export_rows.len() + commonjs_only);
         let kind = string_field(bundle, "kind").unwrap_or_default();
         let chunk_ids = bundle
             .get("chunk_ids")
@@ -316,18 +318,18 @@ fn write_module_readme(module_root: &Path, bundles: &[Value], modules: &[Value])
             format!("## Bundle {:02} — {identity}", bundle_id + 1),
             String::new(),
             format!("- Parent: `{}`", markdown_text(string_field(bundle, "parent_path").unwrap_or_default())),
-            format!("- Modules: **{}**; named: **{}**; CommonJS-only: **{commonjs_only}**; unlabeled: **{anonymous}**", rows.len(), named.len()),
+            format!("- Modules: **{}**; named: **{}**; CommonJS-only: **{commonjs_only}**; unlabeled: **{anonymous}**", rows.len(), named_export_rows.len()),
         ]);
-        if !named.is_empty() {
+        if !named_export_rows.is_empty() {
             lines.extend([String::new(), "Named-export modules:".to_owned()]);
-            for row in named {
+            for row in named_export_rows {
                 let source_path = string_field(row, "source_path").unwrap_or_default();
                 let relative = Path::new(source_path)
                     .strip_prefix("src/_modules")
                     .with_context(|| {
                         format!("module path is outside src/_modules: {source_path}")
                     })?;
-                let names = row
+                let export_name_list = row
                     .get("export_names")
                     .and_then(Value::as_array)
                     .into_iter()
@@ -337,7 +339,7 @@ fn write_module_readme(module_root: &Path, bundles: &[Value], modules: &[Value])
                     .collect::<Vec<_>>()
                     .join(", ");
                 lines.push(format!(
-                    "- [module {}]({}): {names} — {} literal dep(s)",
+                    "- [module {}]({}): {export_name_list} — {} literal dep(s)",
                     markdown_text(string_field(row, "module_id").unwrap_or_default()),
                     relative.to_string_lossy(),
                     array_len(row, "dependencies")

@@ -416,7 +416,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
-        let server = thread::spawn(move || -> Result<usize> {
+        let server_thread = thread::spawn(move || -> Result<usize> {
             let mut served = 0;
             let deadline = Instant::now() + Duration::from_secs(6);
             while served < 3 && Instant::now() < deadline {
@@ -457,10 +457,10 @@ mod tests {
             &har,
             HttpCaptureLimits::default(),
         )?;
-        let served = server
+        let served_requests = server_thread
             .join()
             .map_err(|_| anyhow::anyhow!("fixture HTTP server panicked"))??;
-        assert_eq!(served, 3);
+        assert_eq!(served_requests, 3);
         assert_eq!(summary.resources, 3);
         assert_eq!(summary.failed_resources, 0);
         let document: Value = serde_json::from_slice(&fs::read(har)?)?;
