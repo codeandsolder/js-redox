@@ -304,6 +304,233 @@ fn table_initializer_receiver_call<'a>(
     (property == method && symbol_of(scoping, object) == Some(receiver)).then_some(call)
 }
 
+struct TableInitializerVerifier<'c, 'g, 'l> {
+    scoping: &'c Scoping,
+    global_aliases: &'g HashMap<SymbolId, String>,
+    locals: &'l HashSet<SymbolId>,
+    receiver: SymbolId,
+    exports: SymbolId,
+    primitive_locals: HashSet<SymbolId>,
+    receiver_assigned: bool,
+    saw_table_operation: bool,
+    exact_grow_deltas: Vec<u32>,
+}
+impl TableInitializerVerifier<'_, '_, '_> {
+    fn verify_statements(&mut self, statements: &[Statement<'_>]) -> bool {
+        statements
+            .iter()
+            .all(|statement| self.verify_statement(statement))
+    }
+
+    fn verify_statement(&mut self, statement: &Statement<'_>) -> bool {
+        match statement {
+            Statement::BlockStatement(block) => self.verify_statements(&block.body),
+            Statement::EmptyStatement(_) => true,
+            Statement::VariableDeclaration(declaration) => {
+                for declarator in &declaration.declarations {
+                    let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                        return false;
+                    };
+                    let Some(symbol) = identifier.symbol_id.get() else {
+                        return false;
+                    };
+                    if !self.locals.contains(&symbol) {
+                        return false;
+                    }
+                    if let Some(initializer) = &declarator.init {
+                        if !proof_primitive_expression(
+                            initializer,
+                            self.scoping,
+                            self.global_aliases,
+                            &self.primitive_locals,
+                        ) {
+                            return false;
+                        }
+                        self.primitive_locals.insert(symbol);
+                    }
+                }
+                true
+            }
+            Statement::ExpressionStatement(statement) => {
+                let expression = unparenthesized(&statement.expression);
+                if let Expression::AssignmentExpression(assignment) = expression {
+                    if assignment.operator.as_str() != "=" {
+                        return false;
+                    }
+                    let AssignmentTarget::AssignmentTargetIdentifier(left) = &assignment.left
+                    else {
+                        return false;
+                    };
+                    let Some(target) = left.reference_id.get().and_then(|reference_id| {
+                        self.scoping.get_reference(reference_id).symbol_id()
+                    }) else {
+                        return false;
+                    };
+                    if !self.locals.contains(&target) {
+                        return false;
+                    }
+
+                    if target == self.receiver {
+                        if self.receiver_assigned {
+                            return false;
+                        }
+                        let Some((object, property)) = static_member_parts(&assignment.right)
+                        else {
+                            return false;
+                        };
+                        if property != "__wbindgen_export_0"
+                            || symbol_of(self.scoping, object) != Some(self.exports)
+                        {
+                            return false;
+                        }
+                        self.receiver_assigned = true;
+                        return true;
+                    }
+
+                    if let Some(call) = table_initializer_receiver_call(
+                        &assignment.right,
+                        self.scoping,
+                        self.receiver,
+                        "grow",
+                        1,
+                    ) {
+                        if !self.receiver_assigned {
+                            return false;
+                        }
+                        let Some(argument) = call.arguments[0].as_expression() else {
+                            return false;
+                        };
+                        if !proof_primitive_expression(
+                            argument,
+                            self.scoping,
+                            self.global_aliases,
+                            &self.primitive_locals,
+                        ) {
+                            return false;
+                        }
+                        let Expression::NumericLiteral(delta) = unparenthesized(argument) else {
+                            return false;
+                        };
+                        let Some(delta) =
+                            exact_u64(delta.value).and_then(|value| u32::try_from(value).ok())
+                        else {
+                            return false;
+                        };
+                        self.exact_grow_deltas.push(delta);
+                        self.primitive_locals.insert(target);
+                        self.saw_table_operation = true;
+                        return true;
+                    }
+
+                    if proof_primitive_expression(
+                        &assignment.right,
+                        self.scoping,
+                        self.global_aliases,
+                        &self.primitive_locals,
+                    ) {
+                        self.primitive_locals.insert(target);
+                        return true;
+                    }
+                    false
+                } else if let Some(call) = table_initializer_receiver_call(
+                    expression,
+                    self.scoping,
+                    self.receiver,
+                    "set",
+                    2,
+                ) {
+                    if !self.receiver_assigned {
+                        return false;
+                    }
+                    let [index, value] = call.arguments.as_slice() else {
+                        return false;
+                    };
+                    let (Some(index), Some(value)) = (index.as_expression(), value.as_expression())
+                    else {
+                        return false;
+                    };
+                    if !proof_primitive_expression(
+                        index,
+                        self.scoping,
+                        self.global_aliases,
+                        &self.primitive_locals,
+                    ) || !proof_primitive_expression(
+                        value,
+                        self.scoping,
+                        self.global_aliases,
+                        &self.primitive_locals,
+                    ) {
+                        return false;
+                    }
+                    self.saw_table_operation = true;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+struct TableExportBindingCollector<'c, 'l> {
+    scoping: &'c Scoping,
+    locals: &'l HashSet<SymbolId>,
+    candidates: Vec<(SymbolId, SymbolId)>,
+}
+impl<'a> Visit<'a> for TableExportBindingCollector<'_, '_> {
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {}
+
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment.operator.as_str() == "="
+            && expression_property_name(&assignment.right) == Some("__wbindgen_export_0")
+        {
+            if let AssignmentTarget::AssignmentTargetIdentifier(left) = &assignment.left {
+                if let Some((object, _)) = static_member_parts(&assignment.right) {
+                    if let (Some(receiver), Some(exports)) = (
+                        left.reference_id
+                            .get()
+                            .and_then(|id| self.scoping.get_reference(id).symbol_id()),
+                        symbol_of(self.scoping, object),
+                    ) {
+                        if self.locals.contains(&receiver) {
+                            self.candidates.push((receiver, exports));
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+}
+
+struct TableLocalDeclarationCollector {
+    all: HashSet<SymbolId>,
+    uninitialized: HashSet<SymbolId>,
+    invalid: bool,
+}
+impl<'a> Visit<'a> for TableLocalDeclarationCollector {
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                self.invalid = true;
+                continue;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                self.invalid = true;
+                continue;
+            };
+            self.all.insert(symbol);
+            if declarator.init.is_none() {
+                self.uninitialized.insert(symbol);
+            }
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: oxc_syntax::scope::ScopeFlags) {}
+}
+
 fn table_initializer_only(
     function: &Function<'_>,
     scoping: &Scoping,
@@ -314,38 +541,7 @@ fn table_initializer_only(
     }
     let body = function.body.as_ref()?;
 
-    struct LocalCollector {
-        all: HashSet<SymbolId>,
-        uninitialized: HashSet<SymbolId>,
-        invalid: bool,
-    }
-    impl<'a> Visit<'a> for LocalCollector {
-        fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
-            for declarator in &declaration.declarations {
-                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                    self.invalid = true;
-                    continue;
-                };
-                let Some(symbol) = identifier.symbol_id.get() else {
-                    self.invalid = true;
-                    continue;
-                };
-                self.all.insert(symbol);
-                if declarator.init.is_none() {
-                    self.uninitialized.insert(symbol);
-                }
-            }
-            walk::walk_variable_declaration(self, declaration);
-        }
-
-        fn visit_function(
-            &mut self,
-            _function: &Function<'a>,
-            _flags: oxc_syntax::scope::ScopeFlags,
-        ) {
-        }
-    }
-    let mut locals = LocalCollector {
+    let mut locals = TableLocalDeclarationCollector {
         all: HashSet::new(),
         uninitialized: HashSet::new(),
         invalid: false,
@@ -357,45 +553,7 @@ fn table_initializer_only(
         return None;
     }
 
-    struct BindingCollector<'c, 'l> {
-        scoping: &'c Scoping,
-        locals: &'l HashSet<SymbolId>,
-        candidates: Vec<(SymbolId, SymbolId)>,
-    }
-    impl<'a> Visit<'a> for BindingCollector<'_, '_> {
-        fn visit_function(
-            &mut self,
-            _function: &Function<'a>,
-            _flags: oxc_syntax::scope::ScopeFlags,
-        ) {
-        }
-
-        fn visit_assignment_expression(
-            &mut self,
-            assignment: &oxc_ast::ast::AssignmentExpression<'a>,
-        ) {
-            if assignment.operator.as_str() == "="
-                && expression_property_name(&assignment.right) == Some("__wbindgen_export_0")
-            {
-                if let AssignmentTarget::AssignmentTargetIdentifier(left) = &assignment.left {
-                    if let Some((object, _)) = static_member_parts(&assignment.right) {
-                        if let (Some(receiver), Some(exports)) = (
-                            left.reference_id
-                                .get()
-                                .and_then(|id| self.scoping.get_reference(id).symbol_id()),
-                            symbol_of(self.scoping, object),
-                        ) {
-                            if self.locals.contains(&receiver) {
-                                self.candidates.push((receiver, exports));
-                            }
-                        }
-                    }
-                }
-            }
-            walk::walk_assignment_expression(self, assignment);
-        }
-    }
-    let mut bindings = BindingCollector {
+    let mut bindings = TableExportBindingCollector {
         scoping,
         locals: &locals.all,
         candidates: Vec::new(),
@@ -410,178 +568,7 @@ fn table_initializer_only(
         return None;
     }
 
-    struct Verifier<'c, 'g, 'l> {
-        scoping: &'c Scoping,
-        global_aliases: &'g HashMap<SymbolId, String>,
-        locals: &'l HashSet<SymbolId>,
-        receiver: SymbolId,
-        exports: SymbolId,
-        primitive_locals: HashSet<SymbolId>,
-        receiver_assigned: bool,
-        saw_table_operation: bool,
-        exact_grow_deltas: Vec<u32>,
-    }
-    impl Verifier<'_, '_, '_> {
-        fn verify_statements(&mut self, statements: &[Statement<'_>]) -> bool {
-            statements
-                .iter()
-                .all(|statement| self.verify_statement(statement))
-        }
-
-        fn verify_statement(&mut self, statement: &Statement<'_>) -> bool {
-            match statement {
-                Statement::BlockStatement(block) => self.verify_statements(&block.body),
-                Statement::EmptyStatement(_) => true,
-                Statement::VariableDeclaration(declaration) => {
-                    for declarator in &declaration.declarations {
-                        let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                            return false;
-                        };
-                        let Some(symbol) = identifier.symbol_id.get() else {
-                            return false;
-                        };
-                        if !self.locals.contains(&symbol) {
-                            return false;
-                        }
-                        if let Some(initializer) = &declarator.init {
-                            if !proof_primitive_expression(
-                                initializer,
-                                self.scoping,
-                                self.global_aliases,
-                                &self.primitive_locals,
-                            ) {
-                                return false;
-                            }
-                            self.primitive_locals.insert(symbol);
-                        }
-                    }
-                    true
-                }
-                Statement::ExpressionStatement(statement) => {
-                    let expression = unparenthesized(&statement.expression);
-                    if let Expression::AssignmentExpression(assignment) = expression {
-                        if assignment.operator.as_str() != "=" {
-                            return false;
-                        }
-                        let AssignmentTarget::AssignmentTargetIdentifier(left) = &assignment.left
-                        else {
-                            return false;
-                        };
-                        let Some(target) = left.reference_id.get().and_then(|reference_id| {
-                            self.scoping.get_reference(reference_id).symbol_id()
-                        }) else {
-                            return false;
-                        };
-                        if !self.locals.contains(&target) {
-                            return false;
-                        }
-
-                        if target == self.receiver {
-                            if self.receiver_assigned {
-                                return false;
-                            }
-                            let Some((object, property)) = static_member_parts(&assignment.right)
-                            else {
-                                return false;
-                            };
-                            if property != "__wbindgen_export_0"
-                                || symbol_of(self.scoping, object) != Some(self.exports)
-                            {
-                                return false;
-                            }
-                            self.receiver_assigned = true;
-                            return true;
-                        }
-
-                        if let Some(call) = table_initializer_receiver_call(
-                            &assignment.right,
-                            self.scoping,
-                            self.receiver,
-                            "grow",
-                            1,
-                        ) {
-                            if !self.receiver_assigned {
-                                return false;
-                            }
-                            let Some(argument) = call.arguments[0].as_expression() else {
-                                return false;
-                            };
-                            if !proof_primitive_expression(
-                                argument,
-                                self.scoping,
-                                self.global_aliases,
-                                &self.primitive_locals,
-                            ) {
-                                return false;
-                            }
-                            let Expression::NumericLiteral(delta) = unparenthesized(argument)
-                            else {
-                                return false;
-                            };
-                            let Some(delta) =
-                                exact_u64(delta.value).and_then(|value| u32::try_from(value).ok())
-                            else {
-                                return false;
-                            };
-                            self.exact_grow_deltas.push(delta);
-                            self.primitive_locals.insert(target);
-                            self.saw_table_operation = true;
-                            return true;
-                        }
-
-                        if proof_primitive_expression(
-                            &assignment.right,
-                            self.scoping,
-                            self.global_aliases,
-                            &self.primitive_locals,
-                        ) {
-                            self.primitive_locals.insert(target);
-                            return true;
-                        }
-                        false
-                    } else if let Some(call) = table_initializer_receiver_call(
-                        expression,
-                        self.scoping,
-                        self.receiver,
-                        "set",
-                        2,
-                    ) {
-                        if !self.receiver_assigned {
-                            return false;
-                        }
-                        let [index, value] = call.arguments.as_slice() else {
-                            return false;
-                        };
-                        let (Some(index), Some(value)) =
-                            (index.as_expression(), value.as_expression())
-                        else {
-                            return false;
-                        };
-                        if !proof_primitive_expression(
-                            index,
-                            self.scoping,
-                            self.global_aliases,
-                            &self.primitive_locals,
-                        ) || !proof_primitive_expression(
-                            value,
-                            self.scoping,
-                            self.global_aliases,
-                            &self.primitive_locals,
-                        ) {
-                            return false;
-                        }
-                        self.saw_table_operation = true;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            }
-        }
-    }
-
-    let mut verifier = Verifier {
+    let mut verifier = TableInitializerVerifier {
         scoping,
         global_aliases,
         locals: &locals.all,
