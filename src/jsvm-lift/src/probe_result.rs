@@ -5,9 +5,10 @@
 //! only a proven value can then deliberately collapse the other two cases.
 
 /// One-shot structural/evidence lookup in an AST.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ProbeResult<T> {
+#[derive(Debug, Default, PartialEq, Eq)]
+pub enum ProbeResult<T> {
     /// The visitor has not yet encountered the requested site.
+    #[default]
     NotVisited,
     /// The requested site was seen, but the requested evidence was not proven.
     Unproven,
@@ -15,25 +16,16 @@ pub(crate) enum ProbeResult<T> {
     Proven(T),
 }
 
-impl<T> Default for ProbeResult<T> {
-    fn default() -> Self {
-        Self::NotVisited
-    }
-}
-
 impl<T> ProbeResult<T> {
-    pub(crate) fn resolve(proof: Option<T>) -> Self {
-        match proof {
-            Some(proof) => Self::Proven(proof),
-            None => Self::Unproven,
-        }
+    pub fn resolve(proof: Option<T>) -> Self {
+        proof.map_or(Self::Unproven, Self::Proven)
     }
 
-    pub(crate) fn is_decided(&self) -> bool {
+    pub const fn is_decided(&self) -> bool {
         !matches!(self, Self::NotVisited)
     }
 
-    pub(crate) fn into_proven(self) -> Option<T> {
+    pub fn into_proven(self) -> Option<T> {
         match self {
             Self::Proven(value) => Some(value),
             Self::NotVisited | Self::Unproven => None,

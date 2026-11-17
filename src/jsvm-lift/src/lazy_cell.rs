@@ -434,7 +434,7 @@ enum FastGetterReturn {
 }
 
 impl FastGetterReturn {
-    fn guard(self) -> Option<Span> {
+    const fn guard(self) -> Option<Span> {
         match self {
             Self::Direct => None,
             Self::Guarded(span) => Some(span),
