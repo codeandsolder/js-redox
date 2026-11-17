@@ -11,7 +11,7 @@ use oxc_ast::ast::{
     BindingPattern, CallExpression, Expression, IdentifierReference, Statement, WithStatement,
 };
 use oxc_ast_visit::{walk, Visit};
-use oxc_semantic::{Scoping, SemanticBuilder};
+use oxc_semantic::{Reference, Scoping, SemanticBuilder};
 use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::symbol::SymbolId;
 use rolldown_redox::ecmascript::parse_program;
@@ -166,7 +166,7 @@ fn template(helper: &ContextHelper) -> Option<ReturnTemplate> {
             .semantic
             .scoping()
             .get_resolved_references(*symbol)
-            .any(|reference| reference.is_write())
+            .any(Reference::is_write)
     }) {
         return None;
     }
@@ -285,7 +285,7 @@ impl CallExpander<'_> {
                             && !self
                                 .scoping
                                 .get_resolved_references(symbol)
-                                .any(|reference| reference.is_write())
+                                .any(Reference::is_write)
                     }),
                 _ => false,
             };

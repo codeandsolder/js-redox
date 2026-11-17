@@ -128,7 +128,7 @@ fn decode_with_label(raw: &[u8], label: &str) -> Option<String> {
             let encoding = Encoding::for_label(label.as_bytes())?;
             encoding
                 .decode_without_bom_handling_and_without_replacement(raw)
-                .map(|decoded| decoded.into_owned())
+                .map(std::borrow::Cow::into_owned)
         }
     }
 }

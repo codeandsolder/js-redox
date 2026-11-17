@@ -32,7 +32,7 @@ impl<'a> Visit<'a> for Guards {
             site: node.span(),
             test: node.test.span(),
             consequent: Some(node.consequent.span()),
-            alternate: node.alternate.as_ref().map(|arm| arm.span()),
+            alternate: node.alternate.as_ref().map(GetSpan::span),
         });
         walk::walk_if_statement(self, node);
     }
