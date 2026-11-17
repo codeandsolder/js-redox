@@ -251,10 +251,10 @@ pub(crate) fn merge_import_map(existing: &ImportMap, new: &ImportMap) -> ImportM
         integrity: existing.integrity.clone(),
     };
     for (scope, entries) in &new.scopes {
-        let current = merged.scopes.get(scope).cloned().unwrap_or_default();
-        merged
-            .scopes
-            .insert(scope.clone(), merge_specifier_map(&current, entries));
+        let current = merged.scopes.entry(scope.clone()).or_default();
+        for (key, value) in entries {
+            current.entry(key.clone()).or_insert_with(|| value.clone());
+        }
     }
     for (url, integrity) in &new.integrity {
         merged
@@ -276,13 +276,12 @@ fn resolve_in_specifier_map(
         .keys()
         .filter(|key| key.ends_with('/') && normalized.starts_with(key.as_str()))
         .max_by_key(|key| key.len())?;
-    let base = specifier_map.get(key)?.clone();
-    let Some(base) = base else {
+    let Some(base) = specifier_map.get(key)?.as_deref() else {
         return Some((None, key.clone()));
     };
     let suffix = &normalized[key.len()..];
-    let resolved = join_url(&base, suffix);
-    let resolved = resolved.filter(|value| value.starts_with(&base));
+    let resolved = join_url(base, suffix);
+    let resolved = resolved.filter(|value| value.starts_with(base));
     Some((resolved, key.clone()))
 }
 
@@ -293,13 +292,22 @@ fn resolution_value(
     key: Option<String>,
     scope: Option<String>,
 ) -> Value {
-    json!({
-        "resolved_url": resolved_url,
-        "bare_specifier": bare,
-        "resolution": resolution,
-        "import_map_key": key,
-        "scope": scope,
-    })
+    Value::Object(Map::from_iter([
+        (
+            "resolved_url".to_owned(),
+            resolved_url.map_or(Value::Null, Value::String),
+        ),
+        ("bare_specifier".to_owned(), Value::Bool(bare)),
+        (
+            "resolution".to_owned(),
+            Value::String(resolution.to_owned()),
+        ),
+        (
+            "import_map_key".to_owned(),
+            key.map_or(Value::Null, Value::String),
+        ),
+        ("scope".to_owned(), scope.map_or(Value::Null, Value::String)),
+    ]))
 }
 
 pub(crate) fn resolve_with_import_map(
@@ -309,9 +317,7 @@ pub(crate) fn resolve_with_import_map(
 ) -> Value {
     let specifier = specifier.trim();
     let normalized_url = url_like(base_url, specifier);
-    let normalized = normalized_url
-        .clone()
-        .unwrap_or_else(|| specifier.to_owned());
+    let normalized = normalized_url.as_deref().unwrap_or(specifier);
     if let (Some(import_map), Some(base_url)) = (import_map, base_url) {
         let mut scopes = import_map
             .scopes
@@ -323,28 +329,30 @@ pub(crate) fn resolve_with_import_map(
             if let Some((resolved, key)) =
                 resolve_in_specifier_map(&normalized, &import_map.scopes[scope])
             {
+                let resolution = if resolved.is_some() {
+                    "import_map_scope"
+                } else {
+                    "import_map_blocked"
+                };
                 return resolution_value(
-                    resolved.clone(),
+                    resolved,
                     normalized_url.is_none(),
-                    if resolved.is_some() {
-                        "import_map_scope"
-                    } else {
-                        "import_map_blocked"
-                    },
+                    resolution,
                     Some(key),
                     Some(scope.clone()),
                 );
             }
         }
         if let Some((resolved, key)) = resolve_in_specifier_map(&normalized, &import_map.imports) {
+            let resolution = if resolved.is_some() {
+                "import_map"
+            } else {
+                "import_map_blocked"
+            };
             return resolution_value(
-                resolved.clone(),
+                resolved,
                 normalized_url.is_none(),
-                if resolved.is_some() {
-                    "import_map"
-                } else {
-                    "import_map_blocked"
-                },
+                resolution,
                 Some(key),
                 None,
             );
@@ -1087,6 +1095,62 @@ mod tests {
         );
         assert_eq!(result["resolved_url"], "https://scope.test/pkg/util.js");
         assert_eq!(result["resolution"], "import_map_scope");
+    }
+
+    #[test]
+    fn import_map_merge_preserves_existing_scope_entries_and_explicit_blocks() {
+        let scope = "https://app.test/feature/";
+        let mut existing = ImportMap::default();
+        existing.scopes.insert(
+            scope.to_owned(),
+            BTreeMap::from([
+                ("pkg/".into(), Some("https://old.test/pkg/".into())),
+                ("blocked".into(), None),
+            ]),
+        );
+        let mut update = ImportMap::default();
+        update.scopes.insert(
+            scope.to_owned(),
+            BTreeMap::from([
+                ("pkg/".into(), Some("https://new.test/pkg/".into())),
+                ("blocked".into(), Some("https://new.test/blocked".into())),
+                ("extra".into(), Some("https://new.test/extra.js".into())),
+            ]),
+        );
+        let merged = merge_import_map(&existing, &update);
+        assert_eq!(
+            merged.scopes[scope]["pkg/"].as_deref(),
+            Some("https://old.test/pkg/")
+        );
+        assert_eq!(merged.scopes[scope]["blocked"], None);
+        let package = resolve_with_import_map(
+            Some("https://app.test/feature/main.js"),
+            "pkg/util.js",
+            Some(&merged),
+        );
+        assert_eq!(package["resolved_url"], "https://old.test/pkg/util.js");
+        assert_eq!(package["resolution"], "import_map_scope");
+        assert_eq!(package["bare_specifier"], true);
+        assert_eq!(package["import_map_key"], "pkg/");
+        assert_eq!(package["scope"], scope);
+
+        let blocked = resolve_with_import_map(
+            Some("https://app.test/feature/main.js"),
+            "blocked",
+            Some(&merged),
+        );
+        assert_eq!(blocked["resolved_url"], Value::Null);
+        assert_eq!(blocked["resolution"], "import_map_blocked");
+        assert_eq!(blocked["import_map_key"], "blocked");
+
+        let added = resolve_with_import_map(
+            Some("https://app.test/feature/main.js"),
+            "extra",
+            Some(&merged),
+        );
+        assert_eq!(added["resolved_url"], "https://new.test/extra.js");
+        assert_eq!(added["resolution"], "import_map_scope");
+        assert_eq!(existing.scopes[scope].len(), 2);
     }
 
     #[test]

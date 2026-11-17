@@ -100,7 +100,7 @@ fn har_entry(url: &str, mime: &str, text: &str, encoding: Option<&str>) -> Value
     })
 }
 
-fn write_har(path: &Path, title: &str, entries: Vec<Value>) -> Result<()> {
+fn write_har(path: &Path, title: &str, entries: &[Value]) -> Result<()> {
     fs::write(
         path,
         serde_json::to_vec(&json!({
@@ -119,7 +119,7 @@ fn write_inline_wasm_har(path: &Path, title: &str, source: &str) -> Result<()> {
     write_har(
         path,
         title,
-        vec![
+        &[
             har_entry(
                 "https://fixture.invalid/index.html",
                 "text/html",
@@ -238,7 +238,7 @@ fn wasm_capture_deduplicates_origins_and_correlates_host_effects() -> Result<()>
     write_har(
         &har,
         "wasm capture regression",
-        vec![
+        &[
             har_entry(
                 "https://fixture.invalid/index.html",
                 "text/html",
