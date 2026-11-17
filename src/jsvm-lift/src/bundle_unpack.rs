@@ -281,6 +281,66 @@ struct AmdMemberGroup {
     modules: Vec<ModuleRecord>,
 }
 
+struct BootstrapProbe<'s> {
+    scoping: &'s Scoping,
+    modules_symbol: SymbolId,
+    local_functions: HashSet<SymbolId>,
+    proven: bool,
+}
+impl<'a> Visit<'a> for BootstrapProbe<'_> {
+    fn enter_node(&mut self, kind: AstKind<'a>) {
+        match kind {
+            AstKind::Function(function) => {
+                if let Some(symbol) = function.id.as_ref().and_then(|id| id.symbol_id.get()) {
+                    self.local_functions.insert(symbol);
+                }
+            }
+            AstKind::AssignmentExpression(assign) if assign.operator.as_str() == "=" => {
+                let object = match &assign.left {
+                    AssignmentTarget::StaticMemberExpression(member)
+                        if member.property.name.as_str() == "m" =>
+                    {
+                        Some(&member.object)
+                    }
+                    AssignmentTarget::ComputedMemberExpression(member)
+                        if computed_string(&member.expression).as_deref() == Some("m") =>
+                    {
+                        Some(&member.object)
+                    }
+                    _ => None,
+                };
+                if let Some(object) = object {
+                    let loader = expression_symbol(self.scoping, object);
+                    let rhs = expression_symbol(self.scoping, &assign.right);
+                    if rhs == Some(self.modules_symbol)
+                        && loader.is_some_and(|symbol| self.local_functions.contains(&symbol))
+                    {
+                        self.proven = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Prove that this bootstrap assigns the exact modules parameter to the
+/// m property of a locally declared loader, using resolved symbols.
+fn bootstrap_installs_module_table(
+    body: &oxc_ast::ast::FunctionBody<'_>,
+    scoping: &Scoping,
+    modules_symbol: SymbolId,
+) -> bool {
+    let mut probe = BootstrapProbe {
+        scoping,
+        modules_symbol,
+        local_functions: HashSet::new(),
+        proven: false,
+    };
+    probe.visit_function_body(body);
+    probe.proven
+}
+
 struct Collector<'s, 'c> {
     source: &'s str,
     scoping: &'c Scoping,
@@ -1351,59 +1411,7 @@ impl Collector<'_, '_> {
             _ => return false,
         };
 
-        struct BootstrapProbe<'s> {
-            scoping: &'s Scoping,
-            modules_symbol: SymbolId,
-            local_functions: HashSet<SymbolId>,
-            proven: bool,
-        }
-        impl<'a> Visit<'a> for BootstrapProbe<'_> {
-            fn enter_node(&mut self, kind: AstKind<'a>) {
-                match kind {
-                    AstKind::Function(function) => {
-                        if let Some(symbol) = function.id.as_ref().and_then(|id| id.symbol_id.get())
-                        {
-                            self.local_functions.insert(symbol);
-                        }
-                    }
-                    AstKind::AssignmentExpression(assign) if assign.operator.as_str() == "=" => {
-                        let object = match &assign.left {
-                            AssignmentTarget::StaticMemberExpression(member)
-                                if member.property.name.as_str() == "m" =>
-                            {
-                                Some(&member.object)
-                            }
-                            AssignmentTarget::ComputedMemberExpression(member)
-                                if computed_string(&member.expression).as_deref() == Some("m") =>
-                            {
-                                Some(&member.object)
-                            }
-                            _ => None,
-                        };
-                        if let Some(object) = object {
-                            let loader = expression_symbol(self.scoping, object);
-                            let rhs = expression_symbol(self.scoping, &assign.right);
-                            if rhs == Some(self.modules_symbol)
-                                && loader
-                                    .is_some_and(|symbol| self.local_functions.contains(&symbol))
-                            {
-                                self.proven = true;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let mut probe = BootstrapProbe {
-            scoping: self.scoping,
-            modules_symbol,
-            local_functions: HashSet::new(),
-            proven: false,
-        };
-        probe.visit_function_body(body);
-        if !probe.proven {
+        if !bootstrap_installs_module_table(body, self.scoping, modules_symbol) {
             return false;
         }
 
@@ -1681,4 +1689,49 @@ pub fn analyze_bundle_source(
         fatal_error,
         bundles,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webpack_bootstrap_requires_proven_local_loader_assignment() -> Result<(), BudgetExceeded> {
+        let fixtures = [
+            (
+                "locally proven loader",
+                r"(function(modules) {
+                    function load(id) { return modules[id]; }
+                    load.m = modules;
+                })({ 1: function(module, exports) { exports.answer = 42; } });",
+                true,
+            ),
+            (
+                "unrelated RHS",
+                r"(function(modules) {
+                    function load(id) { return modules[id]; }
+                    load.m = unrelated;
+                })({ 1: function(module, exports) { exports.answer = 42; } });",
+                false,
+            ),
+            (
+                "unresolved loader",
+                r"(function(modules) {
+                    outside.m = modules;
+                })({ 1: function(module, exports) { exports.answer = 42; } });",
+                false,
+            ),
+        ];
+        let budget = WorkBudget::unlimited("webpack-bootstrap-proof");
+        for (label, source, expected) in fixtures {
+            let report = analyze_bundle_source(source, label, &budget)?;
+            assert!(!report.fatal_error, "{label}");
+            let recognized = report
+                .bundles
+                .iter()
+                .any(|bundle| bundle.kind == "webpack_object_bootstrap");
+            assert_eq!(recognized, expected, "{label}");
+        }
+        Ok(())
+    }
 }

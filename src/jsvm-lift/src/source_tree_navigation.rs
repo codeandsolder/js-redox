@@ -250,6 +250,56 @@ pub(crate) fn long_assignment_roots(
         .collect()
 }
 
+/// Append a source-bound AST assignment row and all its nested assignments.
+fn append_assignment_outline_node(
+    nodes: &[AssignmentNode],
+    children: &[Vec<usize>],
+    source: &str,
+    index: usize,
+    depth: usize,
+    output: &mut String,
+) {
+    let node = &nodes[index];
+    let (line, col) = line_col(source, node.span.start as usize);
+    let target = if node.target.len() > 80
+        || node.target.contains(char::from(96))
+        || node.target.contains(char::from(10))
+    {
+        "<complex target>".to_owned()
+    } else {
+        node.target.replace('|', r"\|")
+    };
+    let role = if node.parent.is_none() {
+        "root"
+    } else if node.in_target_reference {
+        "target reference"
+    } else {
+        "assignment value"
+    };
+    let guard = node.nearest_guard.as_ref().map_or_else(
+        || "none".to_owned(),
+        |guard| format!("{} ({} total)", guard, node.guard_depth),
+    );
+    let _ = writeln!(
+        output,
+        "| {} | {} | {} {} | {} | {} | {} | {}:{} ({}–{}) |",
+        depth,
+        index + 1,
+        target,
+        node.operator,
+        node.rhs,
+        role,
+        guard,
+        line,
+        col,
+        node.span.start,
+        node.span.end,
+    );
+    for &child in &children[index] {
+        append_assignment_outline_node(nodes, children, source, child, depth + 1, output);
+    }
+}
+
 fn assignment_outline(source: &str, program: &oxc_ast::ast::Program<'_>) -> Option<String> {
     let mut collector = AssignmentOutlineCollector {
         source,
@@ -291,54 +341,6 @@ by AST type and byte length, not evaluated or silently truncated.
 
 ",
     );
-    fn emit(
-        nodes: &[AssignmentNode],
-        children: &[Vec<usize>],
-        source: &str,
-        index: usize,
-        depth: usize,
-        output: &mut String,
-    ) {
-        let node = &nodes[index];
-        let (line, col) = line_col(source, node.span.start as usize);
-        let target = if node.target.len() > 80
-            || node.target.contains(char::from(96))
-            || node.target.contains(char::from(10))
-        {
-            "<complex target>".to_owned()
-        } else {
-            node.target.replace('|', r"\|")
-        };
-        let role = if node.parent.is_none() {
-            "root"
-        } else if node.in_target_reference {
-            "target reference"
-        } else {
-            "assignment value"
-        };
-        let guard = node.nearest_guard.as_ref().map_or_else(
-            || "none".to_owned(),
-            |guard| format!("{} ({} total)", guard, node.guard_depth),
-        );
-        let _ = writeln!(
-            output,
-            "| {} | {} | {} {} | {} | {} | {} | {}:{} ({}–{}) |",
-            depth,
-            index + 1,
-            target,
-            node.operator,
-            node.rhs,
-            role,
-            guard,
-            line,
-            col,
-            node.span.start,
-            node.span.end,
-        );
-        for &child in &children[index] {
-            emit(nodes, children, source, child, depth + 1, output);
-        }
-    }
     for root in roots {
         let node = &nodes[root];
         let (line, col) = line_col(source, node.span.start as usize);
@@ -348,7 +350,7 @@ by AST type and byte length, not evaluated or silently truncated.
             node.span.end - node.span.start,
         );
         output.push_str("| Depth | ID | Assignment target/operator | Assigned RHS | Containment | Nearest guard | Source location |\n|---:|---:|---|---|---|---|---|\n");
-        emit(nodes, &children, source, root, 0, &mut output);
+        append_assignment_outline_node(nodes, &children, source, root, 0, &mut output);
         output.push(char::from(10));
     }
     Some(output)

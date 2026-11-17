@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 
 type FunctionKey = (u32, u32);
+type ParameterOriginSources = BTreeSet<Option<usize>>;
 
 const fn key(span: Span) -> FunctionKey {
     (span.start, span.end)
@@ -692,8 +693,7 @@ fn propagate_reachable_parameter_origins(
         }
     }
 
-    type Sources = BTreeSet<Option<usize>>;
-    let mut states = BTreeMap::<FunctionKey, Vec<Sources>>::new();
+    let mut states = BTreeMap::<FunctionKey, Vec<ParameterOriginSources>>::new();
     states.insert(
         root,
         entry
@@ -717,7 +717,7 @@ fn propagate_reachable_parameter_origins(
             };
             let (target_states, mut changed) = match states.entry(*to) {
                 std::collections::btree_map::Entry::Vacant(slot) => (
-                    slot.insert(vec![Sources::new(); definition.params.len()]),
+                    slot.insert(vec![ParameterOriginSources::new(); definition.params.len()]),
                     true,
                 ),
                 std::collections::btree_map::Entry::Occupied(slot) => (slot.into_mut(), false),
@@ -734,7 +734,7 @@ fn propagate_reachable_parameter_origins(
                 };
                 // Defaults/destructuring, omitted arguments, spread arguments,
                 // and computed input expressions have no direct entry origin.
-                let input = supplied.unwrap_or_else(|| Sources::from([None]));
+                let input = supplied.unwrap_or_else(|| ParameterOriginSources::from([None]));
                 let before = target_states[index].len();
                 target_states[index].extend(input);
                 changed |= target_states[index].len() != before;

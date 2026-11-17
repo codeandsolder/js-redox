@@ -20,6 +20,9 @@ use oxc_syntax::{operator::UnaryOperator, scope::ScopeFlags, symbol::SymbolId};
 use rolldown_redox::ecmascript::parse_program;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+type RequestKey = ([u32; 2], Vec<(usize, String)>);
+type RequestValue = (String, BTreeSet<[u32; 2]>, Vec<[u32; 2]>);
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct LiteralCall {
     pub helper: String,
@@ -561,8 +564,6 @@ pub fn specialize_resolved_call_graph(
         }
     }
 
-    type RequestKey = ([u32; 2], Vec<(usize, String)>);
-    type RequestValue = (String, BTreeSet<[u32; 2]>, Vec<[u32; 2]>);
     let mut requested = BTreeMap::<RequestKey, RequestValue>::new();
     let mut pending = views
         .iter()
