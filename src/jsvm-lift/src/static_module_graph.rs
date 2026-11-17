@@ -715,7 +715,7 @@ mod tests {
         assert!(
             link_static_modules(project, &[tampered], &index, &refs, &manifest, &budget).is_err()
         );
-        let mut changed_manifest = manifest.clone();
+        let mut changed_manifest = manifest;
         changed_manifest.resources[1]["sha256"] = json!("incorrect-target-hash");
         assert!(link_static_modules(
             project,

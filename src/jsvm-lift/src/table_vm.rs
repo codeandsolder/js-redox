@@ -1129,11 +1129,10 @@ impl<'s> Analyzer<'s> {
                 .filter(|table| table.binding == *source)
                 .filter(|table| table.scope_start <= start && table.scope_end >= end)
                 .min_by_key(|table| table.scope_end.saturating_sub(table.scope_start))
-                .cloned()
             else {
                 continue;
             };
-            self.tables.push(DetailedHandlerTableCandidate {
+            let derived = DetailedHandlerTableCandidate {
                 binding: binding.clone(),
                 start,
                 end,
@@ -1149,7 +1148,8 @@ impl<'s> Analyzer<'s> {
                 dynamic_read_sites: 0,
                 looped_dynamic_read_sites: 0,
                 handlers: source_table.handlers.clone(),
-            });
+            };
+            self.tables.push(derived);
         }
     }
 

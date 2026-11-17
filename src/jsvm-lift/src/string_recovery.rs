@@ -143,7 +143,7 @@ pub fn recover_static_strings(
             )
         }
         None => (
-            classic_source.clone(),
+            classic_source,
             Vec::new(),
             vec![json!({
                 "iteration": 1,

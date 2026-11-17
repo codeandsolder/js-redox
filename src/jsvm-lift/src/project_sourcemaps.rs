@@ -154,7 +154,7 @@ fn join_relative_path(base: &str, reference: &str) -> String {
     let Ok(fake) = fake else {
         return reference.to_owned();
     };
-    let base = fake.join(base).unwrap_or(fake.clone());
+    let base = fake.join(base).unwrap_or(fake);
     let joined = base.join(reference).unwrap_or(base);
     let mut output = joined.path().to_owned();
     if let Some(query) = joined.query() {
@@ -347,10 +347,7 @@ fn load_map(
         return Err(problem(
             "invalid_source_map",
             [
-                (
-                    "map_url",
-                    map_url.clone().map_or(Value::Null, Value::String),
-                ),
+                ("map_url", map_url.map_or(Value::Null, Value::String)),
                 (
                     "map_resource_id",
                     map_resource_id.map_or(Value::Null, Value::from),

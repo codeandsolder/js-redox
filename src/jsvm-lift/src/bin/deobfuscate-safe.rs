@@ -1730,7 +1730,7 @@ fn build_source_tree(args: SourceTreeArgs) -> Result<serde_json::Value> {
                 "targeted_functions": guarded.targeted_functions,
             });
             if let Some(report) = full_context.as_mut() {
-                report["guarded_executable"] = metadata.clone();
+                report["guarded_executable"] = metadata;
             }
             let mut index = fs::read_to_string(whole_dir.join("README.md"))?;
             let _ = write!(index,
@@ -2643,7 +2643,7 @@ mod tests {
         fs::write(input.join("notes.txt"), "not javascript")?;
 
         run_source_tree(SourceTreeArgs {
-            input: input.clone(),
+            input,
             output: output.clone(),
             max_iterations: 12,
             format_output: false,
