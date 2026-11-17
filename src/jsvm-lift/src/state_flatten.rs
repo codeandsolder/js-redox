@@ -1,4 +1,5 @@
 use crate::numeric::{eval_js_bitwise_i64, exact_i64, exact_u64, js_int32_from_i64};
+use crate::probe_result::ProbeResult;
 use crate::{
     ast_utils::{expr_ident, numeric_u64, target_ident},
     source_text::preview,
@@ -1570,15 +1571,15 @@ pub fn prove_function_protected_if_ladder_event_unreachable_with_call_arguments(
 struct ExactBooleanExpressionProbe<'e> {
     env: &'e HashMap<String, Scalar>,
     target: Span,
-    result: Option<Option<bool>>,
+    result: ProbeResult<bool>,
 }
 impl<'a> Visit<'a> for ExactBooleanExpressionProbe<'_> {
     fn visit_expression(&mut self, expression: &Expression<'a>) {
-        if self.result.is_some() {
+        if self.result.is_decided() {
             return;
         }
         if expression.span() == self.target {
-            self.result = Some(branch_truthiness(expression, self.env));
+            self.result = ProbeResult::resolve(branch_truthiness(expression, self.env));
             return;
         }
         walk::walk_expression(self, expression);
@@ -1613,12 +1614,12 @@ pub fn proven_function_boolean_expression_with_integer_parameters(
         function_end: u32,
         expression: Span,
         parameter_bindings: &'b BTreeMap<usize, i64>,
-        result: Option<Option<bool>>,
+        result: ProbeResult<bool>,
     }
 
     impl<'a> Visit<'a> for FunctionHarness<'_> {
         fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if self.result.is_some() {
+            if self.result.is_decided() {
                 return;
             }
             if function.span.start != self.function_start || function.span.end != self.function_end
@@ -1629,21 +1630,21 @@ pub fn proven_function_boolean_expression_with_integer_parameters(
             let Some(env) =
                 exact_integer_parameter_env(function, self.scoping, self.parameter_bindings)
             else {
-                self.result = Some(None);
+                self.result = ProbeResult::Unproven;
                 return;
             };
             let Some(body) = function.body.as_deref() else {
-                self.result = Some(None);
+                self.result = ProbeResult::Unproven;
                 return;
             };
 
             let mut probe = ExactBooleanExpressionProbe {
                 env: &env,
                 target: self.expression,
-                result: None,
+                result: ProbeResult::default(),
             };
             probe.visit_function_body(body);
-            self.result = Some(probe.result.flatten());
+            self.result = ProbeResult::resolve(probe.result.into_proven());
         }
     }
 
@@ -1653,10 +1654,10 @@ pub fn proven_function_boolean_expression_with_integer_parameters(
         function_end,
         expression,
         parameter_bindings,
-        result: None,
+        result: ProbeResult::default(),
     };
     harness.visit_program(program);
-    harness.result.flatten()
+    harness.result.into_proven()
 }
 
 struct StructuredBranchExclusionProbe<'e> {
@@ -5403,6 +5404,32 @@ mod tests {
     use oxc_span::SourceType;
     use rolldown_redox::ecmascript::parse_program;
     use work_budget::{BudgetExceededKind, BudgetLimits};
+
+    #[test]
+    fn exact_boolean_probe_preserves_true_false_and_unknown() -> TestResult {
+        let source = "function f(flag) { return flag === 7; }";
+        let allocator = Allocator::default();
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        let function = last_direct_function_span(&parsed.program).test_value("function span")?;
+        let comparison = source_span(source, "flag === 7", "comparison span")?;
+        let evaluate = |bindings: &BTreeMap<usize, i64>, span: Span| {
+            proven_function_boolean_expression_with_integer_parameters(
+                &parsed.program,
+                semantic.semantic.scoping(),
+                function.start,
+                function.end,
+                span,
+                bindings,
+            )
+        };
+        assert_eq!(evaluate(&BTreeMap::from([(0, 7)]), comparison), Some(true));
+        assert_eq!(evaluate(&BTreeMap::from([(0, 6)]), comparison), Some(false));
+        assert_eq!(evaluate(&BTreeMap::new(), comparison), None);
+        assert_eq!(evaluate(&BTreeMap::from([(0, 7)]), Span::new(0, 0)), None);
+        Ok(())
+    }
 
     #[derive(Default)]
     struct DetectorHarness<'s> {

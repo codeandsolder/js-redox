@@ -30,6 +30,12 @@ pub struct StaticAliasInstallerCall {
     pub semantics_proven: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolverReturn {
+    Parameter,
+    Member(String),
+}
+
 #[derive(Debug, Clone)]
 struct ResolverShape {
     name: String,
@@ -186,9 +192,9 @@ fn resolver_member(
     returned: &Expression<'_>,
     parameter: SymbolId,
     argument_boxes: &HashSet<SymbolId>,
-) -> Option<Option<String>> {
+) -> Option<ResolverReturn> {
     if is_first_argument(scoping, returned, parameter, argument_boxes) {
-        return Some(None);
+        return Some(ResolverReturn::Parameter);
     }
 
     let Expression::StaticMemberExpression(member) = returned else {
@@ -197,7 +203,7 @@ fn resolver_member(
     if member.optional || !is_first_argument(scoping, &member.object, parameter, argument_boxes) {
         return None;
     }
-    Some(Some(member.property.name.to_string()))
+    Some(ResolverReturn::Member(member.property.name.to_string()))
 }
 
 struct ReturnShapeCollector<'c, 'b> {
@@ -205,7 +211,7 @@ struct ReturnShapeCollector<'c, 'b> {
     parameter: SymbolId,
     argument_boxes: &'b HashSet<SymbolId>,
     returns: usize,
-    member: Option<Option<String>>,
+    member: Option<ResolverReturn>,
     invalid: bool,
     poller: BudgetPoller,
 }
@@ -376,7 +382,10 @@ impl ResolverCollector<'_> {
                     function_symbol,
                     ResolverShape {
                         name: id.name.to_string(),
-                        member,
+                        member: match member {
+                            ResolverReturn::Parameter => None,
+                            ResolverReturn::Member(name) => Some(name),
+                        },
                     },
                 );
             }
