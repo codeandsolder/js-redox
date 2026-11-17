@@ -624,7 +624,7 @@ impl PathWalker<'_> {
                 })
                 .collect::<Vec<_>>();
             names.push(target.label.clone());
-            spans.push([next.0, next.1]);
+            spans.push(next.into());
             links.push(edge.clone());
             if links.len() >= 2 {
                 let leaf_parameters = target
@@ -752,7 +752,7 @@ fn propagate_reachable_parameter_origins(
             let depth = shortest_depth.get(&key).copied()?;
             Some(ReachableFunction {
                 name: definition.label.clone(),
-                span: [key.0, key.1],
+                span: key.into(),
                 shortest_call_depth: depth,
                 parameters: params
                     .into_iter()
@@ -978,22 +978,21 @@ pub fn reconstruct_caller_views(
     for symbol in ambiguous {
         symbols.remove(&symbol);
     }
-    for symbol in symbols.keys().copied().collect::<Vec<_>>() {
+    // Filter symbol targets in place rather than allocating temporary keys.
+    symbols.retain(|symbol, key| {
         let writes = scoping
-            .get_resolved_reference_ids(symbol)
+            .get_resolved_reference_ids(*symbol)
             .iter()
             .filter(|reference| scoping.get_reference(**reference).is_write())
             .count();
         let declaration_assignment = finder
             .functions
-            .get(&symbols[&symbol])
+            .get(key)
             .is_some_and(|definition| definition.initialized_by_assignment);
         // A single assignment can establish a previously declared function;
         // any additional write means the call target can vary at runtime.
-        if writes > usize::from(declaration_assignment) {
-            symbols.remove(&symbol);
-        }
-    }
+        writes <= usize::from(declaration_assignment)
+    });
     // First validate the original function definitions, then extend the map
     // through const aliases. A renamed direct call is still a call to the
     // original function, not a new function definition.
@@ -1063,7 +1062,7 @@ pub fn reconstruct_caller_views(
             *root,
             &origins,
             &mut vec![def.label.clone()],
-            &mut vec![[root.0, root.1]],
+            &mut vec![(*root).into()],
             &mut Vec::new(),
             &mut BTreeSet::from([*root]),
         );
@@ -1080,8 +1079,8 @@ pub fn reconstruct_caller_views(
             if let Some(edges) = collector.edges.get(&from) {
                 for (to, call) in edges {
                     reachable_edges.push(ResolvedCallEdge {
-                        from_span: [from.0, from.1],
-                        to_span: [to.0, to.1],
+                        from_span: from.into(),
+                        to_span: (*to).into(),
                         call: call.clone(),
                     });
                     queue.push_back(*to);
@@ -1099,7 +1098,7 @@ pub fn reconstruct_caller_views(
         paths.sort_by(|a, b| a.functions.cmp(&b.functions));
         let mut view = CallerView {
             entry: def.label.clone(),
-            entry_span: [root.0, root.1],
+            entry_span: (*root).into(),
             paths,
             reachable_edges,
             reachable_functions,

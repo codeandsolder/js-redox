@@ -1027,17 +1027,13 @@ fn evidence_precedes_on_path(evidence: &BranchPath, define: &BranchPath) -> bool
 }
 
 fn merge_strings(
-    left: &HashMap<ExprKey, String>,
+    mut left: HashMap<ExprKey, String>,
     right: &HashMap<ExprKey, String>,
 ) -> HashMap<ExprKey, String> {
-    left.iter()
-        .filter_map(|(key, value)| {
-            right
-                .get(key)
-                .filter(|other| *other == value)
-                .map(|_| (key.clone(), value.clone()))
-        })
-        .collect()
+    // Keep only facts that agree in both branches, reusing owned keys,
+    // values and the existing allocation rather than cloning every match.
+    left.retain(|key, value| right.get(key) == Some(value));
+    left
 }
 
 struct HelperProbe<'c> {
@@ -1308,19 +1304,15 @@ impl<'a> Visit<'a> for HelperProbe<'_> {
         self.branch_path.push((marker, true));
         walk::walk_statement(self, &statement.consequent);
         self.branch_path.pop();
-        let consequent_strings = self.strings.clone();
-
-        self.strings = base_strings.clone();
-        let alternate_strings = if let Some(alternate) = &statement.alternate {
+        // Preserve branch isolation while moving each result directly.
+        let consequent_strings = std::mem::replace(&mut self.strings, base_strings);
+        if let Some(alternate) = &statement.alternate {
             self.branch_path.push((marker, false));
             walk::walk_statement(self, alternate);
             self.branch_path.pop();
-            self.strings.clone()
-        } else {
-            base_strings
-        };
-
-        self.strings = merge_strings(&consequent_strings, &alternate_strings);
+        }
+        let alternate_strings = std::mem::take(&mut self.strings);
+        self.strings = merge_strings(consequent_strings, &alternate_strings);
     }
 
     fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
@@ -3538,9 +3530,10 @@ pub fn structurally_proven_forwarding_installers(
 #[cfg(test)]
 mod tests {
     use super::{
-        structurally_proven_forwarding_installers, structurally_proven_registry_forwarding_calls,
+        merge_strings, structurally_proven_forwarding_installers,
+        structurally_proven_registry_forwarding_calls,
         structurally_proven_registry_forwarding_value_calls,
-        structurally_proven_registry_read_calls,
+        structurally_proven_registry_read_calls, ExprKey,
     };
     use crate::test_support::{source_slice, TestFailure, TestResult, TestValue};
     use oxc_allocator::Allocator;
@@ -3551,6 +3544,31 @@ mod tests {
 
     fn test_budget() -> WorkBudget {
         WorkBudget::unlimited("forwarding-test")
+    }
+
+    #[test]
+    fn string_facts_survive_only_when_both_branches_agree() {
+        use oxc_syntax::symbol::SymbolId;
+        use std::collections::HashMap;
+
+        let shared = ExprKey::Symbol(SymbolId::new(0));
+        let changed = ExprKey::Symbol(SymbolId::new(1));
+        let left_only = ExprKey::Symbol(SymbolId::new(2));
+        let right_only = ExprKey::Symbol(SymbolId::new(3));
+        let left = HashMap::from([
+            (shared.clone(), "constant".to_owned()),
+            (changed.clone(), "left".to_owned()),
+            (left_only, "only in consequent".to_owned()),
+        ]);
+        let right = HashMap::from([
+            (shared.clone(), "constant".to_owned()),
+            (changed, "right".to_owned()),
+            (right_only, "only in alternate".to_owned()),
+        ]);
+        assert_eq!(
+            merge_strings(left, &right),
+            HashMap::from([(shared, "constant".to_owned())])
+        );
     }
 
     fn proven_count(source: &str) -> Result<usize, TestFailure> {

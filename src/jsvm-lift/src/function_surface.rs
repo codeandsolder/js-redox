@@ -262,7 +262,7 @@ impl SurfaceAccumulator {
             .map(
                 |((name, declaration), (reads, writes))| FunctionExternalReference {
                     name,
-                    declaration: declaration.map(|(start, end)| [start, end]),
+                    declaration: declaration.map(Into::into),
                     reads,
                     writes,
                 },

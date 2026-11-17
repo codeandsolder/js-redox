@@ -519,10 +519,11 @@ pub fn helper_navigation(source: &str, helper_path: &str) -> Option<HelperNaviga
                 .and_modify(|d| *d = (*d).max(depth))
                 .or_insert(depth);
         }
+        let closing_depth = depth.saturating_sub(1);
         breaks
             .entry(close)
-            .and_modify(|d| *d = (*d).max(depth.saturating_sub(1)))
-            .or_insert(depth.saturating_sub(1));
+            .and_modify(|d| *d = (*d).max(closing_depth))
+            .or_insert(closing_depth);
     }
     let mut layout = String::with_capacity(source.len() + breaks.len() * 40);
     let mut previous = 0;
