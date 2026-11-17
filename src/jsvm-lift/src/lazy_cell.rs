@@ -3003,6 +3003,35 @@ impl ExactSafeIntegerEvaluator<'_, '_> {
     }
 }
 
+struct ExactSelectorValueProbe<'s> {
+    scoping: &'s Scoping,
+    selector_start: u32,
+    selector_end: u32,
+    selector_key_symbol: SymbolId,
+    exact_key_value: i64,
+    matches: Vec<Option<i64>>,
+}
+impl<'a> Visit<'a> for ExactSelectorValueProbe<'_> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        let span = expression.span();
+        if span.start == self.selector_start && span.end == self.selector_end {
+            let mut evaluator = ExactSafeIntegerEvaluator {
+                scoping: self.scoping,
+                bindings: HashMap::from([(self.selector_key_symbol, self.exact_key_value)]),
+                local_assignment_span: None,
+                handler_symbol: None,
+                handler_array: None,
+                phase_symbol: None,
+                phase_value: None,
+                phase_calls: 0,
+            };
+            self.matches.push(evaluator.eval(expression));
+            return;
+        }
+        walk::walk_expression(self, expression);
+    }
+}
+
 fn exact_selector_value(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -3013,36 +3042,7 @@ fn exact_selector_value(
 ) -> Option<i64> {
     exact_js_safe_integer(i128::from(exact_key_value))?;
 
-    struct Probe<'s> {
-        scoping: &'s Scoping,
-        selector_start: u32,
-        selector_end: u32,
-        selector_key_symbol: SymbolId,
-        exact_key_value: i64,
-        matches: Vec<Option<i64>>,
-    }
-    impl<'a> Visit<'a> for Probe<'_> {
-        fn visit_expression(&mut self, expression: &Expression<'a>) {
-            let span = expression.span();
-            if span.start == self.selector_start && span.end == self.selector_end {
-                let mut evaluator = ExactSafeIntegerEvaluator {
-                    scoping: self.scoping,
-                    bindings: HashMap::from([(self.selector_key_symbol, self.exact_key_value)]),
-                    local_assignment_span: None,
-                    handler_symbol: None,
-                    handler_array: None,
-                    phase_symbol: None,
-                    phase_value: None,
-                    phase_calls: 0,
-                };
-                self.matches.push(evaluator.eval(expression));
-                return;
-            }
-            walk::walk_expression(self, expression);
-        }
-    }
-
-    let mut probe = Probe {
+    let mut probe = ExactSelectorValueProbe {
         scoping,
         selector_start,
         selector_end,
@@ -3055,6 +3055,65 @@ fn exact_selector_value(
         return None;
     };
     *value
+}
+
+struct ResolverIndexAssignmentProbe<'s, 'r, 'h, 'b> {
+    semantic: &'s Semantic<'s>,
+    resolver: &'r Function<'r>,
+    handler_symbol: SymbolId,
+    handler_array: &'h oxc_ast::ast::ArrayExpression<'h>,
+    phase_symbol: SymbolId,
+    phase_value: i64,
+    bindings: &'b HashMap<SymbolId, i64>,
+    matches: Vec<(Span, i64)>,
+}
+impl<'a> Visit<'a> for ResolverIndexAssignmentProbe<'_, 'a, 'a, '_> {
+    fn visit_computed_member_expression(
+        &mut self,
+        member: &oxc_ast::ast::ComputedMemberExpression<'a>,
+    ) {
+        if reference_symbol(self.semantic.scoping(), &member.object) == Some(self.handler_symbol) {
+            if let Some(index_symbol) =
+                reference_symbol(self.semantic.scoping(), &member.expression)
+            {
+                let mut object_items = Vec::new();
+                flatten_top_level_sequence(&member.object, &mut object_items);
+                let mut assignments = object_items.into_iter().filter_map(|expression| {
+                    let assignment = assignment_expression(expression)?;
+                    (assignment_symbol(self.semantic.scoping(), &assignment.left)
+                        == Some(index_symbol))
+                    .then_some(assignment)
+                });
+                if let Some(assignment) = assignments.next() {
+                    if assignments.next().is_none() {
+                        let mut evaluator = ExactSafeIntegerEvaluator {
+                            scoping: self.semantic.scoping(),
+                            bindings: self.bindings.clone(),
+                            local_assignment_span: Some(self.resolver.span),
+                            handler_symbol: Some(self.handler_symbol),
+                            handler_array: Some(self.handler_array),
+                            phase_symbol: Some(self.phase_symbol),
+                            phase_value: Some(self.phase_value),
+                            phase_calls: 0,
+                        };
+                        if let Some(value) = evaluator.eval(&assignment.right) {
+                            if evaluator.phase_calls == 1 {
+                                self.matches.push((assignment.span, value));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_computed_member_expression(self, member);
+    }
+
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
 }
 
 fn resolver_index_value(
@@ -3071,68 +3130,7 @@ fn resolver_index_value(
         return None;
     };
 
-    struct Probe<'s, 'r, 'h, 'b> {
-        semantic: &'s Semantic<'s>,
-        resolver: &'r Function<'r>,
-        handler_symbol: SymbolId,
-        handler_array: &'h oxc_ast::ast::ArrayExpression<'h>,
-        phase_symbol: SymbolId,
-        phase_value: i64,
-        bindings: &'b HashMap<SymbolId, i64>,
-        matches: Vec<(Span, i64)>,
-    }
-    impl<'a> Visit<'a> for Probe<'_, 'a, 'a, '_> {
-        fn visit_computed_member_expression(
-            &mut self,
-            member: &oxc_ast::ast::ComputedMemberExpression<'a>,
-        ) {
-            if reference_symbol(self.semantic.scoping(), &member.object)
-                == Some(self.handler_symbol)
-            {
-                if let Some(index_symbol) =
-                    reference_symbol(self.semantic.scoping(), &member.expression)
-                {
-                    let mut object_items = Vec::new();
-                    flatten_top_level_sequence(&member.object, &mut object_items);
-                    let mut assignments = object_items.into_iter().filter_map(|expression| {
-                        let assignment = assignment_expression(expression)?;
-                        (assignment_symbol(self.semantic.scoping(), &assignment.left)
-                            == Some(index_symbol))
-                        .then_some(assignment)
-                    });
-                    if let Some(assignment) = assignments.next() {
-                        if assignments.next().is_none() {
-                            let mut evaluator = ExactSafeIntegerEvaluator {
-                                scoping: self.semantic.scoping(),
-                                bindings: self.bindings.clone(),
-                                local_assignment_span: Some(self.resolver.span),
-                                handler_symbol: Some(self.handler_symbol),
-                                handler_array: Some(self.handler_array),
-                                phase_symbol: Some(self.phase_symbol),
-                                phase_value: Some(self.phase_value),
-                                phase_calls: 0,
-                            };
-                            if let Some(value) = evaluator.eval(&assignment.right) {
-                                if evaluator.phase_calls == 1 {
-                                    self.matches.push((assignment.span, value));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            walk::walk_computed_member_expression(self, member);
-        }
-
-        fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-        fn visit_arrow_function_expression(
-            &mut self,
-            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-        ) {
-        }
-    }
-
-    let mut probe = Probe {
+    let mut probe = ResolverIndexAssignmentProbe {
         semantic,
         resolver,
         handler_symbol,
