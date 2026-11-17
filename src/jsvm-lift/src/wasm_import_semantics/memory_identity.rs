@@ -816,29 +816,70 @@ fn exact_write_relation(
     (semantic_write_count == 1).then_some(*write)
 }
 
-#[derive(Clone, Copy, Default)]
+/// Reachable write states at one kind of control-flow exit.
+///
+/// Both states can be reachable after an if/else join, so a single bool
+/// would incorrectly treat a conditional assignment as definite.
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+struct WriteStates(u8);
+
+impl WriteStates {
+    const UNASSIGNED: u8 = 0b01;
+    const ASSIGNED: u8 = 0b10;
+
+    const fn only(assigned: bool) -> Self {
+        Self(if assigned {
+            Self::ASSIGNED
+        } else {
+            Self::UNASSIGNED
+        })
+    }
+
+    const fn contains(self, assigned: bool) -> bool {
+        self.0 & Self::only(assigned).0 != 0
+    }
+
+    const fn union(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Track normal completion and explicit returns independently; thrown paths
+/// produce neither, and must not be mistaken for successful initialization.
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
 struct ExitFlow {
-    normal_unassigned: bool,
-    normal_assigned: bool,
-    good_return: bool,
-    bad_return: bool,
+    normal: WriteStates,
+    returned: WriteStates,
 }
 
 impl ExitFlow {
     const fn normal(assigned: bool) -> Self {
         Self {
-            normal_unassigned: !assigned,
-            normal_assigned: assigned,
-            good_return: false,
-            bad_return: false,
+            normal: WriteStates::only(assigned),
+            returned: WriteStates(0),
+        }
+    }
+
+    const fn returning(assigned: bool) -> Self {
+        Self {
+            normal: WriteStates(0),
+            returned: WriteStates::only(assigned),
         }
     }
 
     const fn merge(&mut self, other: Self) {
-        self.normal_unassigned |= other.normal_unassigned;
-        self.normal_assigned |= other.normal_assigned;
-        self.good_return |= other.good_return;
-        self.bad_return |= other.bad_return;
+        self.normal.union(other.normal);
+        self.returned.union(other.returned);
+    }
+
+    const fn write_dominates_normal_exit(self) -> bool {
+        !self.returned.contains(false)
+            && !self.normal.contains(false)
+            && (self.returned.contains(true) || self.normal.contains(true))
     }
 }
 
@@ -910,11 +951,7 @@ fn statement_flow(statement: &Statement<'_>, assigned: bool, write_span: Span) -
                 return None;
             }
             let assigned = assigned || contains;
-            Some(ExitFlow {
-                good_return: assigned,
-                bad_return: !assigned,
-                ..ExitFlow::default()
-            })
+            Some(ExitFlow::returning(assigned))
         }
         Statement::ThrowStatement(_) => Some(ExitFlow::default()),
         Statement::EmptyStatement(_)
@@ -943,35 +980,127 @@ fn statements_flow(
     assigned: bool,
     write_span: Span,
 ) -> Option<ExitFlow> {
-    let mut normal_unassigned = !assigned;
-    let mut normal_assigned = assigned;
+    let mut reachable = WriteStates::only(assigned);
     let mut completed = ExitFlow::default();
     for statement in statements {
-        let mut next_unassigned = false;
-        let mut next_assigned = false;
-        if normal_unassigned {
-            let flow = statement_flow(statement, false, write_span)?;
-            next_unassigned |= flow.normal_unassigned;
-            next_assigned |= flow.normal_assigned;
-            completed.good_return |= flow.good_return;
-            completed.bad_return |= flow.bad_return;
+        let mut continuing = WriteStates::default();
+        for assigned in [false, true] {
+            if reachable.contains(assigned) {
+                let flow = statement_flow(statement, assigned, write_span)?;
+                continuing.union(flow.normal);
+                completed.returned.union(flow.returned);
+            }
         }
-        if normal_assigned {
-            let flow = statement_flow(statement, true, write_span)?;
-            next_unassigned |= flow.normal_unassigned;
-            next_assigned |= flow.normal_assigned;
-            completed.good_return |= flow.good_return;
-            completed.bad_return |= flow.bad_return;
-        }
-        normal_unassigned = next_unassigned;
-        normal_assigned = next_assigned;
-        if !normal_unassigned && !normal_assigned {
+        reachable = continuing;
+        if reachable.is_empty() {
             break;
         }
     }
-    completed.normal_unassigned = normal_unassigned;
-    completed.normal_assigned = normal_assigned;
+    completed.normal = reachable;
     Some(completed)
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::{statements_flow, ExitFlow, WriteStates};
+    use oxc_allocator::Allocator;
+    use oxc_ast::ast::Statement;
+    use oxc_span::{SourceType, Span};
+    use rolldown_redox::ecmascript::parse_program;
+
+    fn exit_flow(source: &str) -> Option<ExitFlow> {
+        let allocator = Allocator::default();
+        let fixture = format!("function sample() {{ {source} }}");
+        let parsed = parse_program(&allocator, &fixture, SourceType::cjs());
+        assert!(parsed.is_clean(), "invalid fixture: {source}");
+        let [Statement::FunctionDeclaration(function)] = parsed.program.body.as_slice() else {
+            panic!("missing fixture function");
+        };
+        let Some(body) = function.body.as_ref() else {
+            panic!("missing fixture body");
+        };
+        let offset = fixture
+            .find("target = value")
+            .expect("assignment in fixture");
+        let start = u32::try_from(offset).expect("small test fixture");
+        let end = start + 14;
+        statements_flow(&body.statements, false, Span::new(start, end))
+    }
+
+    #[test]
+    fn combines_assigned_and_unassigned_paths_without_treating_them_as_proven() {
+        let cases = [
+            (
+                "target = value;",
+                WriteStates::only(true),
+                WriteStates::default(),
+                true,
+            ),
+            (
+                "target = value; return;",
+                WriteStates::default(),
+                WriteStates::only(true),
+                true,
+            ),
+            (
+                "if (cond) { target = value; }",
+                WriteStates(WriteStates::UNASSIGNED | WriteStates::ASSIGNED),
+                WriteStates::default(),
+                false,
+            ),
+            (
+                "if (cond) { target = value; return; } else { return; }",
+                WriteStates::default(),
+                WriteStates(WriteStates::UNASSIGNED | WriteStates::ASSIGNED),
+                false,
+            ),
+            (
+                "if (cond) { return; } target = value;",
+                WriteStates::only(true),
+                WriteStates::only(false),
+                false,
+            ),
+            (
+                "return; target = value;",
+                WriteStates::default(),
+                WriteStates::only(false),
+                false,
+            ),
+            (
+                "throw err; target = value;",
+                WriteStates::default(),
+                WriteStates::default(),
+                false,
+            ),
+        ];
+        for (source, normal, returned, proven) in cases {
+            let flow = exit_flow(source).expect("simple statement flow should be representable");
+            assert_eq!(flow.normal, normal, "{source}");
+            assert_eq!(flow.returned, returned, "{source}");
+            assert_eq!(flow.write_dominates_normal_exit(), proven, "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_write_inside_branch_test() {
+        assert!(exit_flow("if (target = value) { return; }").is_none());
+    }
+
+    #[test]
+    fn write_state_joins_are_idempotent_and_order_independent() {
+        let mut states = WriteStates::only(true);
+        states.union(WriteStates::only(false));
+        assert_eq!(
+            states,
+            WriteStates(WriteStates::UNASSIGNED | WriteStates::ASSIGNED)
+        );
+        states.union(WriteStates::only(true));
+        assert_eq!(
+            states,
+            WriteStates(WriteStates::UNASSIGNED | WriteStates::ASSIGNED)
+        );
+        assert!(states.contains(true) && states.contains(false));
+    }
 }
 
 struct NormalizedWriteCollector<'c> {
@@ -1253,10 +1382,8 @@ impl<'a> Visit<'a> for NormalizedInitializerHelperFinder<'_, '_> {
                 });
                 return;
             };
-            let write_dominates_normal_exit = write_count == 1
-                && !flow.bad_return
-                && !flow.normal_unassigned
-                && (flow.good_return || flow.normal_assigned);
+            let write_dominates_normal_exit =
+                write_count == 1 && flow.write_dominates_normal_exit();
 
             let mut verifier = NormalizedInitializerVerifier {
                 scoping: self.scoping,
