@@ -781,6 +781,55 @@ fn analyze_program(
     })
 }
 
+struct NormalizedHandlerSemanticsCollector<'c, 'g> {
+    scoping: &'c Scoping,
+    global_aliases: &'g HashMap<SymbolId, String>,
+    shapes: Vec<WasmImportHandlerShape>,
+    assignment_counts: HashMap<(Option<String>, String), usize>,
+}
+impl<'a> Visit<'a> for NormalizedHandlerSemanticsCollector<'_, '_> {
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment.operator.as_str() == "=" {
+            if let (Some((import_name, import_module)), Expression::FunctionExpression(function)) = (
+                assignment_property(&assignment.left),
+                unparenthesized(&assignment.right),
+            ) {
+                *self
+                    .assignment_counts
+                    .entry((import_module.map(str::to_string), import_name.to_string()))
+                    .or_default() += 1;
+                if let Some(semantic) =
+                    analyze_import_handler(function, self.scoping, self.global_aliases)
+                {
+                    if matches!(
+                        semantic,
+                        WasmImportHandlerSemantic::TableInitializerOnly { .. }
+                    ) {
+                        let import_object =
+                            assignment_import_object(self.scoping, &assignment.left).and_then(
+                                |(symbol, import_object, module, name)| {
+                                    (module == import_module.unwrap_or_default()
+                                        && name == import_name
+                                        && symbol_binding_is_stable(self.scoping, symbol))
+                                    .then_some(import_object)
+                                },
+                            );
+                        self.shapes.push(WasmImportHandlerShape {
+                            import_module: import_module.map(str::to_string),
+                            import_name: import_name.to_string(),
+                            import_object,
+                            assignment_start: assignment.span.start,
+                            assignment_end: assignment.span.end,
+                            semantic,
+                        });
+                    }
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+}
+
 fn collect_proof_normalized_handler_semantics(
     source: &str,
     budget: &WorkBudget,
@@ -807,60 +856,7 @@ fn collect_proof_normalized_handler_semantics(
             return Ok(Vec::new());
         }
         let global_aliases = collect_global_aliases(&parsed.program, scoping, budget)?;
-        struct Collector<'c, 'g> {
-            scoping: &'c Scoping,
-            global_aliases: &'g HashMap<SymbolId, String>,
-            shapes: Vec<WasmImportHandlerShape>,
-            assignment_counts: HashMap<(Option<String>, String), usize>,
-        }
-        impl<'a> Visit<'a> for Collector<'_, '_> {
-            fn visit_assignment_expression(
-                &mut self,
-                assignment: &oxc_ast::ast::AssignmentExpression<'a>,
-            ) {
-                if assignment.operator.as_str() == "=" {
-                    if let (
-                        Some((import_name, import_module)),
-                        Expression::FunctionExpression(function),
-                    ) = (
-                        assignment_property(&assignment.left),
-                        unparenthesized(&assignment.right),
-                    ) {
-                        *self
-                            .assignment_counts
-                            .entry((import_module.map(str::to_string), import_name.to_string()))
-                            .or_default() += 1;
-                        if let Some(semantic) =
-                            analyze_import_handler(function, self.scoping, self.global_aliases)
-                        {
-                            if matches!(
-                                semantic,
-                                WasmImportHandlerSemantic::TableInitializerOnly { .. }
-                            ) {
-                                let import_object =
-                                    assignment_import_object(self.scoping, &assignment.left)
-                                        .and_then(|(symbol, import_object, module, name)| {
-                                            (module == import_module.unwrap_or_default()
-                                                && name == import_name
-                                                && symbol_binding_is_stable(self.scoping, symbol))
-                                            .then_some(import_object)
-                                        });
-                                self.shapes.push(WasmImportHandlerShape {
-                                    import_module: import_module.map(str::to_string),
-                                    import_name: import_name.to_string(),
-                                    import_object,
-                                    assignment_start: assignment.span.start,
-                                    assignment_end: assignment.span.end,
-                                    semantic,
-                                });
-                            }
-                        }
-                    }
-                }
-                walk::walk_assignment_expression(self, assignment);
-            }
-        }
-        let mut collector = Collector {
+        let mut collector = NormalizedHandlerSemanticsCollector {
             scoping,
             global_aliases: &global_aliases,
             shapes: Vec::new(),
