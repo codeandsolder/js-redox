@@ -460,6 +460,49 @@ fn is_static_numeric_index(index: &str) -> bool {
             .is_some_and(|hex| u64::from_str_radix(hex, 16).is_ok())
 }
 
+// Registry and forwarded-registry observations have identical table semantics;
+// preserve their distinct span maps and container kinds.
+fn materialize_registry_handler_tables(
+    handlers: impl Iterator<Item = ((u32, u32, String), Vec<HandlerFunctionSlot>)>,
+    spans: &HashMap<(u32, u32, String), (u32, u32)>,
+    functions: &[FunctionSummary],
+    tables: &mut Vec<DetailedHandlerTableCandidate>,
+    poller: &mut BudgetPoller,
+    container_kind: &str,
+) {
+    for ((scope_start, scope_end, binding), handlers) in handlers {
+        if !poller.poll(1) {
+            break;
+        }
+        if handlers.len() < 4 {
+            continue;
+        }
+        let key = (scope_start, scope_end, binding.clone());
+        let (start, end) = spans.get(&key).copied().unwrap_or((0, 0));
+        let scope_function_id = functions
+            .iter()
+            .find(|function| function.start == scope_start && function.end == scope_end)
+            .map(|function| function.id.clone());
+        tables.push(DetailedHandlerTableCandidate {
+            binding,
+            start,
+            end,
+            scope_function_id,
+            scope_start,
+            scope_end,
+            container_kind: container_kind.into(),
+            entries: handlers.len(),
+            function_values: handlers.len(),
+            dynamic_call_sites: 0,
+            looped_dynamic_call_sites: 0,
+            read_sites: 0,
+            dynamic_read_sites: 0,
+            looped_dynamic_read_sites: 0,
+            handlers,
+        });
+    }
+}
+
 impl<'s> Analyzer<'s> {
     fn new(
         source: &'s str,
@@ -1035,79 +1078,25 @@ impl<'s> Analyzer<'s> {
     }
 
     fn materialize_registry_tables(&mut self) {
-        for ((scope_start, scope_end, binding), handlers) in self.registry_handlers.drain() {
-            if !self.poller.poll(1) {
-                break;
-            }
-            if handlers.len() < 4 {
-                continue;
-            }
-            let key = (scope_start, scope_end, binding.clone());
-            let (start, end) = self.registry_spans.get(&key).copied().unwrap_or((0, 0));
-            let scope_function_id = self
-                .functions
-                .iter()
-                .find(|function| function.start == scope_start && function.end == scope_end)
-                .map(|function| function.id.clone());
-            self.tables.push(DetailedHandlerTableCandidate {
-                binding,
-                start,
-                end,
-                scope_function_id,
-                scope_start,
-                scope_end,
-                container_kind: "registry".into(),
-                entries: handlers.len(),
-                function_values: handlers.len(),
-                dynamic_call_sites: 0,
-                looped_dynamic_call_sites: 0,
-                read_sites: 0,
-                dynamic_read_sites: 0,
-                looped_dynamic_read_sites: 0,
-                handlers,
-            });
-        }
+        materialize_registry_handler_tables(
+            self.registry_handlers.drain(),
+            &self.registry_spans,
+            &self.functions,
+            &mut self.tables,
+            &mut self.poller,
+            "registry",
+        );
     }
 
     fn materialize_forwarded_registries(&mut self) {
-        for ((scope_start, scope_end, binding), handlers) in
-            self.forwarded_registry_handlers.drain()
-        {
-            if !self.poller.poll(1) {
-                break;
-            }
-            if handlers.len() < 4 {
-                continue;
-            }
-            let key = (scope_start, scope_end, binding.clone());
-            let (start, end) = self
-                .forwarded_registry_spans
-                .get(&key)
-                .copied()
-                .unwrap_or((0, 0));
-            let scope_function_id = self
-                .functions
-                .iter()
-                .find(|function| function.start == scope_start && function.end == scope_end)
-                .map(|function| function.id.clone());
-            self.tables.push(DetailedHandlerTableCandidate {
-                binding,
-                start,
-                end,
-                scope_function_id,
-                scope_start,
-                scope_end,
-                container_kind: "forwarded-registry".into(),
-                entries: handlers.len(),
-                function_values: handlers.len(),
-                dynamic_call_sites: 0,
-                looped_dynamic_call_sites: 0,
-                read_sites: 0,
-                dynamic_read_sites: 0,
-                looped_dynamic_read_sites: 0,
-                handlers,
-            });
-        }
+        materialize_registry_handler_tables(
+            self.forwarded_registry_handlers.drain(),
+            &self.forwarded_registry_spans,
+            &self.functions,
+            &mut self.tables,
+            &mut self.poller,
+            "forwarded-registry",
+        );
     }
 
     fn materialize_derived_registries(&mut self) {
