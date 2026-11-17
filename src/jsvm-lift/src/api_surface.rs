@@ -418,8 +418,10 @@ fn exact_argument(
 enum FetchInitMethod {
     Missing,
     NoOwnMethod,
-    Exact { value: String, expression: String },
-    Invalid { expression: String },
+    Literal {
+        value: Option<String>,
+        expression: String,
+    },
     Unknown,
 }
 
@@ -477,16 +479,13 @@ fn fetch_init_method(
             continue;
         }
 
-        state = if let Some(value) = static_string(&property.value, scoping, constants) {
-            let expression = source_fragment(source, property.value.span());
-            if let Some(value) = effective_http_method(&value) {
-                FetchInitMethod::Exact { value, expression }
-            } else {
-                FetchInitMethod::Invalid { expression }
-            }
-        } else {
-            FetchInitMethod::Unknown
-        };
+        state = static_string(&property.value, scoping, constants).map_or(
+            FetchInitMethod::Unknown,
+            |value| FetchInitMethod::Literal {
+                value: effective_http_method(&value),
+                expression: source_fragment(source, property.value.span()),
+            },
+        );
     }
     state
 }
@@ -507,11 +506,9 @@ fn fetch_method(
     }
 
     match fetch_init_method(source, arguments.get(1), scoping, constants) {
-        FetchInitMethod::Exact { value, expression } => {
-            (Some(value), Some(expression), Some("exact".to_string()))
-        }
-        FetchInitMethod::Invalid { expression } => {
-            (None, Some(expression), Some("invalid".to_string()))
+        FetchInitMethod::Literal { value, expression } => {
+            let status = if value.is_some() { "exact" } else { "invalid" };
+            (value, Some(expression), Some(status.to_owned()))
         }
         FetchInitMethod::Missing if input_is_static_string => {
             (Some("GET".to_string()), None, Some("exact".to_string()))
@@ -685,13 +682,18 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
                         self.scoping,
                         self.constants,
                     );
-                    let (method, method_status) = match method {
-                        Some(value) => match effective_http_method(&value) {
-                            Some(value) => (Some(value), Some("exact".to_string())),
-                            None => (None, Some("invalid".to_string())),
+                    let (method, method_status) = method.map_or_else(
+                        || (None, Some("unknown".to_owned())),
+                        |literal| {
+                            let normalized = effective_http_method(&literal);
+                            let status = if normalized.is_some() {
+                                "exact"
+                            } else {
+                                "invalid"
+                            };
+                            (normalized, Some(status.to_owned()))
                         },
-                        None => (None, Some("unknown".to_string())),
-                    };
+                    );
                     let (url, url_expression) = exact_argument(
                         self.source,
                         call.arguments.get(1),

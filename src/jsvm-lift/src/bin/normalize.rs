@@ -171,13 +171,11 @@ fn normalize_source(source: &str, rename: &HashMap<String, String>) -> String {
     }
 
     let direct = collect_replacements(source, 0, source.len(), rename);
-    let replacements = if let Some(replacements) = direct {
-        replacements
-    } else {
+    let replacements = direct.unwrap_or_else(|| {
         let prefix = "function __vm_wrap(){";
         let wrapped = format!("{prefix}{source}}}");
         collect_replacements(&wrapped, prefix.len(), source.len(), rename).unwrap_or_default()
-    };
+    });
 
     let mut unique = HashSet::new();
     let mut replacements: Vec<_> = replacements

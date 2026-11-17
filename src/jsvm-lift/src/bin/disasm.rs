@@ -140,18 +140,19 @@ fn resolve_fields(builder: &PushBuilder, aliases: &BTreeSet<String>) -> (Vec<Fie
         .values
         .iter()
         .enumerate()
-        .map(|(index, value)| {
-            if let Some(value) = value {
-                Field::Known(*value)
-            } else if let Some(preview) = unknowns.get(&index) {
-                if let Some(value) = resolve_literal_parse_int(preview, aliases) {
-                    resolved_symbolic += 1;
-                    Field::Known(value)
-                } else {
+        .map(|(index, value)| match (value, unknowns.get(&index)) {
+            (Some(value), _) => Field::Known(*value),
+            (None, Some(preview)) => resolve_literal_parse_int(preview, aliases).map_or_else(
+                || {
                     unresolved += 1;
-                    Field::Symbolic((*preview).to_string())
-                }
-            } else {
+                    Field::Symbolic((*preview).to_owned())
+                },
+                |number| {
+                    resolved_symbolic += 1;
+                    Field::Known(number)
+                },
+            ),
+            (None, None) => {
                 unresolved += 1;
                 Field::Missing
             }
@@ -164,7 +165,7 @@ fn build_instructions(fields: &[Field], width: usize, vm: &NormalizedVm) -> Vec<
     let semantics: HashMap<_, _> = vm
         .opcodes
         .iter()
-        .map(|opcode| (opcode.opcode, opcode.paths.clone()))
+        .map(|opcode| (opcode.opcode, opcode.paths.as_slice()))
         .collect();
     (0..fields.len() / width)
         .map(|index| {
@@ -174,7 +175,9 @@ fn build_instructions(fields: &[Field], width: usize, vm: &NormalizedVm) -> Vec<
                 .map(|offset| fields.get(pc + offset).cloned().unwrap_or(Field::Missing))
                 .collect::<Vec<_>>();
             let semantic_paths = match opcode {
-                Field::Known(value) => semantics.get(&value).cloned().unwrap_or_default(),
+                Field::Known(value) => semantics
+                    .get(&value)
+                    .map_or_else(Vec::new, |paths| paths.to_vec()),
                 _ => Vec::new(),
             };
             Instruction {
@@ -332,4 +335,78 @@ fn main() -> Result<()> {
         .with_context(|| format!("writing {}", json_path.display()))?;
     print_summary(&all, &args.output_dir);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_resolution_preserves_literal_precedence_and_symbolic_counts() {
+        let builder = PushBuilder {
+            start: 0,
+            end: 4,
+            _receiver: "stack".to_owned(),
+            arguments: 4,
+            values: vec![Some(7), None, None, None],
+            unknowns: vec![
+                BuilderUnknown {
+                    index: 0,
+                    preview: "p('0', 16)".to_owned(),
+                },
+                BuilderUnknown {
+                    index: 1,
+                    preview: "p('ff', 16)".to_owned(),
+                },
+                BuilderUnknown {
+                    index: 2,
+                    preview: "p(runtime, 16)".to_owned(),
+                },
+            ],
+        };
+        let aliases = parse_int_aliases("const p = parseInt;");
+        let (fields, resolved, unresolved) = resolve_fields(&builder, &aliases);
+        assert_eq!(resolved, 1);
+        assert_eq!(unresolved, 2);
+        assert!(matches!(fields[0], Field::Known(7)));
+        assert!(matches!(fields[1], Field::Known(255)));
+        assert!(matches!(&fields[2], Field::Symbolic(expr) if expr == "p(runtime, 16)"));
+        assert!(matches!(fields[3], Field::Missing));
+    }
+
+    #[test]
+    fn instruction_semantics_keep_source_paths_and_unknown_opcode_empty() -> Result<()> {
+        let vm: NormalizedVm = serde_json::from_value(serde_json::json!({
+            "file": "fixture.js",
+            "decoder": "decode",
+            "parent": "root",
+            "role_bindings": {},
+            "state_machine": {},
+            "opcodes": [
+                {
+                    "opcode": 7,
+                    "derived_env": {},
+                    "paths": [{
+                        "guards": ["guard"],
+                        "states": [],
+                        "effects": ["effect"],
+                        "terminal": null
+                    }]
+                }
+            ]
+        }))?;
+        let fields = [
+            Field::Known(7),
+            Field::Known(12),
+            Field::Known(99),
+            Field::Missing,
+        ];
+        let instructions = build_instructions(&fields, 2, &vm);
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].semantics.len(), 1);
+        assert_eq!(instructions[0].semantics[0].effects, ["effect"]);
+        assert!(instructions[1].semantics.is_empty());
+        assert_eq!(vm.opcodes[0].paths[0].guards, ["guard"]);
+        Ok(())
+    }
 }

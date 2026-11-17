@@ -413,17 +413,18 @@ fn symbolic_field(
     let Some(expr) = unknowns.get(&index) else {
         return json!({"kind": "symbolic", "expr": "<unknown>"});
     };
-    if let Some(value) = resolve_literal_parse_int(expr, aliases) {
-        json!({
-            "kind": "folded",
-            "value": value,
-            "expr": expr,
-            "rule": "parseInt-alias-literal-radix",
-            "confidence": "source-backed",
-        })
-    } else {
-        json!({"kind": "symbolic", "expr": expr})
-    }
+    resolve_literal_parse_int(expr, aliases).map_or_else(
+        || json!({"kind": "symbolic", "expr": expr}),
+        |value| {
+            json!({
+                "kind": "folded",
+                "value": value,
+                "expr": expr,
+                "rule": "parseInt-alias-literal-radix",
+                "confidence": "source-backed",
+            })
+        },
+    )
 }
 
 pub fn extract_linked_streams(
