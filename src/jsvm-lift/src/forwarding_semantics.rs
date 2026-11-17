@@ -1975,23 +1975,60 @@ fn registry_forwarder_proof(
     Ok(Some(first))
 }
 
-struct RegistryForwarderCollector<'c> {
+// Function declarations and function-valued bindings have identical discovery
+// semantics across registry proof families. The resolver owns the proof policy.
+trait RegistryFunctionProofResolver {
+    type Proof;
+    const CHECKPOINT_PER_FUNCTION: bool;
+
+    fn should_prove(&self, _symbol: SymbolId) -> bool {
+        true
+    }
+
+    fn prove(
+        &self,
+        scoping: &Scoping,
+        symbol: SymbolId,
+        function: &Function<'_>,
+        budget: &WorkBudget,
+    ) -> Result<Option<Self::Proof>, BudgetExceeded>;
+}
+
+struct RegistryFunctionCollector<'c, R: RegistryFunctionProofResolver> {
     scoping: &'c Scoping,
-    proofs: HashMap<SymbolId, RegistryForwarderProof>,
+    resolver: R,
+    proofs: HashMap<SymbolId, R::Proof>,
     budget: WorkBudget,
     poller: BudgetPoller,
     budget_error: Option<BudgetExceeded>,
 }
-impl RegistryForwarderCollector<'_> {
+
+impl<'c, R: RegistryFunctionProofResolver> RegistryFunctionCollector<'c, R> {
+    fn new(scoping: &'c Scoping, budget: &WorkBudget, resolver: R) -> Self {
+        Self {
+            scoping,
+            resolver,
+            proofs: HashMap::new(),
+            budget: budget.clone(),
+            poller: BudgetPoller::new(budget, 256),
+            budget_error: None,
+        }
+    }
+
     fn record(&mut self, symbol: SymbolId, function: &Function<'_>) {
-        if self.budget_error.is_some() {
+        if !self.resolver.should_prove(symbol) || self.budget_error.is_some() {
             return;
         }
-        if let Err(error) = self.budget.checkpoint() {
-            self.budget_error = Some(error);
-            return;
+        if R::CHECKPOINT_PER_FUNCTION {
+            if let Err(error) = self.budget.checkpoint() {
+                self.budget_error = Some(error);
+                return;
+            }
         }
-        match registry_forwarder_proof(self.scoping, function, &self.budget) {
+        match self
+            .resolver
+            .prove(self.scoping, symbol, function, &self.budget)
+        {
             Ok(Some(proof)) => {
                 self.proofs.insert(symbol, proof);
             }
@@ -2001,12 +2038,15 @@ impl RegistryForwarderCollector<'_> {
                 return;
             }
         }
-        if let Err(error) = self.budget.checkpoint() {
-            self.budget_error = Some(error);
+        if R::CHECKPOINT_PER_FUNCTION {
+            if let Err(error) = self.budget.checkpoint() {
+                self.budget_error = Some(error);
+            }
         }
     }
 }
-impl<'a> Visit<'a> for RegistryForwarderCollector<'_> {
+
+impl<'a, R: RegistryFunctionProofResolver> Visit<'a> for RegistryFunctionCollector<'_, R> {
     fn visit_statement(&mut self, statement: &Statement<'a>) {
         if self.budget_error.is_some() || !self.poller.poll(1) {
             return;
@@ -2031,6 +2071,7 @@ impl<'a> Visit<'a> for RegistryForwarderCollector<'_> {
         }
         walk::walk_function(self, function, flags);
     }
+
     fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
         for declarator in &declaration.declarations {
             let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
@@ -2045,6 +2086,81 @@ impl<'a> Visit<'a> for RegistryForwarderCollector<'_> {
             self.record(symbol, function);
         }
         walk::walk_variable_declaration(self, declaration);
+    }
+}
+
+struct ForwarderResolution;
+
+impl RegistryFunctionProofResolver for ForwarderResolution {
+    type Proof = RegistryForwarderProof;
+    const CHECKPOINT_PER_FUNCTION: bool = true;
+
+    fn prove(
+        &self,
+        scoping: &Scoping,
+        _symbol: SymbolId,
+        function: &Function<'_>,
+        budget: &WorkBudget,
+    ) -> Result<Option<Self::Proof>, BudgetExceeded> {
+        registry_forwarder_proof(scoping, function, budget)
+    }
+}
+
+struct DelegateResolution<'k> {
+    known: &'k HashMap<SymbolId, RegistryForwarderProof>,
+}
+
+impl RegistryFunctionProofResolver for DelegateResolution<'_> {
+    type Proof = RegistryForwarderProof;
+    const CHECKPOINT_PER_FUNCTION: bool = true;
+
+    fn should_prove(&self, symbol: SymbolId) -> bool {
+        !self.known.contains_key(&symbol)
+    }
+
+    fn prove(
+        &self,
+        scoping: &Scoping,
+        _symbol: SymbolId,
+        function: &Function<'_>,
+        budget: &WorkBudget,
+    ) -> Result<Option<Self::Proof>, BudgetExceeded> {
+        registry_delegate_proof(scoping, function, self.known, budget)
+    }
+}
+
+struct AccessorResolution;
+
+impl RegistryFunctionProofResolver for AccessorResolution {
+    type Proof = RegistryAccessorProof;
+    const CHECKPOINT_PER_FUNCTION: bool = true;
+
+    fn prove(
+        &self,
+        scoping: &Scoping,
+        _symbol: SymbolId,
+        function: &Function<'_>,
+        budget: &WorkBudget,
+    ) -> Result<Option<Self::Proof>, BudgetExceeded> {
+        registry_accessor_proof(scoping, function, budget)
+    }
+}
+
+struct LazyAccessorResolution;
+
+impl RegistryFunctionProofResolver for LazyAccessorResolution {
+    type Proof = LazyRegistryAccessorProof;
+    // Lazy proof already checkpoints within its own proof stages.
+    const CHECKPOINT_PER_FUNCTION: bool = false;
+
+    fn prove(
+        &self,
+        scoping: &Scoping,
+        _symbol: SymbolId,
+        function: &Function<'_>,
+        budget: &WorkBudget,
+    ) -> Result<Option<Self::Proof>, BudgetExceeded> {
+        lazy_registry_accessor_proof(scoping, function, budget)
     }
 }
 
@@ -2179,83 +2295,6 @@ fn registry_delegate_proof(
         return Ok(None);
     }
     Ok(Some(first))
-}
-
-struct RegistryDelegateCollector<'c, 'k> {
-    scoping: &'c Scoping,
-    known: &'k HashMap<SymbolId, RegistryForwarderProof>,
-    proofs: HashMap<SymbolId, RegistryForwarderProof>,
-    budget: WorkBudget,
-    poller: BudgetPoller,
-    budget_error: Option<BudgetExceeded>,
-}
-
-impl RegistryDelegateCollector<'_, '_> {
-    fn record(&mut self, symbol: SymbolId, function: &Function<'_>) {
-        if self.known.contains_key(&symbol) || self.budget_error.is_some() {
-            return;
-        }
-        if let Err(error) = self.budget.checkpoint() {
-            self.budget_error = Some(error);
-            return;
-        }
-        match registry_delegate_proof(self.scoping, function, self.known, &self.budget) {
-            Ok(Some(proof)) => {
-                self.proofs.insert(symbol, proof);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                self.budget_error = Some(error);
-                return;
-            }
-        }
-        if let Err(error) = self.budget.checkpoint() {
-            self.budget_error = Some(error);
-        }
-    }
-}
-
-impl<'a> Visit<'a> for RegistryDelegateCollector<'_, '_> {
-    fn visit_statement(&mut self, statement: &Statement<'a>) {
-        if self.budget_error.is_some() || !self.poller.poll(1) {
-            return;
-        }
-        walk::walk_statement(self, statement);
-    }
-
-    fn visit_expression(&mut self, expression: &Expression<'a>) {
-        if self.budget_error.is_some() || !self.poller.poll(1) {
-            return;
-        }
-        walk::walk_expression(self, expression);
-    }
-
-    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-        if let Some(symbol) = function
-            .id
-            .as_ref()
-            .and_then(|identifier| identifier.symbol_id.get())
-        {
-            self.record(symbol, function);
-        }
-        walk::walk_function(self, function, flags);
-    }
-
-    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
-        for declarator in &declaration.declarations {
-            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                continue;
-            };
-            let Some(Expression::FunctionExpression(function)) = &declarator.init else {
-                continue;
-            };
-            let Some(symbol) = identifier.symbol_id.get() else {
-                continue;
-            };
-            self.record(symbol, function);
-        }
-        walk::walk_variable_declaration(self, declaration);
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2891,79 +2930,6 @@ fn lazy_registry_accessor_proof(
     }))
 }
 
-struct RegistryAccessorCollector<'c> {
-    scoping: &'c Scoping,
-    proofs: HashMap<SymbolId, RegistryAccessorProof>,
-    budget: WorkBudget,
-    poller: BudgetPoller,
-    budget_error: Option<BudgetExceeded>,
-}
-impl RegistryAccessorCollector<'_> {
-    fn record(&mut self, symbol: SymbolId, function: &Function<'_>) {
-        if self.budget_error.is_some() {
-            return;
-        }
-        if let Err(error) = self.budget.checkpoint() {
-            self.budget_error = Some(error);
-            return;
-        }
-        match registry_accessor_proof(self.scoping, function, &self.budget) {
-            Ok(Some(proof)) => {
-                self.proofs.insert(symbol, proof);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                self.budget_error = Some(error);
-                return;
-            }
-        }
-        if let Err(error) = self.budget.checkpoint() {
-            self.budget_error = Some(error);
-        }
-    }
-}
-impl<'a> Visit<'a> for RegistryAccessorCollector<'_> {
-    fn visit_statement(&mut self, statement: &Statement<'a>) {
-        if self.budget_error.is_some() || !self.poller.poll(1) {
-            return;
-        }
-        walk::walk_statement(self, statement);
-    }
-
-    fn visit_expression(&mut self, expression: &Expression<'a>) {
-        if self.budget_error.is_some() || !self.poller.poll(1) {
-            return;
-        }
-        walk::walk_expression(self, expression);
-    }
-
-    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-        if let Some(symbol) = function
-            .id
-            .as_ref()
-            .and_then(|identifier| identifier.symbol_id.get())
-        {
-            self.record(symbol, function);
-        }
-        walk::walk_function(self, function, flags);
-    }
-    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
-        for declarator in &declaration.declarations {
-            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                continue;
-            };
-            let Some(Expression::FunctionExpression(function)) = &declarator.init else {
-                continue;
-            };
-            let Some(symbol) = identifier.symbol_id.get() else {
-                continue;
-            };
-            self.record(symbol, function);
-        }
-        walk::walk_variable_declaration(self, declaration);
-    }
-}
-
 struct RegistryReadCallCollector<'c, 'p> {
     scoping: &'c Scoping,
     proofs: &'p HashMap<SymbolId, RegistryAccessorProof>,
@@ -3030,13 +2996,7 @@ pub fn structurally_proven_registry_read_calls(
     budget: &WorkBudget,
 ) -> Result<Vec<ProvenRegistryReadCall>, BudgetExceeded> {
     budget.checkpoint()?;
-    let mut accessors = RegistryAccessorCollector {
-        scoping,
-        proofs: HashMap::new(),
-        budget: budget.clone(),
-        poller: BudgetPoller::new(budget, 256),
-        budget_error: None,
-    };
+    let mut accessors = RegistryFunctionCollector::new(scoping, budget, AccessorResolution);
     accessors.visit_program(program);
     accessors.poller.finish()?;
     if let Some(error) = accessors.budget_error.take() {
@@ -3057,74 +3017,6 @@ pub fn structurally_proven_registry_read_calls(
         .calls
         .dedup_by_key(|call| (call.call_start, call.call_end));
     Ok(calls.calls)
-}
-
-struct LazyRegistryAccessorCollector<'c> {
-    scoping: &'c Scoping,
-    proofs: HashMap<SymbolId, LazyRegistryAccessorProof>,
-    budget: WorkBudget,
-    poller: BudgetPoller,
-    budget_error: Option<BudgetExceeded>,
-}
-
-impl LazyRegistryAccessorCollector<'_> {
-    fn record(&mut self, symbol: SymbolId, function: &Function<'_>) {
-        if self.budget_error.is_some() {
-            return;
-        }
-        match lazy_registry_accessor_proof(self.scoping, function, &self.budget) {
-            Ok(Some(proof)) => {
-                self.proofs.insert(symbol, proof);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                self.budget_error = Some(error);
-            }
-        }
-    }
-}
-
-impl<'a> Visit<'a> for LazyRegistryAccessorCollector<'_> {
-    fn visit_statement(&mut self, statement: &Statement<'a>) {
-        if self.budget_error.is_some() || !self.poller.poll(1) {
-            return;
-        }
-        walk::walk_statement(self, statement);
-    }
-
-    fn visit_expression(&mut self, expression: &Expression<'a>) {
-        if self.budget_error.is_some() || !self.poller.poll(1) {
-            return;
-        }
-        walk::walk_expression(self, expression);
-    }
-
-    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-        if let Some(symbol) = function
-            .id
-            .as_ref()
-            .and_then(|identifier| identifier.symbol_id.get())
-        {
-            self.record(symbol, function);
-        }
-        walk::walk_function(self, function, flags);
-    }
-
-    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
-        for declarator in &declaration.declarations {
-            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                continue;
-            };
-            let Some(Expression::FunctionExpression(function)) = &declarator.init else {
-                continue;
-            };
-            let Some(symbol) = identifier.symbol_id.get() else {
-                continue;
-            };
-            self.record(symbol, function);
-        }
-        walk::walk_variable_declaration(self, declaration);
-    }
 }
 
 struct LazyRegistryReadCallCollector<'c, 'p> {
@@ -3211,13 +3103,7 @@ pub fn structurally_proven_lazy_registry_read_calls(
     budget: &WorkBudget,
 ) -> Result<Vec<ProvenLazyRegistryReadCall>, BudgetExceeded> {
     budget.checkpoint()?;
-    let mut accessors = LazyRegistryAccessorCollector {
-        scoping,
-        proofs: HashMap::new(),
-        budget: budget.clone(),
-        poller: BudgetPoller::new(budget, 256),
-        budget_error: None,
-    };
+    let mut accessors = RegistryFunctionCollector::new(scoping, budget, LazyAccessorResolution);
     accessors.visit_program(program);
     accessors.poller.finish()?;
     if let Some(error) = accessors.budget_error.take() {
@@ -3246,13 +3132,7 @@ fn registry_forwarder_proofs(
     budget: &WorkBudget,
 ) -> Result<HashMap<SymbolId, RegistryForwarderProof>, BudgetExceeded> {
     budget.checkpoint()?;
-    let mut forwarders = RegistryForwarderCollector {
-        scoping,
-        proofs: HashMap::new(),
-        budget: budget.clone(),
-        poller: BudgetPoller::new(budget, 256),
-        budget_error: None,
-    };
+    let mut forwarders = RegistryFunctionCollector::new(scoping, budget, ForwarderResolution);
     forwarders.visit_program(program);
     forwarders.poller.finish()?;
     if let Some(error) = forwarders.budget_error.take() {
@@ -3260,14 +3140,13 @@ fn registry_forwarder_proofs(
     }
     loop {
         budget.consume(1)?;
-        let mut delegates = RegistryDelegateCollector {
+        let mut delegates = RegistryFunctionCollector::new(
             scoping,
-            known: &forwarders.proofs,
-            proofs: HashMap::new(),
-            budget: budget.clone(),
-            poller: BudgetPoller::new(budget, 256),
-            budget_error: None,
-        };
+            budget,
+            DelegateResolution {
+                known: &forwarders.proofs,
+            },
+        );
         delegates.visit_program(program);
         delegates.poller.finish()?;
         if let Some(error) = delegates.budget_error.take() {
@@ -3546,6 +3425,58 @@ mod tests {
 
     fn test_budget() -> WorkBudget {
         WorkBudget::unlimited("forwarding-test")
+    }
+
+    struct BindingDiscoveryProof;
+
+    impl super::RegistryFunctionProofResolver for BindingDiscoveryProof {
+        type Proof = u32;
+        const CHECKPOINT_PER_FUNCTION: bool = false;
+
+        fn prove(
+            &self,
+            _scoping: &oxc_semantic::Scoping,
+            _symbol: oxc_syntax::symbol::SymbolId,
+            function: &oxc_ast::ast::Function<'_>,
+            _budget: &WorkBudget,
+        ) -> Result<Option<Self::Proof>, work_budget::BudgetExceeded> {
+            Ok(Some(function.span.start))
+        }
+    }
+
+    #[test]
+    fn registry_function_collector_preserves_binding_discovery() -> TestResult {
+        use oxc_ast_visit::Visit as _;
+        let allocator = Allocator::default();
+        let source = r"
+            function declared() {}
+            const assigned = function() {};
+            const named = function internal() {};
+            const arrow = () => 1;
+        ";
+        let parsed = parse_program(&allocator, source, SourceType::cjs());
+        assert!(parsed.is_clean());
+        let semantic = SemanticBuilder::new().build(&parsed.program);
+        assert!(semantic.diagnostics.is_empty());
+        let scoping = semantic.semantic.scoping();
+        let mut collector =
+            super::RegistryFunctionCollector::new(scoping, &test_budget(), BindingDiscoveryProof);
+        collector.visit_program(&parsed.program);
+        collector
+            .poller
+            .finish()
+            .test_value("registry collector traversal budget")?;
+        assert!(collector.budget_error.is_none());
+        let bindings = collector
+            .proofs
+            .keys()
+            .map(|symbol| scoping.symbol_name(*symbol))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            bindings,
+            std::collections::HashSet::from(["declared", "assigned", "named", "internal"])
+        );
+        Ok(())
     }
 
     #[test]
