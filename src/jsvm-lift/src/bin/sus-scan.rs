@@ -113,8 +113,7 @@ fn print_text(report: &SusScanReport) {
                     signal
                         .subject
                         .as_deref()
-                        .map(|subject| format!(" [{subject}]"))
-                        .unwrap_or_default()
+                        .map_or_default(|subject| format!(" [{subject}]"))
                 );
             }
             if cluster.signals.len() > 6 {

@@ -241,7 +241,7 @@ fn main() -> Result<()> {
             });
             let exact_assignments = registry
                 .as_ref()
-                .map(|registry| {
+                .map_or_default(|registry| {
                     proven_slow_lazy_cell_exact_registry_assignments(
                         &source,
                         &parsed.program,
@@ -249,8 +249,7 @@ fn main() -> Result<()> {
                         &flow,
                         registry,
                     )
-                })
-                .unwrap_or_default();
+                });
             let mut path_state_fields = Vec::new();
             for exact_assignment in &exact_assignments {
                 if let Some(fields) = proven_slow_lazy_cell_state_fields_for_exact_assignment(

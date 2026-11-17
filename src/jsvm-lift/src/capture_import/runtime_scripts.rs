@@ -690,8 +690,7 @@ pub(super) fn analyze_recorder_runtime_scripts(
                 let chain = origin
                     .get("chain")
                     .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
+                    .map_or_default(Vec::as_slice);
                 max_depth = max_depth.max(chain.len());
                 if let Some(root) = chain.last() {
                     if let Some(digest) = text(root.get("sha256")) {

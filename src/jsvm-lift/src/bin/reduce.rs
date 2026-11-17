@@ -672,8 +672,7 @@ fn exec_stmt(
             let suffix = ret
                 .argument
                 .as_ref()
-                .map(|arg| source_fragment(ctx.source, arg.span()))
-                .unwrap_or_default();
+                .map_or_default(|arg| source_fragment(ctx.source, arg.span()));
             effects.push(format!("return {suffix}"));
             Exec::Stop("return")
         }

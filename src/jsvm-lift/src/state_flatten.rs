@@ -523,8 +523,7 @@ impl<'a> Visit<'a> for BranchAssignmentCollector<'_> {
             return;
         }
         let possible_target_states = finite_static_state_targets(&assign.right)
-            .map(|targets| targets.into_iter().collect::<Vec<_>>())
-            .unwrap_or_default();
+            .map_or_default(|targets| targets.into_iter().collect::<Vec<_>>());
         let target_state = (possible_target_states.len() == 1).then(|| possible_target_states[0]);
         self.transitions.push(IfLadderTransitionCandidate {
             from_state: self.from_state,

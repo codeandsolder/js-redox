@@ -31,8 +31,7 @@ fn array_field<'a>(value: &'a Value, key: &str) -> &'a [Value] {
     value
         .get(key)
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
+        .map_or(&[], Vec::as_slice)
 }
 
 fn object_field<'a>(value: &'a Value, key: &str) -> Option<&'a Map<String, Value>> {
@@ -277,8 +276,7 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
         let node_id = format!("resource:{resource_id}");
         let units = source_by_resource
             .get(&resource_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+            .map_or(&[], Vec::as_slice);
         let source_paths = units
             .iter()
             .filter_map(|unit| nonempty_string_field(unit, "source_path"))

@@ -150,8 +150,8 @@ fn normalized_frames(initiator: &Map<String, Value>) -> Vec<Value> {
         .map(|frame| {
             json!({
                 "function_name": frame.get("functionName").cloned().unwrap_or(Value::Null),
-                "script_id": frame.get("scriptId").map(|id| Value::String(stringish(Some(id)))).unwrap_or(Value::Null),
-                "url": text(frame.get("url")).filter(|url| !url.is_empty()).map(|url| Value::String(url.to_owned())).unwrap_or(Value::Null),
+                "script_id": frame.get("scriptId").map_or(Value::Null, |id| Value::String(stringish(Some(id)))),
+                "url": text(frame.get("url")).filter(|url| !url.is_empty()).map_or(Value::Null, |url| Value::String(url.to_owned())),
                 "line_number": frame.get("lineNumber").cloned().unwrap_or(Value::Null),
                 "column_number": frame.get("columnNumber").cloned().unwrap_or(Value::Null),
             })

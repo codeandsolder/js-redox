@@ -16,8 +16,7 @@ fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
     value
         .get(key)
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+        .map_or_default(Vec::as_slice)
 }
 
 fn object<'a>(value: &'a Value, key: &str) -> Option<&'a serde_json::Map<String, Value>> {
@@ -528,8 +527,10 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         for unit in confirmed {
             let label = str_field(unit, "path")
                 .or_else(|| str_field(unit, "url"))
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| format!("scan {}", usize_field(unit, "scan_id")));
+                .map_or_else(
+                    || format!("scan {}", usize_field(unit, "scan_id")),
+                    ToOwned::to_owned,
+                );
             lines.push(format!(
                 "- {label} — {} devirtualized interpreter module(s)",
                 array(unit, "devirtualized_units").len()
@@ -544,8 +545,10 @@ pub fn refresh_project_readme(project: &Path, budgets: &AnalysisBudgets) -> Resu
         for unit in large_handler_candidates {
             let label = str_field(unit, "path")
                 .or_else(|| str_field(unit, "url"))
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| format!("scan {}", usize_field(unit, "scan_id")));
+                .map_or_else(
+                    || format!("scan {}", usize_field(unit, "scan_id")),
+                    ToOwned::to_owned,
+                );
             let handlers = if unit.get("largest_non_bundle_handler_table").is_some() {
                 usize_field(unit, "largest_non_bundle_handler_table")
             } else {
