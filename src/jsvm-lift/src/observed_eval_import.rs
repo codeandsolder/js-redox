@@ -1578,7 +1578,7 @@ mod tests {
         altered["captures"][0]["directory"] = json!("../escape");
         fs::write(&bundle, serde_json::to_vec(&altered)?)?;
         assert!(expand_observed_direct_bundle(&root, &original).is_err());
-        altered = descriptor.clone();
+        altered = descriptor;
         altered["captures"][0]["eventCount"] = json!(999);
         fs::write(&bundle, serde_json::to_vec(&altered)?)?;
         assert!(expand_observed_direct_bundle(&root, &original).is_err());

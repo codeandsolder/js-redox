@@ -295,7 +295,7 @@ fn recover_generated_unit(
                 "transforms": outcome.report.transforms,
                 "output_sha256": output_sha,
             });
-            (safe_rel.clone(), "safe_deobfuscation")
+            (safe_rel, "safe_deobfuscation")
         }
         Err(error) => {
             let error = recoverable_unit_error(error)?;
@@ -309,7 +309,7 @@ fn recover_generated_unit(
                         safe_dest.display()
                     )
                 })?;
-                (safe_rel.clone(), "string_recovery_only")
+                (safe_rel, "string_recovery_only")
             } else {
                 (PathBuf::from(raw_rel), "exact_fallback")
             }
@@ -395,7 +395,7 @@ fn reuse_generated_unit(
         let source =
             value_string(cached, "analysis_path").context("cached analysis_path missing")?;
         link_or_copy(&project.join(source), &project.join(&safe_rel))?;
-        safe_rel.clone()
+        safe_rel
     };
     let cached_readable =
         value_string(cached, "readable_path").context("cached readable_path missing")?;

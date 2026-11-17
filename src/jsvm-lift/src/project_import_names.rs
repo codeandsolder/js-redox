@@ -609,7 +609,7 @@ pub fn propagate_imported_names(project: &Path) -> Result<usize> {
             continue;
         };
         modules.insert(
-            url.clone(),
+            url,
             SourceModule {
                 readable_path: readable_path.clone(),
                 source: source.clone(),

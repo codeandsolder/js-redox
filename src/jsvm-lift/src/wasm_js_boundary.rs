@@ -2167,7 +2167,7 @@ mod tests {
         assert_eq!(bad_bindings.len(), 0);
         assert_eq!(bad_returns.len(), 0);
 
-        let mut cyclic = analysis.clone();
+        let mut cyclic = analysis;
         cyclic["runtime_bindings"][0]["runtime_dependencies"] = json!([20]);
         cyclic["runtime_bindings"][0]["semantic_ir"] =
             json!({"kind": "runtime", "value": 20, "name": "$runtime1"});

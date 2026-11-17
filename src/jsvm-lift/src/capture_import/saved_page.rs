@@ -660,7 +660,7 @@ pub(super) fn import_saved_page(
             "id": "saved-page",
             "title": page.file_stem().and_then(OsStr::to_str).unwrap_or_default(),
             "started_date_time": "",
-            "original_url": original_url.clone(),
+            "original_url": original_url,
         })],
         resources,
         inline_scripts,
