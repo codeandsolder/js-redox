@@ -1038,7 +1038,7 @@ impl<'a> Visit<'a> for NormalizedWriteCollector<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct NormalizedInitializerProof {
     write_dominates_normal_exit: bool,
     only_start_export_call: bool,
@@ -1084,119 +1084,16 @@ impl NormalizedInitializerVerifier<'_, '_> {
             .all(|statement| self.verify_statement(statement))
     }
 
+    // Fail closed on unrecognized statements, including arbitrary control flow.
     fn verify_statement(&mut self, statement: &Statement<'_>) -> bool {
         match statement {
             Statement::BlockStatement(block) => self.verify_statements(&block.body),
             Statement::EmptyStatement(_) => true,
             Statement::VariableDeclaration(declaration) => {
-                for declarator in &declaration.declarations {
-                    let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                        return false;
-                    };
-                    let Some(symbol) = identifier.symbol_id.get() else {
-                        return false;
-                    };
-                    if let Some(initializer) = &declarator.init {
-                        if !proof_primitive_expression(
-                            initializer,
-                            self.scoping,
-                            self.global_aliases,
-                            &self.primitive_symbols,
-                        ) {
-                            return false;
-                        }
-                        self.primitive_symbols.insert(symbol);
-                    }
-                }
-                true
+                self.verify_variable_declaration(declaration)
             }
             Statement::ExpressionStatement(statement) => {
-                let expression = unparenthesized(&statement.expression);
-                if let Expression::AssignmentExpression(assignment) = expression {
-                    if assignment.operator.as_str() != "=" {
-                        return false;
-                    }
-                    let AssignmentTarget::AssignmentTargetIdentifier(left) = &assignment.left
-                    else {
-                        return false;
-                    };
-                    let Some(target) = left.reference_id.get().and_then(|reference_id| {
-                        self.scoping.get_reference(reference_id).symbol_id()
-                    }) else {
-                        return false;
-                    };
-                    if target == self.target_symbol {
-                        if self.exports_assigned {
-                            return false;
-                        }
-                        let property = match unparenthesized(&assignment.right) {
-                            Expression::StaticMemberExpression(member)
-                                if !member.optional
-                                    && symbol_of(self.scoping, &member.object)
-                                        == Some(self.parameter_symbol) =>
-                            {
-                                Some(member.property.name.as_str())
-                            }
-                            Expression::ComputedMemberExpression(member)
-                                if !member.optional
-                                    && symbol_of(self.scoping, &member.object)
-                                        == Some(self.parameter_symbol) =>
-                            {
-                                match unparenthesized(&member.expression) {
-                                    Expression::StringLiteral(property) => property.value.as_str(),
-                                    _ => None,
-                                }
-                            }
-                            _ => None,
-                        };
-                        if property != Some("exports") {
-                            return false;
-                        }
-                        self.exports_assigned = true;
-                        return true;
-                    }
-                    if !proof_primitive_expression(
-                        &assignment.right,
-                        self.scoping,
-                        self.global_aliases,
-                        &self.primitive_symbols,
-                    ) {
-                        return false;
-                    }
-                    self.primitive_symbols.insert(target);
-                    true
-                } else if let Expression::CallExpression(call) = expression {
-                    if !self.exports_assigned || call.optional || !call.arguments.is_empty() {
-                        return false;
-                    }
-                    let export = match unparenthesized(&call.callee) {
-                        Expression::StaticMemberExpression(member)
-                            if !member.optional
-                                && symbol_of(self.scoping, &member.object)
-                                    == Some(self.target_symbol) =>
-                        {
-                            Some(member.property.name.as_str())
-                        }
-                        Expression::ComputedMemberExpression(member)
-                            if !member.optional
-                                && symbol_of(self.scoping, &member.object)
-                                    == Some(self.target_symbol) =>
-                        {
-                            match unparenthesized(&member.expression) {
-                                Expression::StringLiteral(property) => property.value.as_str(),
-                                _ => None,
-                            }
-                        }
-                        _ => None,
-                    };
-                    if export != Some("__wbindgen_start") {
-                        return false;
-                    }
-                    self.start_calls += 1;
-                    self.start_calls == 1
-                } else {
-                    false
-                }
+                self.verify_expression(&statement.expression)
             }
             Statement::ReturnStatement(statement) => {
                 statement.argument.as_ref().is_none_or(|argument| {
@@ -1205,6 +1102,94 @@ impl NormalizedInitializerVerifier<'_, '_> {
             }
             _ => false,
         }
+    }
+
+    fn verify_variable_declaration(
+        &mut self,
+        declaration: &oxc_ast::ast::VariableDeclaration<'_>,
+    ) -> bool {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                return false;
+            };
+            let Some(symbol) = identifier.symbol_id.get() else {
+                return false;
+            };
+            if let Some(initializer) = &declarator.init {
+                if !proof_primitive_expression(
+                    initializer,
+                    self.scoping,
+                    self.global_aliases,
+                    &self.primitive_symbols,
+                ) {
+                    return false;
+                }
+                self.primitive_symbols.insert(symbol);
+            }
+        }
+        true
+    }
+
+    fn verify_expression(&mut self, expression: &Expression<'_>) -> bool {
+        match unparenthesized(expression) {
+            Expression::AssignmentExpression(assignment) => self.verify_assignment(assignment),
+            Expression::CallExpression(call) => self.verify_start_call(call),
+            _ => false,
+        }
+    }
+
+    // Only admit exact instance.exports assignment on the export binding;
+    // other assignments must be provably primitive computations.
+    fn verify_assignment(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'_>) -> bool {
+        if assignment.operator.as_str() != "=" {
+            return false;
+        }
+        let AssignmentTarget::AssignmentTargetIdentifier(left) = &assignment.left else {
+            return false;
+        };
+        let Some(target) = left
+            .reference_id
+            .get()
+            .and_then(|reference_id| self.scoping.get_reference(reference_id).symbol_id())
+        else {
+            return false;
+        };
+        if target == self.target_symbol {
+            if self.exports_assigned
+                || member_object_named(&assignment.right, "exports")
+                    .and_then(|object| symbol_of(self.scoping, object))
+                    != Some(self.parameter_symbol)
+            {
+                return false;
+            }
+            self.exports_assigned = true;
+            return true;
+        }
+        if !proof_primitive_expression(
+            &assignment.right,
+            self.scoping,
+            self.global_aliases,
+            &self.primitive_symbols,
+        ) {
+            return false;
+        }
+        self.primitive_symbols.insert(target);
+        true
+    }
+
+    // Only admit one zero-argument __wbindgen_start after exports assignment.
+    fn verify_start_call(&mut self, call: &CallExpression<'_>) -> bool {
+        if !self.exports_assigned
+            || call.optional
+            || !call.arguments.is_empty()
+            || member_object_named(&call.callee, "__wbindgen_start")
+                .and_then(|object| symbol_of(self.scoping, object))
+                != Some(self.target_symbol)
+        {
+            return false;
+        }
+        self.start_calls += 1;
+        self.start_calls == 1
     }
 }
 
@@ -1216,6 +1201,53 @@ struct NormalizedInitializerHelperFinder<'c, 's> {
     global_aliases: &'s HashMap<SymbolId, String>,
     proven: &'s mut Vec<NormalizedInitializerProof>,
 }
+impl NormalizedInitializerHelperFinder<'_, '_> {
+    /// Missing or ambiguous helper shapes are not evidence of disjoint effects.
+    fn proof_for(&self, function: &Function<'_>) -> Option<NormalizedInitializerProof> {
+        let params = parameter_symbols(function)?;
+        let parameter_symbol = params.get(self.parameter).copied()?;
+        let body = function.body.as_ref()?;
+        let mut writes = NormalizedWriteCollector {
+            scoping: self.scoping,
+            parameter_symbol,
+            target_name: self.exports_binding.to_string(),
+            candidates: Vec::new(),
+        };
+        for statement in &body.statements {
+            writes.visit_statement(statement);
+        }
+        let [candidate] = writes.candidates.as_slice() else {
+            return None;
+        };
+        let (target_symbol, write_span) = *candidate;
+        let write_count = self
+            .scoping
+            .get_resolved_reference_ids(target_symbol)
+            .iter()
+            .filter(|reference_id| self.scoping.get_reference(**reference_id).is_write())
+            .count();
+        let flow = statements_flow(&body.statements, false, write_span)?;
+        let write_dominates_normal_exit = write_count == 1 && flow.write_dominates_normal_exit();
+
+        let mut verifier = NormalizedInitializerVerifier {
+            scoping: self.scoping,
+            global_aliases: self.global_aliases,
+            parameter_symbol,
+            target_symbol,
+            primitive_symbols: HashSet::new(),
+            exports_assigned: false,
+            start_calls: 0,
+        };
+        let non_start_effects_memory_disjoint =
+            verifier.verify_statements(&body.statements) && verifier.exports_assigned;
+        Some(NormalizedInitializerProof {
+            write_dominates_normal_exit,
+            only_start_export_call: non_start_effects_memory_disjoint && verifier.start_calls == 1,
+            non_start_effects_memory_disjoint,
+        })
+    }
+}
+
 impl<'a> Visit<'a> for NormalizedInitializerHelperFinder<'_, '_> {
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
         if function
@@ -1223,82 +1255,8 @@ impl<'a> Visit<'a> for NormalizedInitializerHelperFinder<'_, '_> {
             .as_ref()
             .is_some_and(|identifier| identifier.name.as_str() == self.helper_name)
         {
-            let Some(params) = parameter_symbols(function) else {
-                self.proven.push(NormalizedInitializerProof {
-                    write_dominates_normal_exit: false,
-                    only_start_export_call: false,
-                    non_start_effects_memory_disjoint: false,
-                });
-                return;
-            };
-            let Some(parameter_symbol) = params.get(self.parameter).copied() else {
-                self.proven.push(NormalizedInitializerProof {
-                    write_dominates_normal_exit: false,
-                    only_start_export_call: false,
-                    non_start_effects_memory_disjoint: false,
-                });
-                return;
-            };
-            let Some(body) = &function.body else {
-                self.proven.push(NormalizedInitializerProof {
-                    write_dominates_normal_exit: false,
-                    only_start_export_call: false,
-                    non_start_effects_memory_disjoint: false,
-                });
-                return;
-            };
-            let mut writes = NormalizedWriteCollector {
-                scoping: self.scoping,
-                parameter_symbol,
-                target_name: self.exports_binding.to_string(),
-                candidates: Vec::new(),
-            };
-            for statement in &body.statements {
-                writes.visit_statement(statement);
-            }
-            let [candidate] = writes.candidates.as_slice() else {
-                self.proven.push(NormalizedInitializerProof {
-                    write_dominates_normal_exit: false,
-                    only_start_export_call: false,
-                    non_start_effects_memory_disjoint: false,
-                });
-                return;
-            };
-            let (target_symbol, write_span) = *candidate;
-            let write_count = self
-                .scoping
-                .get_resolved_reference_ids(target_symbol)
-                .iter()
-                .filter(|reference_id| self.scoping.get_reference(**reference_id).is_write())
-                .count();
-            let Some(flow) = statements_flow(&body.statements, false, write_span) else {
-                self.proven.push(NormalizedInitializerProof {
-                    write_dominates_normal_exit: false,
-                    only_start_export_call: false,
-                    non_start_effects_memory_disjoint: false,
-                });
-                return;
-            };
-            let write_dominates_normal_exit =
-                write_count == 1 && flow.write_dominates_normal_exit();
-
-            let mut verifier = NormalizedInitializerVerifier {
-                scoping: self.scoping,
-                global_aliases: self.global_aliases,
-                parameter_symbol,
-                target_symbol,
-                primitive_symbols: HashSet::new(),
-                exports_assigned: false,
-                start_calls: 0,
-            };
-            let non_start_effects_memory_disjoint =
-                verifier.verify_statements(&body.statements) && verifier.exports_assigned;
-            self.proven.push(NormalizedInitializerProof {
-                write_dominates_normal_exit,
-                only_start_export_call: non_start_effects_memory_disjoint
-                    && verifier.start_calls == 1,
-                non_start_effects_memory_disjoint,
-            });
+            let proof = self.proof_for(function).unwrap_or_default();
+            self.proven.push(proof);
             return;
         }
         walk::walk_function(self, function, flags);
@@ -1737,6 +1695,71 @@ mod flow_tests {
             false,
             Span::new(start, start + length),
         ))
+    }
+
+    #[test]
+    fn normalized_initializer_requires_exact_exports_and_disjoint_effects() -> TestResult {
+        let budget = work_budget::WorkBudget::unlimited("normalized-initializer-proof-test");
+        let cases = [
+            (
+                "exports_binding = instance.exports; return exports_binding;",
+                (true, false, true),
+            ),
+            (
+                "exports_binding = instance['exports']; exports_binding['__wbindgen_start'](); return exports_binding;",
+                (true, true, true),
+            ),
+            (
+                "exports_binding = instance.exports; exports_binding.__wbindgen_start(); exports_binding.__wbindgen_start();",
+                (true, false, false),
+            ),
+            (
+                "exports_binding = instance.exports; arbitrary_effect();",
+                (true, false, false),
+            ),
+            (
+                "exports_binding = instance.exports; exports_binding.__wbindgen_start(1);",
+                (true, false, false),
+            ),
+            (
+                "exports_binding = instance.exports; exports_binding?.__wbindgen_start();",
+                (true, false, false),
+            ),
+            (
+                "exports_binding = instance.exports; exports_binding = instance.exports;",
+                (false, false, false),
+            ),
+            (
+                "exports_binding = instance.exports; exports_binding.other();",
+                (true, false, false),
+            ),
+            (
+                "if (condition) exports_binding = instance.exports; return exports_binding;",
+                (false, false, false),
+            ),
+        ];
+        for (body, expected) in cases {
+            let source = format!("var exports_binding; function init(instance) {{ {body} }}");
+            let proof = super::normalized_initializer_proof_from_source(
+                &source,
+                "init",
+                "exports_binding",
+                0,
+                &budget,
+            )
+            .test_value("normalized initializer analysis")?
+            .test_value("normalized initializer proof")?;
+            assert_eq!(
+                (
+                    proof.write_dominates_normal_exit,
+                    proof.only_start_export_call,
+                    proof.non_start_effects_memory_disjoint,
+                ),
+                expected,
+                "initializer body: {body}",
+            );
+        }
+        Ok(())
     }
 
     #[test]
