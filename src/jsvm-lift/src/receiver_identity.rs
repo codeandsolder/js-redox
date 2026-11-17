@@ -3914,6 +3914,12 @@ impl<'a> Visit<'a> for ConstructorEscapeProbe<'_, '_, '_> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum OwnerValueKind {
+    Constructor,
+    Prototype,
+}
+
 struct PrototypeMethodProof<'c, 'f> {
     scoping: &'c Scoping,
     constructors: &'f HashMap<SymbolId, FunctionKey>,
@@ -3979,41 +3985,45 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
             .flatten()
     }
 
-    fn constructor_value_owners(&self, expression: &Expression<'_>) -> HashSet<FunctionKey> {
+    fn value_owners(
+        &self,
+        expression: &Expression<'_>,
+        kind: OwnerValueKind,
+    ) -> HashSet<FunctionKey> {
         match expression {
             Expression::ParenthesizedExpression(parenthesized) => {
-                self.constructor_value_owners(&parenthesized.expression)
+                self.value_owners(&parenthesized.expression, kind)
             }
             Expression::SequenceExpression(sequence) => sequence
                 .expressions
                 .last()
                 .map_or_else(HashSet::new, |expression| {
-                    self.constructor_value_owners(expression)
+                    self.value_owners(expression, kind)
                 }),
             Expression::ConditionalExpression(conditional) => {
-                let mut owners = self.constructor_value_owners(&conditional.consequent);
-                owners.extend(self.constructor_value_owners(&conditional.alternate));
+                let mut owners = self.value_owners(&conditional.consequent, kind);
+                owners.extend(self.value_owners(&conditional.alternate, kind));
                 owners
             }
             Expression::LogicalExpression(logical) => {
-                let mut owners = self.constructor_value_owners(&logical.left);
-                owners.extend(self.constructor_value_owners(&logical.right));
+                let mut owners = self.value_owners(&logical.left, kind);
+                owners.extend(self.value_owners(&logical.right, kind));
                 owners
             }
             Expression::AssignmentExpression(assignment) if assignment.operator.is_assign() => {
-                self.constructor_value_owners(&assignment.right)
+                self.value_owners(&assignment.right, kind)
             }
             Expression::ArrayExpression(array) => {
                 let mut owners = HashSet::new();
                 for element in &array.elements {
                     match element {
                         ArrayExpressionElement::SpreadElement(spread) => {
-                            owners.extend(self.constructor_value_owners(&spread.argument));
+                            owners.extend(self.value_owners(&spread.argument, kind));
                         }
                         ArrayExpressionElement::Elision(_) => {}
                         element => {
                             if let Some(expression) = element.as_expression() {
-                                owners.extend(self.constructor_value_owners(expression));
+                                owners.extend(self.value_owners(expression, kind));
                             }
                         }
                     }
@@ -4025,75 +4035,18 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                 for property in &object.properties {
                     match property {
                         ObjectPropertyKind::ObjectProperty(property) => {
-                            owners.extend(self.constructor_value_owners(&property.value));
+                            owners.extend(self.value_owners(&property.value, kind));
                         }
                         ObjectPropertyKind::SpreadProperty(spread) => {
-                            owners.extend(self.constructor_value_owners(&spread.argument));
+                            owners.extend(self.value_owners(&spread.argument, kind));
                         }
                     }
                 }
                 owners
             }
-            _ => self.constructor_value(expression).into_iter().collect(),
-        }
-    }
-
-    fn prototype_value_owners(&self, expression: &Expression<'_>) -> HashSet<FunctionKey> {
-        match expression {
-            Expression::ParenthesizedExpression(parenthesized) => {
-                self.prototype_value_owners(&parenthesized.expression)
-            }
-            Expression::SequenceExpression(sequence) => sequence
-                .expressions
-                .last()
-                .map_or_else(HashSet::new, |expression| {
-                    self.prototype_value_owners(expression)
-                }),
-            Expression::ConditionalExpression(conditional) => {
-                let mut owners = self.prototype_value_owners(&conditional.consequent);
-                owners.extend(self.prototype_value_owners(&conditional.alternate));
-                owners
-            }
-            Expression::LogicalExpression(logical) => {
-                let mut owners = self.prototype_value_owners(&logical.left);
-                owners.extend(self.prototype_value_owners(&logical.right));
-                owners
-            }
-            Expression::AssignmentExpression(assignment) if assignment.operator.is_assign() => {
-                self.prototype_value_owners(&assignment.right)
-            }
-            Expression::ArrayExpression(array) => {
-                let mut owners = HashSet::new();
-                for element in &array.elements {
-                    match element {
-                        ArrayExpressionElement::SpreadElement(spread) => {
-                            owners.extend(self.prototype_value_owners(&spread.argument));
-                        }
-                        ArrayExpressionElement::Elision(_) => {}
-                        element => {
-                            if let Some(expression) = element.as_expression() {
-                                owners.extend(self.prototype_value_owners(expression));
-                            }
-                        }
-                    }
-                }
-                owners
-            }
-            Expression::ObjectExpression(object) => {
-                let mut owners = HashSet::new();
-                for property in &object.properties {
-                    match property {
-                        ObjectPropertyKind::ObjectProperty(property) => {
-                            owners.extend(self.prototype_value_owners(&property.value));
-                        }
-                        ObjectPropertyKind::SpreadProperty(spread) => {
-                            owners.extend(self.prototype_value_owners(&spread.argument));
-                        }
-                    }
-                }
-                owners
-            }
-            Expression::ComputedMemberExpression(member) if !member.optional => {
+            Expression::ComputedMemberExpression(member)
+                if matches!(kind, OwnerValueKind::Prototype) && !member.optional =>
+            {
                 if let Some(owner) = self.constructor_value(&member.object) {
                     let property =
                         proof_property_key(&member.expression, self.scoping, self.property_keys);
@@ -4106,8 +4059,21 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                 }
                 self.prototype_value(expression).into_iter().collect()
             }
-            _ => self.prototype_value(expression).into_iter().collect(),
+            _ => match kind {
+                OwnerValueKind::Constructor => self.constructor_value(expression),
+                OwnerValueKind::Prototype => self.prototype_value(expression),
+            }
+            .into_iter()
+            .collect(),
         }
+    }
+
+    fn constructor_value_owners(&self, expression: &Expression<'_>) -> HashSet<FunctionKey> {
+        self.value_owners(expression, OwnerValueKind::Constructor)
+    }
+
+    fn prototype_value_owners(&self, expression: &Expression<'_>) -> HashSet<FunctionKey> {
+        self.value_owners(expression, OwnerValueKind::Prototype)
     }
 
     fn member_receiver_owner(&self, expression: &Expression<'_>) -> Option<FunctionKey> {
