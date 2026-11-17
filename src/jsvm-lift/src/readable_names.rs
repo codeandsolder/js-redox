@@ -343,7 +343,7 @@ impl<'a> Visit<'a> for NameCandidates {
             if let Some(name) = property
                 .key
                 .static_name()
-                .and_then(|key| key.into_cow_str())
+                .and_then(oxc_ast::StaticPropertyName::into_cow_str)
             {
                 let name = name.into_owned();
                 if meaningful_property_name(&name) {

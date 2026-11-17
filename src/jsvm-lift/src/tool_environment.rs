@@ -1,5 +1,8 @@
 use anyhow::{bail, Context, Result};
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 /// Locate the repository root from the current directory or executable ancestors.
 ///
@@ -28,7 +31,7 @@ pub fn tool_dir() -> Result<PathBuf> {
     let executable = env::current_exe().context("locating current executable")?;
     executable
         .parent()
-        .map(|path| path.to_path_buf())
+        .map(Path::to_path_buf)
         .context("current executable has no parent directory")
 }
 

@@ -264,7 +264,7 @@ impl<'a> Visit<'a> for ExpressionInputs<'_> {
             .or_else(|| {
                 self.values
                     .get(&symbol)
-                    .and_then(|value| value.render())
+                    .and_then(StaticPrimitiveValue::render)
                     .map(ExpressionInput::Literal)
             });
         if let Some(input) = input {

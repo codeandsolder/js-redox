@@ -3,7 +3,7 @@
 //! Every event retains exact source offsets. Nested closures have a separate
 //! lexical depth: their bodies are not treated as executed parent code.
 use oxc_ast::{ast::Expression, AstKind};
-use oxc_semantic::Semantic;
+use oxc_semantic::{Reference, Semantic};
 use oxc_span::{GetSpan, Span};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -148,7 +148,7 @@ impl SurfaceAccumulator {
                     .get()
                     .map(|reference_id| semantic.scoping().get_reference(reference_id));
                 let declaration = resolved
-                    .and_then(|reference| reference.symbol_id())
+                    .and_then(Reference::symbol_id)
                     .map(|symbol| semantic.scoping().symbol_span(symbol));
                 if declaration
                     .is_some_and(|decl| self.span.start <= decl.start && decl.end <= self.span.end)
@@ -160,10 +160,10 @@ impl SurfaceAccumulator {
                     declaration.map(|decl| (decl.start, decl.end)),
                 );
                 let entry = self.references.entry(key).or_default();
-                if resolved.is_none_or(|reference| reference.is_read()) {
+                if resolved.is_none_or(Reference::is_read) {
                     entry.0 += 1;
                 }
-                if resolved.is_some_and(|reference| reference.is_write()) {
+                if resolved.is_some_and(Reference::is_write) {
                     entry.1 += 1;
                 }
             }

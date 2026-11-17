@@ -7,7 +7,7 @@
 
 use anyhow::{Error as AnyError, Result};
 use std::time::Duration;
-use work_budget::{find_budget_exceeded, BudgetLimits, WorkBudget};
+use work_budget::{find_budget_exceeded, BudgetExceeded, BudgetLimits, WorkBudget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisOperation {
@@ -144,7 +144,7 @@ impl AnalysisBudgets {
 ///
 /// Returns an error when the supplied failure represents an inherited work-budget exhaustion; local unit failures are returned as values.
 pub fn recoverable_unit_error(error: AnyError) -> Result<AnyError> {
-    if find_budget_exceeded(error.as_ref()).is_some_and(|budget| budget.is_inherited()) {
+    if find_budget_exceeded(error.as_ref()).is_some_and(BudgetExceeded::is_inherited) {
         return Err(error);
     }
     Ok(error)
