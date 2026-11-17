@@ -1837,7 +1837,7 @@ fn run_source(args: &SourceArgs) -> Result<()> {
     let outcome = deobfuscate_source(
         &original,
         args.input.display().to_string(),
-        source_mode(&args),
+        source_mode(args),
         args.max_iterations,
         args.format_output,
         &budget,
