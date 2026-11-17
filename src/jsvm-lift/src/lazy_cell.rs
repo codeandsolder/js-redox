@@ -481,6 +481,26 @@ fn fast_updater_replaces_capture(
         && reference_symbol(scoping, &assignment.right) == Some(parameter)
 }
 
+#[derive(Clone)]
+struct FastLazyCellCandidate {
+    guard: Span,
+    mode_parameter_index: usize,
+    value_parameter_index: usize,
+    state_parameter_index: usize,
+    prototype_field: String,
+    method_key_field: String,
+    updater_property: String,
+    cell_construction: Span,
+    getter_function: Span,
+    getter_entry_condition: Option<Span>,
+    updater_function: Span,
+    returned_cell_assignment: Span,
+    object_constructor_symbol: SymbolId,
+    cell_symbol: SymbolId,
+    getter_assignment: Span,
+    updater_assignment: Span,
+}
+
 fn fast_shape_for_function(
     function: &Function<'_>,
     scoping: &Scoping,
@@ -503,31 +523,11 @@ fn fast_shape_for_function(
     }
     let returned_symbol = reference_symbol(scoping, ret.argument.as_ref()?)?;
 
-    #[derive(Clone)]
-    struct Candidate {
-        guard: Span,
-        mode_parameter_index: usize,
-        value_parameter_index: usize,
-        state_parameter_index: usize,
-        prototype_field: String,
-        method_key_field: String,
-        updater_property: String,
-        cell_construction: Span,
-        getter_function: Span,
-        getter_entry_condition: Option<Span>,
-        updater_function: Span,
-        returned_cell_assignment: Span,
-        object_constructor_symbol: SymbolId,
-        cell_symbol: SymbolId,
-        getter_assignment: Span,
-        updater_assignment: Span,
-    }
-
     struct Collector<'c, 'p> {
         scoping: &'c Scoping,
         parameters: &'p [SymbolId],
         returned_symbol: SymbolId,
-        candidates: Vec<Candidate>,
+        candidates: Vec<FastLazyCellCandidate>,
     }
     impl<'a> Visit<'a> for Collector<'_, '_> {
         fn visit_logical_expression(&mut self, logical: &oxc_ast::ast::LogicalExpression<'a>) {
@@ -723,7 +723,7 @@ fn fast_shape_for_function(
                             && state_parameter_index != mode_parameter_index
                             && state_parameter_index != getter_value
                         {
-                            self.candidates.push(Candidate {
+                            self.candidates.push(FastLazyCellCandidate {
                                 guard: logical.left.span(),
                                 mode_parameter_index,
                                 value_parameter_index: getter_value,
@@ -3285,6 +3285,44 @@ fn analyze_slow_lazy_cell_resolver_index(
     })
 }
 
+struct SlowResolverIndexHarness<'s, 'p, 'm, 'u> {
+    source: &'s str,
+    program: &'p Program<'p>,
+    semantic: &'m Semantic<'m>,
+    update_state: &'u ProvenSlowLazyCellUpdateState,
+    selector_start: u32,
+    selector_end: u32,
+    selector_key_symbol: SymbolId,
+    exact_assignment: &'u ProvenSlowLazyCellExactRegistryAssignment,
+    phase_value: i64,
+    result: Option<Option<ProvenSlowLazyCellResolverIndex>>,
+}
+impl<'a> Visit<'a> for SlowResolverIndexHarness<'_, 'a, '_, '_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if self.result.is_some() {
+            return;
+        }
+        let shape = &self.update_state.factory_call.shape;
+        if function.span.start == shape.function_start && function.span.end == shape.function_end {
+            self.result = Some(analyze_slow_lazy_cell_resolver_index(
+                self.source,
+                self.program,
+                self.semantic,
+                function,
+                self.update_state,
+                SlowLazyCellResolverIndexFacts {
+                    selector: Span::new(self.selector_start, self.selector_end),
+                    selector_key_symbol: self.selector_key_symbol,
+                    exact_assignment: self.exact_assignment,
+                    phase_value: self.phase_value,
+                },
+            ));
+            return;
+        }
+        walk::walk_function(self, function, flags);
+    }
+}
+
 /// Prove that one slow-cell resolver's computed handler-array index collapses
 /// to the factory's captured handler slot under independently supplied facts.
 ///
@@ -3311,47 +3349,7 @@ pub fn proven_slow_lazy_cell_resolver_index(
         exact_assignment,
         phase_value,
     } = facts;
-    struct Harness<'s, 'p, 'm, 'u> {
-        source: &'s str,
-        program: &'p Program<'p>,
-        semantic: &'m Semantic<'m>,
-        update_state: &'u ProvenSlowLazyCellUpdateState,
-        selector_start: u32,
-        selector_end: u32,
-        selector_key_symbol: SymbolId,
-        exact_assignment: &'u ProvenSlowLazyCellExactRegistryAssignment,
-        phase_value: i64,
-        result: Option<Option<ProvenSlowLazyCellResolverIndex>>,
-    }
-    impl<'a> Visit<'a> for Harness<'_, 'a, '_, '_> {
-        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if self.result.is_some() {
-                return;
-            }
-            let shape = &self.update_state.factory_call.shape;
-            if function.span.start == shape.function_start
-                && function.span.end == shape.function_end
-            {
-                self.result = Some(analyze_slow_lazy_cell_resolver_index(
-                    self.source,
-                    self.program,
-                    self.semantic,
-                    function,
-                    self.update_state,
-                    SlowLazyCellResolverIndexFacts {
-                        selector: Span::new(self.selector_start, self.selector_end),
-                        selector_key_symbol: self.selector_key_symbol,
-                        exact_assignment: self.exact_assignment,
-                        phase_value: self.phase_value,
-                    },
-                ));
-                return;
-            }
-            walk::walk_function(self, function, flags);
-        }
-    }
-
-    let mut harness = Harness {
+    let mut harness = SlowResolverIndexHarness {
         source,
         program,
         semantic,
@@ -3614,6 +3612,30 @@ fn expression_is_empty_ordinary_object(expression: &Expression<'_>) -> bool {
     matches!(last_sequence_expression(expression), Expression::ObjectExpression(object) if object.properties.is_empty())
 }
 
+struct OrdinaryObjectInitializerProbe {
+    symbol: SymbolId,
+    matches: usize,
+    ordinary: bool,
+}
+impl<'a> Visit<'a> for OrdinaryObjectInitializerProbe {
+    fn visit_variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            if identifier.symbol_id.get() != Some(self.symbol) {
+                continue;
+            }
+            self.matches += 1;
+            self.ordinary = declarator
+                .init
+                .as_ref()
+                .is_some_and(expression_is_empty_ordinary_object);
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
 fn variable_initializer_is_empty_ordinary_object(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -3622,39 +3644,49 @@ fn variable_initializer_is_empty_ordinary_object(
     if !symbol_binding_has_no_writes(scoping, symbol) {
         return false;
     }
-    struct Probe {
-        symbol: SymbolId,
-        matches: usize,
-        ordinary: bool,
-    }
-    impl<'a> Visit<'a> for Probe {
-        fn visit_variable_declaration(
-            &mut self,
-            declaration: &oxc_ast::ast::VariableDeclaration<'a>,
-        ) {
-            for declarator in &declaration.declarations {
-                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                    continue;
-                };
-                if identifier.symbol_id.get() != Some(self.symbol) {
-                    continue;
-                }
-                self.matches += 1;
-                self.ordinary = declarator
-                    .init
-                    .as_ref()
-                    .is_some_and(expression_is_empty_ordinary_object);
-            }
-            walk::walk_variable_declaration(self, declaration);
-        }
-    }
-    let mut probe = Probe {
+    let mut probe = OrdinaryObjectInitializerProbe {
         symbol,
         matches: 0,
         ordinary: false,
     };
     probe.visit_program(program);
     probe.matches == 1 && probe.ordinary
+}
+
+struct ObjectConstructorAliasProbe<'c> {
+    scoping: &'c Scoping,
+    symbol: SymbolId,
+    matches: usize,
+    object_symbol: Option<SymbolId>,
+    direct_object: bool,
+}
+impl<'a> Visit<'a> for ObjectConstructorAliasProbe<'_> {
+    fn visit_variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            if identifier.symbol_id.get() != Some(self.symbol) {
+                continue;
+            }
+            self.matches += 1;
+            let Some(Expression::StaticMemberExpression(member)) =
+                declarator.init.as_ref().map(last_sequence_expression)
+            else {
+                continue;
+            };
+            if member.optional || member.property.name.as_str() != "constructor" {
+                continue;
+            }
+            let object = last_sequence_expression(&member.object);
+            if expression_is_empty_ordinary_object(object) {
+                self.direct_object = true;
+            } else {
+                self.object_symbol = reference_symbol(self.scoping, object);
+            }
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
 }
 
 fn symbol_is_ordinary_object_constructor_alias(
@@ -3665,45 +3697,7 @@ fn symbol_is_ordinary_object_constructor_alias(
     if !symbol_binding_has_no_writes(scoping, symbol) {
         return false;
     }
-    struct Probe<'c> {
-        scoping: &'c Scoping,
-        symbol: SymbolId,
-        matches: usize,
-        object_symbol: Option<SymbolId>,
-        direct_object: bool,
-    }
-    impl<'a> Visit<'a> for Probe<'_> {
-        fn visit_variable_declaration(
-            &mut self,
-            declaration: &oxc_ast::ast::VariableDeclaration<'a>,
-        ) {
-            for declarator in &declaration.declarations {
-                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                    continue;
-                };
-                if identifier.symbol_id.get() != Some(self.symbol) {
-                    continue;
-                }
-                self.matches += 1;
-                let Some(Expression::StaticMemberExpression(member)) =
-                    declarator.init.as_ref().map(last_sequence_expression)
-                else {
-                    continue;
-                };
-                if member.optional || member.property.name.as_str() != "constructor" {
-                    continue;
-                }
-                let object = last_sequence_expression(&member.object);
-                if expression_is_empty_ordinary_object(object) {
-                    self.direct_object = true;
-                } else {
-                    self.object_symbol = reference_symbol(self.scoping, object);
-                }
-            }
-            walk::walk_variable_declaration(self, declaration);
-        }
-    }
-    let mut probe = Probe {
+    let mut probe = ObjectConstructorAliasProbe {
         scoping,
         symbol,
         matches: 0,
@@ -3914,34 +3908,69 @@ fn descriptor_parameter_for_projection(
     matched
 }
 
+fn carrier_guard_equality_state(expression: &Expression<'_>, state_var: &str) -> Option<u64> {
+    let Expression::BinaryExpression(binary) = strip_parentheses(expression) else {
+        return None;
+    };
+    if !matches!(binary.operator.as_str(), "==" | "===") {
+        return None;
+    }
+    let parse = |id: &Expression<'_>, value: &Expression<'_>| {
+        let Expression::Identifier(identifier) = strip_parentheses(id) else {
+            return None;
+        };
+        if identifier.name.as_str() != state_var {
+            return None;
+        }
+        let Expression::NumericLiteral(number) = strip_parentheses(value) else {
+            return None;
+        };
+        u64::try_from(exact_i64(number.value)?).ok()
+    };
+    parse(&binary.left, &binary.right).or_else(|| parse(&binary.right, &binary.left))
+}
+
+struct CarrierGuardStateProbe<'g> {
+    state_var: &'g str,
+    event: Span,
+    states: Vec<u64>,
+}
+impl<'a> Visit<'a> for CarrierGuardStateProbe<'_> {
+    fn visit_logical_expression(&mut self, expression: &oxc_ast::ast::LogicalExpression<'a>) {
+        if expression.operator.as_str() == "&&"
+            && expression.right.span().start <= self.event.start
+            && self.event.end <= expression.right.span().end
+        {
+            if let Some(state) = carrier_guard_equality_state(&expression.left, self.state_var) {
+                self.states.push(state);
+            }
+        }
+        walk::walk_logical_expression(self, expression);
+    }
+    fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
+        if statement.consequent.span().start <= self.event.start
+            && self.event.end <= statement.consequent.span().end
+        {
+            if let Some(state) = carrier_guard_equality_state(&statement.test, self.state_var) {
+                self.states.push(state);
+            }
+        }
+        walk::walk_if_statement(self, statement);
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
 fn helper_state_for_create_event(
     source: &str,
     function: &Function<'_>,
     create: Span,
     ret: Span,
 ) -> Option<u64> {
-    fn equality_state(expression: &Expression<'_>, state_var: &str) -> Option<u64> {
-        let Expression::BinaryExpression(binary) = strip_parentheses(expression) else {
-            return None;
-        };
-        if !matches!(binary.operator.as_str(), "==" | "===") {
-            return None;
-        }
-        let parse = |id: &Expression<'_>, value: &Expression<'_>| {
-            let Expression::Identifier(identifier) = strip_parentheses(id) else {
-                return None;
-            };
-            if identifier.name.as_str() != state_var {
-                return None;
-            }
-            let Expression::NumericLiteral(number) = strip_parentheses(value) else {
-                return None;
-            };
-            u64::try_from(exact_i64(number.value)?).ok()
-        };
-        parse(&binary.left, &binary.right).or_else(|| parse(&binary.right, &binary.left))
-    }
-
     struct MachineProbe<'s> {
         source: &'s str,
         create: Span,
@@ -3969,44 +3998,7 @@ fn helper_state_for_create_event(
                 {
                     continue;
                 }
-                struct GuardProbe<'g> {
-                    state_var: &'g str,
-                    event: Span,
-                    states: Vec<u64>,
-                }
-                impl<'a> Visit<'a> for GuardProbe<'_> {
-                    fn visit_logical_expression(
-                        &mut self,
-                        expression: &oxc_ast::ast::LogicalExpression<'a>,
-                    ) {
-                        if expression.operator.as_str() == "&&"
-                            && expression.right.span().start <= self.event.start
-                            && self.event.end <= expression.right.span().end
-                        {
-                            if let Some(state) = equality_state(&expression.left, self.state_var) {
-                                self.states.push(state);
-                            }
-                        }
-                        walk::walk_logical_expression(self, expression);
-                    }
-                    fn visit_if_statement(&mut self, statement: &oxc_ast::ast::IfStatement<'a>) {
-                        if statement.consequent.span().start <= self.event.start
-                            && self.event.end <= statement.consequent.span().end
-                        {
-                            if let Some(state) = equality_state(&statement.test, self.state_var) {
-                                self.states.push(state);
-                            }
-                        }
-                        walk::walk_if_statement(self, statement);
-                    }
-                    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-                    fn visit_arrow_function_expression(
-                        &mut self,
-                        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                    ) {
-                    }
-                }
-                let mut guard = GuardProbe {
+                let mut guard = CarrierGuardStateProbe {
                     state_var: &machine.state_var,
                     event: self.create,
                     states: Vec::new(),
@@ -4049,6 +4041,189 @@ fn helper_state_for_create_event(
     Some(*state)
 }
 
+struct CarrierHelperBodyProbe<'c, 'p, 'o> {
+    scoping: &'c Scoping,
+    parameters: &'p [SymbolId],
+    projection_property: &'o str,
+    creates: Vec<(Span, SymbolId, SymbolId, usize, usize)>,
+    returns: Vec<(Span, SymbolId)>,
+}
+impl<'a> Visit<'a> for CarrierHelperBodyProbe<'_, '_, '_> {
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment.operator.is_assign() {
+            if let Some(target) = assignment_symbol(self.scoping, &assignment.left) {
+                if let Expression::CallExpression(call) =
+                    last_sequence_expression(&assignment.right)
+                {
+                    if !call.optional && call.arguments.len() == 2 {
+                        if let Expression::ComputedMemberExpression(callee) =
+                            last_sequence_expression(&call.callee)
+                        {
+                            if !callee.optional {
+                                if let (Some(constructor), Some(key_symbol)) = (
+                                    reference_symbol(self.scoping, &callee.object),
+                                    reference_symbol(self.scoping, &callee.expression),
+                                ) {
+                                    if let Some(key_index) = self
+                                        .parameters
+                                        .iter()
+                                        .position(|symbol| *symbol == key_symbol)
+                                    {
+                                        let base_ok = call
+                                            .arguments
+                                            .first()
+                                            .and_then(|argument| argument.as_expression())
+                                            .is_some_and(|argument| {
+                                                matches!(
+                                                    last_sequence_expression(argument),
+                                                    Expression::StaticMemberExpression(member)
+                                                        if !member.optional
+                                                            && member.property.name.as_str() == "prototype"
+                                                            && reference_symbol(self.scoping, &member.object) == Some(constructor)
+                                                )
+                                            });
+                                        let descriptor_index = call
+                                            .arguments
+                                            .get(1)
+                                            .and_then(|argument| argument.as_expression())
+                                            .and_then(|argument| {
+                                                match last_sequence_expression(argument) {
+                                                    Expression::ObjectExpression(object) => {
+                                                        descriptor_parameter_for_projection(
+                                                            object,
+                                                            self.scoping,
+                                                            self.parameters,
+                                                            self.projection_property,
+                                                        )
+                                                    }
+                                                    _ => None,
+                                                }
+                                            });
+                                        if base_ok {
+                                            if let Some(descriptor_index) = descriptor_index {
+                                                self.creates.push((
+                                                    assignment.span,
+                                                    target,
+                                                    constructor,
+                                                    key_index,
+                                                    descriptor_index,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+    fn visit_return_statement(&mut self, ret: &oxc_ast::ast::ReturnStatement<'a>) {
+        if let Some(symbol) = ret
+            .argument
+            .as_ref()
+            .and_then(|argument| reference_symbol(self.scoping, argument))
+        {
+            self.returns.push((ret.span, symbol));
+        }
+        walk::walk_return_statement(self, ret);
+    }
+    fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(
+        &mut self,
+        _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+    ) {
+    }
+}
+
+struct CarrierHelperFactoryProbe<'s, 'c, 'o> {
+    source: &'s str,
+    scoping: &'c Scoping,
+    helper_symbol: SymbolId,
+    projection_property: &'o str,
+    shapes: Vec<CarrierHelperShape>,
+}
+impl CarrierHelperFactoryProbe<'_, '_, '_> {
+    fn analyze(&mut self, function: &Function<'_>) {
+        if function.r#async || function.generator {
+            return;
+        }
+        let Some(parameters) = parameter_symbols(function) else {
+            return;
+        };
+        let Some(body) = function.body.as_ref() else {
+            return;
+        };
+        let mut creates = Vec::new();
+        let mut returns = Vec::new();
+        let mut probe = CarrierHelperBodyProbe {
+            scoping: self.scoping,
+            parameters: &parameters,
+            projection_property: self.projection_property,
+            creates: Vec::new(),
+            returns: Vec::new(),
+        };
+        probe.visit_function_body(body);
+        creates.append(&mut probe.creates);
+        returns.append(&mut probe.returns);
+        let [(create, result_symbol, constructor, key_index, descriptor_index)] =
+            creates.as_slice()
+        else {
+            return;
+        };
+        let return_events = returns
+            .iter()
+            .filter_map(|(span, symbol)| (*symbol == *result_symbol).then_some(*span))
+            .collect::<Vec<_>>();
+        let [return_event] = return_events.as_slice() else {
+            return;
+        };
+        let Some(create_state) =
+            helper_state_for_create_event(self.source, function, *create, *return_event)
+        else {
+            return;
+        };
+        self.shapes.push(CarrierHelperShape {
+            function: function.span,
+            create_assignment: *create,
+            return_event: *return_event,
+            create_state,
+            object_constructor_symbol: *constructor,
+            method_key_parameter_index: *key_index,
+            descriptor_parameter_index: *descriptor_index,
+        });
+    }
+}
+impl<'a> Visit<'a> for CarrierHelperFactoryProbe<'_, '_, '_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if function
+            .id
+            .as_ref()
+            .and_then(|identifier| identifier.symbol_id.get())
+            == Some(self.helper_symbol)
+        {
+            self.analyze(function);
+        }
+        walk::walk_function(self, function, flags);
+    }
+    fn visit_variable_declaration(&mut self, declaration: &oxc_ast::ast::VariableDeclaration<'a>) {
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
+                continue;
+            };
+            if identifier.symbol_id.get() != Some(self.helper_symbol) {
+                continue;
+            }
+            if let Some(Expression::FunctionExpression(function)) = &declarator.init {
+                self.analyze(function);
+            }
+        }
+        walk::walk_variable_declaration(self, declaration);
+    }
+}
+
 fn carrier_helper_shape(
     source: &str,
     program: &Program<'_>,
@@ -4059,192 +4234,7 @@ fn carrier_helper_shape(
     if !symbol_binding_has_no_writes(scoping, helper_symbol) {
         return None;
     }
-    struct Probe<'s, 'c, 'o> {
-        source: &'s str,
-        scoping: &'c Scoping,
-        helper_symbol: SymbolId,
-        projection_property: &'o str,
-        shapes: Vec<CarrierHelperShape>,
-    }
-    impl Probe<'_, '_, '_> {
-        fn analyze(&mut self, function: &Function<'_>) {
-            if function.r#async || function.generator {
-                return;
-            }
-            let Some(parameters) = parameter_symbols(function) else {
-                return;
-            };
-            let Some(body) = function.body.as_ref() else {
-                return;
-            };
-            let mut creates = Vec::new();
-            let mut returns = Vec::new();
-            struct BodyProbe<'c, 'p, 'o> {
-                scoping: &'c Scoping,
-                parameters: &'p [SymbolId],
-                projection_property: &'o str,
-                creates: Vec<(Span, SymbolId, SymbolId, usize, usize)>,
-                returns: Vec<(Span, SymbolId)>,
-            }
-            impl<'a> Visit<'a> for BodyProbe<'_, '_, '_> {
-                fn visit_assignment_expression(
-                    &mut self,
-                    assignment: &oxc_ast::ast::AssignmentExpression<'a>,
-                ) {
-                    if assignment.operator.is_assign() {
-                        if let Some(target) = assignment_symbol(self.scoping, &assignment.left) {
-                            if let Expression::CallExpression(call) =
-                                last_sequence_expression(&assignment.right)
-                            {
-                                if !call.optional && call.arguments.len() == 2 {
-                                    if let Expression::ComputedMemberExpression(callee) =
-                                        last_sequence_expression(&call.callee)
-                                    {
-                                        if !callee.optional {
-                                            if let (Some(constructor), Some(key_symbol)) = (
-                                                reference_symbol(self.scoping, &callee.object),
-                                                reference_symbol(self.scoping, &callee.expression),
-                                            ) {
-                                                if let Some(key_index) = self
-                                                    .parameters
-                                                    .iter()
-                                                    .position(|symbol| *symbol == key_symbol)
-                                                {
-                                                    let base_ok = call
-                                                        .arguments
-                                                        .first()
-                                                        .and_then(|argument| argument.as_expression())
-                                                        .is_some_and(|argument| {
-                                                            matches!(
-                                                                last_sequence_expression(argument),
-                                                                Expression::StaticMemberExpression(member)
-                                                                    if !member.optional
-                                                                        && member.property.name.as_str() == "prototype"
-                                                                        && reference_symbol(self.scoping, &member.object) == Some(constructor)
-                                                            )
-                                                        });
-                                                    let descriptor_index = call
-                                                        .arguments
-                                                        .get(1)
-                                                        .and_then(|argument| argument.as_expression())
-                                                        .and_then(|argument| match last_sequence_expression(argument) {
-                                                            Expression::ObjectExpression(object) => descriptor_parameter_for_projection(
-                                                                object,
-                                                                self.scoping,
-                                                                self.parameters,
-                                                                self.projection_property,
-                                                            ),
-                                                            _ => None,
-                                                        });
-                                                    if base_ok {
-                                                        if let Some(descriptor_index) =
-                                                            descriptor_index
-                                                        {
-                                                            self.creates.push((
-                                                                assignment.span,
-                                                                target,
-                                                                constructor,
-                                                                key_index,
-                                                                descriptor_index,
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    walk::walk_assignment_expression(self, assignment);
-                }
-                fn visit_return_statement(&mut self, ret: &oxc_ast::ast::ReturnStatement<'a>) {
-                    if let Some(symbol) = ret
-                        .argument
-                        .as_ref()
-                        .and_then(|argument| reference_symbol(self.scoping, argument))
-                    {
-                        self.returns.push((ret.span, symbol));
-                    }
-                    walk::walk_return_statement(self, ret);
-                }
-                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-                fn visit_arrow_function_expression(
-                    &mut self,
-                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                ) {
-                }
-            }
-            let mut probe = BodyProbe {
-                scoping: self.scoping,
-                parameters: &parameters,
-                projection_property: self.projection_property,
-                creates: Vec::new(),
-                returns: Vec::new(),
-            };
-            probe.visit_function_body(body);
-            creates.append(&mut probe.creates);
-            returns.append(&mut probe.returns);
-            let [(create, result_symbol, constructor, key_index, descriptor_index)] =
-                creates.as_slice()
-            else {
-                return;
-            };
-            let return_events = returns
-                .iter()
-                .filter_map(|(span, symbol)| (*symbol == *result_symbol).then_some(*span))
-                .collect::<Vec<_>>();
-            let [return_event] = return_events.as_slice() else {
-                return;
-            };
-            let Some(create_state) =
-                helper_state_for_create_event(self.source, function, *create, *return_event)
-            else {
-                return;
-            };
-            self.shapes.push(CarrierHelperShape {
-                function: function.span,
-                create_assignment: *create,
-                return_event: *return_event,
-                create_state,
-                object_constructor_symbol: *constructor,
-                method_key_parameter_index: *key_index,
-                descriptor_parameter_index: *descriptor_index,
-            });
-        }
-    }
-    impl<'a> Visit<'a> for Probe<'_, '_, '_> {
-        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if function
-                .id
-                .as_ref()
-                .and_then(|identifier| identifier.symbol_id.get())
-                == Some(self.helper_symbol)
-            {
-                self.analyze(function);
-            }
-            walk::walk_function(self, function, flags);
-        }
-        fn visit_variable_declaration(
-            &mut self,
-            declaration: &oxc_ast::ast::VariableDeclaration<'a>,
-        ) {
-            for declarator in &declaration.declarations {
-                let BindingPattern::BindingIdentifier(identifier) = &declarator.id else {
-                    continue;
-                };
-                if identifier.symbol_id.get() != Some(self.helper_symbol) {
-                    continue;
-                }
-                if let Some(Expression::FunctionExpression(function)) = &declarator.init {
-                    self.analyze(function);
-                }
-            }
-            walk::walk_variable_declaration(self, declaration);
-        }
-    }
-    let mut probe = Probe {
+    let mut probe = CarrierHelperFactoryProbe {
         source,
         scoping,
         helper_symbol,
@@ -4258,6 +4248,28 @@ fn carrier_helper_shape(
     Some(shape.clone())
 }
 
+struct CellConstructorSymbolProbe<'c, 'o> {
+    scoping: &'c Scoping,
+    span: Span,
+    matches: &'o mut Vec<SymbolId>,
+}
+impl<'a> Visit<'a> for CellConstructorSymbolProbe<'_, '_> {
+    fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
+        if assignment.span == self.span && assignment.operator.is_assign() {
+            if let Expression::CallExpression(call) = last_sequence_expression(&assignment.right) {
+                if let Expression::ComputedMemberExpression(callee) =
+                    last_sequence_expression(&call.callee)
+                {
+                    if let Some(symbol) = reference_symbol(self.scoping, &callee.object) {
+                        self.matches.push(symbol);
+                    }
+                }
+            }
+        }
+        walk::walk_assignment_expression(self, assignment);
+    }
+}
+
 fn slow_cell_object_constructor_symbol(
     program: &Program<'_>,
     scoping: &Scoping,
@@ -4268,33 +4280,7 @@ fn slow_cell_object_constructor_symbol(
         factory_call.shape.cell_construction_end,
     );
     let mut matches = Vec::new();
-    struct Probe<'c, 'o> {
-        scoping: &'c Scoping,
-        span: Span,
-        matches: &'o mut Vec<SymbolId>,
-    }
-    impl<'a> Visit<'a> for Probe<'_, '_> {
-        fn visit_assignment_expression(
-            &mut self,
-            assignment: &oxc_ast::ast::AssignmentExpression<'a>,
-        ) {
-            if assignment.span == self.span && assignment.operator.is_assign() {
-                if let Expression::CallExpression(call) =
-                    last_sequence_expression(&assignment.right)
-                {
-                    if let Expression::ComputedMemberExpression(callee) =
-                        last_sequence_expression(&call.callee)
-                    {
-                        if let Some(symbol) = reference_symbol(self.scoping, &callee.object) {
-                            self.matches.push(symbol);
-                        }
-                    }
-                }
-            }
-            walk::walk_assignment_expression(self, assignment);
-        }
-    }
-    Probe {
+    CellConstructorSymbolProbe {
         scoping,
         span,
         matches: &mut matches,
@@ -4431,22 +4417,23 @@ pub fn proven_slow_lazy_cell_prototype_carrier(
     Ok(proven)
 }
 
+struct FunctionParameterSpanProbe<'o> {
+    span: Span,
+    output: &'o mut Option<Vec<SymbolId>>,
+}
+impl<'a> Visit<'a> for FunctionParameterSpanProbe<'_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if function.span == self.span {
+            *self.output = parameter_symbols(function);
+            return;
+        }
+        walk::walk_function(self, function, flags);
+    }
+}
+
 fn parameter_symbols_for_span(program: &Program<'_>, span: Span) -> Option<Vec<SymbolId>> {
     let mut output = None;
-    struct Probe<'o> {
-        span: Span,
-        output: &'o mut Option<Vec<SymbolId>>,
-    }
-    impl<'a> Visit<'a> for Probe<'_> {
-        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if function.span == self.span {
-                *self.output = parameter_symbols(function);
-                return;
-            }
-            walk::walk_function(self, function, flags);
-        }
-    }
-    Probe {
+    FunctionParameterSpanProbe {
         span,
         output: &mut output,
     }
