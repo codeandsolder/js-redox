@@ -251,6 +251,7 @@ fn problem(
 }
 
 type CapturedByUrl = BTreeMap<String, Vec<Value>>;
+type CapturedLookup<T> = std::result::Result<Option<T>, Map<String, Value>>;
 
 /// A URL can denote multiple HTTP responses. Only common, verified bytes
 /// justify parsing the body; they never establish a unique response identity.
@@ -258,7 +259,7 @@ fn captured_bytes_for_url(
     url: &str,
     by_url: &CapturedByUrl,
     project: &Path,
-) -> std::result::Result<Option<(Vec<u8>, Vec<u64>)>, Map<String, Value>> {
+) -> CapturedLookup<(Vec<u8>, Vec<u64>)> {
     let Some(candidates) = by_url.get(url) else {
         return Ok(None);
     };
@@ -463,8 +464,7 @@ fn source_code(
     logical_source: &str,
     by_url: &CapturedByUrl,
     project: &Path,
-) -> std::result::Result<Option<(String, &'static str, Option<u64>, Vec<u64>)>, Map<String, Value>>
-{
+) -> CapturedLookup<(String, &'static str, Option<u64>, Vec<u64>)> {
     if let Some(content) = document
         .get("sourcesContent")
         .and_then(Value::as_array)
@@ -569,11 +569,15 @@ fn expand_map(
             match source_code(&normalized, ordinal, &logical_source, by_url, project) {
                 Ok(Some(source)) => source,
                 Ok(None) => continue,
-                Err(values) => {
+                Err(mut values) => {
                     let mut row = Map::new();
                     row.insert("depth".into(), json!(depth + 1));
                     row.insert("source_ordinal".into(), json!(ordinal));
                     row.insert("logical_source".into(), json!(logical_source));
+                    row.insert("code_url".into(), json!(logical_source));
+                    if let Some(ids) = values.remove("candidate_resource_ids") {
+                        values.insert("candidate_code_resource_ids".into(), ids);
+                    }
                     insert_problem(&mut row, values);
                     links.push(Value::Object(row));
                     continue;
@@ -1106,6 +1110,69 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["resource:4", "resource:5"]),
         );
+        Ok(())
+    }
+
+    #[test]
+    fn chained_source_code_url_ambiguity_is_not_misclassified_as_map_identity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path();
+        let root_map = json!({
+            "version":3,"file":"app.js","sources":["source.js"],
+            "sourcesContent":[],"names":[],"mappings":"",
+        })
+        .to_string();
+        shared_map_fixture(project, &root_map, &root_map)?;
+        let first = "console.log('first');\n//# sourceMappingURL=first.map";
+        let second = "console.log('second');\n//# sourceMappingURL=second.map";
+        for (path, bytes) in [
+            ("resources/source-a", first),
+            ("resources/source-b", second),
+        ] {
+            fs::write(project.join(path), bytes)?;
+        }
+        let mut manifest = crate::capture_project::load_manifest(project)?;
+        for (id, path, bytes) in [
+            (4, "resources/source-a", first),
+            (5, "resources/source-b", second),
+        ] {
+            manifest.resources.push(json!({
+                "id":id,"kind":"javascript","url":"https://fixture.invalid/source.js",
+                "output_path":path,"sha256":sha256_hex(bytes.as_bytes()),
+            }));
+        }
+        crate::capture_project::write_manifest(&project.join("capture-manifest.json"), &manifest)?;
+        let budget = AnalysisBudgets::standard("ambiguous-chained-source-code");
+        let summary = recover_project_sourcemaps(project, &budget)?;
+        assert_eq!(summary.composed_links, 0);
+        let map = read_fixture_artifact(project, "analysis/sourcemaps.json")?;
+        let link = &map["source_maps"][0]["composition"]["links"][0];
+        assert_eq!(link["status"], "ambiguous_captured_resource");
+        assert_eq!(link["code_url"], "https://fixture.invalid/source.js");
+        assert_eq!(link["candidate_code_resource_ids"], json!([4, 5]));
+        assert!(link["candidate_resource_ids"].is_null());
+        crate::source_graph::build_source_graph(project, &budget)?;
+        let graph = read_fixture_artifact(project, "analysis/source-graph.json")?;
+        let edges = graph["edges"].as_array().context("missing graph edges")?;
+        let candidates = edges
+            .iter()
+            .filter(|edge| {
+                edge["from"] == "sourcemap-chain:1:0"
+                    && edge["kind"] == "source_map_chain_code_candidate"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter_map(|edge| edge["to"].as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["resource:4", "resource:5"]),
+        );
+        assert!(edges
+            .iter()
+            .all(|edge| edge["from"] != "sourcemap-chain:1:0"
+                || edge["kind"] != "source_map_chain_resource_candidate"));
         Ok(())
     }
 
