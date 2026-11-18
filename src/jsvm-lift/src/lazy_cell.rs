@@ -826,18 +826,23 @@ fn fast_shape_for_function(
     })
 }
 
-#[must_use]
-pub fn structurally_proven_fast_lazy_cell_factory_shapes(
+// Visit every function and collect only independently proven factory shapes.
+// Fast and slow recognizers remain separate; only their traversal and stable
+// ordering/deduplication were identical.
+fn collect_factory_shapes<T: PartialEq>(
     program: &Program<'_>,
     scoping: &Scoping,
-) -> Vec<FastLazyCellFactoryShape> {
-    struct Collector<'c> {
+    recognize: for<'a> fn(&Function<'a>, &Scoping) -> Option<T>,
+    function_span: fn(&T) -> (u32, u32),
+) -> Vec<T> {
+    struct Collector<'c, T> {
         scoping: &'c Scoping,
-        shapes: Vec<FastLazyCellFactoryShape>,
+        recognize: for<'a> fn(&Function<'a>, &Scoping) -> Option<T>,
+        shapes: Vec<T>,
     }
-    impl<'a> Visit<'a> for Collector<'_> {
+    impl<'a, T> Visit<'a> for Collector<'_, T> {
         fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if let Some(shape) = fast_shape_for_function(function, self.scoping) {
+            if let Some(shape) = (self.recognize)(function, self.scoping) {
                 self.shapes.push(shape);
             }
             walk::walk_function(self, function, flags);
@@ -845,14 +850,23 @@ pub fn structurally_proven_fast_lazy_cell_factory_shapes(
     }
     let mut collector = Collector {
         scoping,
+        recognize,
         shapes: Vec::new(),
     };
     collector.visit_program(program);
-    collector
-        .shapes
-        .sort_by_key(|shape| (shape.function_start, shape.function_end));
+    collector.shapes.sort_by_key(function_span);
     collector.shapes.dedup();
     collector.shapes
+}
+
+#[must_use]
+pub fn structurally_proven_fast_lazy_cell_factory_shapes(
+    program: &Program<'_>,
+    scoping: &Scoping,
+) -> Vec<FastLazyCellFactoryShape> {
+    collect_factory_shapes(program, scoping, fast_shape_for_function, |shape| {
+        (shape.function_start, shape.function_end)
+    })
 }
 
 #[must_use]
@@ -4432,28 +4446,9 @@ pub fn structurally_proven_slow_lazy_cell_factory_shapes(
     program: &Program<'_>,
     scoping: &Scoping,
 ) -> Vec<SlowLazyCellFactoryShape> {
-    struct Collector<'c> {
-        scoping: &'c Scoping,
-        proven: Vec<SlowLazyCellFactoryShape>,
-    }
-    impl<'a> Visit<'a> for Collector<'_> {
-        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if let Some(shape) = shape_for_function(function, self.scoping) {
-                self.proven.push(shape);
-            }
-            walk::walk_function(self, function, flags);
-        }
-    }
-    let mut collector = Collector {
-        scoping,
-        proven: Vec::new(),
-    };
-    collector.visit_program(program);
-    collector
-        .proven
-        .sort_by_key(|shape| (shape.function_start, shape.function_end));
-    collector.proven.dedup();
-    collector.proven
+    collect_factory_shapes(program, scoping, shape_for_function, |shape| {
+        (shape.function_start, shape.function_end)
+    })
 }
 
 #[cfg(test)]
