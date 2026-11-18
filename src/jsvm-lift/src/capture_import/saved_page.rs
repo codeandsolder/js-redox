@@ -1,5 +1,5 @@
 use crate::{
-    browser_decode::decode_html,
+    browser_decode::{decode_html, DecodedHtml},
     browser_script_types::{inline_script_extension, is_executable_script, script_type_essence},
     capture_project::{
         prepare_project_output, write_manifest, CaptureManifest, CaptureSource, MANIFEST_NAME,
@@ -354,58 +354,18 @@ fn index_saved_urls(resources: &[Value]) -> Result<HashMap<String, usize>> {
     Ok(by_url)
 }
 
-pub(super) fn import_saved_page(
+fn collect_saved_page_files(
     page: &Path,
-    output: &Path,
-    options: &SavedPageOptions,
+    assets: Option<&Path>,
     budget: &WorkBudget,
-) -> Result<SavedPageSummary> {
-    budget.checkpoint()?;
-    let page = page
-        .canonicalize()
-        .with_context(|| format!("saved page HTML does not exist: {}", page.display()))?;
-    if !page.is_file() {
-        bail!("saved page HTML does not exist: {}", page.display());
-    }
-    let output = if output.is_absolute() {
-        output.to_owned()
-    } else {
-        std::env::current_dir()?.join(output)
-    };
-    prepare_project_output(&output, options.overwrite)?;
-
-    let page_bytes = fs::read(&page)?;
-    let decoded = decode_html(&page_bytes, None, None);
-    budget.checkpoint()?;
-    let page_text = decoded.source;
-    let assets = if let Some(explicit) = &options.assets_dir {
-        let resolved = explicit
-            .canonicalize()
-            .with_context(|| format!("assets directory does not exist: {}", explicit.display()))?;
-        if !resolved.is_dir() {
-            bail!("assets directory does not exist: {}", resolved.display());
-        }
-        Some(resolved)
-    } else {
-        discover_assets_dir(&page)?
-    };
-
-    if let Some(root) = assets.as_ref() {
-        root.to_str().with_context(|| {
-            format!(
-                "saved-page assets directory is not UTF-8: {}",
-                root.display()
-            )
-        })?;
-    }
-
+) -> Result<(PathBuf, Vec<(PathBuf, PathBuf)>)> {
     let page_name = page
         .file_name()
         .context("saved page has no filename")?
         .to_owned();
     let page_rel = PathBuf::from("saved-page").join(&page_name);
-    let mut files = vec![(page.clone(), page_rel.clone())];
-    if let Some(assets_root) = &assets {
+    let mut files = vec![(page.to_path_buf(), page_rel.clone())];
+    if let Some(assets_root) = assets {
         let assets_name = assets_root
             .file_name()
             .context("assets directory has no name")?;
@@ -417,6 +377,16 @@ pub(super) fn import_saved_page(
         }
     }
 
+    Ok((page_rel, files))
+}
+
+fn materialize_saved_resources(
+    page: &Path,
+    output: &Path,
+    files: &[(PathBuf, PathBuf)],
+    decoded: &DecodedHtml,
+    budget: &WorkBudget,
+) -> Result<(Vec<Value>, HashMap<PathBuf, u64>)> {
     let mut resources = Vec::<Value>::new();
     let mut rel_to_id = HashMap::<PathBuf, u64>::new();
     for (id, (source, capture_rel)) in files.iter().enumerate() {
@@ -454,7 +424,7 @@ pub(super) fn import_saved_page(
         object.insert("response_headers".into(), json!([]));
         object.insert("references".into(), json!([]));
         object.insert("saved_source_path".into(), json!(path_text(source)));
-        if source == &page {
+        if source.as_path() == page {
             object.insert("document_encoding".into(), json!(decoded.encoding.clone()));
             object.insert(
                 "document_decode_source".into(),
@@ -470,27 +440,21 @@ pub(super) fn import_saved_page(
         rel_to_id.insert(capture_rel.clone(), resource_id);
     }
 
-    let page_id = *rel_to_id
-        .get(&page_rel)
-        .context("saved page resource disappeared")?;
-    let page_index =
-        usize::try_from(page_id).context("saved page resource ID does not fit usize")?;
-    let page_url = resources[page_index]["url"]
-        .as_str()
-        .context("saved page resource URL missing")?
-        .to_owned();
-    budget.checkpoint()?;
-    let page_refs = html_references(&page_text, &page_url)?;
-    budget.checkpoint()?;
-    resources[page_index]["references"] = Value::Array(page_refs.clone());
+    Ok((resources, rel_to_id))
+}
 
+fn reconcile_saved_reference_roles(
+    resources: &mut [Value],
+    page_refs: &[Value],
+    budget: &WorkBudget,
+) -> Result<()> {
     // A saved-page file path must identify one resource. Reject collisions
     // rather than silently choosing the last matching entry.
-    let by_url = index_saved_urls(&resources)?;
+    let by_url = index_saved_urls(resources)?;
     // HTML declarations describe roles, not distinct captured bodies. Gather
     // every role before choosing a stable primary kind for single-kind consumers.
     let mut roles_by_resource = vec![BTreeSet::<&str>::new(); resources.len()];
-    for reference in &page_refs {
+    for reference in page_refs {
         budget.checkpoint()?;
         let Some(url) = reference.get("resolved_url").and_then(Value::as_str) else {
             continue;
@@ -526,7 +490,21 @@ pub(super) fn import_saved_page(
         resource["saved_page_reference_roles"] = json!(roles);
     }
 
-    for resource in &mut resources {
+    Ok(())
+}
+
+fn saved_reference_key(item: &Value) -> (String, String, String) {
+    let field = |name| {
+        item.get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    (field("kind"), field("raw"), field("resolved_url"))
+}
+
+fn collect_saved_resource_references(resources: &mut [Value], budget: &WorkBudget) -> Result<()> {
+    for resource in resources.iter_mut() {
         budget.checkpoint()?;
         let Some(kind) = resource.get("kind").and_then(Value::as_str) else {
             continue;
@@ -561,54 +539,37 @@ pub(super) fn import_saved_page(
             .context("saved resource references are not an array")?;
         let mut known = references
             .iter()
-            .map(|item| {
-                (
-                    item.get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    item.get("raw")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    item.get("resolved_url")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                )
-            })
+            .map(saved_reference_key)
             .collect::<HashSet<_>>();
         for item in items {
-            let key = (
-                item.get("kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                item.get("raw")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                item.get("resolved_url")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-            );
-            if known.insert(key) {
+            if known.insert(saved_reference_key(&item)) {
                 references.push(item);
             }
         }
     }
 
+    Ok(())
+}
+
+fn materialize_saved_inline_scripts(
+    page_text: &str,
+    page_rel: &Path,
+    page_url: &str,
+    page_id: u64,
+    decoded: &DecodedHtml,
+    output: &Path,
+    budget: &WorkBudget,
+) -> Result<Vec<Value>> {
     let mut inline_scripts = Vec::<Value>::new();
     let mut inline_seen = HashMap::<String, String>::new();
     budget.checkpoint()?;
-    for (offset, script) in extract_script_tags(&page_text).into_iter().enumerate() {
+    for (offset, script) in extract_script_tags(page_text).into_iter().enumerate() {
         budget.checkpoint()?;
         let ordinal = offset + 1;
         let script_type = script_type_essence(script.attrs.get("type").map(String::as_str));
         let src = script.attrs.get("src").and_then(|value| clean_ref(value));
         if let Some(src) = src {
-            let resolved = Url::parse(&page_url)?.join(&src)?.to_string();
+            let resolved = Url::parse(page_url)?.join(&src)?.to_string();
             inline_scripts.push(json!({
                 "parent_resource_id": page_id,
                 "ordinal": ordinal,
@@ -676,6 +637,17 @@ pub(super) fn import_saved_page(
         }));
     }
 
+    Ok(inline_scripts)
+}
+
+fn saved_page_manifest(
+    page: &Path,
+    page_text: &str,
+    assets: Option<&Path>,
+    resources: Vec<Value>,
+    inline_scripts: Vec<Value>,
+    budget: &WorkBudget,
+) -> Result<CaptureManifest> {
     // Count the final classified resources, not the pre-reference filename
     // guesses (which can differ for e.g. a .bin used as a script).
     let mut counts = BTreeMap::<String, usize>::new();
@@ -695,7 +667,7 @@ pub(super) fn import_saved_page(
             .filter(|script| !script["output_path"].is_null())
             .count(),
     );
-    let original_url = infer_original_url(&page_text)?;
+    let original_url = infer_original_url(page_text)?;
     let mut source_extra = Map::new();
     source_extra.insert("parse_error".into(), Value::Null);
     source_extra.insert(
@@ -717,7 +689,7 @@ pub(super) fn import_saved_page(
                 "saved_page_html"
             }
             .into(),
-            input: path_text(&page),
+            input: path_text(page),
             salvaged: false,
             extra: source_extra,
         },
@@ -732,6 +704,85 @@ pub(super) fn import_saved_page(
         counts,
         extra: Map::new(),
     };
+
+    Ok(manifest)
+}
+
+pub(super) fn import_saved_page(
+    page: &Path,
+    output: &Path,
+    options: &SavedPageOptions,
+    budget: &WorkBudget,
+) -> Result<SavedPageSummary> {
+    budget.checkpoint()?;
+    let page = page
+        .canonicalize()
+        .with_context(|| format!("saved page HTML does not exist: {}", page.display()))?;
+    if !page.is_file() {
+        bail!("saved page HTML does not exist: {}", page.display());
+    }
+    let output = if output.is_absolute() {
+        output.to_owned()
+    } else {
+        std::env::current_dir()?.join(output)
+    };
+    prepare_project_output(&output, options.overwrite)?;
+
+    let page_bytes = fs::read(&page)?;
+    let decoded = decode_html(&page_bytes, None, None);
+    budget.checkpoint()?;
+    let page_text = &decoded.source;
+    let assets = if let Some(explicit) = &options.assets_dir {
+        let resolved = explicit
+            .canonicalize()
+            .with_context(|| format!("assets directory does not exist: {}", explicit.display()))?;
+        if !resolved.is_dir() {
+            bail!("assets directory does not exist: {}", resolved.display());
+        }
+        Some(resolved)
+    } else {
+        discover_assets_dir(&page)?
+    };
+
+    if let Some(root) = assets.as_ref() {
+        root.to_str().with_context(|| {
+            format!(
+                "saved-page assets directory is not UTF-8: {}",
+                root.display()
+            )
+        })?;
+    }
+
+    let (page_rel, files) = collect_saved_page_files(&page, assets.as_deref(), budget)?;
+    let (mut resources, rel_to_id) =
+        materialize_saved_resources(&page, &output, &files, &decoded, budget)?;
+    let page_id = *rel_to_id
+        .get(&page_rel)
+        .context("saved page resource disappeared")?;
+    let page_index =
+        usize::try_from(page_id).context("saved page resource ID does not fit usize")?;
+    let page_url = resources[page_index]["url"]
+        .as_str()
+        .context("saved page resource URL missing")?
+        .to_owned();
+    budget.checkpoint()?;
+    let page_refs = html_references(page_text, &page_url)?;
+    budget.checkpoint()?;
+    resources[page_index]["references"] = Value::Array(page_refs.clone());
+
+    reconcile_saved_reference_roles(&mut resources, &page_refs, budget)?;
+    collect_saved_resource_references(&mut resources, budget)?;
+    let inline_scripts = materialize_saved_inline_scripts(
+        page_text, &page_rel, &page_url, page_id, &decoded, &output, budget,
+    )?;
+    let manifest = saved_page_manifest(
+        &page,
+        page_text,
+        assets.as_deref(),
+        resources,
+        inline_scripts,
+        budget,
+    )?;
     budget.checkpoint()?;
     write_manifest(&output.join(MANIFEST_NAME), &manifest)?;
     budget.checkpoint()?;
