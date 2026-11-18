@@ -1,4 +1,6 @@
-use crate::forwarding_semantics::structurally_proven_forwarding_installers;
+use crate::forwarding_semantics::{
+    only_unconditional_statements_budgeted, structurally_proven_forwarding_installers,
+};
 use jsvm_safe_core::string_literal_value;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -97,30 +99,6 @@ impl<'a> Visit<'a> for ArgumentsBoxCollector {
 
     fn visit_arrow_function_expression(&mut self, _it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
     }
-}
-
-fn only_unconditional_statements_budgeted(
-    statements: &[Statement<'_>],
-    budget: &WorkBudget,
-) -> Result<bool, BudgetExceeded> {
-    for statement in statements {
-        budget.consume(1)?;
-        let valid = match statement {
-            Statement::BlockStatement(block) => {
-                only_unconditional_statements_budgeted(&block.body, budget)?
-            }
-            Statement::VariableDeclaration(_)
-            | Statement::ExpressionStatement(_)
-            | Statement::ReturnStatement(_)
-            | Statement::EmptyStatement(_)
-            | Statement::DebuggerStatement(_) => true,
-            _ => false,
-        };
-        if !valid {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 struct ReturnLocationCollector {
