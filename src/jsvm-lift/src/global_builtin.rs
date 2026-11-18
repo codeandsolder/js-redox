@@ -122,28 +122,9 @@ pub fn global_constructor(
     callee: &Expression<'_>,
     constructor: &str,
 ) -> Option<String> {
-    match unparenthesized(callee) {
-        Expression::Identifier(identifier) if identifier.name.as_str() == constructor => {
-            let reference_id = identifier.reference_id.get()?;
-            statically_unresolved_global_reference(scoping, reference_id)
-                .then(|| "globalThis".to_string())
-        }
-        Expression::StaticMemberExpression(member)
-            if !member.optional && member.property.name.as_str() == constructor =>
-        {
-            global_object_name(scoping, global_aliases, &member.object)
-        }
-        Expression::ComputedMemberExpression(member) if !member.optional => {
-            let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
-                return None;
-            };
-            if property.value.as_str()? != constructor {
-                return None;
-            }
-            global_object_name(scoping, global_aliases, &member.object)
-        }
-        _ => None,
-    }
+    // A constructor reference and a namespace reference have identical
+    // exact global-identity requirements. Do not weaken either proof.
+    namespace_global(scoping, global_aliases, callee, constructor)
 }
 
 fn namespace_global(
@@ -222,6 +203,7 @@ mod tests {
         aliases: &'g HashMap<SymbolId, String>,
         wasm: bool,
         data_view: bool,
+        constructor_resolutions: Vec<Option<String>>,
     }
     impl<'a> Visit<'a> for ResolvedBuiltinsProbe<'_, '_> {
         fn visit_call_expression(&mut self, call: &oxc_ast::ast::CallExpression<'a>) {
@@ -234,12 +216,12 @@ mod tests {
         }
 
         fn visit_new_expression(&mut self, expression: &oxc_ast::ast::NewExpression<'a>) {
-            if global_constructor(self.scoping, self.aliases, &expression.callee, "DataView")
-                .as_deref()
-                == Some("window")
-            {
+            let resolved =
+                global_constructor(self.scoping, self.aliases, &expression.callee, "DataView");
+            if resolved.as_deref() == Some("window") {
                 self.data_view = true;
             }
+            self.constructor_resolutions.push(resolved);
             walk::walk_new_expression(self, expression);
         }
     }
@@ -267,6 +249,9 @@ mod tests {
             var host2 = host;
             host2["WebAssembly"]["instantiate"](bytes, imports);
             new host2["DataView"](buffer);
+            function local(DataView) { new DataView(buffer); }
+            new globalThis["DataView"](buffer);
+            new DataView(buffer);
         "#;
         let allocator = Allocator::default();
         let parsed = parse_program(&allocator, source, SourceType::cjs());
@@ -284,10 +269,20 @@ mod tests {
             aliases: &aliases,
             wasm: false,
             data_view: false,
+            constructor_resolutions: Vec::new(),
         };
         probe.visit_program(&parsed.program);
         assert!(probe.wasm);
         assert!(probe.data_view);
+        assert_eq!(
+            probe.constructor_resolutions,
+            [
+                Some("window".to_string()),
+                None, // Locally shadowed constructor is not a global.
+                Some("globalThis".to_string()),
+                Some("globalThis".to_string()),
+            ],
+        );
         Ok(())
     }
 
