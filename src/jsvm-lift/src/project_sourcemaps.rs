@@ -410,7 +410,7 @@ fn load_map(
                     fields.remove("url");
                     CapturedLookupError::Resource(fields)
                 }
-                error => error,
+                CapturedLookupError::Budget(error) => CapturedLookupError::Budget(error),
             },
         )?;
         let Some((bytes, resource_ids)) = resolved else {
