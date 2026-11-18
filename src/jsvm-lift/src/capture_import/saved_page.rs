@@ -114,12 +114,14 @@ fn read_text_lossless(path: &Path) -> Result<Option<String>> {
 }
 
 fn clean_ref(raw: &str) -> Option<String> {
-    let decoded = decode_html_entities(raw.trim());
-    let decoded = decoded.trim();
-    if decoded.is_empty() || decoded.starts_with('#') {
+    // HTML attributes have already had character references decoded by
+    // parse_attrs. Source-map directives are not HTML; decoding them here
+    // would be equally incorrect and could bind a different captured URL.
+    let cleaned = raw.trim();
+    if cleaned.is_empty() || cleaned.starts_with('#') {
         return None;
     }
-    if let Ok(parsed) = Url::parse(decoded) {
+    if let Ok(parsed) = Url::parse(cleaned) {
         if matches!(
             parsed.scheme(),
             "data" | "blob" | "javascript" | "mailto" | "tel" | "about"
@@ -127,7 +129,7 @@ fn clean_ref(raw: &str) -> Option<String> {
             return None;
         }
     }
-    Some(decoded.replace('\\', "/"))
+    Some(cleaned.replace('\\', "/"))
 }
 
 fn reference(base: &str, kind: &str, raw: &str) -> Option<Value> {
@@ -720,7 +722,7 @@ mod tests {
     fn reference_cleaning_rejects_non_network_inline_schemes() {
         assert!(clean_ref(" data:text/plain,hello ").is_none());
         assert!(clean_ref("javascript:alert(1)").is_none());
-        assert_eq!(clean_ref(" ./a&amp;b.js ").as_deref(), Some("./a&b.js"));
+        assert_eq!(clean_ref(" ./a&amp;b.js ").as_deref(), Some("./a&amp;b.js"));
     }
 
     #[test]
@@ -735,6 +737,7 @@ mod tests {
             r#"<script type="application/ld+json" src="./Example_files/data.bin"></script>
             <script type="text/x-template" src="./Example_files/template.bin"></script>
             <script type="module" src="./Example_files/runtime.bin"></script>
+            <script src="./Example_files/amp&amp;amp;name.bin"></script>
             <link rel="modulepreload" href="./Example_files/module.bin">
             <link rel="notstylesheet" href="./Example_files/false-style.bin">
             <link rel="stylesheet alternate" href="./Example_files/style.bin">
@@ -745,6 +748,8 @@ mod tests {
             "data.bin",
             "template.bin",
             "runtime.bin",
+            "amp&amp;name.bin",
+            "amp&name.bin",
             "module.bin",
             "false-style.bin",
             "style.bin",
@@ -768,7 +773,7 @@ mod tests {
                 .find(|resource| {
                     resource["url"]
                         .as_str()
-                        .is_some_and(|url| url.ends_with(name))
+                        .is_some_and(|url| url.rsplit('/').next() == Some(name))
                 })
                 .with_context(|| format!("missing fixture resource: {name}"))
         };
@@ -777,6 +782,7 @@ mod tests {
             "template.bin",
             "false-style.bin",
             "false-preload.bin",
+            "amp&name.bin",
         ] {
             assert_eq!(
                 resource(name)?["kind"],
@@ -784,7 +790,12 @@ mod tests {
                 "{name} must remain inert"
             );
         }
-        for name in ["runtime.bin", "module.bin", "preload.bin"] {
+        for name in [
+            "runtime.bin",
+            "amp&amp;name.bin",
+            "module.bin",
+            "preload.bin",
+        ] {
             assert_eq!(
                 resource(name)?["kind"],
                 "javascript",
@@ -792,6 +803,7 @@ mod tests {
             );
         }
         assert_eq!(resource("style.bin")?["kind"], "css");
+        assert_eq!(resource("amp&name.bin")?["kind"], "binary");
         let page_record = resource("Example.html")?;
         let references = page_record["references"]
             .as_array()
@@ -807,6 +819,12 @@ mod tests {
                 && reference["resolved_url"]
                     .as_str()
                     .is_some_and(|url| url.ends_with("runtime.bin"))
+        }));
+        assert!(references.iter().any(|reference| {
+            reference["raw"] == "./Example_files/amp&amp;name.bin"
+                && reference["resolved_url"]
+                    .as_str()
+                    .is_some_and(|url| url.ends_with("amp&amp;name.bin"))
         }));
         Ok(())
     }
