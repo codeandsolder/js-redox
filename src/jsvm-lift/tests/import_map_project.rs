@@ -523,16 +523,14 @@ fn html_base_is_shared_by_har_scripts_import_maps_and_module_graph() -> Result<(
     Ok(())
 }
 
-#[test]
-fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let input = root.path().join("shared-contexts.har");
-    let project = root.path().join("project");
-    let mapped_page = "https://fixture.invalid/mapped.html";
-    let plain_page = "https://fixture.invalid/plain.html";
-    let shared_url = "https://fixture.invalid/modules/shared.js";
-    let child_url = "https://fixture.invalid/modules/child.js";
-    let mapped_url = "https://fixture.invalid/modules/mapped.js";
+// Shared external module source is observed by one mapped and one unmapped HTML page.
+const SHARED_MAPPED_PAGE_URL: &str = "https://fixture.invalid/mapped.html";
+const SHARED_PLAIN_PAGE_URL: &str = "https://fixture.invalid/plain.html";
+const SHARED_MODULE_URL: &str = "https://fixture.invalid/modules/shared.js";
+const SHARED_CHILD_URL: &str = "https://fixture.invalid/modules/child.js";
+const SHARED_MAPPED_MODULE_URL: &str = "https://fixture.invalid/modules/mapped.js";
+
+fn write_shared_module_context_fixture(input: &Path, project: &Path) -> Result<()> {
     let mapped_html = concat!(
         "<script type=\"importmap\">",
         "{\"imports\":{\"pkg\":\"/modules/mapped.js\"}}",
@@ -540,22 +538,22 @@ fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
     );
     let plain_html = "<script type=\"module\" src=\"/modules/shared.js\"></script>";
     let entries = vec![
-        har_entry(mapped_page, "text/html", mapped_html),
-        har_entry(plain_page, "text/html", plain_html),
+        har_entry(SHARED_MAPPED_PAGE_URL, "text/html", mapped_html),
+        har_entry(SHARED_PLAIN_PAGE_URL, "text/html", plain_html),
         har_entry(
-            shared_url,
+            SHARED_MODULE_URL,
             "application/javascript",
             "import 'pkg'; import './child.js';",
         ),
-        har_entry(child_url, "application/javascript", "import 'pkg';"),
+        har_entry(SHARED_CHILD_URL, "application/javascript", "import 'pkg';"),
         har_entry(
-            mapped_url,
+            SHARED_MAPPED_MODULE_URL,
             "application/javascript",
             "export const mapped = true;",
         ),
     ];
     fs::write(
-        &input,
+        input,
         serde_json::to_vec(&json!({
             "log": {
                 "version":"1.2",
@@ -566,7 +564,16 @@ fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
             }
         }))?,
     )?;
-    run_pipeline(&input, &project)?;
+    run_pipeline(input, project)?;
+    Ok(())
+}
+
+#[test]
+fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let input = root.path().join("shared-contexts.har");
+    let project = root.path().join("project");
+    write_shared_module_context_fixture(&input, &project)?;
     let manifest = read_json(&project.join("capture-manifest.json"))?;
     let resource_id = |url: &str| -> Result<u64> {
         manifest["resources"]
@@ -577,16 +584,18 @@ fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
             .and_then(|resource| resource["id"].as_u64())
             .with_context(|| format!("missing resource {url}"))
     };
-    let mapped_id = resource_id(mapped_page)?;
-    let plain_id = resource_id(plain_page)?;
-    let shared_id = resource_id(shared_url)?;
-    let child_id = resource_id(child_url)?;
-    let mapped_target_id = resource_id(mapped_url)?;
+    let mapped_id = resource_id(SHARED_MAPPED_PAGE_URL)?;
+    let plain_id = resource_id(SHARED_PLAIN_PAGE_URL)?;
+    let shared_id = resource_id(SHARED_MODULE_URL)?;
+    let child_id = resource_id(SHARED_CHILD_URL)?;
+    let mapped_target_id = resource_id(SHARED_MAPPED_MODULE_URL)?;
     let refs = read_json(&project.join("analysis/js-references.json"))?;
     let rows = refs["code_units"]
         .as_array()
         .context("missing JS reference rows")?;
-    for (url, expected_resource_id) in [(shared_url, shared_id), (child_url, child_id)] {
+    for (url, expected_resource_id) in
+        [(SHARED_MODULE_URL, shared_id), (SHARED_CHILD_URL, child_id)]
+    {
         let unit = code_unit(rows, url)?;
         assert_eq!(unit["resource_id"], expected_resource_id);
         assert_eq!(
@@ -603,7 +612,7 @@ fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
         assert_eq!(choices.len(), 2);
         assert!(choices.iter().any(|choice| {
             choice["document_resource_id"] == mapped_id
-                && choice["resolved_url"] == mapped_url
+                && choice["resolved_url"] == SHARED_MAPPED_MODULE_URL
                 && choice["resolution"] == "import_map"
         }));
         assert!(choices.iter().any(|choice| {
@@ -612,8 +621,8 @@ fn shared_modules_keep_mapped_and_unmapped_document_contexts() -> Result<()> {
                 && choice["resolution"] == "unresolved_bare"
         }));
     }
-    let child_import = reference(code_unit(rows, shared_url)?, "./child.js")?;
-    assert_eq!(child_import["resolved_url"], child_url);
+    let child_import = reference(code_unit(rows, SHARED_MODULE_URL)?, "./child.js")?;
+    assert_eq!(child_import["resolved_url"], SHARED_CHILD_URL);
     assert_eq!(
         child_import["resolution_candidates"]
             .as_array()
