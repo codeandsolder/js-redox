@@ -291,39 +291,6 @@ fn sink_family(path: &str) -> Option<&'static str> {
     }
 }
 
-fn assignment_global_path(
-    scoping: &Scoping,
-    target: &oxc_ast::ast::AssignmentTarget<'_>,
-) -> Option<String> {
-    match target {
-        oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
-            let reference = scoping.get_reference(identifier.reference_id.get()?);
-            reference
-                .symbol_id()
-                .is_none()
-                .then(|| identifier.name.to_string())
-        }
-        oxc_ast::ast::AssignmentTarget::StaticMemberExpression(member) if !member.optional => {
-            Some(format!(
-                "{}.{}",
-                global_path(scoping, &member.object)?,
-                member.property.name
-            ))
-        }
-        oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(member) if !member.optional => {
-            let Expression::StringLiteral(property) = unparenthesized(&member.expression) else {
-                return None;
-            };
-            Some(format!(
-                "{}.{}",
-                global_path(scoping, &member.object)?,
-                property.value.as_str()?
-            ))
-        }
-        _ => None,
-    }
-}
-
 fn simple_assignment_global_path(
     scoping: &Scoping,
     target: &oxc_ast::ast::SimpleAssignmentTarget<'_>,
@@ -376,7 +343,13 @@ impl SinkMutationCollector<'_> {
 
 impl<'a> Visit<'a> for SinkMutationCollector<'_> {
     fn visit_assignment_expression(&mut self, assignment: &oxc_ast::ast::AssignmentExpression<'a>) {
-        self.record(assignment_global_path(self.scoping, &assignment.left).as_deref());
+        self.record(
+            assignment
+                .left
+                .as_simple_assignment_target()
+                .and_then(|target| simple_assignment_global_path(self.scoping, target))
+                .as_deref(),
+        );
         walk::walk_assignment_expression(self, assignment);
     }
 
@@ -1067,6 +1040,16 @@ navigator.sendBeacon("https://real.example.test/beacon", body);
             rows[0].url.as_deref(),
             Some("https://real.example.test/beacon")
         );
+        // Update expressions must invalidate the same recognized global sinks
+        // as plain assignments, but unrelated sink families remain available.
+        let updated = r#"
+window["fetch"]++;
+++navigator.sendBeacon;
+new WebSocket("wss://real.example.test/remaining-sink");
+"#;
+        let updated_rows = analyze_api_surface(updated)?;
+        assert_eq!(updated_rows.len(), 1, "{updated_rows:#?}");
+        assert_eq!(updated_rows[0].kind, "websocket");
         Ok(())
     }
 
