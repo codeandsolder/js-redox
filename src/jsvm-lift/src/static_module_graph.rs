@@ -190,17 +190,18 @@ fn candidate_resolutions(reference: &Value, document_id: u64) -> Vec<&Value> {
         .get("resolution_candidates")
         .and_then(Value::as_array)
     {
-        if !choices.is_empty() {
-            return choices
-                .iter()
-                .filter(|candidate| {
-                    candidate
-                        .get("document_resource_id")
-                        .and_then(Value::as_u64)
-                        == Some(document_id)
-                })
-                .collect();
-        }
+        // An explicit (including empty) contextual inventory is authoritative.
+        // Falling back to the summary fields could invent an import for a
+        // document with no matching resolution.
+        return choices
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .get("document_resource_id")
+                    .and_then(Value::as_u64)
+                    == Some(document_id)
+            })
+            .collect();
     }
     vec![reference]
 }
@@ -224,6 +225,302 @@ fn match_root(
         out.push((idx, identity));
     }
     Ok(out)
+}
+
+struct SourceCatalog<'a> {
+    units: Vec<Unit<'a>>,
+    raw_index: BTreeMap<String, Vec<usize>>,
+    url_index: BTreeMap<String, Vec<usize>>,
+}
+
+impl<'a> SourceCatalog<'a> {
+    fn build(
+        source_rows: &'a [Value],
+        reference_rows: &'a [Value],
+        budget: &WorkBudget,
+    ) -> Result<Self> {
+        let mut source_by_path = BTreeMap::<(&str, &str), Option<SourceIndexLink<'_>>>::new();
+        for row in source_rows {
+            budget.consume(1)?;
+            let (Some(raw), Some(analyzed), Some(transform), Some(origin), Some(kind)) = (
+                field(row, "raw_path"),
+                field(row, "source_path"),
+                field(row, "transform"),
+                field(row, "origin"),
+                field(row, "kind"),
+            ) else {
+                continue;
+            };
+            let link = SourceIndexLink {
+                transform,
+                origin,
+                kind,
+            };
+            source_by_path
+                .entry((raw, analyzed))
+                .and_modify(|current| {
+                    if *current != Some(link) {
+                        *current = None;
+                    }
+                })
+                .or_insert(Some(link));
+        }
+        let mut units = Vec::new();
+        let mut raw_index = BTreeMap::<String, Vec<usize>>::new();
+        let mut url_index = BTreeMap::<String, Vec<usize>>::new();
+        for row in reference_rows {
+            budget.consume(1)?;
+            let (Some(raw_path), Some(analyzed_path)) =
+                (field(row, "raw_path"), field(row, "source_path"))
+            else {
+                continue;
+            };
+            let Some(link) = source_by_path
+                .get(&(raw_path, analyzed_path))
+                .copied()
+                .flatten()
+            else {
+                // Missing or ambiguous raw→formatted provenance: do not connect.
+                continue;
+            };
+            let idx = units.len();
+            units.push(Unit {
+                row,
+                raw_path,
+                analyzed_path,
+                transform: link.transform,
+                origin: link.origin,
+            });
+            raw_index.entry(raw_path.to_string()).or_default().push(idx);
+            // A document URL is also the URL of every inline script within it.
+            // Imported modules cannot resolve to arbitrary inline script bodies
+            // just because they share that document URL.
+            if link.kind == "javascript" && link.origin == "resource" {
+                if let Some(url) = field(row, "url").filter(|url| !url.is_empty()) {
+                    url_index.entry(url.to_owned()).or_default().push(idx);
+                }
+            }
+        }
+        Ok(Self {
+            units,
+            raw_index,
+            url_index,
+        })
+    }
+}
+
+struct RootDiscovery {
+    roots: Vec<ModuleRoot>,
+    unmatched_module_roots: Vec<UnmatchedModuleRoot>,
+    identities: BTreeMap<usize, ModuleSourceIdentity>,
+    queue: VecDeque<(u64, usize)>,
+}
+
+fn discover_roots(
+    project: &Path,
+    documents: &[DocumentEntrypoints],
+    catalog: &SourceCatalog<'_>,
+    bodies: &ManifestBodies<'_>,
+    budget: &WorkBudget,
+) -> Result<RootDiscovery> {
+    let mut roots = Vec::new();
+    let mut unmatched_module_roots = Vec::new();
+    let mut identities = BTreeMap::<usize, ModuleSourceIdentity>::new();
+    let mut queue = VecDeque::<(u64, usize)>::new();
+    for document in documents {
+        for script in &document.scripts {
+            budget.consume(1)?;
+            if !script.executable || !script.is_module {
+                continue;
+            }
+            for source in &script.captured_sources {
+                let resolved = match_root(
+                    source,
+                    &catalog.raw_index,
+                    &catalog.units,
+                    bodies,
+                    project,
+                    budget,
+                )?;
+                if resolved.is_empty() {
+                    unmatched_module_roots.push(UnmatchedModuleRoot {
+                        document_resource_id: document.document_resource_id,
+                        script_ordinal: script.ordinal,
+                        raw_path: source.output_path.clone(),
+                        reason: "captured_source_not_indexed_in_js_references_or_source_index",
+                    });
+                }
+                for (idx, identity) in resolved {
+                    identities.insert(idx, identity.clone());
+                    roots.push(ModuleRoot {
+                        document_resource_id: document.document_resource_id,
+                        script_ordinal: script.ordinal,
+                        source: identity,
+                    });
+                    queue.push_back((document.document_resource_id, idx));
+                }
+            }
+        }
+    }
+    Ok(RootDiscovery {
+        roots,
+        unmatched_module_roots,
+        identities,
+        queue,
+    })
+}
+
+struct GraphTraversal<'a, 'source, 'manifest> {
+    project: &'a Path,
+    budget: &'a WorkBudget,
+    catalog: &'a SourceCatalog<'source>,
+    bodies: &'a ManifestBodies<'manifest>,
+    identities: BTreeMap<usize, ModuleSourceIdentity>,
+    queue: VecDeque<(u64, usize)>,
+    visited: BTreeSet<(u64, usize)>,
+    dependencies: Vec<ModuleDependency>,
+    unresolved: usize,
+    ambiguous: usize,
+}
+
+impl<'a, 'source, 'manifest> GraphTraversal<'a, 'source, 'manifest> {
+    fn new(
+        project: &'a Path,
+        budget: &'a WorkBudget,
+        catalog: &'a SourceCatalog<'source>,
+        bodies: &'a ManifestBodies<'manifest>,
+        identities: BTreeMap<usize, ModuleSourceIdentity>,
+        queue: VecDeque<(u64, usize)>,
+    ) -> Self {
+        Self {
+            project,
+            budget,
+            catalog,
+            bodies,
+            identities,
+            queue,
+            visited: BTreeSet::new(),
+            dependencies: Vec::new(),
+            unresolved: 0,
+            ambiguous: 0,
+        }
+    }
+
+    fn identity(&mut self, idx: usize) -> Result<ModuleSourceIdentity> {
+        if let Some(existing) = self.identities.get(&idx) {
+            return Ok(existing.clone());
+        }
+        let identity = source_identity(
+            self.project,
+            &self.catalog.units[idx],
+            self.bodies,
+            self.budget,
+        )?;
+        self.identities.insert(idx, identity.clone());
+        Ok(identity)
+    }
+
+    fn traverse(&mut self) -> Result<()> {
+        while let Some((document_id, idx)) = self.queue.pop_front() {
+            self.budget.consume(1)?;
+            if !self.visited.insert((document_id, idx)) {
+                continue;
+            }
+            let from = self.identity(idx)?;
+            let catalog = self.catalog;
+            let Some(references) = catalog.units[idx]
+                .row
+                .get("references")
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for reference in references {
+                self.visit_reference(document_id, &from, reference)?;
+            }
+        }
+        Ok(())
+    }
+
+    // The contextual inventory is authoritative, including zero candidates.
+    // Dynamic edges remain visible without entering the traversal queue.
+    fn visit_reference(
+        &mut self,
+        document_id: u64,
+        from: &ModuleSourceIdentity,
+        reference: &Value,
+    ) -> Result<()> {
+        self.budget.consume(1)?;
+        let Some(kind) = field(reference, "kind") else {
+            return Ok(());
+        };
+        let is_static = matches!(kind, "import_static" | "reexport_named" | "reexport_all");
+        let dynamic = kind == "import_dynamic";
+        if !(is_static || dynamic) {
+            return Ok(());
+        }
+        let specifier = field(reference, "specifier").unwrap_or_default();
+        let span = [
+            reference.get("start").and_then(Value::as_u64).unwrap_or(0),
+            reference.get("end").and_then(Value::as_u64).unwrap_or(0),
+        ];
+        let choices = candidate_resolutions(reference, document_id);
+        if choices.is_empty() {
+            self.unresolved += 1;
+            self.dependencies.push(ModuleDependency {
+                document_resource_id: document_id,
+                from: from.clone(),
+                analyzed_source_reference_bytes: span,
+                kind: kind.to_string(),
+                specifier: specifier.to_owned(),
+                resolution: "no_matching_document_resolution".into(),
+                resolved_url: None,
+                import_map_key: None,
+                import_map_scope: None,
+                target_candidates: Vec::new(),
+                blocked: false,
+                dynamic_import: dynamic,
+            });
+        }
+        for choice in choices {
+            self.budget.consume(1)?;
+            let resolved_url = field(choice, "resolved_url").map(str::to_owned);
+            let resolution = field(choice, "resolution").unwrap_or("unknown").to_owned();
+            let blocked = resolution == "import_map_blocked";
+            let mut target_candidates = Vec::new();
+            if let Some(url) = &resolved_url {
+                for &target in self.catalog.url_index.get(url).into_iter().flatten() {
+                    self.budget.consume(1)?;
+                    let target_identity = self.identity(target)?;
+                    target_candidates.push(target_identity);
+                    if is_static {
+                        self.queue.push_back((document_id, target));
+                    }
+                }
+            }
+            if resolved_url.is_none() || target_candidates.is_empty() {
+                self.unresolved += 1;
+            }
+            if target_candidates.len() > 1 {
+                self.ambiguous += 1;
+            }
+            self.dependencies.push(ModuleDependency {
+                document_resource_id: document_id,
+                from: from.clone(),
+                analyzed_source_reference_bytes: span,
+                kind: kind.to_string(),
+                specifier: specifier.to_owned(),
+                resolution,
+                resolved_url,
+                import_map_key: field(choice, "import_map_key").map(str::to_owned),
+                import_map_scope: field(choice, "scope").map(str::to_owned),
+                target_candidates,
+                blocked,
+                dynamic_import: dynamic,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Traverse only imports/re-exports that are statically named by a module.
@@ -256,197 +553,22 @@ pub fn link_static_modules(
         .get("code_units")
         .and_then(Value::as_array)
         .context("JS references have no code_units")?;
-    let mut source_by_path = BTreeMap::<(&str, &str), Option<SourceIndexLink<'_>>>::new();
-    for row in source_rows {
-        budget.consume(1)?;
-        let (Some(raw), Some(analyzed), Some(transform), Some(origin), Some(kind)) = (
-            field(row, "raw_path"),
-            field(row, "source_path"),
-            field(row, "transform"),
-            field(row, "origin"),
-            field(row, "kind"),
-        ) else {
-            continue;
-        };
-        let link = SourceIndexLink {
-            transform,
-            origin,
-            kind,
-        };
-        source_by_path
-            .entry((raw, analyzed))
-            .and_modify(|current| {
-                if *current != Some(link) {
-                    *current = None;
-                }
-            })
-            .or_insert(Some(link));
-    }
-    let mut units = Vec::new();
-    let mut raw_index = BTreeMap::<String, Vec<usize>>::new();
-    let mut url_index = BTreeMap::<String, Vec<usize>>::new();
-    for row in reference_rows {
-        budget.consume(1)?;
-        let (Some(raw_path), Some(analyzed_path)) =
-            (field(row, "raw_path"), field(row, "source_path"))
-        else {
-            continue;
-        };
-        let Some(link) = source_by_path
-            .get(&(raw_path, analyzed_path))
-            .copied()
-            .flatten()
-        else {
-            // Missing or ambiguous raw→formatted provenance: do not connect.
-            continue;
-        };
-        let idx = units.len();
-        units.push(Unit {
-            row,
-            raw_path,
-            analyzed_path,
-            transform: link.transform,
-            origin: link.origin,
-        });
-        raw_index.entry(raw_path.to_string()).or_default().push(idx);
-        // A document URL is also the URL of every inline script within it.
-        // Imported modules cannot resolve to arbitrary inline script bodies
-        // just because they share that document URL.
-        if link.kind == "javascript" && link.origin == "resource" {
-            if let Some(url) = field(row, "url").filter(|url| !url.is_empty()) {
-                url_index.entry(url.to_owned()).or_default().push(idx);
-            }
-        }
-    }
-    let mut roots = Vec::new();
-    let mut unmatched_module_roots = Vec::new();
-    let mut identities = BTreeMap::<usize, ModuleSourceIdentity>::new();
-    let mut queue = VecDeque::<(u64, usize)>::new();
-    for document in documents {
-        for script in &document.scripts {
-            budget.consume(1)?;
-            if !script.executable || !script.is_module {
-                continue;
-            }
-            for source in &script.captured_sources {
-                let resolved = match_root(source, &raw_index, &units, &bodies, project, budget)?;
-                if resolved.is_empty() {
-                    unmatched_module_roots.push(UnmatchedModuleRoot {
-                        document_resource_id: document.document_resource_id,
-                        script_ordinal: script.ordinal,
-                        raw_path: source.output_path.clone(),
-                        reason: "captured_source_not_indexed_in_js_references_or_source_index",
-                    });
-                }
-                for (idx, identity) in resolved {
-                    identities.insert(idx, identity.clone());
-                    roots.push(ModuleRoot {
-                        document_resource_id: document.document_resource_id,
-                        script_ordinal: script.ordinal,
-                        source: identity,
-                    });
-                    queue.push_back((document.document_resource_id, idx));
-                }
-            }
-        }
-    }
-    let mut visited = BTreeSet::<(u64, usize)>::new();
-    let mut dependencies = Vec::new();
-    let mut unresolved = 0;
-    let mut ambiguous = 0;
-    while let Some((document_id, idx)) = queue.pop_front() {
-        budget.consume(1)?;
-        if !visited.insert((document_id, idx)) {
-            continue;
-        }
-        let from = if let Some(identity) = identities.get(&idx) {
-            identity.clone()
-        } else {
-            let identity = source_identity(project, &units[idx], &bodies, budget)?;
-            identities.insert(idx, identity.clone());
-            identity
-        };
-        let Some(references) = units[idx].row.get("references").and_then(Value::as_array) else {
-            continue;
-        };
-        for reference in references {
-            budget.consume(1)?;
-            let Some(kind) = field(reference, "kind") else {
-                continue;
-            };
-            let is_static = matches!(kind, "import_static" | "reexport_named" | "reexport_all");
-            let dynamic = kind == "import_dynamic";
-            if !(is_static || dynamic) {
-                continue;
-            }
-            let specifier = field(reference, "specifier").unwrap_or_default();
-            let span = [
-                reference.get("start").and_then(Value::as_u64).unwrap_or(0),
-                reference.get("end").and_then(Value::as_u64).unwrap_or(0),
-            ];
-            let choices = candidate_resolutions(reference, document_id);
-            if choices.is_empty() {
-                unresolved += 1;
-                dependencies.push(ModuleDependency {
-                    document_resource_id: document_id,
-                    from: from.clone(),
-                    analyzed_source_reference_bytes: span,
-                    kind: kind.to_string(),
-                    specifier: specifier.to_owned(),
-                    resolution: "no_matching_document_resolution".into(),
-                    resolved_url: None,
-                    import_map_key: None,
-                    import_map_scope: None,
-                    target_candidates: Vec::new(),
-                    blocked: false,
-                    dynamic_import: dynamic,
-                });
-            }
-            for choice in choices {
-                budget.consume(1)?;
-                let resolved_url = field(choice, "resolved_url").map(str::to_owned);
-                let resolution = field(choice, "resolution").unwrap_or("unknown").to_owned();
-                let blocked = resolution == "import_map_blocked";
-                let mut target_candidates = Vec::new();
-                if let Some(url) = &resolved_url {
-                    for &target in url_index.get(url).into_iter().flatten() {
-                        budget.consume(1)?;
-                        let target_identity = if let Some(value) = identities.get(&target) {
-                            value.clone()
-                        } else {
-                            let value = source_identity(project, &units[target], &bodies, budget)?;
-                            identities.insert(target, value.clone());
-                            value
-                        };
-                        target_candidates.push(target_identity);
-                        if is_static {
-                            queue.push_back((document_id, target));
-                        }
-                    }
-                }
-                if resolved_url.is_none() || target_candidates.is_empty() {
-                    unresolved += 1;
-                }
-                if target_candidates.len() > 1 {
-                    ambiguous += 1;
-                }
-                dependencies.push(ModuleDependency {
-                    document_resource_id: document_id,
-                    from: from.clone(),
-                    analyzed_source_reference_bytes: span,
-                    kind: kind.to_string(),
-                    specifier: specifier.to_owned(),
-                    resolution,
-                    resolved_url,
-                    import_map_key: field(choice, "import_map_key").map(str::to_owned),
-                    import_map_scope: field(choice, "scope").map(str::to_owned),
-                    target_candidates,
-                    blocked,
-                    dynamic_import: dynamic,
-                });
-            }
-        }
-    }
+    let catalog = SourceCatalog::build(source_rows, reference_rows, budget)?;
+    let RootDiscovery {
+        mut roots,
+        unmatched_module_roots,
+        identities,
+        queue,
+    } = discover_roots(project, documents, &catalog, &bodies, budget)?;
+    let mut traversal = GraphTraversal::new(project, budget, &catalog, &bodies, identities, queue);
+    traversal.traverse()?;
+    let GraphTraversal {
+        mut dependencies,
+        visited,
+        unresolved,
+        ambiguous,
+        ..
+    } = traversal;
     roots.sort_by(|a, b| {
         (a.document_resource_id, a.script_ordinal, &a.source.raw_path).cmp(&(
             b.document_resource_id,
@@ -578,6 +700,11 @@ mod tests {
             {
                 "kind":"import_dynamic", "specifier":"./lazy.js","start":14,"end":33,
                 "resolution":"url","resolved_url":"https://example.test/lazy.js"
+            },
+            {
+                "kind":"import_static", "specifier":"ghost", "start":34, "end":42,
+                "resolution_candidates":[],
+                "resolution":"url","resolved_url":"https://example.test/pkg.js"
             }
         ]);
         main_refs["url"] = json!("https://example.test/main.js");
@@ -676,7 +803,24 @@ mod tests {
             .iter()
             .flat_map(|edge| &edge.target_candidates)
             .all(|body| body.capture_manifest_raw_sha256_verified));
-        assert_eq!(result.visited_module_contexts, 5); // doc3: root, both pkg versions, dep; doc4: root; dynamic lazy is not traversed.
+        assert_eq!(result.visited_module_contexts, 5);
+        // An explicit empty per-document inventory overrides stale summary
+        // resolution fields, even if their URL is otherwise a captured module.
+        for document_id in [3, 4] {
+            let ghost = result
+                .dependencies
+                .iter()
+                .filter(|edge| {
+                    edge.document_resource_id == document_id && edge.specifier == "ghost"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ghost.len(), 1);
+            assert_eq!(ghost[0].resolution, "no_matching_document_resolution");
+            assert_eq!(ghost[0].resolved_url, None);
+            assert!(ghost[0].target_candidates.is_empty());
+            assert!(!ghost[0].blocked);
+        }
+        assert_eq!(result.unresolved_specifiers, 3); // doc3: root, both pkg versions, dep; doc4: root; dynamic lazy is not traversed.
         assert!(result
             .dependencies
             .iter()
