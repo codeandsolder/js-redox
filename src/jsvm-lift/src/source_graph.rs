@@ -651,20 +651,21 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
             .filter_map(|unit| nonempty_string_field(unit, "source_path"))
             .map(|path| Value::String(path.to_string()))
             .collect::<Vec<_>>();
-        graph.add_node(
-            node_id.clone(),
-            json!({
-                "type":"resource",
-                "resource_id":resource_id,
-                "url":field(resource,"url"),
-                "kind":field(resource,"kind"),
-                "status":field(resource,"status"),
-                "body_present":field(resource,"body_present"),
-                "raw_path":field(resource,"output_path"),
-                "source_paths":source_paths,
-                "sha256":field(resource,"sha256"),
-            }),
-        )?;
+        let mut node = json!({
+            "type":"resource",
+            "resource_id":resource_id,
+            "url":field(resource,"url"),
+            "kind":field(resource,"kind"),
+            "status":field(resource,"status"),
+            "body_present":field(resource,"body_present"),
+            "raw_path":field(resource,"output_path"),
+            "source_paths":source_paths,
+            "sha256":field(resource,"sha256"),
+        });
+        if let Some(roles) = resource.get("saved_page_reference_roles") {
+            node["saved_page_reference_roles"] = roles.clone();
+        }
+        graph.add_node(node_id.clone(), node)?;
         if let Some(url) = nonempty_string_field(resource, "url") {
             graph.register_resource_url(url, &node_id);
         }

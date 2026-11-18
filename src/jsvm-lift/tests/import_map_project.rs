@@ -395,6 +395,140 @@ fn check_saved_page(root: &Path) -> Result<()> {
     )
 }
 
+fn verify_saved_page_mixed_roles(project: &Path) -> Result<()> {
+    let manifest = read_json(&project.join("capture-manifest.json"))?;
+    let resources = manifest["resources"]
+        .as_array()
+        .context("manifest resources missing")?;
+    assert_eq!(resources.len(), 2, "one page and one physical asset");
+    let asset = resources
+        .iter()
+        .find(|row| {
+            row["url"]
+                .as_str()
+                .is_some_and(|url| url.ends_with("/Page_files/dual.bin"))
+        })
+        .context("dual-role saved asset missing")?;
+    let id = asset["id"].as_u64().context("missing saved asset ID")?;
+    let url = asset["url"].as_str().context("missing dual-role URL")?;
+    assert_eq!(
+        asset["kind"], "javascript",
+        "script analysis must be preserved"
+    );
+    assert_eq!(asset["mime_type"], "application/javascript");
+    assert_eq!(
+        asset["saved_page_reference_roles"],
+        json!(["css", "javascript"])
+    );
+    assert_eq!(manifest["counts"]["javascript"], 1);
+    assert_eq!(manifest["counts"]["html"], 1);
+    assert_eq!(manifest["counts"]["binary"], Value::Null);
+
+    let page_record = resources
+        .iter()
+        .find(|row| row["kind"] == "html")
+        .context("saved page HTML resource missing")?;
+    let page_id = page_record["id"]
+        .as_u64()
+        .context("missing page resource ID")?;
+    let refs = page_record["references"]
+        .as_array()
+        .context("HTML references missing")?;
+    for role in ["script_src", "stylesheet"] {
+        assert_eq!(
+            refs.iter()
+                .filter(|entry| entry["kind"] == role && entry["resolved_url"] == url)
+                .count(),
+            1,
+            "HTML must independently retain the {role} reference"
+        );
+    }
+    let asset_refs = asset["references"]
+        .as_array()
+        .context("asset references missing")?;
+    assert_eq!(
+        asset_refs
+            .iter()
+            .filter(|entry| entry["kind"] == "source_map")
+            .count(),
+        1,
+        "JS and CSS scanners must not duplicate source-map references"
+    );
+
+    let index = read_json(&project.join("analysis/source-index.json"))?;
+    let units = index["units"]
+        .as_array()
+        .context("source index units missing")?;
+    assert_eq!(
+        units
+            .iter()
+            .filter(|row| row["url"] == url && row["kind"] == "javascript")
+            .count(),
+        1
+    );
+    let graph = read_json(&project.join("analysis/source-graph.json"))?;
+    let node = graph["nodes"]
+        .as_array()
+        .context("source graph nodes missing")?
+        .iter()
+        .find(|row| row["id"] == format!("resource:{id}"))
+        .context("dual-role resource node missing")?;
+    assert_eq!(
+        node["saved_page_reference_roles"],
+        json!(["css", "javascript"])
+    );
+    let edges = graph["edges"]
+        .as_array()
+        .context("source graph edges missing")?;
+    for role in ["script_src", "stylesheet"] {
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|edge| {
+                    edge["from"] == format!("resource:{page_id}")
+                        && edge["to"] == format!("resource:{id}")
+                        && edge["kind"] == role
+                })
+                .count(),
+            1,
+            "graph must keep one explicit {role} edge to the same resource"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn saved_page_mixed_script_and_stylesheet_roles_preserve_both_provenances() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    for script_first in [true, false] {
+        let root = workspace.path().join(if script_first {
+            "script-first"
+        } else {
+            "style-first"
+        });
+        let assets = root.join("Page_files");
+        fs::create_dir_all(&assets)?;
+        let page = root.join("Page.html");
+        let script = r#"<script src="./Page_files/dual.bin"></script>"#;
+        let stylesheet = r#"<link rel="stylesheet" href="./Page_files/dual.bin">"#;
+        let html = if script_first {
+            format!("{script}\n{stylesheet}")
+        } else {
+            format!("{stylesheet}\n{script}")
+        };
+        fs::write(&page, html)?;
+        fs::write(
+            assets.join("dual.bin"),
+            "export const value = 7;\n//# sourceMappingURL=dual.map\n",
+        )?;
+        let project = root.join("capture");
+        run_pipeline(&page, &project)?;
+
+        verify_saved_page_mixed_roles(&project)?;
+    }
+    Ok(())
+}
+
 #[test]
 fn import_maps_preserve_document_context_and_isolate_workers() -> Result<()> {
     let workspace = tempfile::tempdir()?;
