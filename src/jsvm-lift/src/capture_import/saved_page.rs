@@ -18,7 +18,7 @@ use html_escape::decode_html_entities;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsStr,
     fs,
     path::{Component, Path, PathBuf},
@@ -418,7 +418,6 @@ pub(super) fn import_saved_page(
     }
 
     let mut resources = Vec::<Value>::new();
-    let mut counts = BTreeMap::<String, usize>::new();
     let mut rel_to_id = HashMap::<PathBuf, u64>::new();
     for (id, (source, capture_rel)) in files.iter().enumerate() {
         budget.checkpoint()?;
@@ -469,7 +468,6 @@ pub(super) fn import_saved_page(
         }
         resources.push(Value::Object(object));
         rel_to_id.insert(capture_rel.clone(), resource_id);
-        *counts.entry(kind.to_owned()).or_default() += 1;
     }
 
     let page_id = *rel_to_id
@@ -489,6 +487,9 @@ pub(super) fn import_saved_page(
     // A saved-page file path must identify one resource. Reject collisions
     // rather than silently choosing the last matching entry.
     let by_url = index_saved_urls(&resources)?;
+    // HTML declarations describe roles, not distinct captured bodies. Gather
+    // every role before choosing a stable primary kind for single-kind consumers.
+    let mut roles_by_resource = vec![BTreeSet::<&str>::new(); resources.len()];
     for reference in &page_refs {
         budget.checkpoint()?;
         let Some(url) = reference.get("resolved_url").and_then(Value::as_str) else {
@@ -499,15 +500,30 @@ pub(super) fn import_saved_page(
         };
         match reference.get("kind").and_then(Value::as_str) {
             Some("script_src" | "script_preload") => {
-                resources[index]["kind"] = json!("javascript");
-                resources[index]["mime_type"] = json!("application/javascript");
+                roles_by_resource[index].insert("javascript");
             }
             Some("stylesheet") => {
-                resources[index]["kind"] = json!("css");
-                resources[index]["mime_type"] = json!("text/css");
+                roles_by_resource[index].insert("css");
             }
             _ => {}
         }
+    }
+    for (resource, roles) in resources.iter_mut().zip(&roles_by_resource) {
+        budget.checkpoint()?;
+        if roles.is_empty() {
+            continue;
+        }
+        // Prefer JavaScript when both roles are declared, so the same bytes
+        // remain indexable as a script. Both independent declarations stay
+        // explicit in saved_page_reference_roles and in the page's references.
+        let (kind, mime) = if roles.contains("javascript") {
+            ("javascript", "application/javascript")
+        } else {
+            ("css", "text/css")
+        };
+        resource["kind"] = json!(kind);
+        resource["mime_type"] = json!(mime);
+        resource["saved_page_reference_roles"] = json!(roles);
     }
 
     for resource in &mut resources {
@@ -515,7 +531,12 @@ pub(super) fn import_saved_page(
         let Some(kind) = resource.get("kind").and_then(Value::as_str) else {
             continue;
         };
-        if !matches!(kind, "javascript" | "css") {
+        let parse_javascript = kind == "javascript";
+        let parse_css = kind == "css"
+            || resource["saved_page_reference_roles"]
+                .as_array()
+                .is_some_and(|roles| roles.iter().any(|role| role == "css"));
+        if !parse_javascript && !parse_css {
             continue;
         }
         let Some(source_path) = resource.get("saved_source_path").and_then(Value::as_str) else {
@@ -527,11 +548,13 @@ pub(super) fn import_saved_page(
         let Some(base_url) = resource.get("url").and_then(Value::as_str) else {
             continue;
         };
-        let items = if kind == "javascript" {
-            js_source_references(&source, base_url)
-        } else {
-            css_source_references(&source, base_url)?
-        };
+        let mut items = Vec::new();
+        if parse_javascript {
+            items.extend(js_source_references(&source, base_url));
+        }
+        if parse_css {
+            items.extend(css_source_references(&source, base_url)?);
+        }
         let references = resource
             .get_mut("references")
             .and_then(Value::as_array_mut)
@@ -653,6 +676,16 @@ pub(super) fn import_saved_page(
         }));
     }
 
+    // Count the final classified resources, not the pre-reference filename
+    // guesses (which can differ for e.g. a .bin used as a script).
+    let mut counts = BTreeMap::<String, usize>::new();
+    for resource in &resources {
+        budget.checkpoint()?;
+        let kind = resource["kind"]
+            .as_str()
+            .context("saved resource kind missing")?;
+        *counts.entry(kind.to_owned()).or_default() += 1;
+    }
     counts.insert("resources_total".into(), resources.len());
     counts.insert("pages".into(), 1);
     counts.insert(
