@@ -3384,6 +3384,138 @@ pub fn prove_detected_if_ladder_event_before_barriers(
     })
 }
 
+// Find a unique flattened loop in exactly one function, without entering
+// nested functions. Each proof supplies its own detection scope and obligations;
+// both use identical for/while traversal and fail closed on ambiguous matches.
+fn prove_function_if_ladder_machine<'a>(
+    source: &str,
+    program: &Program<'a>,
+    function_start: u32,
+    function_end: u32,
+    event: Span,
+    detection_scope: &'static str,
+    mut prove: impl FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
+) -> bool {
+    struct MachineCollector<'s, 'p, F> {
+        source: &'s str,
+        detection_scope: &'static str,
+        event: Span,
+        prove: &'p mut F,
+        matches: usize,
+        result: bool,
+    }
+
+    impl<F> MachineCollector<'_, '_, F> {
+        fn consider<'a>(&mut self, machine: &IfLadderStateMachineCandidate, body: &Statement<'a>)
+        where
+            F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
+        {
+            if machine.start <= self.event.start && self.event.end <= machine.end {
+                self.matches += 1;
+                self.result = (self.prove)(machine, body);
+            }
+        }
+
+        fn scan_statement_list<'a>(&mut self, statements: &[Statement<'a>])
+        where
+            F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool,
+        {
+            for pair in statements.windows(2) {
+                let [init, Statement::WhileStatement(while_statement)] = pair else {
+                    continue;
+                };
+                let Some(machine) = detect_while_state_machine(
+                    self.source,
+                    self.detection_scope,
+                    init,
+                    while_statement,
+                ) else {
+                    continue;
+                };
+                self.consider(&machine, &while_statement.body);
+            }
+        }
+    }
+
+    impl<'a, F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool> Visit<'a>
+        for MachineCollector<'_, '_, F>
+    {
+        fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
+            self.scan_statement_list(&body.statements);
+            walk::walk_function_body(self, body);
+        }
+
+        fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
+            self.scan_statement_list(&block.body);
+            walk::walk_block_statement(self, block);
+        }
+
+        fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
+            let detected = detect_for_state_machines(self.source, self.detection_scope, statement);
+            for machine in detected.if_ladder_machines {
+                self.consider(&machine, &statement.body);
+            }
+            walk::walk_for_statement(self, statement);
+        }
+
+        fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
+        fn visit_arrow_function_expression(
+            &mut self,
+            _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
+        ) {
+        }
+    }
+
+    struct FunctionHarness<'s, 'p, F> {
+        source: &'s str,
+        function_start: u32,
+        function_end: u32,
+        detection_scope: &'static str,
+        event: Span,
+        prove: &'p mut F,
+        result: Option<bool>,
+    }
+
+    impl<'a, F: FnMut(&IfLadderStateMachineCandidate, &Statement<'a>) -> bool> Visit<'a>
+        for FunctionHarness<'_, '_, F>
+    {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            if self.result.is_some() {
+                return;
+            }
+            if function.span.start == self.function_start && function.span.end == self.function_end
+            {
+                self.result = Some(function.body.as_ref().is_some_and(|body| {
+                    let mut collector = MachineCollector {
+                        source: self.source,
+                        detection_scope: self.detection_scope,
+                        event: self.event,
+                        prove: &mut *self.prove,
+                        matches: 0,
+                        result: false,
+                    };
+                    collector.visit_function_body(body);
+                    collector.matches == 1 && collector.result
+                }));
+                return;
+            }
+            walk::walk_function(self, function, flags);
+        }
+    }
+
+    let mut harness = FunctionHarness {
+        source,
+        function_start,
+        function_end,
+        detection_scope,
+        event,
+        prove: &mut prove,
+        result: None,
+    };
+    harness.visit_program(program);
+    harness.result.unwrap_or(false)
+}
+
 /// Prove required state visitation inside the unique detected flattened
 /// if-ladder machine containing `event` in one exact function.
 #[must_use]
@@ -3395,126 +3527,15 @@ pub fn prove_function_if_ladder_states_before_event(
     required_states: &[u64],
     event: Span,
 ) -> bool {
-    struct FunctionHarness<'s, 'r> {
-        source: &'s str,
-        function_start: u32,
-        function_end: u32,
-        required_states: &'r [u64],
-        event: Span,
-        result: Option<bool>,
-    }
-
-    impl FunctionHarness<'_, '_> {
-        fn prove_body(&self, body: &FunctionBody<'_>) -> bool {
-            struct Collector<'s, 'r> {
-                source: &'s str,
-                required_states: &'r [u64],
-                event: Span,
-                matches: usize,
-                result: bool,
-            }
-
-            impl Collector<'_, '_> {
-                fn scan_statement_list(&mut self, statements: &[Statement<'_>]) {
-                    for pair in statements.windows(2) {
-                        let [init, Statement::WhileStatement(while_statement)] = pair else {
-                            continue;
-                        };
-                        let Some(machine) = detect_while_state_machine(
-                            self.source,
-                            "required-state-order",
-                            init,
-                            while_statement,
-                        ) else {
-                            continue;
-                        };
-                        if machine.start <= self.event.start && self.event.end <= machine.end {
-                            self.matches += 1;
-                            self.result = prove_machine_states_before_event(
-                                &machine,
-                                &while_statement.body,
-                                self.required_states,
-                                self.event,
-                            );
-                        }
-                    }
-                }
-            }
-
-            impl<'a> Visit<'a> for Collector<'_, '_> {
-                fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
-                    self.scan_statement_list(&body.statements);
-                    walk::walk_function_body(self, body);
-                }
-                fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
-                    self.scan_statement_list(&block.body);
-                    walk::walk_block_statement(self, block);
-                }
-                fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
-                    let detected =
-                        detect_for_state_machines(self.source, "required-state-order", statement);
-                    for machine in detected.if_ladder_machines {
-                        if machine.start <= self.event.start && self.event.end <= machine.end {
-                            self.matches += 1;
-                            self.result = prove_machine_states_before_event(
-                                &machine,
-                                &statement.body,
-                                self.required_states,
-                                self.event,
-                            );
-                        }
-                    }
-                    walk::walk_for_statement(self, statement);
-                }
-                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-                fn visit_arrow_function_expression(
-                    &mut self,
-                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                ) {
-                }
-            }
-
-            let mut collector = Collector {
-                source: self.source,
-                required_states: self.required_states,
-                event: self.event,
-                matches: 0,
-                result: false,
-            };
-            collector.visit_function_body(body);
-            collector.matches == 1 && collector.result
-        }
-    }
-
-    impl<'a> Visit<'a> for FunctionHarness<'_, '_> {
-        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if self.result.is_some() {
-                return;
-            }
-            if function.span.start == self.function_start && function.span.end == self.function_end
-            {
-                self.result = Some(
-                    function
-                        .body
-                        .as_ref()
-                        .is_some_and(|body| self.prove_body(body)),
-                );
-                return;
-            }
-            walk::walk_function(self, function, flags);
-        }
-    }
-
-    let mut harness = FunctionHarness {
+    prove_function_if_ladder_machine(
         source,
+        program,
         function_start,
         function_end,
-        required_states,
         event,
-        result: None,
-    };
-    harness.visit_program(program);
-    harness.result.unwrap_or(false)
+        "required-state-order",
+        |machine, body| prove_machine_states_before_event(machine, body, required_states, event),
+    )
 }
 
 /// Prove event-before-barriers inside the unique detected flattened if-ladder
@@ -3531,134 +3552,20 @@ pub fn prove_function_if_ladder_event_before_barriers(
     event: Span,
     barriers: &[Span],
 ) -> bool {
-    struct FunctionHarness<'s, 'b> {
-        source: &'s str,
-        function_start: u32,
-        function_end: u32,
-        event: Span,
-        barriers: &'b [Span],
-        result: Option<bool>,
-    }
-
-    impl FunctionHarness<'_, '_> {
-        fn prove_body(&self, body: &FunctionBody<'_>) -> bool {
-            struct Collector<'s, 'b> {
-                source: &'s str,
-                event: Span,
-                barriers: &'b [Span],
-                matches: usize,
-                result: bool,
-            }
-
-            impl Collector<'_, '_> {
-                fn barriers_inside(&self, start: u32, end: u32) -> bool {
-                    self.barriers
-                        .iter()
-                        .all(|barrier| start <= barrier.start && barrier.end <= end)
-                }
-
-                fn scan_statement_list(&mut self, statements: &[Statement<'_>]) {
-                    for pair in statements.windows(2) {
-                        let [init, Statement::WhileStatement(while_statement)] = pair else {
-                            continue;
-                        };
-                        let Some(machine) = detect_while_state_machine(
-                            self.source,
-                            "ordered-call",
-                            init,
-                            while_statement,
-                        ) else {
-                            continue;
-                        };
-                        if machine.start <= self.event.start && self.event.end <= machine.end {
-                            self.matches += 1;
-                            self.result = self.barriers_inside(machine.start, machine.end)
-                                && prove_machine_event_before_barriers(
-                                    &machine,
-                                    &while_statement.body,
-                                    self.event,
-                                    self.barriers,
-                                );
-                        }
-                    }
-                }
-            }
-
-            impl<'a> Visit<'a> for Collector<'_, '_> {
-                fn visit_function_body(&mut self, body: &FunctionBody<'a>) {
-                    self.scan_statement_list(&body.statements);
-                    walk::walk_function_body(self, body);
-                }
-                fn visit_block_statement(&mut self, block: &oxc_ast::ast::BlockStatement<'a>) {
-                    self.scan_statement_list(&block.body);
-                    walk::walk_block_statement(self, block);
-                }
-                fn visit_for_statement(&mut self, statement: &ForStatement<'a>) {
-                    let detected =
-                        detect_for_state_machines(self.source, "ordered-call", statement);
-                    for machine in detected.if_ladder_machines {
-                        if machine.start <= self.event.start && self.event.end <= machine.end {
-                            self.matches += 1;
-                            self.result = self.barriers_inside(machine.start, machine.end)
-                                && prove_machine_event_before_barriers(
-                                    &machine,
-                                    &statement.body,
-                                    self.event,
-                                    self.barriers,
-                                );
-                        }
-                    }
-                    walk::walk_for_statement(self, statement);
-                }
-                fn visit_function(&mut self, _function: &Function<'a>, _flags: ScopeFlags) {}
-                fn visit_arrow_function_expression(
-                    &mut self,
-                    _function: &oxc_ast::ast::ArrowFunctionExpression<'a>,
-                ) {
-                }
-            }
-
-            let mut collector = Collector {
-                source: self.source,
-                event: self.event,
-                barriers: self.barriers,
-                matches: 0,
-                result: false,
-            };
-            collector.visit_function_body(body);
-            collector.matches == 1 && collector.result
-        }
-    }
-
-    impl<'a> Visit<'a> for FunctionHarness<'_, '_> {
-        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-            if self.result.is_some() {
-                return;
-            }
-            if function.span.start == self.function_start && function.span.end == self.function_end
-            {
-                self.result = Some(
-                    function
-                        .body
-                        .as_ref()
-                        .is_some_and(|body| self.prove_body(body)),
-                );
-                return;
-            }
-            walk::walk_function(self, function, flags);
-        }
-    }
-
-    let mut harness = FunctionHarness {
+    prove_function_if_ladder_machine(
         source,
+        program,
         function_start,
         function_end,
         event,
-        barriers,
-        result: None,
-    };
-    harness.visit_program(program);
-    harness.result.unwrap_or(false)
+        "ordered-call",
+        |machine, body| {
+            barriers
+                .iter()
+                .all(|barrier| machine.start <= barrier.start && barrier.end <= machine.end)
+                && prove_machine_event_before_barriers(machine, body, event, barriers)
+        },
+    )
 }
 
 pub fn prove_if_ladder_event_before_barriers(
