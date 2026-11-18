@@ -165,6 +165,100 @@ fn optional_artifact(
 /// Connect an inspector-observed function value to its precise definition
 /// only after the importer verified session + script ID + captured source hash.
 /// Definition identity is not proof that the call was executed.
+fn add_runtime_network_source_edges(
+    graph: &mut GraphBuilder,
+    runtime: &Value,
+    runtime_node: &str,
+    resource_nodes_by_sha: &BTreeMap<String, Vec<String>>,
+) -> Result<()> {
+    let Some(digest) = nonempty_string_field(runtime, "sha256") else {
+        return Ok(());
+    };
+    let urls = array_field(runtime, "urls")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let hash_matches = resource_nodes_by_sha
+        .get(digest)
+        .map_or_default(Vec::as_slice);
+    let exact = hash_matches
+        .iter()
+        .filter(|node| {
+            graph.nodes.get(*node).is_some_and(|resource| {
+                nonempty_string_field(resource, "kind") == Some("javascript")
+                    && nonempty_string_field(resource, "url").is_some_and(|url| urls.contains(url))
+            })
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let (parents, basis) = if !exact.is_empty() {
+        (exact, "sha256_and_url")
+    } else if urls.is_empty() && !hash_matches.is_empty() {
+        (
+            hash_matches
+                .iter()
+                .filter(|node| {
+                    graph.nodes.get(*node).is_some_and(|resource| {
+                        nonempty_string_field(resource, "kind") == Some("javascript")
+                    })
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            "sha256_only",
+        )
+    } else {
+        // A runtime URL cannot identify which captured HTTP response supplied
+        // script bytes. Preserve all URL candidates without asserting execution.
+        (
+            urls.iter()
+                .flat_map(|url| graph.url_to_resources.get(*url).into_iter().flatten())
+                .filter(|node| {
+                    graph.nodes.get(*node).is_some_and(|resource| {
+                        nonempty_string_field(resource, "kind") == Some("javascript")
+                    })
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            "url_only",
+        )
+    };
+    let uniquely_verified = basis == "sha256_and_url" && parents.len() == 1;
+    for parent in &parents {
+        let parent_url = graph
+            .nodes
+            .get(parent)
+            .and_then(|resource| nonempty_string_field(resource, "url"));
+        let execution_observed = parent_url.is_some_and(|url| {
+            array_field(runtime, "script_instances")
+                .iter()
+                .any(|instance| {
+                    nonempty_string_field(instance, "script_url") == Some(url)
+                        && nonempty_string_field(&instance["execution"], "status")
+                            == Some("positive")
+                })
+        });
+        let kind = if uniquely_verified && execution_observed {
+            "runtime_execution"
+        } else if uniquely_verified {
+            "runtime_source_match"
+        } else {
+            "runtime_source_candidate"
+        };
+        graph.add_edge(
+            parent,
+            runtime_node,
+            kind,
+            json!({
+                "identity_basis":basis,
+                "candidate_count":parents.len(),
+                "exact_response_identity":uniquely_verified,
+                "runtime_execution_observed":execution_observed,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
 fn add_observed_callable_definition(
     graph: &mut GraphBuilder,
     runtime_nodes: &BTreeMap<(String, String), String>,
@@ -746,12 +840,16 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
                     edge_fields,
                 )?;
             } else if let Some(url) = nonempty_string_field(parent, "url") {
-                for parent_node in graph.targets_for(url)? {
+                let candidates = graph.targets_for(url)?;
+                for parent_node in &candidates {
+                    let mut fields = edge_fields.clone();
+                    fields["identity_basis"] = json!("url_only");
+                    fields["candidate_count"] = json!(candidates.len());
                     graph.add_edge(
-                        &parent_node,
+                        parent_node,
                         &runtime_node,
-                        "runtime_generated_code",
-                        edge_fields.clone(),
+                        "runtime_generated_code_candidate",
+                        fields,
                     )?;
                 }
             }
@@ -759,23 +857,12 @@ pub fn build_source_graph(project: &Path, budgets: &AnalysisBudgets) -> Result<S
 
         match classification {
             Some("network_response" | "network_observed") => {
-                let mut parents = resource_nodes_by_sha
-                    .get(digest)
-                    .cloned()
-                    .unwrap_or_default();
-                if parents.is_empty() {
-                    for url in array_field(source, "urls").iter().filter_map(Value::as_str) {
-                        if let Some(nodes) = graph.url_to_resources.get(url) {
-                            parents.extend(nodes.iter().cloned());
-                        }
-                    }
-                }
-                let mut seen = BTreeSet::new();
-                for parent in parents {
-                    if seen.insert(parent.clone()) {
-                        graph.add_edge(&parent, &runtime_node, "runtime_execution", json!({}))?;
-                    }
-                }
+                add_runtime_network_source_edges(
+                    &mut graph,
+                    source,
+                    &runtime_node,
+                    &resource_nodes_by_sha,
+                )?;
             }
             Some("inline_script") => {
                 if let Some(parents) = inline_nodes_by_sha.get(digest) {
