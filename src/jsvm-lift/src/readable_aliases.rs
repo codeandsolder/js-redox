@@ -47,6 +47,19 @@ fn root_name<'a>(expr: &'a Expression<'_>) -> Option<&'a str> {
         _ => None,
     }
 }
+// Assignment and update targets use one exact intrinsic-root parser.
+// Destructuring assignments remain unsupported by this proof.
+fn simple_assignment_root<'a>(
+    target: &'a oxc_ast::ast::SimpleAssignmentTarget<'_>,
+) -> Option<&'a str> {
+    use oxc_ast::ast::SimpleAssignmentTarget;
+    match target {
+        SimpleAssignmentTarget::StaticMemberExpression(member) => root_name(&member.object),
+        SimpleAssignmentTarget::ComputedMemberExpression(member) => root_name(&member.object),
+        SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.as_str()),
+        _ => None,
+    }
+}
 fn candidate(expr: &Expression<'_>, scoping: &Scoping) -> bool {
     matches!(
         expr,
@@ -207,27 +220,20 @@ impl<'a> Visit<'a> for References<'_> {
         walk::walk_tagged_template_expression(self, t);
     }
     fn visit_assignment_expression(&mut self, a: &oxc_ast::ast::AssignmentExpression<'a>) {
-        use oxc_ast::ast::AssignmentTarget;
-        let root = match &a.left {
-            AssignmentTarget::StaticMemberExpression(m) => root_name(&m.object),
-            AssignmentTarget::ComputedMemberExpression(m) => root_name(&m.object),
-            AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.as_str()),
-            _ => None,
-        };
-        if let Some(root) = root.filter(|root| INTRINSICS.contains(root)) {
+        if let Some(root) = a
+            .left
+            .as_simple_assignment_target()
+            .and_then(simple_assignment_root)
+            .filter(|root| INTRINSICS.contains(root))
+        {
             self.ctx.modified_intrinsics.insert(root.to_owned());
         }
         walk::walk_assignment_expression(self, a);
     }
     fn visit_update_expression(&mut self, u: &oxc_ast::ast::UpdateExpression<'a>) {
-        use oxc_ast::ast::SimpleAssignmentTarget;
-        let root = match &u.argument {
-            SimpleAssignmentTarget::StaticMemberExpression(m) => root_name(&m.object),
-            SimpleAssignmentTarget::ComputedMemberExpression(m) => root_name(&m.object),
-            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.as_str()),
-            _ => None,
-        };
-        if let Some(root) = root.filter(|root| INTRINSICS.contains(root)) {
+        if let Some(root) =
+            simple_assignment_root(&u.argument).filter(|root| INTRINSICS.contains(root))
+        {
             self.ctx.modified_intrinsics.insert(root.to_owned());
         }
         walk::walk_update_expression(self, u);
