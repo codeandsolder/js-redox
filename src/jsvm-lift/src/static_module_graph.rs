@@ -230,10 +230,14 @@ fn candidate_resolutions(reference: &Value, document_id: u64) -> Vec<&Value> {
     }
 }
 
-fn match_root(
-    source: &CapturedScriptSource,
+struct RootCapture<'a> {
+    source: &'a CapturedScriptSource,
     document_id: u64,
-    script_ordinal: usize,
+    ordinal: usize,
+}
+
+fn match_root(
+    root: RootCapture<'_>,
     raw_index: &BTreeMap<String, Vec<usize>>,
     units: &[Unit<'_>],
     bodies: &ManifestBodies<'_>,
@@ -241,26 +245,30 @@ fn match_root(
     budget: &WorkBudget,
 ) -> Result<Vec<(usize, ModuleSourceIdentity)>> {
     let mut out = Vec::new();
-    for &idx in raw_index.get(&source.output_path).into_iter().flatten() {
+    for &idx in raw_index
+        .get(&root.source.output_path)
+        .into_iter()
+        .flatten()
+    {
         let unit = &units[idx];
         let row_id = unit.row.get("resource_id").and_then(Value::as_u64);
-        let matched = match source.resource_id {
-            Some(resource_id) => unit.origin == "resource" && row_id == Some(resource_id),
-            None => {
+        let matched = root.source.resource_id.map_or_else(
+            || {
                 unit.origin == "inline_script"
-                    && row_id == Some(document_id)
+                    && row_id == Some(root.document_id)
                     && unit.row.get("ordinal").and_then(Value::as_u64)
-                        == u64::try_from(script_ordinal).ok()
-            }
-        };
+                        == u64::try_from(root.ordinal).ok()
+            },
+            |resource_id| unit.origin == "resource" && row_id == Some(resource_id),
+        );
         if !matched {
             continue;
         }
         let identity = source_identity(project, unit, bodies, budget)?;
         anyhow::ensure!(
-            identity.raw_sha256 == source.sha256 && source.matches_manifest_sha256,
+            identity.raw_sha256 == root.source.sha256 && root.source.matches_manifest_sha256,
             "raw HTML root digest changed: {}",
-            source.output_path
+            root.source.output_path
         );
         out.push((idx, identity));
     }
@@ -375,9 +383,11 @@ fn discover_roots(
             }
             for source in &script.captured_sources {
                 let resolved = match_root(
-                    source,
-                    document.document_resource_id,
-                    script.ordinal,
+                    RootCapture {
+                        source,
+                        document_id: document.document_resource_id,
+                        ordinal: script.ordinal,
+                    },
                     &catalog.raw_index,
                     &catalog.units,
                     bodies,
