@@ -120,23 +120,13 @@ fn record_path(
     }
 }
 
-fn ranked_effects(effects: HashMap<u64, Cluster>, min_decoders: usize) -> Vec<(u64, Cluster)> {
-    let mut rows: Vec<_> = effects
-        .into_iter()
-        .filter(|(_, cluster)| cluster.decoders.len() >= min_decoders)
-        .collect();
-    rows.sort_by(|a, b| {
-        b.1.decoders
-            .len()
-            .cmp(&a.1.decoders.len())
-            .then_with(|| b.1.count.cmp(&a.1.count))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    rows
-}
-
-fn ranked_paths(paths: HashMap<String, Cluster>, min_decoders: usize) -> Vec<(String, Cluster)> {
-    let mut rows: Vec<_> = paths
+// Both signature key types use exactly the same cross-decoder selection and
+// stable tie-breaking order; only the key's Ord implementation differs.
+fn ranked_clusters<K: Ord>(
+    clusters: HashMap<K, Cluster>,
+    min_decoders: usize,
+) -> Vec<(K, Cluster)> {
+    let mut rows: Vec<_> = clusters
         .into_iter()
         .filter(|(_, cluster)| cluster.decoders.len() >= min_decoders)
         .collect();
@@ -203,8 +193,8 @@ fn main() -> Result<()> {
     let text = fs::read_to_string(&args.input)
         .with_context(|| format!("reading {}", args.input.display()))?;
     let clusters = collect_clusters(&text)?;
-    let effect_rows = ranked_effects(clusters.effects, args.min_decoders);
-    let path_rows = ranked_paths(clusters.paths, args.min_decoders);
+    let effect_rows = ranked_clusters(clusters.effects, args.min_decoders);
+    let path_rows = ranked_clusters(clusters.paths, args.min_decoders);
 
     println!(
         "VMs {} shared_effect_shapes {} shared_path_signatures {}",
@@ -215,4 +205,47 @@ fn main() -> Result<()> {
     print_effects(effect_rows, args.top);
     print_paths(path_rows, args.top);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ranked_clusters, Cluster};
+    use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn effect_and_path_ranking_keep_threshold_and_stable_tie_breaks() {
+        let cluster = |count: usize, decoders: &[&str]| Cluster {
+            count,
+            decoders: decoders
+                .iter()
+                .map(|decoder| (*decoder).to_owned())
+                .collect::<BTreeSet<_>>(),
+            ..Cluster::default()
+        };
+        let effects = HashMap::from([
+            (9_u64, cluster(10, &["a", "b"])),
+            (2_u64, cluster(10, &["a", "b"])),
+            (5_u64, cluster(12, &["a", "b", "c"])),
+            (1_u64, cluster(99, &["a"])),
+        ]);
+        assert_eq!(
+            ranked_clusters(effects, 2)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            [5, 2, 9],
+        );
+        let paths = HashMap::from([
+            ("z".to_owned(), cluster(5, &["a", "b"])),
+            ("a".to_owned(), cluster(5, &["a", "b"])),
+            ("excluded".to_owned(), cluster(100, &["a"])),
+        ]);
+        assert_eq!(
+            ranked_clusters(paths, 2)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            ["a", "z"],
+        );
+    }
 }
