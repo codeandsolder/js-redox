@@ -2031,11 +2031,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn source_graph_never_upgrades_contextual_summaries_or_blocked_imports() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(&project)?;
+    // Reusable captured-resource/reference inventory for document-context proof regressions.
+    fn write_contextual_reference_fixture(project: &Path) -> Result<()> {
         let source_url = "https://example.test/entry.js";
         let exact_url = "https://example.test/exact.js";
         let stale_url = "https://example.test/stale.js";
@@ -2107,6 +2104,15 @@ mod tests {
             &project,
             &AnalysisBudgets::standard("source-graph-contextual-proof-test"),
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn source_graph_never_upgrades_contextual_summaries_or_blocked_imports() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        write_contextual_reference_fixture(&project)?;
         let graph = load_artifact(&project, SOURCE_GRAPH, false)?.context("missing graph")?;
         let edges = graph["edges"].as_array().context("missing graph edges")?;
         let refs = edges
