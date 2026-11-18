@@ -4163,6 +4163,31 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
         }
     }
 
+    /// Record the same proven function/string property value regardless of
+    /// whether its assignment target used static or computed member syntax.
+    /// Reference evaluation and key resolution belong to the caller.
+    fn record_prototype_member_assignment(
+        &mut self,
+        owner: FunctionKey,
+        property: String,
+        value: &Expression<'_>,
+        span: Span,
+    ) {
+        if property == "__proto__" {
+            self.invalidate_constructor(owner);
+        } else if let Some(functions) = possible_regular_functions(value) {
+            self.record_method(owner, property, functions, span.start, span.end);
+        } else if let Expression::StringLiteral(literal) = last_sequence_expression(value) {
+            if let Some(value) = string_literal_value(literal) {
+                self.record_string(owner, property, value, span.start, span.end);
+            } else {
+                self.invalidate_property(owner, property);
+            }
+        } else {
+            self.invalidate_property(owner, property);
+        }
+    }
+
     fn process_statement_list(&mut self, statements: &[Statement<'_>]) {
         self.aliases.clear();
         for statement in statements {
@@ -4370,35 +4395,12 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                             return;
                         }
                         if let Some(owner) = owner {
-                            if property == "__proto__" {
-                                self.invalidate_constructor(owner);
-                            } else if let Some(functions) =
-                                possible_regular_functions(&assignment.right)
-                            {
-                                self.record_method(
-                                    owner,
-                                    property,
-                                    functions,
-                                    assignment.span.start,
-                                    assignment.span.end,
-                                );
-                            } else if let Expression::StringLiteral(value) =
-                                last_sequence_expression(&assignment.right)
-                            {
-                                if let Some(value) = string_literal_value(value) {
-                                    self.record_string(
-                                        owner,
-                                        property,
-                                        value,
-                                        assignment.span.start,
-                                        assignment.span.end,
-                                    );
-                                } else {
-                                    self.invalidate_property(owner, property);
-                                }
-                            } else {
-                                self.invalidate_property(owner, property);
-                            }
+                            self.record_prototype_member_assignment(
+                                owner,
+                                property,
+                                &assignment.right,
+                                assignment.span,
+                            );
                         }
                     }
                     AssignmentTarget::ComputedMemberExpression(member) => {
@@ -4421,35 +4423,12 @@ impl<'c, 'f> PrototypeMethodProof<'c, 'f> {
                         self.process_expression(&assignment.right);
                         if let Some(owner) = owner {
                             if let Some(property) = property {
-                                if property == "__proto__" {
-                                    self.invalidate_constructor(owner);
-                                } else if let Some(functions) =
-                                    possible_regular_functions(&assignment.right)
-                                {
-                                    self.record_method(
-                                        owner,
-                                        property,
-                                        functions,
-                                        assignment.span.start,
-                                        assignment.span.end,
-                                    );
-                                } else if let Expression::StringLiteral(value) =
-                                    last_sequence_expression(&assignment.right)
-                                {
-                                    if let Some(value) = string_literal_value(value) {
-                                        self.record_string(
-                                            owner,
-                                            property,
-                                            value,
-                                            assignment.span.start,
-                                            assignment.span.end,
-                                        );
-                                    } else {
-                                        self.invalidate_property(owner, property);
-                                    }
-                                } else {
-                                    self.invalidate_property(owner, property);
-                                }
+                                self.record_prototype_member_assignment(
+                                    owner,
+                                    property,
+                                    &assignment.right,
+                                    assignment.span,
+                                );
                             } else {
                                 self.invalidate_lookup(owner);
                             }
@@ -6250,6 +6229,39 @@ mod tests {
             .iter()
             .all(|proof| proof.candidate.call.property != "run")
         );
+    }
+
+    #[test]
+    fn static_and_computed_prototype_value_assignments_share_classification() {
+        let source = r#"
+            const C = function() {};
+            const p = C.prototype;
+            p.staticText = "first";
+            p["computedText"] = "second";
+            p.staticMethod = function() { return 1; };
+            p["computedMethod"] = function() { return 2; };
+        "#;
+        let strings = prototype_strings(source);
+        assert_eq!(strings.len(), 2);
+        assert_eq!(
+            strings
+                .iter()
+                .map(|assignment| assignment.property.as_str())
+                .collect::<Vec<_>>(),
+            ["computedText", "staticText"],
+        );
+        let methods = method_assignments(source);
+        assert_eq!(methods.len(), 2);
+        assert_eq!(
+            methods
+                .iter()
+                .map(|assignment| assignment.property.as_str())
+                .collect::<Vec<_>>(),
+            ["computedMethod", "staticMethod"],
+        );
+        assert!(methods
+            .iter()
+            .all(|method| method.possible_functions.len() == 1));
     }
 
     #[test]
